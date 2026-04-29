@@ -277,8 +277,32 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
                     Ok(_) => return R::top_result(),
                     Err(lltype::DelayedPointer) => return R::top_result(),
                 };
-                let Some(graph_key) = funcobj.graph else {
+                // Upstream `:104-108`:
+                //     if getattr(funcobj, 'external', None) is not None:
+                //         x = self.analyze_external_call(funcobj, seen)
+                //         ...
+                //         return x
+                // pyre's `_func` mirrors upstream `**attrs`-set members
+                // through `_func.attrs`. The `external='C'` kwarg from
+                // `lltype.functionptr` (`rffi.py:162`) lands in
+                // `attrs["external"]`, so the equivalent test is "any
+                // value for the external key is non-None upstream".
+                if funcobj.attrs.contains_key("external") {
                     return self.analyze_external_call(op, seen);
+                }
+                // Upstream `:109-112`:
+                //     try:
+                //         graph = funcobj.graph
+                //     except AttributeError:
+                //         return self.top_result()
+                // Upstream's `funcobj.graph` raises AttributeError when
+                // the slot is absent. Pyre stores `None` in the same
+                // slot for graphless internal funcobjs; collapse both
+                // arms here — graph absent and not-external upstream
+                // surfaces as `top_result()`, which mirrors pyre's
+                // current behaviour for an opaque funcobj.
+                let Some(graph_key) = funcobj.graph else {
+                    return R::top_result();
                 };
                 let graph = {
                     let trans_graphs = self.translator().graphs.borrow();

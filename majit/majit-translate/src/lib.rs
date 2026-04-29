@@ -2105,7 +2105,8 @@ mod tests {
         let mut call_control = call::CallControl::new();
         let mut function_graphs = std::collections::HashMap::new();
         for parsed in &parsed_files {
-            parse::collect_function_graphs(parsed, &mut function_graphs);
+            parse::collect_function_graphs(parsed, &mut function_graphs)
+                .expect("collect_function_graphs: FlowingError must propagate");
         }
         for (path, graph) in &function_graphs {
             call_control.register_function_graph(path.clone(), graph.clone());

@@ -1630,13 +1630,31 @@ impl<'t> BaseInliner<'t> {
             //
             // Pass-through cases ultimately route through
             // `rewire_exceptblock` → `rewire_exceptblock_with_guard`,
-            // which depends on `lltype.normalizeptr` and
-            // `RPythonTyper.lltype_to_classdef_mapping()` — both
-            // unported (Slice 4d). The unconditional rejection is
-            // therefore unavoidable at the *inline* gate, but the
-            // upstream conditional shape is preserved so the
-            // CannotInline message identifies which upstream branch
-            // would have fired and a reviewer can verify the
+            // which depends on:
+            //   * `lltype.normalizeptr` (`lltype.py:1139-1161`) —
+            //     pointer normalization for exception-class
+            //     constants in `_find_exception_type`.
+            //   * `RPythonTyper.lltype_to_classdef_mapping()` —
+            //     dict from lltype Ptr to ClassDef, used to look up
+            //     the matching exception handler.
+            //   * `RPythonTyper.exceptiondata.fn_exception_match` —
+            //     runtime helper that checks vtable identity.
+            //   * `RPythonTyper.exceptiondata.lltype_of_exception_type`
+            //     — type alias used to extract the vtable from the
+            //     class repr.
+            //   * `RPythonTyper.exceptiondata.generate_exception_match`
+            //     — code-generator that emits ll-ops for the
+            //     `generic_exception_matching` fallback path.
+            //   * `rclass.getclassrepr(rtyper, classdef)` — class
+            //     repr resolver from the rtyper rclass module.
+            //
+            // None of these have local equivalents (rtyper is a
+            // skeleton; the exceptiondata machinery is genuinely
+            // unported). The unconditional rejection at this gate
+            // is therefore unavoidable today, but the upstream
+            // conditional shape is preserved so the CannotInline
+            // message identifies which upstream branch would have
+            // fired and a reviewer can verify the
             // would-have-passed-through cases are the only ones the
             // Slice 4d gap blocks.
             if self.inline_guarded_calls {

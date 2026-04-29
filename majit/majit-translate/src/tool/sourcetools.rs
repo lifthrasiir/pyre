@@ -163,8 +163,36 @@ pub fn func_with_new_name(
     let mut renamed = func.with_new_name(newname);
     if let Some(g) = globals {
         renamed.globals = g.clone();
+        // Upstream `types.FunctionType(code, globals, name, ...)`
+        // (`sourcetools.py:221`) sets the new function's
+        // `__module__` to the supplied globals' `__name__`. Mirror
+        // that here so a renamed-into-fresh-globals copy reads its
+        // module from the new globals dict — otherwise stale module
+        // annotations leak through to the caller (notably
+        // `descrcontainer.subseq_method`).
+        renamed.module = module_from_globals(g);
     }
     renamed
+}
+
+/// Extract `globals.__name__` from a Python globals-dict Constant.
+/// Mirrors CPython's `types.FunctionType(..., globals, name, ...)`
+/// post-construction `f.__module__ = globals.get('__name__')` rule
+/// (`Objects/funcobject.c:func_new_impl`).
+fn module_from_globals(globals: &Constant) -> Option<String> {
+    let dict = match &globals.value {
+        crate::flowspace::model::ConstValue::Dict(d) => d,
+        _ => return None,
+    };
+    use crate::flowspace::model::ConstValue;
+    let key_uni = ConstValue::UniStr("__name__".to_string());
+    let key_byte = ConstValue::ByteStr(b"__name__".to_vec());
+    let entry = dict.get(&key_uni).or_else(|| dict.get(&key_byte))?;
+    match entry {
+        ConstValue::UniStr(s) => Some(s.clone()),
+        ConstValue::ByteStr(b) => std::str::from_utf8(b).ok().map(str::to_string),
+        _ => None,
+    }
 }
 
 /// Host-object counterpart for callers that still hold a Python

@@ -92,10 +92,41 @@ pub fn backend_optimizations(
     }
 
     // Upstream `:59-61 remove_asserts`.
+    //
+    // `removeassert.py:8 remove_asserts(translator, graphs)` walks each
+    // graph's `iterlinks()` looking for links that target
+    // `graph.exceptblock` with a constant `ll_AssertionError` value,
+    // then strips the assertion via `kill_assertion_link`. Both
+    // `iterlinks` and `recloseblock` are already in
+    // `flowspace::model.rs`, but the body needs four rtyper-side
+    // primitives that are still skeletons:
+    //
+    //   * `RPythonTyper.exceptiondata.get_standard_ll_exc_instance(
+    //     rtyper, clsdef)` (`exceptiondata.py:get_standard_ll_exc_instance`)
+    //     — returns the canonical `ll_AssertionError` constant the
+    //     scan compares against.
+    //   * `bookkeeper.getuniqueclassdef(AssertionError)`
+    //     (`bookkeeper.py:430`) — pyre's annotator already exposes
+    //     `getuniqueclassdef`, but the `AssertionError` host class
+    //     must be registered in the bookkeeper namespace first.
+    //   * `LowLevelOpList()` + `newops.genop('bool_not', ...)`
+    //     (`rtyper.py LowLevelOpList`) — `kill_assertion_link` rewrites
+    //     `if cond: raise AssertionError` to `debug_assert(not cond,
+    //     msg)`. Requires the LLOpList builder.
+    //   * `inputconst(lltype.Void, msg)` (`rtyper.py inputconst`) —
+    //     constructs the `Void` message constant.
+    //
+    // Convergence path: once `rtyper::exceptiondata` lands the standard
+    // exception singletons + `LowLevelOpList`/`inputconst`, lift the
+    // 56-LOC `removeassert.py` body verbatim. Comment-only TaskError
+    // until then.
     if boolopt(&config, "remove_asserts")? {
         constfold_pass(&config, &graphs)?;
         return Err(TaskError {
-            message: "all.py:61 remove_asserts not yet ported".to_string(),
+            message: "all.py:61 remove_asserts: requires \
+                      rtyper.exceptiondata.get_standard_ll_exc_instance + \
+                      LowLevelOpList + inputconst (rtyper skeleton unported)"
+                .to_string(),
         });
     }
 
@@ -144,13 +175,20 @@ pub fn backend_optimizations(
         } else {
             0.0
         };
-        // Upstream `:88-91 inline_malloc_removal_phase(...)`.
+        // Upstream `:88-91 inline_malloc_removal_phase(...)`. The
+        // `call_count_pred` slot is `None` here — upstream's
+        // `:84-91` non-profile branch never supplies one. The
+        // profile-based branch at `:99-113` would build a counter-
+        // backed predicate and call this same helper; pyre's
+        // profile branch is still gated as a TaskError below until
+        // `translator.driver_instrument_result` lands.
         inline_malloc_removal_phase(
             &config,
             &translator,
             &graphs,
             threshold,
             inline::inlining_heuristic,
+            None,
             inline_graph_from_anywhere,
         )?;
         // Upstream `:92 constfold(config, graphs)`.
@@ -166,9 +204,35 @@ pub fn backend_optimizations(
     }
 
     // Upstream `:99-113 profile_based_inline`.
+    //
+    // The static pieces of this branch are ported:
+    // `inline::instrument_inline_candidates` lives at
+    // `inline.rs::instrument_inline_candidates`, the `call_count_pred`
+    // carrier is `inline::CallCountPred` (`Rc<RefCell<dyn FnMut>>`),
+    // and `inline_malloc_removal_phase` accepts the predicate
+    // verbatim. The runtime piece is the blocker:
+    // `translator.driver_instrument_result(filename)` (upstream
+    // `driver.py`) compiles the instrumented graph through the C
+    // backend, runs it, and reads back per-label counters. Pyre's
+    // C-backend driver is not ported, so the path stays gated as a
+    // `TaskError`. Convergence path: port the C-backend
+    // instrument-and-run pipeline, then replace this gate with
+    //     let counters = translator.driver_instrument_result(...)?;
+    //     let pred: CallCountPred = Rc::new(RefCell::new(
+    //         move |label| (label as usize) < counters.len()
+    //             && counters[label as usize] > 250,
+    //     ));
+    //     inline::instrument_inline_candidates(&graphs, threshold, &translator);
+    //     inline_malloc_removal_phase(&config, &translator, &graphs,
+    //                                  threshold, inline_heuristic,
+    //                                  Some(pred), inline_graph_from_anywhere)?;
     if stropt(&config, "profile_based_inline")?.is_some() && !secondary {
         return Err(TaskError {
-            message: "all.py:99-113 profile_based_inline not yet ported".to_string(),
+            message: "all.py:99-113 profile_based_inline: static pieces ported \
+                      (instrument_inline_candidates / CallCountPred / \
+                      inline_malloc_removal_phase signature); blocked on \
+                      C-backend driver_instrument_result runtime"
+                .to_string(),
         });
     }
 
@@ -230,20 +294,21 @@ pub fn backend_optimizations(
 /// inline_threshold, inline_heuristic, call_count_pred=None,
 /// inline_graph_from_anywhere=False)` at `all.py:138-164`.
 ///
-/// `call_count_pred` is pinned to `None` to match
-/// [`inline::auto_inline_graphs`]'s current shape — see the
-/// PRE-EXISTING-ADAPTATION on [`inline::auto_inlining`] for the
-/// `Rc<RefCell<dyn FnMut>>` carrier work that would unblock threading
-/// it. Upstream's only `call_count_pred=...` caller is the
-/// `profile_based_inline` branch, which is itself still gated as
-/// `TaskError` at `:141-145` of [`backend_optimizations`], so the
-/// pin is observationally complete.
+/// `call_count_pred` is the predicate `auto_inline_graphs` consults
+/// when an `instrument_count`-tagged op selects the
+/// profile-based-inline path (`inline.py:176-182`). Upstream's only
+/// `call_count_pred=...` caller is `backend_optimizations`'s
+/// `profile_based_inline` branch (`:106-113`); pyre's wrapper wires
+/// the parameter through verbatim so callers can opt-in once
+/// `translator.driver_instrument_result` (the runtime counter
+/// supplier at `driver.py`) is ported.
 pub(crate) fn inline_malloc_removal_phase(
     config: &Rc<Config>,
     translator: &Rc<TranslationContext>,
     graphs: &[GraphRef],
     inline_threshold: f64,
     inline_heuristic: fn(&GraphRef) -> (f64, bool),
+    call_count_pred: Option<inline::CallCountPred>,
     inline_graph_from_anywhere: bool,
 ) -> Result<(), TaskError> {
     // Upstream `:143-151 if inline_threshold: log.inlining(...) ;
@@ -256,7 +321,7 @@ pub(crate) fn inline_malloc_removal_phase(
             graphs,
             inline_threshold,
             inline_heuristic,
-            None,
+            call_count_pred,
             inline_graph_from_anywhere,
         )
         .map_err(|e| TaskError {
@@ -271,9 +336,51 @@ pub(crate) fn inline_malloc_removal_phase(
 
     // Upstream `:158-164 if config.mallocs: log.malloc(...) ;
     // remove_mallocs(translator, graphs); ...`.
+    //
+    // `malloc.py` is a 566-LOC escape-analysis pass. The driver
+    // `remove_mallocs(translator, graphs)` (`malloc.py:553-566`) wraps
+    // a `LLTypeMallocRemover` (`:333-547`, subclass of
+    // `BaseMallocRemover`, `:26-332`) that:
+    //
+    //   1. Builds a per-graph `LifeTime` UnionFind (`:9-24` +
+    //      `:121-?compute_lifetimes`) over malloc result vars, tracking
+    //      creation- and use-points.
+    //   2. Walks operations to identify `malloc` ops whose result
+    //      never escapes (no aliasing into a non-removable use), then
+    //      replaces field reads/writes with direct local-var access.
+    //   3. Calls `removenoops.remove_same_as`,
+    //      `simplify.eliminate_empty_blocks`, and
+    //      `simplify.transform_dead_op_vars` to clean up.
+    //
+    // Local availability of deps:
+    //
+    //   * `tool::algo::unionfind::UnionFind` — already ported.
+    //   * `simplify::transform_dead_op_vars` /
+    //     `eliminate_empty_blocks` — already ported.
+    //   * `removenoops::remove_same_as` — already ported.
+    //   * `lltype::Struct` / array type introspection — partially
+    //     ported (struct kinds + immutable_field landed; the
+    //     `_arrayfld` / nested-struct interior layout the malloc
+    //     remover relies on is gated on the same `_parentable` /
+    //     `_parent_link` work `constfold.rs::fixup_solid` cites).
+    //
+    // The actual blocker is the 566 LOC of `malloc.py` itself, not a
+    // missing dep — the port is a self-contained ~3-4 day chunk that
+    // mostly mirrors line-by-line. It stays gated as a `TaskError`
+    // because the upstream default has `mallocs=True`, so silently
+    // returning `Ok(())` would mask a real configuration mismatch
+    // (regression catcher: `inline_malloc_phase_surfaces_mallocs_taskerror_when_enabled`).
+    //
+    // Convergence path: lift `malloc.py` ~`:9-566` into
+    // `backendopt/malloc.rs` as a new module; expose
+    // `remove_mallocs(translator, graphs)` and call it from here.
     if boolopt(config, "mallocs")? {
         return Err(TaskError {
-            message: "all.py:160 remove_mallocs (malloc.py) not yet ported".to_string(),
+            message: "all.py:160 remove_mallocs: needs malloc.py port \
+                      (566 LOC self-contained escape-analysis pass; \
+                      UnionFind / simplify / removenoops deps already \
+                      landed locally — body itself unported)"
+                .to_string(),
         });
     }
 

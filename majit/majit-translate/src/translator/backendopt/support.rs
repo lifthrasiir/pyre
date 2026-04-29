@@ -73,6 +73,41 @@ pub fn all_operations(graphs: &[GraphRef]) -> Vec<SpaceOperation> {
     out
 }
 
+/// `annotate(translator, func, result, args)` at `support.py:20-25`.
+///
+/// ```python
+/// def annotate(translator, func, result, args):
+///     args   = [arg.concretetype for arg in args]
+///     graph  = translator.rtyper.annotate_helper(func, args)
+///     fptr   = lltype.functionptr(lltype.FuncType(args, result.concretetype),
+///                                  func.__name__, graph=graph)
+///     c      = inputconst(lltype.typeOf(fptr), fptr)
+///     return c
+/// ```
+///
+/// **Deferred — needs `RPythonTyper.annotate_helper` (rtyper-side
+/// wrapper that lifts lltype args into SomeValues and delegates to
+/// the annotator) and `rmodel.inputconst` to land first.** The
+/// annotator-side `RPythonAnnotator::annotate_helper` is already
+/// ported (`annrpython.rs:610-639`), but it consumes
+/// `Vec<SomeValue>`, not the lltype-args shape upstream wraps. The
+/// signature is published here so future callers (`malloc.py` and
+/// `escape.py` when those land) can write the upstream-shaped call;
+/// the body returns a `TaskError` until the deps arrive.
+pub fn annotate(
+    _translator: &TranslationContext,
+    _func: &crate::flowspace::model::HostObject,
+    _result: &Hlvalue,
+    _args: &[Hlvalue],
+) -> Result<crate::flowspace::model::Constant, crate::translator::tool::taskengine::TaskError> {
+    Err(crate::translator::tool::taskengine::TaskError {
+        message: "support.py:20-25 annotate: requires \
+                  RPythonTyper.annotate_helper + rmodel.inputconst \
+                  (unported)"
+            .to_string(),
+    })
+}
+
 /// `var_needsgc(var)` at `support.py:27-29`.
 ///
 /// ```python
@@ -91,12 +126,48 @@ pub fn var_needsgc(var: &Variable) -> bool {
 }
 
 /// `find_calls_from(translator, graph, memo=None)` at
-/// `support.py:31-37`. Memoization elided — pyre's call sites that
-/// would consume the cache (`malloc.py`, `escape.py`) are unported,
-/// so the helper currently runs uncached. Convergence path: thread
-/// `Option<&mut HashMap<GraphKey, Vec<(BlockRef, GraphRef)>>>` once a
-/// caller pays the savings; the result vector is identical regardless.
+/// `support.py:31-37`.
+///
+/// ```python
+/// def find_calls_from(translator, graph, memo=None):
+///     if memo and graph in memo:
+///         return memo[graph]
+///     res = [i for i in _find_calls_from(translator, graph)]
+///     if memo is not None:
+///         memo[graph] = res
+///     return res
+/// ```
+///
+/// Pyre threads the memo as
+/// `Option<&mut HashMap<usize, Vec<(BlockRef, GraphRef)>>>` keyed on
+/// the graph identity (`Rc::as_ptr` cast through
+/// [`crate::flowspace::model::GraphKey`]). `None` runs uncached,
+/// matching upstream's default.
 pub fn find_calls_from(
+    translator: &TranslationContext,
+    graph: &FunctionGraph,
+    memo: Option<&mut HashMap<usize, Vec<(BlockRef, GraphRef)>>>,
+) -> Vec<(BlockRef, GraphRef)> {
+    // Upstream `:32-33`: cache lookup keyed on graph identity.
+    // Pyre's flowspace `FunctionGraph` is borrowed `&` here so the
+    // GraphKey is computed via the surrounding `Rc<RefCell>` —
+    // callers thread their own GraphKey into the memo when they
+    // already have one in hand.
+    let key = graph as *const _ as usize;
+    if let Some(memo) = memo.as_deref() {
+        if let Some(cached) = memo.get(&key) {
+            return cached.clone();
+        }
+    }
+    let res = _find_calls_from(translator, graph);
+    if let Some(memo) = memo {
+        memo.insert(key, res.clone());
+    }
+    res
+}
+
+/// `_find_calls_from(translator, graph)` at `support.py:39-50`.
+fn _find_calls_from(
     translator: &TranslationContext,
     graph: &FunctionGraph,
 ) -> Vec<(BlockRef, GraphRef)> {

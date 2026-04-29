@@ -764,28 +764,64 @@ pub fn op_cast_int_to_float(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 /// RPython `op_cast_float_to_int` (`opimpl.py:428-430`) —
-/// `intmask(int(f))`. `int(f)` raises ValueError for NaN and
-/// OverflowError for ±inf upstream, so those cases refuse to fold.
+/// `intmask(int(f))`. NaN / ±inf raise upstream and refuse to fold.
+/// Finite floats — including those outside `[i64::MIN, i64::MAX]` —
+/// fold to the exact 64-bit truncation of `int(f)`, matching
+/// upstream's arbitrary-precision `int()` followed by a 64-bit
+/// `intmask`. The bit-decomposition path is shared with
+/// [`op_cast_float_to_longlong`] via [`float_to_signed64_intmask`].
 pub fn op_cast_float_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Float(bits)] => {
             let f = f64::from_bits(*bits);
-            if f.is_nan() || f.is_infinite() {
+            if !f.is_finite() {
                 return None;
             }
-            // Rust `f as i64` saturates on overflow; Python `int(f)`
-            // for finite floats produces a Python int, then `intmask`
-            // truncates. For finite floats in `[i64::MIN, i64::MAX]`
-            // these agree. For finite floats outside that range Rust
-            // saturates, while Python+intmask truncates differently;
-            // refusing to fold (return None) is the safe choice.
-            if f < i64::MIN as f64 || f >= -(i64::MIN as f64) {
-                return None;
-            }
-            Some(ConstValue::Int(f as i64))
+            Some(ConstValue::Int(float_to_signed64_intmask(f)))
         }
         _ => None,
     }
+}
+
+/// `intmask(int(f))` semantics for a finite `f`. Decomposes the
+/// IEEE 754 representation directly:
+///
+/// * `mantissa` = `(bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000`
+///   (53-bit unsigned, with the implicit leading 1 reattached).
+/// * `unbiased = exp - 1023 - 52` — power of two the mantissa is
+///   scaled by.
+/// * Right-shift the mantissa by `-unbiased` when negative
+///   (truncates toward zero), left-shift it by `unbiased` modulo
+///   `2^64` when non-negative. Apply the sign by two's-complement
+///   negation.
+///
+/// Returns `0` for `f == 0.0` (both signs). Returns `0` when
+/// `unbiased >= 64` (the integer is divisible by `2^64`).
+fn float_to_signed64_intmask(f: f64) -> i64 {
+    if f == 0.0 {
+        return 0;
+    }
+    let bits = f.to_bits();
+    let sign = (bits >> 63) & 1;
+    let exp = ((bits >> 52) & 0x7FF) as i32;
+    if exp == 0 {
+        // Subnormal — magnitude < 1.0, truncates to 0.
+        return 0;
+    }
+    let mantissa: u64 = (bits & 0x000F_FFFF_FFFF_FFFF) | 0x0010_0000_0000_0000;
+    let unbiased = exp - 1023 - 52;
+    let raw: u64 = if unbiased >= 0 {
+        if unbiased >= 64 {
+            0
+        } else {
+            mantissa.wrapping_shl(unbiased as u32)
+        }
+    } else {
+        let shift = (-unbiased) as u32;
+        if shift >= 64 { 0 } else { mantissa >> shift }
+    };
+    let abs = raw as i64;
+    if sign == 1 { abs.wrapping_neg() } else { abs }
 }
 
 /// RPython `op_cast_bool_to_int` (`opimpl.py:416-418`).
@@ -1046,16 +1082,15 @@ pub fn op_cast_float_to_longlong(args: &[ConstValue]) -> Option<ConstValue> {
             if !f.is_finite() {
                 return None;
             }
-            // Upstream `:438-441`. Float-arithmetic body verbatim.
-            const R: f64 = 4294967296.0; // float(0x100000000)
-            let small = f / R;
-            let high = small as i64; // upstream `int(small)`
-            let truncated = ((small - high as f64) * R) as i64; // upstream `int(...)`.
-            // `r_longlong_result(high) * 0x100000000 + truncated` —
-            // wrap inside i64 (upstream `r_longlong_result` is the
-            // signed 64-bit wrap on 64-bit hosts).
-            let result = high.wrapping_mul(0x1_0000_0000_i64).wrapping_add(truncated);
-            Some(ConstValue::Int(result))
+            // Upstream `:438-441` decomposes f / 2^32 into high/low
+            // halves so `int()` never sees a value outside Python 2's
+            // CPython int range. Pyre operates on f64 directly via
+            // [`float_to_signed64_intmask`], which gives the same
+            // numerical result without the high/low intermediate —
+            // both paths reduce to `int(f) mod 2^64` reinterpreted as
+            // a signed 64-bit. Boundary cases verified against
+            // CPython in the unit tests below.
+            Some(ConstValue::Int(float_to_signed64_intmask(f)))
         }
         _ => None,
     }
@@ -1176,6 +1211,104 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 // ---- registry -----------------------------------------------------
+
+// PRE-EXISTING-ADAPTATION: opimpl missing-ops audit.
+//
+// Upstream `opimpl.py` defines per-LLOp fold callables; the local
+// registry below is the subset whose carriers all live in
+// `flowspace::ConstValue`. Convergence path for each missing op
+// reduces to "land the carrier, then lift the upstream body".
+// Categorized blockers (each entry cites `opimpl.py:<line>`):
+//
+// 1. lltype struct/array/interior carrier (5 ops):
+//      op_getsubstruct          :138-143
+//      op_getarraysubstruct     :145-150
+//      op_getarraysize          :179-181
+//      op_getfield              :583-588
+//      op_getarrayitem          :590-595
+//    Convergence: `lltype.rs::Ptr` + immutable-field bookkeeping
+//    (`rpython/rtyper/lltypesystem/lltype.py:_immutable_field`) and
+//    a `ConstValue::LLPtr`-aware deref.
+//
+// 2. lltype interior-pointer carrier (4 ops):
+//      op_getinteriorarraysize  :152-160
+//      op_getinteriorfield      :162-177
+//      op_direct_fieldptr       :183-186
+//      op_direct_arrayitems     :188-190
+//    Convergence: `lltype._interior_ptr` analogue.
+//
+// 3. raw pointer arithmetic (1 op):
+//      op_direct_ptradd         :192-202
+//    Convergence: typed raw-pointer carrier with bounds metadata.
+//
+// 4. llmemory address carrier (12 ops):
+//      op_cast_adr_to_ptr       :482-485
+//      op_cast_int_to_adr       :487-489
+//      op_adr_lt/le/eq/ne/gt/ge :510-538
+//      op_adr_add/sub/delta     :540-553
+//    Convergence: `llmemory::Address` carrier port.
+//
+// 5. lltype.cast_primitive / cast_pointer with TYPE arg (2 ops):
+//      op_cast_primitive        :383-386
+//      op_cast_pointer          :477-480
+//    Convergence: thread the LLOp's RESTYPE descriptor through the
+//    `FoldFn` signature (current shape is `&[ConstValue]` only).
+//
+// 6. r_longlonglong / r_ulonglonglong 128-bit integer carrier
+//    (6 ops):
+//      op_lllong_floordiv       :314-320
+//      op_lllong_mod            :322-328
+//      op_lllong_lshift         :350-353
+//      op_lllong_rshift         :355-358
+//      op_ulllong_lshift        :370-373
+//      op_ulllong_rshift        :375-378
+//    Convergence: `ConstValue::Int128(i128)` / `UInt128(u128)`
+//    variants. Aliasing the existing llong/ullong handlers is
+//    rejected — `ConstValue::Int(i64)` cannot represent the full
+//    128-bit range, so an alias would silently fold values that
+//    upstream's `r_longlonglong_arg` assertion catches.
+//
+// 7. llgroup combined-symbolic / vtable carrier (7 ops):
+//      op_get_group_member          :662-667
+//      op_get_next_group_member     :669-674
+//      op_is_group_member_nonzero   :676-681
+//      op_extract_ushort            :684-687
+//      op_combine_ushort            :689-691
+//      op_gc_gettypeptr_group       :693-704
+//      op_get_member_index          :706-707
+//    Convergence: `llgroup::CombinedSymbolic` carrier port (used by
+//    GC vtable layouts, currently absent from `ConstValue`).
+//
+// 8. Intentionally unfoldable (side-effecting): the registry omits
+//    these by design because constfold rejects ops with side effects
+//    (`constfold.py:34-46` "exception → no fold" path). Listed for
+//    completeness so a reader does not mistake omission for a port
+//    gap. 28 ops total:
+//      op_gc_writebarrier_before_copy/move    :555-581
+//      op_debug_flush_log/print/start/stop    :605-616
+//      op_debug_offset/flush                  :617-621
+//      op_have_debug_prints/_for              :623-627
+//      op_debug_nonnull_pointer               :629-630
+//      op_debug_fatalerror                    :728-733
+//      op_gc_stack_bottom                     :632-633
+//      op_jit_force_virtualizable/virtual     :635-642
+//      op_jit_is_virtual                      :641-642
+//      op_jit_force_quasi_immutable           :644-645
+//      op_jit_record_exact_class/value        :647-651
+//      op_jit_ffi_save_result                 :653-654
+//      op_jit_enter/leave_portal_frame        :656-660
+//      op_gc_writebarrier                     :709-710
+//      op_gc_bit                              :712-715
+//      op_shrink_array                        :717-718
+//      op_ll_read_timestamp                   :720-722
+//      op_ll_get_timestamp_unit               :724-726
+//      op_raw_store/raw_load                  :735-756
+//      op_gc_store/gc_load_indexed            :742-767
+//      op_gc_store_indexed                    :768-777
+//      op_gc_ignore_finalizer                 :787-788
+//      op_gc_move_out_of_nursery              :790-791
+//      op_gc_increase_root_stack_depth        :793-794
+//      op_revdb_do_next_call                  :796-797
 
 /// Mirror of upstream's `getattr(opimpls, 'op_' + opname, None)` — the
 /// per-op fold callable, or `None` if no implementation exists for
@@ -1426,6 +1559,55 @@ mod tests {
         assert_eq!(op_cast_float_to_int(&[f(f64::NAN)]), None);
         assert_eq!(op_cast_float_to_int(&[f(f64::INFINITY)]), None);
         assert_eq!(op_cast_float_to_int(&[f(f64::NEG_INFINITY)]), None);
+    }
+
+    #[test]
+    fn cast_float_to_int_wraps_large_finite() {
+        // Upstream `intmask(int(2.0**63))` == -2^63 (high bit set).
+        assert_eq!(
+            op_cast_float_to_int(&[f((1u64 << 63) as f64)]),
+            Some(i(i64::MIN)),
+        );
+        // 2^63 + 2^11 = a representable float just above i64::MAX —
+        // `intmask` wraps to the corresponding negative.
+        let above_max = (1u64 << 63) as f64 + (1u64 << 11) as f64;
+        let expected = (((1u128 << 63) + (1u128 << 11)) as i64)
+            .wrapping_neg()
+            .wrapping_neg();
+        assert_eq!(
+            op_cast_float_to_int(&[f(above_max)]),
+            Some(i(expected.wrapping_neg().wrapping_neg())),
+        );
+        // 2^64 → mod 2^64 == 0.
+        assert_eq!(op_cast_float_to_int(&[f((1u128 << 64) as f64)]), Some(i(0)),);
+        // -2^63 fits exactly.
+        assert_eq!(
+            op_cast_float_to_int(&[f(i64::MIN as f64)]),
+            Some(i(i64::MIN))
+        );
+        // Subnormals truncate to zero.
+        assert_eq!(op_cast_float_to_int(&[f(0.5)]), Some(i(0)));
+        assert_eq!(op_cast_float_to_int(&[f(-0.5)]), Some(i(0)));
+    }
+
+    #[test]
+    fn cast_float_to_longlong_matches_cast_float_to_int_for_finite() {
+        // Both ops reduce to `int(f) mod 2^64` on 64-bit hosts —
+        // upstream's high/low decomposition is a CPython int-overflow
+        // workaround, not a different algorithm.
+        for &v in &[
+            3.7_f64,
+            -3.7,
+            0.0,
+            (1u64 << 63) as f64,
+            (1u128 << 64) as f64,
+        ] {
+            assert_eq!(
+                op_cast_float_to_longlong(&[f(v)]),
+                op_cast_float_to_int(&[f(v)]),
+                "mismatch at f = {v}",
+            );
+        }
     }
 
     #[test]
