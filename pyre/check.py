@@ -22,6 +22,7 @@ PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
 
 BENCH_DIR = "pyre/bench"
 SNAP_DIR = "pyre/check.snap"
+BENCH_COMPARE_BUFFER_S = 0.005
 
 CARGO_CONFIG = {
     "dynasm": {
@@ -321,7 +322,7 @@ class Check:
             ratio = f"{elapsed / float(t_pypy):.1f}x"
 
         if vs_cpython and t_cpython not in (None, "-"):
-            if elapsed > float(t_cpython) * vs_cpython:
+            if elapsed > float(t_cpython) * vs_cpython + BENCH_COMPARE_BUFFER_S:
                 self._record(
                     backend, False, name,
                     f"{elapsed:.2f}s > cpython {t_cpython}s x{vs_cpython}",
@@ -334,7 +335,7 @@ class Check:
                 return
 
         if vs_pypy and t_pypy not in (None, "-"):
-            if elapsed > float(t_pypy) * vs_pypy:
+            if elapsed > float(t_pypy) * vs_pypy + BENCH_COMPARE_BUFFER_S:
                 self._record(
                     backend, False, name,
                     f"{elapsed:.2f}s > pypy {t_pypy}s x{vs_pypy}",

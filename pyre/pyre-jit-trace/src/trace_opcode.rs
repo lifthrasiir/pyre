@@ -965,7 +965,31 @@ impl MIFrame {
         if length_r != 0 {
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(snapshot_bank(&registers_r_bank, reg_idx as usize));
+                // `registers_r` is the unified abstract register file
+                // indexed by semantic slot (locals[..nlocals],
+                // stack[nlocals..nlocals+stack_only]) — not by liveness
+                // register color. The lazy-load preamble above (line 643)
+                // already routes colors through
+                // `semantic_ref_slot_for_reg_color`; the snapshot read
+                // must do the same to land in the slot the lazy load
+                // populated. Falling through to the raw color index
+                // returned an unrelated semantic slot (commonly a
+                // locals-side `OpRef::NONE` masquerading as a stack
+                // entry), poisoning the guard's fail_args.
+                let slot_idx = if is_portal_bridge {
+                    Some(reg_idx as usize)
+                } else {
+                    crate::state::semantic_ref_slot_for_reg_color(
+                        nlocals,
+                        valid_stack_only,
+                        &stack_slot_color_map,
+                        reg_idx as usize,
+                    )
+                };
+                let value = slot_idx
+                    .map(|idx| snapshot_bank(&registers_r_bank, idx))
+                    .unwrap_or(OpRef::NONE);
+                boxes.push(value);
             }
             cursor = it.offset;
         }
@@ -3217,7 +3241,7 @@ impl MIFrame {
     }
 
     pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
-        // pyjitpl.py:558-563 `_establish_nullity` cache hit:
+        // pyjitpl.py:3517-3520 `_establish_nullity` cache hit:
         //     if heapcache.is_nullity_known(box):
         //         self.metainterp.staticdata.profiler.count_ops(rop.GUARD_NONNULL, Counters.HEAPCACHED_OPS)
         //         return value
@@ -4417,6 +4441,10 @@ impl MIFrame {
                                 Type::Ref,
                                 expansion,
                             );
+                            // pyjitpl.py:2080-2081 direct_assembler_call:
+                            // record KEEPALIVE on callee virtualizable so
+                            // it survives until the result is consumed.
+                            ctx.record_op(OpCode::Keepalive, &[callee_frame]);
                             ctx.call_void(
                                 crate::callbacks::get().jit_drop_callee_frame,
                                 &[callee_frame],
@@ -4648,6 +4676,10 @@ impl MIFrame {
                                         expansion,
                                     )
                                 };
+                                // pyjitpl.py:2080-2081 direct_assembler_call:
+                                // record KEEPALIVE on callee virtualizable so
+                                // it survives until the result is consumed.
+                                ctx.record_op(OpCode::Keepalive, &[callee_frame]);
                                 ctx.call_void(
                                     crate::callbacks::get().jit_drop_callee_frame,
                                     &[callee_frame],
@@ -6743,8 +6775,16 @@ mod tests {
         let float_box = OpRef(30);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
-        sym.nlocals = 0;
-        sym.valuestackdepth = 0;
+        // `registers_r` is the unified abstract register file
+        // (locals[..nlocals] then stack[nlocals..nlocals+stack_only]); the
+        // snapshot read translates the Ref liveness color through
+        // `semantic_ref_slot_for_reg_color` to land at the same slot the
+        // lazy-load preamble populates. Set nlocals=2 so the encoded ref
+        // color 1 maps to semantic slot `locals[1]` via the in-range
+        // fallback. Int and Float banks stay kind-specific (no
+        // unification), so their bank-indexed setup is unchanged.
+        sym.nlocals = 2;
+        sym.valuestackdepth = 2;
         sym.registers_i = vec![OpRef::NONE, OpRef::NONE, int_box];
         sym.registers_r = vec![OpRef::NONE, ref_box];
         sym.registers_f = vec![OpRef::NONE, OpRef::NONE, OpRef::NONE, float_box];

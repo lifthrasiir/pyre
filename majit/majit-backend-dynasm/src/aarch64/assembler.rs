@@ -983,34 +983,57 @@ impl AssemblerARM64 {
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
             ; mov x29, x0
         );
-        if let Some(addrs) = crate::stack_check_addresses() {
-            let continue_label = self.mc.new_dynamic_label();
-            // Fast path: load end, subtract sp, compare with length.
-            self.emit_mov_imm64(30, addrs.end_adr as i64); // lr holds end addr
-            dynasm!(self.mc ; .arch aarch64
-                ; ldr x30, [x30]                  // x30 = *end_adr
-            );
-            self.emit_mov_imm64(16, addrs.length_adr as i64); // ip0 holds length addr
-            dynasm!(self.mc ; .arch aarch64
-                ; ldr x16, [x16]                  // x16 = *length_adr
-                ; mov x17, sp                     // x17 = sp (can't SUB sp directly)
-                ; sub x30, x30, x17               // x30 = ofs = end - sp
-                ; cmp x30, x16
-                ; b.ls =>continue_label           // fast path OK: ofs <= length
-                // Slow path: call pyre_stack_too_big_slowpath(sp).
-                ; mov x0, sp
-            );
-            self.emit_mov_imm64(17, addrs.slowpath_addr as i64);
-            dynasm!(self.mc ; .arch aarch64
-                ; blr x17
-                ; cbz w0, =>continue_label        // slowpath says OK
-                // Overflow fallthrough: return x29 as jf_ptr.
-                ; mov x0, x29
-                ; ldp x19, x20, [sp, #16]
-                ; ldp x29, x30, [sp], #32
-                ; ret
-                ; =>continue_label
-            );
+        let propagate_descr = self.propagate_exception_descr_ptr();
+        if propagate_descr != 0 {
+            if let Some(addrs) = crate::stack_check_addresses() {
+                let continue_label = self.mc.new_dynamic_label();
+                let exc_value_addr = crate::jit_exc_value_addr() as i64;
+                let exc_type_addr = crate::jit_exc_type_addr() as i64;
+                // Fast path: load end, subtract sp, compare with length.
+                self.emit_mov_imm64(30, addrs.end_adr as i64); // lr holds end addr
+                dynasm!(self.mc ; .arch aarch64
+                    ; ldr x30, [x30]                  // x30 = *end_adr
+                );
+                self.emit_mov_imm64(16, addrs.length_adr as i64); // ip0 holds length addr
+                dynasm!(self.mc ; .arch aarch64
+                    ; ldr x16, [x16]                  // x16 = *length_adr
+                    ; mov x17, sp                     // x17 = sp (can't SUB sp directly)
+                    ; sub x30, x30, x17               // x30 = ofs = end - sp
+                    ; cmp x30, x16
+                    ; b.ls =>continue_label           // fast path OK: ofs <= length
+                    // Slow path: call pyre_stack_too_big_slowpath(sp).
+                    ; mov x0, sp
+                );
+                self.emit_mov_imm64(17, addrs.slowpath_addr as i64);
+                dynasm!(self.mc ; .arch aarch64
+                    ; blr x17
+                    ; cbz w0, =>continue_label        // slowpath says OK
+                );
+                // aarch64/assembler.py `_build_stack_check_slowpath` jumps
+                // into the same propagate-exception path as x86: move
+                // pos_exc_value into jf_guard_exc, clear pos_exception, stamp
+                // propagate_exception_descr, then return the incoming jf_ptr.
+                self.emit_mov_imm64(16, exc_value_addr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; ldr x0, [x16]
+                    ; str xzr, [x16]
+                    ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
+                );
+                self.emit_mov_imm64(16, exc_type_addr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; str xzr, [x16]
+                );
+                self.emit_mov_imm64(0, propagate_descr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; str x0, [x29, JF_DESCR_OFS as u32]
+                    // Overflow fallthrough: return x29 as jf_ptr.
+                    ; mov x0, x29
+                    ; ldp x19, x20, [sp, #16]
+                    ; ldp x29, x30, [sp], #32
+                    ; ret
+                    ; =>continue_label
+                );
+            }
         }
         // When addresses are not registered (tests / early startup), no
         // stack check is emitted — aarch64/assembler.py:1094-1095 parity.
@@ -2726,8 +2749,7 @@ impl AssemblerARM64 {
                 }
             }
             OpCode::GuardNoException => {
-                self.emit_cmp_no_exception();
-                self.guard_success_cc = Some(CC_E);
+                self.emit_guard_no_exception_check();
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
@@ -3926,10 +3948,22 @@ impl AssemblerARM64 {
         self.append_guard_token(op, fail_index, fail_label);
     }
 
+    /// assembler.py:1794 generate_guard_no_exception:
+    /// `LDR loc, [loc]; CMP loc, #0` with success on zero.
+    fn emit_guard_no_exception_check(&mut self) {
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        self.emit_mov_imm64(16, exc_type_addr);
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x16, [x16]
+            ; cmp x16, xzr
+        );
+        self.guard_success_cc = Some(CC_E);
+    }
+
     /// assembler.py:1782 genop_guard_guard_no_exception.
-    /// Stub: no exception tracking yet.
     fn genop_guard_guard_no_exception(&mut self, op: &Op, fail_index: u32) {
-        self.implement_guard_nojump(op, fail_index);
+        self.emit_guard_no_exception_check();
+        self.implement_guard(op, fail_index);
     }
 
     /// assembler.py:1799 genop_guard_guard_not_invalidated.

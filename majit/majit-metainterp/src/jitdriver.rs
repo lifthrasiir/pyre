@@ -1001,21 +1001,20 @@ impl<S: JitState> JitDriver<S> {
                 // SwitchToBlackhole`.  When
                 // `JitState::populate_frame_for_guard` is overridden
                 // (state-field-JIT macro consumers), pair the guard with
-                // the bridge snapshot.  When the default no-op returns
-                // `None`, still emit the segment without a snapshot —
-                // the optimizer's `store_final_boxes_in_guard`
-                // (`optimizeopt/mod.rs:3200`) drops the resume data and
-                // emits a sentinel descr that triggers loop
-                // invalidation on guard fail, mirroring the
-                // SwitchToBlackhole bailout.
+                // the bridge snapshot.
                 //
-                // PRE-EXISTING-ADAPTATION: this branch is only reached
-                // on the segmented-loop force path of the low-level
-                // driver and dissolves once Task #89 lifts `S::Sym`
-                // into `MIFrame::populate_for_guard` so every consumer
-                // captures uniformly via the standard
-                // `MIFrame::get_list_of_active_boxes` walk
-                // (`pyjitpl.py:2586 capture_resumedata`).
+                // PRE-EXISTING-ADAPTATION: when the default no-op
+                // returns `None`, this low-level driver has no MIFrame
+                // to walk — it only knows the active jump boxes from
+                // `S::collect_jump_args`.  We feed those into
+                // `capture_snapshot_for_last_guard`, which records a
+                // single placeholder frame in lieu of the RPython
+                // `framestack` walk (`pyjitpl.py:2586
+                // capture_resumedata`).  Bounded scope: this branch is
+                // only reached on the segmented-loop force path of the
+                // low-level driver and dissolves once Task #89 lifts
+                // `S::Sym` into `MIFrame::populate_for_guard` so every
+                // path captures uniformly via the framestack walk.
                 let pre_snapshot = self
                     .sym
                     .as_ref()
@@ -1745,9 +1744,9 @@ impl<S: JitState> JitDriver<S> {
                 // `build_state_field_snapshot`'s `program_pc` argument);
                 // subsequent frames' `jitcode_index` holds
                 // `parent_descr_idx` (set by `BC_INLINE_CALL` at the
-                // sub-frame setup, `dispatch.rs ~1370`).  We thread the
-                // most-recently-resolved jitcode through `last_resolved`
-                // so `resolve_jitcode(parent_descr_idx, pc)` can walk
+                // sub-frame setup).  We thread the most-recently-resolved
+                // jitcode through `last_resolved` so
+                // `resolve_jitcode(parent_descr_idx, pc)` can walk
                 // `parent.descrs[idx].as_jitcode()` without re-invoking
                 // the factory.
                 let last_resolved: std::cell::RefCell<
@@ -3430,10 +3429,8 @@ impl<S: JitState> JitDriver<S> {
                 };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-                // resume.py:1339: resolve jitcode from (jitcode_pos, pc).
-                // Same multi-frame state-field-JIT wiring as the
-                // back_edge_internal path above — see that comment for
-                // the chain-walk rationale.
+                // resume.py:1339 multi-frame state-field-JIT chain
+                // reconstruction (mirrors the loop_jit guard-fail path).
                 let jitcode_factory_ref = self.jitcode_factory.as_ref();
                 let last_resolved: std::cell::RefCell<
                     Option<std::sync::Arc<majit_metainterp::JitCode>>,

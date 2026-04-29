@@ -1742,7 +1742,7 @@ impl ExportedState {
         // VirtualStateInfo::KnownClass, Virtual{known_class}, Constant(Ref)
         let dummy_key = OpRef(u32::MAX);
         for (i, entry) in self.virtual_state.state.iter().enumerate() {
-            match &**entry {
+            match &entry.info {
                 VirtualStateInfo::KnownClass { class_ptr } if !class_ptr.is_null() => {
                     let ss_idx = majit_gc::shadow_stack::push(*class_ptr);
                     self.rooted_refs.push((
@@ -1778,7 +1778,7 @@ impl ExportedState {
     /// Update GcRef values from shadow stack — GC may have moved objects.
     ///
     /// VirtualStateInfo top-level entries are stored as
-    /// `Rc<VirtualStateInfo>` (so two aliased jump args can share a single
+    /// `Rc<VirtualStateInfoNode>` (so two aliased jump args can share a single
     /// `Rc`); GcRef updates have to replace the entire `Rc` with a fresh
     /// one because the inner enum is immutable.
     ///
@@ -1795,7 +1795,7 @@ impl ExportedState {
     /// post-refresh tree preserves the pre-GC aliasing.
     pub fn refresh_from_gc(&mut self) {
         use crate::optimizeopt::info::PtrInfo;
-        use crate::optimizeopt::virtualstate::VirtualStateInfo;
+        use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
         use std::rc::Rc;
         // virtualstate.py:712 cache parity: snapshot original Rc identities
         // so we can re-share post-update slots that aliased pre-GC.
@@ -1830,9 +1830,11 @@ impl ExportedState {
                 }
                 ExportedGcRefField::VirtualStateKnownClass(i) => {
                     if let Some(slot) = self.virtual_state.state.get_mut(*i)
-                        && matches!(&**slot, VirtualStateInfo::KnownClass { .. })
+                        && matches!(&slot.info, VirtualStateInfo::KnownClass { .. })
                     {
-                        *slot = Rc::new(VirtualStateInfo::KnownClass { class_ptr: updated });
+                        *slot = VirtualStateInfoNode::new_rc(VirtualStateInfo::KnownClass {
+                            class_ptr: updated,
+                        });
                         virtual_state_dirty = true;
                     }
                 }
@@ -1844,9 +1846,9 @@ impl ExportedState {
                             fields,
                             field_descrs,
                             ..
-                        } = &**slot
+                        } = &slot.info
                         {
-                            *slot = Rc::new(VirtualStateInfo::Virtual {
+                            *slot = VirtualStateInfoNode::new_rc(VirtualStateInfo::Virtual {
                                 descr: descr.clone(),
                                 known_class: Some(updated),
                                 ob_type_descr: ob_type_descr.clone(),
@@ -1859,7 +1861,9 @@ impl ExportedState {
                 }
                 ExportedGcRefField::VirtualStateConstantRef(i) => {
                     if let Some(entry) = self.virtual_state.state.get_mut(*i) {
-                        *entry = Rc::new(VirtualStateInfo::Constant(Value::Ref(updated)));
+                        *entry = VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
+                            Value::Ref(updated),
+                        ));
                         virtual_state_dirty = true;
                     }
                 }
@@ -1869,7 +1873,7 @@ impl ExportedState {
             // Re-share slots that originally aliased: walk the snapshot
             // map and copy each group's first canonical Rc into every
             // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: std::collections::HashMap<usize, Rc<VirtualStateInfo>> =
+            let mut canonical_by_old: std::collections::HashMap<usize, Rc<VirtualStateInfoNode>> =
                 std::collections::HashMap::new();
             for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
                 let entry = canonical_by_old
@@ -2304,9 +2308,26 @@ impl OptUnroll {
                 })
             })
             .collect();
+        // RPython parity: store next_iteration_args in their post-forwarding
+        // form so the cache key invariant established by `export_single_value`
+        // (which uses `get_box_replacement` as the cache key, virtualstate.rs:2213)
+        // survives the phase boundary. `import_state` later runs in a fresh
+        // Phase 2 ctx that does NOT inherit Phase 1's forwarding map; if we
+        // stored raw `end_args[i]` here, two top-level entries that shared
+        // the same `VirtualStateInfoNode` Rc (because their post-resolution
+        // targets coincided in Phase 1) would `replace_op(source(i), raw_i)`
+        // to *different* raw OpRefs, and `make_inputargs` in Phase 2 would
+        // see divergent forwarding for the supposedly-shared state slot.
+        // RPython sidesteps this naturally because `box._forwarded` persists
+        // across phases. virtualstate.py make_inputargs assumes shared state
+        // ⇒ same forwarded target.
+        let resolved_next_iteration_args: Vec<OpRef> = end_args
+            .iter()
+            .map(|&a| ctx.get_box_replacement(a))
+            .collect();
         ExportedState::new(
             label_args.clone(),
-            end_args,
+            resolved_next_iteration_args,
             virtual_state,
             infos,
             exported_short_ops,
@@ -3852,14 +3873,14 @@ pub(crate) fn import_short_preamble_state(
 fn build_imported_virtuals_from_state(
     state: &ExportedState,
 ) -> Vec<crate::optimizeopt::optimizer::ImportedVirtual> {
-    use crate::optimizeopt::virtualstate::VirtualStateInfo;
+    use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
 
     /// virtualstate.py:158-165 AbstractVirtualStructStateInfo.generate_guards
     /// parity: walk `fielddescrs` in parent-local slot order, looking up
     /// the matching field state via descr.get_index() (= field_idx in pyre).
     fn ordered_fields(
         field_descrs: &[majit_ir::DescrRef],
-        fields: &[(u32, std::rc::Rc<VirtualStateInfo>)],
+        fields: &[(u32, std::rc::Rc<VirtualStateInfoNode>)],
     ) -> Vec<(majit_ir::DescrRef, VirtualStateInfo)> {
         field_descrs
             .iter()
@@ -3870,14 +3891,14 @@ fn build_imported_virtuals_from_state(
                 fields
                     .iter()
                     .find(|(idx, _)| *idx == field_idx)
-                    .map(|(_, field_value)| (field_descr.clone(), (**field_value).clone()))
+                    .map(|(_, field_value)| (field_descr.clone(), field_value.info.clone()))
             })
             .collect()
     }
 
     let mut result = Vec::new();
     for (idx, info) in state.virtual_state.state.iter().enumerate() {
-        match &**info {
+        match &info.info {
             VirtualStateInfo::Virtual {
                 descr,
                 known_class,

@@ -11421,6 +11421,35 @@ impl<M: Clone> MetaInterp<M> {
              warmspot.py:1010-1012 must populate it before any recursive-call \
              site can build a CALL_ASSEMBLER funcbox"
         );
+        // pyjitpl.py:1418-1420 — `_opimpl_recursive_call` runs
+        // `self.verify_green_args(targetjitdriver_sd, greenboxes)` right
+        // before its `return self.do_recursive_call(...)` call. pyre folds
+        // the upstream `_opimpl_recursive_call` and `do_recursive_call`
+        // into this single entry, so the verify lifts to here. The
+        // greens are the first `num_green_args` entries of `allboxes`
+        // (upstream `allboxes = greenboxes + redboxes`, line 1416 / 1422).
+        //
+        // Always-on `assert!` rather than `cfg!(debug_assertions)` —
+        // upstream `assert isinstance(varargs[i], Const)` is only
+        // stripped under RPython's `-O` translation, which is not the
+        // default for the bench harness or the production interpreter
+        // (compile.py:1101-1135 `compile_tmp_callback` ports the same
+        // contract unconditionally). `verify_green_args` panics on a
+        // non-Const greens slot — that would mean a caller gave us a
+        // Box where upstream demands a ConstPtr / ConstInt / ConstFloat.
+        let num_green_args = targetjitdriver_sd.num_green_args();
+        assert!(
+            allboxes.len() >= num_green_args,
+            "do_recursive_call: allboxes.len()={} < num_green_args={} \
+             (upstream pyjitpl.py:1416 builds allboxes = greenboxes + redboxes)",
+            allboxes.len(),
+            num_green_args,
+        );
+        let greens: Vec<OpRef> = allboxes[..num_green_args]
+            .iter()
+            .map(|(_, opref, _)| *opref)
+            .collect();
+        crate::pyjitpl::MIFrame::verify_green_args(targetjitdriver_sd, &greens);
         // pyjitpl.py:1428: k = targetjitdriver_sd.portal_runner_adr
         let k = targetjitdriver_sd.portal_runner_adr;
         // pyjitpl.py:1429: funcbox = ConstInt(adr2int(k))
@@ -14033,6 +14062,48 @@ mod metainterp_static_data_tests {
         // sentinel must trigger the S2.1 invariant assertion.
         let jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
         let _ = meta.do_recursive_call(&jd, &[], descr_ref, &descr_view, 0, 0, false);
+    }
+
+    /// pyjitpl.py:1418-1420 — verify_green_args fires before the
+    /// recursive-call funcbox is built. pyre folds upstream
+    /// `_opimpl_recursive_call` and `do_recursive_call` so the verify
+    /// runs at `do_recursive_call` entry. A non-Const greens slot
+    /// (Box leaking through) must trip the `is_constant()` panic from
+    /// `verify_green_args` (frame.rs:222-227).
+    #[test]
+    #[should_panic(expected = "is not a Const")]
+    fn do_recursive_call_panics_when_greens_contain_non_const() {
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let descr_view = StubCallDescr {
+            arg_types: vec![majit_ir::Type::Int],
+            result_type: majit_ir::Type::Int,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        let descr_ref = majit_ir::descr::make_call_descr(
+            vec![majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            majit_ir::EffectInfo::default(),
+        );
+        // `num_green_args() == 1` so allboxes[0] is the green slot.
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(
+            vec![("g0", majit_ir::Type::Int)],
+            vec![("r0", majit_ir::Type::Int)],
+        );
+        jd.is_recursive = true;
+        jd.portal_runner_adr = portal_runner_helper as *const () as i64;
+
+        // OpRef(0) is in the operation namespace (CONST_BIT clear) so
+        // is_constant() returns false — upstream demands ConstInt /
+        // ConstPtr / ConstFloat at this slot.
+        let allboxes = [
+            (JitArgKind::Int, OpRef(0), 0),
+            (JitArgKind::Int, OpRef::from_const(1), 0xfeed),
+        ];
+        let _ = meta.do_recursive_call(&jd, &allboxes, descr_ref, &descr_view, 0, 0, false);
     }
 
     #[test]

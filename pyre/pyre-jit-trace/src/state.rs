@@ -1790,13 +1790,10 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
 /// `list_length`, typed list `int_items.len`).
 pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrRef) -> OpRef {
     if let Some(cached) = ctx.heap_cache().arraylen(array) {
-        // pyjitpl.py:756-764 `opimpl_arraylen_gc` cache hit:
-        //     lengthbox = self.metainterp.heapcache.arraylen(arraybox)
-        //     if lengthbox is None:
-        //         ...
-        //     else:
+        // pyjitpl.py:889-893 `_opimpl_arraylen_gc` cache hit:
+        //     if length is not None:
         //         self.metainterp.staticdata.profiler.count_ops(rop.ARRAYLEN_GC, Counters.HEAPCACHED_OPS)
-        //     return lengthbox
+        //         return lengthbox
         ctx.profiler().count_ops(
             OpCode::ArraylenGc,
             majit_metainterp::counters::HEAPCACHED_OPS,
@@ -1818,7 +1815,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
-        // pyjitpl.py:929-947 `_opimpl_getfield_gc_any_pureornot` cache hit:
+        // pyjitpl.py:923-947 `_opimpl_getfield_gc_any_pureornot` cache hit:
         //   if upd.currfieldbox is not None:
         //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
         //       return upd.currfieldbox
@@ -3644,18 +3641,50 @@ fn emit_stroruni_oopspec_call(
     ctx.record_op_with_descr(majit_ir::OpCode::CallR, &call_args, calldescr.clone())
 }
 
+struct BridgeVirtualCache {
+    virtuals_ptr_cache: Vec<Option<OpRef>>,
+    virtuals_int_cache: Vec<Option<OpRef>>,
+}
+
+impl BridgeVirtualCache {
+    fn new(size: usize) -> Self {
+        Self {
+            virtuals_ptr_cache: vec![None; size],
+            virtuals_int_cache: vec![None; size],
+        }
+    }
+
+    fn get_any(&self, i: usize) -> Option<OpRef> {
+        self.virtuals_ptr_cache
+            .get(i)
+            .copied()
+            .flatten()
+            .or_else(|| self.virtuals_int_cache.get(i).copied().flatten())
+    }
+
+    fn set_ptr(&mut self, i: usize, v: OpRef) {
+        self.virtuals_ptr_cache[i] = Some(v);
+    }
+
+    fn set_int(&mut self, i: usize, v: OpRef) {
+        self.virtuals_int_cache[i] = Some(v);
+    }
+}
+
 fn materialize_bridge_virtual(
     ctx: &mut majit_metainterp::TraceCtx,
     vidx: usize,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &majit_metainterp::ResumeDataResult,
-    cache: &mut std::collections::HashMap<usize, OpRef>,
+    cache: &mut BridgeVirtualCache,
 ) -> OpRef {
     use majit_ir::OpCode;
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
 
-    // resume.py:951 virtuals_cache.get_ptr(index): hit → return cached.
-    if let Some(&cached) = cache.get(&vidx) {
+    // resume.py:874-899 VirtualCache: list caches indexed by virtual number
+    // (ptr and int banks). This bridge helper is still OpRef-typed, so it
+    // probes both banks before allocating.
+    if let Some(cached) = cache.get_any(vidx) {
         return cached;
     }
 
@@ -3678,7 +3707,7 @@ fn materialize_bridge_virtual(
         tagged: i16,
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         resume_data: &majit_metainterp::ResumeDataResult,
-        cache: &mut std::collections::HashMap<usize, OpRef>,
+        cache: &mut BridgeVirtualCache,
     ) -> OpRef {
         if tagged == majit_ir::resumedata::UNINITIALIZED_TAG {
             return OpRef::NONE;
@@ -3755,7 +3784,7 @@ fn materialize_bridge_virtual(
         parent_descr: majit_ir::DescrRef,
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         resume_data: &majit_metainterp::ResumeDataResult,
-        cache: &mut std::collections::HashMap<usize, OpRef>,
+        cache: &mut BridgeVirtualCache,
     ) {
         for (fd_info, &fnum) in fielddescrs.iter().zip(fieldnums.iter()) {
             if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -3800,7 +3829,7 @@ fn materialize_bridge_virtual(
             let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:620 decoder.virtuals_cache.set_ptr(index, struct)
-            cache.insert(vidx, new_op);
+            cache.set_ptr(vidx, new_op);
             // resume.py:621 self.setfields(decoder, struct)
             setfields(
                 ctx,
@@ -3834,7 +3863,7 @@ fn materialize_bridge_virtual(
             let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:636 decoder.virtuals_cache.set_ptr(index, struct)
-            cache.insert(vidx, new_op);
+            cache.set_ptr(vidx, new_op);
             // resume.py:637 self.setfields(decoder, struct)
             setfields(
                 ctx,
@@ -3894,7 +3923,7 @@ fn materialize_bridge_virtual(
             let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
-            cache.insert(vidx, new_op);
+            cache.set_ptr(vidx, new_op);
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop
             let set_opcode = match kind {
@@ -3946,7 +3975,7 @@ fn materialize_bridge_virtual(
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:751: decoder.virtuals_cache.set_ptr(index, array)
-            cache.insert(vidx, new_op);
+            cache.set_ptr(vidx, new_op);
             // resume.py:752-759:
             //   p = 0
             //   for i in range(self.size):
@@ -4004,7 +4033,7 @@ fn materialize_bridge_virtual(
             let calldescr = crate::descr::make_raw_malloc_calldescr();
             let buffer = ctx.record_op_with_descr(OpCode::CallI, &[func_ref, size_ref], calldescr);
             // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
-            cache.insert(vidx, buffer);
+            cache.set_int(vidx, buffer);
             // resume.py:705-708: setrawbuffer_item for each offset/descr
             for (i, (&off, &fnum)) in offsets.iter().zip(fieldnums.iter()).enumerate() {
                 if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -4053,7 +4082,7 @@ fn materialize_bridge_virtual(
             let offset_ref = ctx.const_int(*offset as i64);
             let buffer = ctx.record_op(OpCode::IntAdd, &[base_buffer, offset_ref]);
             // resume.py:727: decoder.virtuals_cache.set_int(index, buffer)
-            cache.insert(vidx, buffer);
+            cache.set_int(vidx, buffer);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} VRawSliceInfo(offset={}) → OpRef({})",
@@ -4091,7 +4120,7 @@ fn materialize_bridge_virtual(
             // resume.py:769: string = decoder.allocate_string(length)
             let string = ctx.record_op(alloc_opcode, &[length_ref]);
             // resume.py:770: decoder.virtuals_cache.set_ptr(index, string)
-            cache.insert(vidx, string);
+            cache.set_ptr(vidx, string);
             // resume.py:771-774: string_setitem for each filled char.
             for (i, &charnum) in fieldnums.iter().enumerate() {
                 if charnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -4151,7 +4180,7 @@ fn materialize_bridge_virtual(
                 majit_ir::effectinfo::OopSpecIndex::StrConcat
             };
             let string = emit_stroruni_oopspec_call(ctx, oopspec, &[left, right]);
-            cache.insert(vidx, string);
+            cache.set_ptr(vidx, string);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} V{}ConcatInfo → OpRef({})",
@@ -4202,7 +4231,7 @@ fn materialize_bridge_virtual(
                 majit_ir::effectinfo::OopSpecIndex::StrSlice
             };
             let string = emit_stroruni_oopspec_call(ctx, oopspec, &[largerstr, start, stop]);
-            cache.insert(vidx, string);
+            cache.set_ptr(vidx, string);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} V{}SliceInfo → OpRef({})",
@@ -4426,10 +4455,10 @@ impl JitState for PyreJitState {
             }
         };
 
-        // resume.py:874-899 VirtualCache parity: per-bridge cache so shared
-        // / recursive virtuals materialize exactly once.
-        let mut virtuals_cache: std::collections::HashMap<usize, OpRef> =
-            std::collections::HashMap::new();
+        // resume.py:874-899 VirtualCache parity: per-bridge list caches
+        // indexed by virtual number, so shared / recursive virtuals
+        // materialize exactly once.
+        let mut virtuals_cache = BridgeVirtualCache::new(rd_virtuals.map_or(0, |v| v.len()));
 
         // resume.py:1245 decode_box parity. Each tagged variant resolves
         // to a live box whose `.type` is the kind the encoder dispatched:
@@ -4445,7 +4474,7 @@ impl JitState for PyreJitState {
         // `OpRef::from_const(cursor)` without registration leaves a
         // dangling index that the optimizer later re-types arbitrarily.
         let resolve = |ctx: &mut majit_metainterp::TraceCtx,
-                       cache: &mut std::collections::HashMap<usize, OpRef>,
+                       cache: &mut BridgeVirtualCache,
                        v: &RebuiltValue|
          -> OpRef {
             match v {

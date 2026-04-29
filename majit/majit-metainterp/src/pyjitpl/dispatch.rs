@@ -423,15 +423,14 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// Outer interpreter program pc captured at `run_to_end` entry.
     ///
     /// `frame.pc` starts as the program pc but may be overwritten by
-    /// `BC_INLINE_CALL` (`frame.pc = frame.code_cursor`, this file
-    /// line ~1305) or `record_state_guard`'s temporary `frame.pc =
-    /// resume_pc` swap. State-field-JIT's `record_state_guard`
-    /// snapshots reference this stable copy as the
-    /// `SnapshotFrame.jitcode_index`, which the resume-side
-    /// `register_jitcode_factory` callback consumes to rebuild the
-    /// per-opcode JitCode.  RPython carries the equivalent value as
-    /// `MIFrame.jitcode.index` (its portal jitcode is monolithic, so
-    /// the index alone identifies the body); per-opcode majit needs
+    /// `BC_INLINE_CALL` (`frame.pc = frame.code_cursor`) or
+    /// `record_state_guard`'s temporary `frame.pc = resume_pc` swap.
+    /// State-field-JIT's `record_state_guard` snapshots reference this
+    /// stable copy as the `SnapshotFrame.jitcode_index`, which the
+    /// resume-side `register_jitcode_factory` callback consumes to
+    /// rebuild the per-opcode JitCode.  RPython carries the equivalent
+    /// value as `MIFrame.jitcode.index` (its portal jitcode is monolithic,
+    /// so the index alone identifies the body); per-opcode majit needs
     /// the program pc instead because the factory builds the body
     /// on-demand.
     portal_pc: usize,
@@ -611,43 +610,23 @@ where
             // `jit_tag_val(value)` between BC_CALL_PURE_INT and the
             // residual stack_push).
             //
-            // KNOWN GAP vs PyPy `pyjitpl.py:2591-2602 capture_resumedata`:
-            // PyPy swaps only the top frame's `pc` and walks the whole
-            // framestack with each frame's own register bank. The
-            // state-field-JIT SYM scalars conceptually belong to the
-            // *root* (portal) frame; populating `frames.current_mut()`
-            // here writes them into the active sub-frame instead and
-            // leaves the root frame stale. Targeting `frames.frames[0]`
-            // is the structurally correct fix but empirically regresses
-            // benchmarks today (fannkuch / nbody timeout) — the
-            // outer-Rust → metainterp SYM transfer only updates the
-            // root register bank at portal-entry, so a guard fired
-            // mid-inline-call can see a root frame whose register
-            // values lag behind the live SYM. Closing this requires a
-            // populate-on-inline-call hook (or hoisting SYM tracking
-            // to the snapshot side); both are larger structural moves.
+            // RPython `pyjitpl.py:2586 capture_resumedata` only swaps
+            // `frame.pc` and walks the framestack; register banks are
+            // never overwritten because RPython's MIFrame stores live
+            // boxes directly. pyre's state-field-JIT SYM materializes
+            // those scalars on demand via `populate_frame_int_regs`,
+            // hence the explicit save/restore pair below.
             let n = total_slots.min(frame.int_regs.len());
             let saved_int_regs: Vec<Option<OpRef>> = frame.int_regs[..n].to_vec();
             let saved_int_values: Vec<Option<i64>> = frame.int_values[..n].to_vec();
             sym.populate_frame_int_regs(frame);
             // `self.portal_pc` is the trace_jitcode-entry program pc (set
-            // by `run_to_end`); we cannot use `saved_pc` here because
-            // `BC_INLINE_CALL` may have already overwritten `frame.pc` to
-            // `frame.code_cursor` (jitcode-internal byte position) earlier
-            // in this trace, making `saved_pc` carry the wrong scope.
-            //
-            // Factory-key convention: the macro-emitted `__trace_*`
-            // (codegen_trace.rs:63) calls
-            // `factory(program, pc + 1, op)` — pc + 1 is the canonical
-            // jitcode lookup key (`__jit_pc`).  The snapshot must store
-            // the same key so blackhole resume's `resolve_jitcode`
-            // (jitdriver.rs root-frame branch) can call
-            // `factory(env, jitcode_index, 0)` and rebuild the same
-            // JitCode that was used during tracing.  Storing the raw
-            // `portal_pc` would cause the factory to derive
-            // `op = program.get_op(jitcode_index - 1)` from the
-            // *previous* opcode index and emit a JitCode for the wrong
-            // arm (`missing liveness[N] in JitCode (code_len=...)`).
+            // by `run_to_end` at portal entry). We pack `portal_pc + 1`
+            // into the snapshot's root `jitcode_index` so the resume-side
+            // factory rebuilds the *next* per-opcode JitCode on bridge
+            // exit; passing raw `portal_pc` would cause the factory to
+            // derive `pc - 1` for the trace's *current* op, which the
+            // bridge has already executed.
             let program_pc = self.portal_pc + 1;
             let snapshot = build_state_field_snapshot(self.frames, total_slots, program_pc as u32);
             let frame = self.frames.current_mut();
@@ -1879,7 +1858,6 @@ where
                     };
                     // pyjitpl.py:1941-1948: CALL_PURE records plain CALL
                     // first, executes, then patches via record_result_of_call_pure.
-                    //
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     // Wrapped helpers skip record (see BC_RESIDUAL_CALL_VOID);
                     // CALL_PURE is exempt because pure re-execution is harmless
@@ -1904,7 +1882,11 @@ where
                                 plain_op,
                                 &call_args,
                                 &concrete_values,
-                                crate::call_descr::make_call_descr(&arg_types, majit_ir::Type::Int),
+                                crate::call_descr::make_call_descr_for_opcode(
+                                    majit_ir::OpCode::CallPureI,
+                                    &arg_types,
+                                    majit_ir::Type::Int,
+                                ),
                                 patch_pos,
                                 majit_ir::OpCode::CallI,
                                 majit_ir::Value::Int(concrete),
@@ -2013,7 +1995,11 @@ where
                                 plain_op,
                                 &call_args,
                                 &concrete_values,
-                                crate::call_descr::make_call_descr(&arg_types, majit_ir::Type::Ref),
+                                crate::call_descr::make_call_descr_for_opcode(
+                                    majit_ir::OpCode::CallPureR,
+                                    &arg_types,
+                                    majit_ir::Type::Ref,
+                                ),
                                 patch_pos,
                                 majit_ir::OpCode::CallR,
                                 majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
@@ -2124,7 +2110,8 @@ where
                                 plain_op,
                                 &call_args,
                                 &concrete_values,
-                                crate::call_descr::make_call_descr(
+                                crate::call_descr::make_call_descr_for_opcode(
+                                    majit_ir::OpCode::CallPureF,
                                     &arg_types,
                                     majit_ir::Type::Float,
                                 ),
@@ -2965,8 +2952,8 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
     }
 }
 
-/// Build a single-frame `recorder::Snapshot` over
-/// `frame.int_regs[0..num_slots]` for a state-field-JIT guard.
+/// Build a multi-frame `recorder::Snapshot` over the framestack for a
+/// state-field-JIT guard.
 ///
 /// PRE-EXISTING-ADAPTATION (state-field JIT divergence — Task #89
 /// framestack-lift Session 3b-3a):  RPython captures snapshots by
@@ -2977,9 +2964,6 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// (Session 3a-prep) copy `__JitSym` slots into
 /// `frame.int_regs` / `int_values` at the canonical liveness indices
 /// declared by `live_slots_for_state_field_jit` (Task #89 orth-6).
-/// This helper is the matching consumer side: it takes the populated
-/// frame and produces a `recorder::Snapshot` ready for
-/// `TraceCtx::capture_resumedata` + `set_last_guard_resume_position`.
 ///
 /// Each `frame.int_regs[i]` is encoded as
 /// `SnapshotTagged::Box(opref.0, Type::Int)`; `OpRef.0` already
@@ -2990,15 +2974,6 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// TAGCONST split).  `None` slots map to `OpRef::NONE.0` — same fallback
 /// `history.rs:425` emits for unmapped post-cut Boxes.
 ///
-/// `pc` and `jitcode_index` are read from the frame as-is; the caller is
-/// responsible for ensuring `frame.pc` points just past the
-/// `live/<offset>` op so the snapshot consumer can re-derive liveness if
-/// needed.
-///
-/// Convergence path: when state-field JIT migrates to RPython
-/// MIFrame-regs storage (Task #89 orth-9 step 4 reshape), the
-/// `populate_frame_int_regs` override drops out and this helper is
-/// replaced by the standard `MIFrame::get_list_of_active_boxes` walk.
 /// `program_pc` carries the outer interpreter pc (= what the
 /// state-field-JIT factory needs to rebuild the root per-opcode
 /// JitCode on blackhole resume). The top frame's `pc` here holds the
@@ -3006,7 +2981,7 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// it to the guard's orgpc just before this call), matching RPython's
 /// `pyjitpl.py:2596 frame.pc = resumepc` swap; intermediate frames
 /// keep their natural `pc` (= return-to byte position in their
-/// jitcode, set by `BC_INLINE_CALL` at `dispatch.rs ~1346 frame.pc =
+/// jitcode, set by `BC_INLINE_CALL` at `dispatch.rs frame.pc =
 /// frame.code_cursor`).
 ///
 /// Multi-frame walk parallels RPython

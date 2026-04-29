@@ -109,7 +109,7 @@ pub struct MIFrame {
     /// For frames pushed by `BC_INLINE_CALL` this holds the index into
     /// the *parent* frame's `jitcode.descrs` array that the dispatcher
     /// resolved into the sub-jitcode for this frame
-    /// (`pyjitpl/dispatch.rs` line ~1317 `descrs.get(sub_idx)`). Root
+    /// (`pyjitpl/dispatch.rs` BC_INLINE_CALL `descrs.get(sub_idx)`). Root
     /// frames (`trace_jitcode` portal entry) carry `u32::MAX`. The
     /// snapshot-side `build_state_field_snapshot` packs this into
     /// `SnapshotFrame.jitcode_index` for non-root frames, and the

@@ -1166,13 +1166,14 @@ mod tests {
     fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
         // Task #85 lock-in: the unwired-opname set surfaced by
         // `build_default_bh_builder_with_unwired_report` is the
-        // documented kind-mismatch fallout — six opnames whose
+        // documented kind-mismatch fallout — five opnames whose
         // operand kinds disagree with their `bhimpl_*` handler
         // (assembler emits `(ref, int)` `int_ge` for some graphs;
-        // similarly for `int_xor/ri>i`, `int_mul/ir>i`,
-        // `int_ne/fr>i`, `setarrayitem_gc_i/rrid`,
-        // `setarrayitem_gc_f/rrfd`). Pinning the exact set as a
-        // snapshot:
+        // similarly for `int_mul/ir>i`, `int_ne/fr>i`,
+        // `setarrayitem_gc_i/rrid`, `setarrayitem_gc_f/rrfd`).
+        // `int_xor/ri>i` previously appeared on this list but is no
+        // longer registered in the insns table, so it falls out of
+        // the unwired report. Pinning the exact set as a snapshot:
         //   * Catches regressions that ADD a new unwired opname (a
         //     fresh kind-mismatch shape upstream).
         //   * Catches regressions that REMOVE a wired opname (handler

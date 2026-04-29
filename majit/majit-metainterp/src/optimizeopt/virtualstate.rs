@@ -16,10 +16,12 @@
 /// **Sharing**: VirtualStateInfo is wrapped in `Rc<...>` so the export tree
 /// becomes a DAG mirroring RPython's reference-shared
 /// AbstractVirtualStateInfo objects. When two parents reference the same
-/// underlying box, they share the same `Rc<VirtualStateInfo>` and the
+/// underlying box, they share the same `Rc<VirtualStateInfoNode>` and the
 /// position-numbered enum_forced_boxes dedup (virtualstate.py:196, 274,
 /// 352) prevents revisiting it.
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::rc::Rc;
 
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
@@ -161,6 +163,12 @@ impl<'a> GenerateGuardState<'a> {
 ///
 /// Mirrors the hierarchy in RPython's `AbstractVirtualStateInfo` and its subclasses:
 /// `VirtualStateInfoConst`, `VirtualStateInfoVirtual`, `VirtualStateInfoNotVirtual`, etc.
+///
+/// In RPython every subclass is a Python class instance carrying mutable
+/// `position` (and `position_in_notvirtuals` for NotVirtual leaves). Pyre
+/// stores those per-instance attrs on [`VirtualStateInfoNode`] (the wrapper
+/// around `Rc<VirtualStateInfoNode>` in shared trees) so each unique node has
+/// its own slot, matching RPython's class-attr identity.
 #[derive(Clone, Debug)]
 pub enum VirtualStateInfo {
     /// Value is a known constant.
@@ -178,7 +186,7 @@ pub enum VirtualStateInfo {
         /// ob_type field descriptor for force path (pyre offset 0).
         ob_type_descr: Option<DescrRef>,
         /// Field values as VirtualStateInfo (recursive). Excludes typeptr.
-        fields: Vec<(u32, Rc<VirtualStateInfo>)>,
+        fields: Vec<(u32, Rc<VirtualStateInfoNode>)>,
         /// Original field descriptors in parent-local slot order.
         /// virtualstate.py:159 AbstractVirtualStructStateInfo.fielddescrs
         /// is a flat list and box access uses `fielddescrs[i].get_index()`.
@@ -187,7 +195,7 @@ pub enum VirtualStateInfo {
     /// virtualstate.py: VArrayStateInfo — virtual array with known elements.
     VArray {
         descr: DescrRef,
-        items: Vec<Rc<VirtualStateInfo>>,
+        items: Vec<Rc<VirtualStateInfoNode>>,
         /// virtualstate.py: lenbound — known bounds on array length.
         /// None means unbounded.
         lenbound: Option<IntBound>,
@@ -195,7 +203,7 @@ pub enum VirtualStateInfo {
     /// virtualstate.py: VStructStateInfo — virtual struct.
     VStruct {
         descr: DescrRef,
-        fields: Vec<(u32, Rc<VirtualStateInfo>)>,
+        fields: Vec<(u32, Rc<VirtualStateInfoNode>)>,
         /// virtualstate.py:159 AbstractVirtualStructStateInfo.fielddescrs
         /// stored as a flat parent-local list.
         field_descrs: Vec<DescrRef>,
@@ -205,7 +213,7 @@ pub enum VirtualStateInfo {
         descr: DescrRef,
         /// virtualstate.py:289: self.fielddescrs — InteriorFieldDescr per field slot.
         fielddescrs: Vec<DescrRef>,
-        element_fields: Vec<Vec<(u32, Rc<VirtualStateInfo>)>>,
+        element_fields: Vec<Vec<(u32, Rc<VirtualStateInfoNode>)>>,
     },
     /// Value is a virtual raw buffer (info.py:389 RawBufferPtrInfo).
     VirtualRawBuffer {
@@ -213,7 +221,7 @@ pub enum VirtualStateInfo {
         func: i64,
         size: usize,
         /// rawbuffer.py:14-16: offsets, lengths, per-entry child state.
-        entries: Vec<(usize, usize, Rc<VirtualStateInfo>)>,
+        entries: Vec<(usize, usize, Rc<VirtualStateInfoNode>)>,
         /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
         descrs: Vec<DescrRef>,
     },
@@ -247,6 +255,138 @@ pub enum VirtualStateInfo {
     /// `NotVirtualStateInfoInt(cpu, 'i', info)` vs
     /// `NotVirtualStateInfoPtr(cpu, 'r', info)` constructor discriminant.
     Unknown(Type),
+}
+
+/// Per-instance wrapper around [`VirtualStateInfo`] carrying RPython's
+/// `AbstractVirtualStateInfo.position` (virtualstate.py:70) and
+/// `NotVirtualStateInfo.position_in_notvirtuals` (virtualstate.py:430-431)
+/// class attributes.
+///
+/// In RPython each subclass instance holds these directly; pyre's flat
+/// `Rc<VirtualStateInfo>` enum value cannot host per-instance mutability,
+/// so the position cells live on this wrapper. Sharing semantics match
+/// RPython exactly: when two parents reference the same logical box, the
+/// same `Rc<VirtualStateInfoNode>` is shared, both parents see the same
+/// position values, and the `state.position > self.position` dedup works
+/// without an external side map.
+///
+/// [`Deref`] forwards to the inner enum so existing pattern-matching
+/// against `VirtualStateInfo` variants stays valid.
+#[derive(Debug)]
+pub struct VirtualStateInfoNode {
+    pub info: VirtualStateInfo,
+    /// virtualstate.py:70 `AbstractVirtualStateInfo.position`. Default -1.
+    /// Set by [`VirtualState::enum_top_level`] during construction.
+    pub position: Cell<i32>,
+    /// virtualstate.py:430-431 `NotVirtualStateInfo.position_in_notvirtuals`.
+    /// Only meaningful for the NotVirtual leaf variants
+    /// (`Constant`/`KnownClass`/`NonNull`/`IntBounded`/`Unknown`); other
+    /// variants leave this at -1.
+    pub position_in_notvirtuals: Cell<i32>,
+}
+
+impl VirtualStateInfoNode {
+    pub fn new(info: VirtualStateInfo) -> Self {
+        VirtualStateInfoNode {
+            info,
+            position: Cell::new(-1),
+            position_in_notvirtuals: Cell::new(-1),
+        }
+    }
+
+    pub fn new_rc(info: VirtualStateInfo) -> Rc<Self> {
+        Rc::new(Self::new(info))
+    }
+
+    /// virtualstate.py:111-116 `AbstractVirtualStateInfo.enum`.
+    /// ```python
+    /// def enum(self, virtual_state):
+    ///     if self.position != -1:
+    ///         return
+    ///     virtual_state.info_counter += 1
+    ///     self.position = virtual_state.info_counter
+    ///     self._enum(virtual_state)
+    /// ```
+    pub fn enum_into(&self, state: &mut VirtualState) {
+        if self.position.get() != -1 {
+            return;
+        }
+        state.info_counter += 1;
+        self.position.set(state.info_counter);
+        self._enum(state);
+    }
+
+    /// virtualstate.py: `_enum` per subclass. Dispatches over the inner
+    /// enum, mirroring RPython's class-level method dispatch:
+    /// - virtualstate.py:200-203 AbstractVirtualStructStateInfo._enum
+    /// - virtualstate.py:277-280 VArrayStateInfo._enum
+    /// - virtualstate.py:328-331 VArrayStructStateInfo._enum
+    /// - virtualstate.py:427-431 NotVirtualStateInfo._enum
+    fn _enum(&self, state: &mut VirtualState) {
+        match &self.info {
+            VirtualStateInfo::Constant(_) => {
+                // virtualstate.py:427-429: LEVEL_CONSTANT short-circuit.
+            }
+            VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
+                for (_, child) in fields {
+                    child.enum_into(state);
+                }
+            }
+            VirtualStateInfo::VArray { items, .. } => {
+                for child in items {
+                    child.enum_into(state);
+                }
+            }
+            VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+                for fields in element_fields {
+                    for (_, child) in fields {
+                        child.enum_into(state);
+                    }
+                }
+            }
+            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+                for (_, _, child) in entries {
+                    child.enum_into(state);
+                }
+            }
+            VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown(_) => {
+                // virtualstate.py:427-431 NotVirtualStateInfo._enum:
+                //     if self.level == LEVEL_CONSTANT: return
+                //     self.position_in_notvirtuals = virtual_state.numnotvirtuals
+                //     virtual_state.numnotvirtuals += 1
+                //
+                // The Constant case is dispatched above; reaching here
+                // means self is a non-constant NotVirtual leaf.
+                self.position_in_notvirtuals
+                    .set(state.numnotvirtuals as i32);
+                state.numnotvirtuals += 1;
+            }
+        }
+    }
+}
+
+impl Deref for VirtualStateInfoNode {
+    type Target = VirtualStateInfo;
+    fn deref(&self) -> &VirtualStateInfo {
+        &self.info
+    }
+}
+
+impl Clone for VirtualStateInfoNode {
+    /// Cloning resets position/position_in_notvirtuals to -1 because the
+    /// cloned node is a fresh instance — RPython's `__init__` does not
+    /// inherit position from a source instance, and `enum` re-assigns
+    /// positions when called on the new VirtualState.
+    fn clone(&self) -> Self {
+        VirtualStateInfoNode {
+            info: self.info.clone(),
+            position: Cell::new(-1),
+            position_in_notvirtuals: Cell::new(-1),
+        }
+    }
 }
 
 impl VirtualStateInfo {
@@ -521,18 +661,18 @@ impl VirtualStateInfo {
 /// `Jump`/`Label` args). During loop peeling, this is exported at the end
 /// of the preamble and imported at the loop header.
 ///
-/// Top-level entries are stored as `Rc<VirtualStateInfo>` so that aliased
-/// loop-carried variables (two jump args resolving to the same box) share
-/// a single state object — matching RPython's
+/// Top-level entries are stored as `Rc<VirtualStateInfoNode>` so that
+/// aliased loop-carried variables (two jump args resolving to the same
+/// box) share a single state object — matching RPython's
 /// `VirtualStateConstructor.create_state` cache where the same box always
 /// returns the same `AbstractVirtualStateInfo` instance. The dedup walkers
 /// (`build_sequential_slot_schedule`, `enum_forced_boxes_for_entry`, etc.)
 /// use `Rc::as_ptr` identity to short-circuit revisits, mirroring
 /// `state.position > self.position`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct VirtualState {
     /// Abstract info for each loop-carried variable, in order matching Label/Jump args.
-    pub state: Vec<Rc<VirtualStateInfo>>,
+    pub state: Vec<Rc<VirtualStateInfoNode>>,
     /// virtualstate.py: renum — maps virtual OpRef to numbering index.
     /// Used to ensure consistent virtual identity across loop iterations.
     pub renum: std::collections::HashMap<OpRef, usize>,
@@ -540,45 +680,138 @@ pub struct VirtualState {
     /// traversal schedule. Each non-virtual leaf occurrence in `state`
     /// records the slot it should write in `boxes[...]`.
     slot_schedule: Vec<usize>,
+    /// virtualstate.py:631 `VirtualState.numnotvirtuals`. Maintained by
+    /// [`Self::enum_top_level`] (RPython parity) but kept identical to
+    /// the legacy `build_sequential_slot_schedule` count via debug_assert
+    /// during Phase A1.
     numnotvirtuals: usize,
+    /// virtualstate.py:630 `VirtualState.info_counter`. Increments through
+    /// `enum_into` to assign per-instance positions.
+    info_counter: i32,
 }
 
 impl VirtualState {
     pub fn new(state: Vec<VirtualStateInfo>) -> Self {
-        let state: Vec<Rc<VirtualStateInfo>> = state.into_iter().map(Rc::new).collect();
-        let (slot_schedule, numnotvirtuals) = build_sequential_slot_schedule(&state);
-        VirtualState {
-            state,
-            renum: std::collections::HashMap::new(),
-            slot_schedule,
-            numnotvirtuals,
-        }
+        let state: Vec<Rc<VirtualStateInfoNode>> = state
+            .into_iter()
+            .map(VirtualStateInfoNode::new_rc)
+            .collect();
+        Self::from_shared_rcs(state)
     }
 
     /// Construct directly from already-shared `Rc`s. Used by `export_state`
     /// so two top-level jump args resolving to the same box collapse onto
-    /// the same `Rc<VirtualStateInfo>` (matching RPython's
+    /// the same `Rc<VirtualStateInfoNode>` (matching RPython's
     /// `VirtualStateConstructor.create_state` box-keyed cache).
-    pub fn from_shared_rcs(state: Vec<Rc<VirtualStateInfo>>) -> Self {
-        let (slot_schedule, numnotvirtuals) = build_sequential_slot_schedule(&state);
-        VirtualState {
+    pub fn from_shared_rcs(state: Vec<Rc<VirtualStateInfoNode>>) -> Self {
+        let (slot_schedule, legacy_numnotvirtuals) = build_sequential_slot_schedule(&state);
+        let mut vs = VirtualState {
             state,
             renum: std::collections::HashMap::new(),
             slot_schedule,
-            numnotvirtuals,
-        }
+            numnotvirtuals: 0,
+            info_counter: -1,
+        };
+        vs.enum_top_level();
+        debug_assert_eq!(
+            vs.numnotvirtuals, legacy_numnotvirtuals,
+            "Phase A1 parity: enum-derived numnotvirtuals diverged from legacy slot_schedule count",
+        );
+        vs
     }
 
     fn new_with_slot_schedule(
-        state: Vec<Rc<VirtualStateInfo>>,
+        state: Vec<Rc<VirtualStateInfoNode>>,
         slot_schedule: Vec<usize>,
         numnotvirtuals: usize,
     ) -> Self {
-        VirtualState {
+        let mut vs = VirtualState {
             state,
             renum: std::collections::HashMap::new(),
             slot_schedule,
-            numnotvirtuals,
+            numnotvirtuals: 0,
+            info_counter: -1,
+        };
+        vs.enum_top_level();
+        debug_assert_eq!(
+            vs.numnotvirtuals, numnotvirtuals,
+            "Phase A1 parity: enum-derived numnotvirtuals diverged from caller-supplied count",
+        );
+        vs
+    }
+
+    /// virtualstate.py:628-634 `VirtualState.__init__` per-state walk:
+    /// ```python
+    /// self.info_counter = -1
+    /// self.numnotvirtuals = 0
+    /// for s in state:
+    ///     if s:
+    ///         s.enum(self)
+    /// ```
+    /// Resets per-instance position cells before walking so that repeated
+    /// calls (e.g., `rebuild_slot_schedule` after `refresh_from_gc`) start
+    /// from a clean RPython-equivalent state.
+    fn enum_top_level(&mut self) {
+        self.info_counter = -1;
+        self.numnotvirtuals = 0;
+        Self::reset_positions(&self.state);
+        // Borrow split: clone the top-level Rcs into a temporary list so
+        // the per-node `enum_into` can take `&mut self`. Rc::clone is
+        // refcount-only.
+        let top: Vec<Rc<VirtualStateInfoNode>> = self.state.clone();
+        for node in &top {
+            node.enum_into(self);
+        }
+    }
+
+    /// Walk all reachable nodes and reset position cells to -1 so the
+    /// next `enum_top_level` traversal mirrors a fresh RPython
+    /// VirtualState.__init__ over fresh subclass instances.
+    fn reset_positions(state: &[Rc<VirtualStateInfoNode>]) {
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for node in state {
+            Self::reset_positions_walk(node, &mut visited);
+        }
+    }
+
+    fn reset_positions_walk(
+        node: &Rc<VirtualStateInfoNode>,
+        visited: &mut std::collections::HashSet<usize>,
+    ) {
+        let key = Rc::as_ptr(node) as usize;
+        if !visited.insert(key) {
+            return;
+        }
+        node.position.set(-1);
+        node.position_in_notvirtuals.set(-1);
+        match &node.info {
+            VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
+                for (_, child) in fields {
+                    Self::reset_positions_walk(child, visited);
+                }
+            }
+            VirtualStateInfo::VArray { items, .. } => {
+                for child in items {
+                    Self::reset_positions_walk(child, visited);
+                }
+            }
+            VirtualStateInfo::VArrayStruct { element_fields, .. } => {
+                for fields in element_fields {
+                    for (_, child) in fields {
+                        Self::reset_positions_walk(child, visited);
+                    }
+                }
+            }
+            VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
+                for (_, _, child) in entries {
+                    Self::reset_positions_walk(child, visited);
+                }
+            }
+            VirtualStateInfo::Constant(_)
+            | VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::IntBounded(_)
+            | VirtualStateInfo::Unknown(_) => {}
         }
     }
 
@@ -587,13 +820,17 @@ impl VirtualState {
     /// `Rc`s that may have broken sharing). Mirrors RPython's invariant
     /// that `numnotvirtuals` always reflects the current state graph.
     pub fn rebuild_slot_schedule(&mut self) {
-        let (slot_schedule, numnotvirtuals) = build_sequential_slot_schedule(&self.state);
+        let (slot_schedule, legacy_numnotvirtuals) = build_sequential_slot_schedule(&self.state);
         self.slot_schedule = slot_schedule;
-        self.numnotvirtuals = numnotvirtuals;
+        self.enum_top_level();
+        debug_assert_eq!(
+            self.numnotvirtuals, legacy_numnotvirtuals,
+            "Phase A1 parity: rebuild numnotvirtuals diverged from legacy slot_schedule count",
+        );
     }
 
     /// Counts the leaves in a single top-level state entry, deduping shared
-    /// `Rc<VirtualStateInfo>` subtrees via the caller-supplied visited map.
+    /// `Rc<VirtualStateInfoNode>` subtrees via the caller-supplied visited map.
     /// The visited map (Rc::as_ptr → first imported OpRef, NONE for the
     /// counting path) must be threaded across all top-level state entries
     /// in a single VirtualState walk so cross-entry shared substates are
@@ -601,7 +838,7 @@ impl VirtualState {
     /// `build_sequential_slot_schedule` dedup. Both the top-level Rc
     /// identity and the recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
-        rc: &Rc<VirtualStateInfo>,
+        rc: &Rc<VirtualStateInfoNode>,
         visited: &mut std::collections::HashMap<usize, OpRef>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
@@ -646,7 +883,7 @@ impl VirtualState {
     /// Rc::as_ptr dedup wrapper for `count_forced_boxes_for_entry`,
     /// mirroring `enum_forced_boxes_recurse`.
     fn count_forced_boxes_for_entry_rc(
-        rc: &Rc<VirtualStateInfo>,
+        rc: &Rc<VirtualStateInfoNode>,
         visited: &mut std::collections::HashMap<usize, OpRef>,
     ) -> usize {
         let key = Rc::as_ptr(rc) as usize;
@@ -814,7 +1051,7 @@ impl VirtualState {
     /// guard (virtualstate.py:196, 274, 352) skips revisiting a shared
     /// `AbstractVirtualStateInfo` so each unique state object's
     /// `NotVirtualStateInfo` gets exactly one slot. The Rust port wraps
-    /// nested children in `Rc<VirtualStateInfo>` and dedups via
+    /// nested children in `Rc<VirtualStateInfoNode>` and dedups via
     /// `Rc::as_ptr` identity (carried in `visited`) — when
     /// `export_single_value` returns the SAME `Rc` for an aliased box,
     /// the second visit short-circuits in `enum_forced_boxes_recurse`,
@@ -1106,12 +1343,12 @@ impl VirtualState {
 
     /// virtualstate.py:111-116 `enum` parity for the
     /// `enum_forced_boxes_for_entry` recursion: dedup nested
-    /// `Rc<VirtualStateInfo>` references via pointer identity so a shared
+    /// `Rc<VirtualStateInfoNode>` references via pointer identity so a shared
     /// substate is enumerated only once. The first call writes its leaves
     /// into `boxes`; subsequent visits short-circuit, mirroring
     /// `if self.position != -1: return`.
     fn enum_forced_boxes_recurse(
-        rc: &Rc<VirtualStateInfo>,
+        rc: &Rc<VirtualStateInfoNode>,
         opref: OpRef,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
@@ -1476,7 +1713,7 @@ impl VirtualState {
     pub fn debug_print(&self) -> String {
         let mut out = String::new();
         for (i, info) in self.state.iter().enumerate() {
-            let kind = match &**info {
+            let kind = match &info.info {
                 VirtualStateInfo::Constant(_) => "Constant",
                 VirtualStateInfo::Virtual { .. } => "Virtual",
                 VirtualStateInfo::VArray { .. } => "VArray",
@@ -1607,7 +1844,7 @@ impl VirtualState {
             if slot.is_virtual() {
                 // virtualstate.py: forced virtuals become NonNull
                 // (they were allocated, so they're always non-null).
-                let new_kind = match &**slot {
+                let new_kind = match &slot.info {
                     VirtualStateInfo::Virtual { known_class, .. } => {
                         if let Some(cls) = *known_class {
                             VirtualStateInfo::KnownClass { class_ptr: cls }
@@ -1617,7 +1854,7 @@ impl VirtualState {
                     }
                     _ => VirtualStateInfo::NonNull,
                 };
-                *slot = Rc::new(new_kind);
+                *slot = VirtualStateInfoNode::new_rc(new_kind);
                 count += 1;
             }
         }
@@ -1629,7 +1866,7 @@ impl VirtualState {
 
     /// Get the lenbound of a virtual array at the given index, if any.
     pub fn getlenbound(&self, index: usize) -> Option<&IntBound> {
-        match self.state.get(index).map(|rc| &**rc) {
+        match self.state.get(index).map(|rc| &rc.info) {
             Some(VirtualStateInfo::VArray { lenbound, .. }) => lenbound.as_ref(),
             _ => None,
         }
@@ -1638,7 +1875,7 @@ impl VirtualState {
     /// Merge two virtual states. For each entry, take the weaker
     /// (more general) of the two. Used when multiple paths converge.
     pub fn merge(&self, other: &VirtualState) -> VirtualState {
-        let merged: Vec<Rc<VirtualStateInfo>> = self
+        let merged: Vec<Rc<VirtualStateInfoNode>> = self
             .state
             .iter()
             .zip(other.state.iter())
@@ -1652,12 +1889,136 @@ impl VirtualState {
                     // at merge time; pyre keeps the type on the
                     // pre-existing `Unknown(Type)` tag.
                     let tp = a.info_type().or_else(|| b.info_type()).unwrap_or(Type::Ref);
-                    Rc::new(VirtualStateInfo::Unknown(tp))
+                    VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(tp))
                 }
             })
             .collect();
         VirtualState::from_shared_rcs(merged)
     }
+}
+
+impl Clone for VirtualState {
+    /// Deep-clone the entire `VirtualStateInfoNode` tree so the cloned
+    /// `VirtualState` owns an independent set of `position` /
+    /// `position_in_notvirtuals` cells. Within a single clone, source nodes
+    /// shared by `Rc` identity remain shared in the destination (cached by
+    /// `Rc::as_ptr`), preserving RPython's `VirtualStateConstructor`
+    /// box-keyed instance sharing semantics.
+    ///
+    /// A naive `#[derive(Clone)]` would `Rc::clone` (refcount-only) and
+    /// leak position cells across clones; calling `enum_top_level` on
+    /// either copy then resets shared `Cell<i32>` positions, corrupting
+    /// the other. RPython's `VirtualState.__init__` constructs fresh
+    /// subclass instances per VirtualState — this manual impl reproduces
+    /// that invariant.
+    fn clone(&self) -> Self {
+        let mut cache: std::collections::HashMap<
+            *const VirtualStateInfoNode,
+            Rc<VirtualStateInfoNode>,
+        > = std::collections::HashMap::new();
+        let cloned: Vec<Rc<VirtualStateInfoNode>> = self
+            .state
+            .iter()
+            .map(|src| deep_clone_node(src, &mut cache))
+            .collect();
+        VirtualState::from_shared_rcs(cloned)
+    }
+}
+
+/// Deep-clone a `VirtualStateInfoNode` tree, mapping each source `Rc`
+/// identity to one fresh `Rc` in the destination via `cache`. Used by
+/// `<VirtualState as Clone>::clone`.
+fn deep_clone_node(
+    src: &Rc<VirtualStateInfoNode>,
+    cache: &mut std::collections::HashMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
+) -> Rc<VirtualStateInfoNode> {
+    let key = Rc::as_ptr(src);
+    if let Some(hit) = cache.get(&key) {
+        return Rc::clone(hit);
+    }
+    let cloned_info = match &src.info {
+        VirtualStateInfo::Constant(v) => VirtualStateInfo::Constant(*v),
+        VirtualStateInfo::KnownClass { class_ptr } => VirtualStateInfo::KnownClass {
+            class_ptr: *class_ptr,
+        },
+        VirtualStateInfo::NonNull => VirtualStateInfo::NonNull,
+        VirtualStateInfo::IntBounded(b) => VirtualStateInfo::IntBounded(b.clone()),
+        VirtualStateInfo::Unknown(t) => VirtualStateInfo::Unknown(*t),
+        VirtualStateInfo::Virtual {
+            descr,
+            known_class,
+            ob_type_descr,
+            fields,
+            field_descrs,
+        } => VirtualStateInfo::Virtual {
+            descr: descr.clone(),
+            known_class: *known_class,
+            ob_type_descr: ob_type_descr.clone(),
+            fields: fields
+                .iter()
+                .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
+                .collect(),
+            field_descrs: field_descrs.clone(),
+        },
+        VirtualStateInfo::VStruct {
+            descr,
+            fields,
+            field_descrs,
+        } => VirtualStateInfo::VStruct {
+            descr: descr.clone(),
+            fields: fields
+                .iter()
+                .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
+                .collect(),
+            field_descrs: field_descrs.clone(),
+        },
+        VirtualStateInfo::VArray {
+            descr,
+            items,
+            lenbound,
+        } => VirtualStateInfo::VArray {
+            descr: descr.clone(),
+            items: items
+                .iter()
+                .map(|child| deep_clone_node(child, cache))
+                .collect(),
+            lenbound: lenbound.clone(),
+        },
+        VirtualStateInfo::VArrayStruct {
+            descr,
+            fielddescrs,
+            element_fields,
+        } => VirtualStateInfo::VArrayStruct {
+            descr: descr.clone(),
+            fielddescrs: fielddescrs.clone(),
+            element_fields: element_fields
+                .iter()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
+                        .collect()
+                })
+                .collect(),
+        },
+        VirtualStateInfo::VirtualRawBuffer {
+            func,
+            size,
+            entries,
+            descrs,
+        } => VirtualStateInfo::VirtualRawBuffer {
+            func: *func,
+            size: *size,
+            entries: entries
+                .iter()
+                .map(|(off, len, child)| (*off, *len, deep_clone_node(child, cache)))
+                .collect(),
+            descrs: descrs.clone(),
+        },
+    };
+    let new_rc = VirtualStateInfoNode::new_rc(cloned_info);
+    cache.insert(key, Rc::clone(&new_rc));
+    new_rc
 }
 
 /// A guard that must be emitted to make an incoming state compatible.
@@ -1777,13 +2138,13 @@ pub fn export_state(
     // to the same target, they share the SAME `VirtualStateInfo` Python
     // object — and consequently the same `position` /
     // `position_in_notvirtuals`. The Rust port mirrors this with an
-    // `Rc<VirtualStateInfo>` cache shared across the whole export, including
+    // `Rc<VirtualStateInfoNode>` cache shared across the whole export, including
     // recursive nested-field calls AND top-level jump args.
     //
     // virtualstate.py:713 `box = get_box_replacement(box)` is performed
     // inside `export_single_value`, so we don't pre-resolve here.
     let mut cache = ExportCache::new();
-    let state: Vec<Rc<VirtualStateInfo>> = oprefs
+    let state: Vec<Rc<VirtualStateInfoNode>> = oprefs
         .iter()
         .map(|opref| export_single_value(*opref, ctx, &mut cache))
         .collect();
@@ -1800,7 +2161,7 @@ pub fn export_state(
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
-    pub finished: HashMap<OpRef, Rc<VirtualStateInfo>>,
+    pub finished: HashMap<OpRef, Rc<VirtualStateInfoNode>>,
     pub in_progress: std::collections::HashSet<OpRef>,
 }
 
@@ -1813,7 +2174,7 @@ impl ExportCache {
     }
 }
 
-/// Export abstract info for a single value, sharing `Rc<VirtualStateInfo>`
+/// Export abstract info for a single value, sharing `Rc<VirtualStateInfoNode>`
 /// across recursive calls so the resulting tree is a DAG: aliased boxes
 /// converge on a single shared `VirtualStateInfo`. virtualstate.py:712-728
 /// VirtualStateConstructor.create_state.
@@ -1828,7 +2189,7 @@ impl ExportCache {
 /// ```
 ///
 /// so a cycle (`A.f -> B`, `B.f -> A`) closes on the same Python object.
-/// Rust's `Rc<VirtualStateInfo>` is immutable after construction, and
+/// Rust's `Rc<VirtualStateInfoNode>` is immutable after construction, and
 /// `Rc::new_cyclic`'s `Weak<T>` cannot upgrade during the closure body,
 /// so we cannot mirror the "cache empty, then mutate" pattern without
 /// switching every consumer to `Rc<RefCell<...>>`. Until that refactor
@@ -1842,7 +2203,7 @@ fn export_single_value(
     opref: OpRef,
     ctx: &OptContext,
     cache: &mut ExportCache,
-) -> Rc<VirtualStateInfo> {
+) -> Rc<VirtualStateInfoNode> {
     // virtualstate.py:713 `box = get_box_replacement(box)` — every
     // create_state entry resolves the forwarding chain BEFORE the cache
     // lookup, so two field references that forward to the same target
@@ -1873,11 +2234,11 @@ fn export_single_value(
         // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
         // RPython where a cycle child resolves to NotVirtualStateInfoPtr
         // with LEVEL_UNKNOWN.
-        return Rc::new(VirtualStateInfo::Unknown(Type::Ref));
+        return VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Ref));
     }
 
     let info = export_single_value_inner(opref, ctx, cache);
-    let rc = Rc::new(info);
+    let rc = VirtualStateInfoNode::new_rc(info);
     cache.in_progress.remove(&opref);
     cache.finished.insert(opref, Rc::clone(&rc));
     rc
@@ -1955,7 +2316,7 @@ fn export_single_value_inner(
                 };
             }
             PtrInfo::VirtualArray(vinfo) => {
-                let items: Vec<Rc<VirtualStateInfo>> = vinfo
+                let items: Vec<Rc<VirtualStateInfoNode>> = vinfo
                     .items
                     .iter()
                     .map(|item_ref| export_single_value(*item_ref, ctx, cache))
@@ -2099,10 +2460,10 @@ fn export_single_value_inner(
 /// majit's flat `slot_schedule + numnotvirtuals` plays the role of the
 /// `position_in_notvirtuals` array: each leaf occurrence in DFS order
 /// records the slot it should write into `boxes[...]`. With
-/// `Rc<VirtualStateInfo>` shared subtrees the dedup walks each unique
+/// `Rc<VirtualStateInfoNode>` shared subtrees the dedup walks each unique
 /// `Rc` only once via `Rc::as_ptr` identity, mirroring RPython's
 /// `if self.position != -1: return` cycle break.
-fn build_sequential_slot_schedule(state: &[Rc<VirtualStateInfo>]) -> (Vec<usize>, usize) {
+fn build_sequential_slot_schedule(state: &[Rc<VirtualStateInfoNode>]) -> (Vec<usize>, usize) {
     let mut schedule = Vec::new();
     let mut next_slot = 0usize;
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -2157,10 +2518,10 @@ fn append_sequential_slots(
 }
 
 /// virtualstate.py:111-116 `enum` parity: dedup via `Rc::as_ptr` so a
-/// shared `Rc<VirtualStateInfo>` is enumerated exactly once, matching
+/// shared `Rc<VirtualStateInfoNode>` is enumerated exactly once, matching
 /// `if self.position != -1: return` on the Python side.
 fn append_sequential_slots_rc(
-    rc: &Rc<VirtualStateInfo>,
+    rc: &Rc<VirtualStateInfoNode>,
     schedule: &mut Vec<usize>,
     next_slot: &mut usize,
     visited: &mut std::collections::HashSet<usize>,
@@ -2266,22 +2627,24 @@ mod tests {
         let a1 = VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
-                Rc::new(VirtualStateInfo::Constant(Value::Int(1))),
-                Rc::new(VirtualStateInfo::Unknown(Type::Int)),
+                VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(1))),
+                VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Int)),
             ],
             lenbound: None,
         };
         let a2 = VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
-                Rc::new(VirtualStateInfo::Constant(Value::Int(1))),
-                Rc::new(VirtualStateInfo::Constant(Value::Int(2))),
+                VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(1))),
+                VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(2))),
             ],
             lenbound: None,
         };
         let a3 = VirtualStateInfo::VArray {
             descr: descr.clone(),
-            items: vec![Rc::new(VirtualStateInfo::Constant(Value::Int(1)))],
+            items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
+                Value::Int(1),
+            ))],
             lenbound: None,
         };
 
@@ -2497,7 +2860,7 @@ mod tests {
 
     /// virtualstate.py:196 / 274 / 352 — `state.position > self.position`
     /// shared-substate dedup parity. When two top-level state entries
-    /// reference the same `Rc<VirtualStateInfo>` (an aliased nested box),
+    /// reference the same `Rc<VirtualStateInfoNode>` (an aliased nested box),
     /// the leaves under that subtree must be enumerated exactly once into
     /// the inputargs slot vector — matching RPython's per-state-object
     /// `position_in_notvirtuals` allocation.
@@ -2506,7 +2869,8 @@ mod tests {
         let descr = test_descr(13);
         // Two top-level VStruct entries that share the SAME Rc'd field.
         // After dedup the field's leaf occupies a single slot.
-        let shared_field: Rc<VirtualStateInfo> = Rc::new(VirtualStateInfo::NonNull);
+        let shared_field: Rc<VirtualStateInfoNode> =
+            VirtualStateInfoNode::new_rc(VirtualStateInfo::NonNull);
         let outer_a = VirtualStateInfo::VStruct {
             descr: descr.clone(),
             fields: vec![(0, Rc::clone(&shared_field))],
@@ -2559,12 +2923,13 @@ mod tests {
     /// Top-level Rc dedup parity: when two jump args resolve to the
     /// same box, RPython's VirtualStateConstructor cache returns the
     /// same AbstractVirtualStateInfo Python object. The Rust port shares
-    /// the top-level `Rc<VirtualStateInfo>` directly via
+    /// the top-level `Rc<VirtualStateInfoNode>` directly via
     /// `from_shared_rcs` so `numnotvirtuals` reflects the deduped
     /// slot count.
     #[test]
     fn test_top_level_rc_aliasing_dedups_slots() {
-        let shared_leaf: Rc<VirtualStateInfo> = Rc::new(VirtualStateInfo::NonNull);
+        let shared_leaf: Rc<VirtualStateInfoNode> =
+            VirtualStateInfoNode::new_rc(VirtualStateInfo::NonNull);
         // Both top-level state entries are the SAME Rc, mirroring
         // VirtualStateConstructor returning the cached object for
         // aliased jump args.
@@ -2590,8 +2955,11 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::VStruct {
             descr: descr.clone(),
             fields: vec![
-                (0, Rc::new(VirtualStateInfo::Constant(Value::Int(7)))),
-                (8, Rc::new(VirtualStateInfo::NonNull)),
+                (
+                    0,
+                    VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(7))),
+                ),
+                (8, VirtualStateInfoNode::new_rc(VirtualStateInfo::NonNull)),
             ],
             field_descrs: Vec::new(),
         }]);
@@ -2628,7 +2996,9 @@ mod tests {
             VirtualStateInfo::NonNull,
             VirtualStateInfo::VArray {
                 descr,
-                items: vec![Rc::new(VirtualStateInfo::Unknown(Type::Int))],
+                items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(
+                    Type::Int,
+                ))],
                 lenbound: None,
             },
             VirtualStateInfo::Unknown(Type::Int),
@@ -2639,11 +3009,11 @@ mod tests {
         assert_eq!(state.num_virtuals(), 0);
         // Virtual with known_class becomes KnownClass
         assert!(matches!(
-            &*state.state[0],
+            &state.state[0].info,
             VirtualStateInfo::KnownClass { .. }
         ));
         // VirtualArray becomes NonNull
-        assert!(matches!(&*state.state[2], VirtualStateInfo::NonNull));
+        assert!(matches!(&state.state[2].info, VirtualStateInfo::NonNull));
     }
 
     #[test]

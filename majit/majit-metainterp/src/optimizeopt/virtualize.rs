@@ -651,12 +651,17 @@ impl OptVirtualize {
             op.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
         );
+        let is_standard_vable_ref = self.is_standard_virtualizable_ref(struct_ref, ctx);
 
         // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
         // which was virtual in the preamble, forward to the imported virtual head.
+        //
+        // The import-state pool is not pyre's standard virtualizable frame.
+        // PyFrame is also inputarg 0, so applying this shortcut to v0 would
+        // corrupt virtualizable field loads such as locals_cells_stack_w.
         if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
             let pool_ref = ctx.get_box_replacement(OpRef(0)); // pool is always inputarg 0
-            if struct_ref == pool_ref {
+            if struct_ref == pool_ref && !is_standard_vable_ref {
                 for &(descr_idx, virtual_head) in &ctx.imported_virtual_heads {
                     if field_idx == descr_idx as u32 {
                         ctx.replace_op(op.pos, virtual_head);
@@ -666,7 +671,7 @@ impl OptVirtualize {
             }
         }
 
-        if is_raw_op && self.is_standard_virtualizable_ref(struct_ref, ctx) {
+        if is_raw_op && is_standard_vable_ref {
             return OptimizationResult::PassOn;
         }
 
@@ -3009,6 +3014,80 @@ mod tests {
         let has_setfield = result.iter().any(|o| o.opcode == OpCode::SetfieldGc);
         assert!(has_setfield, "should have SETFIELD_GC");
         assert_eq!(result.last().unwrap().opcode, OpCode::CallN);
+    }
+
+    #[test]
+    fn test_default_pipeline_forced_virtual_keeps_field_store_before_call() {
+        // info.py:216-226 _force_elements clears the non-virtual field slot
+        // before emitting SETFIELD_GC. Otherwise OptHeap can see the newly
+        // forced PtrInfo as already containing the value and remove the
+        // materialization store before an escaping call.
+        let sd = size_descr(1);
+        let fd = field_descr(10);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd),
+            Op::new(OpCode::CallR, &[OpRef(200), OpRef(0)]),
+            Op::new(OpCode::Finish, &[OpRef(2)]),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline_typed(&ops, &[100], &[]);
+        let setfield_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("forced virtual must emit SETFIELD_GC for its field");
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR)
+            .expect("escaping call must remain");
+        assert!(
+            setfield_pos < call_pos,
+            "SETFIELD_GC must materialize the virtual field before the call; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_default_pipeline_lazy_setfield_flushed_before_residual_call_descr() {
+        // heap.py:540-560 `force_from_effectinfo`: a residual CALL
+        // whose descr lacks per-call write analysis must still flush
+        // any lazy_set on the cached fields it could touch. This is
+        // the descrful counterpart of the test above — earlier the
+        // production `MetaCallDescr` defaulted to `EF_CANNOT_RAISE`
+        // with empty bitsets, so `force_from_effectinfo` saw "no
+        // tracked field read or written" and skipped the flush. With
+        // `DEFAULT_EFFECT_INFO` flipped to `EF_CAN_RAISE` + all-ones
+        // bitsets the per-cached-field flush runs and `setfield_gc`
+        // survives in front of the call.
+        let sd = size_descr(2);
+        let fd = field_descr(11);
+        let call_descr = crate::call_descr::make_call_descr(&[Type::Ref], Type::Ref);
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd),
+            Op::with_descr(OpCode::CallR, &[OpRef(200), OpRef(0)], call_descr),
+            Op::new(OpCode::Finish, &[OpRef(2)]),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline_typed(&ops, &[100], &[]);
+        let setfield_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("descrful CallR must not absorb the lazy SETFIELD_GC");
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR)
+            .expect("descrful CallR must survive optimization");
+        assert!(
+            setfield_pos < call_pos,
+            "SETFIELD_GC must flush before a residual CALL whose descr has \
+             no per-call write analysis; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
     }
 
     // Note: forced struct field forwarding is handled by heap.rs caching,

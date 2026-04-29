@@ -983,31 +983,48 @@ impl Assembler386 {
             ; push r12               // save r12 (used by genop_call_assembler)
             ; mov rbp, rdi
         );
-        if let Some(addrs) = crate::stack_check_addresses() {
-            let continue_label = self.mc.new_dynamic_label();
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            dynasm!(self.mc
-                ; .arch x64
-                // Fast path: load end, subtract SP, compare with length.
-                ; mov Rq(scratch), QWORD addrs.end_adr as i64
-                ; mov rax, [Rq(scratch)]
-                ; sub rax, rsp
-                ; mov Rq(scratch), QWORD addrs.length_adr as i64
-                ; cmp rax, [Rq(scratch)]
-                ; jbe =>continue_label
-                // Slow path: call pyre_stack_too_big_slowpath(rsp).
-                ; mov rdi, rsp
-                ; mov Rq(scratch), QWORD addrs.slowpath_addr as i64
-                ; call Rq(scratch)
-                ; test al, al
-                ; jz =>continue_label
-                // Overflow fallthrough: return rbp as jf_ptr.
-                ; mov rax, rbp
-                ; pop r12
-                ; pop rbp
-                ; ret
-                ; =>continue_label
-            );
+        let propagate_descr = self.propagate_exception_descr_ptr();
+        if propagate_descr != 0 {
+            if let Some(addrs) = crate::stack_check_addresses() {
+                let continue_label = self.mc.new_dynamic_label();
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                let exc_value_addr = crate::jit_exc_value_addr() as i64;
+                let exc_type_addr = crate::jit_exc_type_addr() as i64;
+                dynasm!(self.mc
+                    ; .arch x64
+                    // Fast path: load end, subtract SP, compare with length.
+                    ; mov Rq(scratch), QWORD addrs.end_adr as i64
+                    ; mov rax, [Rq(scratch)]
+                    ; sub rax, rsp
+                    ; mov Rq(scratch), QWORD addrs.length_adr as i64
+                    ; cmp rax, [Rq(scratch)]
+                    ; jbe =>continue_label
+                    // Slow path: call pyre_stack_too_big_slowpath(rsp).
+                    ; mov rdi, rsp
+                    ; mov Rq(scratch), QWORD addrs.slowpath_addr as i64
+                    ; call Rq(scratch)
+                    ; test al, al
+                    ; jz =>continue_label
+                    // x86/assembler.py:347-390 `_build_stack_check_slowpath`:
+                    // the slowpath raised into pos_exception(); merge with the
+                    // propagate-exception path by moving that value into
+                    // jf_guard_exc and publishing propagate_exception_descr.
+                    ; mov Rq(scratch), QWORD exc_value_addr
+                    ; mov rax, [Rq(scratch)]
+                    ; mov QWORD [Rq(scratch)], 0
+                    ; mov [rbp + JF_GUARD_EXC_OFS], rax
+                    ; mov Rq(scratch), QWORD exc_type_addr
+                    ; mov QWORD [Rq(scratch)], 0
+                    ; mov Rq(scratch), QWORD propagate_descr
+                    ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
+                    // Overflow fallthrough: return rbp as jf_ptr.
+                    ; mov rax, rbp
+                    ; pop r12
+                    ; pop rbp
+                    ; ret
+                    ; =>continue_label
+                );
+            }
         }
         // When addresses are not registered (tests / early startup), no
         // stack check is emitted — assembler.py:1082-1083 parity.
@@ -2500,8 +2517,7 @@ impl Assembler386 {
                 }
             }
             OpCode::GuardNoException => {
-                self.emit_cmp_no_exception();
-                self.guard_success_cc = Some(CC_E);
+                self.emit_guard_no_exception_check();
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
@@ -3790,10 +3806,22 @@ impl Assembler386 {
         self.append_guard_token(op, fail_index, fail_label);
     }
 
+    /// assembler.py:1794 generate_guard_no_exception:
+    /// `CMP heap(self.cpu.pos_exception()), imm0` with success on zero.
+    fn emit_guard_no_exception_check(&mut self) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD exc_type_addr
+            ; cmp QWORD [Rq(scratch)], 0
+        );
+        self.guard_success_cc = Some(CC_E);
+    }
+
     /// assembler.py:1782 genop_guard_guard_no_exception.
-    /// Stub: no exception tracking yet.
     fn genop_guard_guard_no_exception(&mut self, op: &Op, fail_index: u32) {
-        self.implement_guard_nojump(op, fail_index);
+        self.emit_guard_no_exception_check();
+        self.implement_guard(op, fail_index);
     }
 
     /// assembler.py:1799 genop_guard_guard_not_invalidated.

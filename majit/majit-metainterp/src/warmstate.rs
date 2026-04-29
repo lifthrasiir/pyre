@@ -586,6 +586,96 @@ impl WarmEnterState {
         self.start_tracing_cell(green_key_hash)
     }
 
+    /// warmstate.py:446-511 `WarmEnterState.maybe_compile_and_run` —
+    /// typed-greenkey variant of [`Self::maybe_compile`].
+    ///
+    /// Walks the per-bucket chain by typed comparekey for both the
+    /// state read (`lookup_chain_with_key`) and the state mutation
+    /// (`start_tracing_cell_for_key`), mirroring upstream's
+    /// `JitCell.get_jitcell_for_args` (`warmstate.py:455-465`) followed
+    /// by per-cell flag mutation. Hash collisions across distinct
+    /// typed greens therefore do not cross-contaminate each other's
+    /// `JC_TRACING` / `JC_COMPILED` flags or counter-derived
+    /// transitions.
+    ///
+    /// The bucket-shared counter ticks via `key.get_uhash()` — upstream
+    /// counter is per-bucket too (`warmstate.py:496`), so colliding
+    /// typed greens share the back-edge counter while keeping
+    /// independent cell state.
+    ///
+    /// Hash-only callers ([`Self::maybe_compile`]) still mutate the
+    /// bucket head via the legacy entry point. Migrating
+    /// `finish_tracing`, `abort_tracing`, `clear_loop_token`, and
+    /// `mark_dont_trace` to the typed chain-walk is tracked as a
+    /// pre-existing PRE-EXISTING-ADAPTATION follow-up so the typed
+    /// path's full lifecycle stays self-consistent on its own buckets.
+    pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
+        let hash = key.get_uhash();
+        if let Some(cell) = self.lookup_chain_with_key(key) {
+            let is_compiled = cell.is_compiled();
+            let is_tracing = cell.is_tracing();
+            let flags = cell.flags;
+            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            if is_compiled {
+                return HotResult::RunCompiled;
+            }
+            if is_tracing {
+                return HotResult::AlreadyTracing;
+            }
+            if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
+                return self.start_tracing_cell_for_key(key);
+            }
+            if flags & jc_flags::DONT_TRACE_HERE != 0 {
+                return HotResult::NotHot;
+            }
+        }
+
+        if !self.counter.tick(hash) {
+            return HotResult::NotHot;
+        }
+
+        self.start_tracing_cell_for_key(key)
+    }
+
+    /// Mutable chain-walk variant of [`Self::lookup_chain_with_key`].
+    /// Returns `Some` only when a chained cell carries a comparekey
+    /// equal (`equal_whatever`) to `key`; the bucket head is no
+    /// longer privileged.
+    fn lookup_chain_with_key_mut(&mut self, key: &GreenKey) -> Option<&mut BaseJitCell> {
+        let hash = key.get_uhash();
+        let mut cell = self.cells.get_mut(&hash);
+        while let Some(c) = cell {
+            if c.comparekey_matches(key) {
+                return Some(c);
+            }
+            cell = c.next.as_deref_mut();
+        }
+        None
+    }
+
+    /// warmstate.py:425-444 `WarmEnterState.bound_reached` —
+    /// typed-key variant of [`Self::start_tracing_cell`].
+    ///
+    /// Walks the chain by `key`'s comparekey to mutate the matching
+    /// cell's `JC_TRACING` / `JC_TRACING_OCCURRED` flags +
+    /// `tracing_generation`, rather than the bucket head. Pairs with
+    /// [`Self::maybe_compile_with_key`] so a typed greenkey always
+    /// transitions its own cell on a hash collision.
+    fn start_tracing_cell_for_key(&mut self, key: &GreenKey) -> HotResult {
+        let hash = key.get_uhash();
+        self.counter.reset(hash);
+        self.tracing_generation += 1;
+        let current_generation = self.tracing_generation;
+        self.ensure_cell_for_key(key);
+        let cell = self
+            .lookup_chain_with_key_mut(key)
+            .expect("ensure_cell_for_key just installed a cell matching this key");
+        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+        cell.state = BaseJitCellState::Tracing;
+        cell.tracing_generation = current_generation;
+        HotResult::StartTracing
+    }
+
     /// Force-start tracing for a green key, bypassing the hot counter.
     ///
     /// Used by function-entry tracing where the caller has already
@@ -3063,5 +3153,178 @@ mod tests {
             })
             .expect("re-fetch b");
         assert_eq!(count, 0, "cached lookups must not invoke make_token");
+    }
+
+    /// warmstate.py:446-511 — typed variant of `maybe_compile_and_run`.
+    /// Upstream installs the JitCell lazily at `bound_reached`
+    /// (warmstate.py:425-444): each tick under threshold returns
+    /// without writing to the celltable; on the threshold tick, the
+    /// cell is created with `comparekey` and installed via
+    /// `jitcounter.install_new_cell`. The typed entry point preserves
+    /// that lifecycle — pre-threshold ticks see no cell installed,
+    /// only the bucket counter ticks.
+    #[test]
+    fn maybe_compile_with_key_lazily_installs_on_threshold_tick() {
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![7, 9]);
+
+        // Tick 1, 2: not hot. Cell is NOT yet installed — upstream
+        // `maybe_compile_and_run` only allocates at `bound_reached`
+        // (warmstate.py:438-440).
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "cold ticks must not install a cell (warmstate.py:466-468)",
+        );
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "second cold tick still no cell",
+        );
+
+        // Tick 3: threshold reached → `start_tracing_cell_for_key`
+        // installs a cell carrying `comparekey = key` (typed) and
+        // sets the TRACING flags.
+        match ws.maybe_compile_with_key(&key) {
+            HotResult::StartTracing => {}
+            _ => panic!("expected StartTracing"),
+        }
+
+        let cell = ws
+            .lookup_chain_with_key(&key)
+            .expect("cell installed at threshold tick");
+        assert_eq!(
+            cell.comparekey.as_ref(),
+            Some(&key),
+            "comparekey populated on lazy install (warmstate.py:438-439)",
+        );
+        assert!(cell.is_tracing(), "JC_TRACING flag set on threshold tick");
+    }
+
+    /// warmstate.py:455-465 — `JitCell.get_jitcell_for_args(*greenargs)`
+    /// walks the per-bucket chain by `comparekey` to read AND mutate
+    /// the cell associated with `greenargs`. A hash-only delegate
+    /// would alias colliding GreenKeys to the same head and read /
+    /// write the wrong cell's `JC_TRACING` / `JC_COMPILED` flags.
+    ///
+    /// The test simulates a hash collision by directly installing two
+    /// cells in the SAME bucket via [`WarmEnterState::install_new_cell`]:
+    /// `key_a` carries `JC_TRACING`, `key_b` is fresh. After installs,
+    /// `install_new_cell` folds non-removable cells to the front, so
+    /// the chain becomes `head=key_a (TRACING) -> tail=key_b`.
+    ///
+    /// `maybe_compile_with_key(&key_b)` must return `NotHot` (cell B
+    /// has no flags). A hash-only read path would see the head
+    /// (`key_a`) and incorrectly return `AlreadyTracing`.
+    #[test]
+    fn maybe_compile_with_key_walks_chain_for_state_under_hash_collision() {
+        let mut ws = WarmEnterState::new(100);
+        // Same hash bucket for both keys — install_new_cell takes the
+        // bucket explicitly so we don't need a real `get_uhash`
+        // collision in the GreenKey values.
+        let key_b = GreenKey::new(vec![300, 400]);
+        let key_a = GreenKey::new(vec![100, 200]);
+        let bucket = key_b.get_uhash();
+
+        // Pre-install A at B's bucket. JC_TRACING keeps A non-removable
+        // (counter.py:246-256 should_remove gate) so the next install
+        // chains B behind A.
+        let mut cell_a = BaseJitCell::new();
+        cell_a.flags |= jc_flags::TRACING;
+        cell_a.comparekey = Some(key_a.clone());
+        ws.install_new_cell(bucket, Some(cell_a));
+
+        // Install B at the same bucket. install_new_cell folds A in
+        // front; resulting chain shape: head=A (TRACING) → tail=B.
+        let mut cell_b = BaseJitCell::new();
+        cell_b.comparekey = Some(key_b.clone());
+        ws.install_new_cell(bucket, Some(cell_b));
+
+        // Sanity — chain order matches the install_new_cell contract.
+        let head = ws.lookup_chain(bucket).expect("bucket has a head");
+        assert_eq!(head.comparekey.as_ref(), Some(&key_a));
+        assert!(head.is_tracing(), "head A carries the TRACING flag");
+        let chained = head
+            .next
+            .as_deref()
+            .expect("chained tail exists after second install");
+        assert_eq!(chained.comparekey.as_ref(), Some(&key_b));
+        assert!(!chained.is_tracing(), "B is fresh");
+
+        // Without the chain-walk fix, `maybe_compile_with_key(&key_b)`
+        // would delegate to `maybe_compile(hash)`, hit `cells.get(&hash)`,
+        // see the head A's TRACING flag and return AlreadyTracing —
+        // contaminating B's lookup with A's tracing state. With the fix
+        // it walks the chain by comparekey and reads B's clean state
+        // (NotHot path: counter ticks under threshold).
+        match ws.maybe_compile_with_key(&key_b) {
+            HotResult::AlreadyTracing => panic!(
+                "maybe_compile_with_key(&key_b) aliased to head A's TRACING flag — \
+                 chain walk by comparekey is broken (warmstate.py:455-465 parity)"
+            ),
+            HotResult::NotHot | HotResult::StartTracing | HotResult::RunCompiled => {}
+        }
+
+        // Cell A's TRACING flag must remain on A, not migrate to B.
+        let head_after = ws.lookup_chain(bucket).expect("bucket head still exists");
+        assert!(
+            head_after.is_tracing(),
+            "head A's TRACING flag must persist across maybe_compile_with_key(&key_b)",
+        );
+        assert_eq!(head_after.comparekey.as_ref(), Some(&key_a));
+        let chained_after = head_after
+            .next
+            .as_deref()
+            .expect("chained tail still present");
+        assert_eq!(chained_after.comparekey.as_ref(), Some(&key_b));
+        assert!(
+            !chained_after.is_tracing(),
+            "B must not have inherited A's TRACING flag (counter under threshold)",
+        );
+    }
+
+    /// warmstate.py:425-444 + 596-604 — typed-key transition writes
+    /// land on the matching chained cell, not the bucket head. A
+    /// collision-shaped chain `head=A → tail=B` followed by enough
+    /// `maybe_compile_with_key(&key_b)` ticks to exhaust the counter
+    /// must flip `B.is_tracing()` to true while A's flags stay intact.
+    #[test]
+    fn maybe_compile_with_key_start_tracing_writes_to_chained_cell() {
+        let mut ws = WarmEnterState::new(2); // threshold=2 → 2 ticks fire
+        let key_b = GreenKey::new(vec![700, 800]);
+        let key_a = GreenKey::new(vec![500, 600]);
+        let bucket = key_b.get_uhash();
+
+        // Head A: must stay non-removable across B's install.
+        let mut cell_a = BaseJitCell::new();
+        cell_a.flags |= jc_flags::TRACING;
+        cell_a.comparekey = Some(key_a.clone());
+        ws.install_new_cell(bucket, Some(cell_a));
+
+        // Tick #1 — counter not at threshold yet, NotHot.
+        match ws.maybe_compile_with_key(&key_b) {
+            HotResult::NotHot => {}
+            _ => panic!("tick #1 expected NotHot"),
+        }
+        // Tick #2 — counter fires; start_tracing_cell_for_key must
+        // chain-walk and flip B's flags, not the head A.
+        match ws.maybe_compile_with_key(&key_b) {
+            HotResult::StartTracing => {}
+            _ => panic!("tick #2 expected StartTracing"),
+        }
+
+        // Walk the chain — A still TRACING (its own flag), B now
+        // additionally TRACING.
+        let head = ws.lookup_chain(bucket).expect("head exists");
+        assert_eq!(head.comparekey.as_ref(), Some(&key_a));
+        assert!(head.is_tracing(), "A's TRACING flag is its own");
+        let b_cell = ws
+            .lookup_chain_with_key(&key_b)
+            .expect("typed lookup finds B in the chain");
+        assert!(
+            b_cell.is_tracing(),
+            "B's TRACING flag set by start_tracing_cell_for_key — \
+             chain-walk write must reach the tail, not just the head",
+        );
     }
 }

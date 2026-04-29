@@ -2042,7 +2042,9 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
         Err(err) => {
             #[cfg(feature = "cranelift")]
             majit_backend_cranelift::jit_exc_raise(err.exc_object as i64);
-            #[cfg(not(feature = "cranelift"))]
+            #[cfg(feature = "dynasm")]
+            majit_backend_dynasm::jit_exc_raise(err.exc_object as i64);
+            #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
             let _ = err;
             pyre_object::PY_NULL
         }
@@ -2269,6 +2271,69 @@ fn jit_merge_point_hook(
 ) -> Option<LoopResult> {
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.pycode, pc);
+
+    // S2.5 (wiggly-barto plan, Stage 2 — dual verification mode).
+    //
+    // TODO(delete in S3.2): the env var and this whole soak block ship
+    // out alongside the direct-hook deletion. Upstream has no eval-side
+    // marker gate (rlib/jit.py:881-1006 + warmspot.py:874-1075 run
+    // unconditionally). The gate exists only as scaffolding for the
+    // S3.1 cutover so we can bring up the marker/static-data path
+    // alongside the legacy `make_green_key` hash flow without flipping
+    // production default in one commit.
+    //
+    // While `PYRE_JIT_MARKER_PARITY_SOAK=1` is set, this block runs
+    // shadow-style next to the production decision: it constructs the
+    // typed `GreenKey` mirroring `pypyjitdriver.greens` (rlib/jit.py:649,
+    // interp_jit.py:69 — `[next_instr, is_being_profiled, pycode]`) and
+    // exercises `WarmEnterState::lookup_chain_with_key` so the typed-key
+    // surface stays warm for the cutover; the result is intentionally
+    // discarded so the legacy hash-only flow below still owns the
+    // decision (see also Pre-S3.1 Task #17 — incremental hash unification
+    // is blocked by a fannkuch perf regression, so the soak gate is the
+    // S3.1 prereq instead).
+    static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PYRE_JIT_MARKER_PARITY_SOAK
+        .get_or_init(|| std::env::var_os("PYRE_JIT_MARKER_PARITY_SOAK").is_some())
+    {
+        // pypyjitdriver greens declaration order
+        // (interp_jit.py:69 / rlib/jit.py:649): pc first, then
+        // is_being_profiled, then pycode — verify_green_args upstream
+        // walks the same prefix (pyjitpl.py:1532-1535).
+        //
+        // The hot-path overhead would dominate variance if we allocated
+        // three Vecs per tick; reuse a thread-local GreenKey with
+        // pre-built `types` so each call only mutates `values[0..3]`.
+        thread_local! {
+            static SOAK_KEY: std::cell::RefCell<majit_ir::GreenKey> =
+                std::cell::RefCell::new(majit_ir::GreenKey::with_types(
+                    vec![0_i64, 0, 0],
+                    vec![
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Int,
+                        majit_ir::Type::Ref,
+                    ],
+                ));
+        }
+        SOAK_KEY.with(|cell| {
+            let mut key = cell.borrow_mut();
+            key.values[0] = pc as i64;
+            key.values[1] = if frame.get_is_being_profiled() { 1 } else { 0 };
+            key.values[2] = frame.pycode as i64;
+            // Shadow lookup — read-only, no install. Discarded result.
+            // Pre-S3.1 the typed `get_uhash` and the legacy
+            // `make_green_key` hash differ (see Task #17), so this lookup
+            // intentionally misses. The soak's value is exercising the
+            // typed-API call site so a regression in
+            // `lookup_chain_with_key` surfaces under
+            // `PYRE_JIT_MARKER_PARITY_SOAK=1` before S3.1 cutover.
+            let _shadow = driver
+                .meta_interp()
+                .warm_state_ref()
+                .lookup_chain_with_key(&key);
+        });
+    }
+
     let mut jit_state = build_jit_state(frame, info);
     let current_depth = call_depth();
     let was_tracing = driver.is_tracing();

@@ -757,7 +757,7 @@ impl Optimizer {
     /// single Phase 2 box (matching RPython's setinfo_from_preamble
     /// `if op.get_forwarded() is not None: return` semantics).
     fn import_virtual_state_from_label_args_recurse(
-        rc: &std::rc::Rc<crate::optimizeopt::virtualstate::VirtualStateInfo>,
+        rc: &std::rc::Rc<crate::optimizeopt::virtualstate::VirtualStateInfoNode>,
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
@@ -771,7 +771,7 @@ impl Optimizer {
         // the real OpRef once import_virtual_state_from_label_args returns.
         walk_visited.insert(key, OpRef::NONE);
         let opref = Self::import_virtual_state_from_label_args(
-            rc,
+            &rc.info,
             imported_label_args,
             label_slot,
             ctx,

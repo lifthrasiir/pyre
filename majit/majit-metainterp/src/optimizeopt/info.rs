@@ -1391,14 +1391,14 @@ impl PtrInfo {
 
         match self {
             PtrInfo::VirtualStruct(vinfo) => {
-                // RPython info.py:147-156: _is_virtual = False, _fields retained.
+                // RPython info.py:216-226 _force_elements clears each
+                // `self._fields[i] = None` BEFORE `optforce.emit_extra(setfieldop)`.
+                // After force, the non-virtual structinfo carries no field cache,
+                // so heap.py do_setfield records the SETFIELD_GC as a lazy_set
+                // instead of MUST_ALIAS-eliding it against the preserved value.
                 let preserved = PtrInfo::Struct(StructPtrInfo {
                     descr: vinfo.descr.clone(),
-                    fields: vinfo
-                        .fields
-                        .iter()
-                        .map(|&(idx, val)| (idx, FieldEntry::Value(ctx.get_box_replacement(val))))
-                        .collect(),
+                    fields: Vec::new(),
                     field_descrs: vinfo.field_descrs.clone(),
                     last_guard_pos: -1,
                 });
@@ -1440,14 +1440,14 @@ impl PtrInfo {
                 alloc_ref
             }
             PtrInfo::Virtual(vinfo) => {
+                // info.py:216-226 — see VirtualStruct branch above. Build the
+                // non-virtual replacement with no field cache so heap.py
+                // do_setfield does not MUST_ALIAS-elide the materialization
+                // SETFIELD_GC against the preserved value.
                 let preserved = PtrInfo::Instance(InstancePtrInfo {
                     descr: Some(vinfo.descr.clone()),
                     known_class: vinfo.known_class,
-                    fields: vinfo
-                        .fields
-                        .iter()
-                        .map(|&(idx, val)| (idx, FieldEntry::Value(ctx.get_box_replacement(val))))
-                        .collect(),
+                    fields: Vec::new(),
                     field_descrs: vinfo.field_descrs.clone(),
                     last_guard_pos: -1,
                 });

@@ -1448,6 +1448,25 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     result
 }
 
+/// Dynasm x86/assembler.py:347-390 `_build_stack_check_slowpath` parity.
+///
+/// The interpreter-level slowpath stores the RecursionError in
+/// `stack_check::JIT_PENDING_EXCEPTION` for non-dynasm backend glue. Dynasm's
+/// prologue, however, mirrors RPython's `pos_exception()` path: after this
+/// call returns non-zero, emitted code transfers `majit_backend_dynasm`'s
+/// `JIT_EXC_VALUE` into `jf_guard_exc` and stamps `propagate_exception_descr`
+/// into `jf_descr`. Bridge the two exception slots here.
+#[cfg(feature = "dynasm")]
+extern "C" fn dynasm_stack_check_slowpath_for_backend(current: usize) -> u8 {
+    let result = pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend(current);
+    if result != 0 {
+        if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+            majit_backend_dynasm::jit_exc_raise(exc.to_exc_object() as i64);
+        }
+    }
+    result
+}
+
 /// Unbox a Ref (PyObjectRef to boxed int) to a raw i64 value.
 /// Used by call_assembler_guard_failure's FALLBACK path when the first
 /// local is a Ref type (boxed int) instead of raw Int.
@@ -1611,8 +1630,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_stack_check_addresses(
                 pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
                 pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
-                pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend as *const ()
-                    as usize,
+                dynasm_stack_check_slowpath_for_backend as *const () as usize,
             );
         }
     });

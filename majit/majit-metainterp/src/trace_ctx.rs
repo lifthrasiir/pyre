@@ -2916,7 +2916,7 @@ impl TraceCtx {
         ret_type: Type,
     ) -> OpRef {
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
-        let descr = make_call_descr(arg_types, ret_type);
+        let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
         let result = self
@@ -3396,7 +3396,7 @@ impl TraceCtx {
             return cached;
         }
         let opcode = OpCode::call_loopinvariant_for_type(ret_type);
-        let descr = make_call_descr(arg_types, ret_type);
+        let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
         let result = self

@@ -10,7 +10,7 @@ collection looks more convenient.
 
 ### Rules
 
-1. **Look up the RPython source first.** Before adding `HashMap`, `HashSet`,
+1. **Look up the RPython/PyPy source first.** Before adding `HashMap`, `HashSet`,
    `BTreeMap`, etc., find the corresponding RPython attribute and check what
    container it uses (`dict`, `list`, an attribute on a class instance, a
    field on `_forwarded`, …). Port that exact shape.
