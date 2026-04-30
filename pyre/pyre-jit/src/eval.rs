@@ -4457,7 +4457,11 @@ fn rebuild_typed_from_rd_numb(
     // synchronize_virtualizable writes them back to the heap.
     // Frame registers fill frame.registers_i/r/f independently.
 
-    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
+    // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
+    //                 valuestackdepth(3), debugdata(4), w_globals(5),
+    //                 array...]  (5 scalars + frame ptr; PyPy's
+    // `lastblock` slot is omitted under CPython 3.14 bytecode — see
+    // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`).
     // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     let header: Vec<Value> = if vable_values.len() >= num_scalars {
@@ -5848,14 +5852,15 @@ mod tests {
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
         );
         assert_eq!(fail_args[0], frame_ref);
-        // last_instr and valuestackdepth are re-seeded by `flush_to_frame_for_guard`
-        // (the two fields that advance per-opcode).
+        // last_instr / valuestackdepth are guard-time-overridden by
+        // flush_to_frame_for_guard (orgpc - 1, pre-opcode depth).
         assert_eq!(fail_args[1], ctx.const_int(resume_pc as i64 - 1));
         assert_eq!(fail_args[3], ctx.const_int(4));
-        // pycode / debugdata / lastblock / w_globals keep their seed values —
-        // Slice 4 (Task #116) dropped the heap re-seed for these invariant
-        // scalars; sym is now expected to carry the trace-start OpRef
-        // (inputarg for root traces, resume-restored value for bridges).
+        // pycode / debugdata / lastblock / w_globals are JIT-scope
+        // invariant under CPython 3.14 bytecode (`lastblock` is mutated
+        // only by SETUP_*/POP_BLOCK paths the tracer never enters) and
+        // stay bound to the trace-start inputarg OpRefs the fixture
+        // seeded above.
         assert_eq!(fail_args[2], ctx.const_ref(0xdead));
         assert_eq!(fail_args[4], ctx.const_ref(0xbeef));
         assert_eq!(fail_args[5], ctx.const_ref(0xcafe));
@@ -5896,6 +5901,8 @@ mod tests {
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
+        let stack0 = ctx.const_ref(0xb0);
+        let stack1 = ctx.const_ref(0xb1);
         let mut sym = PyreSym::from_test_state(TestSymState {
             frame: frame_ref,
             jitcode: jitcode_ptr,
@@ -5904,7 +5911,7 @@ mod tests {
             locals_cells_stack_array_ref: locals_array,
             symbolic_local_types: vec![Type::Ref, Type::Int],
             symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE; 4],
+            registers_r: vec![OpRef::NONE, OpRef::NONE, stack0, stack1],
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(0),
@@ -5914,6 +5921,13 @@ mod tests {
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
+        trace_state::seed_compiled_trace_jitcode_test_state(
+            &mut sym,
+            &mut ctx,
+            jitcode_index,
+            resume_pc as i32,
+            &[(0, stack0), (1, stack1)],
+        );
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let fail_args = state.capture_current_fail_args();
@@ -6229,6 +6243,13 @@ mod tests {
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
                 vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
             });
+            trace_state::seed_compiled_trace_jitcode_test_state(
+                &mut sym,
+                &mut ctx,
+                jitcode_index,
+                resume_pc as i32,
+                &[(0, lower_stack), (1, truth)],
+            );
             let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
             if record_branch_guard {
                 state.capture_record_branch_guard(OpRef::NONE, truth, true, resume_pc);
@@ -6366,6 +6387,13 @@ mod tests {
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         });
+        trace_state::seed_compiled_trace_jitcode_test_state(
+            &mut sym,
+            &mut ctx,
+            jitcode_index,
+            resume_pc as i32,
+            &[(0, lower_stack), (1, truth)],
+        );
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         state.capture_generate_guard(OpCode::GuardTrue, &[truth]);

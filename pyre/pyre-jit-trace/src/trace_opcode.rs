@@ -220,17 +220,33 @@ use crate::helpers::TraceHelperAccess;
 /// returns false for them).
 ///
 /// Snapshot capture (`flush_to_frame_for_guard`) intentionally does
-/// NOT mirror — its only consumer is `list_of_boxes_virtualizable`
-/// which reads from `s.vable_*` directly (Issue #2 PRE-EXISTING-
-/// ADAPTATION reader), so a shadow write would only pollute parent
-/// frames mid-callee snapshot via
-/// `materialize_parent_snapshot_state`.  See
-/// `vable_shadow_split_brain_load_bearing_2026_04_28` memo.
+/// NOT mirror into the shared `ctx.virtualizable_boxes`.  Upstream
+/// `rpython/jit/metainterp/pyjitpl.py:2586 capture_resumedata` reads
+/// `metainterp.virtualizable_boxes` and hands it to
+/// `rpython/jit/metainterp/opencoder.py:718
+/// _list_of_boxes_virtualizable(boxes)` with no fallback heap source.
+/// Pyre matches that single-source model in spirit: under CPython 3.14
+/// only `last_instr` / `valuestackdepth` advance per-opcode, and the
+/// snapshot rewrites them in `s.vable_*` to the pre-opcode value at
+/// `orgpc - 1`.  The other three scalars (`pycode`, `debugdata`,
+/// `w_globals`) are JIT-scope invariant and stay bound to the inputarg
+/// OpRefs `init_vable_indices` seeded at trace start (PyPy-style
+/// `lastblock` is absent — see `virtualizable_spec.rs:8-23`).  The
+/// snapshot does not mirror its `s.vable_*` overrides into the shared
+/// shadow because the shared shadow is the JUMP/JIT-time view (live
+/// virtualizable values that `gen_writeback_vable_to_heap` and
+/// `close_loop_args_at` consume), while `s.vable_last_instr/vsd` carry
+/// the pre-opcode override that the snapshot reader needs.  The two
+/// stores stay distinct deliberately: `record_branch_guard` saves
+/// `s.vable_last_instr/vsd` before flushing and restores them after
+/// the snapshot is built, but the shared shadow has no symmetric
+/// save/restore — mirroring the override there would leak the
+/// pre-opcode value into the JUMP path.
 ///
 /// `static_field_name` matches the canonical PyFrame virtualizable
-/// spec at `virtualizable_spec.rs:11-18`
+/// spec at `virtualizable_spec.rs:24-30`
 /// (`last_instr`, `pycode`, `valuestackdepth`, `debugdata`,
-/// `lastblock`, `w_globals`).
+/// `w_globals`).
 ///
 /// No-op when `virtualizable_boxes` is not yet seeded
 /// (non-virtualizable trace, or before `init_virtualizable_boxes`).
@@ -1797,35 +1813,34 @@ impl MIFrame {
                 .map(|pre_r| pre_r.len())
                 .unwrap_or(s.valuestackdepth) as i64
         });
-        // pyjitpl.py:2586-2602 `capture_resumedata` parity: upstream reads
-        // `metainterp.virtualizable_boxes` without mutating it; the snapshot's
-        // vable section comes from that shadow.  pyre's snapshot reader
-        // (`list_of_boxes_virtualizable`) consults `s.vable_*` instead
-        // (Issue #2 PRE-EXISTING-ADAPTATION) so we still need to publish the
-        // guard-time-correct values for the two fields that advance per-opcode:
-        // `last_instr` (orgpc - 1) and `valuestackdepth` (pre-opcode depth via
-        // `pre_opcode_registers_r` / `portal_bridge_vable_vsd`).  The other
-        // four scalars (`pycode`, `debugdata`, `lastblock`, `w_globals`) keep
-        // whatever OpRef they were seeded with at trace start (inputarg for
-        // root traces, resume-restored value for bridges) — pyre has no
-        // per-opcode handler that mutates them mid-trace, and the previous
-        // heap re-seed here was a NEW-DEVIATION compensating for the missing
-        // `_opimpl_setfield_vable` calls (which RPython's pyopcode handlers
-        // emit and pyre's tracer never reaches).  Slice 4 (Task #116).
+        // pyjitpl.py:2586-2602 `capture_resumedata` parity: RPython reads
+        // `metainterp.virtualizable_boxes` without mutating it. The two
+        // fields that advance per-opcode (`last_instr`, `valuestackdepth`)
+        // need a guard-time-correct override here because pyre's tracer
+        // is itself the dispatch loop: at guard time the active opcode is
+        // the one at `orgpc`, so the snapshot must encode the pre-opcode
+        // state (`last_instr = orgpc - 1`, `valuestackdepth = pre-opcode
+        // depth via pre_opcode_registers_r / portal_bridge_vable_vsd`).
+        // The other three scalars (`pycode`, `debugdata`, `w_globals`)
+        // are JIT-scope invariant under CPython 3.14 bytecode: set only
+        // by `pyframe.rs::frame_reinit` (`pycode` / `w_globals`) and by
+        // `getorcreate_debug_data` (`debugdata`, never reached during
+        // tracing). Their `s.vable_*` slots stay bound to the inputarg
+        // OpRefs `init_vable_indices` seeded at trace start, matching
+        // RPython's "boxes carry vable inputargs" model.
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
         let vsd_op = ctx.const_int(vsd);
         let s = self.sym_mut();
         s.vable_last_instr = last_instr_op;
         s.vable_valuestackdepth = vsd_op;
-        // The shared `ctx.virtualizable_boxes` shadow is intentionally NOT
-        // mirrored here — earlier `_opimpl_setfield_vable` parity comment
-        // (Slice 3.0c) said it should be, but the mirror polluted shadow
-        // when `materialize_parent_snapshot_state` invoked
-        // `parent_frame.flush_to_frame_for_guard` mid-callee snapshot,
-        // forcing band-aid save/restore in `capture_resumedata`,
-        // `record_branch_guard`, and around inline frame push/pop.  See
-        // `vable_shadow_split_brain_load_bearing_2026_04_28` memo.
+        // The shared `ctx.virtualizable_boxes` shadow is intentionally
+        // not mirrored here — see `mirror_vable_static_to_boxes` doc
+        // for the convention.  The two stores have distinct roles:
+        // `s.vable_*` is the snapshot reader's view (carries pre-opcode
+        // overrides set here, save/restored by `record_branch_guard`),
+        // `ctx.virtualizable_boxes` is the JUMP/JIT-time view (consumed
+        // by `gen_writeback_vable_to_heap` and `close_loop_args_at`).
     }
 
     /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
@@ -2646,15 +2661,9 @@ impl MIFrame {
             // the inline fail_args is now dead and removed; the
             // snapshot's `vable_boxes` already encodes the same
             // information via `build_virtualizable_boxes`. Parent-frame
-            // types are still collected via
-            // `extend_fail_args_and_types_with_parents` (the discarded
-            // `_fail_args` is the residual of the legacy path; the
-            // parent-types-only refactor is a separate cleanup).
-            let (_fail_args, types) = self.extend_fail_args_and_types_with_parents(
-                ctx,
-                Vec::new(),
-                callee_snapshot_types_full,
-            );
+            // types still flow into the recorded guard via
+            // `extend_types_with_parents`.
+            let types = self.extend_types_with_parents(ctx, callee_snapshot_types_full);
             let snapshot_id = ctx.capture_resumedata(snapshot);
 
             ctx.record_guard_typed(opcode, args, types);
@@ -2774,25 +2783,21 @@ impl MIFrame {
         s.vable_valuestackdepth = saved_vsd;
     }
 
-    /// Extend a single-frame callee's `(fail_args, fail_arg_types)` with
-    /// the contribution of every active parent frame.  Mirrors the
-    /// `pyjitpl.py:2597` generate_guard fail_args collection — parent
-    /// frames contribute their full header + active boxes because the
-    /// resume path must rehydrate virtualizable fields and registers
-    /// across the entire framestack on guard failure.
-    fn extend_fail_args_and_types_with_parents(
-        &mut self,
-        ctx: &mut TraceCtx,
-        mut fail_args: Vec<OpRef>,
-        mut types: Vec<Type>,
-    ) -> (Vec<OpRef>, Vec<Type>) {
+    /// Extend a single-frame callee's `fail_arg_types` with the type
+    /// contribution of every active parent frame.  Mirrors the
+    /// `pyjitpl.py:2597` generate_guard collection: parent boxes ride
+    /// the snapshot (built by `build_framestack_snapshot`), and the
+    /// optimizer's `store_final_boxes_in_guard` (`optimizeopt/mod.rs:
+    /// 3200`) overwrites `op.fail_args` from the snapshot via
+    /// `op.store_final_boxes(liveboxes)` (mod.rs:3392), so an inline
+    /// `fail_args` collection is redundant — only the per-frame
+    /// `parent_types` need to flow into `record_guard_typed`.
+    fn extend_types_with_parents(&mut self, ctx: &mut TraceCtx, mut types: Vec<Type>) -> Vec<Type> {
         for parent in self.parent_frames.clone() {
-            let (parent_fail_args, parent_types, _jitcode_index) =
-                self.materialize_parent_frame_state(ctx, parent);
-            fail_args.extend_from_slice(&parent_fail_args);
+            let (parent_types, _jitcode_index) = self.materialize_parent_frame_state(ctx, parent);
             types.extend_from_slice(&parent_types);
         }
-        (fail_args, types)
+        types
     }
 
     /// Build the full framestack `Snapshot` — top (callee) frame
@@ -2829,7 +2834,7 @@ impl MIFrame {
         // opencoder.py:806: parent frames keep their original pc.
         // Snapshot boxes = active boxes only (skip scalar inputarg header).
         for parent in self.parent_frames.clone() {
-            let (_parent_fail_args, parent_types_full, parent_jitcode_index, parent_active) =
+            let (parent_types_full, parent_jitcode_index, parent_active) =
                 self.materialize_parent_snapshot_state(ctx, parent);
             let parent_types: &[Type] = if parent_types_full.len() > n {
                 &parent_types_full[n..]
@@ -2898,17 +2903,33 @@ impl MIFrame {
         &mut self,
         ctx: &mut TraceCtx,
         parent: ResumeFrameState,
-    ) -> (Vec<OpRef>, Vec<Type>, u32) {
-        let (fail_args, full_types, jitcode_index, _active_boxes) =
+    ) -> (Vec<Type>, u32) {
+        let (full_types, jitcode_index, _active_boxes) =
             self.materialize_parent_snapshot_state(ctx, parent);
-        (fail_args, full_types, jitcode_index)
+        (full_types, jitcode_index)
     }
 
     fn materialize_parent_snapshot_state(
         &mut self,
         ctx: &mut TraceCtx,
         parent: ResumeFrameState,
-    ) -> (Vec<OpRef>, Vec<Type>, u32, Vec<OpRef>) {
+    ) -> (Vec<Type>, u32, Vec<OpRef>) {
+        // pyjitpl.py:2586 capture_resumedata parity: parent frames
+        // contribute only their per-frame regular boxes (locals + stack)
+        // to the snapshot.  The virtualizable scalars are emitted once
+        // via `list_of_boxes_virtualizable` for the whole snapshot, not
+        // per-frame.  Earlier pyre revisions called
+        // `parent_frame.flush_to_frame_for_guard(ctx)` here and built a
+        // `[s.frame, s.vable_*..., active_boxes]` fail_args vec for the
+        // legacy `record_guard_typed_with_fail_args` path; both are dead
+        // since the snapshot reader (`build_framestack_snapshot`) reads
+        // active boxes directly and `store_final_boxes_in_guard`
+        // overwrites `op.fail_args` from the snapshot
+        // (`optimizeopt/mod.rs:3200`).  Keeping the parent flush around
+        // mutates parent's `s.vable_*` mid-callee snapshot — the
+        // structural blocker called out in
+        // `vable_shadow_split_brain_load_bearing_2026_04_28` — so it is
+        // dropped together with the dead fail_args build.
         let parent_sym = unsafe { &mut *parent.sym };
         let mut parent_frame = MIFrame::from_sym(
             ctx,
@@ -2918,25 +2939,10 @@ impl MIFrame {
             parent.resume_pc,
         );
         parent_frame.pending_result_stack_idx = parent.pending_result_stack_idx;
-        parent_frame.flush_to_frame_for_guard(ctx);
         let active_boxes = parent_frame.get_list_of_active_boxes(ctx, true, false);
         let full_types = parent_frame.build_fail_arg_types_for_active_boxes(&active_boxes);
         let jitcode_index = unsafe { (*parent_frame.sym().jitcode).index } as u32;
-        let fail_args = {
-            let s = parent_frame.sym();
-            let mut fa = vec![
-                s.frame,
-                s.vable_last_instr,
-                s.vable_pycode,
-                s.vable_valuestackdepth,
-                s.vable_debugdata,
-                s.vable_lastblock,
-                s.vable_w_globals,
-            ];
-            fa.extend_from_slice(&active_boxes);
-            fa
-        };
-        (fail_args, full_types, jitcode_index, active_boxes)
+        (full_types, jitcode_index, active_boxes)
     }
 
     /// virtualizable.py:139 _get_virtualizable_field_boxes parity:
@@ -3041,20 +3047,35 @@ impl MIFrame {
         // `FIELDTYPE`; pyre mirrors that by consulting
         // `VirtualizableInfo::static_fields[i].field_type`.
         //
-        // PRE-EXISTING-ADAPTATION (split-brain): upstream
-        // `opencoder.py:718-726 _list_of_boxes_virtualizable` reads
-        // from `metainterp.virtualizable_boxes` — pyre's canonical
-        // analog is `ctx.virtualizable_boxes`.  pyre reads from
-        // `sym.vable_field_oprefs()` because guard-snapshot capture
-        // calls `flush_to_frame_for_guard` which re-seeds `s.vable_*`
-        // from the PyFrame heap WITHOUT mirroring into the shared
-        // shadow (see `mirror_vable_static_to_boxes` doc).  The shadow
-        // tracks JUMP-time writeback values — using it here would
-        // pick up the wrong PC / vsd for the guard's snapshot.
-        // Convergence to a shadow-only reader is multi-session and
-        // requires pyre's vable-touching opcodes to emit
-        // `_opimpl_setfield_vable` properly so the shadow stays
-        // current without the heap re-seed crutch.
+        // PRE-EXISTING-ADAPTATION (split-brain reader) — Task #117.
+        // Upstream `opencoder.py:718-726
+        // _list_of_boxes_virtualizable` reads from
+        // `metainterp.virtualizable_boxes` exclusively.  Pyre reads
+        // `sym.vable_field_oprefs()` because that store carries the
+        // pre-opcode override that `flush_to_frame_for_guard` writes
+        // for the snapshot reader (see `mirror_vable_static_to_boxes`
+        // doc).  The shared `ctx.virtualizable_boxes` is the JUMP/JIT-
+        // time view: continuously mirrored by push/pop and
+        // setfield_vable, but never carries the orgpc-1 / pre-opcode
+        // vsd override, so its slot 2 lies post-push at guard time.
+        //
+        // Per-slot freshness today:
+        //   slot 0 (last_instr): publish_last_instr_to_vable mirrors
+        //     `pc - 1` into both stores at every opcode, so a switch
+        //     would be safe for this slot in isolation.
+        //   slot 2 (valuestackdepth): push/pop mirror the post-state
+        //     into both stores; only `s.vable_valuestackdepth` carries
+        //     the flush-time pre-opcode override.  A switch needs a
+        //     symmetric save/restore around the snapshot build.
+        //   slots 1/3/4 (pycode / debugdata / w_globals): JIT-scope
+        //     invariant under CPython 3.14 — both stores carry the
+        //     trace-start inputarg OpRefs that `init_vable_indices`
+        //     seeded.
+        //
+        // Net: a unified reader is feasible per slot but would require
+        // pushing the pre-opcode override pattern (currently localized
+        // in `s.vable_*` via `record_branch_guard` save/restore) onto
+        // `ctx.virtualizable_boxes` as well.
         let vable_static_types: Vec<majit_ir::Type> = ctx
             .virtualizable_info()
             .map(|info| info.static_fields.iter().map(|f| f.field_type).collect())
@@ -3385,11 +3406,7 @@ impl MIFrame {
         // which records the guard with no inline fail_args and lets
         // `capture_resumedata` + `_number_boxes` populate them from the
         // snapshot chain.
-        let (_fail_args, types) = self.extend_fail_args_and_types_with_parents(
-            ctx,
-            Vec::new(),
-            callee_snapshot_types_full,
-        );
+        let types = self.extend_types_with_parents(ctx, callee_snapshot_types_full);
         let snapshot_id = ctx.capture_resumedata(snapshot);
 
         ctx.record_guard_typed(opcode, &[truth], types);
@@ -4595,10 +4612,6 @@ impl MIFrame {
                                                 Type::Ref,
                                             ),
                                             (
-                                                crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
-                                                Type::Ref,
-                                            ),
-                                            (
                                                 crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
                                                 Type::Ref,
                                             ),
@@ -5043,11 +5056,12 @@ impl MIFrame {
                         let (callee_nlocals, callee_array_capacity) =
                             crate::state::callee_layout_for_call_assembler(callee_code);
                         let callee_ns_ptr = unsafe { function_get_globals(concrete_callable) };
-                        // interp_jit.py:25-31: 6 scalar fields + frame = 7 slots
+                        // interp_jit.py:25-31: 6 scalar fields + frame = 7 slots.
                         let first_array_slot = 1 + 6; // frame + 6 scalars
-                        // Callee entry overrides: last_instr=-1, vsd=nlocals.
-                        // debugdata=0, lastblock=0 (null).
-                        // Non-self-recursive also overrides pycode and w_globals.
+                        // Callee entry overrides: last_instr=-1, vsd=nlocals,
+                        // debugdata=0 (None), lastblock=0 (None).
+                        // Non-self-recursive also overrides pycode and
+                        // w_globals.
                         let mut const_overrides = vec![
                             (1, -1),                    // slot 1 = last_instr = -1
                             (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
@@ -5528,8 +5542,7 @@ impl MIFrame {
                 // no inline fail_args and lets `capture_resumedata` +
                 // `_number_boxes` populate them from the snapshot
                 // chain.
-                let (_all_fail_args, all_types) =
-                    this.extend_fail_args_and_types_with_parents(ctx, Vec::new(), fail_arg_types);
+                let all_types = this.extend_types_with_parents(ctx, fail_arg_types);
                 let snapshot_id = ctx.capture_resumedata(snapshot);
 
                 let exc_type_const = ctx.const_int(exc_type_ptr);

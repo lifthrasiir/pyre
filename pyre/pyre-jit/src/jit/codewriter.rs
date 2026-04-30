@@ -2851,10 +2851,11 @@ impl CodeWriter {
         // PRE-EXISTING-ADAPTATION: literal field indices crystallised at
         // the codewriter call site. RPython looks up the index dynamically
         // through `VABLEINFO.static_field_descrs` since each backend may
-        // reorder fields. Pyre's `interp_jit.py:25-31` `_virtualizable_`
-        // declaration has fixed order [last_instr, pycode, valuestackdepth,
-        // debugdata, lastblock, w_globals], so the literals match
-        // `virtualizable_spec.rs`.
+        // reorder fields. Pyre's `_virtualizable_` order matches PyPy
+        // `interp_jit.py:25-31` line by line:
+        // [last_instr, pycode, valuestackdepth, debugdata, lastblock,
+        // w_globals], so the literals match
+        // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;

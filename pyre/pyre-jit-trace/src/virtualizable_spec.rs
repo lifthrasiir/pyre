@@ -5,15 +5,34 @@
 
 pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 
-/// Virtualizable scalar fields in canonical PyPy index order.
-/// interp_jit.py:25-31: last_instr, pycode, valuestackdepth,
-/// debugdata, lastblock, w_globals
+/// Virtualizable scalar fields, in line-by-line PyPy parity order with
+/// `pypy/module/pypyjit/interp_jit.py:25-31`'s `_virtualizable_`
+/// declaration.  PyPy lists
+/// `[last_instr, pycode, valuestackdepth, debugdata, lastblock,
+/// w_globals]`; pyre keeps the same six static fields and the same
+/// ordering so `VirtualizableInfo::static_fields` matches RPython's
+/// `rpython/jit/metainterp/virtualizable.py:71 static_field_descrs`
+/// length.
+///
+/// Note on `lastblock` semantics: PyPy's bytecode emits
+/// `SETUP_FINALLY` / `SETUP_EXCEPT` / `POP_BLOCK` (`pyopcode.py:1268`)
+/// which mutate `frame.lastblock` on the hot path and the JIT must
+/// track those mutations via `_opimpl_setfield_vable`.  CPython 3.14's
+/// compiler emits no such opcodes — try/except/finally goes through
+/// the zero-cost `co_exceptiontable` side table consulted only on
+/// raise.  Under pyre's 3.14 bytecode the slot is therefore JIT-scope
+/// invariant, but the layout slot is preserved for line-by-line PyPy
+/// parity (the legacy SETUP_*/POP_BLOCK interpreter path at
+/// `pyre-interpreter/src/eval.rs:306-308` still mutates the heap
+/// field, and any future port of those opcode handlers must emit
+/// `setfield_vable_r` per RPython
+/// `pyjitpl.py:1188 _opimpl_setfield_vable`).
 pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
-    ("last_instr", 0),
-    ("pycode", 1),
+    ("last_instr", 0),      // interp_jit.py:25 last_instr
+    ("pycode", 1),          // interp_jit.py:25 pycode
     ("valuestackdepth", 2), // interp_jit.py:26 valuestackdepth
     ("debugdata", 3),       // interp_jit.py:28 debugdata
-    ("lastblock", 4),       // interp_jit.py:29 lastblock
+    ("lastblock", 4),       // interp_jit.py:30 lastblock
     ("w_globals", 5),       // interp_jit.py:31 w_globals
 ];
 

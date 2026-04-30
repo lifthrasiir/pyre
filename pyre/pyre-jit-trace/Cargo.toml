@@ -10,6 +10,7 @@ description = "Trace-time JIT for pyre — MIFrame and tracing logic"
 default = []
 cranelift = ["dep:majit-backend-cranelift", "majit-metainterp/cranelift"]
 dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
+test-support = []
 
 [dependencies]
 pyre-object = { workspace = true }

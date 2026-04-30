@@ -1008,6 +1008,92 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
     frame_liveness_reg_indices_by_bank_at(jitcode_index, pc).flattened()
 }
 
+/// Test-only fixture seeder for `_with_compiled_trace_jitcode` unit tests.
+/// Gated behind `#[cfg(any(test, feature = "test-support"))]` so production
+/// builds cannot reach the synthetic register-bank fill — RPython has no
+/// counterpart and live holes get filled with `0xfeed` / `0` dummy consts
+/// that would corrupt a real trace if invoked outside fixtures.
+///
+/// `pyjitpl.py:218-225 get_list_of_active_boxes` reads each live register
+/// directly from its kind-specific bank (`registers_i[reg]` /
+/// `registers_r[reg]` / `registers_f[reg]`); commit
+/// `3fdb617f5d1` removed pyre's prior `registers_r_semantic` fallback to
+/// match that contract. Production tracers fill the kind banks via
+/// `bcd_op` dispatch as the trace is recorded, but unit-test fixtures
+/// build a `PyreSym` directly through `from_test_state` and never run the
+/// dispatch loop — without seeding, `current_fail_args` returns a vector
+/// full of `OpRef::NONE` holes.
+///
+/// This helper mirrors what production code does:
+///   1. `setup_kind_register_banks` to size the three banks +
+///      copy-constants per `pyjitpl.py:97-119`.
+///   2. Place each `(stack_depth, opref)` at the post-regalloc
+///      Ref-bank color from `stack_slot_color_map[depth]` AND at the
+///      semantic prefix slot `registers_r[nlocals + depth]`. Both
+///      writes target the same `registers_r` Vec — the two indices
+///      differ once `apply_rename` reshuffles colors.
+///   3. Fill any still-`OpRef::NONE` slot listed in `live_pc`'s
+///      bank-split liveness with a typed dummy constant (`const_int`
+///      / `const_ref` / `const_float`) so `get_list_of_active_boxes`
+///      returns a hole-free `Vec<OpRef>`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn seed_compiled_trace_jitcode_test_state(
+    sym: &mut PyreSym,
+    ctx: &mut TraceCtx,
+    jitcode_index: i32,
+    live_pc: i32,
+    stack_slots: &[(usize, OpRef)],
+) {
+    if !sym.jitcode.is_null() {
+        sym.setup_kind_register_banks(ctx);
+    }
+
+    let stack_color_map = stack_slot_color_map_at(jitcode_index);
+    let nlocals = sym.nlocals;
+    for &(depth, opref) in stack_slots {
+        let semantic_idx = nlocals + depth;
+        if semantic_idx < sym.registers_r.len() {
+            sym.registers_r[semantic_idx] = opref;
+        }
+        if let Some(&color) = stack_color_map.get(depth) {
+            let ridx = color as usize;
+            if ridx >= sym.registers_r.len() {
+                sym.registers_r.resize(ridx + 1, OpRef::NONE);
+            }
+            sym.registers_r[ridx] = opref;
+        }
+    }
+
+    let banks = frame_liveness_reg_indices_by_bank_at(jitcode_index, live_pc);
+    for &reg in &banks.int {
+        let r = reg as usize;
+        if r >= sym.registers_i.len() {
+            sym.registers_i.resize(r + 1, OpRef::NONE);
+        }
+        if sym.registers_i[r].is_none() {
+            sym.registers_i[r] = ctx.const_int(0xfeed);
+        }
+    }
+    for &reg in &banks.ref_ {
+        let r = reg as usize;
+        if r >= sym.registers_r.len() {
+            sym.registers_r.resize(r + 1, OpRef::NONE);
+        }
+        if sym.registers_r[r].is_none() {
+            sym.registers_r[r] = ctx.const_ref(0xfeed);
+        }
+    }
+    for &reg in &banks.float {
+        let r = reg as usize;
+        if r >= sym.registers_f.len() {
+            sym.registers_f.resize(r + 1, OpRef::NONE);
+        }
+        if sym.registers_f[r].is_none() {
+            sym.registers_f[r] = ctx.const_float(0);
+        }
+    }
+}
+
 /// Return the post-regalloc Ref-bank color of each Python-semantic stack
 /// slot for the registered jitcode at `jitcode_index`. Mirrors the
 /// `metadata.stack_slot_color_map` Vec stored on `PyJitCode` (sized
@@ -2583,9 +2669,13 @@ impl PyreSym {
     ///      `setup_bridge_sym` calls `seed_virtualizable_boxes` to
     ///      repopulate the shadow from resume data. `is_active_vable_owner`
     ///      is cleared (`clear_active_vable`) because the bridge's
-    ///      inputarg layout lacks the 7-slot scalar header that
-    ///      `init_vable_indices` assumes; the frame still owns the shadow
-    ///      semantically though.
+    ///      inputarg layout lacks the `[frame, last_instr, pycode,
+    ///      valuestackdepth, debugdata, w_globals]` scalar header that
+    ///      `init_vable_indices` assumes (see `virtualizable_spec.rs::
+    ///      PYFRAME_VABLE_FIELDS` for the canonical 5-scalar layout —
+    ///      PyPy's `lastblock` slot is omitted under CPython 3.14
+    ///      bytecode); the frame still owns the shadow semantically
+    ///      though.
     ///
     /// Callee inline frames (`inline_function_call` allocates a fresh
     /// `PyreSym::new_uninit`) keep both fields at their defaults and
@@ -2616,10 +2706,12 @@ impl PyreSym {
 
     /// Demote this frame from active virtualizable owner. Used at bridge
     /// setup (`setup_bridge_sym`) where the bridge's inputarg layout
-    /// does not have the 7-slot scalar header that the loop-portal
-    /// `init_vable_indices` assumes; subsequent reads consult
-    /// `bridge_local_oprefs` or fall through to the heap array via
-    /// `locals_cells_stack_array_ref`.
+    /// does not have the `[frame, last_instr, pycode, valuestackdepth,
+    /// debugdata, w_globals]` scalar header that the loop-portal
+    /// `init_vable_indices` assumes (canonical 5-scalar layout in
+    /// `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`); subsequent reads
+    /// consult `bridge_local_oprefs` or fall through to the heap array
+    /// via `locals_cells_stack_array_ref`.
     pub(crate) fn clear_active_vable(&mut self) {
         self.vable_array_base = None;
         self.is_active_vable_owner = false;
@@ -4684,7 +4776,7 @@ impl JitState for PyreJitState {
         // Layout mirrors virtualizable.py:86-98 read_boxes():
         //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
         //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
-        //      vable_debugdata, vable_lastblock, vable_w_globals)
+        //      vable_debugdata, vable_w_globals)
         //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
         //     (bridge_locals followed by reserved stack slots)
         //   boxes[-1] = vable identity (sym.frame)

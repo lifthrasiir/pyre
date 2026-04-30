@@ -25,7 +25,9 @@ majit_macros::virtualizable! {
     // Must match `fields` order — RPython includes ALL static fields
     // in unroll_static_fields (virtualizable.py:90-93 read_boxes).
     // Layout: [frame:Ref, last_instr:Int, pycode:Ref, valuestackdepth:Int,
-    //          debugdata:Ref, lastblock:Ref, w_globals:Ref, array...]
+    //          debugdata:Ref, lastblock:Ref, w_globals:Ref, array...].
+    // Mirrors `pypy/module/pypyjit/interp_jit.py:25-31`'s
+    // `_virtualizable_` declaration line by line.
     //
     // NOTE on `extra_reds`: the macro now also accepts an `extra_reds`
     // block for non-vable JitDriver reds (`interp_jit.py:67 reds =
@@ -51,8 +53,8 @@ majit_macros::virtualizable! {
     // Array items are PyObjectRef (Ref)
     array_item_type = Ref,
 
-    // VirtualizableInfo field layout (byte offsets)
-    // interp_jit.py:25-31 order (excluding array field)
+    // VirtualizableInfo field layout (byte offsets).
+    // interp_jit.py:25-31 order — line-by-line PyPy parity.
     fields = {
         last_instr: int @ PYFRAME_LAST_INSTR_OFFSET,
         pycode: ref @ PYFRAME_PYCODE_OFFSET,

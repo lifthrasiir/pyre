@@ -60,8 +60,25 @@ pub struct PyFrame {
     /// Absolute index into `locals_cells_stack_w` marking the top of the
     /// operand stack. Starts at `nlocals + ncells` (empty stack), grows upward.
     pub valuestackdepth: usize,
-    /// pyframe.py:72 last_instr — index of the last executed instruction.
-    /// PyPy initializes to -1; get_last_lineno uses this for offset2lineno.
+    /// `pyframe.py:72 last_instr` — index of the last executed instruction.
+    /// PyPy initializes to -1; `get_last_lineno` uses this for `offset2lineno`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (Stage 3 / Task #118): pyre stores the PC of
+    /// the last executed instruction here (matches CPython's `f_lasti`
+    /// semantic, returned directly by `fget_f_lasti`). RPython's runtime
+    /// stores `last_instr = next_instr` instead, set every dispatch by
+    /// `pypy/interpreter/pyopcode.py:172 self.last_instr = intmask(next_instr)`,
+    /// so RPython's `last_instr` is one ahead of pyre's. The two conventions
+    /// are equivalent modulo ±1; `next_instr()` below adds one to recover
+    /// PyPy's view, and JIT shadow code (`vable_last_instr`) is consistently
+    /// produced as `pc - 1` and consumed as such across both pyre-jit and
+    /// pyre-jit-trace. Flipping storage to RPython's convention is
+    /// achievable but requires an atomic 30+ site mechanical rewrite (every
+    /// `vable_last_instr = ctx.const_int(pc - 1)` producer plus the
+    /// downstream readers) with no observable behavior change. Until that is
+    /// done the divergence is documented but accepted; cited at
+    /// `pypy/interpreter/pyopcode.py:172` and
+    /// `pypy/module/pypyjit/interp_jit.py:25`.
     pub last_instr: isize,
     /// pyframe.py:80 escaped — see mark_as_escaped()
     pub escaped: bool,
@@ -1667,6 +1684,10 @@ impl PyFrame {
         self.f_generator_nowref
     }
 
+    /// Returns RPython's `last_instr` (= `next_instr`) value, derived from
+    /// pyre's CPython-aligned storage. See the field comment on `last_instr`
+    /// for the convention difference. PyPy `pyopcode.py:172` would read this
+    /// field directly; pyre derives it because storage matches `f_lasti`.
     #[inline]
     pub fn next_instr(&self) -> usize {
         if self.last_instr < 0 {
@@ -1676,6 +1697,9 @@ impl PyFrame {
         }
     }
 
+    /// Inverse of `next_instr()`. Stores `next_instr - 1` so the field
+    /// continues to satisfy `f_lasti = last_instr` (CPython convention).
+    /// RPython would write `next_instr` directly here.
     #[inline]
     pub fn set_last_instr_from_next_instr(&mut self, next_instr: usize) {
         self.last_instr = next_instr as isize - 1;
