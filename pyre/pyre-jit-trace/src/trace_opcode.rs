@@ -225,28 +225,40 @@ use crate::helpers::TraceHelperAccess;
 /// `metainterp.virtualizable_boxes` and hands it to
 /// `rpython/jit/metainterp/opencoder.py:718
 /// _list_of_boxes_virtualizable(boxes)` with no fallback heap source.
-/// Pyre matches that single-source model in spirit: under CPython 3.14
-/// only `last_instr` / `valuestackdepth` advance per-opcode, and the
-/// snapshot rewrites them in `s.vable_*` to the pre-opcode value at
-/// `orgpc - 1`.  The other three scalars (`pycode`, `debugdata`,
-/// `w_globals`) are JIT-scope invariant and stay bound to the inputarg
-/// OpRefs `init_vable_indices` seeded at trace start (PyPy-style
-/// `lastblock` is absent — see `virtualizable_spec.rs:8-23`).  The
-/// snapshot does not mirror its `s.vable_*` overrides into the shared
-/// shadow because the shared shadow is the JUMP/JIT-time view (live
-/// virtualizable values that `gen_writeback_vable_to_heap` and
-/// `close_loop_args_at` consume), while `s.vable_last_instr/vsd` carry
-/// the pre-opcode override that the snapshot reader needs.  The two
-/// stores stay distinct deliberately: `record_branch_guard` saves
-/// `s.vable_last_instr/vsd` before flushing and restores them after
-/// the snapshot is built, but the shared shadow has no symmetric
-/// save/restore — mirroring the override there would leak the
-/// pre-opcode value into the JUMP path.
+/// Pyre matches that single-source model in spirit for the two
+/// per-opcode-advancing fields: `last_instr` / `valuestackdepth` are
+/// rewritten in `s.vable_*` to their pre-opcode value at `orgpc - 1`
+/// before the snapshot is built.  The other four scalars (`pycode`,
+/// `debugdata`, `lastblock`, `w_globals`) keep whatever OpRef
+/// `init_vable_indices` seeded at trace start because the tracer
+/// never reaches their mutators under CPython 3.14 bytecode
+/// (`pycode` / `w_globals`: only `pyframe.rs::frame_reinit`;
+/// `debugdata`: only `getorcreate_debug_data` on debug paths;
+/// `lastblock`: only `pyopcode.py:1268
+/// SETUP_FINALLY/SETUP_EXCEPT/POP_BLOCK` which CPython 3.14 no
+/// longer emits — try/except/finally goes through the zero-cost
+/// `co_exceptiontable` consulted only on raise).  Convergence to
+/// RPython's pure single-source model requires emitting
+/// `_opimpl_setfield_vable` for those handlers if/when they are
+/// re-introduced, after which the heap remains authoritative through
+/// `metainterp.virtualizable_boxes` rather than through the snapshot
+/// reader's own state.
+///
+/// The snapshot does not mirror its `s.vable_*` overrides into the
+/// shared shadow because the shared shadow is the JUMP/JIT-time view
+/// (live virtualizable values that `gen_writeback_vable_to_heap` and
+/// `close_loop_args_at` consume), while `s.vable_last_instr/vsd`
+/// carry the pre-opcode override that the snapshot reader needs.
+/// The two stores stay distinct deliberately: `record_branch_guard`
+/// saves `s.vable_last_instr/vsd` before flushing and restores them
+/// after the snapshot is built, but the shared shadow has no
+/// symmetric save/restore — mirroring the override there would leak
+/// the pre-opcode value into the JUMP path.
 ///
 /// `static_field_name` matches the canonical PyFrame virtualizable
-/// spec at `virtualizable_spec.rs:24-30`
+/// spec at `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`
 /// (`last_instr`, `pycode`, `valuestackdepth`, `debugdata`,
-/// `w_globals`).
+/// `lastblock`, `w_globals`).
 ///
 /// No-op when `virtualizable_boxes` is not yet seeded
 /// (non-virtualizable trace, or before `init_virtualizable_boxes`).
@@ -1821,13 +1833,17 @@ impl MIFrame {
         // the one at `orgpc`, so the snapshot must encode the pre-opcode
         // state (`last_instr = orgpc - 1`, `valuestackdepth = pre-opcode
         // depth via pre_opcode_registers_r / portal_bridge_vable_vsd`).
-        // The other three scalars (`pycode`, `debugdata`, `w_globals`)
-        // are JIT-scope invariant under CPython 3.14 bytecode: set only
-        // by `pyframe.rs::frame_reinit` (`pycode` / `w_globals`) and by
-        // `getorcreate_debug_data` (`debugdata`, never reached during
-        // tracing). Their `s.vable_*` slots stay bound to the inputarg
-        // OpRefs `init_vable_indices` seeded at trace start, matching
-        // RPython's "boxes carry vable inputargs" model.
+        // The other four scalars (`pycode`, `debugdata`, `lastblock`,
+        // `w_globals`) keep the inputarg OpRefs `init_vable_indices`
+        // seeded at trace start because pyre-jit-trace never enters
+        // their mutators under CPython 3.14 bytecode: `pycode` /
+        // `w_globals` are set only by `pyframe.rs::frame_reinit`;
+        // `debugdata` only by `getorcreate_debug_data` on debug paths;
+        // `lastblock` only by `pyopcode.py:1268 SETUP_*/POP_BLOCK`,
+        // none of which CPython 3.14 emits.  This matches RPython's
+        // "boxes carry vable inputargs" model — see
+        // `mirror_vable_static_to_boxes` doc for the convergence path
+        // when those handlers are re-introduced.
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
         let vsd_op = ctx.const_int(vsd);
@@ -2792,10 +2808,24 @@ impl MIFrame {
     /// `op.store_final_boxes(liveboxes)` (mod.rs:3392), so an inline
     /// `fail_args` collection is redundant — only the per-frame
     /// `parent_types` need to flow into `record_guard_typed`.
+    ///
+    /// `build_framestack_snapshot` strips the `[s.frame, s.vable_*..]`
+    /// scalar inputarg header from each parent frame's snapshot boxes
+    /// (`opencoder.py:806` — parent frames contribute only active
+    /// boxes; the virtualizable section is emitted once for the whole
+    /// snapshot via `list_of_boxes_virtualizable`).  Mirror that here
+    /// so the static type vector matches the static box shape per
+    /// frame, otherwise the inline `fail_arg_types` stretched parent
+    /// types over the snapshot's header-less box positions before the
+    /// optimizer's snapshot-derived overwrite hid the divergence.
     fn extend_types_with_parents(&mut self, ctx: &mut TraceCtx, mut types: Vec<Type>) -> Vec<Type> {
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         for parent in self.parent_frames.clone() {
-            let (parent_types, _jitcode_index) = self.materialize_parent_frame_state(ctx, parent);
-            types.extend_from_slice(&parent_types);
+            let (parent_types_full, _jitcode_index) =
+                self.materialize_parent_frame_state(ctx, parent);
+            if parent_types_full.len() > n {
+                types.extend_from_slice(&parent_types_full[n..]);
+            }
         }
         types
     }
@@ -3053,29 +3083,68 @@ impl MIFrame {
         // `metainterp.virtualizable_boxes` exclusively.  Pyre reads
         // `sym.vable_field_oprefs()` because that store carries the
         // pre-opcode override that `flush_to_frame_for_guard` writes
-        // for the snapshot reader (see `mirror_vable_static_to_boxes`
-        // doc).  The shared `ctx.virtualizable_boxes` is the JUMP/JIT-
-        // time view: continuously mirrored by push/pop and
-        // setfield_vable, but never carries the orgpc-1 / pre-opcode
-        // vsd override, so its slot 2 lies post-push at guard time.
+        // for the snapshot reader's `last_instr` / `valuestackdepth`
+        // (see `mirror_vable_static_to_boxes` doc).  The shared
+        // `ctx.virtualizable_boxes` is the JUMP/JIT-time view:
+        // continuously mirrored by push/pop and setfield_vable, but
+        // never carries the orgpc-1 / pre-opcode vsd override, so its
+        // slot 2 lies post-push at guard time.  Both stores carry the
+        // same trace-start inputarg OpRefs for the four invariant
+        // scalars (`pycode`, `debugdata`, `lastblock`, `w_globals`)
+        // because their mutators are unreachable under CPython 3.14
+        // bytecode.
         //
-        // Per-slot freshness today:
-        //   slot 0 (last_instr): publish_last_instr_to_vable mirrors
-        //     `pc - 1` into both stores at every opcode, so a switch
-        //     would be safe for this slot in isolation.
+        // Per-slot freshness today (layout per
+        // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`):
+        //   slot 0 (last_instr): `publish_last_instr_to_vable`
+        //     mirrors `pc - 1` into both stores at every opcode; a
+        //     switch would be safe for this slot in isolation.
+        //   slot 1 (pycode): JIT-scope invariant — set only by
+        //     `pyframe.rs::frame_reinit` outside any trace; both
+        //     stores carry the trace-start inputarg OpRef.
         //   slot 2 (valuestackdepth): push/pop mirror the post-state
-        //     into both stores; only `s.vable_valuestackdepth` carries
-        //     the flush-time pre-opcode override.  A switch needs a
-        //     symmetric save/restore around the snapshot build.
-        //   slots 1/3/4 (pycode / debugdata / w_globals): JIT-scope
-        //     invariant under CPython 3.14 — both stores carry the
-        //     trace-start inputarg OpRefs that `init_vable_indices`
-        //     seeded.
+        //     into both stores; only `s.vable_valuestackdepth`
+        //     carries the flush-time pre-opcode override.  A switch
+        //     needs a symmetric save/restore around the snapshot
+        //     build (the same pattern `record_branch_guard` uses for
+        //     `s.vable_*` would need to be pushed onto
+        //     `ctx.virtualizable_boxes`).
+        //   slot 3 (debugdata): mutated lazily by
+        //     `pyframe.rs::getorcreate_debug_data` on debug paths the
+        //     tracer never enters; both stores carry the trace-start
+        //     inputarg OpRef.
+        //   slot 4 (lastblock): mutated only by
+        //     `pyopcode.py:1268 SETUP_*/POP_BLOCK` which CPython 3.14
+        //     no longer emits (the legacy interpreter path
+        //     `pyre-interpreter/src/eval.rs:306-308` still mutates
+        //     the heap field but the tracer never enters those
+        //     handlers); both stores carry the trace-start inputarg
+        //     OpRef.
+        //   slot 5 (w_globals): JIT-scope invariant — set only by
+        //     `pyframe.rs::frame_reinit`; same trajectory as slot 1.
         //
-        // Net: a unified reader is feasible per slot but would require
-        // pushing the pre-opcode override pattern (currently localized
-        // in `s.vable_*` via `record_branch_guard` save/restore) onto
-        // `ctx.virtualizable_boxes` as well.
+        // Net: a unified reader on `ctx.virtualizable_boxes` is the
+        // RPython-orthodox direction but is empirically blocked.  An
+        // attempted switch on 2026-04-30 — read all six static slots
+        // from `ctx.virtualizable_boxes` and recompute slot 2 inline
+        // from `pre_opcode_registers_r` / `portal_bridge_vable_vsd`
+        // so no save/restore on the shared shadow was needed —
+        // regressed `fib_recursive` to a >5s timeout on both dynasm
+        // and cranelift backends and slowed `nested_loop` by 2-3x.
+        // The on-the-fly slot-2 override matches the value
+        // `flush_to_frame_for_guard` writes into `s.vable_
+        // valuestackdepth`, so the regression points at a deeper
+        // reader-side mismatch (likely bridge-import shadow seeding
+        // or parent-frame snapshot capture order) rather than at
+        // slot freshness alone.  Until that root cause is isolated,
+        // the snapshot reader stays on `sym.vable_field_oprefs()`
+        // and the convergence path is "diagnose + close the
+        // bridge/parent-frame mismatch first, then switch the
+        // reader" — multi-session.  No additional `_opimpl_setfield_
+        // vable` emission would be needed for slots 3/4 today
+        // because their mutators are unreachable; that requirement
+        // only resurfaces if pyre re-introduces SETUP_*/POP_BLOCK
+        // or debug-mode tracing.
         let vable_static_types: Vec<majit_ir::Type> = ctx
             .virtualizable_info()
             .map(|info| info.static_fields.iter().map(|f| f.field_type).collect())

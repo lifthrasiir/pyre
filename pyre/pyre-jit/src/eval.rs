@@ -4458,9 +4458,9 @@ fn rebuild_typed_from_rd_numb(
     // Frame registers fill frame.registers_i/r/f independently.
 
     // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
-    //                 valuestackdepth(3), debugdata(4), w_globals(5),
-    //                 array...]  (5 scalars + frame ptr; PyPy's
-    // `lastblock` slot is omitted under CPython 3.14 bytecode — see
+    //                 valuestackdepth(3), debugdata(4), lastblock(5),
+    //                 w_globals(6), array...]  (6 scalars + frame ptr,
+    // line-by-line PyPy parity with `interp_jit.py:25-31` — see
     // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`).
     // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
@@ -4847,7 +4847,10 @@ fn build_resumed_frames(
                 // resolved_vable layout (opencoder.py:722
                 // _list_of_boxes_virtualizable parity):
                 //   [0]            virtualizable_ptr  (= the frame itself)
-                //   [1..num_scalars] static fields    (next_instr, code, vsd, ns)
+                //   [1..num_scalars] static fields
+                //     (last_instr, pycode, valuestackdepth, debugdata,
+                //      lastblock, w_globals — line-by-line PyPy parity
+                //      with `interp_jit.py:25-31`)
                 //   [num_scalars..] array items
                 //
                 // resume.py:1406 exact-size invariant:

@@ -2670,12 +2670,12 @@ impl PyreSym {
     ///      repopulate the shadow from resume data. `is_active_vable_owner`
     ///      is cleared (`clear_active_vable`) because the bridge's
     ///      inputarg layout lacks the `[frame, last_instr, pycode,
-    ///      valuestackdepth, debugdata, w_globals]` scalar header that
-    ///      `init_vable_indices` assumes (see `virtualizable_spec.rs::
-    ///      PYFRAME_VABLE_FIELDS` for the canonical 5-scalar layout —
-    ///      PyPy's `lastblock` slot is omitted under CPython 3.14
-    ///      bytecode); the frame still owns the shadow semantically
-    ///      though.
+    ///      valuestackdepth, debugdata, lastblock, w_globals]` scalar
+    ///      header that `init_vable_indices` assumes (see
+    ///      `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` for the
+    ///      canonical 6-scalar layout — line-by-line PyPy parity with
+    ///      `interp_jit.py:25-31`); the frame still owns the shadow
+    ///      semantically though.
     ///
     /// Callee inline frames (`inline_function_call` allocates a fresh
     /// `PyreSym::new_uninit`) keep both fields at their defaults and
@@ -2707,11 +2707,11 @@ impl PyreSym {
     /// Demote this frame from active virtualizable owner. Used at bridge
     /// setup (`setup_bridge_sym`) where the bridge's inputarg layout
     /// does not have the `[frame, last_instr, pycode, valuestackdepth,
-    /// debugdata, w_globals]` scalar header that the loop-portal
-    /// `init_vable_indices` assumes (canonical 5-scalar layout in
-    /// `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`); subsequent reads
-    /// consult `bridge_local_oprefs` or fall through to the heap array
-    /// via `locals_cells_stack_array_ref`.
+    /// debugdata, lastblock, w_globals]` scalar header that the
+    /// loop-portal `init_vable_indices` assumes (canonical 6-scalar
+    /// layout in `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`);
+    /// subsequent reads consult `bridge_local_oprefs` or fall through
+    /// to the heap array via `locals_cells_stack_array_ref`.
     pub(crate) fn clear_active_vable(&mut self) {
         self.vable_array_base = None;
         self.is_active_vable_owner = false;
@@ -4776,7 +4776,7 @@ impl JitState for PyreJitState {
         // Layout mirrors virtualizable.py:86-98 read_boxes():
         //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
         //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
-        //      vable_debugdata, vable_w_globals)
+        //      vable_debugdata, vable_lastblock, vable_w_globals)
         //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
         //     (bridge_locals followed by reserved stack slots)
         //   boxes[-1] = vable identity (sym.frame)
