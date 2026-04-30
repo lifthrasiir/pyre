@@ -2763,9 +2763,9 @@ impl Assembler386 {
     /// x86/assembler.py:1797-1801 `generate_guard_no_exception`.
     fn emit_cmp_no_exception(&mut self) {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
         dynasm!(self.mc ; .arch x64
-            ; mov Rq(scratch), QWORD exc_value_addr
+            ; mov Rq(scratch), QWORD exc_type_addr
             ; cmp QWORD [Rq(scratch)], 0
         );
     }

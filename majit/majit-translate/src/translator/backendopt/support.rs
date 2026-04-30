@@ -16,10 +16,6 @@
 //!
 //! Deferred:
 //!
-//! * `annotate(translator, func, result, args)` (`:20-25`) — needs
-//!   `RPythonTyper.annotate_helper` + `inputconst`. Both partial
-//!   today; this helper lands when the rtyper pass that calls it
-//!   (`malloc.py::remove_mallocs` and friends) lands.
 //! * `log = AnsiLogger("backendopt")` (`:6`) — pyre's logger
 //!   channels are unported; helpers that emit through `log` use
 //!   no-op stubs in their callers.
@@ -38,11 +34,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::flowspace::model::{
-    BlockKey, BlockRef, ConstValue, FunctionGraph, GraphRef, Hlvalue, LinkRef, SpaceOperation,
-    Variable,
+    BlockKey, BlockRef, ConstValue, Constant, FunctionGraph, GraphKey, GraphRef, Hlvalue, LinkRef,
+    SpaceOperation, Variable,
 };
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, functionptr};
+use crate::translator::rtyper::rmodel::inputconst_from_lltype;
 use crate::translator::simplify::get_graph_for_call;
+use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
 /// `graph_operations(graph)` at `support.py:9-12`.
@@ -85,26 +83,48 @@ pub fn all_operations(graphs: &[GraphRef]) -> Vec<SpaceOperation> {
 ///     return c
 /// ```
 ///
-/// **Deferred — needs `RPythonTyper.annotate_helper` (rtyper-side
-/// wrapper that lifts lltype args into SomeValues and delegates to
-/// the annotator) and `rmodel.inputconst` to land first.** The
-/// annotator-side `RPythonAnnotator::annotate_helper` is already
-/// ported (`annrpython.rs:610-639`), but it consumes
-/// `Vec<SomeValue>`, not the lltype-args shape upstream wraps. The
-/// signature is published here so future callers (`malloc.py` and
-/// `escape.py` when those land) can write the upstream-shaped call;
-/// the body returns a `TaskError` until the deps arrive.
 pub fn annotate(
-    _translator: &TranslationContext,
-    _func: &crate::flowspace::model::HostObject,
-    _result: &Hlvalue,
-    _args: &[Hlvalue],
-) -> Result<crate::flowspace::model::Constant, crate::translator::tool::taskengine::TaskError> {
-    Err(crate::translator::tool::taskengine::TaskError {
-        message: "support.py:20-25 annotate: requires \
-                  RPythonTyper.annotate_helper + rmodel.inputconst \
-                  (unported)"
-            .to_string(),
+    translator: &TranslationContext,
+    func: &crate::flowspace::model::HostObject,
+    result: &Hlvalue,
+    args: &[Hlvalue],
+) -> Result<Constant, TaskError> {
+    let rtyper = translator.rtyper().ok_or_else(|| TaskError {
+        message: "support.py:22 annotate: translator.rtyper is None".to_string(),
+    })?;
+    let arg_types: Vec<LowLevelType> = args
+        .iter()
+        .map(|arg| {
+            hlvalue_concretetype(arg).ok_or_else(|| TaskError {
+                message: "support.py:21 annotate: argument missing concretetype".to_string(),
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let result_type = hlvalue_concretetype(result).ok_or_else(|| TaskError {
+        message: "support.py:23 annotate: result missing concretetype".to_string(),
+    })?;
+    let graph = rtyper
+        .annotate_helper(
+            func,
+            arg_types.clone().into_iter().map(Into::into).collect(),
+        )
+        .map_err(|e| TaskError {
+            message: format!("support.py:22 annotate_helper: {e}"),
+        })?;
+    let ftype = FuncType {
+        args: arg_types,
+        result: result_type,
+    };
+    let name = func.simple_name().to_string();
+    let fptr = functionptr(
+        ftype,
+        &name,
+        Some(GraphKey::of(&graph.graph).as_usize()),
+        None,
+    );
+    let ptr_type = LowLevelType::Ptr(Box::new(fptr._TYPE.clone()));
+    inputconst_from_lltype(&ptr_type, &ConstValue::LLPtr(Box::new(fptr))).map_err(|e| TaskError {
+        message: format!("support.py:24 inputconst(typeOf(fptr), fptr): {e}"),
     })
 }
 
@@ -122,6 +142,13 @@ pub fn var_needsgc(var: &Variable) -> bool {
     match var.concretetype() {
         Some(LowLevelType::Ptr(ptr)) => ptr._needsgc(),
         _ => false,
+    }
+}
+
+fn hlvalue_concretetype(value: &Hlvalue) -> Option<LowLevelType> {
+    match value {
+        Hlvalue::Variable(v) => v.concretetype(),
+        Hlvalue::Constant(c) => c.concretetype.clone(),
     }
 }
 

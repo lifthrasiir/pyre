@@ -2958,7 +2958,7 @@ impl AssemblerARM64 {
 
     /// aarch64/opassembler.py:720-724 `emit_op_guard_no_exception`.
     fn emit_cmp_no_exception(&mut self) {
-        self.emit_mov_imm64(16, crate::jit_exc_value_addr() as i64);
+        self.emit_mov_imm64(16, crate::jit_exc_type_addr() as i64);
         dynasm!(self.mc ; .arch aarch64
             ; ldr x16, [x16]
             ; cmp x16, xzr

@@ -31,6 +31,7 @@ use crate::flowspace::model::{
     GraphKey, GraphRef, HOST_ENV, Hlvalue, Link, LinkRef, SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::rtyper::annlowlevel::{LowLevelAnnotatorPolicy, annotate_lowlevel_helper};
 use crate::translator::rtyper::error::{TyperError, TyperWhere};
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
@@ -448,6 +449,35 @@ pub fn constant_result_values_agree(rv: &ConstValue, s_const: &ConstValue) -> bo
     }
 }
 
+/// RPython `RPythonTyper.annotate_helper(..., argtypes)` accepts a
+/// mixed list: each item is either already an `annmodel.SomeObject` or
+/// a low-level type that must pass through `lltype_to_annotation`.
+/// Rust carries that Python union explicitly.
+#[derive(Clone, Debug)]
+pub enum AnnotateHelperArg {
+    Annotation(SomeValue),
+    LlType(LowLevelType),
+}
+
+impl From<SomeValue> for AnnotateHelperArg {
+    fn from(value: SomeValue) -> Self {
+        AnnotateHelperArg::Annotation(value)
+    }
+}
+
+impl From<LowLevelType> for AnnotateHelperArg {
+    fn from(value: LowLevelType) -> Self {
+        AnnotateHelperArg::LlType(value)
+    }
+}
+
+fn annotate_helper_arg_to_annotation(s: AnnotateHelperArg) -> SomeValue {
+    match s {
+        AnnotateHelperArg::Annotation(s) => s,
+        AnnotateHelperArg::LlType(t) => lltype_to_annotation(t),
+    }
+}
+
 impl RPythonTyper {
     /// RPython `RPythonTyper.__init__(self, annotator, backend=...)`.
     ///
@@ -634,6 +664,62 @@ impl RPythonTyper {
         getfunctionptr(&graph.graph, |v| {
             self.bindingrepr(v).map(|r| r.lowleveltype().clone())
         })
+    }
+
+    /// RPython `RPythonTyper.annotate_helper(self, ll_function, argtypes)`
+    /// (`rtyper.py:586-603`).
+    pub fn annotate_helper(
+        &self,
+        ll_function: &crate::flowspace::model::HostObject,
+        argtypes: Vec<AnnotateHelperArg>,
+    ) -> Result<Rc<PyGraph>, TyperError> {
+        let annotator = self
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+        let mut args_s = Vec::new();
+        for s in argtypes {
+            // rtyper.py:590-594:
+            //   assume 's' is a low-level type, unless it is already
+            //   an annotation.
+            args_s.push(annotate_helper_arg_to_annotation(s));
+        }
+        let mut function = ll_function;
+
+        // rtyper.py:595-599 — bound method hack:
+        // prepend `im_self`'s immutable annotation and annotate `im_func`.
+        if ll_function.is_bound_method() {
+            let self_obj = ll_function.bound_method_self().ok_or_else(|| {
+                TyperError::message("RPythonTyper.annotate_helper: bound method missing im_self")
+            })?;
+            let s_self = annotator
+                .bookkeeper
+                .immutablevalue(&ConstValue::HostObject(self_obj.clone()))
+                .map_err(|e| TyperError::message(e.to_string()))?;
+            args_s.insert(0, s_self);
+            function = ll_function.bound_method_func().ok_or_else(|| {
+                TyperError::message("RPythonTyper.annotate_helper: bound method missing im_func")
+            })?;
+        }
+
+        let self_rc = self.self_rc()?;
+        annotate_lowlevel_helper(
+            &annotator,
+            function,
+            args_s,
+            Some(LowLevelAnnotatorPolicy::new(Some(&self_rc))),
+        )
+    }
+
+    /// RPython `RPythonTyper.annotate_helper_fn(self, ll_function,
+    /// argtypes)` (`rtyper.py:605-610`).
+    pub fn annotate_helper_fn(
+        &self,
+        ll_function: &crate::flowspace::model::HostObject,
+        argtypes: Vec<AnnotateHelperArg>,
+    ) -> Result<_ptr, TyperError> {
+        let graph = self.annotate_helper(ll_function, argtypes)?;
+        self.getcallable(&graph)
     }
 
     /// RPython `annlowlevel.annotate_lowlevel_helper()` +
@@ -4666,6 +4752,21 @@ mod tests {
         assert!(rtyper.primitive_to_repr.borrow().is_empty());
         assert!(rtyper.rootclass_repr.borrow().is_none());
         assert!(rtyper.instance_reprs.borrow().is_empty());
+    }
+
+    #[test]
+    fn annotate_helper_arg_matches_rtyper_py_someobject_or_lltype_branch() {
+        // rtyper.py:590-594 keeps already-annotation arguments as-is
+        // and only maps low-level types through lltype_to_annotation.
+        let already_annotation = SomeValue::Bool(SomeBool::new());
+        assert!(matches!(
+            annotate_helper_arg_to_annotation(already_annotation.into()),
+            SomeValue::Bool(_)
+        ));
+        assert!(matches!(
+            annotate_helper_arg_to_annotation(LowLevelType::Signed.into()),
+            SomeValue::Integer(_)
+        ));
     }
 
     #[test]

@@ -465,11 +465,12 @@ fn handle_fail_done_with_this_frame(
 /// Also publishes the exception via `jit_exc_raise` so a future
 /// `genop_guard_guard_no_exception` (assembler.py:1782) emitted by
 /// the caller sees the pending exception — symmetric with cranelift's
-/// CALL_ASSEMBLER trampoline path.  The caller's GUARD_NO_EXCEPTION
-/// stub today does not actually compare against `JIT_EXC_VALUE`, so
-/// the publish is a write-only invariant for now; flipping the stub
-/// to a real `mov rax, [pos_exc_value] / test rax, rax / jne fail`
-/// will close the loop without further changes here.
+/// CALL_ASSEMBLER trampoline path.  PyPy's
+/// `generate_guard_no_exception` checks `cpu.pos_exception()` (the
+/// exception type slot), so dynasm's guard-no-exception fast path
+/// compares against `JIT_EXC_TYPE`; `jit_exc_raise` publishes both
+/// slots and keeps the value slot available for
+/// `_store_and_reset_exception` / `save_exception`.
 fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
     let value = unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 };
     // warmspot.py:998-1005 + llsupport/assembler.py:345 —

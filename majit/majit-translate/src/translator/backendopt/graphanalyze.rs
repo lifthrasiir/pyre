@@ -283,11 +283,15 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
                 //         ...
                 //         return x
                 // pyre's `_func` mirrors upstream `**attrs`-set members
-                // through `_func.attrs`. The `external='C'` kwarg from
+                // through `_func.attrs`. `getattr(funcobj, 'external',
+                // None) is not None` is False both when the attribute is
+                // absent AND when its value is the literal `None`; the
+                // Rust analogue must therefore reject
+                // `Some(ConstValue::None)` as well as the missing-key
+                // case. The `external='C'` kwarg from
                 // `lltype.functionptr` (`rffi.py:162`) lands in
-                // `attrs["external"]`, so the equivalent test is "any
-                // value for the external key is non-None upstream".
-                if funcobj.attrs.contains_key("external") {
+                // `attrs["external"]` as a non-`None` ConstValue.
+                if !matches!(funcobj.attrs.get("external"), None | Some(ConstValue::None)) {
                     return self.analyze_external_call(op, seen);
                 }
                 // Upstream `:109-112`:
