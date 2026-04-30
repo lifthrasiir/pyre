@@ -1130,7 +1130,9 @@ pub enum OpCode {
     CallLoopinvariantF,
     CallLoopinvariantN,
     CallReleaseGilI,
-    CallReleaseGilR,
+    // CallReleaseGilR intentionally absent: resoperation.py:1243-1244
+    // (`# no such thing`) excludes CALL_RELEASE_GIL_R from the upstream
+    // opcode table.
     CallReleaseGilF,
     CallReleaseGilN,
     CallPureI,
@@ -1382,12 +1384,11 @@ impl OpCode {
     }
 
     pub fn is_call_release_gil(self) -> bool {
+        // resoperation.py:1238-1248 call_release_gil_for_descr maps
+        // 'i'/'f'/'v' only; 'r' is `# no such thing`.
         matches!(
             self,
-            OpCode::CallReleaseGilI
-                | OpCode::CallReleaseGilR
-                | OpCode::CallReleaseGilF
-                | OpCode::CallReleaseGilN
+            OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
         )
     }
 
@@ -1501,10 +1502,20 @@ impl OpCode {
         }
     }
 
+    /// Mirrors `resoperation.py:1238-1248 call_release_gil_for_descr`:
+    /// the `'r'` arm is explicitly commented out as `# no such thing`,
+    /// so a `Type::Ref` result-typed release-gil callee has no upstream
+    /// opcode mapping.  Panic rather than returning `CallReleaseGilR`,
+    /// which has no producer in upstream and would record an IR op the
+    /// optimizer/backend cannot consume.
     pub fn call_release_gil_for_type(tp: Type) -> OpCode {
         match tp {
             Type::Int => OpCode::CallReleaseGilI,
-            Type::Ref => OpCode::CallReleaseGilR,
+            Type::Ref => panic!(
+                "call_release_gil_for_type: Type::Ref has no upstream counterpart \
+                 (resoperation.py:1243-1244 `# no such thing`); CALL_RELEASE_GIL_R \
+                 has no producer in RPython"
+            ),
             Type::Float => OpCode::CallReleaseGilF,
             Type::Void => OpCode::CallReleaseGilN,
         }
@@ -2099,7 +2110,6 @@ static OPWITHDESCR: [bool; OPCODE_COUNT] = {
         CallLoopinvariantF,
         CallLoopinvariantN,
         CallReleaseGilI,
-        CallReleaseGilR,
         CallReleaseGilF,
         CallReleaseGilN,
         CallPureI,
@@ -2339,7 +2349,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         CallMayForceR,
         CallAssemblerR,
         CallLoopinvariantR,
-        CallReleaseGilR,
         ThreadlocalrefGet,
         CallMallocNursery,
         CallMallocNurseryVarsize,
@@ -2583,7 +2592,6 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         CallLoopinvariantF,
         CallLoopinvariantN,
         CallReleaseGilI,
-        CallReleaseGilR,
         CallReleaseGilF,
         CallReleaseGilN,
         CallPureI,
@@ -2878,7 +2886,6 @@ mod tests {
             OpCode::CallLoopinvariantF,
             OpCode::CallLoopinvariantN,
             OpCode::CallReleaseGilI,
-            OpCode::CallReleaseGilR,
             OpCode::CallReleaseGilF,
             OpCode::CallReleaseGilN,
             OpCode::CallPureI,
@@ -3013,7 +3020,6 @@ mod tests {
             OpCode::CallMayForceR,
             OpCode::CallAssemblerR,
             OpCode::CallLoopinvariantR,
-            OpCode::CallReleaseGilR,
             OpCode::CondCallValueR,
             OpCode::ThreadlocalrefGet,
             OpCode::CallMallocNursery,

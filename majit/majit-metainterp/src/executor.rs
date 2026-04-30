@@ -664,7 +664,6 @@ pub(crate) fn execute_one(
         | OpCode::CallMayForceR
         | OpCode::CallMayForceF
         | OpCode::CallReleaseGilI
-        | OpCode::CallReleaseGilR
         | OpCode::CallReleaseGilF => OpResult::Value(0),
         OpCode::CallN | OpCode::CallMayForceN | OpCode::CallReleaseGilN => OpResult::Void,
 

@@ -1189,7 +1189,6 @@ fn dispatch_op(
         "call_ref"
         | "call_pure_ref"
         | "call_may_force_ref"
-        | "call_release_gil_ref"
         | "call_loopinvariant_ref"
         | "call_assembler_ref" => {
             let fn_idx = expect_small_u16(&args[0]);
@@ -1201,9 +1200,8 @@ fn dispatch_op(
                 "call_may_force_ref" => state
                     .builder
                     .call_may_force_ref_typed(fn_idx, &call_args, dst),
-                "call_release_gil_ref" => state
-                    .builder
-                    .call_release_gil_ref_typed(fn_idx, &call_args, dst),
+                // "call_release_gil_ref" intentionally rejected:
+                // resoperation.py:1243-1244 (`# no such thing`).
                 "call_loopinvariant_ref" => state
                     .builder
                     .call_loopinvariant_ref_typed(fn_idx, &call_args, dst),
@@ -1515,14 +1513,26 @@ fn dispatch_residual_call(
                 .call_release_gil_int_typed(fn_idx, &call_args, dst);
         }
         (CallFlavor::ReleaseGil, ResKind::Ref) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Ref,
-                "residual_call release_gil ref needs result",
+            // RPython `resoperation.py:1238 call_release_gil_for_descr`
+            // explicitly skips the `tp == 'r'` arm with the comment
+            // `# no such thing` (`:1243-1244`):
+            //
+            //     # no such thing
+            //     #elif tp == 'r':
+            //     #    return rop.CALL_RELEASE_GIL_R
+            //
+            // and `:1462 is_call_release_gil` excludes
+            // `CALL_RELEASE_GIL_R` from the predicate.  No upstream
+            // dispatcher / optimizer / backend can consume a
+            // `CALL_RELEASE_GIL_R` op; emitting one is a NEW-DEVIATION
+            // surface that pyre rejects at the codewriter layer.
+            // The `OpCode::CallReleaseGilR` enum variant has been
+            // removed from `majit-ir` per the upstream comment.
+            panic!(
+                "dispatch_residual_call: ReleaseGil + ResKind::Ref has no upstream \
+                 counterpart (resoperation.py:1243-1244 `# no such thing`); pyre \
+                 must not emit CALL_RELEASE_GIL_R via the residual_call shape."
             );
-            state
-                .builder
-                .call_release_gil_ref_typed(fn_idx, &call_args, dst);
         }
         (CallFlavor::ReleaseGil, ResKind::Float) => {
             let dst = expect_result_reg(

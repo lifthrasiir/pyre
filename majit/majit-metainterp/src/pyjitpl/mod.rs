@@ -10563,13 +10563,12 @@ impl<M: Clone> MetaInterp<M> {
         }
         let (realfuncaddr, saveerr) = effectinfo.call_release_gil_target;
         let realfuncaddr = realfuncaddr as i64;
-        // pyjitpl.py:3678: opnum = rop.call_release_gil_for_descr(calldescr)
-        let opnum = match descr_view.result_type() {
-            majit_ir::Type::Int => OpCode::CallReleaseGilI,
-            majit_ir::Type::Ref => OpCode::CallReleaseGilR,
-            majit_ir::Type::Float => OpCode::CallReleaseGilF,
-            majit_ir::Type::Void => OpCode::CallReleaseGilN,
-        };
+        // pyjitpl.py:3678: opnum = rop.call_release_gil_for_descr(calldescr).
+        // resoperation.py:1243-1244 has the `'r'` arm commented out as
+        // `# no such thing` — Type::Ref has no upstream opcode.  Defer
+        // to the helper so the panic citation is shared with every
+        // other `call_release_gil_for_type` caller.
+        let opnum = OpCode::call_release_gil_for_type(descr_view.result_type());
         let ctx = self.tracing.as_mut()?;
         // pyjitpl.py:3676-3677: funcbox/savebox ConstInt
         let savebox = ctx.const_int(saveerr as i64);

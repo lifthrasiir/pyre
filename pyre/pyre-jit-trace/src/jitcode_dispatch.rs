@@ -138,7 +138,7 @@
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::MIFrame;
-use majit_ir::{DescrRef, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type};
 use majit_metainterp::TraceCtx;
 
 /// Body of a callee jitcode that the walker needs to recurse into.
@@ -1616,29 +1616,49 @@ fn select_residual_call_opcode(
 /// cache for subsequent matching calls.
 ///
 /// RPython upstream (`heapcache.py:629-634`) keys the lookup by descr
-/// **identity** and `allboxes[0].getint()`.  pyre-jit-trace doesn't
-/// thread the funcbox's concrete int alongside its symbolic OpRef
-/// (cf. `majit-metainterp/src/pyjitpl/mod.rs:11103 funcbox.2`), so the
-/// caller passes `funcptr.0 as i64` — the OpRef raw u32 — as the
-/// `arg0_int` key, matching `trace_ctx.rs:3383
-/// call_loopinvariant_impl`'s established convention.  This is
-/// observationally equivalent: identical OpRefs always denote
-/// identical concrete funcptrs within a single trace, and distinct
-/// OpRefs never collide on the cache key even if they happen to alias
-/// the same concrete address (a stricter equivalence than upstream's
-/// concrete-int key).  `descr_index` is the per-trace CallDescr slot
-/// index emitted by the codewriter (`decode_descr_index`) — pyre's
-/// stand-in for upstream's identity comparison.
+/// **identity** and `allboxes[0].getint()`.  Upstream's
+/// `do_residual_or_indirect_call` (`pyjitpl.py:2174-2186`) reaches
+/// `do_residual_call` for **both** non-`Const` `funcbox` and `Const`
+/// funcboxes whose address has no registered jitcode — the
+/// `isinstance(funcbox, Const)` guard only short-circuits to
+/// `perform_call` when `bytecode_for_address` resolves a jitcode.
+/// In the residual path `allboxes[0].getint()` is well-defined
+/// regardless of `Const`-ness because every Box subclass exposes
+/// `getint()` over its runtime int (`history.BoxInt._value` /
+/// `ConstInt.value`).
+///
+/// pyre's [`TraceCtx::concrete_of_opref`]
+/// (`majit-metainterp/src/trace_ctx.rs:1646`) reconstructs the
+/// concrete int from the per-trace constant pool only for constant
+/// OpRefs; non-constant OpRefs are symbolic at the dispatcher
+/// layer and carry no runtime int the trace-time walker can read.
+/// When `funcptr` is non-constant we skip the cache entirely —
+/// using `funcptr.0` as a sentinel would key on symbolic identity
+/// rather than the concrete callee, risking false hits across two
+/// different non-const funcptrs that share an OpRef after IR
+/// renaming, and false misses across two different OpRefs aliasing
+/// the same concrete callee.  Returning `None` is the conservative
+/// choice (the caller falls through to record the call); the cost
+/// is a missed cache hit on non-const funcptrs that upstream would
+/// have caught.  Convergence with upstream's full coverage requires
+/// threading concrete-int shadow alongside OpRef for non-const ints
+/// (Task #137 territory) — multi-session work.
+///
+/// `descr_index` is the per-trace CallDescr slot index emitted by
+/// the codewriter (`decode_descr_index`) — pyre's stand-in for
+/// upstream's identity comparison on `descr` (PRE-EXISTING-ADAPTATION
+/// per the per-trace descriptor slot model).
 #[inline]
 fn loopinvariant_lookup(
     ctx: &WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
     descr_index: usize,
-    arg0_int: i64,
+    funcptr: OpRef,
 ) -> Option<OpRef> {
     if ei.extraeffect != majit_ir::ExtraEffect::LoopInvariant {
         return None;
     }
+    let arg0_int = funcptr_concrete_int(ctx, funcptr)?;
     ctx.trace_ctx
         .heap_cache()
         .call_loopinvariant_known_result(descr_index as u32, arg0_int)
@@ -1647,36 +1667,66 @@ fn loopinvariant_lookup(
 
 /// `pyjitpl.py:2109 heapcache.call_loopinvariant_now_known`: after
 /// recording a fresh `CALL_LOOPINVARIANT_*` op, remember the
-/// `(descr_index, arg0_int) -> result` mapping so the next matching
-/// call short-circuits via [`loopinvariant_lookup`].  No-op for non-
-/// loopinvariant EI.
+/// `(descr_index, allboxes[0].getint()) -> result` mapping so the
+/// next matching call short-circuits via [`loopinvariant_lookup`].
+/// No-op for non-loopinvariant EI, and no-op when `funcptr` is
+/// non-constant (no concrete int key — see [`loopinvariant_lookup`]).
 ///
-/// `resvalue` is stored as `0` because pyre-jit-trace's residual_call
-/// dispatchers do not yet thread the concrete result alongside the
-/// symbolic OpRef (mirroring `trace_ctx.rs::call_loopinvariant_impl`'s
-/// legacy `0` placeholder).  RPython's upstream caller stores the
-/// concrete `res` from `execute_varargs`; pyre's `record_op_with_descr`
-/// only returns the symbolic OpRef.  The cached `_resvalue` is unused
-/// by [`loopinvariant_lookup`]'s consumer (the OpRef alone is enough
-/// for register writeback), so the placeholder is observationally
-/// equivalent until a concrete-result-returning record helper lands.
+/// `resvalue` is stored as `0`.  RPython's upstream caller
+/// (`pyjitpl.py:2109`) stores `res` — the concrete value returned
+/// by `execute_varargs` after actually running the callee.  pyre-
+/// jit-trace records symbolically without executing, so no concrete
+/// result exists at this point: `record_op_with_descr` returns a
+/// freshly-minted SSA OpRef whose runtime value is only known when
+/// the compiled trace later executes.  The cached `_resvalue` is
+/// unused by [`loopinvariant_lookup`]'s consumer (only the symbolic
+/// OpRef is read for register writeback), so the `0` placeholder is
+/// observationally equivalent.  Convergence with upstream requires
+/// either threading the concrete result up from the executing trace
+/// (Task #68 — concrete shadow tracking) or dropping the field from
+/// the cache shape entirely (separate cleanup).
 #[inline]
 fn loopinvariant_now_known(
     ctx: &mut WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
     descr_index: usize,
-    arg0_int: i64,
+    funcptr: OpRef,
     result: OpRef,
 ) {
     if ei.extraeffect != majit_ir::ExtraEffect::LoopInvariant {
         return;
     }
+    let Some(arg0_int) = funcptr_concrete_int(ctx, funcptr) else {
+        return;
+    };
     ctx.trace_ctx.heap_cache_mut().call_loopinvariant_now_known(
         descr_index as u32,
         arg0_int,
         result,
         0,
     );
+}
+
+/// Resolve a residual-call funcptr OpRef to the concrete function
+/// pointer integer that RPython's heapcache keys on
+/// (`heapcache.py:629-634` calls `allboxes[0].getint()`).
+///
+/// Returns `Some(int)` when `funcptr` is a constant int OpRef whose
+/// value lives in pyre's per-trace constant pool, mirroring upstream's
+/// guarantee that `do_residual_or_indirect_call` (`pyjitpl.py:2174-2186`)
+/// only reaches the residual path with a `Const` funcbox.  Returns
+/// `None` for non-constant or non-int OpRefs — the caller treats this
+/// as a cache skip rather than substituting a sentinel that could
+/// alias distinct callees.
+#[inline]
+fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64> {
+    if !funcptr.is_constant() {
+        return None;
+    }
+    match ctx.trace_ctx.concrete_of_opref(funcptr) {
+        majit_ir::Value::Int(v) => Some(v),
+        _ => None,
+    }
 }
 
 /// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
@@ -1733,10 +1783,64 @@ fn loopinvariant_now_known(
 /// `'r'`-result release-gil callee without first wiring an upstream
 /// `CALL_RELEASE_GIL_R` opcode.
 ///
-/// `'f'` (Float) bank is not currently dispatched through
-/// [`dispatch_residual_call_iRd_kind`] / `_iIRd_kind` either —
-/// codewriter does not emit a float-result `iRd>X` shape today.  An
-/// `unreachable!` covers that residual case.
+/// `'i'` / `'f'` / `'v'` are the three result kinds upstream's
+/// `call_release_gil_for_descr` accepts (`resoperation.py:1240-1248`).
+/// All three are decoded here so the **opcode selection** matches
+/// upstream's three-way result-kind table even though only
+/// `dispatch_residual_call_iRd_kind` / `_iIRd_kind` currently route
+/// `'i'` and `'r'` (the latter rejected per the panic above).
+///
+/// **Float / Void coverage is opcode-only, not full reuse.**  A
+/// future float / void residual-call dispatcher would still have
+/// to extend its own callsite to (a) widen `dst_bank` validation,
+/// (b) add the corresponding writeback path to
+/// `registers_f` / no-writeback, and (c) thread Float-typed
+/// `argbox_types` through `build_allboxes` for the `'f'` arg-list
+/// case.  This helper produces the right `OpCode::CallReleaseGil*`
+/// once those landed; it does not by itself complete the dispatcher.
+/// `pyjitpl.py:2003-2005 do_residual_call` parity:
+///
+/// ```python
+/// if effectinfo.oopspecindex == effectinfo.OS_NOT_IN_TRACE:
+///     return self.metainterp.do_not_in_trace_call(allboxes, descr)
+/// ```
+///
+/// Upstream's `do_not_in_trace_call` (pyjitpl.py:3683-3697) executes the
+/// callee concretely and raises `SwitchToBlackhole(ABORT_ESCAPE)` if
+/// it raised, otherwise returns `None` so no IR op is recorded.
+///
+/// The pyre trace-walker has no concrete-execution / abort-to-blackhole
+/// path for jitcode-walked residual_call bytecodes — concrete execution
+/// happens in the metainterp layer (`pyjitpl/mod.rs:11122-11124
+/// do_not_in_trace_call`) which dispatches `BC_CALL_*` not
+/// `BC_RESIDUAL_CALL_*`.  Therefore an `OS_NOT_IN_TRACE` callee that
+/// reached this dispatcher would have to be either silently lowered to
+/// a regular `CALL_*` op (NEW-DEVIATION: trace records a call upstream
+/// would not record) or aborted (no abort path exists).
+///
+/// `effect_info_for_call_flavor` (`flatten.rs:431` audit table) never
+/// sets `oopspecindex`, so this branch is unreachable from production
+/// today.  A future producer that begins populating `oopspecindex`
+/// (e.g. when the `majit-translate` analyzer trio ports `OS_NOT_IN_TRACE`
+/// detection) would otherwise silently introduce the deviation; the
+/// fail-loud panic surfaces it at first reach so the convergence work
+/// can wire the proper abort path.
+#[inline]
+fn guard_not_os_not_in_trace(ei: &majit_ir::EffectInfo, caller: &'static str) {
+    if ei.oopspecindex == OopSpecIndex::NotInTrace {
+        panic!(
+            "{caller}: OS_NOT_IN_TRACE callee reached the trace-walker \
+             residual_call dispatcher (pyjitpl.py:2003-2005); upstream \
+             routes this through do_not_in_trace_call (pyjitpl.py:3683-3697) \
+             which executes concretely and raises \
+             SwitchToBlackhole(ABORT_ESCAPE) on raise.  Pyre's trace-walker \
+             has no concrete-execution / abort-to-blackhole path here; \
+             convergence requires a SwitchToBlackhole analog in WalkContext \
+             alongside the producer that sets `oopspecindex`."
+        );
+    }
+}
+
 fn direct_call_release_gil(
     ctx: &mut WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
@@ -1750,19 +1854,23 @@ fn direct_call_release_gil(
     // pyjitpl.py:3676-3677: funcbox/savebox ConstInt
     let savebox = ctx.trace_ctx.const_int(saveerr as i64);
     let funcbox_real = ctx.trace_ctx.const_int(realfuncaddr as i64);
-    // pyjitpl.py:3678: opnum = rop.call_release_gil_for_descr(calldescr)
+    // pyjitpl.py:3678: opnum = rop.call_release_gil_for_descr(calldescr).
+    // resoperation.py:1240-1248 maps the descr's normalized result
+    // type to {CALL_RELEASE_GIL_I, CALL_RELEASE_GIL_F, CALL_RELEASE_GIL_N};
+    // 'r' is explicitly skipped (`# no such thing`).
     let opcode = match dst_bank {
         'i' => OpCode::CallReleaseGilI,
+        'f' => OpCode::CallReleaseGilF,
+        'v' => OpCode::CallReleaseGilN,
         'r' => panic!(
             "{caller}: CALL_RELEASE_GIL_R has no upstream counterpart \
-             (resoperation.py:1238 `# no such thing`); a 'r'-result \
+             (resoperation.py:1243-1244 `# no such thing`); a 'r'-result \
              release-gil callee cannot be lowered to an IR op the \
              optimizer/backend can consume."
         ),
-        // Float / Void bank not dispatched through this helper today.
         _ => unreachable!(
             "{caller}: dst_bank '{dst_bank}' not supported by direct_call_release_gil \
-             (callers validate 'i'/'r' before reaching here)"
+             (callers must pass 'i' / 'f' / 'v' per resoperation.py:1240-1248)"
         ),
     };
     // pyjitpl.py:3679-3681: history.record_nospec(opnum,
@@ -1774,6 +1882,22 @@ fn direct_call_release_gil(
         new_args.extend_from_slice(&allboxes[1..]);
     }
     let result = ctx.trace_ctx.record_op_with_descr(opcode, &new_args, descr);
+    // pyjitpl.py:2072 `heapcache.invalidate_caches_varargs(opnum1, descr,
+    // allboxes)` — the forces-branch invalidation uses `opnum1` which is
+    // the corresponding `CALL_MAY_FORCE_*`, NOT `CALL_RELEASE_GIL_*`.
+    // Pass the **original** `allboxes` (not the reshaped
+    // `[savebox, funcbox] + argboxes[1:]`) so heapcache's
+    // `mark_escaped_varargs` sees the same operand identities upstream
+    // does at this site.
+    let mayforce_opnum = match dst_bank {
+        'i' => OpCode::CallMayForceI,
+        'f' => OpCode::CallMayForceF,
+        'v' => OpCode::CallMayForceN,
+        _ => unreachable!("dst_bank validated above"),
+    };
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .invalidate_caches_varargs(mayforce_opnum, Some(ei), allboxes);
     // pyjitpl.py:2079 GUARD_NOT_FORCED — unconditional on the outer
     // forces-virtual-or-virtualizable branch (the release-gil sub-case
     // is inside that branch, so the guard fires regardless of which
@@ -1832,13 +1956,22 @@ fn direct_call_release_gil(
 ///
 /// Emits `GUARD_NOT_FORCED` on the forces path plus
 /// `GUARD_NO_EXCEPTION` whenever `check_can_raise(False)` is true,
-/// matching `pyjitpl.py:2078-2082`. Still missing relative to upstream
-/// `do_residual_call`:
+/// matching `pyjitpl.py:2078-2082`. After every recorded call op,
+/// invalidates the heapcache via
+/// `heap_cache.invalidate_caches_varargs(call_opcode, ei, allboxes)`
+/// matching `pyjitpl.py:2659 _record_helper_varargs` parity (forces
+/// branch's `pyjitpl.py:2072` redundantly invalidates with
+/// `CALL_MAY_FORCE_*`, equivalent because `select_residual_call_opcode`
+/// returns `CallMayForce*` for the forces classification).  Release-gil
+/// helper invalidates with `CALL_MAY_FORCE_*` matching
+/// `pyjitpl.py:2072`'s `opnum1`. The `OS_NOT_IN_TRACE` check fires up
+/// front via [`guard_not_os_not_in_trace`] — unreachable today (no
+/// producer populates `oopspecindex`) but fail-loud against future
+/// silent NEW-DEVIATIONs once `majit-translate` analyzers land. Still
+/// missing relative to upstream `do_residual_call`:
 ///   - `vable_and_vrefs_before/after_residual_call` virtualizable
 ///     bookkeeping (`pyjitpl.py:2055-2080`).
-///   - `heapcache.invalidate_caches_varargs` for write effects
-///     (`pyjitpl.py:2042`).
-///   - `OS_NOT_IN_TRACE` early return via `do_not_in_trace_call`
+///   - `OS_NOT_IN_TRACE` abort-to-blackhole convergence via `do_not_in_trace_call`
 ///     (`pyjitpl.py:2003-2006 + 3683-3697`) — the dead path is
 ///     unreachable today because `effect_info_for_call_flavor` stub
 ///     never sets `oopspecindex` (see `flatten.rs:431` audit table).
@@ -1884,6 +2017,9 @@ fn dispatch_residual_call_iRd_kind(
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
 
     let ei = call_descr.get_extra_info();
+    // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
+    // for the convergence rationale.
+    guard_not_os_not_in_trace(ei, "dispatch_residual_call_iRd_kind");
 
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
@@ -1912,13 +2048,29 @@ fn dispatch_residual_call_iRd_kind(
         // LoopInvariant` AND the `(descr_index, funcptr)` pair matches
         // the heapcache; for all other EI branches it falls through
         // and the normal record path runs.
-        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr.0 as i64) {
+        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr) {
             cached
         } else {
             let recorded =
                 ctx.trace_ctx
                     .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+            // pyjitpl.py:2659 `_record_helper_varargs` parity: every
+            // recorded varargs op invalidates the heapcache via
+            // `heapcache.invalidate_caches_varargs(opnum, descr,
+            // argboxes)`.  Pyre's `record_op_with_descr` does NOT
+            // auto-invalidate, so call it explicitly here.  Forces
+            // branch (`select_residual_call_opcode` returned a
+            // `CallMayForce*`) thus matches `pyjitpl.py:2072` which uses
+            // `opnum1 = CALL_MAY_FORCE_*`; non-forces branches
+            // (`CallLoopinvariant*`/`CallPure*`/`Call*`) match the
+            // `_record_helper_varargs` invocation that runs inside
+            // upstream's `executor.execute_varargs(opnum, ...)`.
+            ctx.trace_ctx.heap_cache_mut().invalidate_caches_varargs(
+                call_opcode,
+                Some(ei),
+                &allboxes,
+            );
             // pyjitpl.py:2079 `metainterp.generate_guard(rop.GUARD_NOT_FORCED)`
             // — unconditionally on the forces-virtual-or-virtualizable branch.
             if emit_guard_not_forced {
@@ -1936,7 +2088,7 @@ fn dispatch_residual_call_iRd_kind(
             // populate the cache so a subsequent matching call short-
             // circuits via the lookup above.  No-op for non-loopinvariant
             // EI per `loopinvariant_now_known`'s extraeffect check.
-            loopinvariant_now_known(ctx, ei, descr_index, funcptr.0 as i64, recorded);
+            loopinvariant_now_known(ctx, ei, descr_index, funcptr, recorded);
 
             recorded
         }
@@ -2000,16 +2152,21 @@ fn dispatch_residual_call_iRd_kind(
 /// [`loopinvariant_now_known`]) sub-cases route through dedicated
 /// helpers ahead of the selector.
 ///
-/// PRE-EXISTING-ADAPTATION coverage matches `iRd_kind`: vable
-/// bookkeeping (`vable_and_vrefs_before/after_residual_call`),
-/// heapcache invalidation (`heapcache.invalidate_caches_varargs`),
-/// `OS_NOT_IN_TRACE` early return (unreachable until
+/// Heapcache invalidation matches `iRd_kind`:
+/// `invalidate_caches_varargs(call_opcode, ei, allboxes)` after every
+/// recorded call op (`pyjitpl.py:2659 _record_helper_varargs`); the
+/// release-gil helper invalidates with `CALL_MAY_FORCE_*` per
+/// `pyjitpl.py:2072`. `OS_NOT_IN_TRACE` is fail-loud-guarded up front
+/// via [`guard_not_os_not_in_trace`] (matches `iRd_kind`). Still
+/// PRE-EXISTING-ADAPTATION: vable bookkeeping
+/// (`vable_and_vrefs_before/after_residual_call`), `OS_NOT_IN_TRACE`
+/// abort-to-blackhole convergence (unreachable until
 /// `effect_info_for_call_flavor` plumbs `oopspecindex`),
-/// libffi / assembler specialization, KEEPALIVE for vablebox, and
-/// `num_live`-aware `capture_resumedata(after_residual_call=True)`
-/// on the guards remain absent. Convergence: the broader
-/// `capture_resumedata` wire-up epic + `majit-translate` analyzer
-/// trio (see `flatten.rs:431` audit table).
+/// libffi / assembler specialization, KEEPALIVE
+/// for vablebox, and `num_live`-aware
+/// `capture_resumedata(after_residual_call=True)` on the guards.
+/// Convergence: the broader `capture_resumedata` wire-up epic +
+/// `majit-translate` analyzer trio (see `flatten.rs:431` audit table).
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iIRd_kind(
     code: &[u8],
@@ -2042,6 +2199,9 @@ fn dispatch_residual_call_iIRd_kind(
     let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
 
     let ei = call_descr.get_extra_info();
+    // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
+    // for the convergence rationale.
+    guard_not_os_not_in_trace(ei, "dispatch_residual_call_iIRd_kind");
 
     // pyjitpl.py:2063 forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
@@ -2062,13 +2222,22 @@ fn dispatch_residual_call_iIRd_kind(
         // short-circuit. See [`loopinvariant_lookup`] /
         // [`loopinvariant_now_known`] for the upstream citation; the
         // structure mirrors `dispatch_residual_call_iRd_kind`.
-        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr.0 as i64) {
+        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr) {
             cached
         } else {
             let recorded =
                 ctx.trace_ctx
                     .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
+            // pyjitpl.py:2659 `_record_helper_varargs` parity — see
+            // `dispatch_residual_call_iRd_kind` for the upstream-citation
+            // walkthrough.  Same invalidation semantics; only the
+            // arglist construction differs (boxes2 = i_args ++ r_args).
+            ctx.trace_ctx.heap_cache_mut().invalidate_caches_varargs(
+                call_opcode,
+                Some(ei),
+                &allboxes,
+            );
             if emit_guard_not_forced {
                 ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             }
@@ -2076,7 +2245,7 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             }
 
-            loopinvariant_now_known(ctx, ei, descr_index, funcptr.0 as i64, recorded);
+            loopinvariant_now_known(ctx, ei, descr_index, funcptr, recorded);
 
             recorded
         }

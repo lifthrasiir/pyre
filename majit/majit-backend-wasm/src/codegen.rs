@@ -1075,7 +1075,6 @@ fn build_function(
             | OpCode::CallAssemblerR
             | OpCode::CallAssemblerN
             | OpCode::CallReleaseGilI
-            | OpCode::CallReleaseGilR
             | OpCode::CallReleaseGilN
             | OpCode::CondCallValueI
             | OpCode::CondCallValueR

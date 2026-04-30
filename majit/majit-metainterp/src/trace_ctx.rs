@@ -3253,11 +3253,9 @@ impl TraceCtx {
         self.call_release_gil_void_typed(func_ptr, args, &arg_types);
     }
 
-    /// Record a ref-returning GIL-release call (CallReleaseGilR).
-    pub fn call_release_gil_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types = self.infer_arg_types(args);
-        self.call_release_gil_ref_typed(func_ptr, args, &arg_types)
-    }
+    // call_release_gil_ref / _typed intentionally absent:
+    // resoperation.py:1243-1244 (`# no such thing`) excludes
+    // CALL_RELEASE_GIL_R from the upstream opcode table.
 
     /// Record a float-returning GIL-release call (CallReleaseGilF).
     pub fn call_release_gil_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
@@ -3304,21 +3302,6 @@ impl TraceCtx {
             args,
             arg_types,
             Type::Int,
-        )
-    }
-
-    pub fn call_release_gil_ref_typed(
-        &mut self,
-        func_ptr: *const (),
-        args: &[OpRef],
-        arg_types: &[Type],
-    ) -> OpRef {
-        self.call_family_typed(
-            OpCode::call_release_gil_for_type(Type::Ref),
-            func_ptr,
-            args,
-            arg_types,
-            Type::Ref,
         )
     }
 

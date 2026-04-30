@@ -2337,7 +2337,6 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
-                | crate::jit_interp::CallPolicyKind::ReleaseGilRefWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
@@ -2370,10 +2369,6 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.call_may_force_ref_typed(__fn_idx, #typed_args, #reg); }
-                        }
-                        crate::jit_interp::CallPolicyKind::ReleaseGilRefWrapped => {
-                            result_kind = BindingKind::Ref;
-                            quote! { __builder.call_release_gil_ref_typed(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped => {
                             result_kind = BindingKind::Ref;

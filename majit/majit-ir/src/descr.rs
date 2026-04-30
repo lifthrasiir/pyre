@@ -3365,18 +3365,27 @@ mod tests {
     #[test]
     fn test_call_release_gil_opcodes_exist() {
         use crate::resoperation::OpCode;
-        // Parity with test_fficall.py: CallReleaseGil opcodes for all return types
+        // Parity with resoperation.py:1238-1248 call_release_gil_for_descr:
+        // 'i' / 'f' / 'v' arms exist; 'r' is commented out as `# no such thing`
+        // and is covered by the should_panic test below.
         let int_op = OpCode::call_release_gil_for_type(Type::Int);
         assert_eq!(int_op, OpCode::CallReleaseGilI);
 
         let float_op = OpCode::call_release_gil_for_type(Type::Float);
         assert_eq!(float_op, OpCode::CallReleaseGilF);
 
-        let ref_op = OpCode::call_release_gil_for_type(Type::Ref);
-        assert_eq!(ref_op, OpCode::CallReleaseGilR);
-
         let void_op = OpCode::call_release_gil_for_type(Type::Void);
         assert_eq!(void_op, OpCode::CallReleaseGilN);
+    }
+
+    #[test]
+    #[should_panic(expected = "Type::Ref has no upstream counterpart")]
+    fn test_call_release_gil_ref_panics() {
+        use crate::resoperation::OpCode;
+        // resoperation.py:1243-1244: `# no such thing` — `Type::Ref`
+        // has no `CALL_RELEASE_GIL_R` arm in upstream; pyre matches by
+        // panicking instead of fabricating the missing opcode.
+        let _ = OpCode::call_release_gil_for_type(Type::Ref);
     }
 
     #[test]

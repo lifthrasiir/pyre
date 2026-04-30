@@ -477,11 +477,7 @@ fn execute_one_with_memory(
             let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_i(func, &args))
         }
-        OpCode::CallR
-        | OpCode::CallPureR
-        | OpCode::CallMayForceR
-        | OpCode::CallReleaseGilR
-        | OpCode::CallLoopinvariantR => {
+        OpCode::CallR | OpCode::CallPureR | OpCode::CallMayForceR | OpCode::CallLoopinvariantR => {
             let func = values.resolve(op.args[0]);
             let args: Vec<i64> = op.args[1..].iter().map(|&r| values.resolve(r)).collect();
             OpResult::Value(memory.call_r(func, &args))
@@ -2306,7 +2302,6 @@ impl BlackholeInterpreter {
             jitcode::BC_CALL_REF
             | jitcode::BC_CALL_PURE_REF
             | jitcode::BC_CALL_MAY_FORCE_REF
-            | jitcode::BC_CALL_RELEASE_GIL_REF
             | jitcode::BC_CALL_LOOPINVARIANT_REF
             | jitcode::BC_CALL_ASSEMBLER_REF => {
                 let fn_ptr_idx = self.next_u16() as usize;

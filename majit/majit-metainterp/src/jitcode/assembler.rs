@@ -1511,19 +1511,10 @@ impl JitCodeBuilder {
         self.call_ref_like(jitcode::BC_CALL_MAY_FORCE_REF, fn_ptr_idx, arg_regs, dst);
     }
 
-    pub fn call_release_gil_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_release_gil_ref_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_release_gil_ref_typed(
-        &mut self,
-        fn_ptr_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.call_ref_like(jitcode::BC_CALL_RELEASE_GIL_REF, fn_ptr_idx, arg_regs, dst);
-    }
+    // call_release_gil_ref / _typed intentionally absent:
+    // resoperation.py:1243-1244 (`# no such thing`) excludes
+    // CALL_RELEASE_GIL_R, so emitting BC_CALL_RELEASE_GIL_REF would
+    // record an IR op the optimizer/backend cannot consume.
 
     pub fn call_loopinvariant_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
         let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();

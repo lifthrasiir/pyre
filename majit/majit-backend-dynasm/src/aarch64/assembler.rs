@@ -2473,7 +2473,6 @@ impl AssemblerARM64 {
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN
             | OpCode::CallReleaseGilI
-            | OpCode::CallReleaseGilR
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
                 self.genop_call_with_arglocs(op, arglocs);

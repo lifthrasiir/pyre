@@ -1927,7 +1927,6 @@ where
             jitcode::BC_CALL_REF
             | jitcode::BC_CALL_PURE_REF
             | jitcode::BC_CALL_MAY_FORCE_REF
-            | jitcode::BC_CALL_RELEASE_GIL_REF
             | jitcode::BC_CALL_LOOPINVARIANT_REF
             | jitcode::BC_CALL_ASSEMBLER_REF => {
                 let (opcode, fn_ptr_idx, dst, arg_regs) = {
@@ -2008,9 +2007,8 @@ where
                         jitcode::BC_CALL_MAY_FORCE_REF => {
                             ctx.call_may_force_ref_typed(trace_ptr, &args, &arg_types)
                         }
-                        jitcode::BC_CALL_RELEASE_GIL_REF => {
-                            ctx.call_release_gil_ref_typed(trace_ptr, &args, &arg_types)
-                        }
+                        // BC_CALL_RELEASE_GIL_REF intentionally absent:
+                        // resoperation.py:1243-1244 (`# no such thing`).
                         jitcode::BC_CALL_LOOPINVARIANT_REF => {
                             ctx.call_loopinvariant_ref_typed(trace_ptr, &args, &arg_types)
                         }

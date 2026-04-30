@@ -522,38 +522,59 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // `ElidableCannotRaise (0) < CannotRaise (2)` → false (no
         // GUARD_NO_EXCEPTION),
         // `ElidableOrMemoryError (3) > CannotRaise (2)` → true,
-        // `ElidableCanRaise (4) > CannotRaise (2)` → true.  Picking the
-        // wrong one drops a guard the trace needs.
+        // `ElidableCanRaise (4) > CannotRaise (2)` → true.  Picking
+        // the wrong one drops a guard the trace needs.
         //
-        // Pyre has no static-raise analyzer (RPython
-        // `randomeffects_analyzer` / `quasiimmut_analyzer` /
-        // `_canraise` infrastructure is unported — see
-        // `majit-translate` roadmap), so a producer-side `CallFlavor`
-        // mnemonic cannot pick the correct EF_ELIDABLE_* variant.
-        // Hardcoding to `ElidableCannotRaise` was a NEW-DEVIATION:
-        // any future caller marking a raise-capable elidable callee
-        // would silently get an under-strength EI and the dispatcher
-        // would skip GUARD_NO_EXCEPTION.
+        // Pyre has no static-raise analyzer (`randomeffects_analyzer`
+        // / `quasiimmut_analyzer` / `_canraise` infrastructure is
+        // unported — see `majit-translate` roadmap).  An earlier
+        // attempt to default to `ElidableCanRaise` (the conservative
+        // variant that satisfies `check_can_raise(False)`) was
+        // *itself* a NEW-DEVIATION because pyre's flatten path
+        // collapses `CallFlavor::Pure` to `BC_CALL_PURE_*` bytecode
+        // (`assembler.rs:1491` `(CallFlavor::Pure, _) => call_pure_*`),
+        // and the runtime dispatcher (`majit-metainterp/src/pyjitpl/
+        // dispatch.rs:1895 + 2004 + 2115`) consumes
+        // `BC_CALL_PURE_*` via `record_result_of_call_pure` without
+        // reading the descr's `EffectInfo` — so the
+        // `EF_ELIDABLE_CAN_RAISE`'s `GUARD_NO_EXCEPTION` requirement
+        // is silently dropped at runtime.  Producing
+        // `ElidableCanRaise` here therefore produces a *worse*
+        // parity surface than panicking: it looks correct on paper
+        // but the guard is never actually emitted, regressing main's
+        // fail-fast behaviour.
         //
+        // Until the `BC_CALL_PURE_*` runtime sites read the descr's
+        // EI and emit `GuardNoException` per
+        // `pyjitpl.py:2111 exc = effectinfo.check_can_raise()`, no
+        // `CallFlavor::Pure` producer can be honoured correctly.
         // No production `emit_residual_call(_, CallFlavor::Pure, ...)`
-        // site exists today (verified: every codewriter emit_residual_call
-        // call passes `Plain` or `MayForce`).  Panic so future callers
-        // are forced to construct an `EffectInfo` directly with the
-        // correct elidable variant — or add a precise `CallFlavor`
-        // sub-variant per `call.py:294-299` — instead of inheriting
-        // this stub.  The reverse mapper
-        // `dispatch_kind_for_effect_info` and the dispatcher
-        // `dispatch_residual_call` (`assembler.rs:1491-1505`) keep
-        // their `Pure` arms intact so they remain ready to consume
-        // a properly-formed elidable EI from such a future producer.
+        // site exists today (verified: every codewriter
+        // `emit_residual_call` call passes `Plain` or `MayForce`),
+        // so panicking here forces any future producer to either:
+        //   (1) wire `BC_CALL_PURE_*` runtime sites to emit
+        //       `GuardNoException` from the descr's EI, then add an
+        //       `ElidableCanRaise` arm here; or
+        //   (2) construct an `EffectInfo` directly at the call site
+        //       with the correct elidable variant and a runtime path
+        //       that honours its guard requirement.
+        //
+        // The reverse mapper `dispatch_kind_for_effect_info` and the
+        // dispatcher `dispatch_residual_call` (`assembler.rs:1491-
+        // 1505`) keep their `Pure` arms intact so they remain ready
+        // to consume a properly-formed elidable EI from such a
+        // future producer.
         CallFlavor::Pure => panic!(
             "effect_info_for_call_flavor: CallFlavor::Pure has no production \
              producer in pyre, and the EF_ELIDABLE_* extraeffect cannot be \
              chosen correctly without static raise analysis (call.py:292-299). \
+             Defaulting to ElidableCanRaise would silently drop \
+             GUARD_NO_EXCEPTION at the BC_CALL_PURE_* runtime sites \
+             (dispatch.rs:1895/2004/2115) which do not read the descr's EI. \
              Construct EffectInfo directly with the correct \
              ElidableCannotRaise / ElidableOrMemoryError / ElidableCanRaise \
-             variant, or add a precise CallFlavor sub-variant before routing \
-             through this mnemonic."
+             variant AND wire BC_CALL_PURE_* dispatch to honour \
+             check_can_raise() before routing through this mnemonic."
         ),
         // EF_RANDOM_EFFECTS — `effectinfo.py:24`. Upstream's
         // `call.py:282-289 getcalldescr` upgrades release-gil callees

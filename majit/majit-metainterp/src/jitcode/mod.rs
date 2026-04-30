@@ -36,7 +36,9 @@ pub(crate) const BC_CALL_MAY_FORCE_REF: u8 = 39;
 pub(crate) const BC_CALL_MAY_FORCE_FLOAT: u8 = 40;
 pub(crate) const BC_CALL_MAY_FORCE_VOID: u8 = 41;
 pub(crate) const BC_CALL_RELEASE_GIL_INT: u8 = 42;
-pub(crate) const BC_CALL_RELEASE_GIL_REF: u8 = 43;
+// BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
+// resoperation.py:1243-1244 (`# no such thing`) excludes
+// CALL_RELEASE_GIL_R from the upstream opcode table.
 pub(crate) const BC_CALL_RELEASE_GIL_FLOAT: u8 = 44;
 pub(crate) const BC_CALL_RELEASE_GIL_VOID: u8 = 45;
 pub(crate) const BC_CALL_LOOPINVARIANT_INT: u8 = 46;

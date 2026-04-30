@@ -8834,10 +8834,7 @@ impl CraneliftBackend {
                     builder.def_var(jf_ptr_var, jf_ptr);
                 }
 
-                OpCode::CallReleaseGilI
-                | OpCode::CallReleaseGilR
-                | OpCode::CallReleaseGilF
-                | OpCode::CallReleaseGilN => {
+                OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
                     // x86/assembler.py:2242-2244 _genop_call_release_gil:
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc, is_call_release_gil=True)

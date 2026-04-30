@@ -232,7 +232,10 @@ pub(crate) enum CallPolicyKind {
     ElidableIntWrapped,
     ResidualRefWrapped,
     MayForceRefWrapped,
-    ReleaseGilRefWrapped,
+    // ReleaseGilRefWrapped intentionally absent: resoperation.py:1243-1244
+    // (`# no such thing`) excludes CALL_RELEASE_GIL_R from the upstream
+    // opcode table, so a `'release_gil_ref_wrapped'` policy could only
+    // emit an IR op the optimizer/backend cannot consume.
     LoopInvariantRefWrapped,
     ElidableRefWrapped,
     ResidualFloatWrapped,
@@ -267,7 +270,8 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_wrapped" => CallPolicyKind::ElidableIntWrapped,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
-        "release_gil_ref_wrapped" => CallPolicyKind::ReleaseGilRefWrapped,
+        // "release_gil_ref_wrapped" intentionally rejected per
+        // resoperation.py:1243-1244 — see CallPolicyKind comment.
         "loopinvariant_ref_wrapped" => CallPolicyKind::LoopInvariantRefWrapped,
         "elidable_ref_wrapped" => CallPolicyKind::ElidableRefWrapped,
         "residual_float_wrapped" => CallPolicyKind::ResidualFloatWrapped,

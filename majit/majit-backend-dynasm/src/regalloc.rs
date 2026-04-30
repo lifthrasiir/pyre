@@ -2638,10 +2638,7 @@ impl RegAlloc {
             | OpCode::CallMayForceN => {
                 self.consider_call_j2(dst, args, op, i, output, opcode.is_call_may_force(), 1);
             }
-            OpCode::CallReleaseGilI
-            | OpCode::CallReleaseGilR
-            | OpCode::CallReleaseGilF
-            | OpCode::CallReleaseGilN => {
+            OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
                 self.consider_call_j2(dst, args, op, i, output, true, 2);
             }
             OpCode::CallAssemblerI
@@ -3077,10 +3074,7 @@ impl RegAlloc {
             | OpCode::CallMayForceN => {
                 self.consider_call(op, i, output, op.opcode.is_call_may_force(), 1);
             }
-            OpCode::CallReleaseGilI
-            | OpCode::CallReleaseGilR
-            | OpCode::CallReleaseGilF
-            | OpCode::CallReleaseGilN => {
+            OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
                 self.consider_call(op, i, output, true, 2);
             }
             OpCode::CallAssemblerI
