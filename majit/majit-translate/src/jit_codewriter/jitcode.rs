@@ -410,6 +410,15 @@ impl JitCode {
     /// ```
     pub fn follow_jump(&self, position: usize) -> usize {
         let position = position - 2;
+        // RPython `:108-109`: `if not we_are_translated(): assert
+        // position in self._alllabels`. `debug_assert` mirrors the
+        // non-translated guard — fires in dev/test builds, elided in
+        // release just like RPython skips the check post-translation.
+        debug_assert!(
+            self.alllabels.contains(&position),
+            "follow_jump: position {position} not in alllabels for {}",
+            self.name,
+        );
         let labelvalue = (self.code[position] as usize) | ((self.code[position + 1] as usize) << 8);
         assert!(labelvalue < self.code.len(), "follow_jump out of range");
         labelvalue

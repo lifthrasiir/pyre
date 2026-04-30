@@ -29,6 +29,12 @@ pub struct JitCodeBuilder {
     /// `start_instr` / `write_insn`; every helper that pushes an opcode
     /// byte goes through one of those.
     startpoints: std::collections::HashSet<usize>,
+    /// RPython `assembler.py:176` `self.alllabels.add(len(self.code))` —
+    /// every TLabel emit records the bytecode offset of the 2-byte
+    /// label slot so `JitCode.follow_jump` (RPython `jitcode.py:108-109`)
+    /// can fire its non-translated `assert position in self._alllabels`
+    /// debug check.  Populated by `push_label_ref`.
+    alllabels: std::collections::HashSet<usize>,
     num_regs_i: u16,
     num_regs_r: u16,
     num_regs_f: u16,
@@ -1801,7 +1807,7 @@ impl JitCodeBuilder {
             c_num_regs_r: self.num_regs_r,
             c_num_regs_f: self.num_regs_f,
             startpoints: self.startpoints,
-            alllabels: Default::default(),
+            alllabels: self.alllabels,
             resulttypes: Default::default(),
             _ssarepr: None,
         };
@@ -1895,7 +1901,10 @@ impl JitCodeBuilder {
     }
 
     fn push_label_ref(&mut self, label: u16) {
+        // RPython `assembler.py:176` records the offset of the 2-byte
+        // label slot in `alllabels` just before the temp bytes go in.
         let patch_offset = self.code.len();
+        self.alllabels.insert(patch_offset);
         self.push_u16(0);
         self.patches.push((label as usize, patch_offset));
     }

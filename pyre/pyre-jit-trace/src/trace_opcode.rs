@@ -811,8 +811,33 @@ impl MIFrame {
             if in_a_call {
                 if let Some(result_idx) = self.pending_result_stack_idx {
                     let abs_idx = s.nlocals + result_idx;
+                    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
                     if abs_idx < registers_r_semantic.len() {
-                        registers_r_semantic[abs_idx] = ctx.const_ref(pyre_object::PY_NULL as i64);
+                        registers_r_semantic[abs_idx] = null_ref;
+                    }
+                    // pyjitpl.py:180 _result_argcode parity: the call
+                    // result register is reset to CONST_NULL before the
+                    // residual call so any guard captured inside the
+                    // call sees NULL at the result slot. Pyre's
+                    // per-CodeObject path reads `registers_r_bank`
+                    // (color-indexed), so map the semantic stack depth
+                    // through `stack_slot_color_map` and apply the
+                    // placeholder to the colored bank too. Portal-bridge
+                    // has identity coloring, so the semantic abs_idx is
+                    // also the bank index.
+                    let color_idx_opt = if is_portal_bridge {
+                        Some(abs_idx)
+                    } else {
+                        stack_slot_color_map
+                            .get(result_idx)
+                            .copied()
+                            .map(|c| c as usize)
+                    };
+                    if let Some(color_idx) = color_idx_opt {
+                        if color_idx >= registers_r_bank.len() {
+                            registers_r_bank.resize(color_idx + 1, OpRef::NONE);
+                        }
+                        registers_r_bank[color_idx] = null_ref;
                     }
                 }
             }
@@ -944,59 +969,32 @@ impl MIFrame {
         let length_f = all_liveness[off + 2] as u32;
         let mut cursor = off + 3;
         let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
-        // RPython `pyjitpl.py:218-225` reads each live register out of its
-        // kind-specific bank via direct list indexing:
-        // `registers_i[reg_i]`, `registers_r[reg_r]`, `registers_f[reg_f]`.
-        // The bank is expected to be complete (the codewriter only emits
-        // a register index when the SSA-alive set says it holds a value
-        // at this PC), so a liveness-listed index out of bank range is
-        // an encoder/codewriter invariant violation. Use Rust's slice
-        // indexing — it bounds-checks and panics on OOB, mirroring
-        // Python's IndexError.
-        let snapshot_bank = |bank: &[OpRef], reg: usize| -> OpRef { bank[reg] };
+        // `pyjitpl.py:216-233` line-by-line parity: each live register
+        // is read from its kind-specific bank via direct list indexing
+        // (`self.registers_i[index]` etc).  Rust slice indexing
+        // bounds-checks and panics on OOB, matching Python's
+        // IndexError contract — a liveness-listed index out of bank
+        // range is an encoder/codewriter invariant violation, not a
+        // silent NONE.
         use majit_translate::liveness::LivenessIterator;
         if length_i != 0 {
             let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(snapshot_bank(&registers_i, reg_idx as usize));
+                boxes.push(registers_i[reg_idx as usize]);
             }
             cursor = it.offset;
         }
         if length_r != 0 {
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                // `registers_r` is the unified abstract register file
-                // indexed by semantic slot (locals[..nlocals],
-                // stack[nlocals..nlocals+stack_only]) — not by liveness
-                // register color. The lazy-load preamble above (line 643)
-                // already routes colors through
-                // `semantic_ref_slot_for_reg_color`; the snapshot read
-                // must do the same to land in the slot the lazy load
-                // populated. Falling through to the raw color index
-                // returned an unrelated semantic slot (commonly a
-                // locals-side `OpRef::NONE` masquerading as a stack
-                // entry), poisoning the guard's fail_args.
-                let slot_idx = if is_portal_bridge {
-                    Some(reg_idx as usize)
-                } else {
-                    crate::state::semantic_ref_slot_for_reg_color(
-                        nlocals,
-                        valid_stack_only,
-                        &stack_slot_color_map,
-                        reg_idx as usize,
-                    )
-                };
-                let value = slot_idx
-                    .map(|idx| snapshot_bank(&registers_r_bank, idx))
-                    .unwrap_or(OpRef::NONE);
-                boxes.push(value);
+                boxes.push(registers_r_bank[reg_idx as usize]);
             }
             cursor = it.offset;
         }
         if length_f != 0 {
             let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(snapshot_bank(&registers_f, reg_idx as usize));
+                boxes.push(registers_f[reg_idx as usize]);
             }
         }
         boxes
