@@ -2124,7 +2124,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // ── jit_merge_point (RPython interp_jit.py:85-87) ──
         // Runtime no-op. Only handles trace feed when tracing is active.
         if is_portal {
-            let tracing_depth = driver.meta_interp().tracing_call_depth;
+            let tracing_depth: Option<u32> = driver.meta_interp().tracing_call_depth;
             if let Some(depth) = tracing_depth {
                 if call_depth() == depth {
                     if let Some(loop_result) =

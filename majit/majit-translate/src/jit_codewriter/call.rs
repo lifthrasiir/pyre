@@ -3950,7 +3950,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: int_neg, bool_not → cannot raise
         OpKind::UnaryOp { op, .. } if !op.contains("ovf") => RaiseClass::No,
         // RPython LL: same_as, cast_*, hint → cannot raise
-        OpKind::Input { .. } | OpKind::ConstInt(_) => RaiseClass::No,
+        OpKind::Input { .. } | OpKind::ConstInt(_) | OpKind::ConstFloat(_) => RaiseClass::No,
         // JIT-specific ops that cannot raise
         OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
@@ -4010,10 +4010,10 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // for Phase B.
         OpKind::IndirectCall { .. } => RaiseClass::Yes,
 
-        // ── Unknown ops: canraise.py:18 → True (conservative) ─────
+        // ── Abort placeholders: canraise.py:18 → True (conservative) ─
         // RPython: log.WARNING("Unknown operation: %s" % op.opname)
         //          return True
-        OpKind::Unknown { .. } => RaiseClass::Yes,
+        OpKind::Abort { .. } => RaiseClass::Yes,
     }
 }
 

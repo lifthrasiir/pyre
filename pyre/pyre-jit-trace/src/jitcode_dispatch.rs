@@ -5347,7 +5347,60 @@ mod tests {
 
     #[test]
     fn int_same_as_records_sameasi() {
-        drive_int_unop("int_same_as/i>i", majit_ir::OpCode::SameAsI);
+        // Dispatcher-handler validation; RPython `blackhole.py:455
+        // bhimpl_int_same_as_i` exists regardless of whether jtransform
+        // emits same_as in production.  `jtransform.py:246
+        // rewrite_op_same_as` typically deletes the op and renames its
+        // result to its argument, so `int_same_as/i>i` rarely makes it
+        // into the build-time insns table — but the walker still needs
+        // a working handler if a producer surfaces (e.g. rtyper PBC
+        // dispatch).  Drive `handle()` with a synthesized `DecodedOp`
+        // so the byte-table check (`drive_int_unop`) is bypassed and
+        // production emission and handler validation stay decoupled.
+        let op = DecodedOp {
+            key: "int_same_as/i>i",
+            opname: "int_same_as",
+            argcodes: "i>i",
+            pc: 0,
+            next_pc: 3,
+        };
+        let code = [0u8, 0x02, 0x05]; // src=2, dst=5
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let arg = regs_i[2];
+        let dst_pre = regs_i[5];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            handle(&op, &code, &mut wc).expect("`int_same_as/i>i` must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 3,
+            "`int_same_as/i>i` operand layout `i>i` = 2 bytes"
+        );
+        let dst_post = wc.registers_i[5];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::SameAsI);
+        assert_eq!(last.args.as_slice(), &[arg]);
+        assert_eq!(dst_post, last.pos);
     }
 
     #[test]

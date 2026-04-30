@@ -172,15 +172,16 @@ impl CodeWriter {
         };
         // Transformer is dropped here, releasing the &mut CallControl borrow.
 
-        // Re-resolve types on the post-jtransform graph: jtransform synthesizes
-        // fresh ValueIds (e.g. ConstInt funcptrs from `direct_funcptr_value`)
-        // that the original `type_state` never saw. The rerun supplies kinds
-        // for those new IDs so `build_value_kinds` covers every operand
-        // reaching regalloc/flatten. RPython has no analogue because its
-        // jtransform preserves Variable.concretetype on every newly created
-        // Variable; pyre's side-table needs the rebuild.
-        let rewritten_type_state =
-            crate::translate_legacy::rtyper::rtyper::resolve_types(&rewritten.graph, &annotations);
+        // RPython stores `.concretetype` on each Variable. Pyre merges
+        // the pre-jtransform rtyper table with explicit result kinds
+        // introduced by jtransform (`CallResidual.result_kind`, etc.)
+        // without letting stale pre-rewrite entries override them.
+        let rewritten_type_state = crate::translate_legacy::rtyper::rtyper::resolve_rewritten_types(
+            &type_state,
+            &rewritten.graph,
+            &annotations,
+            &rewritten.synth_kinds,
+        );
 
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)

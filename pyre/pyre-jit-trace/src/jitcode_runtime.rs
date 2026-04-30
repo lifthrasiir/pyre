@@ -370,22 +370,13 @@ pub fn all_descr_refs() -> &'static [DescrRef] {
 /// `_get_method` eagerly, raising `AttributeError` if any `bhimpl_*`
 /// is missing. The Rust port mirrors the `setup_insns` + `setup_descrs`
 /// + `wire_bhimpl_handlers` sequence, but surfaces the unwired list as
-/// a return value instead of panicking — Task #85 (`int_ge/ir>i`
-/// family root cause: assembler emits mixed `(ref, int)` operand kinds
-/// for some graphs, leaving the kind-suffixed opname unmapped to any
-/// `bhimpl_*`) is open and the panicking variant blocks unrelated
-/// tests from exercising the dispatch table.
+/// a return value instead of panicking.
 ///
-/// PRE-EXISTING-ADAPTATION (transitional). RPython has no equivalent
+/// PRE-EXISTING-ADAPTATION (diagnostic). RPython has no equivalent
 /// of this Result-returning shape because upstream's `setup_insns`
-/// has total opname coverage at startup. Convergence path: when
-/// Task #85 closes the kind-flow bug the unwired set goes empty and
-/// every caller can use [`build_default_bh_builder`] (the panicking
-/// strict variant). Until then, callers that only execute opnames
-/// known to be wired (the synthetic-bytecode dispatch tests in this
-/// module, the bh-table coverage diagnostic) should call
-/// [`build_default_bh_builder_with_unwired_report`] and ignore the
-/// unwired list.
+/// has total opname coverage at startup. The strict variant
+/// [`build_default_bh_builder`] is the production path; this helper is
+/// retained for tests that need to inspect the coverage set directly.
 pub fn build_default_bh_builder_with_unwired_report() -> (
     majit_metainterp::blackhole::BlackholeInterpBuilder,
     Vec<String>,
@@ -409,9 +400,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// RPython parity: matches the `AttributeError` raised by upstream's
 /// `setup_insns` (blackhole.py:66) when `_get_method(name, argcodes)`
 /// fails. Use this in any code path that must run real production
-/// jitcodes; tests that exercise a fixed slice of opcodes prefer
-/// [`build_default_bh_builder_with_unwired_report`] to dodge Task #85
-/// noise.
+/// jitcodes; tests that inspect the raw coverage list can use
+/// [`build_default_bh_builder_with_unwired_report`].
 pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     let (builder, unwired) = build_default_bh_builder_with_unwired_report();
     if !unwired.is_empty() {
@@ -1127,21 +1117,12 @@ mod tests {
         assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
     }
 
-    // Ignored pending root-cause fix for `int_ge/ir>i`: the assembler
-    // emits an `int_ge` op whose operand kinds are `(ref, int)` for
-    // some registered graph, so the insns table contains
-    // `int_ge/ir>i` with no matching `bhimpl_*` handler.  The
-    // previous pragmatic "add a bhhandler_ir_i! alias" workaround
-    // (commit 72d2710eb1) was removed per reviewer directive —
-    // adding a bhhandler alias papers over a real type-flow bug
-    // upstream of the assembler (Expr::Path creating a new
-    // `Input { ty: Unknown }` instead of reusing an existing local
-    // binding, rtyper backfilling an int as ref, or codewriter
-    // emitting the wrong kind suffix).  Task #85 tracks locating
-    // and fixing the origin so `int_ge/ii>i` emerges naturally,
-    // after which these tests re-enable.
+    // Task #85 closure check: the strict builder should now cover every
+    // opname in the generated insns table.  Earlier revisions kept this
+    // ignored while kind-flow bugs emitted pyre-only mixed signatures
+    // such as `int_ge/ir>i`; the codewriter/rtyper/jtransform parity
+    // fixes now make those opnames disappear at the source.
     #[test]
-    #[ignore = "task #85: int_ge/ir>i root cause — assembler emits mixed (ref,int) ge kinds"]
     fn build_default_bh_builder_matches_insns_table() {
         // Slice 3a: the runtime-side `BlackholeInterpBuilder` is reachable
         // from pyre-jit-trace. After `setup_insns + wire_bhimpl_handlers`
@@ -1164,59 +1145,27 @@ mod tests {
 
     #[test]
     fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
-        // Task #85 lock-in: the unwired-opname set surfaced by
-        // `build_default_bh_builder_with_unwired_report` is the
-        // documented kind-mismatch fallout — five opnames whose
-        // operand kinds disagree with their `bhimpl_*` handler
-        // (assembler emits `(ref, int)` `int_ge` for some graphs;
-        // similarly for `int_mul/ir>i`, `int_ne/fr>i`,
-        // `setarrayitem_gc_i/rrid`, `setarrayitem_gc_f/rrfd`).
-        // `int_xor/ri>i` previously appeared on this list but is no
-        // longer registered in the insns table, so it falls out of
-        // the unwired report. Pinning the exact set as a snapshot:
-        //   * Catches regressions that ADD a new unwired opname (a
-        //     fresh kind-mismatch shape upstream).
-        //   * Catches regressions that REMOVE a wired opname (handler
-        //     deletion that broke coverage).
-        //   * Auto-fails when Task #85 closes — the snapshot becomes
-        //     stale, the test forces an explicit empty-set update,
-        //     and the ignored strict-coverage tests above can have
-        //     `#[ignore]` lifted in the same change.
+        // Task #85 lock-in: every generated opname must be wired by
+        // `wire_bhimpl_handlers`.  This remains as a regression
+        // snapshot even though the expected set is empty: a new entry
+        // means codewriter/regalloc emitted a kind shape that no
+        // RPython blackhole handler has.  When that happens the fix is
+        // upstream type inference, not adding a `*_r>i`/`*_ir>i` alias
+        // — pyre-only mixed signatures masked over real type-inference
+        // gaps and were rolled back in `jtransform: drop Ref-operand
+        // auto-coercion arms`.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        // Snapshot refreshed after the eval-restack squash landed: the
-        // upstream kind-flow surface shifted — `int_ge/ir>i`,
-        // `int_xor/ri>i`, `setarrayitem_gc_f/rrfd`, and
-        // `setarrayitem_gc_i/rrid` no longer surface (Task #85 partial
-        // progress) while `int_add/if>f`, `int_eq/fr>i`,
-        // `int_gt/fr>i`, `int_lt/fr>i`, `int_ne/rf>i`, and
-        // `int_same_as/r>r` newly appear (fresh kind-mismatch shapes
-        // for Task #85 to chase).  The snapshot pins the new boundary
-        // so future drift remains visible.
-        let expected: Vec<String> = [
-            "int_add/if>f",
-            "int_eq/fr>i",
-            "int_gt/fr>i",
-            "int_lt/fr>i",
-            "int_mul/ir>i",
-            "int_ne/fr>i",
-            "int_ne/rf>i",
-            "int_same_as/r>r",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let expected: Vec<String> = Vec::new();
         assert_eq!(
             unwired, expected,
             "Task #85 unwired-opname snapshot drifted. If a new entry \
-             appeared, find the new kind-flow bug upstream. If an entry \
-             disappeared (good — Task #85 progress), update this snapshot \
-             and lift `#[ignore]` from the strict-coverage tests above.",
+             appeared, find the new kind-flow bug upstream instead of \
+             adding a bhhandler alias.",
         );
     }
 
     #[test]
-    #[ignore = "task #85: int_ge/ir>i root cause — assembler emits mixed (ref,int) ge kinds"]
     fn default_bh_builder_handler_coverage_report() {
         // Diagnostic: surface the opnames in the real insns table that
         // `wire_bhimpl_handlers` did NOT override. These fall back to
@@ -1298,11 +1247,9 @@ mod tests {
         // majit-metainterp. Closes the build-artifact → runtime →
         // BlackholeInterpBuilder round trip end-to-end.
         //
-        // `_with_unwired_report` over the strict `build_default_bh_builder()`
-        // because the latter panics on the 6 unwired opnames
-        // (`int_ge/ir>i` family — Task #85 root cause is open).
-        // Those opcodes aren't on this test's dispatch path; the
-        // unwired list is intentionally ignored.
+        // Use the reporting helper here because this test inspects a tiny
+        // synthetic bytecode slice and does not need the strict coverage
+        // assertion exercised by `build_default_bh_builder()`.
         let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();

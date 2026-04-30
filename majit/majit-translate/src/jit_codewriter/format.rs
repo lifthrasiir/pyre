@@ -406,6 +406,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
     match &op.kind {
         OpKind::Call { .. } => "call".to_string(),
         OpKind::ConstInt(_) => "const_int".to_string(),
+        OpKind::ConstFloat(_) => "const_float".to_string(),
         OpKind::CallElidable {
             result_kind,
             args_i,
@@ -500,6 +501,9 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
         // format.py:23 `'$%r' % (x.value,)` — constants print as $<value>.
         OpKind::ConstInt(value) => {
             let _ = write!(out, "${value}");
+        }
+        OpKind::ConstFloat(bits) => {
+            let _ = write!(out, "${}", f64::from_bits(*bits));
         }
         // jtransform.py:414-435 `rewrite_call`:
         //   sublists = [lst_i?, lst_r?, lst_f?, calldescr?]   # only kinds present

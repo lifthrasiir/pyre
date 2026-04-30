@@ -291,6 +291,13 @@ pub enum OpKind {
         ty: ValueType,
     },
     ConstInt(i64),
+    /// RPython `flowmodel.py:Constant(rfloat)` — a float constant whose
+    /// `concretetype` is `lltype.Float`.  Stored as the f64 bit pattern
+    /// (`history.py:265 ConstFloat.getfloatstorage`) so PartialEq/Hash
+    /// stay derivable.  The assembler materialises this through the
+    /// existing `constants_f` pool with a `float_copy` op, mirroring
+    /// the `ConstInt` → `int_copy` lowering.
+    ConstFloat(u64),
     FieldRead {
         base: ValueId,
         field: FieldDescriptor,
@@ -678,7 +685,17 @@ pub enum OpKind {
         jitdriver_index: usize,
     },
 
-    Unknown {
+    /// pyre-only marker emitted by the front-end (`front/ast.rs`
+    /// `continue_with_unknown*` / `stop_unsupported`) when a syntactic
+    /// form cannot be lowered to a canonical opname.  Reaching the op at
+    /// runtime means tracing or blackhole resume crossed an
+    /// untranslatable graph slice; downstream handlers advance past it
+    /// (see `blackhole.rs::handler_abort_marker_pyre`).  Distinct from
+    /// RPython's `SwitchToBlackhole` exception path — RPython aborts
+    /// before lowering so no equivalent opname exists.  Kept under
+    /// `kind: UnknownKind` because the same diagnostic enum is reused
+    /// by `FlowingError::Unsupported` (`front/ast.rs:53`).
+    Abort {
         kind: UnknownKind,
     },
 }

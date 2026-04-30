@@ -170,7 +170,7 @@ pub fn recognition_report(result: &crate::pipeline::ProgramPipelineResult) -> Re
             if let FlatOp::Op(op) = insn {
                 flat_ops += 1;
                 match &op.kind {
-                    OpKind::Unknown { .. } => unknowns += 1,
+                    OpKind::Abort { .. } => unknowns += 1,
                     OpKind::Call { target, .. } => {
                         if matches!(target, crate::model::CallTarget::UnsupportedExpr) {
                             unresolved += 1;

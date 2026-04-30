@@ -167,6 +167,21 @@ fn bigint_result(value: BigInt) -> PyObjectRef {
     }
 }
 
+#[majit_macros::elidable]
+fn bigint_and(a: BigInt, b: BigInt) -> BigInt {
+    a & b
+}
+
+#[majit_macros::elidable]
+fn bigint_or(a: BigInt, b: BigInt) -> BigInt {
+    a | b
+}
+
+#[majit_macros::elidable]
+fn bigint_xor(a: BigInt, b: BigInt) -> BigInt {
+    a ^ b
+}
+
 // ── Arithmetic operations ─────────────────────────────────────────────
 
 /// Integer addition fast path.
@@ -214,10 +229,11 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
     // Python floor division: rounds toward negative infinity.
     // i64::MIN / -1 overflows → fall back to BigInt.
-    let (q, r) = match va.checked_div(vb) {
-        Some(q) => (q, va % vb),
+    let q = match va.checked_div(vb) {
+        Some(q) => q,
         None => return Ok(bigint_result(BigInt::from(va).div_floor(&BigInt::from(vb)))),
     };
+    let r = va % vb;
     // Adjust: if remainder is nonzero and signs of operands differ, subtract 1.
     let q = if r != 0 && (r ^ vb) < 0 { q - 1 } else { q };
     Ok(w_int_new(q))
@@ -486,15 +502,15 @@ unsafe fn int_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_bitand(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(as_bigint(a) & as_bigint(b)))
+    Ok(bigint_result(bigint_and(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_bitor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(as_bigint(a) | as_bigint(b)))
+    Ok(bigint_result(bigint_or(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_bitxor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(as_bigint(a) ^ as_bigint(b)))
+    Ok(bigint_result(bigint_xor(as_bigint(a), as_bigint(b))))
 }
 
 // ── String operations ────────────────────────────────────────────────

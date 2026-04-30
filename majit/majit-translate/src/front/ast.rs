@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use syn::{Item, ItemFn};
 
 use crate::ParsedInterpreter;
+use crate::flowspace::model::ConstValue;
 use crate::model::{
     BlockId, CallTarget, ExitSwitch, FunctionGraph, ImmutableRank, Link, LinkArg, OpKind,
     UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind, ValueId, ValueType,
@@ -160,16 +161,51 @@ pub struct StructFieldRegistry {
 }
 
 impl StructFieldRegistry {
-    /// RPython: look up a field's type.  For array-typed fields like
+    /// Look up a field's type.  For array-typed fields like
     /// `Vec<Point>`, this returns the full type string `"Vec<Point>"`.
     /// Callers use `array_element_type_from_str` to extract `"Point"`.
+    ///
+    /// **Structural adaptation (parity rule §1):** RPython compares
+    /// `lltype.Ptr(GcStruct)` objects directly; field/method lookups
+    /// resolve by structural type identity, not name.  Pyre's
+    /// analyser carries types as strings (the only stable handle on
+    /// `syn::Type`), so identity is recovered by string match.  A
+    /// receiver may surface as a fully-qualified path that adds
+    /// crate-level segments the analyser's `module_prefix` did not
+    /// contain at registration time (e.g. `obj as *mut
+    /// pyre_object::rangeobject::W_RangeIterator` while
+    /// `collect_fields_and_returns` registered the struct under the
+    /// shorter analyser-relative path).  Walk the trailing segments
+    /// until a registered key matches.
+    ///
+    /// **Limitation:** the suffix walk does not disambiguate two
+    /// structs that share a leaf name in different modules of the
+    /// same parsed crate.  `collect_fields_and_returns` registers
+    /// the bare name via `entry().or_insert`, so the first struct
+    /// with a given leaf wins the bare-key slot and a suffix walk
+    /// bottoming out there returns its fields regardless of which
+    /// qualified owner the caller asked about.  The parsed-
+    /// interpreter crate has no leaf-name collisions today; a future
+    /// collision is a structural-correctness concern that must be
+    /// re-evaluated rather than papered over.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
-        self.fields.get(owner).and_then(|fields| {
-            fields
+        if let Some(fields) = self.fields.get(owner) {
+            return fields
                 .iter()
                 .find(|(name, _)| name == field_name)
-                .map(|(_, ty)| ty.as_str())
-        })
+                .map(|(_, ty)| ty.as_str());
+        }
+        let mut tail = owner;
+        while let Some(rest) = tail.split_once("::").map(|(_, rest)| rest) {
+            if let Some(fields) = self.fields.get(rest) {
+                return fields
+                    .iter()
+                    .find(|(name, _)| name == field_name)
+                    .map(|(_, ty)| ty.as_str());
+            }
+            tail = rest;
+        }
+        None
     }
 }
 
@@ -459,6 +495,26 @@ fn collect_fields_and_returns(
                                     ret_ty,
                                 );
                             }
+                        }
+                    }
+                }
+            }
+            Item::Trait(trait_def) => {
+                let trait_root = qualify_type_name(&trait_def.ident.to_string(), prefix);
+                for sub in &trait_def.items {
+                    if let syn::TraitItem::Fn(method) = sub {
+                        let ret_ty = match &method.sig.output {
+                            syn::ReturnType::Type(_, ty) => qualified_full_type_string(
+                                ty,
+                                prefix,
+                                known_struct_names,
+                                known_trait_names,
+                            ),
+                            syn::ReturnType::Default => Some("()".to_string()),
+                        };
+                        if let Some(ret_ty) = ret_ty {
+                            fn_return_types
+                                .insert(format!("{}::{}", trait_root, method.sig.ident), ret_ty);
                         }
                     }
                 }
@@ -766,7 +822,10 @@ pub fn collect_jit_hints_pub(attrs: &[syn::Attribute]) -> Vec<String> {
 #[derive(Debug, Clone)]
 struct GraphBuildContext<'a> {
     local_type_roots: HashMap<String, String>,
+    local_type_strings: HashMap<String, String>,
     local_value_types: HashMap<String, ValueType>,
+    local_trait_bound_roots: HashMap<String, String>,
+    generic_trait_roots: HashMap<String, String>,
     /// RPython: ARRAY element type identity — maps variable name to the
     /// element type of its array (e.g. "arr" → "Point" for `arr: Vec<Point>`).
     /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
@@ -820,7 +879,10 @@ impl<'a> GraphBuildContext<'a> {
     ) -> Self {
         Self {
             local_type_roots: HashMap::new(),
+            local_type_strings: HashMap::new(),
             local_value_types: HashMap::new(),
+            local_trait_bound_roots: HashMap::new(),
+            generic_trait_roots: HashMap::new(),
             local_array_types: HashMap::new(),
             local_dyn_trait_roots: HashMap::new(),
             struct_fields,
@@ -830,6 +892,37 @@ impl<'a> GraphBuildContext<'a> {
             known_trait_names,
             loop_stack: Vec::new(),
         }
+    }
+}
+
+struct LocalBindingSnapshot {
+    local_type_roots: HashMap<String, String>,
+    local_type_strings: HashMap<String, String>,
+    local_value_types: HashMap<String, ValueType>,
+    local_trait_bound_roots: HashMap<String, String>,
+    local_array_types: HashMap<String, String>,
+    local_dyn_trait_roots: HashMap<String, String>,
+}
+
+impl LocalBindingSnapshot {
+    fn capture(ctx: &GraphBuildContext<'_>) -> Self {
+        Self {
+            local_type_roots: ctx.local_type_roots.clone(),
+            local_type_strings: ctx.local_type_strings.clone(),
+            local_value_types: ctx.local_value_types.clone(),
+            local_trait_bound_roots: ctx.local_trait_bound_roots.clone(),
+            local_array_types: ctx.local_array_types.clone(),
+            local_dyn_trait_roots: ctx.local_dyn_trait_roots.clone(),
+        }
+    }
+
+    fn restore(self, ctx: &mut GraphBuildContext<'_>) {
+        ctx.local_type_roots = self.local_type_roots;
+        ctx.local_type_strings = self.local_type_strings;
+        ctx.local_value_types = self.local_value_types;
+        ctx.local_trait_bound_roots = self.local_trait_bound_roots;
+        ctx.local_array_types = self.local_array_types;
+        ctx.local_dyn_trait_roots = self.local_dyn_trait_roots;
     }
 }
 
@@ -882,6 +975,8 @@ fn build_function_graph(
         known_struct_names,
         known_trait_names,
     );
+    ctx.generic_trait_roots =
+        collect_generic_trait_roots(&func.sig.generics, module_prefix, known_trait_names);
 
     // Register function parameters as Input ops AND on `Block.inputargs`.
     //
@@ -900,6 +995,8 @@ fn build_function_graph(
             syn::FnArg::Receiver(recv) => {
                 if let Some(self_ty_root) = &self_ty_root {
                     ctx.local_type_roots
+                        .insert("self".to_string(), self_ty_root.clone());
+                    ctx.local_type_strings
                         .insert("self".to_string(), self_ty_root.clone());
                 }
                 // `self`, `&self`, `&mut self` — all three correspond to
@@ -926,6 +1023,10 @@ fn build_function_graph(
                     // Qualify bare type with module prefix for exact identity.
                     let qualified = qualify_type_name(&type_root, &ctx.module_prefix);
                     ctx.local_type_roots.insert(name.clone(), qualified);
+                    if let Some(trait_root) = ctx.generic_trait_roots.get(&type_root) {
+                        ctx.local_trait_bound_roots
+                            .insert(name.clone(), trait_root.clone());
+                    }
                 }
                 if let Some(full_type) = qualified_full_type_string(
                     &pat_type.ty,
@@ -933,6 +1034,8 @@ fn build_function_graph(
                     ctx.known_struct_names,
                     ctx.known_trait_names,
                 ) {
+                    ctx.local_type_strings
+                        .insert(name.clone(), full_type.clone());
                     ctx.local_array_types.insert(name.clone(), full_type);
                 }
                 if let Some(trait_root) = extract_dyn_trait_root_with_context(
@@ -1024,8 +1127,8 @@ fn build_function_graph(
 fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
     let mut hints = Vec::new();
     for attr in attrs {
-        if let Some(ident) = attr.path().get_ident() {
-            let name = ident.to_string();
+        if let Some(segment) = attr.path().segments.last() {
+            let name = segment.ident.to_string();
             match name.as_str() {
                 // RPython-parity names (rlib/jit.py)
                 "elidable" | "jit_elidable" => hints.push("elidable".into()),
@@ -1164,6 +1267,8 @@ fn lower_stmt(
                     ctx.known_struct_names,
                     ctx.known_trait_names,
                 ) {
+                    ctx.local_type_strings
+                        .insert(name.clone(), full_type.clone());
                     ctx.local_array_types.insert(name.clone(), full_type);
                 }
                 if let Some(trait_root) = extract_dyn_trait_root_with_context(
@@ -1175,6 +1280,7 @@ fn lower_stmt(
                 }
             }
             if let Some(init) = &local.init {
+                let init_type_string = expression_type_string(&init.expr, ctx);
                 let lowered = lower_expr(graph, block, &init.expr, options, ctx)?;
                 if lowered.path_closed {
                     return Ok(true);
@@ -1194,10 +1300,24 @@ fn lower_stmt(
                         let name = canonical_pat_name(&pat_type.pat);
                         graph.name_value(vid, name);
                     }
-                    if let Some(name) = name
-                        && let Some(ty) = graph_result_value_type(graph, vid)
-                    {
-                        ctx.local_value_types.insert(name, ty);
+                    if let Some(name) = name {
+                        if let Some(ty) = graph_value_type(graph, vid) {
+                            ctx.local_value_types.insert(name.clone(), ty);
+                        }
+                        if let Some(type_string) = init_type_string {
+                            // Mirror `bind_ident_type` on let-with-annotation:
+                            // record the receiver root so subsequent
+                            // `receiver_type_root` lookups for field access
+                            // can resolve `(*x).field` against
+                            // `ctx.struct_fields`.  Without this, lets bound
+                            // by inference from a Cast/Call init lose their
+                            // owner root and field reads land with `ty:
+                            // Unknown` → cast arms fire downstream.
+                            if let Some(root) = type_root_from_type_string(&type_string) {
+                                ctx.local_type_roots.insert(name.clone(), root);
+                            }
+                            ctx.local_type_strings.insert(name, type_string);
+                        }
                     }
                 }
             }
@@ -1279,7 +1399,7 @@ fn lower_expr(
      -> Result<Lowered, FlowingError> {
         graph.push_op(
             block,
-            OpKind::Unknown {
+            OpKind::Abort {
                 kind: UnknownKind::UnsupportedExpr { variant },
             },
             true,
@@ -1298,7 +1418,7 @@ fn lower_expr(
         |graph: &mut FunctionGraph, block: BlockId, variant: UnsupportedExprKind| -> Lowered {
             let v = graph.push_op(
                 block,
-                OpKind::Unknown {
+                OpKind::Abort {
                     kind: UnknownKind::UnsupportedExpr { variant },
                 },
                 true,
@@ -1312,7 +1432,7 @@ fn lower_expr(
         |graph: &mut FunctionGraph, block: BlockId, variant: UnsupportedLiteralKind| -> Lowered {
             let v = graph.push_op(
                 block,
-                OpKind::Unknown {
+                OpKind::Abort {
                     kind: UnknownKind::UnsupportedLiteral { variant },
                 },
                 true,
@@ -1508,14 +1628,11 @@ fn lower_expr(
                     .iter()
                     .map(|s| s.ident.to_string())
                     .collect();
-                let key = if segments.len() == 1 && !ctx.module_prefix.is_empty() {
-                    format!("{}::{}", ctx.module_prefix, segments[0])
-                } else {
-                    segments.join("::")
-                };
-                ctx.fn_return_types
-                    .get(&key)
-                    .map(|s| type_string_to_value_type(s))
+                intrinsic_call_result_type(&segments)
+                    .or_else(|| {
+                        lookup_function_return_type(ctx, &segments)
+                            .map(|s| type_string_to_value_type(s))
+                    })
                     .unwrap_or(ValueType::Unknown)
             } else {
                 ValueType::Unknown
@@ -1549,6 +1666,7 @@ fn lower_expr(
             // locals / params / Box<dyn> receivers all participate
             // (Issue 3 coverage).
             let receiver_root = receiver_type_root(&mc.receiver, ctx);
+            let trait_bound_root = trait_bound_root_for_receiver(&mc.receiver, ctx);
             let target = if let Some(trait_root) = dyn_trait_root_for_receiver(&mc.receiver, ctx) {
                 CallTarget::indirect(trait_root, mc.method.to_string())
             } else {
@@ -1563,9 +1681,14 @@ fn lower_expr(
             // integer ops (otherwise `value_type_to_kind` defaults to
             // `'r'` and the result reaches the assembler as a Ref-kind
             // operand, surfacing as `int_ge/ir>i` etc.).
-            let result_ty = transparent_option_method_result_type(graph, &args, &mc.method)
+            let result_ty = primitive_method_result_type(graph, &args, &mc.method)
+                .or_else(|| transparent_option_method_result_type(graph, &args, &mc.method))
                 .or_else(|| {
                     lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
+                        .map(|s| type_string_to_value_type(s))
+                })
+                .or_else(|| {
+                    lookup_method_return_type(ctx, trait_bound_root.as_deref(), &mc.method)
                         .map(|s| type_string_to_value_type(s))
                 })
                 .unwrap_or(ValueType::Unknown);
@@ -1601,7 +1724,7 @@ fn lower_expr(
             //
             // Without this desugar, `if_expr.cond` would be lowered as
             // a regular expression and trip the catch-all `Expr::Let`
-            // arm below, emitting `OpKind::Unknown { Let }`. That stub
+            // arm below, emitting `OpKind::Abort { Let }`. That stub
             // makes any function carrying an `if let` un-portal-able
             // (Phase G G.4.4 path A.1) since a BH resume could land on
             // it and crash on "unknown bhimpl_*".
@@ -1749,7 +1872,7 @@ fn lower_expr(
         // every literal to a concrete SSA value at annotation time.  pyre
         // handles the common RPython-usable cases here; cases that RPython
         // itself does not support (f64 literals, char/str/byte literals
-        // inside annotated code) still fall through to `OpKind::Unknown`
+        // inside annotated code) still fall through to `OpKind::Abort`
         // and are tracked as rtyper follow-ups.
         syn::Expr::Lit(lit) => {
             match &lit.lit {
@@ -1787,6 +1910,20 @@ fn lower_expr(
                         value: graph.push_op(*block, OpKind::ConstInt(c.value() as i64), true),
                         path_closed: false,
                     });
+                }
+                // RPython `flowmodel.py:Constant(rfloat)`: float literals
+                // become `Constant` nodes with `lltype.Float` concretetype.
+                // Pyre stores the bit pattern (`history.py:265
+                // ConstFloat.getfloatstorage`) so PartialEq/Hash stay
+                // derivable; the assembler materialises this through the
+                // existing `constants_f` pool with a `float_copy` op.
+                syn::Lit::Float(f) => {
+                    if let Ok(v) = f.base10_parse::<f64>() {
+                        return Ok(Lowered {
+                            value: graph.push_op(*block, OpKind::ConstFloat(v.to_bits()), true),
+                            path_closed: false,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -1871,14 +2008,16 @@ fn lower_expr(
         syn::Expr::Binary(bin) => {
             let lhs = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
             let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
+            let op_name = binary_op_name(&bin.op);
+            let result_ty = binary_result_value_type(graph, lhs, rhs, op_name);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::BinOp {
-                        op: binary_op_name(&bin.op).into(),
+                        op: op_name.into(),
                         lhs,
                         rhs,
-                        result_ty: ValueType::Unknown,
+                        result_ty,
                     },
                     true,
                 ),
@@ -1896,7 +2035,7 @@ fn lower_expr(
             if result_ty == ValueType::Void {
                 return Ok(Lowered::no_value());
             }
-            let source_ty = graph_result_value_type(graph, operand);
+            let source_ty = graph_value_type(graph, operand);
             let op = cast_op_name(source_ty.as_ref(), &result_ty).to_string();
             Ok(Lowered {
                 value: graph.push_op(
@@ -1915,6 +2054,7 @@ fn lower_expr(
         // ── match expr { arms } → multi-block (RPython switch) ──
         syn::Expr::Match(m) => {
             let scrutinee = get_value!(lower_expr(graph, block, &m.expr, options, ctx)?);
+            let scrutinee_type_string = expression_type_string(&m.expr, ctx);
 
             if m.arms.is_empty() {
                 return Ok(Lowered::no_value());
@@ -1944,7 +2084,11 @@ fn lower_expr(
             for arm in &m.arms {
                 let entry = graph.create_block();
                 let mut tail = entry;
-                let arm_lowered = lower_expr(graph, &mut tail, &arm.body, options, ctx)?;
+                let saved_locals = LocalBindingSnapshot::capture(ctx);
+                bind_pattern_locals(&arm.pat, scrutinee_type_string.as_deref(), ctx);
+                let arm_lowered_result = lower_expr(graph, &mut tail, &arm.body, options, ctx);
+                saved_locals.restore(ctx);
+                let arm_lowered = arm_lowered_result?;
                 // A closed arm (body is `return x` / `break` / `panic!`
                 // / `raise`) does not contribute a value to the merge —
                 // its path terminates inside `tail` and no outgoing
@@ -2123,7 +2267,7 @@ fn lower_expr(
             // leave every statement after the `for` unreachable).
             let for_cond = graph.push_op(
                 header_entry,
-                OpKind::Unknown {
+                OpKind::Abort {
                     kind: UnknownKind::UnsupportedExpr {
                         variant: UnsupportedExprKind::ForLoop,
                     },
@@ -2348,7 +2492,7 @@ fn lower_expr(
                 //
                 // Without this desugar, `matches!` flows through the
                 // catch-all `Expr::Macro` arm below and emits
-                // `OpKind::Unknown { Macro }`. Phase G G.4.4 Path A.B.
+                // `OpKind::Abort { Macro }`. Phase G G.4.4 Path A.B.
                 if macro_name == "matches" {
                     let tokens = m.mac.tokens.clone();
                     if let Some((scrutinee_tokens, rest_tokens)) =
@@ -2387,7 +2531,7 @@ fn lower_expr(
                         }
                     }
                     // Parse failure falls through to the catch-all
-                    // Macro arm — preserves the `OpKind::Unknown`
+                    // Macro arm — preserves the `OpKind::Abort`
                     // diagnostic for un-portable `matches!` shapes
                     // rather than silently mis-lowering.
                 }
@@ -2846,6 +2990,69 @@ fn binary_op_name(op: &syn::BinOp) -> &'static str {
     }
 }
 
+fn binary_result_value_type(
+    graph: &FunctionGraph,
+    lhs: ValueId,
+    rhs: ValueId,
+    op: &str,
+) -> ValueType {
+    if matches!(op, "eq" | "ne" | "lt" | "le" | "gt" | "ge") {
+        return ValueType::Int;
+    }
+
+    let lhs_ty = graph_value_type(graph, lhs);
+    let rhs_ty = graph_value_type(graph, rhs);
+    match (lhs_ty, rhs_ty) {
+        (Some(ValueType::Float), Some(ValueType::Float))
+        | (Some(ValueType::Float), Some(ValueType::Int))
+        | (Some(ValueType::Int), Some(ValueType::Float))
+            if matches!(
+                op,
+                "add"
+                    | "sub"
+                    | "mul"
+                    | "div"
+                    | "mod"
+                    | "add_assign"
+                    | "sub_assign"
+                    | "mul_assign"
+                    | "div_assign"
+                    | "mod_assign"
+            ) =>
+        {
+            ValueType::Float
+        }
+        (Some(ValueType::Int), Some(ValueType::Int))
+            if matches!(
+                op,
+                "add"
+                    | "sub"
+                    | "mul"
+                    | "div"
+                    | "mod"
+                    | "bitand"
+                    | "bitor"
+                    | "bitxor"
+                    | "lshift"
+                    | "rshift"
+                    | "add_assign"
+                    | "sub_assign"
+                    | "mul_assign"
+                    | "div_assign"
+                    | "mod_assign"
+                    | "bitand_assign"
+                    | "bitor_assign"
+                    | "bitxor_assign"
+                    | "lshift_assign"
+                    | "rshift_assign"
+            ) =>
+        {
+            ValueType::Int
+        }
+        _ => ValueType::Unknown,
+    }
+}
+
 fn member_name(member: &syn::Member) -> String {
     match member {
         syn::Member::Named(ident) => ident.to_string(),
@@ -2960,6 +3167,98 @@ fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<Valu
         })
 }
 
+fn graph_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
+    graph_result_value_type(graph, value).or_else(|| graph_link_input_value_type(graph, value))
+}
+
+fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
+    for target_block in &graph.blocks {
+        let Some(arg_index) = target_block
+            .inputargs
+            .iter()
+            .position(|&inputarg| inputarg == value)
+        else {
+            continue;
+        };
+        let mut inferred: Option<ValueType> = None;
+        for predecessor in &graph.blocks {
+            for link in &predecessor.exits {
+                if link.target != target_block.id {
+                    continue;
+                }
+                let source_ty = match link.args.get(arg_index)? {
+                    LinkArg::Value(source) => match graph_result_value_type(graph, *source) {
+                        Some(ty) => ty,
+                        None => continue,
+                    },
+                    // RPython `flowspace/model.py:Constant.concretetype`
+                    // — `Link.args` may carry constants whose lltype is
+                    // determined by the constant's Python class; the
+                    // inputarg's concretetype is unified across all
+                    // predecessor links the same way variable sources
+                    // are.  Skipping constants leaves the inputarg
+                    // Unknown, which the rtyper backfills with GcRef
+                    // and forces synthetic casts at int/float
+                    // operations downstream.
+                    LinkArg::Const(c) => match const_value_value_type(c) {
+                        Some(ty) => ty,
+                        None => continue,
+                    },
+                };
+                match &inferred {
+                    None => inferred = Some(source_ty),
+                    Some(existing) if *existing == source_ty => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        if inferred.is_some() {
+            return inferred;
+        }
+    }
+    None
+}
+
+/// RPython `flowspace/model.py:Constant.concretetype` — map a Python
+/// constant value to its lltype kind.  Used by
+/// `graph_link_input_value_type` to infer phi-input concretetype from
+/// constant link args.  `Placeholder` is unmaterialised by definition
+/// and never appears in production link args.
+fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
+    match c {
+        // RPython int/bool both map to `lltype.Signed`
+        // (`rpython/rtyper/rint.py`); booleans flow through int handlers.
+        ConstValue::Int(_) | ConstValue::Bool(_) => Some(ValueType::Int),
+        ConstValue::Float(_) => Some(ValueType::Float),
+        // GC-managed Python objects → `lltype.Ptr(GcStruct)` (Ref bank).
+        ConstValue::ByteStr(_)
+        | ConstValue::UniStr(_)
+        | ConstValue::None
+        | ConstValue::Tuple(_)
+        | ConstValue::List(_)
+        | ConstValue::Dict(_)
+        | ConstValue::Code(_)
+        | ConstValue::Function(_)
+        | ConstValue::Graphs(_)
+        | ConstValue::Atom(_)
+        | ConstValue::LLPtr(_)
+        | ConstValue::HostObject(_) => Some(ValueType::Ref),
+        // `LowLevelType` constants are `lltype.Void` carriers (the
+        // value IS a TYPE object); RPython flow `Constant(TYPE,
+        // lltype.Void)` — Void register class.
+        ConstValue::LowLevelType(_) => Some(ValueType::Void),
+        // `_address` is RPython's `Address` lowleveltype — distinct
+        // from GcRef and Signed.  Pyre has no Address bank, but the
+        // value is a raw pointer-sized integer in practice; conservative
+        // None lets the rtyper Unknown→GcRef fallback handle it as it
+        // does today.
+        ConstValue::LLAddress(_) => None,
+        // SpecTag identity carrier — never feeds an int/float/ref op.
+        ConstValue::SpecTag(_) => None,
+        ConstValue::Placeholder => None,
+    }
+}
+
 fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
     match kind {
         OpKind::Input { ty, .. }
@@ -2978,6 +3277,7 @@ fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
         OpKind::ConstInt(_) | OpKind::VtableMethodPtr { .. } | OpKind::CurrentTraceLength => {
             Some(ValueType::Int)
         }
+        OpKind::ConstFloat(_) => Some(ValueType::Float),
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. } => {
@@ -3006,7 +3306,68 @@ fn transparent_option_method_result_type(
         "as_usize" | "len" | "is_empty" | "is_null" | "wrapping_mul" => Some(ValueType::Int),
         "unwrap_or" => args
             .get(1)
-            .and_then(|&default| graph_result_value_type(graph, default)),
+            .and_then(|&default| graph_value_type(graph, default)),
+        _ => None,
+    }
+}
+
+/// Inference for Rust `f64`/i64 method calls used as low-level
+/// floating-point/integer helpers in pyre's port of
+/// `pypy/objspace/std/floatobject.py`.
+///
+/// **Structural adaptation (parity rule §1):** RPython spells the
+/// same low-level operations as `r_float`/`r_uint`/`r_longlong`
+/// helpers (`rpython/rlib/rfloat.py`, `rpython/rlib/rarithmetic.py`),
+/// not as method calls.  The Rust port relays them through `f64::*`
+/// and `i64::*` because that is the only way to express the same
+/// arithmetic in stable Rust.  The receiver-typed match below stamps
+/// the result class so jtransform sees the same concretetype the
+/// rtyper would have written onto a Variable for an `r_float` /
+/// `r_uint` operand.
+///
+/// This mapping is for the LOW-LEVEL helpers only — it does NOT
+/// translate Python-level `float.__floor__` / `int.__abs__`.  The
+/// PyPy descriptors (`pypy/objspace/std/floatobject.py:descr_floor`)
+/// box-return `int`, whereas Rust `f64::floor` returns `f64`.
+/// Callers must already have lowered to the helper level (e.g.
+/// `floatobject.py` body, not the unboxed Python descriptor) before
+/// this inference applies.
+fn primitive_method_result_type(
+    graph: &FunctionGraph,
+    args: &[ValueId],
+    method: &syn::Ident,
+) -> Option<ValueType> {
+    let receiver = args
+        .first()
+        .and_then(|&recv| graph_value_type(graph, recv))?;
+    match (receiver, method.to_string().as_str()) {
+        (ValueType::Float, "abs" | "floor" | "ceil" | "trunc" | "round" | "sqrt" | "powf") => {
+            Some(ValueType::Float)
+        }
+        (ValueType::Float, "is_nan" | "is_infinite" | "is_finite" | "is_sign_negative") => {
+            Some(ValueType::Int)
+        }
+        (
+            ValueType::Int,
+            "abs" | "wrapping_abs" | "wrapping_mul" | "wrapping_add" | "wrapping_sub",
+        ) => Some(ValueType::Int),
+        _ => None,
+    }
+}
+
+fn intrinsic_call_result_type(segments: &[String]) -> Option<ValueType> {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    match path.as_slice() {
+        // Rust's `size_of::<T>()` is a compile-time `usize`.  RPython
+        // carries such layout sizes as `lltype.Signed` constants before
+        // codewriter, so the equivalent register class is Int.
+        ["std", "mem", "size_of"] | ["core", "mem", "size_of"] | ["mem", "size_of"] => {
+            Some(ValueType::Int)
+        }
+        // Associated f64 helpers used by the floatobject.py port.
+        ["f64", "copysign"] | ["std", "f64", "copysign"] | ["core", "f64", "copysign"] => {
+            Some(ValueType::Float)
+        }
         _ => None,
     }
 }
@@ -3195,6 +3556,137 @@ fn canonical_pat_name(pat: &syn::Pat) -> String {
     }
 }
 
+fn bind_pattern_locals(
+    pat: &syn::Pat,
+    matched_type: Option<&str>,
+    ctx: &mut GraphBuildContext<'_>,
+) {
+    match pat {
+        syn::Pat::Ident(ident) => {
+            if let Some(type_str) = matched_type {
+                bind_ident_type(&ident.ident, type_str, ctx);
+            }
+        }
+        syn::Pat::Reference(reference) => bind_pattern_locals(&reference.pat, matched_type, ctx),
+        syn::Pat::Paren(paren) => bind_pattern_locals(&paren.pat, matched_type, ctx),
+        syn::Pat::Type(typed) => {
+            let explicit_type = qualified_full_type_string(
+                &typed.ty,
+                &ctx.module_prefix,
+                ctx.known_struct_names,
+                ctx.known_trait_names,
+            );
+            bind_pattern_locals(&typed.pat, explicit_type.as_deref().or(matched_type), ctx);
+        }
+        syn::Pat::TupleStruct(tuple_struct) => {
+            let path: Vec<String> = tuple_struct
+                .path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect();
+            if matches_constructor_path(&path, "Some") {
+                if let (Some(inner), Some(inner_pat)) = (
+                    matched_type.and_then(transparent_option_inner_type),
+                    tuple_struct.elems.first(),
+                ) {
+                    bind_pattern_locals(inner_pat, Some(inner), ctx);
+                }
+            } else if matches_constructor_path(&path, "Ok") {
+                if let (Some(inner), Some(inner_pat)) = (
+                    matched_type.and_then(transparent_result_ok_type),
+                    tuple_struct.elems.first(),
+                ) {
+                    bind_pattern_locals(inner_pat, Some(inner), ctx);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bind_ident_type(ident: &syn::Ident, type_str: &str, ctx: &mut GraphBuildContext<'_>) {
+    let name = ident.to_string();
+    ctx.local_value_types
+        .insert(name.clone(), type_string_to_value_type(type_str));
+    ctx.local_type_strings
+        .insert(name.clone(), type_str.trim().to_string());
+    if let Some(root) = type_root_from_type_string(type_str) {
+        ctx.local_type_roots.insert(name, root);
+    }
+}
+
+fn matches_constructor_path(path: &[String], leaf: &str) -> bool {
+    path.last().is_some_and(|last| last == leaf)
+}
+
+/// Extract the head identifier from a Rust type string for
+/// receiver / method / field-owner lookups.
+///
+/// **Structural adaptation (parity rule §1):** RPython carries
+/// `concretetype` as an `lltype.Ptr(GcStruct)` object whose identity
+/// is structural; field/method lookups compare type objects directly.
+/// Rust's `syn` AST surfaces types as strings, and the analyser
+/// keeps them as strings throughout, so type identity resolves by
+/// head-identifier match.  Wrapper info (`Box<T>`, `Vec<T>`,
+/// generic args, lifetime params) is discarded here — the caller is
+/// expected to have already applied the appropriate transparent-
+/// container unwrapping (`extract_element_type_from_str` for arrays,
+/// `transparent_option_inner_type` etc.) when the wrapper carries
+/// payload type information.  Two distinct types that happen to share
+/// a head identifier (e.g. via `use crate::foo::Bar` and
+/// `use crate::baz::Bar`) will collide; pyre does not currently
+/// disambiguate, mirroring the analyser's flat name table.  The
+/// raw-pointer / reference prefix strip preserves single-identity
+/// behaviour for `let x = obj as *mut Foo;` bindings.
+fn type_root_from_type_string(type_str: &str) -> Option<String> {
+    let mut trimmed = type_str.trim();
+    loop {
+        let stripped = trimmed
+            .strip_prefix("*const ")
+            .or_else(|| trimmed.strip_prefix("*mut "))
+            .or_else(|| trimmed.strip_prefix("&mut "))
+            .or_else(|| trimmed.strip_prefix("&"));
+        match stripped {
+            Some(rest) => trimmed = rest.trim_start(),
+            None => break,
+        }
+    }
+    if trimmed.is_empty() || is_primitive_type_string(trimmed) {
+        return None;
+    }
+    let head = trimmed
+        .split(['<', ' ', '('])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
+fn is_primitive_type_string(type_str: &str) -> bool {
+    matches!(
+        type_str,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "bool"
+            | "char"
+            | "f32"
+            | "f64"
+            | "()"
+    )
+}
+
 /// RPython: lltype graph identity — returns the full type path.
 /// For `Foo` → "Foo", for `a::Foo` → "a::Foo".
 /// Classify a Rust parameter/return `syn::Type` into one of the three
@@ -3322,6 +3814,22 @@ fn type_root_ident(ty: &syn::Type) -> Option<String> {
     }
 }
 
+fn trait_bound_root_for_receiver(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .and_then(|ident| ctx.local_trait_bound_roots.get(&ident.to_string()).cloned()),
+        syn::Expr::Reference(reference) => trait_bound_root_for_receiver(&reference.expr, ctx),
+        syn::Expr::Paren(paren) => trait_bound_root_for_receiver(&paren.expr, ctx),
+        syn::Expr::Group(group) => trait_bound_root_for_receiver(&group.expr, ctx),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            trait_bound_root_for_receiver(&unary.expr, ctx)
+        }
+        _ => None,
+    }
+}
+
 /// Extract the declaring trait name from a `dyn T + 'a` bound list:
 /// returns the first `T::Trait`-style bound's canonical path.
 /// Used by `type_root_ident` / `full_type_string` / `extract_dyn_trait_root`
@@ -3340,6 +3848,38 @@ fn trait_object_root_name(
         ),
         _ => None,
     })
+}
+
+fn collect_generic_trait_roots(
+    generics: &syn::Generics,
+    prefix: &str,
+    known_trait_names: &std::collections::HashSet<String>,
+) -> HashMap<String, String> {
+    let mut roots = HashMap::new();
+    for param in &generics.params {
+        if let syn::GenericParam::Type(type_param) = param {
+            if let Some(root) =
+                trait_object_root_name_qualified(&type_param.bounds, prefix, known_trait_names)
+            {
+                roots.insert(type_param.ident.to_string(), root);
+            }
+        }
+    }
+    if let Some(where_clause) = &generics.where_clause {
+        for predicate in &where_clause.predicates {
+            if let syn::WherePredicate::Type(pred_ty) = predicate {
+                let Some(type_name) = type_root_ident(&pred_ty.bounded_ty) else {
+                    continue;
+                };
+                if let Some(root) =
+                    trait_object_root_name_qualified(&pred_ty.bounds, prefix, known_trait_names)
+                {
+                    roots.insert(type_name, root);
+                }
+            }
+        }
+    }
+    roots
 }
 
 fn qualify_known_trait_name(
@@ -3628,6 +4168,7 @@ pub(crate) fn qualified_full_type_string(
 /// RPython: `getkind(TYPE)[0]` — map type string to ValueType for kind suffix.
 /// Used by InteriorFieldRead/Write to determine the i/r/f suffix.
 fn type_string_to_value_type(type_str: &str) -> ValueType {
+    let type_str = type_str.trim();
     match type_str {
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
         | "bool" => ValueType::Int,
@@ -3637,15 +4178,124 @@ fn type_string_to_value_type(type_str: &str) -> ValueType {
     }
 }
 
+fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
+        let Some(inner) = trimmed
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        let ok_type = first_top_level_generic_arg(inner).map(str::trim)?;
+        if ok_type == "()" {
+            return None;
+        }
+        return Some(ok_type);
+    }
+    None
+}
+
+fn transparent_option_inner_type(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    for prefix in ["Option<", "std::option::Option<", "core::option::Option<"] {
+        let Some(inner) = trimmed
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        return first_top_level_generic_arg(inner).map(str::trim);
+    }
+    None
+}
+
+fn first_top_level_generic_arg(args: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (idx, ch) in args.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some(&args[..idx]),
+            _ => {}
+        }
+    }
+    if args.is_empty() { None } else { Some(args) }
+}
+
 fn field_value_type_from_expr(
     base: &syn::Expr,
     member: &syn::Member,
     ctx: &GraphBuildContext,
 ) -> Option<ValueType> {
-    let owner = receiver_type_root(base, ctx)?;
+    field_type_string_from_expr(base, member, ctx)
+        .map(|field_type| type_string_to_value_type(&field_type))
+}
+
+fn field_type_string_from_expr(
+    base: &syn::Expr,
+    member: &syn::Member,
+    ctx: &GraphBuildContext,
+) -> Option<String> {
     let field_name = member_name(member);
-    let field_type = ctx.struct_fields.field_type(&owner, &field_name)?;
-    Some(type_string_to_value_type(field_type))
+    let owner = receiver_type_root(base, ctx)?;
+    ctx.struct_fields
+        .field_type(&owner, &field_name)
+        .map(ToOwned::to_owned)
+}
+
+fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .and_then(|ident| ctx.local_type_strings.get(&ident.to_string()).cloned()),
+        syn::Expr::Reference(reference) => expression_type_string(&reference.expr, ctx),
+        syn::Expr::Paren(paren) => expression_type_string(&paren.expr, ctx),
+        syn::Expr::Unary(unary) => match &unary.op {
+            syn::UnOp::Deref(_) => expression_type_string(&unary.expr, ctx),
+            _ => None,
+        },
+        syn::Expr::Cast(cast) => qualified_full_type_string(
+            &cast.ty,
+            &ctx.module_prefix,
+            ctx.known_struct_names,
+            ctx.known_trait_names,
+        ),
+        syn::Expr::Field(field) => field_type_string_from_expr(&field.base, &field.member, ctx),
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(path) = &*call.func else {
+                return None;
+            };
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            lookup_function_return_type(ctx, &segments).cloned()
+        }
+        syn::Expr::MethodCall(mc) => {
+            let receiver_root = receiver_type_root(&mc.receiver, ctx);
+            let trait_bound_root = trait_bound_root_for_receiver(&mc.receiver, ctx);
+            lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
+                .or_else(|| lookup_method_return_type(ctx, trait_bound_root.as_deref(), &mc.method))
+                .cloned()
+        }
+        _ => None,
+    }
+}
+
+fn lookup_function_return_type<'a>(
+    ctx: &'a GraphBuildContext,
+    segments: &[String],
+) -> Option<&'a String> {
+    let key = if segments.len() == 1 && !ctx.module_prefix.is_empty() {
+        format!("{}::{}", ctx.module_prefix, segments[0])
+    } else {
+        segments.join("::")
+    };
+    ctx.fn_return_types.get(&key)
 }
 
 fn array_item_value_type_from_array_type_id(array_type_id: Option<&str>) -> Option<ValueType> {
@@ -3717,12 +4367,7 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
                     .iter()
                     .map(|s| s.ident.to_string())
                     .collect();
-                let key = if segments.len() == 1 && !ctx.module_prefix.is_empty() {
-                    format!("{}::{}", ctx.module_prefix, segments[0])
-                } else {
-                    segments.join("::")
-                };
-                ctx.fn_return_types.get(&key).cloned()
+                lookup_function_return_type(ctx, &segments).cloned()
             } else {
                 None
             }
@@ -3793,6 +4438,44 @@ mod tests {
             )),
             "expected FieldRead for 'x', got {:?}",
             ops
+        );
+    }
+
+    #[test]
+    fn binds_option_some_inner_type_in_match_arm() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            struct Meta { tracing_call_depth: Option<u32> }
+            fn call_depth() -> u32 { 0 }
+            fn example(meta: Meta) -> bool {
+                let tracing_depth = meta.tracing_call_depth;
+                if let Some(depth) = tracing_depth {
+                    call_depth() == depth
+                } else {
+                    false
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|func| func.name == "example")
+            .expect("example graph")
+            .graph;
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Input { name, ty }
+                            if name == "depth" && *ty == ValueType::Int
+                    )
+                })
+            }),
+            "expected Some(depth) to bind depth as Int; graph:\n{}",
+            graph.dump()
         );
     }
 

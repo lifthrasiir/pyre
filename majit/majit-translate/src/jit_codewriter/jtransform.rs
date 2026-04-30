@@ -154,6 +154,13 @@ pub struct GraphTransformResult {
     pub vable_rewrites: usize,
     /// Number of calls classified.
     pub calls_classified: usize,
+    /// ConcreteType for every synthetic ValueId emitted by jtransform
+    /// (Phase C v2 Slice C-2). Callers merge this into their existing
+    /// `TypeResolutionState` so the rewritten graph's kind classification
+    /// stays authoritative without requiring a full `resolve_types`
+    /// rerun.  See `Transformer::synth_kinds`.
+    pub synth_kinds:
+        std::collections::HashMap<ValueId, crate::jit_codewriter::type_state::ConcreteType>,
 }
 
 /// Rewrite a semantic graph with JIT-specific transformations.
@@ -241,6 +248,15 @@ pub struct Transformer<'a> {
     /// ValueId can pull one without colliding with the rtyper-equivalent
     /// pass output.
     next_synthetic_value: usize,
+    /// ValueId → ConcreteType for synthetic ValueIds allocated via
+    /// `fresh_synthetic_value_typed` and for existing result ValueIds
+    /// whose kind is changed by a rewrite in this pass.  RPython
+    /// attaches `concretetype` directly on every `Variable`
+    /// (`flowmodel.py:Variable.__init__`); pyre stamps the equivalent
+    /// table entry here so later operations in the same transform pass,
+    /// and the post-transform type merge, see the rewritten kind.
+    synth_kinds:
+        std::collections::HashMap<ValueId, crate::jit_codewriter::type_state::ConcreteType>,
 }
 
 /// RPython: jtransform.py vable_flags values
@@ -349,6 +365,7 @@ impl<'a> Transformer<'a> {
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
             next_synthetic_value: 0,
+            synth_kinds: std::collections::HashMap::new(),
         }
     }
 
@@ -407,6 +424,7 @@ impl<'a> Transformer<'a> {
             notes: std::mem::take(&mut self.notes),
             vable_rewrites: self.vable_rewrites,
             calls_classified: self.calls_classified,
+            synth_kinds: std::mem::take(&mut self.synth_kinds),
         }
     }
 
@@ -468,13 +486,56 @@ impl<'a> Transformer<'a> {
         value
     }
 
+    /// Allocate a fresh synthetic ValueId AND stamp its `ConcreteType`
+    /// into `synth_kinds` (Phase C v2 Slice C-2).  Mirrors RPython's
+    /// `Variable(concretetype=T)` (`flowmodel.py:Variable.__init__`).
+    fn fresh_synthetic_value_typed(
+        &mut self,
+        ty: crate::jit_codewriter::type_state::ConcreteType,
+    ) -> ValueId {
+        let value = self.fresh_synthetic_value();
+        self.synth_kinds.insert(value, ty);
+        value
+    }
+
+    fn stamp_value_kind(
+        &mut self,
+        value: Option<ValueId>,
+        ty: crate::jit_codewriter::type_state::ConcreteType,
+    ) {
+        if let Some(value) = value {
+            self.synth_kinds.insert(value, ty);
+        }
+    }
+
+    /// Stamp the synthetic kind from a `ValueType` source, skipping
+    /// `ValueType::Unknown` so the fallback Unknown→Ref defaulting in
+    /// `value_type_to_kind` does not pollute `synth_kinds` with a
+    /// GcRef entry that would mask the real `concretetype` already
+    /// computed by the rtyper for an existing ValueId.
+    fn stamp_value_kind_from_value_type(&mut self, value: Option<ValueId>, result_ty: &ValueType) {
+        let ty = match result_ty {
+            ValueType::Int | ValueType::State => {
+                crate::jit_codewriter::type_state::ConcreteType::Signed
+            }
+            ValueType::Ref => crate::jit_codewriter::type_state::ConcreteType::GcRef,
+            ValueType::Float => crate::jit_codewriter::type_state::ConcreteType::Float,
+            ValueType::Void => crate::jit_codewriter::type_state::ConcreteType::Void,
+            ValueType::Unknown => return,
+        };
+        self.stamp_value_kind(value, ty);
+    }
+
     fn direct_funcptr_value(&mut self, target: &CallTarget) -> (ValueId, SpaceOperation) {
         let fnaddr = self
             .callcontrol
             .as_deref()
             .map(|cc| cc.fnaddr_for_target(target))
             .unwrap_or_else(|| crate::call::symbolic_fnaddr_for_target(target));
-        let value = self.fresh_synthetic_value();
+        // Function pointer materialized as ConstInt — assembler emits it
+        // through the `'i'` argcode so the kind is Signed.
+        let value = self
+            .fresh_synthetic_value_typed(crate::jit_codewriter::type_state::ConcreteType::Signed);
         (
             value,
             SpaceOperation {
@@ -557,38 +618,14 @@ impl<'a> Transformer<'a> {
                 result_ty,
                 graph_name,
             ),
-            // ── unknown ops ──
-            OpKind::Unknown { kind } => {
+            // ── abort placeholders ──
+            OpKind::Abort { kind } => {
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
-                    detail: format!("unknown op: {:?}", kind),
+                    detail: format!("abort placeholder: {:?}", kind),
                 });
                 RewriteResult::Keep
             }
-            // pyre front-end uses Rust's syn::BinOp / syn::UnOp identifiers
-            // (`add_assign`, `deref`) which have no RPython counterpart —
-            // RPython's flow-space never sees Python-level `+=` or `*x` as
-            // distinct ops (Python bytecode expands `+=` to BINARY_ADD
-            // followed by STORE_FAST, and `*x` disappears at rtyper). After
-            // pyre's rtyper the SSA graph has already materialized the read
-            // + write as separate values, so the in-place / dereference
-            // semantics no longer carry information — the op degenerates to
-            // a plain `add` / identity. Canonicalize here so downstream
-            // layers (assembler, blackhole) see only the RPython opnames.
-            OpKind::BinOp {
-                op: binop_name,
-                lhs,
-                rhs,
-                result_ty,
-            } if binop_name == "add_assign" => RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
-                kind: OpKind::BinOp {
-                    op: "add".into(),
-                    lhs: *lhs,
-                    rhs: *rhs,
-                    result_ty: result_ty.clone(),
-                },
-            }]),
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -614,15 +651,14 @@ impl<'a> Transformer<'a> {
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
-                result_ty,
-            } if unop_name == "deref" => RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result,
-                kind: OpKind::UnaryOp {
-                    op: "same_as".into(),
-                    operand: *operand,
-                    result_ty: result_ty.clone(),
-                },
-            }]),
+                ..
+            } if unop_name == "same_as" || unop_name == "deref" => {
+                // RPython `jtransform.py:246 rewrite_op_same_as`
+                // returns None: the op is removed and its result is
+                // renamed to its argument. Rust reference/deref sugar
+                // has the same identity shape at this IR level.
+                RewriteResult::Identity(*operand)
+            }
             // RPython `jtransform.py:1243-1255` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
             // + `_rewrite_cmp_ptrs`: equality/inequality of two Ref operands is
             // `ptr_eq`/`ptr_ne` (wired at `blackhole.py:585-590`), not `int_eq`/
@@ -680,18 +716,26 @@ impl<'a> Transformer<'a> {
                 op: binop_name,
                 lhs,
                 rhs,
-                ..
-            } if matches!(binop_name.as_str(), "add" | "sub" | "mul" | "div")
-                && is_int_float_domain(self.get_value_kind(*lhs))
-                && is_int_float_domain(self.get_value_kind(*rhs))
-                && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
+                result_ty,
+            } if canonical_float_arith_binop(binop_name).is_some()
+                && is_float_rewrite_domain(self.get_value_kind(*lhs))
+                && is_float_rewrite_domain(self.get_value_kind(*rhs))
+                && (self.get_value_kind(*lhs) == 'f'
+                    || self.get_value_kind(*rhs) == 'f'
+                    || *result_ty == ValueType::Float) =>
             {
-                let canonical = match binop_name.as_str() {
+                let canonical = match canonical_float_arith_binop(binop_name)
+                    .expect("guard checked float arithmetic op")
+                {
                     "div" => "truediv", // RPython lltype: `float_truediv`
                     other => other,
                 };
-                let (lhs, mut ops) = self.coerce_operand_to_float(*lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float(*rhs);
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                );
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(*lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(*rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -710,12 +754,16 @@ impl<'a> Transformer<'a> {
                 rhs,
                 ..
             } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
-                && is_int_float_domain(self.get_value_kind(*lhs))
-                && is_int_float_domain(self.get_value_kind(*rhs))
+                && is_float_rewrite_domain(self.get_value_kind(*lhs))
+                && is_float_rewrite_domain(self.get_value_kind(*rhs))
                 && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
             {
-                let (lhs, mut ops) = self.coerce_operand_to_float(*lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float(*rhs);
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                );
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(*lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(*rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -732,14 +780,20 @@ impl<'a> Transformer<'a> {
                 op: binop_name,
                 lhs,
                 rhs,
-                ..
-            } if binop_name == "mod"
-                && is_int_float_domain(self.get_value_kind(*lhs))
-                && is_int_float_domain(self.get_value_kind(*rhs))
-                && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
+                result_ty,
+            } if canonical_float_mod_binop(binop_name).is_some()
+                && is_float_rewrite_domain(self.get_value_kind(*lhs))
+                && is_float_rewrite_domain(self.get_value_kind(*rhs))
+                && (self.get_value_kind(*lhs) == 'f'
+                    || self.get_value_kind(*rhs) == 'f'
+                    || *result_ty == ValueType::Float) =>
             {
-                let (lhs, mut ops) = self.coerce_operand_to_float(*lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float(*rhs);
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                );
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(*lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(*rhs);
                 ops.extend(rhs_ops);
                 let target = CallTarget::function_path(["ll_math_fmod"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
@@ -771,12 +825,43 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "neg" && self.get_value_kind(*operand) == 'f' => {
+                self.stamp_value_kind(
+                    op.result,
+                    crate::jit_codewriter::type_state::ConcreteType::Float,
+                );
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result,
                     kind: OpKind::UnaryOp {
                         op: "float_neg".into(),
                         operand: *operand,
                         result_ty: ValueType::Float,
+                    },
+                }])
+            }
+            // pyre front-end uses Rust's syn::BinOp / syn::UnOp identifiers
+            // (`add_assign`, `deref`) which have no RPython counterpart —
+            // RPython's flow-space never sees Python-level `+=` or `*x` as
+            // distinct ops (Python bytecode expands `+=` to BINARY_ADD
+            // followed by STORE_FAST, and `*x` disappears at rtyper). After
+            // the float/int coercion arms above have had a chance to match,
+            // the remaining in-place ops degenerate to their plain RPython
+            // binary opnames.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if canonical_assign_binop(binop_name).is_some() => {
+                let canonical = canonical_assign_binop(binop_name)
+                    .expect("guard checked assign binop")
+                    .to_string();
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::BinOp {
+                        op: canonical,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        result_ty: result_ty.clone(),
                     },
                 }])
             }
@@ -812,6 +897,15 @@ impl<'a> Transformer<'a> {
     /// RPython: `getkind(v.concretetype)` — get the kind of a value.
     /// Uses type_state if available, falls back to 'r' for unknown.
     fn get_value_kind(&self, v: ValueId) -> char {
+        if let Some(ct) = self.synth_kinds.get(&v) {
+            return match ct {
+                crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
+                crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
+                crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
+                crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+                crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
+            };
+        }
         if let Some(ts) = self.type_state {
             if let Some(ct) = ts.concrete_types.get(&v) {
                 return match ct {
@@ -840,12 +934,27 @@ impl<'a> Transformer<'a> {
 
     /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
     /// inserts `cast_int_to_float` for mixed int/float operands before
+    /// emitting `float_*` or the `math.fmod` helper call.  Pyre's float
+    /// rewrite arms only enter when both operands are
+    /// `is_float_rewrite_domain` (i.e. `'i'` or `'f'`); Ref operands do
+    /// not reach this helper.
+    fn coerce_operand_to_float_domain(&mut self, value: ValueId) -> (ValueId, Vec<SpaceOperation>) {
+        match self.get_value_kind(value) {
+            'f' => (value, Vec::new()),
+            'i' => self.coerce_operand_to_float(value),
+            _ => (value, Vec::new()),
+        }
+    }
+
+    /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
+    /// inserts `cast_int_to_float` for mixed int/float operands before
     /// emitting `float_*` or the `math.fmod` helper call.
     fn coerce_operand_to_float(&mut self, value: ValueId) -> (ValueId, Vec<SpaceOperation>) {
         if self.get_value_kind(value) != 'i' {
             return (value, Vec::new());
         }
-        let coerced = self.fresh_synthetic_value();
+        let coerced = self
+            .fresh_synthetic_value_typed(crate::jit_codewriter::type_state::ConcreteType::Float);
         (
             coerced,
             vec![SpaceOperation {
@@ -1492,6 +1601,7 @@ impl<'a> Transformer<'a> {
         // Split args by kind (RPython make_three_lists)
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -1558,6 +1668,7 @@ impl<'a> Transformer<'a> {
         let (greens_i, greens_r, greens_f) = self.make_three_lists(green_args);
         let (reds_i, reds_r, reds_f) = self.make_three_lists(red_args);
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -1856,6 +1967,7 @@ impl<'a> Transformer<'a> {
             "force_ir: no float args in conditional_call"
         );
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
         let rewritten_opname = if is_value {
             "conditional_call_value"
         } else {
@@ -2185,6 +2297,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
@@ -2243,6 +2356,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
         let result_ir_type = value_type_to_ir_type(result_ty);
         let cc_mut = self
@@ -2369,6 +2483,7 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         RewriteResult::Replace(vec![
             funcptr_op,
@@ -2407,6 +2522,7 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = value_type_to_kind(result_ty);
+        self.stamp_value_kind_from_value_type(op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
@@ -2523,8 +2639,46 @@ fn value_type_to_kind(ty: &ValueType) -> char {
     }
 }
 
-fn is_int_float_domain(kind: char) -> bool {
+/// RPython `rfloat._rtype_template` calls `hop.inputargs(Float, Float)`,
+/// which only coerces `Signed → Float`.  Pyre's float arms enter
+/// when both operands fall into this domain.
+fn is_float_rewrite_domain(kind: char) -> bool {
     matches!(kind, 'i' | 'f')
+}
+
+/// Rust assignment operators have no separate RPython flow op.  Include them
+/// here so float-domain rewrites run before the generic assignment collapse.
+fn canonical_float_arith_binop(op: &str) -> Option<&'static str> {
+    match op {
+        "add" | "add_assign" => Some("add"),
+        "sub" | "sub_assign" => Some("sub"),
+        "mul" | "mul_assign" => Some("mul"),
+        "div" | "div_assign" => Some("div"),
+        _ => None,
+    }
+}
+
+fn canonical_float_mod_binop(op: &str) -> Option<&'static str> {
+    match op {
+        "mod" | "mod_assign" => Some("mod"),
+        _ => None,
+    }
+}
+
+fn canonical_assign_binop(op: &str) -> Option<&'static str> {
+    match op {
+        "add_assign" => Some("add"),
+        "sub_assign" => Some("sub"),
+        "mul_assign" => Some("mul"),
+        "div_assign" => Some("div"),
+        "mod_assign" => Some("mod"),
+        "bitand_assign" => Some("and"),
+        "bitor_assign" => Some("or"),
+        "bitxor_assign" => Some("xor"),
+        "rshift_assign" => Some("rshift"),
+        "lshift_assign" => Some("lshift"),
+        _ => None,
+    }
 }
 
 /// Convert codewriter ValueType to IR Type.
@@ -2609,13 +2763,14 @@ fn remap_op(
     let kind = match &op.kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstFloat(_)
         | OpKind::VableForce
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::GuardValue { .. }
         | OpKind::VtableMethodPtr { .. }
-        | OpKind::Unknown { .. } => op.kind.clone(),
+        | OpKind::Abort { .. } => op.kind.clone(),
         OpKind::JitMergePoint {
             jitdriver_index,
             greens_i,
@@ -3763,7 +3918,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         graph.push_op(
             graph.startblock,
-            OpKind::Unknown {
+            OpKind::Abort {
                 kind: crate::model::UnknownKind::UnsupportedExpr {
                     variant: crate::model::UnsupportedExprKind::OtherExpr,
                 },

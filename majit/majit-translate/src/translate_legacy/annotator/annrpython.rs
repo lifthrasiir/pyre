@@ -200,6 +200,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
+        OpKind::ConstFloat(_) => ValueType::Float,
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,
         OpKind::ArrayRead { item_ty, .. } => item_ty.clone(),
@@ -268,7 +269,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         | OpKind::RecursiveCall { result_kind, .. }
         | OpKind::ConditionalCallValue { result_kind, .. } => kind_char_to_value_type(*result_kind),
         OpKind::ConditionalCall { .. } => ValueType::Void,
-        OpKind::Unknown { .. } => ValueType::Unknown,
+        OpKind::Abort { .. } => ValueType::Unknown,
     }
 }
 

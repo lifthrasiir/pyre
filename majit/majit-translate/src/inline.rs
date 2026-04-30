@@ -348,6 +348,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             ty: ty.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
+        OpKind::ConstFloat(bits) => OpKind::ConstFloat(*bits),
         OpKind::FieldRead {
             base,
             field,
@@ -704,7 +705,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             args_f: args_f.iter().map(remap).collect(),
             result_kind: *result_kind,
         },
-        OpKind::Unknown { kind } => OpKind::Unknown { kind: kind.clone() },
+        OpKind::Abort { kind } => OpKind::Abort { kind: kind.clone() },
     }
 }
 
@@ -713,11 +714,12 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstFloat(_)
         | OpKind::VableForce
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
-        | OpKind::Unknown { .. } => {
+        | OpKind::Abort { .. } => {
             vec![]
         }
         OpKind::JitMergePoint {

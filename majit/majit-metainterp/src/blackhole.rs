@@ -4935,6 +4935,10 @@ bhhandler_i_i!(handler_int_neg, bhimpl_int_neg);
 bhhandler_i_i!(handler_int_invert, bhimpl_int_invert);
 // pyre-specific r>i variant for Rust `!x` on i64 (bitwise NOT) when
 // the operand lands in a Ref register. Same primitive as int_invert.
+// jtransform now inserts cast_ptr_to_int for most sites
+// (`coerce_operand_to_int` rewrites ~97% of `not` UnaryOps with Ref
+// operands), but a small residual still emits this argcode shape;
+// keep the wire until the residual is run to ground.
 bhhandler_r_i!(handler_int_not_r, bhimpl_int_invert);
 bhhandler_i_i!(handler_int_is_true, bhimpl_int_is_true);
 bhhandler_i_i!(handler_int_is_zero, bhimpl_int_is_zero);
@@ -4979,13 +4983,16 @@ bhhandler_ii_i!(handler_int_sub_assign_pyre, bhimpl_int_sub);
 // primitive as `int_same_as`.
 bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
 
-// pyre-only: `OpKind::Unknown` fallback emitted by the front-end when a
-// syntax node has no dedicated OpKind variant (assembler.rs:1254
-// `OpKind::Unknown { .. } => "unknown".into()`). Carries zero operand
+// pyre-only: `OpKind::Abort` placeholder emitted by the front-end when a
+// syntax node has no dedicated OpKind variant (assembler.rs
+// `OpKind::Abort { .. } => "abort".into()`). Carries zero operand
 // bytes (empty argcodes). Reaching here at runtime means a graph that
-// made it through rtyper still has an unrecognized op — log-and-skip
-// rather than panic so shadow dispatch can see the mismatch.
-fn handler_unknown_marker_pyre(
+// made it through rtyper still has an untranslatable op — advance past
+// it rather than panic so blackhole resume can keep walking. RPython
+// has no direct analog: its codewriter raises before lowering, so a
+// jitcode never carries an unrecognized op. Removing this placeholder
+// requires per-case canonical routing or front-end Err.
+fn handler_abort_marker_pyre(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
@@ -4993,21 +5000,21 @@ fn handler_unknown_marker_pyre(
     Ok(position)
 }
 
-/// Handler for pyre-only `unknown/>i` — a no-op result marker emitted by
-/// `Assembler::encode_op`'s default branch for `OpKind::Unknown { .. }`.
+/// Handler for pyre-only `abort/>i` — a no-op result marker emitted by
+/// `Assembler::encode_op`'s default branch for `OpKind::Abort { .. }`.
 /// The bytecode layout has no args and a single destination register byte.
-fn handler_unknown_result_marker_i(
+fn handler_abort_result_marker_i(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
     Ok(position + 1)
 }
-/// Handler for pyre-only `unknown/>r` — counterpart of
-/// `unknown/>i` with a Ref-classified result register.  Emerges when
-/// pyre's rtyper routes an unrecognized op's result through the
-/// Unknown→GcRef fallback (`rtyper.rs::infer_concrete_from_op`).
-fn handler_unknown_result_marker_r(
+/// Handler for pyre-only `abort/>r` — counterpart of
+/// `abort/>i` with a Ref-classified result register.  Emerges when
+/// pyre's rtyper routes an untranslatable op's result through the
+/// Abort→GcRef fallback (`rtyper.rs::infer_concrete_from_op`).
+fn handler_abort_result_marker_r(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
@@ -5308,12 +5315,12 @@ bhhandler_r_i!(handler_ptr_nonzero, bhimpl_ptr_nonzero);
 // pyre-only `/rr>i` arithmetic aliases: both operands land in Ref
 // registers (tagged-int-in-ref deviation, see `bhhandler_ri_i` docs).
 // RPython never emits `int_*` keys with Ref operands because rtyper
-// always classifies integer values as `Signed`; pyre's Unknown→GcRef
+// always classifies integer values as `Signed`; pyre's Abort→GcRef
 // fallback (rtyper.rs `infer_concrete_from_op`) puts miscategorized
 // integer values in Ref registers. `registers_r`/`registers_i` are
 // both `Vec<i64>` so the raw bits read correctly without tag decoding.
 // These aliases disappear once rtyper coverage eliminates the
-// Unknown→GcRef fallback (tracked as structural debt).
+// Abort→GcRef fallback (tracked as structural debt).
 bhhandler_rr_i!(handler_int_add_rr, bhimpl_int_add);
 bhhandler_rr_i!(handler_int_sub_rr, bhimpl_int_sub);
 bhhandler_rr_i!(handler_int_sub_assign_rr, bhimpl_int_sub);
@@ -6434,10 +6441,8 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_same_as/i>i", handler_int_same_as);
     builder.wire_handler("int_neg/i>i", handler_int_neg);
     builder.wire_handler("int_invert/i>i", handler_int_invert);
-    // pyre-specific `int_invert/r>i`: bitwise NOT on an i64 that landed
-    // in a Ref register due to pyre's tagged-int register class mixing.
-    // Same RPython bhimpl (`bhimpl_int_invert`), only the source register
-    // class differs — see `int_add/ri>i` for the broader pattern.
+    // pyre-specific `int_invert/r>i`: residual after jtransform's
+    // `coerce_operand_to_int` (~97% of sites) — see handler comment.
     builder.wire_handler("int_invert/r>i", handler_int_not_r);
     builder.wire_handler("int_is_true/i>i", handler_int_is_true);
     builder.wire_handler("int_is_zero/i>i", handler_int_is_zero);
@@ -6483,7 +6488,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_add_assign/ii>i", handler_int_add_assign_pyre);
     builder.wire_handler("int_sub_assign/ii>i", handler_int_sub_assign_pyre);
     builder.wire_handler("int_deref/i>i", handler_int_deref_pyre);
-    builder.wire_handler("unknown/", handler_unknown_marker_pyre);
+    builder.wire_handler("abort/", handler_abort_marker_pyre);
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
     builder.wire_handler("int_div/ii>i", handler_int_floordiv);
     builder.wire_handler("int_floordiv/ii>i", handler_int_floordiv);
@@ -6503,10 +6508,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Copy operations
     builder.wire_handler("int_copy/i>i", handler_int_copy);
-    // pyre-only unknown marker emitted by `Assembler::encode_op`'s
-    // default branch for `OpKind::Unknown { .. }`.
-    builder.wire_handler("unknown/>i", handler_unknown_result_marker_i);
-    builder.wire_handler("unknown/>r", handler_unknown_result_marker_r);
+    // pyre-only abort placeholder emitted by `Assembler::encode_op`'s
+    // default branch for `OpKind::Abort { .. }`.
+    builder.wire_handler("abort/>i", handler_abort_result_marker_i);
+    builder.wire_handler("abort/>r", handler_abort_result_marker_r);
 
     // Control flow
     builder.wire_handler("live/", handler_live);

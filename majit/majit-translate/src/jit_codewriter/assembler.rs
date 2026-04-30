@@ -77,6 +77,19 @@ pub struct Assembler {
     /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-ValueId
     /// panic can cite the offending op.
     current_flatop_debug: Option<String>,
+    /// Phase C v2 Slice C-3: authoritative ValueId → RegKind table for
+    /// the SSARepr currently being assembled.  Set at `assemble`
+    /// entry from `ssarepr.value_kinds` and consulted by
+    /// `lookup_coloring`, which previously fell back to "search all
+    /// three regalloc classes" and silently returned whichever class
+    /// happened to hold a coloring for the ValueId.  RPython has no
+    /// analogue because `Variable.concretetype` (set once at
+    /// `flowmodel.py:Variable.__init__`) is the single source of
+    /// truth, and `regalloc.py` only produces a coloring in the kind
+    /// matching `getkind(v.concretetype)`.  Pyre's authoritative
+    /// table now plays the same role: the kind decided at build time
+    /// must match the regalloc class that holds the coloring.
+    current_value_kinds: Option<HashMap<ValueId, RegKind>>,
 }
 
 impl Assembler {
@@ -96,6 +109,7 @@ impl Assembler {
             num_liveness_ops: 0,
             current_graph_name: None,
             current_flatop_debug: None,
+            current_value_kinds: None,
         }
     }
 
@@ -156,6 +170,14 @@ impl Assembler {
         // set of alive registers.
         crate::liveness::compute_liveness(ssarepr);
         self.current_graph_name = Some(ssarepr.name.clone());
+        // Phase C v2 Slice C-3: snapshot the authoritative ValueId →
+        // RegKind table for `lookup_coloring`.  `flatten_with_types`
+        // populates `ssarepr.value_kinds` from the resolved type
+        // state and augments the canonical exception-block
+        // inputargs.  Cloning here keeps lookup_coloring's signature
+        // unchanged so the existing `regallocs` parameter still
+        // dominates write_insn's read path.
+        self.current_value_kinds = Some(ssarepr.value_kinds.clone());
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -246,6 +268,11 @@ impl Assembler {
         };
 
         self.count_jitcodes += 1;
+        // Phase C v2 Slice C-3: drop the per-graph value_kinds snapshot.
+        // A subsequent assemble call will repopulate it from its own
+        // SSARepr, so leaking the previous graph's table here would let a
+        // stale entry mask a missing kind.
+        self.current_value_kinds = None;
         body
     }
 
@@ -907,6 +934,27 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
 
+            // Float-constant materialization mirrors `ConstInt`: the
+            // bit pattern goes through `emit_const_f` (the same pool
+            // every `'f'` constant uses) and the resulting pool-region
+            // register index is moved into the SSA destination via
+            // `float_copy`.
+            OpKind::ConstFloat(bits) => {
+                let const_value = crate::flowspace::model::ConstValue::Float(*bits);
+                let idx = self.emit_const_f(&const_value, state);
+                state.code.push(idx);
+                argcodes.push('f');
+                if let Some(result) = op.result {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("float_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
             // Field/array operations: encode registers + descriptor.
             // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
             // Field operations: register + descriptor.
@@ -1423,41 +1471,67 @@ impl Assembler {
     /// RPython parity: every `Variable` reaching the assembler has a
     /// `concretetype` and therefore exactly one `(kind, color)` pair
     /// via `getkind()` + `regalloc.py` (`rpython/jit/codewriter/
-    /// regalloc.py`).  A miss here means the upstream rtyper invariant
-    /// is broken, so we panic with the full per-class coverage so the
-    /// gap surfaces immediately instead of propagating a wrong
-    /// (register, kind) pair into `opcode_insns.bin`.
-    ///
-    /// Iterates in fixed `[Int, Ref, Float]` order so the diagnostic
-    /// message and the resolution are reproducible across processes.
-    /// Rust `HashMap` uses SipHash with a per-process random seed,
-    /// whereas RPython has no HashMap iteration on this path.
+    /// regalloc.py`).  Phase C v2 Slice C-3 promotes pyre to the same
+    /// invariant: `current_value_kinds[v]` (set at `assemble` entry
+    /// from `ssarepr.value_kinds`) is the authoritative kind, and the
+    /// matching `regallocs[kind].coloring` is the only place we look
+    /// for the color.  A miss in either side panics with the full
+    /// per-class coverage so future drift surfaces at build time
+    /// rather than getting silently masked by the previous "search
+    /// all three classes" fallback.
     fn lookup_coloring(
         &self,
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, RegKind) {
-        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-            if let Some(ra) = regallocs.get(&kind) {
-                if let Some(&color) = ra.coloring.get(&v) {
-                    return (color as u8, kind);
-                }
-            }
-        }
-        let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-            .iter()
-            .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
-            .map(|(k, ra)| {
-                let min = ra.coloring.keys().map(|v| v.0).min();
-                let max = ra.coloring.keys().map(|v| v.0).max();
-                (k, ra.coloring.len(), min, max)
-            })
-            .collect();
-        panic!(
-            "lookup_coloring: value {v:?} has no regalloc coloring \
-             (graph={:?}, op={:?}, regalloc_coverage={:?})",
-            self.current_graph_name, self.current_flatop_debug, class_coverage
-        );
+        let value_kinds = self.current_value_kinds.as_ref().unwrap_or_else(|| {
+            panic!(
+                "lookup_coloring: assemble entry must seed current_value_kinds \
+                 before any write_insn lookup (graph={:?}, op={:?})",
+                self.current_graph_name, self.current_flatop_debug,
+            );
+        });
+        let class_coverage = || -> Vec<_> {
+            [RegKind::Int, RegKind::Ref, RegKind::Float]
+                .iter()
+                .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
+                .map(|(k, ra)| {
+                    let min = ra.coloring.keys().map(|v| v.0).min();
+                    let max = ra.coloring.keys().map(|v| v.0).max();
+                    let contains_v = ra.coloring.contains_key(&v);
+                    (k, ra.coloring.len(), min, max, contains_v)
+                })
+                .collect()
+        };
+        let expected = value_kinds.get(&v).copied().unwrap_or_else(|| {
+            panic!(
+                "lookup_coloring: value {v:?} has no value_kinds entry — \
+                 type-state did not classify it before regalloc \
+                 (graph={:?}, op={:?}, regalloc_coverage={:?})",
+                self.current_graph_name,
+                self.current_flatop_debug,
+                class_coverage(),
+            );
+        });
+        let ra = regallocs.get(&expected).unwrap_or_else(|| {
+            panic!(
+                "lookup_coloring: regallocs map is missing the expected kind {expected:?} \
+                 entry for value {v:?} (graph={:?}, op={:?})",
+                self.current_graph_name, self.current_flatop_debug,
+            );
+        });
+        let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+            panic!(
+                "lookup_coloring: value {v:?} declared as {expected:?} by value_kinds \
+                 but has no coloring in regallocs[{expected:?}] — \
+                 type-state ↔ regalloc kind mismatch \
+                 (graph={:?}, op={:?}, regalloc_coverage={:?})",
+                self.current_graph_name,
+                self.current_flatop_debug,
+                class_coverage(),
+            );
+        });
+        (color as u8, expected)
     }
 
     /// Look up the register index (as u8) for a ValueId.
@@ -1516,6 +1590,7 @@ impl Assembler {
             match kind {
                 OpKind::Input { .. } => "Input",
                 OpKind::ConstInt(_) => "ConstInt",
+                OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::FieldRead { .. } => "FieldRead",
                 OpKind::FieldWrite { .. } => "FieldWrite",
                 OpKind::ArrayRead { .. } => "ArrayRead",
@@ -1552,7 +1627,7 @@ impl Assembler {
                 OpKind::Live => "Live",
                 OpKind::JitMergePoint { .. } => "JitMergePoint",
                 OpKind::LoopHeader { .. } => "LoopHeader",
-                OpKind::Unknown { .. } => "Unknown",
+                OpKind::Abort { .. } => "Abort",
             }
         }
         let mut sites: std::collections::HashMap<ValueId, ValueSites> =
@@ -2368,6 +2443,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
         OpKind::ConstInt(_) => "int_copy".into(),
+        // Mirrors `ConstInt` — the constant is materialised through the
+        // shared `constants_f` pool, then a `float_copy` op moves it into
+        // the SSA destination register.
+        OpKind::ConstFloat(_) => "float_copy".into(),
         // RPython: getfield_gc_i, getfield_gc_r, getfield_gc_f and `_pure`
         // variants from jtransform.py rewrite_op_getfield().
         OpKind::FieldRead { ty, pure, .. } => {
@@ -2470,7 +2549,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::IndirectCall { .. } => "indirect_call".into(),
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
-        OpKind::Unknown { .. } => "unknown".into(),
+        OpKind::Abort { .. } => "abort".into(),
     }
 }
 
@@ -3268,6 +3347,13 @@ mod tests {
         value_kinds.insert(result, RegKind::Int);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
         let mut flat = flatten_graph(&rewritten, &regallocs);
+        // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
+        // exceptblock-augmented map — `flatten_graph` (without type
+        // state) leaves it empty, but the Slice C-3 lookup_coloring
+        // contract requires the same authoritative table that
+        // `perform_all_register_allocations` consumed.
+        flat.value_kinds =
+            regalloc::augment_value_kinds_with_canonical_exceptblock(&rewritten, &value_kinds);
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
 
@@ -3391,6 +3477,11 @@ mod tests {
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
         let mut flat = flatten_graph(&rewritten, &regallocs);
+        // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
+        // exceptblock-augmented map so `lookup_coloring` finds every
+        // operand including the synthetic `(etype, evalue)` pair.
+        flat.value_kinds =
+            regalloc::augment_value_kinds_with_canonical_exceptblock(&rewritten, &value_kinds);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -3510,6 +3601,11 @@ mod tests {
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
         let mut flat = flatten_graph(&rewritten, &regallocs);
+        // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
+        // exceptblock-augmented map so `lookup_coloring` finds every
+        // operand including the synthetic `(etype, evalue)` pair.
+        flat.value_kinds =
+            regalloc::augment_value_kinds_with_canonical_exceptblock(&rewritten, &value_kinds);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -3647,6 +3743,10 @@ mod tests {
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
         let mut flat = flatten_graph(&graph, &regallocs);
+        // Slice C-3: seed `SSARepr.value_kinds` (left empty by
+        // `flatten_graph`) so `lookup_coloring` finds the
+        // authoritative kind for every operand.
+        flat.value_kinds = value_kinds.clone();
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -3735,6 +3835,13 @@ mod tests {
 
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
         let mut flat = flatten_graph(&graph, &regallocs);
+        // Slice C-3: `flatten()` (the typed-state-less variant used
+        // by this test) leaves `SSARepr.value_kinds` empty.  Seed it
+        // with the canonical-exceptblock-augmented map so
+        // `lookup_coloring` finds every operand including the
+        // synthetic `(etype, evalue)` pair.
+        flat.value_kinds =
+            regalloc::augment_value_kinds_with_canonical_exceptblock(&graph, &value_kinds);
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,

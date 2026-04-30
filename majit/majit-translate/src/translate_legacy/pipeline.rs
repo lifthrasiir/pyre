@@ -63,12 +63,29 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     // / `guess_call_kind` / `graphs_from`. With no registered candidates
     // the op resolves to `CallKind::Residual`, matching upstream's
     // conservative fallback for `indirect_call` with unknown family.
-    let transform_result =
-        rewrite_graph_with_callcontrol(&graph_owned, &config.transform, &mut legacy_callcontrol);
+    // Also thread `types` so jtransform's `get_value_kind` sees each
+    // operand's `concretetype` — RPython's rtyper resolves
+    // `Variable.concretetype` once at typing time and every later pass
+    // (including jtransform) reads it directly.  Without `with_type_state`
+    // the legacy snapshot path defaulted every operand to `'r'`, which
+    // forced the kind-coercion arms in `jtransform` to manufacture
+    // `cast_ptr_to_int` ops on graphs that the canonical pipeline
+    // already processed correctly.
+    let transform_result = {
+        let mut transformer = crate::jtransform::Transformer::new(&config.transform)
+            .with_callcontrol(&mut legacy_callcontrol)
+            .with_type_state(&types);
+        transformer.transform(&graph_owned)
+    };
     let vable_rewrites = transform_result.vable_rewrites;
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();
-    let rewritten_types = resolve_types(&transform_result.graph, &annotations);
+    let rewritten_types = crate::translate_legacy::rtyper::rtyper::resolve_rewritten_types(
+        &types,
+        &transform_result.graph,
+        &annotations,
+        &transform_result.synth_kinds,
+    );
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
     let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);

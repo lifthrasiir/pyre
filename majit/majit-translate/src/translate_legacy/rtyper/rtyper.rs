@@ -9,6 +9,8 @@
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
 
+use std::collections::HashMap;
+
 use crate::flowspace::model::ConstValue;
 use crate::jit_codewriter::annotation_state::AnnotationState;
 use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
@@ -88,16 +90,16 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     /// variant exists in RPython — these must see Signed operands.
     fn canonical_int_binop(op: &str) -> Option<&'static str> {
         match op {
-            "add" => Some("add"),
-            "sub" => Some("sub"),
-            "mul" => Some("mul"),
-            "div" => Some("div"),
-            "mod" => Some("mod"),
-            "and" | "bitand" => Some("and"),
-            "or" | "bitor" => Some("or"),
-            "xor" | "bitxor" => Some("xor"),
-            "rshift" | "shr" => Some("rshift"),
-            "lshift" | "shl" => Some("lshift"),
+            "add" | "add_assign" => Some("add"),
+            "sub" | "sub_assign" => Some("sub"),
+            "mul" | "mul_assign" => Some("mul"),
+            "div" | "div_assign" => Some("div"),
+            "mod" | "mod_assign" => Some("mod"),
+            "and" | "bitand" | "bitand_assign" => Some("and"),
+            "or" | "bitor" | "bitor_assign" => Some("or"),
+            "xor" | "bitxor" | "bitxor_assign" => Some("xor"),
+            "rshift" | "shr" | "rshift_assign" => Some("rshift"),
+            "lshift" | "shl" | "lshift_assign" => Some("lshift"),
             "lt" => Some("lt"),
             "le" => Some("le"),
             "gt" => Some("gt"),
@@ -337,6 +339,48 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     state
 }
 
+/// Merge the pre-jtransform rtyper state with the rewritten graph's
+/// concrete result kinds.
+///
+/// RPython has no merge step: every `Variable` carries
+/// `.concretetype` inline, and jtransform-created operations preserve or
+/// assign that type on the result variable. Pyre's legacy graph uses a
+/// `ValueId -> ConcreteType` table, so the codewriter has two partial
+/// sources after jtransform:
+///
+/// * `original_types`: first-pass backward inferences that can disappear
+///   after jtransform removes the consumer op that caused the inference.
+/// * `resolve_types(rewritten_graph, ...)`: explicit post-jtransform
+///   result kinds such as `CallResidual.result_kind`.
+///
+/// Keep the first-pass table for operands, but never let it override a
+/// result kind that the rewritten operation itself declares. That mirrors
+/// RPython's single authoritative `op.result.concretetype` instead of
+/// treating the stale pre-rewrite side table as stronger.
+pub fn resolve_rewritten_types(
+    original_types: &TypeResolutionState,
+    rewritten_graph: &FunctionGraph,
+    annotations: &AnnotationState,
+    stamped_kinds: &HashMap<ValueId, ConcreteType>,
+) -> TypeResolutionState {
+    let post_result_types = authoritative_result_types(rewritten_graph);
+    let mut merged = resolve_types(rewritten_graph, annotations);
+
+    for (&value, kind) in &original_types.concrete_types {
+        if *kind != ConcreteType::Unknown && !post_result_types.contains_key(&value) {
+            merged.concrete_types.insert(value, kind.clone());
+        }
+    }
+    for (value, kind) in post_result_types {
+        merged.concrete_types.insert(value, kind);
+    }
+    for (&value, kind) in stamped_kinds {
+        merged.concrete_types.insert(value, kind.clone());
+    }
+
+    merged
+}
+
 fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
     match value {
         ConstValue::Int(_)
@@ -486,6 +530,7 @@ fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
 fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
     match kind {
         OpKind::ConstInt(_) => ConcreteType::Signed,
+        OpKind::ConstFloat(_) => ConcreteType::Float,
         // RPython `rpython/annotator/annrpython.py` types every Variable
         // at annotation time, so `OpKind::Input` reaching rtyper has a
         // concrete type.  pyre's front-end (`front/ast.rs` Expr::Path
@@ -568,15 +613,67 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
                 c
             }
         }
-        // pyre-only `OpKind::Unknown` (`front/ast.rs` lowering of Rust
+        // pyre-only `OpKind::Abort` (`front/ast.rs` lowering of Rust
         // syntax not yet ported — macros, unsupported literals,
         // fallback expressions).  Fall back to GcRef so these values
         // still get a regalloc coloring and the assembler's
         // `lookup_reg_with_kind` covers every operand. RPython has no
         // analogue; porting each producer path individually eliminates
-        // the `unknown/` wire keys.
-        OpKind::Unknown { .. } => ConcreteType::GcRef,
+        // the `abort/` wire keys.
+        OpKind::Abort { .. } => ConcreteType::GcRef,
         _ => ConcreteType::Unknown,
+    }
+}
+
+fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<ValueId, ConcreteType> {
+    let mut result = HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(value) = op.result else {
+                continue;
+            };
+            if let Some(concrete) = authoritative_result_type_from_op(&op.kind) {
+                result.insert(value, concrete);
+            }
+        }
+    }
+    result
+}
+
+fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
+    if concrete == ConcreteType::Unknown {
+        None
+    } else {
+        Some(concrete)
+    }
+}
+
+fn authoritative_result_type_from_op(kind: &OpKind) -> Option<ConcreteType> {
+    match kind {
+        OpKind::ConstInt(_) => Some(ConcreteType::Signed),
+        OpKind::ConstFloat(_) => Some(ConcreteType::Float),
+        OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete(ty)),
+        OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
+            concrete_if_known(valuetype_to_concrete(ty))
+        }
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. } => {
+            concrete_if_known(valuetype_to_concrete(item_ty))
+        }
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => concrete_if_known(valuetype_to_concrete(result_ty)),
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => {
+            concrete_if_known(kind_char_to_concrete(*result_kind))
+        }
+        OpKind::VtableMethodPtr { .. } => Some(ConcreteType::Signed),
+        _ => None,
     }
 }
 
@@ -784,6 +881,46 @@ mod tests {
         let types = resolve_types(&graph, &annotations);
         assert_eq!(types.get(value), &ConcreteType::Signed);
         assert_eq!(types.get(alias), &ConcreteType::Signed);
+    }
+
+    #[test]
+    fn rewritten_call_result_kind_overrides_stale_original_type() {
+        use crate::call::CallDescriptor;
+        use crate::model::CallFuncPtr;
+        use majit_ir::descr::EffectInfo;
+
+        let mut graph = FunctionGraph::new("rewritten_call_result");
+        let entry = graph.startblock;
+        let funcptr = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
+        let result = graph
+            .push_op(
+                entry,
+                OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::known(EffectInfo::default()),
+                    args_i: vec![],
+                    args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'r',
+                    indirect_targets: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result));
+
+        let annotations = annotate::annotate(&graph);
+        let mut original = TypeResolutionState::new();
+        original.concrete_types.insert(result, ConcreteType::Void);
+
+        let types = resolve_rewritten_types(
+            &original,
+            &graph,
+            &annotations,
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(types.get(result), &ConcreteType::GcRef);
     }
 
     #[test]

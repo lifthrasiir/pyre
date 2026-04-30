@@ -861,7 +861,12 @@ fn build_canonical_opcode_dispatch(
                 .with_callcontrol(&mut *call_control)
                 .with_type_state(&type_state);
             let rewritten = transformer.transform(&handler_graph_owned);
-            let rewritten_type_state = rtype::resolve_types(&rewritten.graph, &annotations);
+            let rewritten_type_state = rtype::resolve_rewritten_types(
+                &type_state,
+                &rewritten.graph,
+                &annotations,
+                &rewritten.synth_kinds,
+            );
             let value_kinds =
                 crate::jit_codewriter::type_state::build_value_kinds(&rewritten_type_state);
             let regallocs =
