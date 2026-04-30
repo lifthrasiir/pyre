@@ -429,6 +429,14 @@ pub struct RPythonTyper {
     /// no host Python helper function object to hang that cache from, so
     /// the rtyper owns the equivalent graph cache for `ll_*` helpers.
     lowlevel_helper_graphs: RefCell<HashMap<LowLevelHelperKey, Rc<PyGraph>>>,
+    /// RPython `self.lowlevel_ann_policy = LowLevelAnnotatorPolicy(self)`
+    /// (`rtyper.py:53`). Populated by
+    /// [`RPythonTyper::initialize_exceptiondata`] after `self_weak` is
+    /// set so the policy's `Weak<RPythonTyper>` backref is non-empty,
+    /// matching upstream's `LowLevelAnnotatorPolicy(self)` argument.
+    /// Cached on the typer because `annotate_helper` (`rtyper.py:600`)
+    /// passes the same instance on every call.
+    pub lowlevel_ann_policy: RefCell<Option<LowLevelAnnotatorPolicy>>,
 }
 
 /// RPython rtyper.py:456-458 constant-result agreement predicate.
@@ -500,6 +508,11 @@ impl RPythonTyper {
             pbc_reprs: RefCell::new(HashMap::new()),
             annmixlevel: RefCell::new(None),
             lowlevel_helper_graphs: RefCell::new(HashMap::new()),
+            // RPython `self.lowlevel_ann_policy = LowLevelAnnotatorPolicy(self)`
+            // (`rtyper.py:53`) cannot run here because the typer is not
+            // yet wrapped in `Rc`. Populated by
+            // `initialize_exceptiondata` once `self_weak` is set.
+            lowlevel_ann_policy: RefCell::new(None),
         }
     }
 
@@ -526,6 +539,12 @@ impl RPythonTyper {
         // `SomeInstance.rtyper_makerepr -> getinstancerepr`) sees a
         // live handle even before `rootclass_repr` is installed.
         *self.self_weak.borrow_mut() = Rc::downgrade(self);
+        // rtyper.py:53 — `self.lowlevel_ann_policy =
+        // LowLevelAnnotatorPolicy(self)`. The policy stores a
+        // `Weak<RPythonTyper>` so it is safe to construct now that
+        // `self_weak` is populated and to reuse on every
+        // `annotate_helper` call (`rtyper.py:600`).
+        *self.lowlevel_ann_policy.borrow_mut() = Some(LowLevelAnnotatorPolicy::new(Some(self)));
         // rtyper.py:57 — `self.rootclass_repr = RootClassRepr(self)`.
         let root = Arc::new(RootClassRepr::new(self));
         // rtyper.py:58 — `self.rootclass_repr.setup()`.
@@ -659,8 +678,55 @@ impl RPythonTyper {
             .insert(BlockKey::of(block), true);
     }
 
-    /// RPython `RPythonTyper.getcallable(self, graph)` (rtyper.py:569-581).
+    /// RPython `RPythonTyper.getcallable(self, graph)` (rtyper.py:569-584).
+    ///
+    /// ```python
+    /// def getcallable(self, graph):
+    ///     def getconcretetype(v):
+    ///         return self.bindingrepr(v).lowleveltype
+    ///     if self.annotator.translator.config.translation.sandbox:
+    ///         try:
+    ///             name = graph.func._sandbox_external_name
+    ///         except AttributeError:
+    ///             pass
+    ///         else:
+    ///             args_s = [v.annotation for v in graph.getargs()]
+    ///             s_result = graph.getreturnvar().annotation
+    ///             sandboxed = make_sandbox_trampoline(name, args_s, s_result)
+    ///             return self.getannmixlevel().delayedfunction(
+    ///                     sandboxed, args_s, s_result)
+    ///
+    ///     return getfunctionptr(graph, getconcretetype)
+    /// ```
     pub fn getcallable(&self, graph: &Rc<PyGraph>) -> Result<_ptr, TyperError> {
+        // rtyper.py:572 — `if self.annotator.translator.config.translation.sandbox:`.
+        let sandbox = self
+            .annotator
+            .upgrade()
+            .map(|ann| ann.translator.config.translation.sandbox)
+            .unwrap_or(false);
+        if sandbox {
+            // rtyper.py:573-575 — `try: name = graph.func._sandbox_external_name
+            // except AttributeError: pass`.
+            let sandbox_name = graph.func._sandbox_external_name.clone();
+            if let Some(name) = sandbox_name {
+                // rtyper.py:577-582 — sandbox trampoline path.
+                // `make_sandbox_trampoline` lives in `rsandbox.py`
+                // and is currently unported (see
+                // `annotator/policy.rs:42` — same gate). Surface a
+                // structured TaskError-equivalent so the missing
+                // dep is visible at the right call site.
+                return Err(TyperError::message(format!(
+                    "rtyper.py:577-582 getcallable sandbox path: \
+                     make_sandbox_trampoline({name}) is unported \
+                     (rsandbox.py). Convergence path: port \
+                     rsandbox.make_sandbox_trampoline alongside \
+                     LowLevelAnnotatorPolicy sandbox_external lookup; \
+                     then route through self.getannmixlevel().delayedfunction(...)."
+                )));
+            }
+        }
+        // rtyper.py:584 — `return getfunctionptr(graph, getconcretetype)`.
         getfunctionptr(&graph.graph, |v| {
             self.bindingrepr(v).map(|r| r.lowleveltype().clone())
         })
@@ -702,13 +768,19 @@ impl RPythonTyper {
             })?;
         }
 
-        let self_rc = self.self_rc()?;
-        annotate_lowlevel_helper(
-            &annotator,
-            function,
-            args_s,
-            Some(LowLevelAnnotatorPolicy::new(Some(&self_rc))),
-        )
+        // rtyper.py:600 — `policy=self.lowlevel_ann_policy`.
+        // The same instance is reused on every call; `__init__`
+        // (`rtyper.py:53`) stores it once. Surface the missing-init
+        // case as a structured `TyperError` to mirror
+        // [`RPythonTyper::self_rc`].
+        let policy = self.lowlevel_ann_policy.borrow().clone().ok_or_else(|| {
+            TyperError::message(
+                "RPythonTyper.lowlevel_ann_policy not set — call \
+                 initialize_exceptiondata() on an Rc<RPythonTyper> \
+                 before invoking annotate_helper",
+            )
+        })?;
+        annotate_lowlevel_helper(&annotator, function, args_s, Some(policy))
     }
 
     /// RPython `RPythonTyper.annotate_helper_fn(self, ll_function,
@@ -2529,8 +2601,15 @@ impl HighLevelOp {
 /// Upstream subclasses `list`; pyre keeps the list in `ops` and
 /// exposes Vec-style operations explicitly.
 pub struct LowLevelOpList {
-    /// RPython `self.rtyper = rtyper` (rtyper.py:794).
-    pub rtyper: Rc<RPythonTyper>,
+    /// RPython `self.rtyper = rtyper` (rtyper.py:794). Upstream's
+    /// `__init__(self, rtyper=None, ...)` accepts `rtyper=None` so
+    /// callers that only need `genop` (e.g.
+    /// `removeassert.py:72 LowLevelOpList()`) can construct without
+    /// the typer. The Rust port mirrors that with `Option<...>`;
+    /// methods that actually read the typer (`gendirectcall`,
+    /// `record_extra_call`, `record_extra_call_by_graph_id`) surface
+    /// a structured `TyperError` when this is `None`.
+    pub rtyper: Option<Rc<RPythonTyper>>,
     /// RPython `self.originalblock = originalblock` (rtyper.py:795).
     pub originalblock: Option<BlockRef>,
     /// RPython `LowLevelOpList.llop_raising_exceptions = None` class
@@ -4434,13 +4513,45 @@ impl LowLevelOpList {
     /// originalblock=None)` (rtyper.py:793-795).
     pub fn new(rtyper: Rc<RPythonTyper>, originalblock: Option<BlockRef>) -> Self {
         LowLevelOpList {
-            rtyper,
+            rtyper: Some(rtyper),
             originalblock,
             llop_raising_exceptions: None,
             implicit_exceptions_checked: None,
             _called_exception_is_here_or_cannot_occur: false,
             ops: Vec::new(),
         }
+    }
+
+    /// RPython `LowLevelOpList()` (rtyper.py:793-795 with default
+    /// `rtyper=None`). Used by callers that only ever invoke
+    /// `genop` and friends — e.g. `removeassert.py:72`. Methods
+    /// that actually require the typer (`gendirectcall`,
+    /// `record_extra_call`, `record_extra_call_by_graph_id`)
+    /// surface a structured `TyperError` when called against an
+    /// instance built this way.
+    pub fn without_rtyper(originalblock: Option<BlockRef>) -> Self {
+        LowLevelOpList {
+            rtyper: None,
+            originalblock,
+            llop_raising_exceptions: None,
+            implicit_exceptions_checked: None,
+            _called_exception_is_here_or_cannot_occur: false,
+            ops: Vec::new(),
+        }
+    }
+
+    /// Internal helper for methods that *require* the typer. Mirrors
+    /// the upstream call sites that would have crashed with
+    /// `AttributeError: 'NoneType' object has no attribute ...` if
+    /// they ran against `LowLevelOpList(rtyper=None)`. Pyre converts
+    /// that to a structured `TyperError`.
+    pub fn require_rtyper(&self, fn_name: &str) -> Result<&Rc<RPythonTyper>, TyperError> {
+        self.rtyper.as_ref().ok_or_else(|| {
+            TyperError::message(format!(
+                "LowLevelOpList::{fn_name} requires an rtyper but the \
+                 list was constructed via without_rtyper()"
+            ))
+        })
     }
 
     /// RPython `LowLevelOpList.hasparentgraph(self)` (rtyper.py:800-801).
@@ -4454,10 +4565,11 @@ impl LowLevelOpList {
         if !self.hasparentgraph() {
             return Ok(());
         }
-        let annotator =
-            self.rtyper.annotator.upgrade().ok_or_else(|| {
-                TyperError::message("RPythonTyper.annotator weak reference dropped")
-            })?;
+        let rtyper = self.require_rtyper("record_extra_call")?;
+        let annotator = rtyper
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
         let Some(parent_block) = &self.originalblock else {
             return Ok(());
         };
@@ -4481,10 +4593,11 @@ impl LowLevelOpList {
     /// `lltype._func.graph`; the live graph object is in
     /// `translator.graphs`.
     pub fn record_extra_call_by_graph_id(&self, graph_id: usize) -> Result<(), TyperError> {
-        let annotator =
-            self.rtyper.annotator.upgrade().ok_or_else(|| {
-                TyperError::message("RPythonTyper.annotator weak reference dropped")
-            })?;
+        let rtyper = self.require_rtyper("record_extra_call_by_graph_id")?;
+        let annotator = rtyper
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
         let callee_graph = annotator
             .translator
             .graphs
@@ -4676,7 +4789,8 @@ impl LowLevelOpList {
         })?;
         self.record_extra_call(&graph.graph)?;
 
-        let func_ptr = self.rtyper.getcallable(graph)?;
+        let rtyper = self.require_rtyper("gendirectcall")?;
+        let func_ptr = rtyper.getcallable(graph)?;
         let PtrTarget::Func(func_type) = &func_ptr._TYPE.TO else {
             return Err(TyperError::message(format!(
                 "gendirectcall({}) callable is not a function pointer",
@@ -5155,6 +5269,105 @@ mod tests {
         assert_eq!(func_obj.graph.is_some(), true);
     }
 
+    #[test]
+    fn getcallable_sandbox_with_external_name_surfaces_unported_trampoline() {
+        // rtyper.py:572-582 — sandbox path requires
+        // `make_sandbox_trampoline` (rsandbox.py), which is unported
+        // in pyre. When `translation.sandbox` is enabled and the
+        // graph carries a `_sandbox_external_name`, the path must
+        // surface a structured TyperError citing the missing dep
+        // rather than silently falling through to `getfunctionptr`.
+        let mut translator = crate::translator::translator::TranslationContext::new();
+        translator.config.translation.sandbox = true;
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let code = HostCode {
+            id: HostCode::fresh_identity(),
+            co_name: "f".into(),
+            co_filename: "<test>".into(),
+            co_firstlineno: 1,
+            co_nlocals: 1,
+            co_argcount: 1,
+            co_stacksize: 0,
+            co_flags: 0,
+            co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            co_varnames: vec!["x".into()],
+            co_freevars: Vec::new(),
+            co_cellvars: Vec::new(),
+            consts: Vec::new(),
+            names: Vec::new(),
+            co_lnotab: Vec::new(),
+            exceptiontable: Vec::new().into_boxed_slice(),
+            signature: Signature::new(vec!["x".into()], None, None),
+        };
+        let mut func = GraphFunc::new("ext", Constant::new(ConstValue::Dict(Default::default())));
+        func._sandbox_external_name = Some("ext".to_string());
+        let graph = Rc::new(PyGraph::new(func, &code));
+        let err = rtyper
+            .getcallable(&graph)
+            .expect_err("sandbox path must surface unported trampoline");
+        assert!(
+            err.to_string().contains("make_sandbox_trampoline"),
+            "expected sandbox-trampoline TaskError, got {:?}",
+            err.to_string()
+        );
+    }
+
+    #[test]
+    fn getcallable_sandbox_without_external_name_falls_through_to_getfunctionptr() {
+        // rtyper.py:573-575 — `try:
+        // graph.func._sandbox_external_name; except AttributeError:
+        // pass`. With sandbox enabled but no external name set, the
+        // try block raises AttributeError and the function falls
+        // through to `getfunctionptr` per upstream.
+        let mut translator = crate::translator::translator::TranslationContext::new();
+        translator.config.translation.sandbox = true;
+        let ann = RPythonAnnotator::new(Some(translator), None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let code = HostCode {
+            id: HostCode::fresh_identity(),
+            co_name: "f".into(),
+            co_filename: "<test>".into(),
+            co_firstlineno: 1,
+            co_nlocals: 1,
+            co_argcount: 1,
+            co_stacksize: 0,
+            co_flags: 0,
+            co_code: rustpython_compiler_core::bytecode::CodeUnits::from(Vec::new()),
+            co_varnames: vec!["x".into()],
+            co_freevars: Vec::new(),
+            co_cellvars: Vec::new(),
+            consts: Vec::new(),
+            names: Vec::new(),
+            co_lnotab: Vec::new(),
+            exceptiontable: Vec::new().into_boxed_slice(),
+            signature: Signature::new(vec!["x".into()], None, None),
+        };
+        let graph = Rc::new(PyGraph::new(
+            GraphFunc::new("f", Constant::new(ConstValue::Dict(Default::default()))),
+            &code,
+        ));
+        {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            let graph_borrow = graph.graph.borrow();
+            for arg in graph_borrow.startblock.borrow_mut().inputargs.iter_mut() {
+                if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
+                    v.set_concretetype(Some(LowLevelType::Signed));
+                    v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+                }
+            }
+            for arg in graph_borrow.returnblock.borrow_mut().inputargs.iter_mut() {
+                if let crate::flowspace::model::Hlvalue::Variable(v) = arg {
+                    v.set_concretetype(Some(LowLevelType::Void));
+                    v.annotation.replace(Some(Rc::new(SomeValue::Impossible)));
+                }
+            }
+        }
+        rtyper
+            .getcallable(&graph)
+            .expect("sandbox without external name must fall through");
+    }
+
     fn make_rtyper_rc() -> Rc<RPythonTyper> {
         let ann = RPythonAnnotator::new(None, None, None, false);
         Rc::new(RPythonTyper::new(&ann))
@@ -5501,6 +5714,46 @@ mod tests {
             "int_add",
             vec![Hlvalue::Variable(untyped)],
             GenopResult::LLType(LowLevelType::Signed),
+        );
+    }
+
+    #[test]
+    fn lowlevelop_without_rtyper_supports_genop() {
+        // rtyper.py:793-795 — `LowLevelOpList(rtyper=None)` is the
+        // shape `removeassert.py:72` uses. The Rust port mirrors
+        // that with `LowLevelOpList::without_rtyper`; methods that
+        // do not require the typer (`genop`, `append`, `len`,
+        // `is_empty`) work normally.
+        let mut llops = LowLevelOpList::without_rtyper(None);
+        let mut input = Variable::new();
+        input.set_concretetype(Some(LowLevelType::Bool));
+        let result = llops
+            .genop(
+                "bool_not",
+                vec![Hlvalue::Variable(input)],
+                GenopResult::LLType(LowLevelType::Bool),
+            )
+            .expect("genop without rtyper must succeed");
+        assert_eq!(result.concretetype(), Some(LowLevelType::Bool));
+        assert_eq!(llops.ops.len(), 1);
+        assert_eq!(llops.ops[0].opname, "bool_not");
+    }
+
+    #[test]
+    fn lowlevelop_without_rtyper_record_extra_call_surfaces_typererror() {
+        // Methods that require the typer must surface a structured
+        // TyperError when called on a `without_rtyper()` instance,
+        // matching upstream's implicit `AttributeError` on
+        // `None.something(...)`.
+        let block = Rc::new(RefCell::new(crate::flowspace::model::Block::new(vec![])));
+        let llops = LowLevelOpList::without_rtyper(Some(block));
+        let err = llops
+            .record_extra_call_by_graph_id(0)
+            .expect_err("record_extra_call_by_graph_id without rtyper must surface TyperError");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("requires an rtyper") || msg.contains("without_rtyper"),
+            "expected without_rtyper guard message, got {msg:?}"
         );
     }
 
@@ -5868,7 +6121,7 @@ mod tests {
         let block = Block::shared(vec![]);
         let llops = rtyper.make_new_lloplist(block.clone());
         assert!(
-            Rc::ptr_eq(&llops.rtyper, &rtyper),
+            Rc::ptr_eq(llops.rtyper.as_ref().expect("rtyper required"), &rtyper),
             "LowLevelOpList.rtyper must share identity with make_new_lloplist caller"
         );
         assert!(llops.originalblock.is_some());

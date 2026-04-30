@@ -896,8 +896,14 @@ pub fn pair_charlike_string_convert_from_to(
             _ => return Ok(None),
         };
 
-    let helper =
-        lowlevel_chr2str_function(llops.rtyper.as_ref(), helper_name, ptr_lltype, elem_lltype)?;
+    let helper = lowlevel_chr2str_function(
+        llops
+            .require_rtyper("pair_char_string_convert_from_to")?
+            .as_ref(),
+        helper_name,
+        ptr_lltype,
+        elem_lltype,
+    )?;
     let result = llops.gendirectcall(&helper, vec![v.clone()])?;
     Ok(result.map(Hlvalue::Variable))
 }
@@ -916,14 +922,16 @@ pub fn pair_string_char_convert_from_to(
     {
         return Ok(None);
     }
-    let helper = llops.rtyper.lowlevel_helper_function_with_builder(
-        "ll_stritem_nonneg".to_string(),
-        vec![STRPTR.clone(), LowLevelType::Signed],
-        LowLevelType::Char,
-        move |_rtyper, _args, _result| {
-            build_ll_stritem_nonneg_helper_graph("ll_stritem_nonneg", STRPTR.clone())
-        },
-    )?;
+    let helper = llops
+        .require_rtyper("pair_string_char_convert_from_to")?
+        .lowlevel_helper_function_with_builder(
+            "ll_stritem_nonneg".to_string(),
+            vec![STRPTR.clone(), LowLevelType::Signed],
+            LowLevelType::Char,
+            move |_rtyper, _args, _result| {
+                build_ll_stritem_nonneg_helper_graph("ll_stritem_nonneg", STRPTR.clone())
+            },
+        )?;
     let zero = Hlvalue::Constant(HighLevelOp::inputconst(
         &LowLevelType::Signed,
         &ConstValue::Int(0),

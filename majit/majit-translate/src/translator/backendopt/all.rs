@@ -5,15 +5,10 @@ use std::rc::Rc;
 
 use crate::config::config::{Config, ConfigValue, OptionValue};
 use crate::config::translationoption::get_combined_translation_config;
-use crate::flowspace::model::{
-    BlockRefExt, ConstValue, Constant, FunctionGraph, GraphRef, HOST_ENV, Hlvalue, LinkRef,
-};
+use crate::flowspace::model::GraphRef;
 use crate::translator::backendopt::{
-    constfold, gilanalysis, inline, merge_if_blocks, removenoops, stat, storesink,
+    constfold, gilanalysis, inline, merge_if_blocks, removeassert, removenoops, stat, storesink,
 };
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-use crate::translator::rtyper::rmodel::inputconst_from_lltype;
-use crate::translator::rtyper::rtyper::{GenopResult, LowLevelOpList, RPythonTyper};
 use crate::translator::simplify;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
@@ -99,7 +94,9 @@ pub fn backend_optimizations(
     // Upstream `:59-61 remove_asserts`.
     if boolopt(&config, "remove_asserts")? {
         constfold_pass(&config, &graphs)?;
-        remove_asserts(&translator, &graphs)?;
+        // Upstream `all.py:11 from rpython.translator.backendopt.removeassert
+        // import remove_asserts`. The Rust port mirrors that file split.
+        removeassert::remove_asserts(&translator, &graphs)?;
     }
 
     // Upstream `:63-66 really_remove_asserts → removenoops.remove_debug_assert`.
@@ -187,6 +184,8 @@ pub fn backend_optimizations(
     //                                  threshold, profile_heuristic,
     //                                  Some(pred), inline_graph_from_anywhere)?;
     if stropt(&config, "profile_based_inline")?.is_some() && !secondary {
+        // Upstream `:100 threshold = config.profile_based_inline_threshold`.
+        let _profile_threshold = floatopt(&config, "profile_based_inline_threshold")?;
         // Upstream `:101 heuristic = get_function(config.profile_based_inline_heuristic)`.
         // Surface registry misses ahead of the C-backend gate so
         // misconfigured dotted names fail fast with the same shape
@@ -196,11 +195,18 @@ pub fn backend_optimizations(
                 "rpython.translator.backendopt.inline.inlining_heuristic".to_string()
             });
         let _profile_heuristic = get_function(&profile_heuristic_name)?;
+        // Upstream `:102 inline.instrument_inline_candidates(graphs,
+        // threshold)`. Runs unconditionally before the C-backend
+        // `driver_instrument_result` gate at `:103-104`; upstream
+        // instrumentation tags every direct_call site whose callee
+        // passes `inlining_heuristic`'s threshold check, regardless
+        // of whether the trailing counter-collection step succeeds.
+        inline::instrument_inline_candidates(&graphs, _profile_threshold, &translator);
         return Err(TaskError {
             message: "all.py:103-104 profile_based_inline: static pieces ported \
-                      (get_function / instrument_inline_candidates / CallCountPred / \
-                      inline_malloc_removal_phase signature); blocked on \
-                      translator.driver_instrument_result (driver.py) — \
+                      (get_function / instrument_inline_candidates run upstream-order / \
+                      CallCountPred / inline_malloc_removal_phase signature); \
+                      blocked on translator.driver_instrument_result (driver.py) — \
                       pyre's C-backend instrument-and-run pipeline is unported"
                 .to_string(),
         });
@@ -374,229 +380,6 @@ pub(crate) fn constfold_pass(config: &Rc<Config>, graphs: &[GraphRef]) -> Result
     Ok(())
 }
 
-/// RPython `removeassert.remove_asserts(translator, graphs)` at
-/// `removeassert.py:8-53`.
-pub(crate) fn remove_asserts(
-    translator: &TranslationContext,
-    graphs: &[GraphRef],
-) -> Result<(), TaskError> {
-    // Upstream `:9 rtyper = translator.rtyper`.
-    let rtyper = translator.rtyper().ok_or_else(|| TaskError {
-        message: "removeassert.py:9 remove_asserts: translator.rtyper is None".to_string(),
-    })?;
-    // Upstream `:10 excdata = rtyper.exceptiondata`.
-    let excdata = rtyper.exceptiondata().map_err(|e| TaskError {
-        message: format!("removeassert.py:10 exceptiondata: {e}"),
-    })?;
-    // Upstream `:11 clsdef =
-    //     translator.annotator.bookkeeper.getuniqueclassdef(AssertionError)`.
-    let annotator = translator.annotator().ok_or_else(|| TaskError {
-        message: "removeassert.py:11 remove_asserts: translator.annotator is None".to_string(),
-    })?;
-    let assertion_error = HOST_ENV
-        .lookup_builtin("AssertionError")
-        .ok_or_else(|| TaskError {
-            message: "removeassert.py:11 AssertionError missing from HOST_ENV".to_string(),
-        })?;
-    let clsdef = annotator
-        .bookkeeper
-        .getuniqueclassdef(&assertion_error)
-        .map_err(|e| TaskError {
-            message: format!("removeassert.py:11 getuniqueclassdef(AssertionError): {e}"),
-        })?;
-    // Upstream `:12 ll_AssertionError =
-    //     excdata.get_standard_ll_exc_instance(rtyper, clsdef)`.
-    let ll_assertion_error = excdata
-        .get_standard_ll_exc_instance(&rtyper, Some(clsdef))
-        .map_err(|e| TaskError {
-            message: format!("removeassert.py:12 get_standard_ll_exc_instance: {e}"),
-        })?;
-    // Upstream `:13 total_count = [0, 0]`. The accumulator feeds the
-    // final `log.removeassert(...)` summary at `:42-53`. Pyre's
-    // `AnsiLogger("backendopt")` channel is a documented
-    // PRE-EXISTING-ADAPTATION (`support.rs` module doc); the
-    // accumulator structure is preserved here so the body mirrors
-    // upstream line-for-line and lights up the moment the logger
-    // lands.
-    let mut total_count: [usize; 2] = [0, 0];
-
-    for graph in graphs {
-        // Upstream `:16-17 count = 0; morework = True`.
-        let mut count = 0usize;
-        loop {
-            let mut morework = false;
-            // Upstream `:20-21 eliminate_empty_blocks(graph);
-            // join_blocks(graph)`.
-            {
-                let graph_b = graph.borrow();
-                simplify::eliminate_empty_blocks(&graph_b);
-                simplify::join_blocks(&graph_b);
-            }
-            let links = graph.borrow().iterlinks();
-            for link in links {
-                let is_assertion_link = {
-                    let graph_b = graph.borrow();
-                    assertion_link_matches(&graph_b, &link, &ll_assertion_error)
-                };
-                if !is_assertion_link {
-                    continue;
-                }
-                // Upstream `:26-33 if kill_assertion_link(graph, link):
-                //     count += 1; morework = True; break
-                // else: total_count[0] += 1
-                //     if verbose: log.removeassert("cannot remove ...")`.
-                if kill_assertion_link(&graph.borrow(), &link, &rtyper)? {
-                    count += 1;
-                    morework = true;
-                    break;
-                } else {
-                    total_count[0] += 1;
-                    // log.removeassert("cannot remove ...") — no-op
-                    // (logger unported).
-                }
-            }
-            if !morework {
-                break;
-            }
-        }
-        // Upstream `:34-40 if count: total_count[1] += count; ...
-        // checkgraph(graph)`.
-        if count != 0 {
-            total_count[1] += count;
-            // log.removeassert("removed %d asserts in %s") — no-op.
-            crate::flowspace::model::checkgraph(&graph.borrow());
-        }
-    }
-    // Upstream `:41-53 if total_count[0] == 0: msg = ... else: ...
-    // if msg is not None: log.removeassert(msg)`. Logger no-op
-    // gates the entire emission; the accumulator computation is
-    // still preserved above.
-    let _ = total_count;
-    Ok(())
-}
-
-fn assertion_link_matches(
-    graph: &FunctionGraph,
-    link: &LinkRef,
-    ll_assertion_error: &Constant,
-) -> bool {
-    let link_b = link.borrow();
-    let Some(target) = &link_b.target else {
-        return false;
-    };
-    if !Rc::ptr_eq(target, &graph.exceptblock) {
-        return false;
-    }
-    matches!(
-        link_b.args.get(1).and_then(|arg| arg.as_ref()),
-        Some(Hlvalue::Constant(c)) if c == ll_assertion_error
-    )
-}
-
-/// RPython `removeassert.kill_assertion_link(graph, link)` at
-/// `removeassert.py:38-62`.
-fn kill_assertion_link(
-    graph: &FunctionGraph,
-    link: &LinkRef,
-    rtyper: &Rc<RPythonTyper>,
-) -> Result<bool, TaskError> {
-    let block = link
-        .borrow()
-        .prevblock
-        .as_ref()
-        .and_then(|prev| prev.upgrade())
-        .ok_or_else(|| TaskError {
-            message: "removeassert.py:39 kill_assertion_link: link.prevblock missing".to_string(),
-        })?;
-    let mut exits: Vec<LinkRef> = block.borrow().exits.clone();
-    if exits.len() <= 1 {
-        return Ok(false);
-    }
-    let link_index = exits
-        .iter()
-        .position(|candidate| Rc::ptr_eq(candidate, link))
-        .ok_or_else(|| TaskError {
-            message: "removeassert.py:39 kill_assertion_link: link not in prevblock.exits"
-                .to_string(),
-        })?;
-    let mut remove_condition = exits.len() == 2;
-    if block.borrow().canraise() {
-        if link_index == 0 {
-            return Ok(false);
-        }
-    } else {
-        let exitswitch = block.borrow().exitswitch.clone();
-        if exitswitch.as_ref().and_then(hlvalue_concretetype).as_ref() != Some(&LowLevelType::Bool)
-        {
-            remove_condition = false;
-        } else {
-            if !remove_condition {
-                return Err(TaskError {
-                    message:
-                        "removeassert.py:49 kill_assertion_link: bool exitswitch without two exits"
-                            .to_string(),
-                });
-            }
-            let exitswitch = exitswitch.expect("checked above");
-            let mut newops = LowLevelOpList::new(Rc::clone(rtyper), None);
-            let condition = if hlvalue_is_true(link.borrow().exitcase.as_ref()) {
-                let inverted = newops
-                    .genop(
-                        "bool_not",
-                        vec![exitswitch],
-                        GenopResult::LLType(LowLevelType::Bool),
-                    )
-                    .expect("bool_not has Bool result");
-                Hlvalue::Variable(inverted)
-            } else {
-                exitswitch
-            };
-            let msg = format!("assertion failed in {}", graph.name);
-            let c_msg = inputconst_from_lltype(&LowLevelType::Void, &ConstValue::byte_str(msg))
-                .map_err(|e| TaskError {
-                    message: format!("removeassert.py:55 inputconst(Void, msg): {e}"),
-                })?;
-            newops.genop(
-                "debug_assert",
-                vec![condition, Hlvalue::Constant(c_msg)],
-                GenopResult::Void,
-            );
-            block.borrow_mut().operations.extend(newops.ops);
-        }
-    }
-    exits.remove(link_index);
-    if remove_condition {
-        block.borrow_mut().exitswitch = None;
-        if let Some(first) = exits.first() {
-            let mut first_b = first.borrow_mut();
-            first_b.exitcase = None;
-            first_b.llexitcase = None;
-        }
-    }
-    block.recloseblock(exits);
-    Ok(true)
-}
-
-fn hlvalue_concretetype(value: &Hlvalue) -> Option<LowLevelType> {
-    match value {
-        Hlvalue::Variable(v) => v.concretetype(),
-        Hlvalue::Constant(c) => c.concretetype.clone(),
-    }
-}
-
-fn hlvalue_is_true(value: Option<&Hlvalue>) -> bool {
-    match value {
-        Some(Hlvalue::Constant(c)) => match &c.value {
-            ConstValue::Bool(value) => *value,
-            ConstValue::Int(value) => *value != 0,
-            ConstValue::None => false,
-            _ => true,
-        },
-        Some(Hlvalue::Variable(_)) => true,
-        None => false,
-    }
-}
-
 /// RPython nested `remove_obvious_noops()` at `all.py:69-80`.
 pub(crate) fn remove_obvious_noops(
     config: &Rc<Config>,
@@ -738,12 +521,10 @@ fn get_function(dottedname: &str) -> Result<fn(&GraphRef) -> (f64, bool), TaskEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, LAST_EXCEPTION, Link,
-        SpaceOperation, Variable,
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link, SpaceOperation,
+        Variable,
     };
-    use crate::translator::rtyper::rtyper::RPythonTyper;
     use std::cell::RefCell;
 
     fn fixture_translator() -> Rc<TranslationContext> {
@@ -876,98 +657,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn kill_assertion_link_drops_canraise_assertion_exit() {
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        let v = Variable::named("v");
-        let result = Variable::named("result");
-        let body = Block::shared(vec![Hlvalue::Variable(v.clone())]);
-        let graph = FunctionGraph::new("f", body.clone());
-        body.borrow_mut().operations.push(SpaceOperation::new(
-            "direct_call",
-            vec![Hlvalue::Variable(v)],
-            Hlvalue::Variable(result.clone()),
-        ));
-        body.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::new(ConstValue::Atom(
-            LAST_EXCEPTION.clone(),
-        ))));
-        let ok = Link::new(
-            vec![Hlvalue::Variable(result)],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref();
-        let ll_assertion = Constant::with_concretetype(ConstValue::Int(42), LowLevelType::Signed);
-        let err = Link::new(
-            vec![
-                Hlvalue::Constant(Constant::new(ConstValue::builtin("AssertionError"))),
-                Hlvalue::Constant(ll_assertion.clone()),
-            ],
-            Some(graph.exceptblock.clone()),
-            Some(Hlvalue::Constant(Constant::new(ConstValue::builtin(
-                "AssertionError",
-            )))),
-        )
-        .into_ref();
-        body.closeblock(vec![ok.clone(), err.clone()]);
-
-        assert!(assertion_link_matches(&graph, &err, &ll_assertion));
-        assert!(kill_assertion_link(&graph, &err, &rtyper).expect("kill assertion link"));
-
-        assert_eq!(body.borrow().exits.len(), 1);
-        assert!(body.borrow().exitswitch.is_none());
-        assert!(Rc::ptr_eq(
-            body.borrow().exits[0].borrow().target.as_ref().unwrap(),
-            &graph.returnblock
-        ));
-        assert!(body.borrow().exits[0].borrow().exitcase.is_none());
-    }
-
-    #[test]
-    fn kill_assertion_link_rewrites_bool_switch_to_debug_assert() {
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        let cond = Variable::named("cond");
-        cond.set_concretetype(Some(LowLevelType::Bool));
-        let body = Block::shared(vec![Hlvalue::Variable(cond.clone())]);
-        let graph = FunctionGraph::new("f", body.clone());
-        body.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
-        let ok = Link::new(
-            vec![Hlvalue::Constant(Constant::new(ConstValue::None))],
-            Some(graph.returnblock.clone()),
-            Some(Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::Bool(false),
-                LowLevelType::Bool,
-            ))),
-        )
-        .into_ref();
-        let ll_assertion = Constant::with_concretetype(ConstValue::Int(7), LowLevelType::Signed);
-        let err = Link::new(
-            vec![
-                Hlvalue::Constant(Constant::new(ConstValue::builtin("AssertionError"))),
-                Hlvalue::Constant(ll_assertion.clone()),
-            ],
-            Some(graph.exceptblock.clone()),
-            Some(Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::Bool(true),
-                LowLevelType::Bool,
-            ))),
-        )
-        .into_ref();
-        body.closeblock(vec![ok.clone(), err.clone()]);
-
-        assert!(kill_assertion_link(&graph, &err, &rtyper).expect("kill assertion link"));
-
-        let body_b = body.borrow();
-        assert_eq!(body_b.operations.len(), 2);
-        assert_eq!(body_b.operations[0].opname, "bool_not");
-        assert_eq!(body_b.operations[1].opname, "debug_assert");
-        assert_eq!(body_b.exits.len(), 1);
-        assert!(body_b.exitswitch.is_none());
-        assert!(body_b.exits[0].borrow().exitcase.is_none());
     }
 
     #[test]
@@ -1195,6 +884,120 @@ mod tests {
             err.message.contains("driver_instrument_result"),
             "expected driver_instrument_result TaskError, got {:?}",
             err.message
+        );
+    }
+
+    #[test]
+    fn profile_based_inline_runs_instrument_inline_candidates_before_runtime_gate() {
+        // Upstream `:102 inline.instrument_inline_candidates(graphs,
+        // threshold)` runs BEFORE `:103-104 counters =
+        // translator.driver_instrument_result(...)`. Build a host
+        // graph that calls a tiny callee through an `lltype._func`
+        // pointer so `instrument_inline_candidates` has a real
+        // direct_call candidate; `inlining_heuristic` reports a
+        // weight ≤ default `profile_based_inline_threshold` (32.4),
+        // so an `instrument_count` op is inserted before the
+        // runtime gate raises.
+        use crate::flowspace::model::GraphKey;
+        use crate::flowspace::model::SpaceOperation;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, functionptr,
+        };
+
+        // Tiny callee: `f(x) -> x + 1`.
+        let x = Variable::named("x");
+        let r = Variable::named("r");
+        let callee_start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let callee_graph = FunctionGraph::new("f", callee_start.clone());
+        callee_start
+            .borrow_mut()
+            .operations
+            .push(SpaceOperation::new(
+                "int_add",
+                vec![
+                    Hlvalue::Variable(x),
+                    Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
+                ],
+                Hlvalue::Variable(r.clone()),
+            ));
+        callee_start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(r)],
+                Some(callee_graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let callee_ref = graph_ref(callee_graph);
+
+        let translator = fixture_translator();
+        translator.graphs.borrow_mut().push(callee_ref.clone());
+
+        // Host: direct_call(callee_funcptr).
+        let func_type = FuncType {
+            args: vec![LowLevelType::Signed],
+            result: LowLevelType::Signed,
+        };
+        let key = GraphKey::of(&callee_ref).as_usize();
+        let ptr = functionptr(func_type, "f", Some(key), Some("f".to_string()));
+        let funcptr = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(ptr))));
+        let host_start = Block::shared(vec![]);
+        let host_graph = FunctionGraph::new("host", host_start.clone());
+        let call_result = Variable::named("call_result");
+        host_start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                funcptr,
+                Hlvalue::Constant(Constant::new(ConstValue::Int(7))),
+            ],
+            Hlvalue::Variable(call_result.clone()),
+        ));
+        host_start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(call_result)],
+                Some(host_graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let host_ref = graph_ref(host_graph);
+        translator.graphs.borrow_mut().push(host_ref.clone());
+
+        let n_ops_before = host_ref.borrow().startblock.borrow().operations.len();
+
+        let kwds = vec![
+            ("mallocs".to_string(), OptionValue::Bool(false)),
+            ("inline".to_string(), OptionValue::Bool(false)),
+            (
+                "profile_based_inline".to_string(),
+                OptionValue::Str("any-non-empty-arg".to_string()),
+            ),
+        ];
+
+        let err = backend_optimizations(
+            translator,
+            Some(vec![host_ref.clone(), callee_ref]),
+            false,
+            false,
+            kwds,
+            None,
+        )
+        .expect_err("runtime gate must still surface");
+        assert!(
+            err.message.contains("driver_instrument_result"),
+            "expected driver_instrument_result TaskError, got {:?}",
+            err.message
+        );
+
+        let n_ops_after = host_ref.borrow().startblock.borrow().operations.len();
+        assert!(
+            n_ops_after > n_ops_before,
+            "instrument_inline_candidates must insert an instrument_count op \
+             before the runtime gate; ops {n_ops_before} -> {n_ops_after}"
+        );
+        assert_eq!(
+            host_ref.borrow().startblock.borrow().operations[0].opname,
+            "instrument_count"
         );
     }
 }

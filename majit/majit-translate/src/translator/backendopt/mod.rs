@@ -13,6 +13,7 @@ pub mod gilanalysis;
 pub mod graphanalyze;
 pub mod inline;
 pub mod merge_if_blocks;
+pub mod removeassert;
 pub mod removenoops;
 pub mod ssa;
 pub mod stat;
