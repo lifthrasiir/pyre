@@ -236,16 +236,7 @@ fn emit_call_assembler_callee_frame(
             if ncells == 0 && !stores_global {
                 let pycode_const = ctx.const_ref(w_callee_code as i64);
                 let w_globals_const = ctx.const_ref(callee_globals as i64);
-                let ec_opref = this.sym().execution_context;
-                let ec = if ec_opref.is_none() {
-                    ctx.record_op_with_descr(
-                        majit_ir::OpCode::GetfieldGcR,
-                        &[this.frame()],
-                        crate::descr::pyframe_execution_context_descr(),
-                    )
-                } else {
-                    ec_opref
-                };
+                let ec = this.ensure_execution_context(ctx);
                 let frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
                     ctx,
                     raw_arg,
@@ -603,6 +594,26 @@ impl MIFrame {
 
     pub(crate) fn frame(&self) -> OpRef {
         self.sym().frame
+    }
+
+    /// `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']` requires
+    /// every CALL_ASSEMBLER red-args list and JUMP-args list to carry ec.
+    /// `init_symbolic` / `pypyjit_create_sym` / `setup_bridge_sym` all seed
+    /// `sym.execution_context` ahead of any trace emission, so this helper
+    /// is structurally just a getter — the recovery branch is defensive
+    /// against future paths that forget to seed it.
+    pub(crate) fn ensure_execution_context(&mut self, ctx: &mut TraceCtx) -> OpRef {
+        let ec = self.sym().execution_context;
+        if !ec.is_none() {
+            return ec;
+        }
+        let recovered = ctx.record_op_with_descr(
+            majit_ir::OpCode::GetfieldGcR,
+            &[self.frame()],
+            crate::descr::pyframe_execution_context_descr(),
+        );
+        self.sym_mut().execution_context = recovered;
+        recovered
     }
 
     #[inline]
@@ -4731,16 +4742,12 @@ impl MIFrame {
 
                                 // pyjitpl.py:2017: do_residual_call step 1
                                 this.vable_and_vrefs_before_residual_call(ctx);
-                                let ec = this.sym().execution_context;
-                                let (ca_args, ca_types): (Vec<OpRef>, Vec<Type>) = if ec.is_none() {
-                                    (vec![callee_frame], vec![Type::Ref])
-                                } else {
-                                    (vec![callee_frame, ec], vec![Type::Ref, Type::Ref])
-                                };
+                                // interp_jit.py:67 reds = ['frame', 'ec']
+                                let ec = this.ensure_execution_context(ctx);
                                 let ca_result = ctx.call_assembler_red_only_ref(
                                     token_number,
-                                    &ca_args,
-                                    &ca_types,
+                                    &[callee_frame, ec],
+                                    &[Type::Ref, Type::Ref],
                                 );
                                 ctx.record_op(OpCode::Keepalive, &[callee_frame]);
                                 if drop_callee_frame {
@@ -5119,14 +5126,13 @@ impl MIFrame {
                         )?;
                         // pyjitpl.py:2017: do_residual_call step 1
                         this.vable_and_vrefs_before_residual_call(ctx);
-                        let ec = this.sym().execution_context;
-                        let (ca_args, ca_types): (Vec<OpRef>, Vec<Type>) = if ec.is_none() {
-                            (vec![callee_frame], vec![Type::Ref])
-                        } else {
-                            (vec![callee_frame, ec], vec![Type::Ref, Type::Ref])
-                        };
-                        let ca_result =
-                            ctx.call_assembler_red_only_ref(token_number, &ca_args, &ca_types);
+                        // interp_jit.py:67 reds = ['frame', 'ec']
+                        let ec = this.ensure_execution_context(ctx);
+                        let ca_result = ctx.call_assembler_red_only_ref(
+                            token_number,
+                            &[callee_frame, ec],
+                            &[Type::Ref, Type::Ref],
+                        );
                         ctx.record_op(OpCode::Keepalive, &[callee_frame]);
                         if drop_callee_frame {
                             ctx.call_void(

@@ -7244,6 +7244,22 @@ impl CraneliftBackend {
             .collect();
         let has_entry_label = label_indices.first().copied() == Some(0);
 
+        // descr.index() → label op's source-arity (args.len()).  Captured up
+        // front because Cranelift's FunctionBuilder may auto-promote `def_var`
+        // chains into block params later, growing the block's runtime
+        // num_block_params past the original label arity. Used by the
+        // OpCode::Jump handler to detect arity-mismatched local jumps and
+        // lower them as external jumps (rewriter.py LABEL/JUMP redirect parity).
+        let label_arity_by_descr: HashMap<u32, usize> = label_indices
+            .iter()
+            .filter_map(|&li| {
+                ops[li]
+                    .descr
+                    .as_ref()
+                    .map(|d| (d.index(), ops[li].args.len()))
+            })
+            .collect();
+
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
             for &li in &label_indices {
                 eprintln!(
@@ -11077,24 +11093,34 @@ impl CraneliftBackend {
                     // Resolve target: try descr-based lookup first, then
                     // fall back to loop_block (Jump without descr targets
                     // the loop header, matching RPython's self-loop).
-                    let target_block =
+                    // rewriter.py LABEL/JUMP redirect parity: a local target
+                    // whose original label arity differs from the JUMP arg
+                    // count lowers as external jump (Cranelift's
+                    // FunctionBuilder may have auto-promoted `def_var` chains
+                    // into block params, so the runtime num_block_params is
+                    // unreliable — compare against the arity captured before
+                    // codegen).
+                    let local_target_arity_matches = op.descr.as_ref().is_some_and(|d| {
+                        label_arity_by_descr
+                            .get(&d.index())
+                            .copied()
+                            .is_some_and(|arity| arity == op.args.len())
+                    });
+                    let target_block = if local_target_arity_matches {
                         op.descr
                             .as_ref()
                             .and_then(|descr| label_blocks_by_descr.get(&descr.index()).copied())
-                            .or_else(|| {
-                                // Only fallback to loop_block for implicit self-loops
-                                // (Jump with no descr). If the Jump has a descr pointing
-                                // to a target NOT in this function's Labels (bridge →
-                                // main loop), it's an external jump — compile as FINISH.
-                                let has_unmatched_descr = op.descr.as_ref().map_or(false, |d| {
-                                    !label_blocks_by_descr.contains_key(&d.index())
-                                });
-                                if !has_unmatched_descr && loop_block != entry_block {
-                                    Some(loop_block)
-                                } else {
-                                    None
-                                }
-                            });
+                    } else if op.descr.is_some() {
+                        // Descr present but either points outside this function
+                        // (bridge → main loop) or to a local label with
+                        // mismatched arity — compile as external jump.
+                        None
+                    } else if loop_block != entry_block {
+                        // Implicit self-loop: Jump without descr.
+                        Some(loop_block)
+                    } else {
+                        None
+                    };
                     if let Some(target_block) = target_block {
                         builder.ins().jump(target_block, &block_args(&vals));
                     } else {
@@ -12284,22 +12310,31 @@ fn collect_guards(
     let num_inputs = inputargs.len();
     let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
 
-    // Collect Label descr indices to distinguish internal vs external JUMPs.
-    let label_descr_indices: HashSet<u32> = ops
+    // Map Label descr index → block arity, used to distinguish internal vs
+    // external JUMPs.  rewriter.py LABEL/JUMP redirect parity: a JUMP whose
+    // descr targets a Label in this function but with a *different* arg arity
+    // also lowers as an external jump (the target's stack frame layout
+    // doesn't match, so we exit this trace and re-enter the target via the
+    // dispatcher instead of jumping locally).
+    let label_arity_by_descr: HashMap<u32, usize> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.descr.as_ref().map(|d| d.index()))
+        .filter_map(|op| op.descr.as_ref().map(|d| (d.index(), op.args.len())))
         .collect();
 
     for (op_idx, op) in ops.iter().enumerate() {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
-        // External JUMP: target not in this function's Labels.
+        // External JUMP: target not in this function's Labels, or local
+        // target with mismatched arity (treated as external for parity).
         let is_external_jump = op.opcode == OpCode::Jump
             && op
                 .descr
                 .as_ref()
-                .map_or(false, |d| !label_descr_indices.contains(&d.index()));
+                .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
+                    None => true,
+                    Some(&arity) => arity != op.args.len(),
+                });
 
         if !is_guard && !is_finish && !is_external_jump {
             continue;
@@ -13463,193 +13498,53 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        let attachments_guard = compiled.cpu_attachments.read().unwrap();
-        let exec = run_compiled_code(
-            compiled.code_ptr,
-            &compiled.fail_descrs,
-            compiled.num_ref_roots,
-            compiled.max_output_slots,
-            args,
-            &*attachments_guard,
-        );
-        let fail_index = exec.fail_index;
-        let direct_descr = exec.direct_descr.clone();
-        let mut outputs = exec.extract_outputs(compiled.max_output_slots.max(1));
-
-        if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
-            eprintln!(
-                "[exec-raw] fail_index={fail_index} outputs_len={}",
-                outputs.len()
-            );
-        }
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
-            if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
-                eprintln!("[exec-raw] fail_index=0 → call_assembler path");
-            }
-            let frame = wrap_call_assembler_deadframe_with_caller_prefix(
-                frame,
-                compiled.trace_id,
-                compiled.header_pc,
-                None,
-                &compiled.input_types,
-                args,
-                compiled.caller_prefix_layout.as_ref(),
-            );
-            let descr = self.get_latest_descr(&frame);
-            let exit_layout = self.describe_deadframe(&frame);
-            let savedata = self.get_savedata_ref(&frame);
-            let exception_value = self.grab_exc_value(&frame);
-            let exit_arity = descr.fail_arg_types().len();
-            let mut result = Vec::with_capacity(exit_arity);
-            let mut typed_result = Vec::with_capacity(exit_arity);
-            for (i, &tp) in descr.fail_arg_types().iter().enumerate() {
-                match tp {
-                    Type::Int => {
-                        let value = self.get_int_value(&frame, i);
-                        result.push(value);
-                        typed_result.push(Value::Int(value));
-                    }
-                    Type::Ref => {
-                        let value = self.get_ref_value(&frame, i);
-                        result.push(value.as_usize() as i64);
-                        typed_result.push(Value::Ref(value));
-                    }
-                    Type::Float => {
-                        let value = self.get_float_value(&frame, i);
-                        result.push(value.to_bits() as i64);
-                        typed_result.push(Value::Float(value));
-                    }
-                    Type::Void => {
-                        result.push(0);
-                        typed_result.push(Value::Void);
-                    }
-                }
-            }
-            return majit_backend::RawExecResult {
-                outputs: result,
-                typed_outputs: typed_result,
-                exit_layout,
-                force_token_slots: descr.force_token_slots().to_vec(),
-                savedata,
-                exception_value,
-                fail_index: descr.fail_index(),
-                trace_id: descr.trace_id(),
-                is_finish: descr.is_finish(),
-                is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
-                status: descr.get_status(),
-                descr_addr: descr as *const dyn FailDescr as *const () as usize,
-            };
-        }
-
-        let fail_descr_arc =
-            direct_descr.unwrap_or_else(|| compiled.fail_descrs[fail_index as usize].clone());
-        let fail_descr = &fail_descr_arc;
-        fail_descr.increment_fail_count();
-
-        // If a bridge is attached, dispatch to it.
-        if std::env::var_os("MAJIT_LOG").is_some() && fail_index == 0 {
-            let has_bridge = fail_descr.bridge_ref().is_some();
-            eprintln!("[exec-guard0] fail_index={fail_index} has_bridge={has_bridge}");
-        }
-        let bridge_guard = fail_descr.bridge_ref();
-        if let Some(ref bridge) = *bridge_guard {
-            let frame = Self::execute_bridge(
-                bridge,
-                &outputs,
-                &fail_descr.fail_arg_types,
-                &*attachments_guard,
-            );
-            let descr = frame
-                .data
-                .downcast_ref::<JitFrameDeadFrame>()
-                .expect("bridge returned unexpected frame type");
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[bridge-dispatch] guard={} bridge_trace={} bridge_exit_fail={} is_finish={}",
-                    fail_index,
-                    bridge.trace_id,
-                    descr.fail_descr.fail_index(),
-                    descr.fail_descr.is_finish()
-                );
-            }
-            let arity = descr.fail_descr.fail_arg_types().len();
-            let mut result = Vec::with_capacity(arity);
-            let mut typed_result = Vec::with_capacity(arity);
-            for (i, &tp) in descr.fail_descr.fail_arg_types().iter().enumerate() {
-                match tp {
-                    Type::Int => {
-                        let value = descr.get_int(i);
-                        result.push(value);
-                        typed_result.push(Value::Int(value));
-                    }
-                    Type::Ref => {
-                        let value = descr.get_ref(i);
-                        result.push(value.as_usize() as i64);
-                        typed_result.push(Value::Ref(value));
-                    }
-                    Type::Float => {
-                        let value = descr.get_float(i);
-                        result.push(value.to_bits() as i64);
-                        typed_result.push(Value::Float(value));
-                    }
-                    Type::Void => {
-                        result.push(0);
-                        typed_result.push(Value::Void);
-                    }
-                }
-            }
-            return majit_backend::RawExecResult {
-                outputs: result,
-                typed_outputs: typed_result,
-                exit_layout: Some(descr.fail_descr.layout()),
-                force_token_slots: descr.fail_descr.force_token_slots().to_vec(),
-                savedata: descr.try_get_savedata_ref(),
-                exception_value: descr.grab_exc_value(),
-                fail_index: descr.fail_descr.fail_index(),
-                trace_id: descr.fail_descr.trace_id(),
-                is_finish: descr.fail_descr.is_finish(),
-                is_exit_frame_with_exception: descr.fail_descr.is_exit_frame_with_exception(),
-                status: descr.fail_descr.get_status(),
-                descr_addr: Arc::as_ptr(&descr.fail_descr) as usize,
-            };
-        }
-        let _ = bridge_guard;
-
-        // No bridge — skip DeadFrame, return outputs directly.
-        // Read savedata directly from jf_frame memory.
-        let savedata = {
-            let raw = unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
-            if raw != 0 { Some(GcRef(raw)) } else { None }
-        };
-        // jf_guard_exc written by emit_guard_exit.
-        let exc_raw = unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
-        let exception = GcRef(exc_raw);
-
-        let exit_arity = fail_descr.fail_arg_types().len();
-        outputs.truncate(exit_arity);
-        let mut typed_outputs = Vec::with_capacity(exit_arity);
-        for (&raw, &tp) in outputs.iter().zip(fail_descr.fail_arg_types().iter()) {
+        // Run the dispatch loop (handles bridge attachment and external-JUMP
+        // re-entry, llgraph/runner.py:1130-1140 closing_jump parity) and then
+        // marshall the resulting DeadFrame into RawExecResult.
+        let frame = Self::execute_with_inputs(compiled, args);
+        let descr = self.get_latest_descr(&frame);
+        let exit_layout = self.describe_deadframe(&frame);
+        let savedata = self.get_savedata_ref(&frame);
+        let exception_value = self.grab_exc_value(&frame);
+        let exit_arity = descr.fail_arg_types().len();
+        let mut result = Vec::with_capacity(exit_arity);
+        let mut typed_result = Vec::with_capacity(exit_arity);
+        for (i, &tp) in descr.fail_arg_types().iter().enumerate() {
             match tp {
-                Type::Int => typed_outputs.push(Value::Int(raw)),
-                Type::Ref => typed_outputs.push(Value::Ref(GcRef(raw as usize))),
-                Type::Float => typed_outputs.push(Value::Float(f64::from_bits(raw as u64))),
-                Type::Void => typed_outputs.push(Value::Void),
+                Type::Int => {
+                    let value = self.get_int_value(&frame, i);
+                    result.push(value);
+                    typed_result.push(Value::Int(value));
+                }
+                Type::Ref => {
+                    let value = self.get_ref_value(&frame, i);
+                    result.push(value.as_usize() as i64);
+                    typed_result.push(Value::Ref(value));
+                }
+                Type::Float => {
+                    let value = self.get_float_value(&frame, i);
+                    result.push(value.to_bits() as i64);
+                    typed_result.push(Value::Float(value));
+                }
+                Type::Void => {
+                    result.push(0);
+                    typed_result.push(Value::Void);
+                }
             }
         }
-
         majit_backend::RawExecResult {
-            outputs,
-            typed_outputs,
-            exit_layout: Some(fail_descr.layout()),
-            force_token_slots: fail_descr.force_token_slots().to_vec(),
+            outputs: result,
+            typed_outputs: typed_result,
+            exit_layout,
+            force_token_slots: descr.force_token_slots().to_vec(),
             savedata,
-            exception_value: exception,
-            fail_index,
-            trace_id: fail_descr.trace_id(),
-            is_finish: fail_descr.is_finish(),
-            is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
-            status: fail_descr.get_status(),
-            descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
+            exception_value,
+            fail_index: descr.fail_index(),
+            trace_id: descr.trace_id(),
+            is_finish: descr.is_finish(),
+            is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
+            status: descr.get_status(),
+            descr_addr: descr as *const dyn FailDescr as *const () as usize,
         }
     }
 
@@ -18710,7 +18605,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external-jump arity-mismatch lowering (Jump descr targeting a Label with different param count, rewriter.py LABEL/JUMP redirect parity) is not yet ported on side3; test added ahead of supporting code"]
     fn test_execute_bridge_follows_external_jump_to_compiled_target() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1500_260);
@@ -18910,7 +18804,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external-jump arity-mismatch lowering (Jump descr targeting a Label with different param count, rewriter.py LABEL/JUMP redirect parity) is not yet ported on side3; test added ahead of supporting code"]
+    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry; multi-session structural change."]
     fn test_execute_bridge_external_jump_to_second_label_skips_preamble() {
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1500_265);
@@ -18968,7 +18862,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external-jump arity-mismatch lowering (Jump descr targeting a Label with different param count, rewriter.py LABEL/JUMP redirect parity) is not yet ported on side3; test added ahead of supporting code"]
+    #[ignore = "label-selector dispatch (assembler.py:990-993 TargetToken._ll_loop_code per-label entry) is not yet ported — re-entry runs from the function code_ptr, not the target label's address. Cranelift cannot expose internal block addresses, so closing this requires either a per-label dispatch prologue or a switch-on-selector entry; multi-session structural change."]
     fn test_execute_bridge_external_jump_to_middle_label_uses_label_selector() {
         let mut backend = CraneliftBackend::new();
         let start_descr = make_label_descr(1500_268);
@@ -19041,7 +18935,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external-jump arity-mismatch lowering (Jump descr targeting a Label with different param count, rewriter.py LABEL/JUMP redirect parity) is not yet ported on side3; test added ahead of supporting code"]
     fn test_jump_to_mismatched_local_label_lowers_as_external_jump() {
         let mut backend = CraneliftBackend::new();
         let start_descr = majit_ir::make_loop_target_descr(1500_360, true);

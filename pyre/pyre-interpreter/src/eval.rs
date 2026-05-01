@@ -44,11 +44,16 @@ impl Code {
 thread_local! {
     static CURRENT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(PY_NULL) };
     pub(crate) static CURRENT_FRAME: Cell<*mut PyFrame> = const { Cell::new(std::ptr::null_mut()) };
-    static CURRENT_FRAME_PREVIOUS_ROOTS: std::cell::RefCell<Vec<majit_ir::GcRef>> =
-        const { std::cell::RefCell::new(Vec::new()) };
 }
 use crate::pyframe::PyFrame;
 
+/// Saves the previous `CURRENT_FRAME` and (when EC was modified) the
+/// previous `ec.topframeref` so they can be restored on Drop. The two
+/// pointers are pushed onto `majit_gc::shadow_stack` rather than a local
+/// `Vec` — this matches RPython's `framework.py` shadow-stack
+/// (rpython/memory/gctransform/shadowstack.py:281) and lets the GC's
+/// Phase 1b root-walker forward both pointers in place when a minor
+/// collection runs while the guard is on the stack.
 pub struct CurrentFrameGuard {
     save_point: usize,
     ec: *mut PyExecutionContext,
@@ -57,19 +62,14 @@ pub struct CurrentFrameGuard {
 
 impl Drop for CurrentFrameGuard {
     fn drop(&mut self) {
-        let (previous, previous_ec_top) = CURRENT_FRAME_PREVIOUS_ROOTS.with(|roots| {
-            let mut roots = roots.borrow_mut();
-            let previous = roots
-                .get(self.save_point)
-                .copied()
-                .unwrap_or(majit_ir::GcRef::NULL);
-            let previous_ec_top = self
-                .ec_top_root_index
-                .and_then(|idx| roots.get(idx).copied())
-                .unwrap_or(majit_ir::GcRef::NULL);
-            roots.truncate(self.save_point);
-            (previous, previous_ec_top)
-        });
+        // Read forwarded values from the shadow stack before pop_to so we
+        // observe any in-place updates the GC may have made.
+        let previous = majit_gc::shadow_stack::get(self.save_point);
+        let previous_ec_top = self
+            .ec_top_root_index
+            .map(majit_gc::shadow_stack::get)
+            .unwrap_or(majit_ir::GcRef::NULL);
+        majit_gc::shadow_stack::pop_to(self.save_point);
         CURRENT_FRAME.with(|current| current.set(previous.0 as *mut PyFrame));
         if !self.ec.is_null() {
             unsafe {
@@ -84,19 +84,14 @@ fn push_current_frame_previous_root(
     ec: *mut PyExecutionContext,
     previous_ec_top: *mut PyFrame,
 ) -> CurrentFrameGuard {
-    let (save_point, ec_top_root_index) = CURRENT_FRAME_PREVIOUS_ROOTS.with(|roots| {
-        let mut roots = roots.borrow_mut();
-        let save_point = roots.len();
-        roots.push(majit_ir::GcRef(previous as usize));
-        let ec_top_root_index = if ec.is_null() {
-            None
-        } else {
-            let idx = roots.len();
-            roots.push(majit_ir::GcRef(previous_ec_top as usize));
-            Some(idx)
-        };
-        (save_point, ec_top_root_index)
-    });
+    let save_point = majit_gc::shadow_stack::push(majit_ir::GcRef(previous as usize));
+    let ec_top_root_index = if ec.is_null() {
+        None
+    } else {
+        Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
+            previous_ec_top as usize,
+        )))
+    };
     CurrentFrameGuard {
         save_point,
         ec,
@@ -183,12 +178,9 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // the duration of the visit so no other code mutates the cell.
         let cf_slot_ptr = cf.as_ptr() as *mut majit_ir::GcRef;
         visitor(unsafe { &mut *cf_slot_ptr });
-        CURRENT_FRAME_PREVIOUS_ROOTS.with(|roots| {
-            let mut roots = roots.borrow_mut();
-            for root in roots.iter_mut() {
-                visitor(root);
-            }
-        });
+        // Saved previous-frame / previous-ec-topframe roots now live on
+        // `majit_gc::shadow_stack` (pushed by `push_current_frame_previous_root`)
+        // and are forwarded by the GC's Phase 1b walker; no extra visit here.
 
         let mut frame = cf.get();
         if !frame.is_null() {

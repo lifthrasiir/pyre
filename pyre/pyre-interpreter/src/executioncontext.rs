@@ -414,65 +414,44 @@ impl ExecutionContext {
         if !self.space.is_null() && self.is_tracing > 0 {
             self._revdb_enter(frame);
         }
-        let top = self.topframeref;
-        if !top.is_null() && (top as usize) < 0x10000 {
-            eprintln!(
-                "[ec][enter] CORRUPT topframeref=0x{:x} new_frame={:p}",
-                top as usize, frame
-            );
-            std::process::abort();
-        }
         unsafe {
-            // Also check the new frame's f_back slot — if it's a small int,
-            // some other write has stomped on it. enter() is about to clobber
-            // it with topframeref anyway, but the source of garbage matters.
-            let f_back_pre = (*frame).f_backref;
-            if !f_back_pre.is_null() && (f_back_pre as usize) < 0x10000 {
-                eprintln!(
-                    "[ec][enter] new_frame={:p} arrives with CORRUPT f_back=0x{:x} (will be overwritten with topframeref={:p})",
-                    frame, f_back_pre as usize, top
-                );
-            }
-            (*frame).f_backref = top;
+            (*frame).f_backref = self.topframeref;
         }
         self.topframeref = frame;
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn leave(&mut self, frame: *mut PyFrame, _w_exitvalue: PyObjectRef, got_exception: bool) {
-        let _ = got_exception;
-        self.is_tracing = self.is_tracing.saturating_sub(0);
-        let _ = frame;
-        if self.is_tracing > 0 {
-            self._trace(self.gettopframe(), "leaveframe", pyre_object::PY_NULL, None);
+    pub fn leave(&mut self, frame: *mut PyFrame, w_exitvalue: PyObjectRef, got_exception: bool) {
+        // pypy/interpreter/executioncontext.py:91-109 leave parity.
+        // The Python `try/finally` collapses into linear code here because
+        // `_trace` cannot raise — it's a no-op stub.
+        if !self.profilefunc.is_null() {
+            self._trace(frame, "leaveframe", w_exitvalue, None);
         }
-        if !self.topframeref.is_null() {
-            // SAFETY: current top frame can be queried with raw pointer.
-            unsafe {
-                let top = self.topframeref;
-                if (top as usize) < 0x1000 {
-                    eprintln!(
-                        "[ec][leave] CORRUPT topframeref=0x{:x} popped_frame={:p}",
-                        top as usize, frame
-                    );
-                    std::process::abort();
+        // `frame_vref = self.topframeref` — vref currently a raw frame
+        // pointer; the `vref()` force at the bottom of the if-block is a
+        // no-op until `jit.virtual_ref` ports.
+        let _frame_vref = self.topframeref;
+        unsafe {
+            self.topframeref = (*frame).f_backref;
+            // pypy/interpreter/executioncontext.py:98-106: if the frame
+            // escaped to applevel (or unwinding via exception), the back-
+            // chain must also be marked so consumers walking f_back stop
+            // treating it as "still on the JIT stack".
+            if (*frame).escaped || got_exception {
+                let f_back = (*frame).get_f_back();
+                if !f_back.is_null() {
+                    (*f_back).mark_as_escaped();
                 }
-                let f_back = (*top).get_f_back();
-                if !f_back.is_null() && (f_back as usize) < 0x1000 {
-                    eprintln!(
-                        "[ec][leave] CORRUPT f_back=0x{:x} top_frame={:p} popped_frame={:p}",
-                        f_back as usize, top, frame
-                    );
-                    std::process::abort();
-                }
-                self.topframeref = f_back;
+                // `frame_vref()` — vref force, no-op until `jit.virtual_ref`
+                // is ported.
             }
         }
-        if self.space.is_null() && self.gettopframe().is_null() {
-            self._revdb_leave(got_exception);
-        } else {
-            self._revdb_leave(got_exception);
-        }
+        // `jit.virtual_ref_finish(frame_vref, frame)` — no-op until
+        // `jit.virtual_ref` is ported.
+        // PyPy gates this on `self.space.reverse_debugging`; pyre has no
+        // equivalent flag, so the (also no-op) call runs unconditionally.
+        self._revdb_leave(got_exception);
     }
 
     pub fn c_call_trace(

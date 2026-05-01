@@ -13360,16 +13360,17 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2483-2486 — popframe + framestack[-1].make_result_of_lastop +
         // raise ChangeFrame.
         use crate::jitcode::{JitArgKind, JitCodeBuilder};
+        let callee = std::sync::Arc::new(JitCodeBuilder::new().finish());
         let mut builder_caller = JitCodeBuilder::new();
-        builder_caller.load_const_i_value(0, 0);
-        builder_caller.load_const_i_value(1, 0);
+        let callee_idx = builder_caller.add_sub_jitcode_arc(callee.clone());
+        builder_caller.inline_call_r_i(callee_idx, &[], Some(1));
         let caller = std::sync::Arc::new(builder_caller.finish());
-        let builder_callee = JitCodeBuilder::new();
-        let callee = std::sync::Arc::new(builder_callee.finish());
+        let caller_return_pc = caller.body().code.len();
 
         let mut meta = MetaInterp::<()>::new(0);
         // Push caller, then callee.
         meta.perform_call(caller, &[], None).unwrap_err();
+        meta.framestack.current_mut().pc = caller_return_pc;
         meta.perform_call(callee, &[], None).unwrap_err();
         assert_eq!(meta.framestack.len(), 2);
 

@@ -5546,19 +5546,22 @@ impl JitState for PyreJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        if sym.execution_context.is_none() {
-            sym.vable_collect_jump_args()
-        } else {
-            Self::pypyjit_collect_jump_args(sym)
-        }
+        // interp_jit.py:67 `reds = ['frame', 'ec']` — every JUMP threads ec.
+        // `pypyjit_create_sym` / `setup_bridge_sym` seed sym.execution_context
+        // before any trace emission, so this is unconditional.
+        debug_assert!(
+            !sym.execution_context.is_none(),
+            "sym.execution_context must be seeded before collect_jump_args"
+        );
+        Self::pypyjit_collect_jump_args(sym)
     }
 
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        if sym.execution_context.is_none() {
-            sym.vable_collect_typed_jump_args()
-        } else {
-            Self::pypyjit_collect_typed_jump_args(sym)
-        }
+        debug_assert!(
+            !sym.execution_context.is_none(),
+            "sym.execution_context must be seeded before collect_typed_jump_args"
+        );
+        Self::pypyjit_collect_typed_jump_args(sym)
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {

@@ -948,8 +948,7 @@ thread_local! {
         // Excluded: `execution_context` (Rc::into_raw, persistent),
         // `pycode` (static W_CodeObject), `debugdata` / `lastblock`
         // (heap-allocated, not GC), `w_globals` (Box-allocated
-        // DictStorage, not GC), `pending_inline_results`
-        // (`Option<Box<VecDeque>>`, not GC).
+        // DictStorage, not GC).
         //
         // `walk_pyframe_roots` (`pyre-interpreter::eval`) still walks
         // `CURRENT_FRAME → f_backref` and visits the items inside
@@ -2186,44 +2185,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
 
-        // ── inline replay (tracing bookkeeping) ──
-        if frame.pending_inline_resume_pc == Some(pc) {
-            if matches!(
-                instruction,
-                pyre_interpreter::bytecode::Instruction::Call { .. }
-            ) {
-                frame.pending_inline_resume_pc = None;
-                continue;
-            }
-        }
-        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
-            if frame
-                .pending_inline_results
-                .as_ref()
-                .is_some_and(|b| !b.is_empty())
-            {
-                frame.set_last_instr_from_next_instr(opcode_pc + 1);
-                if pyre_interpreter::call::replay_pending_inline_call(
-                    frame,
-                    argc.get(op_arg) as usize,
-                ) {
-                    continue;
-                }
-                frame.set_last_instr_from_next_instr(pc);
-            }
-        }
-
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         trace_jit_bytecode(pc, "");
         frame.last_instr = pc as isize;
         frame.set_last_instr_from_next_instr(opcode_pc + 1);
         let mut next_instr = frame.next_instr();
-        if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
-            if pyre_interpreter::call::replay_pending_inline_call(frame, argc.get(op_arg) as usize)
-            {
-                continue;
-            }
-        }
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
             Ok(StepResult::Continue) => {
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check after

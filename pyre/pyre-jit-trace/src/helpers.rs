@@ -562,8 +562,7 @@ pub fn emit_box_float_inline(
 ///    `new_for_call_with_closure`; the nullable GC fields
 ///    (`f_generator_nowref`, `w_yielding_from`, `f_backref`) are written
 ///    explicitly to match the same constructor shape instead of relying on
-///    an implicit backend zero-fill side effect. `pending_inline_results`
-///    stays bit-zero because its Rust representation is `Option<Box<...>>`.
+///    an implicit backend zero-fill side effect.
 pub fn emit_new_pyframe_inline_self_recursive(
     ctx: &mut TraceCtx,
     raw_int_arg: OpRef,

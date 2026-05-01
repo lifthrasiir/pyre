@@ -2532,10 +2532,6 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.debugdata = std::ptr::null_mut();
     frame.escaped = false;
     frame.set_blocklist(&[]);
-    if let Some(buf) = frame.pending_inline_results.as_mut() {
-        buf.clear();
-    }
-    frame.pending_inline_resume_pc = None;
 }
 
 fn create_callee_frame_impl_1_boxed(

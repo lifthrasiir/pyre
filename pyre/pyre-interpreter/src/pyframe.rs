@@ -4,7 +4,6 @@
 //! local variables, and instruction pointer. The JIT virtualizes
 //! these fields so they live in registers instead of memory.
 
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::{CodeFlags, CodeObject};
@@ -101,31 +100,6 @@ pub struct PyFrame {
     pub w_yielding_from: PyObjectRef,
     /// PyPy: `f_backref = jit.vref_None`.
     pub f_backref: *mut PyFrame,
-    /// Concrete inline-trace replay results owned by this frame.
-    ///
-    /// PyPy's `finishframe()` writes each child result into the parent in
-    /// bytecode order. Tracing can run ahead of concrete execution and queue
-    /// multiple inline-handled CALL results on the same caller frame before
-    /// the interpreter replays the first CALL opcode, so this must preserve
-    /// ordering instead of using a single overwrite-prone slot.
-    ///
-    /// `Option<Box<VecDeque<...>>>` rather than `VecDeque<...>` directly so
-    /// the all-zero bit pattern is a valid initial state (`None` =
-    /// 8-byte NULL pointer). `VecDeque`'s inline `RawVec::dangling()`
-    /// stores an alignment-shaped pointer, NOT zero — making zero-init UB
-    /// the moment any `push_back`/`pop_front`/`clear` runs. Phase 2.3
-    /// 옵션 B prep: a future `NewWithVtable(PyFrame)` in trace IR would
-    /// hand back zeroed nursery memory, so this field had to be made
-    /// zero-init safe before that lands.
-    pub pending_inline_results: Option<Box<VecDeque<PendingInlineResult>>>,
-    /// Outermost inline trace-through resumed this frame past the CALL at the
-    /// recorded pc.
-    ///
-    /// Nested inline frames already follow the MIFrame-owned
-    /// make_result_of_lastop path directly. This marker narrows the same
-    /// protocol to the outermost interpreter loop without conflating it with
-    /// unrelated next_instr changes.
-    pub pending_inline_resume_pc: Option<usize>,
 }
 
 /// GC type id for `PyFrame`. Reserved ahead of any callsite that allocates
@@ -625,10 +599,6 @@ impl PyFrame {
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
             self.getorcreate_debug_data(-1).w_globals = w_globals;
         }
-        if let Some(buf) = self.pending_inline_results.as_mut() {
-            buf.clear();
-        }
-        self.pending_inline_resume_pc = None;
         self.initialize_frame_scopes(outer_func, code);
     }
 
@@ -770,8 +740,6 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            pending_inline_results: None,
-            pending_inline_resume_pc: None,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -839,8 +807,6 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            pending_inline_results: None,
-            pending_inline_resume_pc: None,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -877,8 +843,6 @@ impl PyFrame {
             f_generator_nowref: self.f_generator_nowref,
             w_yielding_from: self.w_yielding_from,
             f_backref: self.f_backref,
-            pending_inline_results: self.pending_inline_results.clone(),
-            pending_inline_resume_pc: self.pending_inline_resume_pc,
         });
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
@@ -1673,8 +1637,6 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            pending_inline_results: None,
-            pending_inline_resume_pc: None,
         };
         frame.init_cells();
         if stores_global {

@@ -553,7 +553,8 @@ impl ArrayCachedItem {
                 Some(v) if !v.is_none() => v,
                 _ => continue,
             };
-            let idx_ref = OpRef(self.index as u32);
+            // compile.py:451 ResOperation(... [arrayop, ConstInt(index)] ...)
+            let idx_ref = ctx.make_constant_int(self.index as i64);
             let opcode = descr
                 .as_array_descr()
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
@@ -726,8 +727,6 @@ pub struct OptHeap {
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
     quasi_immut_cache: HashMap<FieldKey, OpRef>,
-    /// heap.py: cached array lengths.
-    cached_arraylens: HashMap<(OpRef, u32), OpRef>,
 }
 
 impl OptHeap {
@@ -744,7 +743,6 @@ impl OptHeap {
             known_nonnull: Vec::new(),
             heapc_deps: HashMap::new(),
             quasi_immut_cache: HashMap::new(),
-            cached_arraylens: HashMap::new(),
         }
     }
 
@@ -2662,31 +2660,9 @@ impl OptHeap {
             // SETINTERIORFIELD_GC is NOT in the emitting_operation exclusion
             // list, so it triggers force_all_lazy_sets + clean_caches.
 
-            // ── heap.py: ARRAYLEN_GC — cache array lengths ──
-            OpCode::ArraylenGc => {
-                let array = ctx.get_box_replacement(op.arg(0));
-                let descr_idx = op.descr.as_ref().map(|d| d.index()).unwrap_or(0);
-                if let Some(&cached) = self.cached_arraylens.get(&(array, descr_idx)) {
-                    let cached = ctx.get_box_replacement(cached);
-                    ctx.replace_op(op.pos, cached);
-                    return OptimizationResult::Remove;
-                }
-                self.cached_arraylens.insert((array, descr_idx), op.pos);
-                OptimizationResult::Emit(op.clone())
-            }
-
-            // ── heap.py: STRLEN/UNICODELEN — cache like ARRAYLEN ──
-            OpCode::Strlen | OpCode::Unicodelen => {
-                let str_ref = op.arg(0);
-                let key = (str_ref, op.opcode as u32 + 0xFF00);
-                if let Some(&cached) = self.cached_arraylens.get(&key) {
-                    let cached = ctx.get_box_replacement(cached);
-                    ctx.replace_op(op.pos, cached);
-                    return OptimizationResult::Remove;
-                }
-                self.cached_arraylens.insert(key, op.pos);
-                OptimizationResult::PassOn // let intbounds set non-negative
-            }
+            // ARRAYLEN_GC / STRLEN / UNICODELEN: pure ops handled by OptPure
+            // (resoperation.py:947-1056 _ALWAYS_PURE_FIRST..LAST). Heap CSE
+            // would shadow OptPure's `_pure_operations[opnum]` table.
 
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
@@ -2945,7 +2921,6 @@ impl Optimization for OptHeap {
         self.unescaped.clear();
         self.known_nonnull.clear();
         self.quasi_immut_cache.clear();
-        self.cached_arraylens.clear();
     }
 
     fn flush(&mut self, ctx: &mut OptContext) {
@@ -5858,7 +5833,9 @@ mod tests {
 
     #[test]
     fn test_arraylen_caching() {
-        // Two ARRAYLEN_GC on the same array → second eliminated.
+        // Two ARRAYLEN_GC on the same array → second eliminated by OptPure.
+        // resoperation.py:1044 marks ARRAYLEN_GC as ALWAYS_PURE; OptPure's
+        // _pure_operations CSE table handles dedup.
         let d = descr(42);
         let mut ops = vec![
             {
@@ -5875,7 +5852,7 @@ mod tests {
         ];
         assign_positions(&mut ops);
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptHeap::new()));
+        opt.add_pass(Box::new(crate::optimizeopt::pure::OptPure::new()));
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),

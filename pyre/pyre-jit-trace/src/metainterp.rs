@@ -546,9 +546,6 @@ impl PyreMetaInterp {
 
         if let Instruction::Call { argc } = instruction {
             let nargs = argc.get(op_arg) as usize;
-            if pyre_interpreter::call::replay_pending_inline_call(cf, nargs) {
-                return;
-            }
             let _ = super::state::execute_inline_residual_call(cf, nargs);
             return;
         }
