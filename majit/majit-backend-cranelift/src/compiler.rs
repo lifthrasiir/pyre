@@ -4084,6 +4084,46 @@ fn unsupported_semantics(opcode: OpCode, detail: &str) -> BackendError {
     ))
 }
 
+/// Scan `ops[op_idx + 1..]` for the paired `GuardNotForced(_2)` of a
+/// `CallMayForce*` / `CallReleaseGil*`. RPython
+/// (`assembler.py:2234-2244 _genop_call_may_force` /
+/// `_genop_call_release_gil`) takes that guard via
+/// `_find_nearby_operation(+1)` because RPython traces always have the
+/// guard immediately after the call. Pyre's optimizer is allowed to slot
+/// non-guard ops (`NewWithVtable`, `SetfieldGc` from virtual-forcing) in
+/// between, so the strict +1 check rejected list-method-heavy traces
+/// (e.g. `lst.append(i)` loops) even though the codegen below tolerates
+/// the gap: `guard_idx` only advances on guards, so as long as no *other*
+/// guard precedes the paired `GuardNotForced`, `guard_infos[guard_idx]`
+/// already points at it.
+fn check_paired_guard_not_forced(
+    ops: &[Op],
+    op_idx: usize,
+    opcode: OpCode,
+    label: &str,
+) -> Result<(), BackendError> {
+    for next in &ops[op_idx + 1..] {
+        match next.opcode {
+            OpCode::GuardNotForced | OpCode::GuardNotForced2 => return Ok(()),
+            other if other.is_guard() => {
+                return Err(unsupported_semantics(
+                    opcode,
+                    &format!(
+                        "{label}: intervening guard {other:?} between call and \
+                         paired guard_not_forced(_2) — guard_infos[guard_idx] \
+                         would mismatch"
+                    ),
+                ));
+            }
+            _ => continue,
+        }
+    }
+    Err(unsupported_semantics(
+        opcode,
+        &format!("{label}: no paired guard_not_forced(_2) found in remaining trace"),
+    ))
+}
+
 fn missing_gc_runtime(opcode: OpCode) -> BackendError {
     BackendError::Unsupported(format!(
         "opcode {:?} requires a configured GC runtime in the Cranelift backend",
@@ -9631,18 +9671,9 @@ impl CraneliftBackend {
                     // x86/assembler.py:2234-2235 _genop_call_may_force:
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc)
-                    // _find_nearby_operation(+1) = operations[position + 1]
-                    // _store_force_index asserts GUARD_NOT_FORCED or GUARD_NOT_FORCED_2
-                    let next_op = ops.get(op_idx + 1);
-                    let is_paired_guard = next_op.is_some_and(|o| {
-                        o.opcode == OpCode::GuardNotForced || o.opcode == OpCode::GuardNotForced2
-                    });
-                    if !is_paired_guard {
-                        return Err(unsupported_semantics(
-                            op.opcode,
-                            "call_may_force: ops[position+1] must be guard_not_forced(_2)",
-                        ));
-                    }
+                    // RPython traces always have GuardNotForced at +1; pyre's
+                    // optimizer is allowed to slot virtual-forcing ops in between.
+                    check_paired_guard_not_forced(ops, op_idx, op.opcode, "call_may_force")?;
                     let info = &guard_infos[guard_idx];
                     // x86/assembler.py _store_force_index parity:
                     // Store the GUARD_NOT_FORCED fail descriptor pointer
@@ -9715,17 +9746,7 @@ impl CraneliftBackend {
                     // x86/assembler.py:2242-2244 _genop_call_release_gil:
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc, is_call_release_gil=True)
-                    // _store_force_index asserts GUARD_NOT_FORCED or GUARD_NOT_FORCED_2.
-                    let next_op = ops.get(op_idx + 1);
-                    let is_paired_guard = next_op.is_some_and(|o| {
-                        o.opcode == OpCode::GuardNotForced || o.opcode == OpCode::GuardNotForced2
-                    });
-                    if !is_paired_guard {
-                        return Err(unsupported_semantics(
-                            op.opcode,
-                            "call_release_gil: ops[position+1] must be guard_not_forced(_2)",
-                        ));
-                    }
+                    check_paired_guard_not_forced(ops, op_idx, op.opcode, "call_release_gil")?;
                     let info = &guard_infos[guard_idx];
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                     let cur_jf = builder.use_var(jf_ptr_var);
