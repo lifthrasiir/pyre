@@ -10,6 +10,7 @@ use majit_ir::{OpRef, Type};
 use crate::constant_pool::ConstantPool;
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
 use crate::opencoder::{Box as OpBox, TraceRecordBuffer};
+use crate::recorder::SnapshotTagged;
 
 /// Map an int register (OpRef, concrete value) to an `OpBox`.
 /// Constant OpRefs materialize as `ConstInt(value)`; real trace slots
@@ -88,6 +89,15 @@ pub struct MIFrame {
     /// because a fresh frame's "previous opimpl" is the implicit
     /// frame setup (returns void).
     pub _result_argcode: u8,
+    /// Rust bytecode adaptation for `pyjitpl.py:186 ord(self.bytecode[self.pc - 1])`.
+    ///
+    /// RPython encodes the result register as the last byte before the
+    /// post-call LIVE marker, so `get_list_of_active_boxes(in_a_call=True)`
+    /// can recover it from `self.pc - 1`.  pyre's grouped inline-call
+    /// encoding stores three optional return slots (`i/r/f`) as u16 values,
+    /// so the exact result index is carried here while preserving
+    /// `_result_argcode` for the line-by-line clear logic.
+    pub result_arg_index: Option<usize>,
     /// pyjitpl.py `MIFrame.pushed_box` — the box that the previous
     /// `_opimpl_any_push` instruction parked on the frame.  Reset to
     /// `None` by `cleanup_registers` so a recycled frame does not keep
@@ -161,6 +171,7 @@ impl MIFrame {
             return_f: None,
             greenkey: None,
             _result_argcode: b'v',
+            result_arg_index: None,
             pushed_box: None,
             parent_snapshot: -1,
             unroll_iterations: 1,
@@ -187,6 +198,7 @@ impl MIFrame {
             frame.copy_constants(ctx);
         }
         frame._result_argcode = b'v';
+        frame.result_arg_index = None;
         frame.parent_snapshot = -1;
         frame.unroll_iterations = 1;
         frame
@@ -452,7 +464,10 @@ impl MIFrame {
         // snapshot bytes.
         let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
             let argcode = self._result_argcode;
-            let index = self.jitcode.code[self.pc - 1] as usize;
+            let index = self
+                .result_arg_index
+                .take()
+                .unwrap_or_else(|| self.jitcode.code[self.pc - 1] as usize);
             // pyjitpl.py:193 `self._result_argcode = '?'` — mark cleared.
             self._result_argcode = b'?';
             if let Some(pool) = pool {
@@ -605,6 +620,156 @@ impl MIFrame {
         }
 
         storage
+    }
+
+    /// Side-table snapshot counterpart of
+    /// [`Self::get_list_of_active_boxes`].
+    ///
+    /// This follows the same pyjitpl.py:177-234 control flow but returns
+    /// `recorder::SnapshotTagged` entries for the legacy `TraceCtx`
+    /// snapshot side table instead of writing opencoder byte arrays.
+    pub fn get_list_of_active_snapshot_boxes(
+        &mut self,
+        in_a_call: bool,
+        pool: Option<&mut ConstantPool>,
+        op_live: u8,
+        all_liveness: &[u8],
+        after_residual_call: bool,
+    ) -> Vec<SnapshotTagged> {
+        const SIZE_LIVE_OP: usize = majit_translate::liveness::OFFSET_SIZE + 1;
+        use majit_translate::liveness::{LivenessIterator, decode_offset};
+
+        let (clear_int_idx, clear_ref_idx, clear_float_idx) = if in_a_call {
+            let argcode = self._result_argcode;
+            let index = self
+                .result_arg_index
+                .take()
+                .unwrap_or_else(|| self.jitcode.code[self.pc - 1] as usize);
+            self._result_argcode = b'?';
+            if let Some(pool) = pool {
+                match argcode {
+                    b'i' => {
+                        let opref = pool.get_or_insert(0);
+                        self.int_regs[index] = Some(opref);
+                        self.int_values[index] = Some(0);
+                    }
+                    b'r' => {
+                        let opref = pool.get_or_insert_typed(0, Type::Ref);
+                        self.ref_regs[index] = Some(opref);
+                        self.ref_values[index] = Some(0);
+                    }
+                    b'f' => {
+                        let opref = pool.get_or_insert_typed(0, Type::Float);
+                        self.float_regs[index] = Some(opref);
+                        self.float_values[index] = Some(0);
+                    }
+                    _ => {}
+                }
+                (None, None, None)
+            } else {
+                match argcode {
+                    b'i' => (Some(index), None, None),
+                    b'r' => (None, Some(index), None),
+                    b'f' => (None, None, Some(index)),
+                    _ => (None, None, None),
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+
+        let pc = if in_a_call || after_residual_call {
+            self.pc
+        } else {
+            self.pc - SIZE_LIVE_OP
+        };
+        debug_assert_eq!(self.jitcode.code[pc], op_live);
+
+        let mut offset = decode_offset(&self.jitcode.code, pc + 1);
+        let length_i = all_liveness[offset] as u32;
+        let length_r = all_liveness[offset + 1] as u32;
+        let length_f = all_liveness[offset + 2] as u32;
+        offset += 3;
+
+        let total = (length_i + length_r + length_f) as usize;
+        let mut boxes = Vec::with_capacity(total);
+
+        let num_regs_i = self.jitcode.c_num_regs_i as usize;
+        let num_regs_r = self.jitcode.c_num_regs_r as usize;
+        let num_regs_f = self.jitcode.c_num_regs_f as usize;
+
+        if length_i > 0 {
+            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            while let Some(index) = it.next() {
+                let idx = index as usize;
+                let tagged = if Some(idx) == clear_int_idx {
+                    SnapshotTagged::Const(0, Type::Int)
+                } else if idx < num_regs_i {
+                    let opref = self.int_regs[idx]
+                        .expect("get_list_of_active_snapshot_boxes: int register uninitialized");
+                    let value = self.int_values[idx]
+                        .expect("get_list_of_active_snapshot_boxes: int value uninitialized");
+                    if opref.is_constant() {
+                        SnapshotTagged::Const(value, Type::Int)
+                    } else {
+                        SnapshotTagged::Box(opref.0, Type::Int)
+                    }
+                } else {
+                    SnapshotTagged::Const(self.jitcode.constants_i[idx - num_regs_i], Type::Int)
+                };
+                boxes.push(tagged);
+            }
+            offset = it.offset;
+        }
+
+        if length_r > 0 {
+            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            while let Some(index) = it.next() {
+                let idx = index as usize;
+                let tagged = if Some(idx) == clear_ref_idx {
+                    SnapshotTagged::Const(0, Type::Ref)
+                } else if idx < num_regs_r {
+                    let opref = self.ref_regs[idx]
+                        .expect("get_list_of_active_snapshot_boxes: ref register uninitialized");
+                    let value = self.ref_values[idx]
+                        .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
+                    if opref.is_constant() {
+                        SnapshotTagged::Const(value, Type::Ref)
+                    } else {
+                        SnapshotTagged::Box(opref.0, Type::Ref)
+                    }
+                } else {
+                    SnapshotTagged::Const(self.jitcode.constants_r[idx - num_regs_r], Type::Ref)
+                };
+                boxes.push(tagged);
+            }
+            offset = it.offset;
+        }
+
+        if length_f > 0 {
+            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            while let Some(index) = it.next() {
+                let idx = index as usize;
+                let tagged = if Some(idx) == clear_float_idx {
+                    SnapshotTagged::Const(0, Type::Float)
+                } else if idx < num_regs_f {
+                    let opref = self.float_regs[idx]
+                        .expect("get_list_of_active_snapshot_boxes: float register uninitialized");
+                    let value = self.float_values[idx]
+                        .expect("get_list_of_active_snapshot_boxes: float value uninitialized");
+                    if opref.is_constant() {
+                        SnapshotTagged::Const(value, Type::Float)
+                    } else {
+                        SnapshotTagged::Box(opref.0, Type::Float)
+                    }
+                } else {
+                    SnapshotTagged::Const(self.jitcode.constants_f[idx - num_regs_f], Type::Float)
+                };
+                boxes.push(tagged);
+            }
+        }
+
+        boxes
     }
 
     /// pyjitpl.py:236-255 `MIFrame.replace_active_box_in_frame(oldbox, newbox)`.

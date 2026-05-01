@@ -668,6 +668,31 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             /// `Arc::get_mut` invariant on `MetaInterp::staticdata`
             /// (`pyjitpl/mod.rs::install_canonical_liveness`) panics
             /// once any tracing setup has cloned the Arc.
+            ///
+            /// KNOWN GAP vs RPython `assembler.py:146-158 write_insn`:
+            /// RPython emits a per-guard `-live-` marker whose
+            /// `(live_i, live_r, live_f)` is computed from the next
+            /// instruction's `Register` operands (`get_liveness_info`),
+            /// dedupes the entry into `all_liveness_positions`, and
+            /// patches each BC_LIVE marker's 2-byte offset to point at
+            /// that specific entry (`encode_offset`).  pyre's macro-
+            /// emitted JitCodes call `JitCodeBuilder::live_placeholder`
+            /// which writes BC_LIVE + zero offset, so every guard's
+            /// blackhole resume reads back this single canonical
+            /// entry — an over-approximation that claims all SYM
+            /// scalars / arrays / virt_arrays are live regardless of
+            /// the per-pc liveness actually demanded by the next op.
+            /// For aheui (today's sole `#[jit_interp]` user) the per-
+            /// opcode JitCode body touches every SYM slot, so the
+            /// canonical answer is also precise; the gap is purely
+            /// structural for future polymorphic state-field JIT
+            /// consumers.  Closing it requires the lowerer to track
+            /// per-pc live slot sets during JitCode emission and
+            /// register one liveness entry per distinct set, then
+            /// patch each `live_placeholder` via
+            /// `JitCodeBuilder::patch_live_offset` to point at the
+            /// matching entry — orthogonal to this canonical-bridge
+            /// shim.
             #[allow(dead_code)]
             fn install_canonical_liveness(
                 &self,

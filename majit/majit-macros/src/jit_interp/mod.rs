@@ -58,7 +58,7 @@ pub struct JitInterpConfig {
     pub io_shims: Vec<(Path, Ident)>,
     /// Interpreter function call policies for helper calls.
     /// Populated from both `calls = { ... }` and `helpers = [...]`.
-    pub calls: Vec<(Path, Option<CallPolicyKind>)>,
+    pub calls: Vec<CallEntry>,
     /// Whether direct helper calls should be auto-inferred from sidecar metadata.
     pub auto_calls: bool,
     /// Optional structured green-key expressions for marker rewrite.
@@ -210,6 +210,13 @@ pub enum StateFieldKind {
     Opaque(syn::Path),
 }
 
+/// One entry in the `calls = { ... }` / `helpers = [ ... ]` map.
+#[derive(Clone)]
+pub struct CallEntry {
+    pub path: Path,
+    pub policy: Option<CallPolicyKind>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
@@ -291,7 +298,7 @@ impl Parse for JitInterpConfig {
         let mut state_type = None;
         let mut env_type = None;
         let mut io_shims = None;
-        let mut calls: Vec<(Path, Option<CallPolicyKind>)> = Vec::new();
+        let mut calls: Vec<CallEntry> = Vec::new();
         let mut auto_calls = None;
         let mut greens = None;
         let mut virtualizable_decl = None;
@@ -625,13 +632,17 @@ fn parse_io_shim_map(input: ParseStream) -> syn::Result<Vec<(Path, Ident)>> {
 }
 
 /// Parse `{ path::func, path::func => residual_int, ... }`.
-fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<CallPolicyKind>)>> {
+///
+/// Per-entry forms:
+///   - `path::func`                (default policy)
+///   - `path::func => policy_kind` (explicit policy)
+fn parse_call_map(input: ParseStream) -> syn::Result<Vec<CallEntry>> {
     let content;
     braced!(content in input);
     let mut map = Vec::new();
     while !content.is_empty() {
         let func: Path = content.parse()?;
-        let kind = if content.peek(Token![=>]) {
+        let policy = if content.peek(Token![=>]) {
             content.parse::<Token![=>]>()?;
             let kind: Ident = content.parse()?;
             Some(parse_call_policy_kind(&kind).ok_or_else(|| {
@@ -643,18 +654,24 @@ fn parse_call_map(input: ParseStream) -> syn::Result<Vec<(Path, Option<CallPolic
         } else {
             None
         };
-        map.push((func, kind));
+        map.push(CallEntry { path: func, policy });
         let _ = content.parse::<Token![,]>();
     }
     Ok(map)
 }
 
 /// Parse `[func_a, func_b, func_c]` — shorthand helper list with auto-inferred policies.
-fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<(Path, Option<CallPolicyKind>)>> {
+fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<CallEntry>> {
     let content;
     bracketed!(content in input);
     let paths: Punctuated<Path, Token![,]> = content.parse_terminated(Path::parse, Token![,])?;
-    Ok(paths.into_iter().map(|p| (p, None)).collect())
+    Ok(paths
+        .into_iter()
+        .map(|p| CallEntry {
+            path: p,
+            policy: None,
+        })
+        .collect())
 }
 
 /// Main entry point: transform the function with JIT support.
@@ -742,7 +759,7 @@ fn rewrite_body(
     block: &syn::Block,
     merge_fn_name: &Ident,
     default_greens: &[Expr],
-    call_policies: &[(Path, Option<CallPolicyKind>)],
+    call_policies: &[CallEntry],
     io_shims: &[(Path, Ident)],
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
@@ -844,6 +861,8 @@ fn rewrite_body(
     enum ObserverReplayKind {
         Void,
         Int,
+        Ref,
+        Float,
     }
 
     #[derive(Clone)]
@@ -878,44 +897,69 @@ fn rewrite_body(
 
     fn replay_kind_for_policy(kind: CallPolicyKind) -> Option<ObserverReplayKind> {
         // Mirror the metainterp's recording sites in
-        // `pyjitpl/dispatch.rs::run_one_step` for *plain* residual
-        // policies. The outer Rust call site uses the helper symbol
-        // (`#func as *const ()`) as its replay key, which matches the
-        // jitcode's `concrete_ptr` only when the codewriter installed
-        // the helper symbol directly into the fn-ptr table — i.e. for
-        // plain (non-`_wrapped`) policies.
+        // `pyjitpl/dispatch.rs::run_one_step`.  Plain (non-wrapped)
+        // policies use the helper symbol directly; wrapped policies
+        // route through `helper_policy_path` to recover the
+        // `__concrete_target` wrapper symbol the metainterp records,
+        // wired by `observer_replay_for_call` below.
         //
-        // KNOWN GAP: `_wrapped` variants install a generated wrapper
-        // (`__concrete_target` from the policy's
-        // `(__policy, _, __trace_target, __concrete_target)` tuple at
-        // `jitcode_lower.rs ~2409`). The metainterp records the
-        // wrapper pointer onto OBSERVED_CALLS, but the outer side has
-        // no portable way to recover that wrapper's address from the
-        // helper symbol alone. Wrapping the outer call here would
-        // produce a func-pointer mismatch in `consume_observed_*_call`
-        // (panic) or leave a dangling queue entry that breaks the next
-        // plain helper's replay. Until the wrapper-key plumbing lands
-        // we leave wrapped variants un-wrapped on the outer side; the
-        // metainterp continues to record onto the queue, but the queue
-        // entry is consumed harmlessly only when a subsequent plain
-        // helper with matching (func, args) lands first. No current
-        // `#[jit_interp]` user (aheui-jit) exercises a wrapped policy.
-        //
-        // Elidable: not recorded (CALL_PURE_INT is exempt in dispatch),
+        // Elidable: not recorded by dispatch (CALL_PURE_* is exempt),
         // pure re-execution is harmless. Inline: pushes a metainterp
-        // frame, never reaches call_*_function. Float wrapped: no
-        // float observer-record site in dispatch.rs today.
+        // frame, never reaches call_*_function.
         match kind {
             CallPolicyKind::ResidualVoid
             | CallPolicyKind::MayForceVoid
             | CallPolicyKind::ReleaseGilVoid
-            | CallPolicyKind::LoopInvariantVoid => Some(ObserverReplayKind::Void),
+            | CallPolicyKind::LoopInvariantVoid
+            | CallPolicyKind::ResidualVoidWrapped
+            | CallPolicyKind::MayForceVoidWrapped
+            | CallPolicyKind::ReleaseGilVoidWrapped
+            | CallPolicyKind::LoopInvariantVoidWrapped => Some(ObserverReplayKind::Void),
             CallPolicyKind::ResidualInt
             | CallPolicyKind::MayForceInt
             | CallPolicyKind::ReleaseGilInt
-            | CallPolicyKind::LoopInvariantInt => Some(ObserverReplayKind::Int),
+            | CallPolicyKind::LoopInvariantInt
+            | CallPolicyKind::ResidualIntWrapped
+            | CallPolicyKind::MayForceIntWrapped
+            | CallPolicyKind::ReleaseGilIntWrapped
+            | CallPolicyKind::LoopInvariantIntWrapped => Some(ObserverReplayKind::Int),
+            CallPolicyKind::ResidualRefWrapped
+            | CallPolicyKind::MayForceRefWrapped
+            | CallPolicyKind::LoopInvariantRefWrapped => Some(ObserverReplayKind::Ref),
+            CallPolicyKind::ResidualFloatWrapped
+            | CallPolicyKind::MayForceFloatWrapped
+            | CallPolicyKind::ReleaseGilFloatWrapped
+            | CallPolicyKind::LoopInvariantFloatWrapped => Some(ObserverReplayKind::Float),
             _ => None,
         }
+    }
+
+    /// Wrapped policy variants install a generated wrapper at codewriter
+    /// time (`__concrete_target` from `(__policy, _, __trace_target,
+    /// __concrete_target)` tuple).  The metainterp records the wrapper
+    /// pointer on OBSERVED_CALLS, so the outer-side consume must use the
+    /// same wrapper symbol — recovered at runtime by calling the helper's
+    /// `__majit_call_policy_<name>()` accessor.  Plain policies pass
+    /// through `#func as *const ()` directly.
+    fn is_wrapped_policy(kind: CallPolicyKind) -> bool {
+        matches!(
+            kind,
+            CallPolicyKind::ResidualVoidWrapped
+                | CallPolicyKind::MayForceVoidWrapped
+                | CallPolicyKind::ReleaseGilVoidWrapped
+                | CallPolicyKind::LoopInvariantVoidWrapped
+                | CallPolicyKind::ResidualIntWrapped
+                | CallPolicyKind::MayForceIntWrapped
+                | CallPolicyKind::ReleaseGilIntWrapped
+                | CallPolicyKind::LoopInvariantIntWrapped
+                | CallPolicyKind::ResidualRefWrapped
+                | CallPolicyKind::MayForceRefWrapped
+                | CallPolicyKind::LoopInvariantRefWrapped
+                | CallPolicyKind::ResidualFloatWrapped
+                | CallPolicyKind::MayForceFloatWrapped
+                | CallPolicyKind::ReleaseGilFloatWrapped
+                | CallPolicyKind::LoopInvariantFloatWrapped
+        )
     }
 
     fn observer_replay_for_call(
@@ -937,8 +981,38 @@ fn rewrite_body(
         }
         for (path, policy) in call_policies {
             if *path == segments {
-                let kind = replay_kind_for_policy((*policy)?)?;
-                let observed_func = quote! { #func as *const () };
+                let policy_kind = *policy.as_ref()?;
+                let kind = replay_kind_for_policy(policy_kind)?;
+                let observed_func = if is_wrapped_policy(policy_kind) {
+                    // Wrapped policy: outer-side replay key must match the
+                    // wrapper symbol (`__concrete_target`) the metainterp
+                    // recorded — recover it via the helper's policy
+                    // accessor at runtime.
+                    let policy_path = jitcode_lower::helper_policy_path(func)?;
+                    quote! {
+                        {
+                            let (_, _, __majit_observer_trace, __majit_observer_concrete) = #policy_path();
+                            if __majit_observer_trace.is_null()
+                                && __majit_observer_concrete.is_null()
+                            {
+                                panic!("wrapped helper policy requires generated call-target wrappers");
+                            }
+                            let __majit_observer_trace = if __majit_observer_trace.is_null() {
+                                __majit_observer_concrete
+                            } else {
+                                __majit_observer_trace
+                            };
+                            let __majit_observer_concrete = if __majit_observer_concrete.is_null() {
+                                __majit_observer_trace
+                            } else {
+                                __majit_observer_concrete
+                            };
+                            __majit_observer_concrete
+                        }
+                    }
+                } else {
+                    quote! { #func as *const () }
+                };
                 return Some(ObserverReplay {
                     kind,
                     observed_func,
@@ -992,6 +1066,32 @@ fn rewrite_body(
                 #(#arg_binds)*
                 let __majit_observer_args = [#(#observed_args),*];
                 match majit_metainterp::consume_observed_int_call(
+                    #observed_func,
+                    &__majit_observer_args,
+                ) {
+                    Some(__majit_observer_result) => unsafe {
+                        majit_metainterp::observer_i64_to_value(__majit_observer_result)
+                    },
+                    None => #func(#(#arg_names),*),
+                }
+            }},
+            ObserverReplayKind::Ref => quote! {{
+                #(#arg_binds)*
+                let __majit_observer_args = [#(#observed_args),*];
+                match majit_metainterp::consume_observed_ref_call(
+                    #observed_func,
+                    &__majit_observer_args,
+                ) {
+                    Some(__majit_observer_result) => unsafe {
+                        majit_metainterp::observer_i64_to_value(__majit_observer_result)
+                    },
+                    None => #func(#(#arg_names),*),
+                }
+            }},
+            ObserverReplayKind::Float => quote! {{
+                #(#arg_binds)*
+                let __majit_observer_args = [#(#observed_args),*];
+                match majit_metainterp::consume_observed_float_call(
                     #observed_func,
                     &__majit_observer_args,
                 ) {
@@ -1146,7 +1246,7 @@ fn rewrite_body(
         default_greens: default_greens.to_vec(),
         call_policies: call_policies
             .iter()
-            .map(|(path, policy)| (path_segments(path), *policy))
+            .map(|entry| (path_segments(&entry.path), entry.policy))
             .collect(),
         io_shims: io_shims
             .iter()
@@ -1169,20 +1269,19 @@ mod tests {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             [helper_add, helper_sub, helper_mul]
         };
-        let result: Vec<(Path, Option<CallPolicyKind>)> =
-            syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
+        let result: Vec<CallEntry> = syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
         assert_eq!(result.len(), 3);
         assert_eq!(
-            result[0].0.segments.last().unwrap().ident.to_string(),
+            result[0].path.segments.last().unwrap().ident.to_string(),
             "helper_add"
         );
-        assert!(result[0].1.is_none());
+        assert!(result[0].policy.is_none());
         assert_eq!(
-            result[1].0.segments.last().unwrap().ident.to_string(),
+            result[1].path.segments.last().unwrap().ident.to_string(),
             "helper_sub"
         );
         assert_eq!(
-            result[2].0.segments.last().unwrap().ident.to_string(),
+            result[2].path.segments.last().unwrap().ident.to_string(),
             "helper_mul"
         );
     }
@@ -1190,8 +1289,7 @@ mod tests {
     #[test]
     fn parse_helpers_list_empty() {
         let tokens: proc_macro2::TokenStream = parse_quote! { [] };
-        let result: Vec<(Path, Option<CallPolicyKind>)> =
-            syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
+        let result: Vec<CallEntry> = syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
         assert!(result.is_empty());
     }
 
@@ -1200,21 +1298,73 @@ mod tests {
         let tokens: proc_macro2::TokenStream = parse_quote! {
             [module::helper_a, helper_b]
         };
-        let result: Vec<(Path, Option<CallPolicyKind>)> =
-            syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
+        let result: Vec<CallEntry> = syn::parse2::<HelpersListWrapper>(tokens).unwrap().0;
         assert_eq!(result.len(), 2);
         // First has two path segments
-        assert_eq!(result[0].0.segments.len(), 2);
-        assert_eq!(result[0].0.segments[0].ident.to_string(), "module");
-        assert_eq!(result[0].0.segments[1].ident.to_string(), "helper_a");
+        assert_eq!(result[0].path.segments.len(), 2);
+        assert_eq!(result[0].path.segments[0].ident.to_string(), "module");
+        assert_eq!(result[0].path.segments[1].ident.to_string(), "helper_a");
     }
 
     /// Wrapper to make `parse_helpers_list` testable via `syn::parse2`.
-    struct HelpersListWrapper(Vec<(Path, Option<CallPolicyKind>)>);
+    struct HelpersListWrapper(Vec<CallEntry>);
     impl Parse for HelpersListWrapper {
         fn parse(input: ParseStream) -> syn::Result<Self> {
             Ok(Self(parse_helpers_list(input)?))
         }
+    }
+
+    /// Wrapper to make `parse_call_map` testable via `syn::parse2`.
+    struct CallMapWrapper(Vec<CallEntry>);
+    impl std::fmt::Debug for CallMapWrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_list()
+                .entries(self.0.iter().map(|e| {
+                    e.path
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default()
+                }))
+                .finish()
+        }
+    }
+    impl Parse for CallMapWrapper {
+        fn parse(input: ParseStream) -> syn::Result<Self> {
+            Ok(Self(parse_call_map(input)?))
+        }
+    }
+
+    #[test]
+    fn parse_call_map_basic() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            { foo, bar => may_force_int }
+        };
+        let result: Vec<CallEntry> = syn::parse2::<CallMapWrapper>(tokens).unwrap().0;
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].path.segments.last().unwrap().ident.to_string(),
+            "foo"
+        );
+        assert!(result[0].policy.is_none());
+        assert_eq!(
+            result[1].path.segments.last().unwrap().ident.to_string(),
+            "bar"
+        );
+        assert_eq!(result[1].policy, Some(CallPolicyKind::MayForceInt));
+    }
+
+    #[test]
+    fn parse_call_map_rejects_slot_effect_blocks() {
+        let tokens: proc_macro2::TokenStream = parse_quote! {
+            { pop_only { reads: [stackpos] } }
+        };
+        let err = syn::parse2::<CallMapWrapper>(tokens).unwrap_err();
+        assert!(
+            err.to_string().contains("expected identifier")
+                || err.to_string().contains("expected `,`"),
+            "expected call-map parser to reject slot-effect block, got: {err}",
+        );
     }
 
     struct VirtualizableWrapper(VirtualizableDecl);

@@ -79,8 +79,9 @@ pub use pyjitpl::{
     DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
     MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
-    consume_observed_int_call, consume_observed_void_call, counters, observer_arg_to_i64,
-    observer_i64_to_value, trace_jitcode, trace_jitcode_observer,
+    consume_observed_float_call, consume_observed_int_call, consume_observed_ref_call,
+    consume_observed_void_call, counters, observer_arg_to_i64, observer_i64_to_value,
+    trace_jitcode, trace_jitcode_observer,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::{MergePoint, TraceCtx};

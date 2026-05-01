@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -120,7 +120,7 @@ impl ValueKind {
 impl LowererConfig {
     pub fn new(
         io_shims: &[(Path, Ident)],
-        calls: &[(Path, Option<crate::jit_interp::CallPolicyKind>)],
+        calls: &[crate::jit_interp::CallEntry],
         auto_calls: bool,
         vable_decl: Option<&crate::jit_interp::VirtualizableDecl>,
         state_fields_cfg: Option<&crate::jit_interp::StateFieldsConfig>,
@@ -131,12 +131,12 @@ impl LowererConfig {
             .collect();
         let calls = calls
             .iter()
-            .map(|(p, k)| {
-                let spec = match k {
-                    Some(kind) => CallPolicySpec::Explicit(*kind),
+            .map(|entry| {
+                let spec = match entry.policy {
+                    Some(kind) => CallPolicySpec::Explicit(kind),
                     None => CallPolicySpec::Infer,
                 };
-                (canonical_path_segments(p), spec)
+                (canonical_path_segments(&entry.path), spec)
             })
             .collect();
         let (vable_var, vable_fields, vable_arrays) = if let Some(decl) = vable_decl {
@@ -278,9 +278,317 @@ struct Binding {
     depends_on_stack: bool,
 }
 
+// ── Op metadata for backward liveness analysis (Phase 4 Epic B) ─────
+//
+// `op_metadata[i]` describes the i-th emitted op so a downstream backward
+// walker (Slice B.2.B) can produce per-marker live sets matching RPython
+// `liveness.py:33-79 _compute_liveness_must_continue`. Currently only the
+// `LiveMarker` sites are populated — remaining emit sites are migrated in
+// Slice B.2.A.ii.
+//
+// `kind` and `control` are split because future op categories (binop,
+// load_const, jump, ...) carry the same `Linear`/`UnconditionalJump`/etc
+// shape as several others; control flow is the orthogonal axis the walker
+// branches on.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpKind {
+    /// `BC_LIVE` marker emitted before a guard. RPython `flatten.py:259`
+    /// `-live-`. Carries no def/use; the walker records the alive set at
+    /// this point.
+    LiveMarker,
+    LoadConstI,
+    LoadConstR,
+    LoadConstF,
+    MoveI,
+    MoveR,
+    MoveF,
+    BinopI,
+    UnaryI,
+    /// Unconditional `jump` to a target label.
+    Jump,
+    /// `goto_if_not_*` — conditional branch with fail exit on miss.
+    GotoIfNot,
+    /// `mark_label` — defines a label.
+    MarkLabel,
+    /// Any `call_*_typed` / `call_*_args` / `residual_call_*` /
+    /// `conditional_call_*` family op. `reads` carries arg regs;
+    /// `writes` carries the result reg if the call is value-form.
+    Call,
+    /// `inline_call_*` family — sub-jitcode invocation.
+    InlineCall,
+    /// `vable_*` family (getfield/setfield/getarrayitem/setarrayitem/
+    /// arraylen/force).
+    Vable,
+    /// `load_state_*` / `store_state_*` family.
+    StateField,
+    /// `int_guard_value` / `float_guard_value` / `ref_guard_value`.
+    GuardValue,
+    /// `record_known_result_*` — pure-call result hint, no real call.
+    RecordKnownResult,
+    /// Builder-side auxiliary statement that emits no BC_* op. Examples:
+    /// `let #label = __builder.new_label();` (label allocation), Rust
+    /// `let` bindings injected into the generated trace body for
+    /// register-side use, sub-jitcode-add helpers. Carries no def/use;
+    /// the backward walker treats it as a no-op pass-through.
+    Aux,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlFlowClass {
+    /// Falls through to the next op.
+    Linear,
+    /// `-live-` marker. Behaves Linear but is the recording point for
+    /// backward liveness analysis.
+    LiveMarker,
+    /// `goto_if_not_*` — emits a fail exit and falls through on no-fail.
+    /// Walker treats this both as Linear (fall-through into next op) and
+    /// as a branch into the named label (joins at label backward propagation).
+    ConditionalGuard,
+    /// `jump` — unconditional branch. Walker resets `alive` from the
+    /// label's accumulated set instead of the prior fall-through.
+    UnconditionalJump,
+    /// `mark_label` — defines a label. Walker records the current `alive`
+    /// against the label name so forward jumps backward-feed from here.
+    LabelDef,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct OpMeta {
+    kind: OpKind,
+    /// Source registers (uses).
+    reads: Vec<u16>,
+    /// Destination registers (defs).
+    writes: Vec<u16>,
+    /// Branch target label, for control-flow ops.
+    target_label: Option<Ident>,
+    control: ControlFlowClass,
+}
+
+#[allow(dead_code)]
+impl OpMeta {
+    fn live_marker() -> Self {
+        Self {
+            kind: OpKind::LiveMarker,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            target_label: None,
+            control: ControlFlowClass::LiveMarker,
+        }
+    }
+
+    /// Linear op with explicit reads/writes. The most common shape —
+    /// load_const, move, binop, unary, call, vable, state-field,
+    /// guard_value, record_known_result, inline_call.
+    fn linear(kind: OpKind, reads: Vec<u16>, writes: Vec<u16>) -> Self {
+        Self {
+            kind,
+            reads,
+            writes,
+            target_label: None,
+            control: ControlFlowClass::Linear,
+        }
+    }
+
+    /// Unconditional jump to `target`.
+    fn jump(target: Ident) -> Self {
+        Self {
+            kind: OpKind::Jump,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            target_label: Some(target),
+            control: ControlFlowClass::UnconditionalJump,
+        }
+    }
+
+    /// Conditional guard branching to `target` on miss. `cond_reg` is
+    /// the read register feeding the guard.
+    fn conditional_guard(cond_reg: u16, target: Ident) -> Self {
+        Self {
+            kind: OpKind::GotoIfNot,
+            reads: vec![cond_reg],
+            writes: Vec::new(),
+            target_label: Some(target),
+            control: ControlFlowClass::ConditionalGuard,
+        }
+    }
+
+    /// Label definition site. Walker uses `target` to associate the
+    /// current `alive` set with the label name.
+    fn label_def(target: Ident) -> Self {
+        Self {
+            kind: OpKind::MarkLabel,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            target_label: Some(target),
+            control: ControlFlowClass::LabelDef,
+        }
+    }
+
+    /// Builder-side aux op (label allocation, Rust `let` bindings,
+    /// sub-jitcode add). Linear, no def/use.
+    fn aux() -> Self {
+        Self {
+            kind: OpKind::Aux,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            target_label: None,
+            control: ControlFlowClass::Linear,
+        }
+    }
+}
+
+/// Per-marker live set produced by `compute_per_marker_liveness`.
+/// Index aligns with the order in which `LiveMarker` ops appear in
+/// `op_metadata`.
+#[allow(dead_code)]
+type LiveMarkerLiveSets = Vec<BTreeSet<u16>>;
+
+/// Compute the live register set captured at every `LiveMarker` op in
+/// `op_metadata`, mirroring RPython
+/// `rpython/jit/codewriter/liveness.py:33-79
+/// _compute_liveness_must_continue`.
+///
+/// The walk is backward (def `discard`, use `add`); branch ops fold in
+/// the destination label's accumulated alive set; label definitions
+/// store the current alive set for forward jumps to consume on the
+/// next iteration. Iterations continue until no label or marker entry
+/// changes (fixed-point), matching RPython's `must_continue` loop.
+///
+/// Returned `Vec<BTreeSet<u16>>` is indexed in `LiveMarker` encounter
+/// order, so callers can pair entries with their `live_placeholder()`
+/// emit sites.
+#[allow(dead_code)]
+fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerLiveSets {
+    let marker_indices: Vec<usize> = op_metadata
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.control, ControlFlowClass::LiveMarker))
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut label_alive: HashMap<String, BTreeSet<u16>> = HashMap::new();
+    let mut live_at_marker: HashMap<usize, BTreeSet<u16>> = HashMap::new();
+
+    loop {
+        let mut changed = false;
+        let mut alive: BTreeSet<u16> = BTreeSet::new();
+
+        for i in (0..op_metadata.len()).rev() {
+            let op = &op_metadata[i];
+            match op.control {
+                ControlFlowClass::LiveMarker => {
+                    // RPython liveness.py:48-53 — record `alive` at this
+                    // marker. Marker carries no def/use.
+                    let prev = live_at_marker.get(&i);
+                    if prev.is_none() || prev.unwrap() != &alive {
+                        live_at_marker.insert(i, alive.clone());
+                        changed = true;
+                    }
+                }
+                ControlFlowClass::LabelDef => {
+                    // RPython liveness.py:36-42 — record alive against
+                    // the label name (union with prior iterations).
+                    let name = op
+                        .target_label
+                        .as_ref()
+                        .expect("label_def needs target")
+                        .to_string();
+                    let entry = label_alive.entry(name).or_default();
+                    let before = entry.len();
+                    entry.extend(alive.iter().copied());
+                    if entry.len() != before {
+                        changed = true;
+                    }
+                }
+                ControlFlowClass::UnconditionalJump => {
+                    // RPython follow_label (liveness.py:29-31) — `alive`
+                    // becomes the label's accumulated set (overwrite,
+                    // not union, since fall-through past `jump` is
+                    // unreachable).
+                    let name = op
+                        .target_label
+                        .as_ref()
+                        .expect("jump needs target")
+                        .to_string();
+                    alive = label_alive.get(&name).cloned().unwrap_or_default();
+                }
+                ControlFlowClass::ConditionalGuard => {
+                    // Fold the branch target's alive set into the
+                    // fall-through alive set, then add the cond_reg(s)
+                    // as uses. RPython treats `goto_if_not` as a
+                    // normal op whose TLabel arg triggers
+                    // follow_label (alive update) and whose register
+                    // args (cond) become uses.
+                    if let Some(target) = op.target_label.as_ref() {
+                        let name = target.to_string();
+                        if let Some(s) = label_alive.get(&name) {
+                            alive.extend(s.iter().copied());
+                        }
+                    }
+                    for r in &op.reads {
+                        alive.insert(*r);
+                    }
+                }
+                ControlFlowClass::Linear => {
+                    // RPython liveness.py:60-69 — def first
+                    // (`alive.discard(reg)`) then uses (`alive.add(x)`).
+                    for w in &op.writes {
+                        alive.remove(w);
+                    }
+                    for r in &op.reads {
+                        alive.insert(*r);
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    marker_indices
+        .iter()
+        .map(|i| live_at_marker.remove(i).unwrap_or_default())
+        .collect()
+}
+
+/// Print per-marker live sets to stderr when `MAJIT_DUMP_LIVENESS` is
+/// set in the proc-macro build environment. `label` is the lowerer
+/// scope being dumped (e.g. helper name) so concurrent expansions are
+/// distinguishable.
+fn maybe_dump_liveness(label: &str, op_metadata: &[OpMeta]) {
+    if std::env::var("MAJIT_DUMP_LIVENESS").is_err() {
+        return;
+    }
+    let live_sets = compute_per_marker_liveness(op_metadata);
+    let marker_count = op_metadata
+        .iter()
+        .filter(|m| matches!(m.control, ControlFlowClass::LiveMarker))
+        .count();
+    eprintln!(
+        "=== majit liveness dump [{}] op_metadata={} markers={} ===",
+        label,
+        op_metadata.len(),
+        marker_count
+    );
+    for (idx, set) in live_sets.iter().enumerate() {
+        let regs: Vec<u16> = set.iter().copied().collect();
+        eprintln!("  marker[{}] live={:?}", idx, regs);
+    }
+}
+
 struct Lowerer<'c> {
     bindings: HashMap<String, Binding>,
     statements: Vec<TokenStream>,
+    /// Per-op metadata, parallel to `statements`. Populated as B.2.A.ii
+    /// migrates each emit site through `emit_op`. Read by the backward
+    /// walker (B.2.B). Currently sparse — only `LiveMarker` sites land.
+    #[allow(dead_code)]
+    op_metadata: Vec<OpMeta>,
     next_reg: u16,
     next_label: u16,
     config: Option<&'c LowererConfig>,
@@ -303,6 +611,7 @@ impl<'c> Lowerer<'c> {
         Self {
             bindings: HashMap::new(),
             statements: Vec::new(),
+            op_metadata: Vec::new(),
             next_reg: 0,
             next_label: 0,
             config,
@@ -322,6 +631,40 @@ impl<'c> Lowerer<'c> {
         let label = self.next_label;
         self.next_label = self.next_label.saturating_add(1);
         format_ident!("__jit_label_{label}")
+    }
+
+    /// Emit an op token plus its parallel `OpMeta` entry, keeping
+    /// `statements` and `op_metadata` index-aligned for the backward
+    /// liveness walker (Slice B.2.B).
+    fn emit_op(&mut self, meta: OpMeta, tokens: TokenStream) {
+        self.statements.push(tokens);
+        self.op_metadata.push(meta);
+    }
+
+    fn emit_label_def(&mut self, label: &Ident) {
+        self.emit_op(
+            OpMeta::label_def(label.clone()),
+            quote! { __builder.mark_label(#label); },
+        );
+    }
+
+    fn emit_jump(&mut self, target: &Ident) {
+        self.emit_op(
+            OpMeta::jump(target.clone()),
+            quote! { __builder.jump(#target); },
+        );
+    }
+
+    fn emit_conditional_guard(&mut self, cond_reg: u16, target: &Ident) {
+        self.emit_op(
+            OpMeta::conditional_guard(cond_reg, target.clone()),
+            quote! { __builder.goto_if_not_int_is_true(#cond_reg, #target); },
+        );
+    }
+
+    /// Emit a builder-side aux statement (no BC_* op, no def/use).
+    fn emit_aux(&mut self, tokens: TokenStream) {
+        self.emit_op(OpMeta::aux(), tokens);
     }
 
     fn inference_failure_tokens(&self, message: &str) -> TokenStream {
@@ -394,9 +737,7 @@ impl<'c> Lowerer<'c> {
             // runtime value, but this prevents "cannot find value" errors.
             if binding.depends_on_stack {
                 let ident = &pat_ident.ident;
-                self.statements.push(quote! {
-                    let #ident: i64 = 0;
-                });
+                self.emit_aux(quote! { let #ident: i64 = 0; });
             }
             self.bindings.insert(pat_ident.ident.to_string(), binding);
             return Some(());
@@ -407,10 +748,13 @@ impl<'c> Lowerer<'c> {
             let reg = self.alloc_reg();
             let ident = &pat_ident.ident;
             let init_expr = &init.expr;
-            self.statements.push(quote! {
-                let #ident = #init_expr;
-                __builder.load_const_i_value(#reg, #ident as i64);
-            });
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![reg]),
+                quote! {
+                    let #ident = #init_expr;
+                    __builder.load_const_i_value(#reg, #ident as i64);
+                },
+            );
             self.bindings.insert(
                 ident.to_string(),
                 Binding {
@@ -449,15 +793,18 @@ impl<'c> Lowerer<'c> {
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
         match field_type {
-            ValueKind::Ref => self.statements.push(quote! {
-                __builder.vable_setfield_ref(#fi, #src);
-            }),
-            ValueKind::Float => self.statements.push(quote! {
-                __builder.vable_setfield_float(#fi, #src);
-            }),
-            ValueKind::Int => self.statements.push(quote! {
-                __builder.vable_setfield_int(#fi, #src);
-            }),
+            ValueKind::Ref => self.emit_op(
+                OpMeta::linear(OpKind::Vable, vec![src], vec![]),
+                quote! { __builder.vable_setfield_ref(#fi, #src); },
+            ),
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(OpKind::Vable, vec![src], vec![]),
+                quote! { __builder.vable_setfield_float(#fi, #src); },
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(OpKind::Vable, vec![src], vec![]),
+                quote! { __builder.vable_setfield_int(#fi, #src); },
+            ),
         }
         Some(())
     }
@@ -496,15 +843,18 @@ impl<'c> Lowerer<'c> {
         let val_reg = val_binding.reg;
 
         match item_type {
-            ValueKind::Ref => self.statements.push(quote! {
-                __builder.vable_setarrayitem_ref(#ai, #idx_reg, #val_reg);
-            }),
-            ValueKind::Float => self.statements.push(quote! {
-                __builder.vable_setarrayitem_float(#ai, #idx_reg, #val_reg);
-            }),
-            ValueKind::Int => self.statements.push(quote! {
-                __builder.vable_setarrayitem_int(#ai, #idx_reg, #val_reg);
-            }),
+            ValueKind::Ref => self.emit_op(
+                OpMeta::linear(OpKind::Vable, vec![idx_reg, val_reg], vec![]),
+                quote! { __builder.vable_setarrayitem_ref(#ai, #idx_reg, #val_reg); },
+            ),
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(OpKind::Vable, vec![idx_reg, val_reg], vec![]),
+                quote! { __builder.vable_setarrayitem_float(#ai, #idx_reg, #val_reg); },
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(OpKind::Vable, vec![idx_reg, val_reg], vec![]),
+                quote! { __builder.vable_setarrayitem_int(#ai, #idx_reg, #val_reg); },
+            ),
         }
         Some(())
     }
@@ -529,8 +879,10 @@ impl<'c> Lowerer<'c> {
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
-        self.statements
-            .push(quote! { __builder.store_state_field(#fi, #src); });
+        self.emit_op(
+            OpMeta::linear(OpKind::StateField, vec![src], vec![]),
+            quote! { __builder.store_state_field(#fi, #src); },
+        );
         Some(())
     }
 
@@ -563,14 +915,18 @@ impl<'c> Lowerer<'c> {
         // Check virtualizable arrays first, then flattened arrays.
         if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
             let ai = va_idx as u16;
-            self.statements
-                .push(quote! { __builder.store_state_varray(#ai, #idx_reg, #val_reg); });
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![idx_reg, val_reg], vec![]),
+                quote! { __builder.store_state_varray(#ai, #idx_reg, #val_reg); },
+            );
             return Some(());
         }
         let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
-        self.statements
-            .push(quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); });
+        self.emit_op(
+            OpMeta::linear(OpKind::StateField, vec![idx_reg, val_reg], vec![]),
+            quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); },
+        );
         Some(())
     }
 
@@ -589,9 +945,10 @@ impl<'c> Lowerer<'c> {
         if hint != VirtualizableHintKind::ForceVirtualizable {
             return None;
         }
-        self.statements.push(quote! {
-            __builder.vable_force();
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::Vable, vec![], vec![]),
+            quote! { __builder.vable_force(); },
+        );
         Some(())
     }
 
@@ -679,9 +1036,11 @@ impl<'c> Lowerer<'c> {
         let cond_reg = cond_binding.reg;
         // RPython make_three_lists: tag each arg with its kind (int/ref).
         let mut typed_arg_tokens = Vec::new();
+        let mut arg_regs = vec![cond_reg];
         for arg in func_args {
             let b = self.lower_value_expr(arg)?;
             let reg = b.reg;
+            arg_regs.push(reg);
             let token = match b.kind {
                 // jtransform.py:1668: float → raise Exception
                 BindingKind::Float => {
@@ -695,10 +1054,13 @@ impl<'c> Lowerer<'c> {
             typed_arg_tokens.push(token);
         }
         let func_path = args[1];
-        self.statements.push(quote! {
-            let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
-            __builder.conditional_call_ir_v_typed_args(__fn_idx, #cond_reg, &[#(#typed_arg_tokens),*]);
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::Call, arg_regs, vec![]),
+            quote! {
+                let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                __builder.conditional_call_ir_v_typed_args(__fn_idx, #cond_reg, &[#(#typed_arg_tokens),*]);
+            },
+        );
         Some(())
     }
 
@@ -736,9 +1098,11 @@ impl<'c> Lowerer<'c> {
         }
         // RPython make_three_lists: tag each arg with its kind.
         let mut typed_arg_tokens = Vec::new();
+        let mut arg_regs = vec![value_reg];
         for arg in func_args {
             let b = self.lower_value_expr(arg)?;
             let reg = b.reg;
+            arg_regs.push(reg);
             let token = match b.kind {
                 BindingKind::Float => {
                     panic!("Conditional call does not support floats");
@@ -761,10 +1125,13 @@ impl<'c> Lowerer<'c> {
                 __builder.conditional_call_value_ir_i_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
         };
-        self.statements.push(quote! {
-            let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
-            #builder_call
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::Call, arg_regs, vec![result_reg]),
+            quote! {
+                let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                #builder_call
+            },
+        );
         Some(Binding {
             reg: result_reg,
             kind: value_binding.kind,
@@ -802,9 +1169,11 @@ impl<'c> Lowerer<'c> {
         }
         // RPython make_three_lists: tag each arg with its kind.
         let mut typed_arg_tokens = Vec::new();
+        let mut arg_regs = Vec::new();
         for arg in &args[2..] {
             let b = self.lower_value_expr(arg)?;
             let reg = b.reg;
+            arg_regs.push(reg);
             let token = match b.kind {
                 BindingKind::Float => {
                     panic!("record_known_result does not support floats");
@@ -826,10 +1195,13 @@ impl<'c> Lowerer<'c> {
                 __builder.record_known_result_i_ir_v_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
             },
         };
-        self.statements.push(quote! {
-            let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
-            #builder_call
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::RecordKnownResult, arg_regs, vec![result_reg]),
+            quote! {
+                let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                #builder_call
+            },
+        );
         Some(())
     }
 
@@ -921,58 +1293,86 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Explicit(kind) => match kind {
                 crate::jit_interp::CallPolicyKind::ResidualVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::ReleaseGilVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::LoopInvariantVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
+                            },
+                        );
                     }
                 }
                 // Stmt-form variants of result-returning policies discard
@@ -981,62 +1381,96 @@ impl<'c> Lowerer<'c> {
                 // `lj::stack_pop(state.selected_ref);` discards the popped
                 // value but the pop side effect must reach compiled code).
                 // Allocate a throwaway destination register; never read it.
+                //
+                // RPython jtransform.py:456 `handle_residual_call` lowers
+                // every direct_call to a residual_call regardless of result
+                // usage; majit's CallPolicyKind enum captures the effect
+                // distinction (Residual / MayForce / ReleaseGil /
+                // LoopInvariant / Elidable) so the dispatched bytecode
+                // varies per policy here.  Wrapped variants stay deferred
+                // — wrapper closure plumbing is shared with the void path
+                // and not exercised by current `#[jit_interp]` users.
                 crate::jit_interp::CallPolicyKind::ResidualInt
+                | crate::jit_interp::CallPolicyKind::MayForceInt
+                | crate::jit_interp::CallPolicyKind::ReleaseGilInt
+                | crate::jit_interp::CallPolicyKind::LoopInvariantInt
                 | crate::jit_interp::CallPolicyKind::ElidableInt => {
                     let throwaway_reg = self.alloc_reg();
-                    let is_pure = matches!(kind, crate::jit_interp::CallPolicyKind::ElidableInt,);
+                    let (untyped_call, typed_call) = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualInt => {
+                            (quote! { call_int }, quote! { call_int_typed })
+                        }
+                        crate::jit_interp::CallPolicyKind::MayForceInt => (
+                            quote! { call_may_force_int },
+                            quote! { call_may_force_int_typed },
+                        ),
+                        crate::jit_interp::CallPolicyKind::ReleaseGilInt => (
+                            quote! { call_release_gil_int },
+                            quote! { call_release_gil_int_typed },
+                        ),
+                        crate::jit_interp::CallPolicyKind::LoopInvariantInt => (
+                            quote! { call_loopinvariant_int },
+                            quote! { call_loopinvariant_int_typed },
+                        ),
+                        crate::jit_interp::CallPolicyKind::ElidableInt => {
+                            (quote! { call_pure_int }, quote! { call_pure_int_typed })
+                        }
+                        _ => unreachable!(),
+                    };
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        let builder_call = if is_pure {
-                            quote! { __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #throwaway_reg); }
-                        } else {
-                            quote! { __builder.call_int(__fn_idx, &[#(#arg_regs),*], #throwaway_reg); }
-                        };
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            #builder_call
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![throwaway_reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.#untyped_call(__fn_idx, &[#(#arg_regs),*], #throwaway_reg);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let builder_call = if is_pure {
-                            quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
-                        } else {
-                            quote! { __builder.call_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
-                        };
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            #builder_call
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![throwaway_reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.#typed_call(__fn_idx, #typed_args, #throwaway_reg);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::ResidualVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
                     let call_stmt =
                         quote! { __builder.residual_call_void_typed_args(__fn_idx, #typed_args); };
-                    self.statements.push(quote! {
-                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
-                        if __trace_target.is_null() && __concrete_target.is_null() {
-                            panic!("wrapped helper policy requires generated call-target wrappers");
-                        }
-                        let __trace_target = if __trace_target.is_null() {
-                            __concrete_target
-                        } else {
-                            __trace_target
-                        };
-                        let __concrete_target = if __concrete_target.is_null() {
-                            __trace_target
-                        } else {
-                            __concrete_target
-                        };
-                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
-                        #call_stmt
-                    });
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                        quote! {
+                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            if __trace_target.is_null() && __concrete_target.is_null() {
+                                panic!("wrapped helper policy requires generated call-target wrappers");
+                            }
+                            let __trace_target = if __trace_target.is_null() {
+                                __concrete_target
+                            } else {
+                                __trace_target
+                            };
+                            let __concrete_target = if __concrete_target.is_null() {
+                                __trace_target
+                            } else {
+                                __concrete_target
+                            };
+                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            #call_stmt
+                        },
+                    );
                 }
                 crate::jit_interp::CallPolicyKind::MayForceVoidWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilVoidWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::MayForceVoidWrapped => {
                             quote! { __builder.call_may_force_void_typed_args(__fn_idx, #typed_args); }
@@ -1049,13 +1483,137 @@ impl<'c> Lowerer<'c> {
                         }
                         _ => unreachable!(),
                     };
-                    self.statements.push(quote! {
-                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
-                        if __trace_target.is_null() && __concrete_target.is_null() {
-                            panic!("wrapped helper policy requires generated call-target wrappers");
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                        quote! {
+                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            if __trace_target.is_null() && __concrete_target.is_null() {
+                                panic!("wrapped helper policy requires generated call-target wrappers");
+                            }
+                            let __trace_target = if __trace_target.is_null() {
+                                __concrete_target
+                            } else {
+                                __trace_target
+                            };
+                            let __concrete_target = if __concrete_target.is_null() {
+                                __trace_target
+                            } else {
+                                __concrete_target
+                            };
+                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            #call_stmt
+                        },
+                    );
+                }
+                // Wrapped Int / Ref / Float statement-form: result discarded,
+                // but the residual_call must still execute the side effect on
+                // the compiled trace.  RPython jtransform.py:456
+                // handle_residual_call lowers every direct_call regardless of
+                // result usage; the wrapped policy adds the trace_target /
+                // concrete_target tuple resolution shared with the void
+                // wrapped variants above.  Throwaway destination register is
+                // allocated (per-bank slot picked by JitCodeBuilder when the
+                // typed call dispatches) and never read.
+                crate::jit_interp::CallPolicyKind::ResidualIntWrapped
+                | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
+                | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
+                | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
+                | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
+                | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
+                    let policy_path = helper_policy_path(&call.func)?;
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let throwaway_reg = self.alloc_reg();
+                    let call_stmt = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
+                            quote! { __builder.call_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
                         }
+                        crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
+                            quote! { __builder.call_may_force_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped => {
+                            quote! { __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped => {
+                            quote! { __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableIntWrapped => {
+                            quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
+                            quote! { __builder.call_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
+                            quote! { __builder.call_may_force_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped => {
+                            quote! { __builder.call_loopinvariant_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableRefWrapped => {
+                            quote! { __builder.call_pure_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
+                            quote! { __builder.call_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
+                            quote! { __builder.call_may_force_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped => {
+                            quote! { __builder.call_release_gil_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped => {
+                            quote! { __builder.call_loopinvariant_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
+                            quote! { __builder.call_pure_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        _ => unreachable!(),
+                    };
+                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![throwaway_reg]),
+                        quote! {
+                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            if __trace_target.is_null() && __concrete_target.is_null() {
+                                panic!("wrapped helper policy requires generated call-target wrappers");
+                            }
+                            let __trace_target = if __trace_target.is_null() {
+                                __concrete_target
+                            } else {
+                                __trace_target
+                            };
+                            let __concrete_target = if __concrete_target.is_null() {
+                                __trace_target
+                            } else {
+                                __concrete_target
+                            };
+                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            #call_stmt
+                        },
+                    );
+                }
+                _ => return None,
+            },
+            CallPolicySpec::Infer => {
+                let policy_path = helper_policy_path(&call.func)?;
+                let typed_args = typed_call_arg_tokens(&arg_bindings);
+                let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                let unsupported = self.inference_failure_tokens(
+                    "inferred helper policy does not support void calls here",
+                );
+                self.emit_op(
+                    OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                    quote! {
+                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
                         let __trace_target = if __trace_target.is_null() {
-                            __concrete_target
+                            #func as *const ()
                         } else {
                             __trace_target
                         };
@@ -1065,48 +1623,25 @@ impl<'c> Lowerer<'c> {
                             __concrete_target
                         };
                         let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
-                        #call_stmt
-                    });
-                }
-                _ => return None,
-            },
-            CallPolicySpec::Infer => {
-                let policy_path = helper_policy_path(&call.func)?;
-                let typed_args = typed_call_arg_tokens(&arg_bindings);
-                let unsupported = self.inference_failure_tokens(
-                    "inferred helper policy does not support void calls here",
+                        match __policy {
+                            1u8 => {
+                                __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
+                            }
+                            9u8 => {
+                                __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
+                            }
+                            13u8 => {
+                                __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
+                            }
+                            17u8 => {
+                                __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
+                            }
+                            _ => {
+                                #unsupported
+                            }
+                        }
+                    },
                 );
-                self.statements.push(quote! {
-                    let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
-                    let __trace_target = if __trace_target.is_null() {
-                        #func as *const ()
-                    } else {
-                        __trace_target
-                    };
-                    let __concrete_target = if __concrete_target.is_null() {
-                        __trace_target
-                    } else {
-                        __concrete_target
-                    };
-                    let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
-                    match __policy {
-                        1u8 => {
-                            __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
-                        }
-                        9u8 => {
-                            __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
-                        }
-                        13u8 => {
-                            __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
-                        }
-                        17u8 => {
-                            __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
-                        }
-                        _ => {
-                            #unsupported
-                        }
-                    }
-                });
             }
         }
         Some(())
@@ -1125,10 +1660,13 @@ impl<'c> Lowerer<'c> {
                 let arg = unwrap_ref_expr(call.args.first()?);
                 let binding = self.lower_value_expr(arg)?;
                 let reg = binding.reg;
-                self.statements.push(quote! {
-                    let __fn_idx = __builder.add_fn_ptr(#shim as *const ());
-                    __builder.residual_call_void_args(__fn_idx, &[#reg]);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::Call, vec![reg], vec![]),
+                    quote! {
+                        let __fn_idx = __builder.add_fn_ptr(#shim as *const ());
+                        __builder.residual_call_void_args(__fn_idx, &[#reg]);
+                    },
+                );
                 return Some(());
             }
         }
@@ -1421,12 +1959,8 @@ impl<'c> Lowerer<'c> {
             None => Vec::new(),
         };
 
-        self.statements.push(quote! {
-            let #else_label = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let #end_label = __builder.new_label();
-        });
+        self.emit_aux(quote! { let #else_label = __builder.new_label(); });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
         // RPython `flatten.py:259` `-live-` convention: every guard-bearing
         // instruction is *preceded* by a `live` marker (byte order:
         // `BC_LIVE+offset` then the guard op). The recorded `orgpc` (=
@@ -1436,23 +1970,16 @@ impl<'c> Lowerer<'c> {
         // and blackhole's `get_current_position_info` reads liveness from
         // there.  Without this preceding marker, blackhole panics with
         // `missing liveness[N] in JitCode`.
-        self.statements.push(quote! {
-            let _ = __builder.live_placeholder();
-        });
-        self.statements.push(quote! {
-            __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
-        });
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        self.emit_conditional_guard(cond_reg, &else_label);
         self.statements.extend(then_stmts);
-        self.statements.push(quote! {
-            __builder.jump(#end_label);
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#else_label);
-        });
+        self.emit_jump(&end_label);
+        self.emit_label_def(&else_label);
         self.statements.extend(else_stmts);
-        self.statements.push(quote! {
-            __builder.mark_label(#end_label);
-        });
+        self.emit_label_def(&end_label);
         Some(())
     }
 
@@ -1474,9 +2001,7 @@ impl<'c> Lowerer<'c> {
         }
 
         let end_label = self.alloc_label();
-        self.statements.push(quote! {
-            let #end_label = __builder.new_label();
-        });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
 
         // Separate literal/path arms from the wildcard/default arm.
         let mut guarded_arms = Vec::new();
@@ -1502,70 +2027,69 @@ impl<'c> Lowerer<'c> {
 
         for (literals, body) in &guarded_arms {
             let next_label = self.alloc_label();
-            self.statements.push(quote! {
-                let #next_label = __builder.new_label();
-            });
+            self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
             if literals.len() == 1 {
                 // Single literal: eq check + branch
                 let value = literals[0];
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
-                self.statements.push(quote! {
-                    __builder.load_const_i_value(#const_reg, #value);
-                });
-                self.statements.push(quote! {
-                    __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
-                });
-                self.statements.push(quote! {
-                    let _ = __builder.live_placeholder();
-                });
-                self.statements.push(quote! {
-                    __builder.goto_if_not_int_is_true(#eq_reg, #next_label);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                    quote! { __builder.load_const_i_value(#const_reg, #value); },
+                );
+                self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
+            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+        );
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
+                self.emit_conditional_guard(eq_reg, &next_label);
             } else {
                 // Multiple literals (Or pattern): chain with logical OR
                 // (val == lit1) | (val == lit2) | ...
                 let first_val = literals[0];
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
-                self.statements.push(quote! {
-                    __builder.load_const_i_value(#first_const_reg, #first_val);
-                });
-                self.statements.push(quote! {
-                    __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![first_const_reg]),
+                    quote! { __builder.load_const_i_value(#first_const_reg, #first_val); },
+                );
+                self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![disc_reg, first_const_reg], vec![or_reg]),
+            quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
+        );
                 for &lit_val in &literals[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
-                    self.statements.push(quote! {
-                        __builder.load_const_i_value(#const_reg, #lit_val);
-                    });
-                    self.statements.push(quote! {
-                        __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
-                    });
-                    self.statements.push(quote! {
-                        __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg);
-                    });
+                    self.emit_op(
+                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                        quote! { __builder.load_const_i_value(#const_reg, #lit_val); },
+                    );
+                    self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
+            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+        );
+                    self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![or_reg, eq_reg], vec![new_or_reg]),
+            quote! { __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg); },
+        );
                     or_reg = new_or_reg;
                 }
-                self.statements.push(quote! {
-                    let _ = __builder.live_placeholder();
-                });
-                self.statements.push(quote! {
-                    __builder.goto_if_not_int_is_true(#or_reg, #next_label);
-                });
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
+                self.emit_conditional_guard(or_reg, &next_label);
             }
 
             let body_stmts = self.lower_branch_expr(body)?;
             self.statements.extend(body_stmts);
-            self.statements.push(quote! {
-                __builder.jump(#end_label);
-            });
-            self.statements.push(quote! {
-                __builder.mark_label(#next_label);
-            });
+            self.emit_jump(&end_label);
+            self.emit_label_def(&next_label);
         }
 
         // Default arm
@@ -1574,9 +2098,7 @@ impl<'c> Lowerer<'c> {
             self.statements.extend(default_stmts);
         }
 
-        self.statements.push(quote! {
-            __builder.mark_label(#end_label);
-        });
+        self.emit_label_def(&end_label);
         Some(())
     }
 
@@ -1595,37 +2117,26 @@ impl<'c> Lowerer<'c> {
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
-        self.statements.push(quote! {
-            let #loop_start = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let #loop_end = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#loop_start);
-        });
+        self.emit_aux(quote! { let #loop_start = __builder.new_label(); });
+        self.emit_aux(quote! { let #loop_end = __builder.new_label(); });
+        self.emit_label_def(&loop_start);
 
         // Evaluate the condition
         let cond = self.lower_value_expr(&expr_while.cond)?;
         let cond_reg = cond.reg;
-        self.statements.push(quote! {
-            let _ = __builder.live_placeholder();
-        });
-        self.statements.push(quote! {
-            __builder.goto_if_not_int_is_true(#cond_reg, #loop_end);
-        });
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        self.emit_conditional_guard(cond_reg, &loop_end);
 
         // Lower the body, with break targets pointing to loop_end
         let body_stmts = self.lower_loop_body(&expr_while.body, &loop_end, &loop_start)?;
         self.statements.extend(body_stmts);
 
         // Back-edge jump
-        self.statements.push(quote! {
-            __builder.jump(#loop_start);
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#loop_end);
-        });
+        self.emit_jump(&loop_start);
+        self.emit_label_def(&loop_end);
         Some(())
     }
 
@@ -1640,25 +2151,15 @@ impl<'c> Lowerer<'c> {
         let loop_start = self.alloc_label();
         let loop_end = self.alloc_label();
 
-        self.statements.push(quote! {
-            let #loop_start = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let #loop_end = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#loop_start);
-        });
+        self.emit_aux(quote! { let #loop_start = __builder.new_label(); });
+        self.emit_aux(quote! { let #loop_end = __builder.new_label(); });
+        self.emit_label_def(&loop_start);
 
         let body_stmts = self.lower_loop_body(&expr_loop.body, &loop_end, &loop_start)?;
         self.statements.extend(body_stmts);
 
-        self.statements.push(quote! {
-            __builder.jump(#loop_start);
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#loop_end);
-        });
+        self.emit_jump(&loop_start);
+        self.emit_label_def(&loop_end);
         Some(())
     }
 
@@ -1682,6 +2183,7 @@ impl<'c> Lowerer<'c> {
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
             statements: Vec::new(),
+            op_metadata: Vec::new(),
             next_reg: self.next_reg,
             next_label: self.next_label,
             config: self.config,
@@ -1702,6 +2204,7 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.op_metadata.extend(nested.op_metadata);
         Some(nested.statements)
     }
 
@@ -1714,15 +2217,11 @@ impl<'c> Lowerer<'c> {
     ) -> Option<()> {
         match stmt {
             Stmt::Expr(Expr::Break(_), _) => {
-                self.statements.push(quote! {
-                    __builder.jump(#break_label);
-                });
+                self.emit_jump(&break_label);
                 Some(())
             }
             Stmt::Expr(Expr::Continue(_), _) => {
-                self.statements.push(quote! {
-                    __builder.jump(#continue_label);
-                });
+                self.emit_jump(&continue_label);
                 Some(())
             }
             Stmt::Expr(Expr::If(expr_if), _) => {
@@ -1756,28 +2255,19 @@ impl<'c> Lowerer<'c> {
         let end_label = self.alloc_label();
         let cond_reg = cond.reg;
 
-        self.statements.push(quote! {
-            let #else_label = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let #end_label = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let _ = __builder.live_placeholder();
-        });
-        self.statements.push(quote! {
-            __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
-        });
+        self.emit_aux(quote! { let #else_label = __builder.new_label(); });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        self.emit_conditional_guard(cond_reg, &else_label);
 
         // Lower then-branch with loop control
         let then_stmts = self.lower_loop_body(&expr_if.then_branch, break_label, continue_label)?;
         self.statements.extend(then_stmts);
-        self.statements.push(quote! {
-            __builder.jump(#end_label);
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#else_label);
-        });
+        self.emit_jump(&end_label);
+        self.emit_label_def(&else_label);
 
         // Lower else-branch with loop control
         if let Some((_, else_expr)) = &expr_if.else_branch {
@@ -1789,9 +2279,7 @@ impl<'c> Lowerer<'c> {
             self.statements.extend(else_stmts);
         }
 
-        self.statements.push(quote! {
-            __builder.mark_label(#end_label);
-        });
+        self.emit_label_def(&end_label);
         Some(())
     }
 
@@ -1805,9 +2293,7 @@ impl<'c> Lowerer<'c> {
 
         let end_label = self.alloc_label();
         let result_reg = self.alloc_reg();
-        self.statements.push(quote! {
-            let #end_label = __builder.new_label();
-        });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
 
         let mut guarded_arms = Vec::new();
         let mut default_arm = None;
@@ -1832,57 +2318,60 @@ impl<'c> Lowerer<'c> {
 
         for (literals, body) in &guarded_arms {
             let next_label = self.alloc_label();
-            self.statements.push(quote! {
-                let #next_label = __builder.new_label();
-            });
+            self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
             if literals.len() == 1 {
                 let value = literals[0];
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
-                self.statements.push(quote! {
-                    __builder.load_const_i_value(#const_reg, #value);
-                });
-                self.statements.push(quote! {
-                    __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
-                });
-                self.statements.push(quote! {
-                    let _ = __builder.live_placeholder();
-                });
-                self.statements.push(quote! {
-                    __builder.goto_if_not_int_is_true(#eq_reg, #next_label);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                    quote! { __builder.load_const_i_value(#const_reg, #value); },
+                );
+                self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
+            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+        );
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
+                self.emit_conditional_guard(eq_reg, &next_label);
             } else {
                 let first_val = literals[0];
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
-                self.statements.push(quote! {
-                    __builder.load_const_i_value(#first_const_reg, #first_val);
-                });
-                self.statements.push(quote! {
-                    __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![first_const_reg]),
+                    quote! { __builder.load_const_i_value(#first_const_reg, #first_val); },
+                );
+                self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![disc_reg, first_const_reg], vec![or_reg]),
+            quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
+        );
                 for &lit_val in &literals[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
-                    self.statements.push(quote! {
-                        __builder.load_const_i_value(#const_reg, #lit_val);
-                    });
-                    self.statements.push(quote! {
-                        __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
-                    });
-                    self.statements.push(quote! {
-                        __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg);
-                    });
+                    self.emit_op(
+                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                        quote! { __builder.load_const_i_value(#const_reg, #lit_val); },
+                    );
+                    self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
+            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+        );
+                    self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![or_reg, eq_reg], vec![new_or_reg]),
+            quote! { __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg); },
+        );
                     or_reg = new_or_reg;
                 }
-                self.statements.push(quote! {
-                    let _ = __builder.live_placeholder();
-                });
-                self.statements.push(quote! {
-                    __builder.goto_if_not_int_is_true(#or_reg, #next_label);
-                });
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
+                self.emit_conditional_guard(or_reg, &next_label);
             }
 
             let (body_stmts, binding) = self.lower_branch_value_expr(body)?;
@@ -1892,15 +2381,12 @@ impl<'c> Lowerer<'c> {
             depends_on_stack |= binding.depends_on_stack;
             let arm_reg = binding.reg;
             self.statements.extend(body_stmts);
-            self.statements.push(quote! {
-                __builder.move_i(#result_reg, #arm_reg);
-            });
-            self.statements.push(quote! {
-                __builder.jump(#end_label);
-            });
-            self.statements.push(quote! {
-                __builder.mark_label(#next_label);
-            });
+            self.emit_op(
+                OpMeta::linear(OpKind::MoveI, vec![arm_reg], vec![result_reg]),
+                quote! { __builder.move_i(#result_reg, #arm_reg); },
+            );
+            self.emit_jump(&end_label);
+            self.emit_label_def(&next_label);
         }
 
         // Default arm
@@ -1912,14 +2398,13 @@ impl<'c> Lowerer<'c> {
             depends_on_stack |= default_binding.depends_on_stack;
             let default_reg = default_binding.reg;
             self.statements.extend(default_stmts);
-            self.statements.push(quote! {
-                __builder.move_i(#result_reg, #default_reg);
-            });
+            self.emit_op(
+                OpMeta::linear(OpKind::MoveI, vec![default_reg], vec![result_reg]),
+                quote! { __builder.move_i(#result_reg, #default_reg); },
+            );
         }
 
-        self.statements.push(quote! {
-            __builder.mark_label(#end_label);
-        });
+        self.emit_label_def(&end_label);
 
         Some(Binding {
             reg: result_reg,
@@ -1948,21 +2433,24 @@ impl<'c> Lowerer<'c> {
                 let fi = field_index as u16;
                 let kind = match field_type {
                     ValueKind::Ref => {
-                        self.statements.push(quote! {
-                            __builder.vable_getfield_ref(#reg, #fi);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
+                            quote! { __builder.vable_getfield_ref(#reg, #fi); },
+                        );
                         BindingKind::Ref
                     }
                     ValueKind::Float => {
-                        self.statements.push(quote! {
-                            __builder.vable_getfield_float(#reg, #fi);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
+                            quote! { __builder.vable_getfield_float(#reg, #fi); },
+                        );
                         BindingKind::Float
                     }
                     ValueKind::Int => {
-                        self.statements.push(quote! {
-                            __builder.vable_getfield_int(#reg, #fi);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
+                            quote! { __builder.vable_getfield_int(#reg, #fi); },
+                        );
                         BindingKind::Int
                     }
                 };
@@ -2007,21 +2495,24 @@ impl<'c> Lowerer<'c> {
         let ai = array_index as u16;
         let kind = match item_type {
             ValueKind::Ref => {
-                self.statements.push(quote! {
-                    __builder.vable_getarrayitem_ref(#reg, #ai, #idx_reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::Vable, vec![idx_reg], vec![reg]),
+                    quote! { __builder.vable_getarrayitem_ref(#reg, #ai, #idx_reg); },
+                );
                 BindingKind::Ref
             }
             ValueKind::Float => {
-                self.statements.push(quote! {
-                    __builder.vable_getarrayitem_float(#reg, #ai, #idx_reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::Vable, vec![idx_reg], vec![reg]),
+                    quote! { __builder.vable_getarrayitem_float(#reg, #ai, #idx_reg); },
+                );
                 BindingKind::Float
             }
             ValueKind::Int => {
-                self.statements.push(quote! {
-                    __builder.vable_getarrayitem_int(#reg, #ai, #idx_reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::Vable, vec![idx_reg], vec![reg]),
+                    quote! { __builder.vable_getarrayitem_int(#reg, #ai, #idx_reg); },
+                );
                 BindingKind::Int
             }
         };
@@ -2056,9 +2547,10 @@ impl<'c> Lowerer<'c> {
         let &array_index = config.vable_arrays.get(&member_name).map(|(idx, _)| idx)?;
         let reg = self.alloc_reg();
         let ai = array_index as u16;
-        self.statements.push(quote! {
-            __builder.vable_arraylen(#reg, #ai);
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
+            quote! { __builder.vable_arraylen(#reg, #ai); },
+        );
         Some(Binding {
             reg,
             kind: BindingKind::Int,
@@ -2081,8 +2573,10 @@ impl<'c> Lowerer<'c> {
         let &field_index = config.state_scalars.get(&member_name)?;
         let fi = field_index as u16;
         let reg = self.alloc_reg();
-        self.statements
-            .push(quote! { __builder.load_state_field(#fi, #reg); });
+        self.emit_op(
+            OpMeta::linear(OpKind::StateField, vec![], vec![reg]),
+            quote! { __builder.load_state_field(#fi, #reg); },
+        );
         Some(Binding {
             reg,
             kind: BindingKind::Int,
@@ -2114,8 +2608,10 @@ impl<'c> Lowerer<'c> {
         // Check virtualizable arrays first, then flattened arrays.
         if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
             let ai = va_idx as u16;
-            self.statements
-                .push(quote! { __builder.load_state_varray(#ai, #idx_reg, #reg); });
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![idx_reg], vec![reg]),
+                quote! { __builder.load_state_varray(#ai, #idx_reg, #reg); },
+            );
             return Some(Binding {
                 reg,
                 kind: BindingKind::Int,
@@ -2124,8 +2620,10 @@ impl<'c> Lowerer<'c> {
         }
         let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
-        self.statements
-            .push(quote! { __builder.load_state_array(#ai, #idx_reg, #reg); });
+        self.emit_op(
+            OpMeta::linear(OpKind::StateField, vec![idx_reg], vec![reg]),
+            quote! { __builder.load_state_array(#ai, #idx_reg, #reg); },
+        );
         Some(Binding {
             reg,
             kind: BindingKind::Int,
@@ -2170,9 +2668,10 @@ impl<'c> Lowerer<'c> {
             }) => {
                 let value = int_lit.base10_parse::<i64>().ok()?;
                 let reg = self.alloc_reg();
-                self.statements.push(quote! {
-                    __builder.load_const_i_value(#reg, #value);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![reg]),
+                    quote! { __builder.load_const_i_value(#reg, #value); },
+                );
                 Some(Binding {
                     reg,
                     kind: BindingKind::Int,
@@ -2223,19 +2722,22 @@ impl<'c> Lowerer<'c> {
         let reg = binding.reg;
         match binding.kind {
             BindingKind::Int => {
-                self.statements.push(quote! {
-                    __builder.int_guard_value(#reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::GuardValue, vec![reg], vec![]),
+                    quote! { __builder.int_guard_value(#reg); },
+                );
             }
             BindingKind::Ref => {
-                self.statements.push(quote! {
-                    __builder.ref_guard_value(#reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::GuardValue, vec![reg], vec![]),
+                    quote! { __builder.ref_guard_value(#reg); },
+                );
             }
             BindingKind::Float => {
-                self.statements.push(quote! {
-                    __builder.float_guard_value(#reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::GuardValue, vec![reg], vec![]),
+                    quote! { __builder.float_guard_value(#reg); },
+                );
             }
         }
         Some(binding)
@@ -2262,72 +2764,107 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Explicit(kind) => match kind {
                 crate::jit_interp::CallPolicyKind::ResidualInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_int_typed(__fn_idx, #typed_args, #reg);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::MayForceInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::ElidableInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                        });
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                            },
+                        );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        self.statements.push(quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
-                        });
+                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        self.emit_op(
+                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                            },
+                        );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
@@ -2400,117 +2937,133 @@ impl<'c> Lowerer<'c> {
                         }
                         _ => unreachable!(),
                     };
-                    self.statements.push(quote! {
-                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
-                        if __trace_target.is_null() && __concrete_target.is_null() {
-                            panic!("wrapped helper policy requires generated call-target wrappers");
-                        }
-                        let __trace_target = if __trace_target.is_null() {
-                            __concrete_target
-                        } else {
-                            __trace_target
-                        };
-                        let __concrete_target = if __concrete_target.is_null() {
-                            __trace_target
-                        } else {
-                            __concrete_target
-                        };
-                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
-                        #call_stmt
-                    });
+                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                        quote! {
+                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            if __trace_target.is_null() && __concrete_target.is_null() {
+                                panic!("wrapped helper policy requires generated call-target wrappers");
+                            }
+                            let __trace_target = if __trace_target.is_null() {
+                                __concrete_target
+                            } else {
+                                __trace_target
+                            };
+                            let __concrete_target = if __concrete_target.is_null() {
+                                __trace_target
+                            } else {
+                                __concrete_target
+                            };
+                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            #call_stmt
+                        },
+                    );
                 }
                 crate::jit_interp::CallPolicyKind::InlineInt
                 | crate::jit_interp::CallPolicyKind::InlineRef
                 | crate::jit_interp::CallPolicyKind::InlineFloat => {
                     result_kind = binding_kind_for_inline_policy(kind).unwrap();
                     let builder_path = inline_builder_path(&call.func)?;
-                    let inline_call = inline_call_tokens(&arg_bindings, reg);
-                    self.statements.push(quote! {
-                        let __sub_jitcode = #builder_path();
-                        let (__sub_return_kind, _) = __sub_jitcode
-                            .trailing_return_info()
-                            .expect("inline helper jitcode must end in a typed return opcode");
-                        let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                        #inline_call
-                    });
+                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
+                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    self.emit_op(
+                        OpMeta::linear(OpKind::InlineCall, __arg_regs, vec![reg]),
+                        quote! {
+                            let __sub_jitcode = #builder_path();
+                            let (__sub_return_kind, _) = __sub_jitcode
+                                .trailing_return_info()
+                                .expect("inline helper jitcode must end in a typed return opcode");
+                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
                 }
                 _ => return None,
             },
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
-                let inline_call = inline_call_tokens(&arg_bindings, reg);
+                let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
                 let int_arg_regs = int_arg_regs(&arg_bindings);
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy only supports int-return value calls here; use an explicit inline_ref/inline_float or *_ref_wrapped/*_float_wrapped policy",
                 );
+                let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
                 if let Some(_arg_regs) = int_arg_regs {
-                    self.statements.push(quote! {
-                        let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
-                        let __trace_target = if __trace_target.is_null() {
-                            #func as *const ()
-                        } else {
-                            __trace_target
-                        };
-                        let __concrete_target = if __concrete_target.is_null() {
-                            __trace_target
-                        } else {
-                            __concrete_target
-                        };
-                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
-                        match __policy {
-                            2u8 => {
-                                __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs.clone(), vec![reg]),
+                        quote! {
+                            let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let __trace_target = if __trace_target.is_null() {
+                                #func as *const ()
+                            } else {
+                                __trace_target
+                            };
+                            let __concrete_target = if __concrete_target.is_null() {
+                                __trace_target
+                            } else {
+                                __concrete_target
+                            };
+                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            match __policy {
+                                2u8 => {
+                                    __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                3u8 => {
+                                    __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                4u8 => {
+                                    let __builder_fn: fn() -> majit_metainterp::JitCode =
+                                        unsafe { std::mem::transmute(__inline_builder) };
+                                    let __sub_jitcode = __builder_fn();
+                                    let (__sub_return_kind, _) =
+                                        <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
+                                        .expect("inline helper jitcode must end in a typed return opcode");
+                                    let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                                    #inline_call
+                                    #post_live
+                                }
+                                10u8 => {
+                                    __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                14u8 => {
+                                    __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                18u8 => {
+                                    __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                _ => {
+                                    #unsupported
+                                }
                             }
-                            3u8 => {
-                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
-                            }
-                            4u8 => {
-                                let __builder_fn: fn() -> majit_metainterp::JitCode =
-                                    unsafe { std::mem::transmute(__inline_builder) };
-                                let __sub_jitcode = __builder_fn();
-                                let (__sub_return_kind, _) =
-                                    <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
-                                    .expect("inline helper jitcode must end in a typed return opcode");
-                                let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                                #inline_call
-                            }
-                            10u8 => {
-                                __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
-                            }
-                            14u8 => {
-                                __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
-                            }
-                            18u8 => {
-                                __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
-                            }
-                            _ => {
-                                #unsupported
-                            }
-                        }
-                    });
+                        },
+                    );
                 } else {
-                    self.statements.push(quote! {
-                        let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
-                        let __trace_target = if __trace_target.is_null() {
-                            #func as *const ()
-                        } else {
-                            __trace_target
-                        };
-                        let __concrete_target = if __concrete_target.is_null() {
-                            __trace_target
-                        } else {
-                            __concrete_target
-                        };
-                        let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
-                        match __policy {
-                            2u8 => {
-                                __builder.call_int_typed(__fn_idx, #typed_args, #reg);
-                            }
-                            3u8 => {
-                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
-                            }
-                            4u8 => {
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                        quote! {
+                            let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let __trace_target = if __trace_target.is_null() {
+                                #func as *const ()
+                            } else {
+                                __trace_target
+                            };
+                            let __concrete_target = if __concrete_target.is_null() {
+                                __trace_target
+                            } else {
+                                __concrete_target
+                            };
+                            let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
+                            match __policy {
+                                2u8 => {
+                                    __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                3u8 => {
+                                    __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                                }
+                                4u8 => {
                                 let __builder_fn: fn() -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let __sub_jitcode = __builder_fn();
@@ -2519,6 +3072,7 @@ impl<'c> Lowerer<'c> {
                                     .expect("inline helper jitcode must end in a typed return opcode");
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
+                                #post_live
                             }
                             10u8 => {
                                 __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -2574,35 +3128,26 @@ impl<'c> Lowerer<'c> {
         let then_reg = then_binding.reg;
         let else_reg = else_binding.reg;
 
-        self.statements.push(quote! {
-            let #else_label = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let #end_label = __builder.new_label();
-        });
-        self.statements.push(quote! {
-            let _ = __builder.live_placeholder();
-        });
-        self.statements.push(quote! {
-            __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
-        });
+        self.emit_aux(quote! { let #else_label = __builder.new_label(); });
+        self.emit_aux(quote! { let #end_label = __builder.new_label(); });
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        self.emit_conditional_guard(cond_reg, &else_label);
         self.statements.extend(then_stmts);
-        self.statements.push(quote! {
-            __builder.move_i(#result_reg, #then_reg);
-        });
-        self.statements.push(quote! {
-            __builder.jump(#end_label);
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#else_label);
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::MoveI, vec![then_reg], vec![result_reg]),
+            quote! { __builder.move_i(#result_reg, #then_reg); },
+        );
+        self.emit_jump(&end_label);
+        self.emit_label_def(&else_label);
         self.statements.extend(else_stmts);
-        self.statements.push(quote! {
-            __builder.move_i(#result_reg, #else_reg);
-        });
-        self.statements.push(quote! {
-            __builder.mark_label(#end_label);
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::MoveI, vec![else_reg], vec![result_reg]),
+            quote! { __builder.move_i(#result_reg, #else_reg); },
+        );
+        self.emit_label_def(&end_label);
 
         Some(Binding {
             reg: result_reg,
@@ -2623,14 +3168,16 @@ impl<'c> Lowerer<'c> {
             (1, 0) => Some(cond),
             (0, 1) => {
                 let zero_reg = self.alloc_reg();
-                self.statements.push(quote! {
-                    __builder.load_const_i_value(#zero_reg, 0);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![zero_reg]),
+                    quote! { __builder.load_const_i_value(#zero_reg, 0); },
+                );
                 let reg = self.alloc_reg();
                 let cond_reg = cond.reg;
-                self.statements.push(quote! {
-                    __builder.record_binop_i(#reg, majit_ir::OpCode::IntEq, #cond_reg, #zero_reg);
-                });
+                self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![cond_reg, zero_reg], vec![reg]),
+            quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::IntEq, #cond_reg, #zero_reg); },
+        );
                 Some(Binding {
                     reg,
                     kind: BindingKind::Int,
@@ -2650,9 +3197,10 @@ impl<'c> Lowerer<'c> {
                 }
                 let reg = self.alloc_reg();
                 let src_reg = inner.reg;
-                self.statements.push(quote! {
-                    __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg);
-                });
+                self.emit_op(
+                    OpMeta::linear(OpKind::UnaryI, vec![src_reg], vec![reg]),
+                    quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg); },
+                );
                 Some(Binding {
                     reg,
                     kind: BindingKind::Int,
@@ -2673,9 +3221,10 @@ impl<'c> Lowerer<'c> {
         let reg = self.alloc_reg();
         let lhs_reg = lhs.reg;
         let rhs_reg = rhs.reg;
-        self.statements.push(quote! {
-            __builder.record_binop_i(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg);
-        });
+        self.emit_op(
+            OpMeta::linear(OpKind::BinopI, vec![lhs_reg, rhs_reg], vec![reg]),
+            quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
+        );
         Some(Binding {
             reg,
             kind: BindingKind::Int,
@@ -2688,6 +3237,7 @@ impl<'c> Lowerer<'c> {
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
             statements: Vec::new(),
+            op_metadata: Vec::new(),
             next_reg: self.next_reg,
             next_label: self.next_label,
             config: self.config,
@@ -2702,6 +3252,7 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.op_metadata.extend(nested.op_metadata);
         Some(nested.statements)
     }
 
@@ -2709,6 +3260,7 @@ impl<'c> Lowerer<'c> {
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
             statements: Vec::new(),
+            op_metadata: Vec::new(),
             next_reg: self.next_reg,
             next_label: self.next_label,
             config: self.config,
@@ -2720,6 +3272,7 @@ impl<'c> Lowerer<'c> {
         let binding = nested.lower_scoped_value_expr(expr)?;
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.op_metadata.extend(nested.op_metadata);
         Some((nested.statements, binding))
     }
 
@@ -2866,7 +3419,11 @@ fn inline_float_arg_tokens(bindings: &[Binding]) -> TokenStream {
     quote! { &[#(#args),*] }
 }
 
-fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
+/// Returns `(call_match, post_live)` so the caller can register the
+/// `BC_INLINE_CALL` and the trailing `BC_LIVE` marker as two distinct
+/// `OpMeta` entries (RPython `jtransform.py:480-481` emits inline_call
+/// followed by `-live-`).
+fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> (TokenStream, TokenStream) {
     let args_i = inline_int_arg_tokens(bindings);
     let args_r = inline_ref_arg_tokens(bindings);
     let args_f = inline_float_arg_tokens(bindings);
@@ -2943,7 +3500,7 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
         );
     };
 
-    quote! {
+    let call_match = quote! {
         match __sub_return_kind {
             majit_metainterp::JitArgKind::Int => {
                 #call_i
@@ -2955,7 +3512,14 @@ fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> TokenStream {
                 #call_f
             }
         }
-    }
+    };
+    // RPython jtransform.py:480-481 emits inline_call_* followed
+    // immediately by -live-.  Parent-frame resume snapshots rely on
+    // BC_INLINE_CALL leaving frame.pc at this post-call LIVE marker
+    // before opencoder.py:create_snapshot calls
+    // get_list_of_active_boxes(in_a_call=True).
+    let post_live = quote! { let _ = __builder.live_placeholder(); };
+    (call_match, post_live)
 }
 
 fn typed_call_arg_tokens(bindings: &[Binding]) -> TokenStream {
@@ -3058,7 +3622,7 @@ fn binding_kind_for_inline_policy(kind: crate::jit_interp::CallPolicyKind) -> Op
     }
 }
 
-fn helper_policy_path(expr: &Expr) -> Option<Path> {
+pub(super) fn helper_policy_path(expr: &Expr) -> Option<Path> {
     let Expr::Path(ExprPath { path, .. }) = expr else {
         return None;
     };
@@ -3106,7 +3670,7 @@ pub fn try_generate_jitcode_body_with_config(
 
 pub(crate) fn generate_inline_helper_jitcode_with_calls(
     func: &ItemFn,
-    calls: &[(Path, Option<crate::jit_interp::CallPolicyKind>)],
+    calls: &[crate::jit_interp::CallEntry],
 ) -> syn::Result<Option<InlineHelperJitCode>> {
     if !func.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -3130,12 +3694,12 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
 
     let call_policies = calls
         .iter()
-        .map(|(path, kind)| {
-            let spec = match kind {
-                Some(kind) => CallPolicySpec::Explicit(*kind),
+        .map(|entry| {
+            let spec = match entry.policy {
+                Some(kind) => CallPolicySpec::Explicit(kind),
                 None => CallPolicySpec::Infer,
             };
-            (canonical_path_segments(path), spec)
+            (canonical_path_segments(&entry.path), spec)
         })
         .collect();
     let mut lowerer =
@@ -3176,6 +3740,8 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         return Ok(None);
     };
 
+    let helper_name = func.sig.ident.to_string();
+    maybe_dump_liveness(&helper_name, &lowerer.op_metadata);
     let statements = lowerer.statements;
     Ok(Some(InlineHelperJitCode {
         body: quote! {
@@ -3257,6 +3823,7 @@ fn try_generate_jitcode_body_inner(
         lowerer.lower_stmt(stmt)?;
     }
 
+    maybe_dump_liveness("jitcode_body", &lowerer.op_metadata);
     let statements = lowerer.statements;
     Some(quote! {
         #(#statements)*
@@ -3271,6 +3838,110 @@ mod tests {
         let match_code = format!("match x {{ {code} => () }}");
         let expr: syn::ExprMatch = syn::parse_str(&match_code).expect("failed to parse match");
         expr.arms.into_iter().next().unwrap().pat
+    }
+
+    #[test]
+    fn liveness_records_alive_at_marker_after_use() {
+        // [marker, linear reads=[5]]
+        // backward: linear adds 5 → alive={5}; marker saves {5}.
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, vec![5], vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(result, vec![BTreeSet::from([5u16])]);
+    }
+
+    #[test]
+    fn liveness_def_kills_use_kept() {
+        // [marker, linear1 reads=[3], linear2 writes=[3] reads=[5]]
+        // backward: linear2 adds 5 (writes 3 first but alive empty);
+        //           linear1 adds 3; marker saves {3, 5}.
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, vec![3], vec![]),
+            OpMeta::linear(OpKind::BinopI, vec![5], vec![3]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(result, vec![BTreeSet::from([3u16, 5u16])]);
+    }
+
+    #[test]
+    fn liveness_jump_overwrites_alive_with_label_set() {
+        // [marker, jump L1, mark_label L2, reads=[7], mark_label L1, reads=[9]]
+        // backward single pass:
+        //   reads(9): alive={9}
+        //   mark_label L1: label_alive[L1]={9}, alive stays {9}
+        //   reads(7): alive={9,7}
+        //   mark_label L2: label_alive[L2]={9,7}, alive stays {9,7}
+        //   jump L1: alive = label_alive[L1] = {9}
+        //   marker: save {9}
+        let l1 = format_ident!("L1");
+        let l2 = format_ident!("L2");
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::jump(l1.clone()),
+            OpMeta::label_def(l2.clone()),
+            OpMeta::linear(OpKind::BinopI, vec![7], vec![]),
+            OpMeta::label_def(l1.clone()),
+            OpMeta::linear(OpKind::BinopI, vec![9], vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(result, vec![BTreeSet::from([9u16])]);
+    }
+
+    #[test]
+    fn liveness_back_edge_loop_reaches_fixed_point() {
+        // [mark_label START, marker, reads=[2], jump START]
+        // pass 1: jump finds label_alive[START]={}, then reads(2) → {2}, marker={2}, mark_label sets START={2}.
+        // pass 2: jump finds {2}, reads(2) keeps {2}, marker {2}, label unchanged → done.
+        let start = format_ident!("LOOP_START");
+        let ops = vec![
+            OpMeta::label_def(start.clone()),
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, vec![2], vec![]),
+            OpMeta::jump(start.clone()),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(result, vec![BTreeSet::from([2u16])]);
+    }
+
+    #[test]
+    fn liveness_conditional_guard_reads_cond_and_unions_branch_target() {
+        // [marker, conditional_guard cond_reg=4 → ELSE, reads=[6], mark_label ELSE, reads=[8]]
+        // backward:
+        //   reads(8): alive={8}
+        //   mark_label ELSE: label_alive[ELSE]={8}
+        //   reads(6): alive={8, 6}  (fall-through past ELSE in backward order)
+        //
+        //   Wait, "fall-through past ELSE" backward direction means we already passed reads(8) and
+        //   mark_label, now at reads(6). reads(6) sets alive={8,6}.
+        //
+        //   conditional_guard target=ELSE, reads=[4]: alive folds in label_alive[ELSE]={8}
+        //   → alive={8,6} (already had 8) ∪ {8} = {8,6}; then add reads [4] → {8,6,4}.
+        //   marker: save {8,6,4}.
+        let else_label = format_ident!("ELSE");
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::conditional_guard(4, else_label.clone()),
+            OpMeta::linear(OpKind::BinopI, vec![6], vec![]),
+            OpMeta::label_def(else_label.clone()),
+            OpMeta::linear(OpKind::BinopI, vec![8], vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(result, vec![BTreeSet::from([4u16, 6, 8])]);
+    }
+
+    #[test]
+    fn liveness_aux_is_pass_through() {
+        // [marker, aux, reads=[1]] — aux carries no def/use; alive at marker = {1}.
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::aux(),
+            OpMeta::linear(OpKind::BinopI, vec![1], vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(result, vec![BTreeSet::from([1u16])]);
     }
 
     #[test]
@@ -3309,14 +3980,14 @@ mod tests {
     fn inline_policy_with_kind(
         path: &str,
         kind: crate::jit_interp::CallPolicyKind,
-    ) -> (Path, Option<crate::jit_interp::CallPolicyKind>) {
-        (
-            syn::parse_str(path).expect("failed to parse path"),
-            Some(kind),
-        )
+    ) -> crate::jit_interp::CallEntry {
+        crate::jit_interp::CallEntry {
+            path: syn::parse_str(path).expect("failed to parse path"),
+            policy: Some(kind),
+        }
     }
 
-    fn inline_policy(path: &str) -> (Path, Option<crate::jit_interp::CallPolicyKind>) {
+    fn inline_policy(path: &str) -> crate::jit_interp::CallEntry {
         inline_policy_with_kind(path, crate::jit_interp::CallPolicyKind::InlineInt)
     }
 
@@ -3324,9 +3995,14 @@ mod tests {
         syn::parse_str(code).expect("failed to parse call")
     }
 
+    fn inline_call_tokens_combined(bindings: &[Binding], result_reg: u16) -> String {
+        let (call_match, post_live) = inline_call_tokens(bindings, result_reg);
+        format!("{} {}", call_match, post_live)
+    }
+
     #[test]
     fn inline_call_tokens_use_r_family_for_ref_only_args() {
-        let tokens = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7).to_string();
+        let tokens = inline_call_tokens_combined(&[binding(0, BindingKind::Ref)], 7);
         assert!(tokens.contains("inline_call_r_i"));
         assert!(tokens.contains("inline_call_r_r"));
         assert!(tokens.contains("inline_call_irf_f"));
@@ -3338,11 +4014,10 @@ mod tests {
 
     #[test]
     fn inline_call_tokens_use_ir_family_when_any_int_arg_is_present() {
-        let tokens = inline_call_tokens(
+        let tokens = inline_call_tokens_combined(
             &[binding(0, BindingKind::Ref), binding(1, BindingKind::Int)],
             9,
-        )
-        .to_string();
+        );
         assert!(tokens.contains("inline_call_ir_i"));
         assert!(tokens.contains("inline_call_ir_r"));
         assert!(tokens.contains("inline_call_irf_f"));
@@ -3354,11 +4029,10 @@ mod tests {
 
     #[test]
     fn inline_call_tokens_use_irf_family_when_any_float_arg_is_present() {
-        let tokens = inline_call_tokens(
+        let tokens = inline_call_tokens_combined(
             &[binding(0, BindingKind::Int), binding(1, BindingKind::Float)],
             11,
-        )
-        .to_string();
+        );
         assert!(tokens.contains("inline_call_irf_i"));
         assert!(tokens.contains("inline_call_irf_r"));
         assert!(tokens.contains("inline_call_irf_f"));
@@ -3366,6 +4040,16 @@ mod tests {
         assert!(!tokens.contains("inline_call_r_r"));
         assert!(!tokens.contains("inline_call_ir_i"));
         assert!(!tokens.contains("inline_call_ir_r"));
+    }
+
+    #[test]
+    fn inline_call_tokens_emit_post_call_live_marker() {
+        let (_, post_live) = inline_call_tokens(&[binding(0, BindingKind::Ref)], 7);
+        let post = post_live.to_string();
+        assert!(
+            post.contains("live_placeholder"),
+            "RPython jtransform.py emits inline_call followed by -live-"
+        );
     }
 
     #[test]

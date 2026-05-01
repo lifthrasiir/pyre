@@ -29,12 +29,12 @@ mod jit_struct;
 mod virtualizable;
 
 struct JitInlineArgs {
-    calls: Vec<(Path, Option<jit_interp::CallPolicyKind>)>,
+    calls: Vec<jit_interp::CallEntry>,
 }
 
 impl Parse for JitInlineArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut calls = Vec::new();
+        let mut calls: Vec<jit_interp::CallEntry> = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -44,7 +44,7 @@ impl Parse for JitInlineArgs {
                     syn::braced!(content in input);
                     while !content.is_empty() {
                         let func: Path = content.parse()?;
-                        let kind = if content.peek(Token![=>]) {
+                        let policy = if content.peek(Token![=>]) {
                             content.parse::<Token![=>]>()?;
                             let kind: Ident = content.parse()?;
                             Some(jit_interp::parse_call_policy_kind(&kind).ok_or_else(|| {
@@ -56,7 +56,7 @@ impl Parse for JitInlineArgs {
                         } else {
                             None
                         };
-                        calls.push((func, kind));
+                        calls.push(jit_interp::CallEntry { path: func, policy });
                         let _ = content.parse::<Token![,]>();
                     }
                 }
@@ -65,7 +65,10 @@ impl Parse for JitInlineArgs {
                     syn::bracketed!(content in input);
                     let paths: syn::punctuated::Punctuated<Path, Token![,]> =
                         content.parse_terminated(Path::parse, Token![,])?;
-                    calls.extend(paths.into_iter().map(|p| (p, None)));
+                    calls.extend(paths.into_iter().map(|p| jit_interp::CallEntry {
+                        path: p,
+                        policy: None,
+                    }));
                 }
                 other => {
                     return Err(syn::Error::new(

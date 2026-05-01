@@ -42,6 +42,16 @@ enum ObservedCall {
         args: Vec<i64>,
         result: i64,
     },
+    Ref {
+        func: usize,
+        args: Vec<i64>,
+        result: i64,
+    },
+    Float {
+        func: usize,
+        args: Vec<i64>,
+        result: i64,
+    },
 }
 
 /// Returns whether the current thread is running `JitCodeMachine::run_to_end`
@@ -166,6 +176,26 @@ pub fn record_observed_int_call(func: *const (), args: &[i64], result: i64) {
     });
 }
 
+pub fn record_observed_ref_call(func: *const (), args: &[i64], result: i64) {
+    OBSERVED_CALLS.with(|q| {
+        q.borrow_mut().push_back(ObservedCall::Ref {
+            func: func as usize,
+            args: args.to_vec(),
+            result,
+        });
+    });
+}
+
+pub fn record_observed_float_call(func: *const (), args: &[i64], result: i64) {
+    OBSERVED_CALLS.with(|q| {
+        q.borrow_mut().push_back(ObservedCall::Float {
+            func: func as usize,
+            args: args.to_vec(),
+            result,
+        });
+    });
+}
+
 pub fn consume_observed_void_call(func: *const (), args: &[i64]) -> bool {
     OBSERVED_CALLS.with(|q| {
         let mut q = q.borrow_mut();
@@ -202,6 +232,48 @@ pub fn consume_observed_int_call(func: *const (), args: &[i64]) -> Option<i64> {
                 Some(result)
             }
             other => observed_call_mismatch("int", func, args, other),
+        }
+    })
+}
+
+pub fn consume_observed_ref_call(func: *const (), args: &[i64]) -> Option<i64> {
+    OBSERVED_CALLS.with(|q| {
+        let mut q = q.borrow_mut();
+        let Some(front) = q.front() else {
+            return None;
+        };
+        match front {
+            ObservedCall::Ref {
+                func: observed_func,
+                args: observed_args,
+                result,
+            } if *observed_func == func as usize && observed_args.as_slice() == args => {
+                let result = *result;
+                q.pop_front();
+                Some(result)
+            }
+            other => observed_call_mismatch("ref", func, args, other),
+        }
+    })
+}
+
+pub fn consume_observed_float_call(func: *const (), args: &[i64]) -> Option<i64> {
+    OBSERVED_CALLS.with(|q| {
+        let mut q = q.borrow_mut();
+        let Some(front) = q.front() else {
+            return None;
+        };
+        match front {
+            ObservedCall::Float {
+                func: observed_func,
+                args: observed_args,
+                result,
+            } if *observed_func == func as usize && observed_args.as_slice() == args => {
+                let result = *result;
+                q.pop_front();
+                Some(result)
+            }
+            other => observed_call_mismatch("float", func, args, other),
         }
     })
 }
@@ -595,31 +667,34 @@ where
             // snapshot's `SnapshotFrame.pc` to the guard's resumepc
             // independent of the dispatcher's post-decode `frame.pc`.
             let total_slots = sym.total_slots();
-            let frame = self.frames.current_mut();
-            let saved_pc = frame.pc;
-            frame.pc = resume_pc;
-            // Save the local register slots that `populate_frame_int_regs`
-            // is about to overwrite. The state-field-JIT SYM and the
-            // currently-executing JitCode share `int_regs`: slots
-            // 0..total_slots mirror the JitState scalars (read by the
-            // snapshot below), but the JitCode's lowerer also allocates
-            // its locals starting at register 0. Without save/restore the
-            // populate_*_int_regs write would corrupt the JitCode's local
-            // state for any `BC_GOTO_IF_NOT` guard mid-opcode-body
-            // (observed empirically on aheui OP_PUSH where reg 1 holds
-            // `jit_tag_val(value)` between BC_CALL_PURE_INT and the
-            // residual stack_push).
-            //
-            // RPython `pyjitpl.py:2586 capture_resumedata` only swaps
-            // `frame.pc` and walks the framestack; register banks are
-            // never overwritten because RPython's MIFrame stores live
-            // boxes directly. pyre's state-field-JIT SYM materializes
-            // those scalars on demand via `populate_frame_int_regs`,
-            // hence the explicit save/restore pair below.
-            let n = total_slots.min(frame.int_regs.len());
-            let saved_int_regs: Vec<Option<OpRef>> = frame.int_regs[..n].to_vec();
-            let saved_int_values: Vec<Option<i64>> = frame.int_values[..n].to_vec();
-            sym.populate_frame_int_regs(frame);
+            let top_idx = self
+                .frames
+                .frames
+                .len()
+                .checked_sub(1)
+                .expect("record_state_guard: empty framestack");
+            let saved_top_pc = self.frames.frames[top_idx].pc;
+            self.frames.frames[top_idx].pc = resume_pc;
+            // RPython only swaps the top frame pc before
+            // `capture_resumedata`; it never writes portal state into an
+            // inline callee frame.  State-field JIT still needs to
+            // materialize `__JitSym` scalars into an MIFrame register bank,
+            // but the only orthodox destination is the root/portal frame.
+            let n = total_slots.min(self.frames.frames[0].int_regs.len());
+            let saved_int_regs: Vec<Option<OpRef>> = self.frames.frames[0].int_regs[..n].to_vec();
+            let saved_int_values: Vec<Option<i64>> = self.frames.frames[0].int_values[..n].to_vec();
+            let root_inflight_int_result =
+                if self.frames.frames.len() > 1 && self.frames.frames[0]._result_argcode == b'i' {
+                    self.frames.frames[0].result_arg_index.or_else(|| {
+                        let pc = self.frames.frames[0].pc;
+                        pc.checked_sub(1)
+                            .and_then(|idx| self.frames.frames[0].jitcode.code.get(idx).copied())
+                            .map(|idx| idx as usize)
+                    })
+                } else {
+                    None
+                };
+            sym.populate_frame_int_regs(&mut self.frames.frames[0]);
             // `self.portal_pc` is the trace_jitcode-entry program pc (set
             // by `run_to_end` at portal entry). We pack `portal_pc + 1`
             // into the snapshot's root `jitcode_index` so the resume-side
@@ -628,11 +703,26 @@ where
             // derive `pc - 1` for the trace's *current* op, which the
             // bridge has already executed.
             let program_pc = self.portal_pc + 1;
-            let snapshot = build_state_field_snapshot(self.frames, total_slots, program_pc as u32);
-            let frame = self.frames.current_mut();
-            frame.int_regs[..n].copy_from_slice(&saved_int_regs);
-            frame.int_values[..n].copy_from_slice(&saved_int_values);
-            frame.pc = saved_pc;
+            let op_live = ctx.metainterp_sd().op_live as u8;
+            let all_liveness = ctx.metainterp_sd().liveness_info.clone();
+            let snapshot = build_state_field_snapshot(
+                self.frames,
+                program_pc as u32,
+                op_live,
+                &all_liveness,
+                &mut ctx.constants,
+            );
+            for idx in 0..n {
+                // RPython pyjitpl.py:180-193 leaves the parent frame's
+                // in-flight int result slot cleared after get_list_of_active_boxes(True).
+                // Preserve that mutation instead of restoring the pre-snapshot
+                // state-field materialization save.
+                if Some(idx) != root_inflight_int_result {
+                    self.frames.frames[0].int_regs[idx] = saved_int_regs[idx];
+                    self.frames.frames[0].int_values[idx] = saved_int_values[idx];
+                }
+            }
+            self.frames.frames[top_idx].pc = saved_top_pc;
             let snapshot_id = ctx.capture_resumedata(snapshot);
             ctx.set_last_guard_resume_position(snapshot_id);
         } else {
@@ -1522,6 +1612,30 @@ where
                     let return_i = decode_return_slot(frame);
                     let return_r = decode_return_slot(frame);
                     let return_f = decode_return_slot(frame);
+                    let mut result_slots = 0usize;
+                    let mut result_argcode = b'v';
+                    let mut result_arg_index = None;
+                    if let Some(dst) = return_i {
+                        result_slots += 1;
+                        result_argcode = b'i';
+                        result_arg_index = Some(dst);
+                    }
+                    if let Some(dst) = return_r {
+                        result_slots += 1;
+                        result_argcode = b'r';
+                        result_arg_index = Some(dst);
+                    }
+                    if let Some(dst) = return_f {
+                        result_slots += 1;
+                        result_argcode = b'f';
+                        result_arg_index = Some(dst);
+                    }
+                    assert!(
+                        result_slots <= 1,
+                        "BC_INLINE_CALL encodes more than one return slot; RPython call snapshots support one result"
+                    );
+                    frame._result_argcode = result_argcode;
+                    frame.result_arg_index = result_arg_index;
                     frame.pc = frame.code_cursor;
                     (sub_idx, arg_triples, return_i, return_r, return_f)
                 };
@@ -1646,15 +1760,15 @@ where
                         _ => unreachable!(),
                     }
                     call_void_function(concrete_ptr, &concrete_args);
-                    if in_observer_mode() && trace_ptr == concrete_ptr {
-                        // Skip record when the codewriter installed a
-                        // generated wrapper (`*_wrapped` policy: trace_ptr
-                        // != concrete_ptr). The outer Rust body's helper
-                        // reference (`#func as *const ()`) cannot recover
-                        // the wrapper symbol, so a wrapped record would
-                        // leave a queue entry that mismatches the next
-                        // plain-helper consume — see `replay_kind_for_policy`
-                        // KNOWN GAP block in `majit-macros/src/jit_interp/mod.rs`.
+                    if in_observer_mode() {
+                        // Always record using `concrete_ptr`: for plain
+                        // policies it equals the helper symbol; for
+                        // `*_wrapped` it is the codewriter-generated
+                        // wrapper. The outer-side consume in
+                        // `observer_replay_for_call`
+                        // (`majit-macros/src/jit_interp/mod.rs`) recovers
+                        // the wrapper symbol via `helper_policy_path`
+                        // for wrapped variants so the queue keys match.
                         record_observed_void_call(concrete_ptr, &concrete_args);
                     }
                     if bytecode == jitcode::BC_CALL_MAY_FORCE_VOID
@@ -1723,8 +1837,8 @@ where
                         ctx.cond_call_void_typed(first_val, trace_ptr, &args, &arg_types);
                         if first_val != 0 {
                             call_void_function(concrete_ptr, &concrete_args);
-                            // Wrapped helpers skip record (see BC_RESIDUAL_CALL_VOID).
-                            if in_observer_mode() && trace_ptr == concrete_ptr {
+                            // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
+                            if in_observer_mode() {
                                 record_observed_void_call(concrete_ptr, &concrete_args);
                             }
                         }
@@ -1737,8 +1851,8 @@ where
                             ctx.cond_call_value_int_typed(first_val, trace_ptr, &args, &arg_types);
                         let concrete_result = if first_val == 0 {
                             let result = call_int_function(concrete_ptr, &concrete_args);
-                            // Wrapped helpers skip record (see BC_RESIDUAL_CALL_VOID).
-                            if in_observer_mode() && trace_ptr == concrete_ptr {
+                            // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
+                            if in_observer_mode() {
                                 record_observed_int_call(concrete_ptr, &concrete_args, result);
                             }
                             result
@@ -1760,9 +1874,12 @@ where
                             ctx.cond_call_value_ref_typed(first_val, trace_ptr, &args, &arg_types);
                         let concrete_result = if first_val == 0 {
                             let result = call_int_function(concrete_ptr, &concrete_args);
-                            // Wrapped helpers skip record (see BC_RESIDUAL_CALL_VOID).
-                            if in_observer_mode() && trace_ptr == concrete_ptr {
-                                record_observed_int_call(concrete_ptr, &concrete_args, result);
+                            // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
+                            // Ref-shaped result: queue entry uses the Ref
+                            // variant so a wrapped Ref policy's
+                            // `consume_observed_ref_call` matches.
+                            if in_observer_mode() {
+                                record_observed_ref_call(concrete_ptr, &concrete_args, result);
                             }
                             result
                         } else {
@@ -1859,13 +1976,10 @@ where
                     // pyjitpl.py:1941-1948: CALL_PURE records plain CALL
                     // first, executes, then patches via record_result_of_call_pure.
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    // Wrapped helpers skip record (see BC_RESIDUAL_CALL_VOID);
+                    // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID);
                     // CALL_PURE is exempt because pure re-execution is harmless
                     // and `record_result_of_call_pure` already folds the result.
-                    if in_observer_mode()
-                        && opcode != jitcode::BC_CALL_PURE_INT
-                        && trace_ptr == concrete_ptr
-                    {
+                    if in_observer_mode() && opcode != jitcode::BC_CALL_PURE_INT {
                         record_observed_int_call(concrete_ptr, &concrete_args, concrete);
                     }
                     let traced = match opcode {
@@ -1980,6 +2094,12 @@ where
                         None
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID);
+                    // CALL_PURE is exempt because pure re-execution is harmless
+                    // and `record_result_of_call_pure` already folds the result.
+                    if in_observer_mode() && opcode != jitcode::BC_CALL_PURE_REF {
+                        record_observed_ref_call(concrete_ptr, &concrete_args, concrete);
+                    }
                     let traced = match opcode {
                         jitcode::BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
                         jitcode::BC_CALL_PURE_REF => {
@@ -2092,6 +2212,12 @@ where
                         None
                     };
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
+                    // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID);
+                    // CALL_PURE is exempt because pure re-execution is harmless
+                    // and `record_result_of_call_pure` already folds the result.
+                    if in_observer_mode() && opcode != jitcode::BC_CALL_PURE_FLOAT {
+                        record_observed_float_call(concrete_ptr, &concrete_args, concrete);
+                    }
                     let traced = match opcode {
                         jitcode::BC_CALL_FLOAT => {
                             ctx.call_float_typed(trace_ptr, &args, &arg_types)
@@ -2953,24 +3079,14 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// Build a multi-frame `recorder::Snapshot` over the framestack for a
 /// state-field-JIT guard.
 ///
-/// PRE-EXISTING-ADAPTATION (state-field JIT divergence — Task #89
-/// framestack-lift Session 3b-3a):  RPython captures snapshots by
-/// walking `MetaInterp.framestack` and reading per-frame liveness via
-/// `MIFrame.get_list_of_active_boxes`
-/// (`opencoder.py:819 capture_resumedata`); pyre's state-field JIT
-/// instead has the macro-generated `JitCodeSym::populate_frame_int_regs`
-/// (Session 3a-prep) copy `__JitSym` slots into
-/// `frame.int_regs` / `int_values` at the canonical liveness indices
-/// declared by `live_slots_for_state_field_jit` (Task #89 orth-6).
-///
-/// Each `frame.int_regs[i]` is encoded as
-/// `SnapshotTagged::Box(opref.0, Type::Int)`; `OpRef.0` already
-/// distinguishes constants (CONST_BIT high bit) from live boxes, so the
-/// downstream consumer (`tagged_to_opref` in
-/// `pyjitpl/mod.rs:263 finish_trace_for_parity`) decodes both cases via
-/// `OpRef::is_constant` (matching opencoder.py:603 `_encode`'s TAGBOX vs
-/// TAGCONST split).  `None` slots map to `OpRef::NONE.0` — same fallback
-/// `history.rs:425` emits for unmapped post-cut Boxes.
+/// RPython captures snapshots by walking `MetaInterp.framestack` and
+/// reading per-frame liveness via `MIFrame.get_list_of_active_boxes`
+/// (`opencoder.py:819 capture_resumedata`).  The Rust state-field JIT
+/// follows the same consumer shape: each frame decodes the current
+/// BC_LIVE liveness entry and emits only live int/ref/float registers.
+/// The macro-generated `JitCodeSym::populate_frame_int_regs` bridge is
+/// only used to materialize root state fields into the root frame's
+/// register banks before this PyPy-shaped walk.
 ///
 /// `program_pc` carries the outer interpreter pc (= what the
 /// state-field-JIT factory needs to rebuild the root per-opcode
@@ -2985,51 +3101,38 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// Multi-frame walk parallels RPython
 /// `opencoder.py:819 capture_resumedata` + `_ensure_parent_resumedata`:
 /// emit a `SnapshotFrame` per `MIFrame` from outermost (root) to
-/// innermost (top). The root frame packs `program_pc` into
-/// `jitcode_index`; non-root frames pack `MIFrame.parent_descr_idx`
-/// (set by `BC_INLINE_CALL` at sub-frame setup), so the resume-side
-/// `resolve_jitcode` callback can walk
-/// `parent.descrs[idx].as_jitcode()` rather than re-invoking the
-/// factory for sub-jitcodes that have no program-pc meaning.
+/// innermost (top). Parent snapshots pass `in_a_call = true`, matching
+/// `opencoder.py:769 _ensure_parent_resumedata`, so the in-flight inline
+/// call result register is cleared before liveness is read. The root frame
+/// packs `program_pc` into `jitcode_index`; non-root frames pack
+/// `MIFrame.parent_descr_idx` (set by `BC_INLINE_CALL` at sub-frame setup),
+/// so the resume-side `resolve_jitcode` callback can walk
+/// `parent.descrs[idx].as_jitcode()` rather than re-invoking the factory
+/// for sub-jitcodes that have no program-pc meaning.
 ///
-/// `num_slots` is the canonical liveness slot count for the *root*
-/// portal frame's `JitCodeSym`; sub-frames use their own register
-/// allocation (the lib function's lowered jitcode), so we emit boxes
-/// for every populated slot in `int_regs` directly.
 pub fn build_state_field_snapshot(
-    frames: &MIFrameStack,
-    num_slots: usize,
+    frames: &mut MIFrameStack,
     program_pc: u32,
+    op_live: u8,
+    all_liveness: &[u8],
+    pool: &mut crate::constant_pool::ConstantPool,
 ) -> crate::recorder::Snapshot {
     let frame_count = frames.frames.len();
     let mut snapshot_frames = Vec::with_capacity(frame_count);
     // Walk outer → inner (RPython _ensure_parent_resumedata convention).
-    for (i, frame) in frames.frames.iter().enumerate() {
-        // Root frame uses the canonical liveness layout; sub-frames
-        // emit one box per populated register slot.
-        //
-        // KNOWN GAP vs PyPy `MIFrame.get_list_of_active_boxes`
-        // (pyjitpl.py:177-234): PyPy reads `live_i / live_r / live_f`
-        // off the per-pc LIVE header and emits typed boxes per bank.
-        // The state-field-JIT path has no per-guard LIVE header today,
-        // so we conservatively emit only the int bank and tag each box
-        // `Type::Int`. This is observably correct for traces whose
-        // sub-frame inline helpers stay int-shaped (aheui Phase D-1
-        // monomorphic helpers); reaching for a ref / float live
-        // register inside an inline call would silently corrupt the
-        // blackhole resume stream until a per-guard liveness header
-        // lands.
-        let n = if i == 0 {
-            num_slots.min(frame.int_regs.len())
-        } else {
-            frame.int_regs.len()
-        };
-        let boxes: Vec<crate::recorder::SnapshotTagged> = (0..n)
-            .map(|j| {
-                let opref = frame.int_regs[j].unwrap_or(majit_ir::OpRef::NONE);
-                crate::recorder::SnapshotTagged::Box(opref.0, majit_ir::Type::Int)
-            })
-            .collect();
+    for (i, frame) in frames.frames.iter_mut().enumerate() {
+        let is_top = i + 1 == frame_count;
+        // RPython opencoder.py:769/808:
+        // top snapshot calls get_list_of_active_boxes(False, ...);
+        // parent snapshots call get_list_of_active_boxes(True, ...), which
+        // clears the in-flight call result register before reading liveness.
+        let boxes = frame.get_list_of_active_snapshot_boxes(
+            !is_top,
+            if is_top { None } else { Some(&mut *pool) },
+            op_live,
+            all_liveness,
+            /* after_residual_call */ false,
+        );
         let jitcode_index = if i == 0 {
             program_pc
         } else {
@@ -3773,34 +3876,42 @@ mod tests {
 
     #[test]
     fn build_state_field_snapshot_emits_box_tags_for_populated_slots() {
-        // Mirror the canonical layout
-        // (`live_slots_for_state_field_jit(num_scalars=2, array_lens=&[3],
-        // num_virt_arrays=0)`): scalars at slot 0..2, then a 3-element
-        // array at slot 2..5. Helper must encode each as
-        // `SnapshotTagged::Box(opref.0, Type::Int)`.
+        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         for i in 0..5 {
             builder.load_const_i_value(i, 0);
         }
+        builder.live(&mut asm, &[0, 1, 2, 3, 4], &[], &[]);
+        let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
         jitcode.set_index(7);
-        let mut frame = MIFrame::new(jitcode, 3);
+        let mut frame = MIFrame::new(jitcode, pc);
         frame.int_regs[0] = Some(majit_ir::OpRef(10));
+        frame.int_values[0] = Some(100);
         frame.int_regs[1] = Some(majit_ir::OpRef(11));
+        frame.int_values[1] = Some(101);
         for i in 0..3 {
             frame.int_regs[2 + i] = Some(majit_ir::OpRef(20 + i as u32));
+            frame.int_values[2 + i] = Some(200 + i as i64);
         }
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
+        let mut pool = crate::constant_pool::ConstantPool::new();
 
-        let snapshot = build_state_field_snapshot(&stack, 5, 42);
+        let snapshot = build_state_field_snapshot(
+            &mut stack,
+            42,
+            jitcode::BC_LIVE,
+            asm.all_liveness(),
+            &mut pool,
+        );
 
         assert_eq!(snapshot.frames.len(), 1);
         assert!(snapshot.vable_boxes.is_empty());
         assert!(snapshot.vref_boxes.is_empty());
         let f = &snapshot.frames[0];
         assert_eq!(f.jitcode_index, 42);
-        assert_eq!(f.pc, 3);
+        assert_eq!(f.pc, pc as u32);
         assert_eq!(
             f.boxes,
             vec![
@@ -3814,64 +3925,138 @@ mod tests {
     }
 
     #[test]
-    fn build_state_field_snapshot_uses_none_for_empty_slots() {
-        // history.rs:425 fallback parity: an unpopulated `int_regs[i]`
-        // must emit `OpRef::NONE.0` rather than panic, so a snapshot
-        // captured while only some scalars have been bound by the
-        // macro-generated `populate_frame_int_regs` still round-trips.
+    fn build_state_field_snapshot_uses_live_indices_only() {
+        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         for i in 0..3 {
             builder.load_const_i_value(i, 0);
         }
+        builder.live(&mut asm, &[1], &[], &[]);
+        let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
-        let mut frame = MIFrame::new(jitcode, 0);
+        let mut frame = MIFrame::new(jitcode, pc);
         frame.int_regs[1] = Some(majit_ir::OpRef(42));
-        // slot 0 + slot 2 left as `None`.
+        frame.int_values[1] = Some(420);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
+        let mut pool = crate::constant_pool::ConstantPool::new();
 
-        let snapshot = build_state_field_snapshot(&stack, 3, 0);
+        let snapshot = build_state_field_snapshot(
+            &mut stack,
+            0,
+            jitcode::BC_LIVE,
+            asm.all_liveness(),
+            &mut pool,
+        );
 
         let f = &snapshot.frames[0];
         assert_eq!(
             f.boxes,
-            vec![
-                crate::recorder::SnapshotTagged::Box(majit_ir::OpRef::NONE.0, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(42, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(majit_ir::OpRef::NONE.0, majit_ir::Type::Int),
-            ]
+            vec![crate::recorder::SnapshotTagged::Box(
+                42,
+                majit_ir::Type::Int
+            )]
         );
     }
 
     #[test]
-    fn build_state_field_snapshot_clamps_num_slots_to_int_regs_len() {
-        // A caller passing a `num_slots` larger than the frame's
-        // `int_regs.len()` must not panic — emit only as many slots as
-        // the frame can supply. This guards the wire-up path against
-        // accidental over-reads when a state's canonical liveness layout
-        // overflows the frame's allocated register window.
+    fn build_state_field_snapshot_subframe_uses_liveness_and_clears_result_slot() {
+        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
+        let mut root_builder = JitCodeBuilder::new();
+        root_builder.load_const_i_value(0, 0);
+        root_builder.live(&mut asm, &[0], &[], &[]);
+        let root_live_pc =
+            root_builder.current_pos() - (majit_translate::liveness::OFFSET_SIZE + 1);
+        let root_jitcode = std::sync::Arc::new(root_builder.finish());
+        let mut root = MIFrame::new(root_jitcode, root_live_pc);
+        root.int_regs[0] = Some(majit_ir::OpRef(100));
+        root.int_values[0] = Some(1000);
+        root._result_argcode = b'i';
+        root.result_arg_index = Some(0);
+
+        let mut sub_builder = JitCodeBuilder::new();
+        sub_builder.load_const_i_value(0, 0);
+        sub_builder.load_const_r_value(0, 0);
+        sub_builder.load_const_f_value(0, 0);
+        sub_builder.live(&mut asm, &[0], &[0], &[0]);
+        let sub_pc = sub_builder.current_pos();
+        let sub_jitcode = std::sync::Arc::new(sub_builder.finish());
+        let mut sub = MIFrame::new(sub_jitcode, sub_pc);
+        sub.parent_descr_idx = 3;
+        sub.int_regs[0] = Some(majit_ir::OpRef(11));
+        sub.int_values[0] = Some(110);
+        sub.ref_regs[0] = Some(majit_ir::OpRef(22));
+        sub.ref_values[0] = Some(220);
+        sub.float_regs[0] = Some(majit_ir::OpRef(33));
+        sub.float_values[0] = Some(330);
+
+        let mut stack = MIFrameStack::empty();
+        stack.frames.push(root);
+        stack.frames.push(sub);
+        let mut pool = crate::constant_pool::ConstantPool::new();
+
+        let snapshot = build_state_field_snapshot(
+            &mut stack,
+            7,
+            jitcode::BC_LIVE,
+            asm.all_liveness(),
+            &mut pool,
+        );
+        assert_eq!(snapshot.frames.len(), 2);
+        let root_frame = &snapshot.frames[0];
+        assert_eq!(root_frame.jitcode_index, 7);
+        assert_eq!(
+            root_frame.boxes,
+            vec![crate::recorder::SnapshotTagged::Const(
+                0,
+                majit_ir::Type::Int
+            )]
+        );
+        let sub_frame = &snapshot.frames[1];
+        assert_eq!(sub_frame.jitcode_index, 3);
+        assert_eq!(sub_frame.pc, sub_pc as u32);
+        assert_eq!(
+            sub_frame.boxes,
+            vec![
+                crate::recorder::SnapshotTagged::Box(11, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(22, majit_ir::Type::Ref),
+                crate::recorder::SnapshotTagged::Box(33, majit_ir::Type::Float),
+            ],
+            "top sub-frame boxes must come from live_i/live_r/live_f in bank order"
+        );
+    }
+
+    #[test]
+    fn build_state_field_snapshot_reads_constants_from_liveness() {
+        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 0);
-        builder.load_const_i_value(1, 0);
+        let const_slot = 1u8;
+        builder.live(&mut asm, &[const_slot], &[], &[]);
+        let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
-        let mut frame = MIFrame::new(jitcode, 0);
+        let mut frame = MIFrame::new(jitcode, pc);
         frame.int_regs[0] = Some(majit_ir::OpRef(5));
-        frame.int_regs[1] = Some(majit_ir::OpRef(6));
-        let regs_len = frame.int_regs.len();
+        frame.int_values[0] = Some(50);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
+        let mut pool = crate::constant_pool::ConstantPool::new();
 
-        let snapshot = build_state_field_snapshot(&stack, 99, 0);
+        let snapshot = build_state_field_snapshot(
+            &mut stack,
+            0,
+            jitcode::BC_LIVE,
+            asm.all_liveness(),
+            &mut pool,
+        );
 
         let f = &snapshot.frames[0];
-        assert_eq!(f.boxes.len(), regs_len);
         assert_eq!(
-            f.boxes[0],
-            crate::recorder::SnapshotTagged::Box(5, majit_ir::Type::Int)
-        );
-        assert_eq!(
-            f.boxes[1],
-            crate::recorder::SnapshotTagged::Box(6, majit_ir::Type::Int)
+            f.boxes,
+            vec![crate::recorder::SnapshotTagged::Const(
+                0,
+                majit_ir::Type::Int
+            )]
         );
     }
 }
