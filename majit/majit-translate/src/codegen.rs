@@ -1569,6 +1569,15 @@ pub fn generated_list_pop_by_strategy(
     let len_descr_idx = len_descr.index();
 
     let len = crate::state::opimpl_getfield_gc_i(ctx, list, len_descr.clone());
+    // RPython `ll_pop_default` parity (rtyper/rlist.py:633-634):
+    //   `ll_assert(length > 0, "pop from empty list")`
+    // Emit a trace-level guard so the compiled code deoptimizes instead
+    // of reading at index -1 when len happens to be 0 at runtime.
+    // (Caller verifies concrete_len > 0, but the guard anchors the
+    // invariant in the compiled trace independently.)
+    let zero = ctx.const_int(0);
+    let non_empty = ctx.record_op(OpCode::IntGt, &[len, zero]);
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[non_empty]);
     let one = ctx.const_int(1);
     // `IntSub(cached_const, 1)` is constant-folded by the optimizer when
     // heap_cache resolved `len` to a constant; otherwise it remains a
@@ -1581,6 +1590,16 @@ pub fn generated_list_pop_by_strategy(
         0 => {
             let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
             let item = crate::state::trace_items_block_getitem_value(ctx, items_block, last_index);
+            // RPython `ll_pop_default` parity (rtyper/rlist.py:641-643):
+            //   `null = ll_null_item(l)`
+            //   `if null is not None: l.ll_setitem_fast(index, null)`
+            // For Object strategy, item type is Ptr → ll_null_item returns a
+            // null pointer. Clear the slot so the GC does not retain the
+            // popped object via a stale items-array reference.
+            // Int/Float strategies store primitives, not pointers, so
+            // ll_null_item returns None for them (no clear needed).
+            let null_ref = ctx.const_ref(0);
+            crate::state::trace_items_block_setitem_value(ctx, items_block, last_index, null_ref);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
             ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
             item
