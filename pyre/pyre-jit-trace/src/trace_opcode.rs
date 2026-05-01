@@ -4714,9 +4714,19 @@ impl MIFrame {
             return self.trace_call_callable(callable, args);
         }
 
-        // `lst.<method>(...)` flow: `baseobjspace::getattr` returns a fresh
-        // `W_MethodObject` per iteration, so the receiver is pushed by
-        // `load_method` as `null_value` (load_method:6334) and call sees
+        // PRE-EXISTING-ADAPTATION. RPython recognizes `lst.append(i)` /
+        // `lst.pop()` at codewriter time via `@oopspec("list.append")`
+        // (`rpython/rtyper/extregistry.py` registration consumed by
+        // `rpython/jit/codewriter/jtransform.py:do_resizable_list_append`),
+        // which rewrites the IR before tracing ever runs. Pyre's
+        // codewriter is `partial` (per `majit/COMPATIBILITY_MATRIX.md`),
+        // so the analogous specialization happens here at trace recording
+        // time instead. Convergence path: port the codewriter's oopspec
+        // pass and remove this arm.
+        //
+        // `baseobjspace::getattr` returns a fresh `W_MethodObject` per
+        // iteration, so the receiver is pushed by `load_method` as
+        // `null_value` (load_method:6334) and call sees
         // `concrete_callable = W_MethodObject`, with the receiver missing
         // from `args`. Recover the receiver via `GetfieldGcR(callable,
         // w_self)` after guarding the method object's class. The function

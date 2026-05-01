@@ -4085,17 +4085,27 @@ fn unsupported_semantics(opcode: OpCode, detail: &str) -> BackendError {
 }
 
 /// Scan `ops[op_idx + 1..]` for the paired `GuardNotForced(_2)` of a
-/// `CallMayForce*` / `CallReleaseGil*`. RPython
-/// (`assembler.py:2234-2244 _genop_call_may_force` /
-/// `_genop_call_release_gil`) takes that guard via
-/// `_find_nearby_operation(+1)` because RPython traces always have the
-/// guard immediately after the call. Pyre's optimizer is allowed to slot
-/// non-guard ops (`NewWithVtable`, `SetfieldGc` from virtual-forcing) in
-/// between, so the strict +1 check rejected list-method-heavy traces
-/// (e.g. `lst.append(i)` loops) even though the codegen below tolerates
-/// the gap: `guard_idx` only advances on guards, so as long as no *other*
-/// guard precedes the paired `GuardNotForced`, `guard_infos[guard_idx]`
-/// already points at it.
+/// `CallMayForce*` / `CallReleaseGil*`.
+///
+/// PRE-EXISTING-ADAPTATION. RPython
+/// (`rpython/jit/backend/x86/assembler.py:2234-2235 _genop_call_may_force`
+/// / `:2242-2244 _genop_call_release_gil`) takes that guard via
+/// `_find_nearby_operation(+1)` and asserts `isinstance(GuardOp)`.
+/// Upstream's invariant holds because `optimizeopt/heap.py` does not
+/// schedule `NEW_WITH_VTABLE` / `SETFIELD_GC` between a force-able call
+/// and its paired guard. Pyre's heap pass currently does — the virtual
+/// forcing it inserts to satisfy `GuardNotForced`'s fail_args lands in
+/// the gap — so a strict +1 check spuriously rejects list-method-heavy
+/// traces (e.g. `lst.append(i)` loops) even though the codegen below
+/// tolerates the gap: `guard_idx` only advances on guards, so as long
+/// as no *other* guard precedes the paired `GuardNotForced`,
+/// `guard_infos[guard_idx]` already points at it.
+///
+/// Convergence path: align pyre's `optimizeopt/heap.py` op-scheduling
+/// with upstream so virtual-forcing materialization happens *before*
+/// the call and `GuardNotForced` lands at +1 unconditionally. Once
+/// that lands this scanner can collapse back to upstream's `+1`-only
+/// check.
 fn check_paired_guard_not_forced(
     ops: &[Op],
     op_idx: usize,
