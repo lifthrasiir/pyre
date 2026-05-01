@@ -3776,15 +3776,25 @@ mod tests {
 
         // Mirrors `goto_if_not_int_lt_records_compare_and_guard_false`:
         // 5 < 3 is false, so the guard records `IntLt` + `GuardFalse`.
+        let mut asm = majit_translate::jit_codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
         let target = builder.new_label();
         builder.load_const_i_value(0, 5);
         builder.load_const_i_value(1, 3);
+        builder.load_const_i_value(2, 0);
+        builder.live(&mut asm, &[0, 1, 2], &[], &[]);
         builder.goto_if_not_int_lt(0, 1, target);
         builder.mark_label(target);
         let jitcode = builder.finish();
 
-        let mut ctx = TraceCtx::for_test(0);
+        let mut staticdata = crate::MetaInterpStaticData::new();
+        staticdata.op_live = crate::jitcode::BC_LIVE as i32;
+        staticdata.liveness_info = asm.all_liveness().to_vec();
+        let mut ctx = TraceCtx::new(
+            crate::recorder::Trace::new(),
+            0,
+            std::sync::Arc::new(staticdata),
+        );
         // Pre-populate three plausible state-field OpRefs (50, 51, 52)
         // — the actual values are arbitrary; the snapshot must mirror
         // them slot-for-slot post-`populate_frame_int_regs`.

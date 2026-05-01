@@ -949,6 +949,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             fn populate_frame_for_guard(
                 sym: &__JitSym,
                 frames: &mut majit_metainterp::MIFrameStack,
+                __op_live: u8,
+                __all_liveness: &[u8],
             ) -> Option<majit_metainterp::recorder::Snapshot> {
                 use majit_metainterp::JitCodeSym as _;
                 if frames.frames.is_empty() {
@@ -967,10 +969,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                 // pc captured by `begin_portal_op`, in the same factory-key
                 // convention as dispatch-level state guards.
                 let program_pc = (sym.current_portal_pc + 1) as u32;
+                let mut __pool = majit_metainterp::ConstantPool::new();
                 let __snapshot = majit_metainterp::build_state_field_snapshot(
                     frames,
-                    __total_slots,
                     program_pc,
+                    __op_live,
+                    __all_liveness,
+                    &mut __pool,
                 );
                 let __root = &mut frames.frames[0];
                 __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);

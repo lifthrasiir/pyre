@@ -436,6 +436,8 @@ pub trait JitState: Sized {
     fn populate_frame_for_guard(
         _sym: &Self::Sym,
         _frames: &mut crate::pyjitpl::MIFrameStack,
+        _op_live: u8,
+        _all_liveness: &[u8],
     ) -> Option<crate::recorder::Snapshot> {
         None
     }

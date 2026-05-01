@@ -1019,10 +1019,16 @@ impl<S: JitState> JitDriver<S> {
                 // low-level driver and dissolves once Task #89 lifts
                 // `S::Sym` into `MIFrame::populate_for_guard` so every
                 // path captures uniformly via the framestack walk.
-                let pre_snapshot = self
-                    .sym
-                    .as_ref()
-                    .and_then(|sym| S::populate_frame_for_guard(sym, &mut self.meta.framestack));
+                let op_live = self.meta.staticdata.op_live as u8;
+                let all_liveness = self.meta.staticdata.liveness_info.clone();
+                let pre_snapshot = self.sym.as_ref().and_then(|sym| {
+                    S::populate_frame_for_guard(
+                        sym,
+                        &mut self.meta.framestack,
+                        op_live,
+                        &all_liveness,
+                    )
+                });
                 let mut current_live = self
                     .sym
                     .as_ref()
