@@ -38,8 +38,20 @@ pub struct NurseryPtrs {
     pub top: *const u8,
 }
 
-/// Default nursery size: 896KB, matching incminimark's TRANSLATION_PARAMS.
-pub const DEFAULT_NURSERY_SIZE: usize = 896 * 1024;
+/// incminimark.py:240 fallback `TRANSLATION_PARAMS["nursery_size"]`.
+///
+/// This is not the usual runtime nursery size when `read_from_env=True`:
+/// incminimark.py:467-470 first asks the environment/cache estimator and
+/// only falls back to this value if that fails.
+pub const TRANSLATION_NURSERY_SIZE: usize = 896 * 1024;
+
+/// env.py:441 `NURSERY_SIZE_UNKNOWN_CACHE`.
+///
+/// PyPy's translated incminimark normally estimates the nursery from cache
+/// size, but its documented fallback is 4MB.  majit does not yet implement
+/// the platform-specific cache probe, so `GcConfig::default` uses this after
+/// checking `PYPY_GC_NURSERY`.
+pub const DEFAULT_NURSERY_SIZE: usize = 4 * 1024 * 1024;
 
 /// Nursery memory region with bump-pointer allocation.
 ///

@@ -324,7 +324,12 @@ impl PyreMetaInterp {
                 let has_exc = {
                     let top = self.framestack.last().unwrap();
                     let sym = unsafe { &*top.sym };
-                    !sym.last_exc_value.is_null()
+                    // pyjitpl.py:2506 finishframe_exception is reached
+                    // only after opimpl_raise/handle_possible_exception has
+                    // populated both last_exc_value and last_exc_box.  A
+                    // concrete-only exception without a box cannot be encoded
+                    // as compile_exit_frame_with_exception(valuebox).
+                    !sym.last_exc_value.is_null() && sym.last_exc_box != OpRef::NONE
                 };
                 if has_exc {
                     if let Some(action) = self.finishframe_exception(ctx) {

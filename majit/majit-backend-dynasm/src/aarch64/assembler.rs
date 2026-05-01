@@ -28,7 +28,7 @@ use crate::jitframe::{
     JF_GUARD_EXC_OFS,
 };
 use crate::regalloc::{RegAlloc, RegAllocOp};
-use crate::regloc::Loc;
+use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
 
 const AARCH64_GEN_REGS: [crate::regloc::RegLoc; 16] = crate::aarch64::registers::ALL_REGS;
@@ -1111,9 +1111,9 @@ impl AssemblerARM64 {
     /// assembler.py:993 push_gcmap.
     fn push_gcmap(&mut self, gcmap: *mut usize) {
         let gcmap_ptr = gcmap as i64;
-        self.emit_mov_imm64(0, gcmap_ptr);
+        self.emit_mov_imm64(16, gcmap_ptr);
         dynasm!(self.mc ; .arch aarch64
-            ; str x0, [x29, JF_GCMAP_OFS as u32]
+            ; str x16, [x29, JF_GCMAP_OFS as u32]
         );
     }
 
@@ -1122,6 +1122,26 @@ impl AssemblerARM64 {
         dynasm!(self.mc ; .arch aarch64
             ; str xzr, [x29, JF_GCMAP_OFS as u32]
         );
+    }
+
+    /// RPython `AbstractCallBuilder.emit`: CALL_ASSEMBLER is a collecting
+    /// call, so the caller jitframe must publish the regalloc gcmap before
+    /// jumping into the callee and clear it only after reloading a possibly
+    /// moved frame pointer.
+    fn push_pending_call_gcmap(&mut self) -> bool {
+        if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+            self.push_gcmap(gcmap as *mut usize);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pop_pending_call_gcmap_after_collect(&mut self, pushed: bool) {
+        self.reload_frame_if_necessary();
+        if pushed {
+            self.pop_gcmap();
+        }
     }
 
     /// aarch64/assembler.py:967 `_reload_frame_if_necessary` parity:
@@ -1146,6 +1166,57 @@ impl AssemblerARM64 {
             ; sub x16, x16, 8           // ip0 -= WORD
             ; ldr x29, [x16]            // fp = *(top - WORD) = jf_ptr
         );
+        // aarch64/assembler.py:972-976 `_reload_frame_if_necessary`:
+        // after a collecting helper call, re-apply the non-array write
+        // barrier fast path on the current jitframe (`is_frame=True`).
+        let loc_base = crate::aarch64::registers::FP;
+        self.emit_write_barrier_fastpath_for_base(loc_base, false, None);
+    }
+
+    /// aarch64/assembler.py:254 `_push_all_regs_to_jitframe` parity.
+    fn push_all_regs_to_jitframe(
+        &mut self,
+        ignored_regs: &[crate::regloc::RegLoc],
+        withfloats: bool,
+    ) {
+        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as u32;
+        for (i, reg) in all_gen_regs().iter().enumerate() {
+            if ignored_regs.contains(reg) {
+                continue;
+            }
+            let ofs = base_ofs + (i as u32 * WORD as u32);
+            dynasm!(self.mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
+        }
+        if withfloats {
+            let float_base = base_ofs + (all_gen_regs().len() as u32 * WORD as u32);
+            for reg in all_float_regs().iter() {
+                let ofs = float_base + (reg.value as u32 * WORD as u32);
+                dynasm!(self.mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
+            }
+        }
+    }
+
+    /// aarch64/assembler.py:283 `_pop_all_regs_from_jitframe` parity.
+    fn pop_all_regs_from_jitframe(
+        &mut self,
+        ignored_regs: &[crate::regloc::RegLoc],
+        withfloats: bool,
+    ) {
+        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as u32;
+        for (i, reg) in all_gen_regs().iter().enumerate() {
+            if ignored_regs.contains(reg) {
+                continue;
+            }
+            let ofs = base_ofs + (i as u32 * WORD as u32);
+            dynasm!(self.mc ; .arch aarch64 ; ldr X(reg.value), [x29, ofs]);
+        }
+        if withfloats {
+            let float_base = base_ofs + (all_gen_regs().len() as u32 * WORD as u32);
+            for reg in all_float_regs().iter() {
+                let ofs = float_base + (reg.value as u32 * WORD as u32);
+                dynasm!(self.mc ; .arch aarch64 ; ldr D(reg.value), [x29, ofs]);
+            }
+        }
     }
 
     fn guard_gcmap_from_faillocs(
@@ -1351,6 +1422,29 @@ impl AssemblerARM64 {
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
+
+        if std::env::var_os("MAJIT_DUMP").is_some() {
+            let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
+            eprintln!(
+                "[dynasm] BRIDGE CODE DUMP ({} bytes at {:#x}, entry +{:?}):",
+                code.len(),
+                rawstart,
+                entry
+            );
+            for (i, chunk) in code.chunks(4).enumerate() {
+                let word = u32::from_le_bytes([
+                    chunk.first().copied().unwrap_or(0),
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                    chunk.get(3).copied().unwrap_or(0),
+                ]);
+                eprint!("{:08x} ", word);
+                if (i + 1) % 8 == 0 {
+                    eprintln!();
+                }
+            }
+            eprintln!();
+        }
 
         // Load-bearing identity invariant for runtime dispatch: pyre's
         // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
@@ -2129,7 +2223,7 @@ impl AssemblerARM64 {
             | OpCode::GcLoadF
             | OpCode::RawLoadI
             | OpCode::RawLoadF => {
-                if let (Some(Loc::Reg(base)), Some(ofs_loc)) = (arglocs.first(), arglocs.get(1)) {
+                if let Some(ofs_loc) = arglocs.get(1) {
                     // aarch64/opassembler.py:371-374
                     let dst = match arglocs.get(2) {
                         Some(Loc::Reg(r)) => r,
@@ -2150,7 +2244,20 @@ impl AssemblerARM64 {
                             })
                             .unwrap_or(8),
                     };
-                    self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                    match arglocs.first() {
+                        Some(Loc::Reg(base)) => {
+                            self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                        }
+                        Some(Loc::Immed(base_i)) => {
+                            self.emit_mov_imm64(16, base_i.value);
+                            let base = RegLoc {
+                                value: 16,
+                                is_xmm: false,
+                            };
+                            self.emit_op_gcload_regalloc(&base, ofs_loc, dst, nsize);
+                        }
+                        _ => {}
+                    }
                 }
             }
             // ── aarch64/opassembler.py:365 emit_op_gc_store ──
@@ -2194,6 +2301,18 @@ impl AssemblerARM64 {
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
                 };
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    if let Loc::Immed(i) = ofs_loc {
+                        let input0_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE);
+                        let input1_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE + 1);
+                        if i.value as i32 == input0_ofs || i.value as i32 == input1_ofs {
+                            eprintln!(
+                                "[dynasm][gcstore-input] ofs={} value_loc={:?} base_loc={:?} size={}",
+                                i.value, value_loc, base_loc, size
+                            );
+                        }
+                    }
+                }
                 // aarch64/opassembler.py:368: self._write_to_mem(value_loc, base_loc, ofs_loc, scale)
                 self.emit_op_gcstore_regalloc(base, ofs_loc, &val_reg, size);
             }
@@ -2513,19 +2632,89 @@ impl AssemblerARM64 {
             }
             // aarch64/assembler.py:715 malloc_cond_varsize_frame
             OpCode::CallMallocNurseryVarsizeFrame => {
-                if let Some(Loc::Reg(sizeloc)) = arglocs.first() {
+                let sizeloc = match arglocs.first() {
+                    Some(Loc::Reg(sizeloc)) => *sizeloc,
+                    _ => panic!("CallMallocNurseryVarsizeFrame expects register size arg"),
+                };
+                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+                let slow_path = self.mc.new_dynamic_label();
+                let done = self.mc.new_dynamic_label();
+
+                if nf_addr == 0 || nt_addr == 0 {
+                    if sizeloc.value != 0 {
+                        dynasm!(self.mc ; .arch aarch64 ; mov x0, X(sizeloc.value));
+                    }
+                    dynasm!(self.mc ; .arch aarch64 ; b =>slow_path);
+                } else {
+                    let size_reg = if sizeloc == crate::aarch64::registers::X0 {
+                        dynasm!(self.mc ; .arch aarch64 ; mov x1, x0);
+                        crate::aarch64::registers::X1
+                    } else {
+                        sizeloc
+                    };
+                    let gc_header_size = majit_gc::header::GcHeader::SIZE as u32;
+                    self.emit_mov_imm64(0, nf_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]);
+                    dynasm!(self.mc ; .arch aarch64 ; add x1, x0, X(size_reg.value));
+                    dynasm!(self.mc ; .arch aarch64 ; add x1, x1, gc_header_size);
+                    self.emit_mov_imm64(16, nt_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; ldr x16, [x16]
+                        ; cmp x1, x16
+                        ; b.hi =>slow_path
+                    );
+                    self.emit_mov_imm64(16, nf_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; str x1, [x16]
+                        ; str xzr, [x0]
+                        ; add x0, x0, gc_header_size
+                        ; b =>done
+                    );
+                }
+
+                dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+                self.push_all_regs_to_jitframe(
+                    &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
+                    true,
+                );
+                // aarch64/assembler.py:716-734 malloc_cond_varsize_frame:
+                // compute size into X0 BEFORE storing gcmap, because the
+                // gcmap store must NOT clobber the slowpath's size arg.
+                // Upstream uses IP1 for the gcmap pointer (gen_load_int_full
+                // r.ip1.value, ...) so the size arg in X0 stays intact.
+                if nf_addr != 0 && nt_addr != 0 {
+                    dynasm!(self.mc ; .arch aarch64 ; sub x0, x1, x0);
+                    let gc_header_size = majit_gc::header::GcHeader::SIZE as u32;
+                    dynasm!(self.mc ; .arch aarch64 ; sub x0, x0, gc_header_size);
+                } else if sizeloc.value != 0 {
                     dynasm!(self.mc ; .arch aarch64 ; mov x0, X(sizeloc.value));
                 }
-                // push_gcmap
+                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                    // Store gcmap into jf[jf_gcmap_ofs] via a scratch reg
+                    // that is NOT X0 (size arg) or X1 (original nursery_free).
+                    // Using x16 (IP0) matches _reload_frame_if_necessary and
+                    // stays out of the argument register path.
+                    self.emit_mov_imm64(16, gcmap as i64);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; str x16, [x29, crate::jitframe::JF_GCMAP_OFS as u32]
+                    );
+                } else {
+                    let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
+                    dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                }
+                self.emit_mov_imm64(
+                    16,
+                    crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64,
+                );
+                dynasm!(self.mc ; .arch aarch64 ; blr x16);
+                self.reload_frame_if_necessary();
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
-                self.emit_mov_imm64(
-                    2,
-                    crate::runner::dynasm_nursery_slowpath as *const () as i64,
+                self.pop_all_regs_from_jitframe(
+                    &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
+                    true,
                 );
-                self.emit_malloc_slowpath_helper_call(2);
-                // pop_gcmap
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                dynasm!(self.mc ; .arch aarch64 ; =>done);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
                 }
@@ -2566,6 +2755,7 @@ impl AssemblerARM64 {
                     crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64,
                 );
                 self.emit_malloc_slowpath_helper_call(3);
+                self.reload_frame_if_necessary();
                 // pop_gcmap
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
                 if !op.pos.is_none() {
@@ -4847,7 +5037,22 @@ impl AssemblerARM64 {
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
+        let can_collect = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .map(|descr| descr.get_extra_info().check_can_collect())
+            .unwrap_or(false);
+        if can_collect {
+            if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                self.push_gcmap(gcmap as *mut usize);
+            }
+        }
         self._genop_call_with_arglocs(op, arglocs);
+        if can_collect {
+            self.reload_frame_if_necessary();
+            self.pop_gcmap();
+        }
         if !op.pos.is_none() {
             if op.opcode.result_type() == Type::Float {
                 self.store_d0_to_result(op.pos);
@@ -4876,6 +5081,136 @@ impl AssemblerARM64 {
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
         let call_descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
         let expansion = call_descr.and_then(|d| d.vable_expansion());
+        if expansion.is_none() {
+            let frame_loc = arglocs
+                .first()
+                .copied()
+                .expect("call_assembler missing rewritten jitframe arg");
+            let vable_loc = arglocs.get(1).copied();
+            // aarch64/regalloc.py:661-664 routes CALL_ASSEMBLER through
+            // `_call(..., gc_level=2)`, which spills all managed registers.
+            // x19 is already saved by the JIT prologue, so use it as scratch
+            // here without an extra call-site stack save.
+            dynasm!(self.mc ; .arch aarch64 ; mov x19, x29);
+            self.emit_load_to_rax(frame_loc);
+
+            let target_addr: Option<usize> = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_call_descr())
+                .and_then(|cd| cd.call_target_token())
+                .and_then(|token| self.call_assembler_targets.get(&token).copied())
+                .filter(|&addr| addr != 0);
+            let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+            let result_type = op.opcode.result_type();
+            let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
+            let helper_addr = crate::call_assembler_helper_addr() as i64;
+            let green_key = self.header_pc as i64;
+
+            if !is_resolved {
+                let force_addr = crate::call_assembler_force_fn_addr() as i64;
+                dynasm!(self.mc ; .arch aarch64
+                    ; mov x29, x19
+                );
+                if force_addr != 0 {
+                    if let Some(vloc) = vable_loc {
+                        self.emit_load_to_rax(vloc);
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64
+                            ; ldr x0, [x0, FIRST_ITEM_OFFSET as u32]
+                        );
+                    }
+                    self.emit_mov_imm64(2, force_addr);
+                    let pushed_gcmap = self.push_pending_call_gcmap();
+                    dynasm!(self.mc ; .arch aarch64
+                        ; blr x2
+                    );
+                    self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64
+                        ; mov x0, xzr
+                    );
+                }
+                if !op.pos.is_none() {
+                    self.store_rax_to_result(op.pos);
+                }
+                return;
+            }
+
+            // llsupport/assembler.py:320 +
+            // aarch64/opassembler.py:1110-1115 `_call_assembler_emit_call`:
+            // call the target assembler entry directly with the callee
+            // jitframe in x0.  The extra Rust execute trampoline was a
+            // pre-existing adaptation; it is not part of the RPython fast
+            // path and is too expensive for recursive CALL_ASSEMBLER.
+            let pushed_gcmap = self.push_pending_call_gcmap();
+            if let Some(addr) = target_addr {
+                let addr = addr as i64;
+                self.emit_mov_imm64(1, addr);
+                dynasm!(self.mc ; .arch aarch64 ; blr x1);
+            } else if let Some(entry_label) = self.self_entry_label {
+                dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
+            }
+            dynasm!(self.mc ; .arch aarch64
+                ; mov x29, x19
+            );
+            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+
+            let fast_path = self.mc.new_dynamic_label();
+            let merge = self.mc.new_dynamic_label();
+            self.emit_mov_imm64(2, done_descr_ptr);
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x1, [x0, JF_DESCR_OFS as u32]
+                ; cmp x1, x2
+                ; b.eq =>fast_path
+            );
+            {
+                // `compile.py:665` parity: helper signature is
+                // `(cpu_handle, callee_jf_ptr, green_key)`. Pass cpu_ptr as
+                // arg0 so the trampoline can resolve the attached
+                // `done_with_this_frame_descr_*` /
+                // `exit_frame_with_exception_descr_ref` identities. blr
+                // through x3 so x0/x1/x2 stay live as the helper args.
+                let cpu_ptr = self.cpu_handle_ptr();
+                self.emit_mov_imm64(3, helper_addr);
+                dynasm!(self.mc ; .arch aarch64
+                    ; mov x1, x0                    // arg1 = callee_jf_ptr
+                );
+                self.emit_mov_imm64(2, green_key); // arg2 = green_key
+                self.emit_mov_imm64(0, cpu_ptr); // arg0 = cpu_handle
+                let pushed_gcmap = self.push_pending_call_gcmap();
+                dynasm!(self.mc ; .arch aarch64
+                    ; blr x3                        // x0 = helper result
+                );
+                self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+                dynasm!(self.mc ; .arch aarch64 ; b =>merge);
+            }
+            {
+                dynasm!(self.mc ; .arch aarch64
+                    ; =>fast_path
+                );
+                if result_type == Type::Float {
+                    dynasm!(self.mc ; .arch aarch64
+                        ; ldr d0, [x0, FIRST_ITEM_OFFSET as u32]
+                        ; fmov x0, d0
+                    );
+                } else {
+                    dynasm!(self.mc ; .arch aarch64
+                        ; ldr x0, [x0, FIRST_ITEM_OFFSET as u32]
+                    );
+                }
+                dynasm!(self.mc ; .arch aarch64
+                    ; =>merge
+                );
+            }
+            // RPython `BaseAssembler.call_assembler` joins helper/fast paths
+            // here without another frame reload.  The collecting target/helper
+            // calls above already reload in `Aarch64CallBuilder.pop_gcmap`.
+            if !op.pos.is_none() {
+                self.store_rax_to_result(op.pos);
+            }
+            return;
+        }
 
         let num_args = op.args.len();
         let num_expanded_items = expansion
@@ -5054,10 +5389,11 @@ impl AssemblerARM64 {
                     ; mov x0, x21                   // arg0 = PyFrame ptr
                 );
                 self.emit_mov_imm64(2, force_addr);
+                let pushed_gcmap = self.push_pending_call_gcmap();
                 dynasm!(self.mc ; .arch aarch64
                     ; blr x2                        // x0 = force_fn(frame_ptr)
                 );
-                self.reload_frame_if_necessary();
+                self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
             } else {
                 self.emit_mov_imm64(2, free_ptr);
                 dynasm!(self.mc ; .arch aarch64
@@ -5068,24 +5404,22 @@ impl AssemblerARM64 {
                 );
             }
         } else {
-            // Resolved target: call callee via execute trampoline
-            // (stacker stack-growth protection for deep CALL_ASSEMBLER recursion).
-            let trampoline_addr = crate::call_assembler_execute_addr() as i64;
+            // llsupport/assembler.py:320 +
+            // aarch64/opassembler.py:1110-1115 `_call_assembler_emit_call`:
+            // call the target assembler entry directly with the callee
+            // jitframe in x0.  Keep the caller gcmap published across the
+            // direct call because the callee can allocate and move the
+            // caller jitframe.
+            let pushed_gcmap = self.push_pending_call_gcmap();
             if let Some(addr) = target_addr {
                 let addr = addr as i64;
                 self.emit_mov_imm64(1, addr); // x1 = callee entry addr
-                self.emit_mov_imm64(2, trampoline_addr);
-                dynasm!(self.mc ; .arch aarch64 ; blr x2);
-            } else if self.self_entry_label.is_some() {
-                // Self-entry: load entry addr from self_entry_addr_ptr
-                // (written after finalization).
-                let addr_ptr = self.self_entry_addr_ptr as i64;
-                self.emit_mov_imm64(1, addr_ptr); // x1 = &entry_addr
-                dynasm!(self.mc ; .arch aarch64
-                    ; ldr x1, [x1]                // x1 = entry_addr
-                );
-                self.emit_mov_imm64(2, trampoline_addr);
-                dynasm!(self.mc ; .arch aarch64 ; blr x2);
+                dynasm!(self.mc ; .arch aarch64 ; blr x1);
+            } else if let Some(entry_label) = self.self_entry_label {
+                // Self-entry lives in the same code buffer; branch to its
+                // dynamic label directly instead of loading the post-finalize
+                // address cell.
+                dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }
 
             // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
@@ -5094,7 +5428,7 @@ impl AssemblerARM64 {
             dynasm!(self.mc ; .arch aarch64
                 ; mov x29, x19            // restore
             );
-            self.reload_frame_if_necessary();
+            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
 
             // rax = callee's returned jf_ptr (heap-allocated).
             // Save it in rdx for descr check and free.
@@ -5125,10 +5459,11 @@ impl AssemblerARM64 {
                 );
                 self.emit_mov_imm64(2, green_key); // arg2 = green_key
                 self.emit_mov_imm64(0, cpu_ptr); // arg0 = cpu_handle
+                let pushed_gcmap = self.push_pending_call_gcmap();
                 dynasm!(self.mc ; .arch aarch64
                     ; blr x3                        // x0 = helper result
                 );
-                self.reload_frame_if_necessary();
+                self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
                 dynasm!(self.mc ; .arch aarch64 ; b =>merge);
             }
             // Path B (fast)
@@ -5187,6 +5522,24 @@ impl AssemblerARM64 {
 
     /// aarch64/opassembler.py:912 _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
+        let loc_base = match arglocs.first() {
+            Some(Loc::Reg(r)) => *r,
+            _ => return,
+        };
+        let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
+        let loc_index = match arglocs.get(1) {
+            Some(Loc::Reg(r)) => Some(*r),
+            _ => None,
+        };
+        self.emit_write_barrier_fastpath_for_base(loc_base, is_array, loc_index);
+    }
+
+    fn emit_write_barrier_fastpath_for_base(
+        &mut self,
+        loc_base: crate::regloc::RegLoc,
+        is_array: bool,
+        loc_index: Option<crate::regloc::RegLoc>,
+    ) {
         let wb = match crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
             cell.borrow()
                 .as_ref()
@@ -5195,12 +5548,6 @@ impl AssemblerARM64 {
             Some(Some(wb)) => wb,
             _ => return,
         };
-
-        let loc_base = match arglocs.first() {
-            Some(Loc::Reg(r)) => *r,
-            _ => return,
-        };
-        let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
         let card_marking = is_array && wb.jit_wb_cards_set != 0;
 
         // opassembler.py:922-929: build mask
@@ -5249,7 +5596,7 @@ impl AssemblerARM64 {
 
             // opassembler.py:996-1015: card marking inline
             dynasm!(self.mc ; .arch aarch64 ; =>card_mark);
-            if let Some(Loc::Reg(loc_index)) = arglocs.get(1) {
+            if let Some(loc_index) = loc_index {
                 let shift = 3 + wb.jit_wb_card_page_shift;
                 dynasm!(self.mc ; .arch aarch64
                     ; lsr x16, X(loc_index.value), shift
@@ -5411,6 +5758,7 @@ impl AssemblerARM64 {
                 crate::runner::dynasm_nursery_slowpath as *const () as i64,
             );
             self.emit_malloc_slowpath_helper_call(2);
+            self.reload_frame_if_necessary();
             return;
         }
 
@@ -5496,6 +5844,7 @@ impl AssemblerARM64 {
             crate::runner::dynasm_nursery_slowpath as *const () as i64,
         );
         self.emit_malloc_slowpath_helper_call(2);
+        self.reload_frame_if_necessary();
         // pop_gcmap: clear jf_gcmap after collecting call
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);

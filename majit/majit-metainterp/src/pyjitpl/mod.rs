@@ -363,15 +363,16 @@ fn translate_trace_iter_box_map(
 /// ops with `start_fresh = bridge_inputarg_base`, producing a renamed
 /// op vector whose OpRefs do not collide with the parent loop's.
 ///
-/// Production is currently NOT wired: `compile_bridge` keeps the raw
+/// Production is currently NOT wired: `compile_bridge`
+/// (`pyjitpl/mod.rs:7058 optimize_bridge`) keeps the raw
 /// `bridge_inputargs` numbering and passes `bridge_inputarg_base`
 /// through the optimizer interface where it is dropped (see
-/// `optimizer.rs optimize_bridge` for the documented blocker — a
-/// partial activation SIGSEGV'd fib_recursive). The unblocking change
-/// set is shared with the descriptor=Some flip (state.rs
-/// driver_descriptor) and Task #21 vable heap-writeback; once those
-/// land, every site receiving `bridge_inputarg_base` (here +
-/// optimizer.rs) flips together.
+/// `optimizer.rs:2808 #[allow(unused_variables)] bridge_inputarg_base`
+/// for the documented blocker — a partial activation SIGSEGV'd
+/// fib_recursive). The unblocking change set is shared with the
+/// descriptor=Some flip (state.rs:4058) and Task #21 vable
+/// heap-writeback; once those land, every site receiving
+/// `bridge_inputarg_base` (here + optimizer.rs) flips together.
 #[allow(dead_code)]
 fn prepare_bridge_trace_for_optimizer(
     bridge_ops: &[Op],
@@ -1137,22 +1138,6 @@ impl<M: Clone> MetaInterp<M> {
             .map(|layout| layout.public(owning_key, trace_id, fail_index))
     }
 
-    fn terminal_exit_layout_from_trace(
-        trace: &CompiledTrace,
-        owning_key: u64,
-        trace_id: u64,
-        op_index: usize,
-    ) -> Option<CompiledExitLayout> {
-        trace.terminal_exit_layouts.get(&op_index).map(|layout| {
-            layout.public(
-                owning_key,
-                trace_id,
-                compile::find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
-            )
-        })
-    }
-
-    #[allow(dead_code)]
     fn backend_fail_descr_layout(
         &self,
         compiled: &CompiledEntry<M>,
@@ -1173,6 +1158,21 @@ impl<M: Clone> MetaInterp<M> {
                 })
         };
         lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(lookup))
+    }
+
+    fn terminal_exit_layout_from_trace(
+        trace: &CompiledTrace,
+        owning_key: u64,
+        trace_id: u64,
+        op_index: usize,
+    ) -> Option<CompiledExitLayout> {
+        trace.terminal_exit_layouts.get(&op_index).map(|layout| {
+            layout.public(
+                owning_key,
+                trace_id,
+                compile::find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
+            )
+        })
     }
 
     #[allow(dead_code)]
@@ -1206,10 +1206,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<CompiledExitLayout> {
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        self.backend
-            .compiled_trace_fail_descr_layouts(&compiled.token, trace_id)?
-            .into_iter()
-            .find(|layout| layout.fail_index == fail_index)
+        self.backend_fail_descr_layout(compiled, trace_id, fail_index)
             .map(|layout| {
                 // compile.py:861 copy_all_attributes_from parity:
                 // when the compiled trace has been evicted but the
@@ -1219,9 +1216,9 @@ impl<M: Clone> MetaInterp<M> {
                 // (force_from_resumedata, blackhole) see the same
                 // shared pool the frontend-primed path provides.
                 // Mirrors compile.rs:917-924 inside merge_backend_exit_layouts.
-                let storage = layout.rd_numb.clone().map(|numb| {
+                let storage = layout.rd_numb.as_ref().map(|rd_numb| {
                     crate::resume::ResumeStorage::new(
-                        numb,
+                        rd_numb.clone(),
                         layout.rd_consts.clone().unwrap_or_default(),
                         layout.rd_virtuals.clone().unwrap_or_default(),
                         layout.rd_pendingfields.clone().unwrap_or_default(),
@@ -1251,10 +1248,7 @@ impl<M: Clone> MetaInterp<M> {
         op_index: usize,
     ) -> Option<CompiledExitLayout> {
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        self.backend
-            .compiled_trace_terminal_exit_layouts(&compiled.token, trace_id)?
-            .into_iter()
-            .find(|layout| layout.op_index == op_index)
+        self.backend_terminal_exit_layout(compiled, trace_id, op_index)
             .map(|layout| CompiledExitLayout {
                 rd_loop_token: owning_key, // compile.py:186
                 trace_id,
@@ -1637,14 +1631,6 @@ impl<M: Clone> MetaInterp<M> {
         *self.staticdata.all_descrs.lock().unwrap() = all_descrs;
     }
 
-    /// bridgeopt.py:124 parity: set frontend_boxes (raw dead frame values)
-    /// for cls_of_box during bridge deserialization.
-    /// Must be called with dead frame values (guard exit_types order),
-    /// NOT with extract_live values (virtualizable field order).
-    pub fn set_pending_frontend_boxes(&mut self, raw_values: &[i64]) {
-        self.pending_frontend_boxes = Some(raw_values.to_vec());
-    }
-
     /// Accessor for `pending_frontend_boxes` without consuming it.
     /// Used by `start_bridge_tracing` to thread the raw deadframe values
     /// into `setup_bridge_sym` so `Box(n, _)` decodes match `rd_numb`'s
@@ -1822,8 +1808,17 @@ impl<M: Clone> MetaInterp<M> {
         // descriptor=Some + Task #21 heap-writeback). PRE-EXISTING-
         // ADAPTATION: the gate is the convergence-debt marker; the
         // fully-RPython-orthodox shape lands together with descriptor
-        // activation (state.rs driver_descriptor + Task #21 plan).
-        if total_vable == 0 || live_values.len() < num_reds + total_vable {
+        // activation (state.rs:4058 driver_descriptor + Task #21 plan).
+        // Cluster 2 (b): allow heap-read fallback when live_values is the
+        // reds-only `[frame, ec]` shape that descriptor=Some emits. The
+        // expanded-tail path still uses live_values directly; the short
+        // path drives the `vable_ptr` heap read below to mint inputargs
+        // for each vable static field + array item.
+        if total_vable == 0 {
+            return;
+        }
+        let _has_expanded_tail_outer = live_values.len() >= num_reds + total_vable;
+        if !_has_expanded_tail_outer && self.vable_ptr.is_null() {
             return;
         }
         // pyjitpl.py:3293-3295: index = num_green_args + index_of_virtualizable.
@@ -1831,36 +1826,13 @@ impl<M: Clone> MetaInterp<M> {
         // path and the regular JitDriver registry agree.
         let virtualizable_box = OpRef(index as u32);
         let virtualizable_value = live_values[index];
+        let has_expanded_tail = live_values.len() >= num_reds + total_vable;
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
-        // pyre lays out the static + array slots immediately after the
-        // virtualizable input arg, mirroring how `read_boxes` returns
-        // one box per static field followed by one box per array
-        // element. The array section extends up to the full physical
-        // array length; slots beyond the live prefix of live_values
-        // (dead operand-stack region + cells not populated at entry)
-        // carry `OpRef::NONE`, which `opref_to_snapshot_tagged` encodes
-        // as `Const(0, Ref)` — the equivalent of RPython's
-        // `wrap(cpu, None)` null-box (virtualizable.py:96).
-        let field_start = index + 1;
-        let live_array_prefix = live_values.len().saturating_sub(field_start + num_static);
-        let vable_oprefs: Vec<OpRef> = (0..total_vable)
-            .map(|i| {
-                if i < num_static + live_array_prefix {
-                    OpRef((field_start + i) as u32)
-                } else {
-                    OpRef::NONE
-                }
-            })
-            .collect();
-        // pyjitpl.py:3302 parity: seed the concrete shadow from
-        // `vinfo.read_boxes(cpu, virtualizable, startindex)` — RPython reads
-        // the heap-authoritative value for every slot, typed per the
-        // declared field/array-item type.  Falling back to `live_values`
-        // would leak pyre's unboxed-optimization view into what must be a
-        // Ref-typed slot for pypyjit's `locals_cells_stack_w`
-        // (pypy/interpreter/pyframe.py:84: `list[W_Object]`); a later
-        // `BC_GETARRAYITEM_VABLE_R` read would then return `Value::Int(...)`
-        // and `set_ref_reg` would squash it to a null pointer.
+        // pyjitpl.py appends these boxes to `original_boxes` before
+        // create_empty_history() snapshots the trace inputargs. When the
+        // caller already supplied an expanded tail we reuse those inputarg
+        // slots; otherwise we mint new inputargs here for each freshly-read
+        // box, recovering the same `original_boxes += read_boxes(...)` shape.
         let vable_values: Vec<Value> = if !self.vable_ptr.is_null() {
             let (static_boxes, array_boxes) =
                 unsafe { info.read_all_boxes(self.vable_ptr, &array_lengths) };
@@ -1875,8 +1847,31 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             out
-        } else {
+        } else if has_expanded_tail {
             live_values[num_reds..num_reds + total_vable].to_vec()
+        } else {
+            return;
+        };
+        let vable_oprefs: Vec<OpRef> = if has_expanded_tail {
+            (0..total_vable)
+                .map(|i| OpRef((num_reds + i) as u32))
+                .collect()
+        } else {
+            vable_values
+                .iter()
+                .map(|value| {
+                    let opref = ctx.recorder.record_input_arg(value.get_type());
+                    let (bits, tp) = match value {
+                        Value::Int(i) => (*i, Type::Int),
+                        Value::Float(f) => (f.to_bits() as i64, Type::Float),
+                        Value::Ref(r) => (r.as_usize() as i64, Type::Ref),
+                        Value::Void => (0, Type::Void),
+                    };
+                    ctx.initial_inputarg_consts
+                        .push(ctx.constants.get_or_insert_typed(bits, tp));
+                    opref
+                })
+                .collect()
         };
         // pyjitpl.py:3306: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
@@ -3164,16 +3159,12 @@ impl<M: Clone> MetaInterp<M> {
     /// at compile.py:443 — a direct read of the concrete virtualizable heap
     /// object, not a synthesis from `len(inputargs)`.
     ///
-    /// `self.vable_ptr` holds the same pointer RPython's
-    /// `orig_inpargs[...].getref_base()` produces: it is set at trace-start
-    /// by `JitDriverDispatch::sync_before` (jitdriver.rs:1693) from the live
-    /// virtualizable reachable on the interpreter state, and
-    /// `trace_entry_vable_lengths(info)` reads the lengths back out via
-    /// `VirtualizableInfo::get_array_length(vable, i)` in
-    /// virtualizable.rs:695-711.
-    ///
-    /// Helper name matches compile.py so audits can grep the same symbol on
-    /// both sides.
+    /// `orig_vable_ptr` is the `*const u8` view of RPython's
+    /// `orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()`
+    /// (compile.py:510): the caller extracts the constant `Value::Ref` that
+    /// the tracer stashed for the virtualizable inputarg at trace-start and
+    /// passes it through. Helper name matches compile.py so audits can grep
+    /// the same symbol on both sides.
     ///
     /// Invoked from both compile sites that mirror RPython's
     /// `send_loop_to_backend` (compile.py:504-511): the JUMP-terminated
@@ -3193,6 +3184,7 @@ impl<M: Clone> MetaInterp<M> {
         constants: &mut HashMap<u32, i64>,
         constant_types: &mut HashMap<u32, Type>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+        orig_vable_ptr: *const u8,
     ) {
         let Some(vinfo) = self.virtualizable_info() else {
             return;
@@ -3208,28 +3200,31 @@ impl<M: Clone> MetaInterp<M> {
             // Trace was never expanded (no virtualizable fields live at entry).
             return;
         }
+        // compile.py:508-511
+        //     vable = orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()
+        //     patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable)
+        //
+        // RPython never tolerates a null `vable` here — the live
+        // virtualizable is whatever `orig_inpargs[idx]` was constructed from
+        // at trace-start. Require the same invariant: the caller must pass
+        // the constant Ref value from that inputarg. A null pointer means
+        // the tracer-time inputarg lookup failed, which is a bug upstream
+        // of this helper.
+        assert!(
+            !orig_vable_ptr.is_null(),
+            "patch_new_loop_to_load_virtualizable_fields requires \
+             orig_inpargs[index_of_virtualizable].getref_base() to be non-null"
+        );
         // compile.py:443 `vinfo.get_array_length(vable, arrayindex)` — the
         // concrete virtualizable heap object is the sole source of truth
         // for every array length. Read each array field directly via
         // `VirtualizableInfo::get_array_length(obj_ptr, i)`
-        // (virtualizable.rs:695-711). RPython never consults a trace-entry
-        // cache here; any layout that cannot expose its length on the heap
-        // object must be fixed inside `VirtualizableInfo` itself (to match
-        // `vinfo.get_array_length`'s universal contract), not worked around
-        // in this helper.
-        //
-        // Safety: `self.vable_ptr` is seeded at trace-start by
-        // `JitDriverDispatch::sync_before` from the live virtualizable
-        // reachable on the interpreter state (jitdriver.rs:1693). RPython's
-        // counterpart `orig_inpargs[jitdriver_sd.index_of_virtualizable]
-        // .getref_base()` (compile.py:510) also demands a valid pointer at
-        // this point, so bail early for a null pointer rather than silently
-        // dropping the reload prolog.
-        if self.vable_ptr.is_null() {
-            return;
-        }
+        // (virtualizable.rs:695-711). Any layout that cannot expose its
+        // length on the heap object must be fixed inside
+        // `VirtualizableInfo` itself (to match `vinfo.get_array_length`'s
+        // universal contract), not worked around in this helper.
         let array_lengths: Vec<usize> = (0..vinfo.array_fields.len())
-            .map(|i| unsafe { vinfo.get_array_length(self.vable_ptr, i) })
+            .map(|i| unsafe { vinfo.get_array_length(orig_vable_ptr, i) })
             .collect();
         compile::patch_new_loop_to_load_virtualizable_fields(
             ops,
@@ -3251,6 +3246,39 @@ impl<M: Clone> MetaInterp<M> {
         // map and stay untouched. Both `compile_loop_body` and
         // `finish_and_compile` invoke this helper, mirroring RPython's
         // unconditional `send_loop_to_backend` wiring (compile.py:504-511).
+    }
+
+    fn orig_vable_ptr_from_trace_ctx(
+        &self,
+        ctx: &TraceCtx,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) -> *const u8 {
+        driver_descriptor
+            .and_then(|driver| driver.virtualizable_arg_index())
+            .and_then(|idx| ctx.initial_inputarg_consts.get(idx).copied())
+            .and_then(|const_ref| match ctx.constants.get_value(const_ref) {
+                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as *const u8),
+                _ => None,
+            })
+            .unwrap_or(std::ptr::null())
+    }
+
+    /// compile.py:168 / pyjitpl.py:3605 parity: every real loop token must
+    /// carry the same outermost jitdriver metadata that compile_tmp_callback
+    /// installs on pending tokens.  The backend's handle_call_assembler
+    /// lookup reads this to decide whether the rewritten op is [frame] or
+    /// [frame, virtualizable].
+    fn configure_loop_token_for_driver(
+        &self,
+        token: &mut JitCellToken,
+        green_key: u64,
+        driver_descriptor: Option<&JitDriverStaticData>,
+    ) {
+        token.green_key = green_key;
+        token.num_scalar_inputargs = self.num_scalar_inputargs;
+        token.virtualizable_arg_index =
+            driver_descriptor.and_then(JitDriverStaticData::virtualizable_arg_index);
+        token.outermost_jitdriver_index = driver_descriptor.and_then(|driver| driver.index);
     }
 
     /// Close the current trace, optimize, and compile.
@@ -3423,6 +3451,13 @@ impl<M: Clone> MetaInterp<M> {
         // Cache driver descriptor before ctx is partially consumed below;
         // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
         let driver_descriptor = ctx.driver_descriptor().cloned();
+        // compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`.
+        // Resolve while `ctx` is still whole (before `ctx.constants` is moved
+        // out below) so `patch_new_loop_to_load_virtualizable_fields` can
+        // read the heap object via `vinfo.get_array_length(vable, i)`
+        // (compile.py:443).
+        let orig_vable_ptr_loop =
+            self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
                 .filter(|mp| mp.position._pos > 0)
@@ -3801,7 +3836,7 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.alloc_token_number()
         };
         let mut token = JitCellToken::new(token_num);
-        token.green_key = green_key;
+        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -3838,9 +3873,6 @@ impl<M: Clone> MetaInterp<M> {
             unroll_opt.target_tokens.clone()
         };
 
-        // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
-        // so the backend can find the first local in force_fn paths.
-        token.num_scalar_inputargs = self.num_scalar_inputargs;
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
         // field reload for every loop. Mirrors the FINISH-path call in
         // `finish_and_compile`; see `MetaInterp::patch_new_loop_to_load_virtualizable_fields`
@@ -3859,6 +3891,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut constants,
             &mut constant_types,
             driver_descriptor.as_ref(),
+            orig_vable_ptr_loop,
         );
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -4442,24 +4475,80 @@ impl<M: Clone> MetaInterp<M> {
         // gcreftracer.py parity: GC may have moved objects between Phase 1
         // and Phase 2. Refresh GcRef values from shadow stack before use.
         start_state.refresh_from_gc();
-        // Consume retracing_from (position); green_key comes from tracing ctx.
-        self.retracing_from = None;
-        let green_key = match self.tracing.as_ref() {
-            Some(ctx) => ctx.green_key,
-            None => return false,
-        };
+        let bridge_trace = self.bridge_info();
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
+        let retracing_from = self.retracing_from.take();
         let mut ctx = match self.tracing.take() {
             Some(ctx) => ctx,
             None => return false,
         };
+        let (
+            green_key,
+            driver_descriptor,
+            orig_vable_ptr_retrace,
+            numbering_overrides,
+            mut constants,
+            mut constant_types,
+            trace,
+        ) = {
+            let green_key = ctx.green_key;
+            let header_pc = ctx.header_pc;
+            let driver_descriptor = ctx.driver_descriptor().cloned();
+            let retrace_cut = retracing_from.and_then(|retrace_pos| {
+                ctx.get_merge_point_at(green_key, header_pc)
+                    .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
+                    .map(|mp| {
+                        (
+                            mp.original_boxes.clone(),
+                            mp.original_box_types.clone(),
+                            crate::history::TreeLoopCutPosition::new(mp.position._pos),
+                        )
+                    })
+            });
+            let orig_vable_ptr_retrace =
+                self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
+            let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+            let constants = ctx.constants.snapshot();
+            let constant_types = ctx.constants.constant_types_snapshot();
+            let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
 
-        ctx.close_loop(jump_args);
-        let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
-        let (mut constants, mut constant_types) =
-            std::mem::take(&mut ctx.constants).into_inner_with_types();
-        let trace = ctx.into_tree_loop();
+            // compile.py:358-362 records the closing JUMP on the same history
+            // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
+            // so close once, then cut the completed trace.
+            ctx.close_loop(jump_args);
+            let trace = ctx.into_tree_loop();
+            let trace = if let Some((ref original_boxes, ref original_box_types, start)) =
+                retrace_cut
+            {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
+                        start.op_index,
+                        original_boxes.len(),
+                        trace.ops.len(),
+                        header_pc,
+                    );
+                }
+                trace.cut_trace_from_with_consts(
+                    start,
+                    original_boxes,
+                    original_box_types,
+                    &initial_inputarg_consts,
+                )
+            } else {
+                trace
+            };
+            (
+                green_key,
+                driver_descriptor,
+                orig_vable_ptr_retrace,
+                numbering_overrides,
+                constants,
+                constant_types,
+                trace,
+            )
+        };
 
         let trace_ops = trace.ops.clone();
 
@@ -4608,9 +4697,20 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        // NOTE: compile_retrace is a JUMP-terminated path — see the parity
-        // note at `compile_loop` above for why
-        // `patch_new_loop_to_load_virtualizable_fields` is not called here.
+        // compile.py:504-511 send_loop_to_backend virtualizable hook —
+        // retrace paths also need the preamble loads so the loop's inputarg
+        // contract is reds-only and virtualizable fields are reloaded from
+        // the heap object at entry.
+        let mut inputargs = inputargs;
+        let mut combined_ops = combined_ops;
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut combined_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+            orig_vable_ptr_retrace,
+        );
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
@@ -4625,7 +4725,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let token_num = self.warm_state.alloc_token_number();
         let mut token = JitCellToken::new(token_num);
-        token.green_key = green_key;
+        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -4874,6 +4974,13 @@ impl<M: Clone> MetaInterp<M> {
             .cloned();
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
+        // compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`.
+        // Resolve the constant Ref that the tracer stashed for the
+        // virtualizable inputarg at trace-start so
+        // `patch_new_loop_to_load_virtualizable_fields` below can read the
+        // heap object via `vinfo.get_array_length(vable, i)` without
+        // consulting a separate trace-start cache.
+        let orig_vable_ptr = self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
         // pyjitpl.py:3199 compile_done_with_this_frame parity:
         // `store_token_in_vable` (SetfieldGc on vable_token + the
         // accompanying GUARD_NOT_FORCED_2) is recorded by the pyre
@@ -5049,6 +5156,7 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.alloc_token_number()
         };
         let mut token = JitCellToken::new(token_num);
+        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -5086,15 +5194,18 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
         // field reload for every loop. See
-        // `MetaInterp::patch_new_loop_to_load_virtualizable_fields` above; the
-        // helper is shared with the JUMP-terminated `compile_loop` path so both
-        // paths reduce `loop.inputargs` to `num_red_args` identically.
+        // `MetaInterp::patch_new_loop_to_load_virtualizable_fields` above;
+        // `orig_vable_ptr` is the constant Ref that was stashed for the
+        // virtualizable inputarg at trace-start (captured above via
+        // `ctx.initial_inputarg_consts` + `ctx.constants.get_value`), i.e.
+        // RPython's `orig_inpargs[idx].getref_base()`.
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut optimized_ops,
             &mut constants,
             &mut constant_types,
             driver_descriptor.as_ref(),
+            orig_vable_ptr,
         );
 
         let compiled_constants = constants.clone();
@@ -5108,11 +5219,6 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        token.green_key = green_key;
-        // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
-        // so the backend can find the first local in force_fn paths.
-        token.num_scalar_inputargs = self.num_scalar_inputargs;
-
         match self
             .backend
             .compile_loop(&inputargs, &optimized_ops, &mut token)
@@ -5268,6 +5374,12 @@ impl<M: Clone> MetaInterp<M> {
             None => return None,
         };
         let green_key = ctx.green_key;
+        let driver_descriptor = ctx.driver_descriptor().cloned();
+        // compile.py:510 parity — capture orig_inpargs[idx].getref_base()
+        // before `ctx.recorder` is moved. Used by the send_loop_to_backend
+        // hook below.
+        let orig_vable_ptr_simple =
+            self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
 
         let recorder = ctx.recorder;
         // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
@@ -5368,6 +5480,7 @@ impl<M: Clone> MetaInterp<M> {
         // Allocate token and compile.
         let token_num = self.warm_state.alloc_token_number();
         let mut token = JitCellToken::new(token_num);
+        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -5397,9 +5510,19 @@ impl<M: Clone> MetaInterp<M> {
         label_op.descr = Some(target_token.as_jump_target_descr());
         compiled_ops.insert(0, label_op);
 
-        // NOTE: compile_simple_loop is a JUMP-terminated path — see the
-        // parity note at `compile_loop` above for why
-        // `patch_new_loop_to_load_virtualizable_fields` is not called here.
+        // compile.py:504-511 send_loop_to_backend virtualizable hook —
+        // simple-loop compile path must also reload virtualizable fields on
+        // entry. Without this, the vable inputarg contract differs from
+        // the unrolled loop path and guard-failure recovery cannot restore
+        // the heap array slots.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut compiled_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+            orig_vable_ptr_simple,
+        );
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
@@ -5411,8 +5534,6 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        token.green_key = green_key;
-
         match self
             .backend
             .compile_loop(&inputargs, &compiled_ops, &mut token)
@@ -6393,6 +6514,47 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|c| &c.token)
     }
 
+    /// Recover the actual front-target LABEL contract for bridge closes.
+    ///
+    /// RPython bridge closes target the peeled loop entry token recorded in
+    /// `jitcell_token.target_tokens[0]`, not the red-only `JitCellToken`
+    /// entry signature. In majit the equivalent LABEL args live in the root
+    /// trace's saved ops, so rebuild their types from that trace.
+    ///
+    /// Two parity paths cover every JUMP target:
+    /// 1. Peeled (unrolled) loops — `front_target_tokens.first()` names the
+    ///    peeled-entry `TargetToken`; locate its LABEL in the root trace and
+    ///    read each arg's type via `build_trace_value_maps`. RPython:
+    ///    `optimizeopt/unroll.py` peeled-entry LABEL is the JUMP target.
+    /// 2. Non-peeled loops — there is no peeled-entry token; the JUMP target
+    ///    is the loop's `TreeLoop.inputargs` (`history.py:501`). Their types
+    ///    live on `root_trace.inputargs[i].tp`.
+    pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
+        if let Some(front_target) = compiled.front_target_tokens.first() {
+            let target_descr = front_target.as_jump_target_descr();
+            let (value_types, _) =
+                crate::compile::build_trace_value_maps(&root_trace.inputargs, &root_trace.ops);
+            if let Some(label) = root_trace.ops.iter().find(|op| {
+                op.opcode == OpCode::Label
+                    && op
+                        .descr
+                        .as_ref()
+                        .is_some_and(|descr| descr.index() == target_descr.index())
+            }) {
+                return Some(
+                    label
+                        .args
+                        .iter()
+                        .map(|arg| value_types.get(&arg.0).copied().unwrap_or(Type::Ref))
+                        .collect(),
+                );
+            }
+        }
+        Some(root_trace.inputargs.iter().map(|ia| ia.tp).collect())
+    }
+
     /// Get the pre-allocated token number for a trace being recorded.
     ///
     /// Returns `Some(number)` if the given green_key matches the trace
@@ -6781,41 +6943,38 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<compile::BridgeFailDescrProxy> {
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
-        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        let exit_layout = Self::trace_for_exit(compiled, trace_id)
+            .and_then(|(_, trace_data)| trace_data.exit_layouts.get(&fail_index));
+        let backend_layout = self.backend_fail_descr_layout(compiled, trace_id, fail_index);
         // compile.py:797-811 parity: bridge inputargs come from the guard's
         // fail_arg_types AFTER store_final_boxes_in_guard (which may add
         // virtual field boxes, changing the types list). The backend's
         // fail_descr has the UPDATED types; exit_layout.exit_types may have
         // the ORIGINAL MetaFailDescr types (before optimizer update).
         // Prefer the backend's types when available.
-        let fail_arg_types = self
-            .backend
-            .compiled_trace_fail_descr_layouts(&compiled.token, trace_id)
-            .and_then(|layouts| {
-                layouts
-                    .into_iter()
-                    .find(|l| l.fail_index == fail_index)
-                    .map(|l| l.fail_arg_types)
-            })
-            .unwrap_or_else(|| exit_layout.exit_types.clone());
-        let gc_ref_slots = self
-            .backend
-            .compiled_trace_fail_descr_layouts(&compiled.token, trace_id)
-            .and_then(|layouts| {
-                layouts
-                    .into_iter()
-                    .find(|l| l.fail_index == fail_index)
-                    .map(|l| l.gc_ref_slots)
-            })
-            .unwrap_or_else(|| exit_layout.gc_ref_slots.clone());
+        let fail_arg_types = backend_layout
+            .as_ref()
+            .map(|layout| layout.fail_arg_types.clone())
+            .or_else(|| exit_layout.map(|layout| layout.exit_types.clone()))?;
+        let gc_ref_slots = backend_layout
+            .as_ref()
+            .map(|layout| layout.gc_ref_slots.clone())
+            .or_else(|| exit_layout.map(|layout| layout.gc_ref_slots.clone()))?;
+        let force_token_slots = backend_layout
+            .as_ref()
+            .map(|layout| layout.force_token_slots.clone())
+            .or_else(|| exit_layout.map(|layout| layout.force_token_slots.clone()))?;
+        let is_finish = backend_layout
+            .as_ref()
+            .map(|layout| layout.is_finish)
+            .or_else(|| exit_layout.map(|layout| layout.is_finish))?;
         Some(compile::BridgeFailDescrProxy {
             fail_index,
             trace_id,
             fail_arg_types,
             gc_ref_slots,
-            force_token_slots: exit_layout.force_token_slots.clone(),
-            is_finish: exit_layout.is_finish,
+            force_token_slots,
+            is_finish,
         })
     }
 
@@ -6917,6 +7076,27 @@ impl<M: Clone> MetaInterp<M> {
         ))
     }
 
+    fn recovery_slot_types_from_exit_types_and_layout(
+        exit_types: &[Type],
+        recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+    ) -> Vec<Type> {
+        let Some(recovery) = recovery_layout else {
+            return exit_types.to_vec();
+        };
+        let mut types = Vec::new();
+        for frame in recovery.frames.iter().rev() {
+            let Some(slot_types) = frame.slot_types.as_ref() else {
+                return exit_types.to_vec();
+            };
+            types.extend_from_slice(slot_types);
+        }
+        if types.len() == exit_types.len() {
+            types
+        } else {
+            exit_types.to_vec()
+        }
+    }
+
     /// Return the full recovery slot types for a guard exit, concatenated
     /// from all frames in callee-first order (matching the blackhole
     /// consumer's section convention). Falls back to exit_types when
@@ -6929,25 +7109,18 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<Vec<Type>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        if let Some(layout) = self.backend_fail_descr_layout(compiled, trace_id, fail_index) {
+            return Some(Self::recovery_slot_types_from_exit_types_and_layout(
+                &layout.fail_arg_types,
+                layout.recovery_layout.as_ref(),
+            ));
+        }
         let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
         let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
-        if let Some(ref recovery) = exit_layout.recovery_layout {
-            if recovery.frames.len() > 1 {
-                // Multi-frame: concatenate slot_types in callee-first order
-                // (matching rebuild_state_after_failure's .rev() iteration).
-                let mut types = Vec::new();
-                for frame in recovery.frames.iter().rev() {
-                    if let Some(ref st) = frame.slot_types {
-                        types.extend_from_slice(st);
-                    } else {
-                        // No slot_types — use Ref for all slots as default.
-                        types.extend(frame.slots.iter().map(|_| Type::Ref));
-                    }
-                }
-                return Some(types);
-            }
-        }
-        Some(exit_layout.exit_types.clone())
+        Some(Self::recovery_slot_types_from_exit_types_and_layout(
+            &exit_layout.exit_types,
+            exit_layout.recovery_layout.as_ref(),
+        ))
     }
 
     /// Return the merge point PC for blackhole resume from a guard exit.
@@ -6962,10 +7135,8 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
     ) -> Option<u64> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
-        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        let exit_layout =
+            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
         let recovery = exit_layout.recovery_layout.as_ref()?;
         recovery.frames.first()?.header_pc
     }
@@ -7011,11 +7182,32 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
     ) -> Option<Vec<Type>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
-        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        let exit_layout =
+            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
         Some(exit_layout.exit_types.clone())
+    }
+
+    /// resume.py:924-926 _prepare: get rd_virtuals + rd_pendingfields
+    /// for blackhole resume at a guard failure.
+    pub fn get_rd_virtuals(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>> {
+        let storage = self.get_resume_storage(green_key, trace_id, fail_index)?;
+        Some(storage.rd_virtuals.clone())
+    }
+
+    /// resume.py:926 _prepare parity: get rd_pendingfields for a guard.
+    pub fn get_rd_pendingfields(
+        &self,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<Vec<majit_ir::GuardPendingFieldEntry>> {
+        let storage = self.get_resume_storage(green_key, trace_id, fail_index)?;
+        Some(storage.rd_pendingfields.clone())
     }
 
     /// compile.py:1002-1021 ResumeFromInterpDescr.compile_and_attach parity.
@@ -7403,12 +7595,14 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|v| v.clone())
                     .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
                 // unroll.py:183-188: frontend_inputargs = trace.inputargs
-                // RPython's frontend_boxes = trace.inputargs always matches
-                // liveboxes = trace.get_iter().inputargs in length.
-                // Our pending_frontend_boxes (from extract_live) may differ;
-                // resize to match liveboxes (bridgeopt.py:126 assert parity).
-                let mut frontend_boxes = self.pending_frontend_boxes.take().unwrap_or_default();
-                frontend_boxes.resize(liveboxes.len(), 0);
+                // bridgeopt.py:126 asserts len(frontend_boxes) == len(liveboxes).
+                // Cluster 2 (c1): `compile_bridge` is invoked twice for the
+                // same bridge under descriptor=Some + (a)+(b); take() empties
+                // on the first call and the second hits frontend_boxes.len()=0
+                // vs liveboxes.len()=N. RPython threads frontend_boxes through
+                // `optimize_bridge` as a parameter, not a one-shot stash.
+                let frontend_boxes = self.pending_frontend_boxes.clone().unwrap_or_default();
+                assert_eq!(frontend_boxes.len(), liveboxes.len());
                 Some(PendingBridgeRd {
                     storage,
                     frontend_boxes,
@@ -7744,14 +7938,10 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
-        _live_types: &[Type],
     ) -> Option<BridgeRetraceResult> {
-        // bridgeopt.py:124 parity: if the caller hasn't set pending_frontend_boxes
-        // via set_pending_frontend_boxes (with dead frame values in exit_types order),
-        // fall back to extract_live values. The caller should always set them first.
-        if self.pending_frontend_boxes.is_none() {
-            self.pending_frontend_boxes = Some(fail_values.to_vec());
-        }
+        // bridgeopt.py:124 frontend_boxes come directly from the guard
+        // failure values in fail_arg_types order.
+        self.pending_frontend_boxes = Some(fail_values.to_vec());
         let compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => return None,
@@ -7832,20 +8022,17 @@ impl<M: Clone> MetaInterp<M> {
             hook(green_key);
         }
 
-        // resume.py:1042: retrieve rd_numb/rd_consts/rd_virtuals directly from
-        // exit_layout (not from BridgeFailDescrProxy, to avoid cloning on the
-        // hot path). rd_virtuals carries the parent guard's virtual descriptor
-        // table so a future bridge tracer can rebuild parent virtuals via
-        // NEW_WITH_VTABLE + SETFIELD_GC ops at trace start, mirroring RPython's
-        // ResumeDataBoxReader.consume_boxes → rd_virtuals[i].allocate
-        // (resume.py:945-956 getvirtual_ptr).
-        // compile.py:853 `ResumeGuardDescr` storage — share the
-        // parent guard's pool via Arc so the bridge retrace tracer,
-        // optimizer, and GC root walker all observe the same
-        // `rd_consts`. No owned clone.
-        let storage = Self::trace_for_exit(compiled, norm_tid)
-            .and_then(|(_, trace)| trace.exit_layouts.get(&fail_index))
-            .and_then(|layout| layout.storage.clone());
+        // resume.py:1042 / compile.py:853 `ResumeGuardDescr` storage —
+        // share the parent guard's pool via Arc so the bridge retrace
+        // tracer, optimizer, and GC root walker all observe the same
+        // `rd_consts`. No owned clone. rd_virtuals carries the parent
+        // guard's virtual descriptor table so a future bridge tracer
+        // can rebuild parent virtuals via NEW_WITH_VTABLE + SETFIELD_GC
+        // at trace start, mirroring ResumeDataBoxReader.consume_boxes
+        // → rd_virtuals[i].allocate (resume.py:945-956 getvirtual_ptr).
+        let storage = self
+            .get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)
+            .and_then(|layout| layout.storage);
 
         Some(BridgeRetraceResult {
             is_exception_guard,
@@ -7906,18 +8093,23 @@ impl<M: Clone> MetaInterp<M> {
         let rd_numb = storage.map(|s| s.rd_numb.as_slice()).unwrap_or(&[]);
         let empty_consts: [Const; 0] = [];
         let rd_consts: &[Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
-        // resume.py:1368 `_prepare(storage)` reads virtuals/pendingfields
-        // off the storage. RdVirtualInfo → VirtualInfo conversion mirrors
-        // the bridge path at jitdriver.rs:1561-1577.
-        let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> = storage.map(|s| {
-            let count = fail_values.len() as i32;
+        // resume.py:1371 _prepare(storage) parity: materialize rd_virtuals
+        // entries before handling_async_forcing. The decoder needs the
+        // resumecode item count up-front to size virtual layouts.
+        let count = if rd_numb.len() >= 2 {
+            let mut reader = crate::resumecode::Reader::new(rd_numb);
+            let _items_resume_section = reader.next_item();
+            reader.next_item()
+        } else {
+            fail_values.len() as i32
+        };
+        let rd_virtuals = storage.map(|s| {
             s.rd_virtuals
                 .iter()
-                .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
-                .collect()
+                .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd.as_ref(), rd_consts, count))
+                .collect::<Vec<_>>()
         });
-        let rd_virtuals_slice = rd_virtuals_converted.as_deref();
-        let rd_pendingfields_slice = storage.map(|s| s.rd_pendingfields.as_slice());
+        let deadframe_types = self.get_recovery_slot_types(green_key, norm_tid, fail_index);
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let allocator = crate::resume::NullAllocator;
@@ -7927,9 +8119,9 @@ impl<M: Clone> MetaInterp<M> {
             rd_consts,
             all_liveness,
             fail_values,
-            None, // deadframe_types
-            rd_virtuals_slice,
-            rd_pendingfields_slice,
+            deadframe_types.as_deref(),
+            rd_virtuals.as_deref(),
+            storage.map(|s| s.rd_pendingfields.as_slice()),
             Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
@@ -8049,6 +8241,11 @@ impl<M: Clone> MetaInterp<M> {
 
         let exit_layout =
             Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
+                .or_else(|| {
+                    self.compiled_exit_layout_from_backend(
+                        compiled, green_key, trace_id, fail_index,
+                    )
+                })
                 .unwrap_or_else(|| CompiledExitLayout {
                     rd_loop_token: green_key, // from trace context
                     trace_id,
@@ -8783,7 +8980,7 @@ impl<M: Clone> MetaInterp<M> {
         else {
             return false;
         };
-        self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values, &[])
+        self.start_retrace_from_guard(green_key, root_trace_id, _fail_index, live_values)
             .is_some()
     }
 
@@ -15492,6 +15689,536 @@ mod tests {
         assert_eq!(err, (0, 2));
     }
 
+    #[test]
+    fn test_prepare_bridge_trace_for_optimizer_freshens_inputargs_and_snapshots() {
+        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let bridge_ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef(1)], 2),
+            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(0)], 3),
+            mk_op(OpCode::Jump, &[OpRef(2), OpRef(3)], OpRef::NONE.0),
+        ];
+        let mut snapshot_boxes = HashMap::new();
+        snapshot_boxes.insert(0, vec![OpRef(0), OpRef(2), OpRef(3)]);
+        let mut snapshot_vable_boxes = HashMap::new();
+        snapshot_vable_boxes.insert(0, vec![OpRef(1), OpRef(2)]);
+        let pending_bridge_rd = PendingBridgeRd {
+            storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
+            frontend_boxes: vec![11, 22],
+            liveboxes: vec![OpRef(0), OpRef(1)],
+            livebox_types: vec![Type::Int, Type::Ref],
+            all_descrs: vec![],
+            cls_of_box: None,
+        };
+
+        let prepared = prepare_bridge_trace_for_optimizer(
+            &bridge_ops,
+            &bridge_inputargs,
+            snapshot_boxes,
+            HashMap::new(),
+            snapshot_vable_boxes,
+            HashMap::new(),
+            Some(pending_bridge_rd),
+            10,
+        );
+
+        assert_eq!(
+            prepared
+                .inputargs
+                .iter()
+                .map(|arg| (arg.index, arg.tp))
+                .collect::<Vec<_>>(),
+            vec![(10, Type::Int), (11, Type::Ref)]
+        );
+        assert_eq!(prepared.ops[0].pos, OpRef(12));
+        assert_eq!(prepared.ops[0].args.to_vec(), vec![OpRef(11)]);
+        assert_eq!(prepared.ops[1].pos, OpRef(13));
+        assert_eq!(prepared.ops[1].args.to_vec(), vec![OpRef(10), OpRef(10)]);
+        assert_eq!(prepared.ops[2].args.to_vec(), vec![OpRef(12), OpRef(13)]);
+        assert_eq!(
+            prepared.snapshot_boxes.get(&0).cloned().unwrap(),
+            vec![OpRef(10), OpRef(12), OpRef(13)]
+        );
+        assert_eq!(
+            prepared.snapshot_vable_boxes.get(&0).cloned().unwrap(),
+            vec![OpRef(11), OpRef(12)]
+        );
+        assert_eq!(
+            prepared
+                .pending_bridge_rd
+                .as_ref()
+                .unwrap()
+                .liveboxes
+                .clone(),
+            vec![OpRef(10), OpRef(11)]
+        );
+    }
+
+    #[test]
+    fn test_front_target_inputarg_types_uses_saved_front_label_contract() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 7;
+        let trace_id = 11;
+        let token = JitCellToken::new(3);
+        let start_token = crate::optimizeopt::unroll::TargetToken::new_preamble(0);
+        let start_descr = start_token.as_jump_target_descr();
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef(0)], 2),
+            mk_op(OpCode::IntAdd, &[OpRef(100), OpRef(101)], 3),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef(0), OpRef(1), OpRef(2), OpRef(3)],
+                OpRef::NONE.0,
+                start_descr,
+            ),
+        ];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 2);
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: inputargs.clone(),
+                resume_data: HashMap::new(),
+                ops,
+                constants,
+                constant_types: HashMap::new(),
+                guard_op_indices: HashMap::new(),
+                exit_layouts: HashMap::new(),
+                terminal_exit_layouts: HashMap::new(),
+                snapshots: Vec::new(),
+                jitcode: None,
+            },
+        );
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token,
+                num_inputs: inputargs.len(),
+                meta: (),
+                front_target_tokens: vec![start_token],
+                retraced_count: 0,
+                root_trace_id: trace_id,
+                traces,
+                previous_tokens: Vec::new(),
+                next_global_opref: 0,
+            },
+        );
+
+        assert_eq!(
+            meta.front_target_inputarg_types(green_key),
+            Some(vec![Type::Ref, Type::Ref, Type::Ref, Type::Int])
+        );
+    }
+
+    #[test]
+    fn test_recovery_slot_types_use_single_frame_slot_types_when_available() {
+        let recovery_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: vec![],
+            vref_array: vec![],
+            frames: vec![majit_backend::ExitFrameLayout {
+                trace_id: None,
+                header_pc: Some(17),
+                source_guard: None,
+                pc: 17,
+                jitcode_index: 0,
+                slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
+                slot_types: Some(vec![Type::Int]),
+            }],
+            virtual_layouts: vec![],
+            pending_field_layouts: vec![],
+        };
+
+        assert_eq!(
+            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
+                &[Type::Ref],
+                Some(&recovery_layout),
+            ),
+            vec![Type::Int]
+        );
+    }
+
+    #[test]
+    fn test_recovery_slot_types_fall_back_on_length_mismatch() {
+        let recovery_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: vec![],
+            vref_array: vec![],
+            frames: vec![majit_backend::ExitFrameLayout {
+                trace_id: None,
+                header_pc: Some(17),
+                source_guard: None,
+                pc: 17,
+                jitcode_index: 0,
+                slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
+                slot_types: Some(vec![Type::Int]),
+            }],
+            virtual_layouts: vec![],
+            pending_field_layouts: vec![],
+        };
+
+        assert_eq!(
+            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
+                &[Type::Ref, Type::Ref],
+                Some(&recovery_layout),
+            ),
+            vec![Type::Ref, Type::Ref]
+        );
+    }
+
+    #[test]
+    fn test_recovery_slot_types_concatenate_frames_in_callee_first_order() {
+        let recovery_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: vec![],
+            vref_array: vec![],
+            frames: vec![
+                majit_backend::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: Some(11),
+                    source_guard: None,
+                    pc: 11,
+                    jitcode_index: 0,
+                    slots: vec![
+                        majit_backend::ExitValueSourceLayout::ExitValue(0),
+                        majit_backend::ExitValueSourceLayout::ExitValue(1),
+                    ],
+                    slot_types: Some(vec![Type::Ref, Type::Int]),
+                },
+                majit_backend::ExitFrameLayout {
+                    trace_id: None,
+                    header_pc: Some(23),
+                    source_guard: None,
+                    pc: 23,
+                    jitcode_index: 1,
+                    slots: vec![
+                        majit_backend::ExitValueSourceLayout::ExitValue(2),
+                        majit_backend::ExitValueSourceLayout::ExitValue(3),
+                    ],
+                    slot_types: Some(vec![Type::Float, Type::Ref]),
+                },
+            ],
+            virtual_layouts: vec![],
+            pending_field_layouts: vec![],
+        };
+
+        assert_eq!(
+            MetaInterp::<()>::recovery_slot_types_from_exit_types_and_layout(
+                &[Type::Ref, Type::Int, Type::Float, Type::Ref],
+                Some(&recovery_layout),
+            ),
+            vec![Type::Float, Type::Ref, Type::Ref, Type::Int]
+        );
+    }
+
+    #[test]
+    fn test_guard_resume_getters_return_stored_exit_layout_metadata() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 19;
+        let trace_id = 23;
+        let fail_index = 5;
+
+        let recovery_layout = majit_backend::ExitRecoveryLayout {
+            vable_array: vec![],
+            vref_array: vec![],
+            frames: vec![majit_backend::ExitFrameLayout {
+                trace_id: None,
+                header_pc: Some(41),
+                source_guard: None,
+                pc: 41,
+                jitcode_index: 0,
+                slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
+                slot_types: Some(vec![Type::Int]),
+            }],
+            virtual_layouts: vec![],
+            pending_field_layouts: vec![],
+        };
+
+        let mut exit_layouts = HashMap::new();
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                source_op_index: Some(0),
+                exit_types: vec![Type::Ref],
+                is_finish: false,
+                gc_ref_slots: vec![0],
+                force_token_slots: vec![],
+                recovery_layout: Some(recovery_layout),
+                resume_layout: None,
+                storage: Some(crate::resume::ResumeStorage::new(
+                    vec![7, 8, 9],
+                    vec![majit_ir::Const::Int(11)],
+                    vec![],
+                    vec![],
+                )),
+            },
+        );
+
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: vec![],
+                resume_data: HashMap::new(),
+                ops: vec![],
+                constants: HashMap::new(),
+                constant_types: HashMap::new(),
+                guard_op_indices: HashMap::new(),
+                exit_layouts,
+                terminal_exit_layouts: HashMap::new(),
+                snapshots: Vec::new(),
+                jitcode: None,
+            },
+        );
+
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: JitCellToken::new(3),
+                num_inputs: 0,
+                meta: (),
+                front_target_tokens: Vec::new(),
+                retraced_count: 0,
+                root_trace_id: trace_id,
+                traces,
+                previous_tokens: Vec::new(),
+                next_global_opref: 0,
+            },
+        );
+
+        assert_eq!(
+            meta.get_merge_point_pc(green_key, trace_id, fail_index),
+            Some(41)
+        );
+        let storage = meta
+            .get_resume_storage(green_key, trace_id, fail_index)
+            .expect("storage should be present");
+        assert_eq!(storage.rd_numb, vec![7, 8, 9]);
+        assert_eq!(
+            unsafe { (*storage.rd_consts.get()).clone() },
+            vec![majit_ir::Const::Int(11)]
+        );
+        assert_eq!(
+            meta.get_recovery_slot_types(green_key, trace_id, fail_index),
+            Some(vec![Type::Int])
+        );
+        assert_eq!(
+            meta.get_rd_virtuals(green_key, trace_id, fail_index),
+            Some(vec![])
+        );
+        let pendingfields = meta
+            .get_rd_pendingfields(green_key, trace_id, fail_index)
+            .expect("stored exit layout should expose rd_pendingfields");
+        assert!(pendingfields.is_empty());
+    }
+
+    #[test]
+    fn test_handle_async_forcing_prepares_rd_virtuals_from_exit_layout() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 29;
+        let trace_id = 31;
+        let fail_index = 7;
+
+        let mut writer = crate::resumecode::Writer::new(4);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count
+        writer.append_int(0); // vable_size
+        writer.append_int(0); // vref_size
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let mut exit_layouts = HashMap::new();
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                source_op_index: Some(0),
+                exit_types: vec![],
+                is_finish: false,
+                gc_ref_slots: vec![],
+                force_token_slots: vec![],
+                recovery_layout: None,
+                resume_layout: None,
+                storage: Some(crate::resume::ResumeStorage::new(
+                    rd_numb,
+                    vec![],
+                    vec![std::rc::Rc::new(majit_ir::RdVirtualInfo::VRawBufferInfo {
+                        func: 77,
+                        size: 0,
+                        offsets: vec![],
+                        descrs: vec![],
+                        fieldnums: vec![],
+                    })],
+                    vec![],
+                )),
+            },
+        );
+
+        let mut traces = HashMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: vec![],
+                resume_data: HashMap::new(),
+                ops: vec![],
+                constants: HashMap::new(),
+                constant_types: HashMap::new(),
+                guard_op_indices: HashMap::new(),
+                exit_layouts,
+                terminal_exit_layouts: HashMap::new(),
+                snapshots: Vec::new(),
+                jitcode: None,
+            },
+        );
+
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: JitCellToken::new(3),
+                num_inputs: 0,
+                meta: (),
+                front_target_tokens: Vec::new(),
+                retraced_count: 0,
+                root_trace_id: trace_id,
+                traces,
+                previous_tokens: Vec::new(),
+                next_global_opref: 0,
+            },
+        );
+
+        let (ptrs, ints) = meta
+            .handle_async_forcing(green_key, trace_id, fail_index, &[])
+            .expect("stored rd_virtuals should be forced");
+        assert_eq!(ptrs, vec![0]);
+        assert_eq!(ints, vec![0]);
+    }
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[cfg(target_arch = "x86_64")]
+    type DynasmCompiledCode = majit_backend_dynasm::x86::assembler::CompiledCode;
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[cfg(target_arch = "aarch64")]
+    type DynasmCompiledCode = majit_backend_dynasm::aarch64::assembler::CompiledCode;
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    fn patch_dynasm_fail_descr_resume_data(
+        token: &mut JitCellToken,
+        fail_index: u32,
+        rd_numb: Vec<u8>,
+        rd_consts: Vec<majit_ir::Const>,
+    ) {
+        let compiled = token
+            .compiled
+            .as_mut()
+            .expect("compiled token")
+            .downcast_mut::<DynasmCompiledCode>()
+            .expect("dynasm compiled code");
+        let descr = compiled
+            .fail_descrs
+            .iter_mut()
+            .find(|descr| descr.fail_index == fail_index)
+            .expect("fail descr");
+        // Test-only: bypass Arc::get_mut (the runtime keeps a second
+        // Arc for the attached-descr registry) by reinterpreting the
+        // Arc interior as &mut. Safe because test drivers are single-
+        // threaded and no JIT code runs while this helper is active.
+        let descr = unsafe {
+            &mut *(std::sync::Arc::as_ptr(descr)
+                as *mut majit_backend_dynasm::guard::DynasmFailDescr)
+        };
+        descr.rd_numb = Some(rd_numb);
+        descr.rd_consts = Some(rd_consts);
+        descr.rd_virtuals = Some(vec![]);
+        descr.rd_pendingfields = Some(vec![]);
+    }
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    fn patch_dynasm_fail_descr_types(
+        token: &mut JitCellToken,
+        fail_index: u32,
+        fail_arg_types: Vec<Type>,
+    ) {
+        let compiled = token
+            .compiled
+            .as_mut()
+            .expect("compiled token")
+            .downcast_mut::<DynasmCompiledCode>()
+            .expect("dynasm compiled code");
+        let descr = compiled
+            .fail_descrs
+            .iter_mut()
+            .find(|descr| descr.fail_index == fail_index)
+            .expect("fail descr");
+        // Test-only: bypass Arc::get_mut (the runtime keeps a second
+        // Arc for the attached-descr registry) by reinterpreting the
+        // Arc interior as &mut. Safe because test drivers are single-
+        // threaded and no JIT code runs while this helper is active.
+        let descr = unsafe {
+            &mut *(std::sync::Arc::as_ptr(descr)
+                as *mut majit_backend_dynasm::guard::DynasmFailDescr)
+        };
+        descr.fail_arg_types = fail_arg_types;
+    }
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[test]
+    fn test_handle_async_forcing_falls_back_to_previous_token_backend_exit_layout() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 30;
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        let (trace_id, fail_index) = {
+            let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
+            let trace_id = entry.root_trace_id;
+            let trace = entry.traces.get(&trace_id).expect("compiled trace");
+            let fail_index = *trace
+                .exit_layouts
+                .keys()
+                .next()
+                .expect("compiled guard exit");
+            (trace_id, fail_index)
+        };
+
+        let mut writer = crate::resumecode::Writer::new(4);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count
+        writer.append_int(0); // vable_size
+        writer.append_int(0); // vref_size
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        {
+            let entry = meta
+                .compiled_loops
+                .get_mut(&green_key)
+                .expect("compiled entry");
+            patch_dynasm_fail_descr_resume_data(&mut entry.token, fail_index, rd_numb, vec![]);
+            let mut fresh_token = JitCellToken::new(9003);
+            fresh_token.green_key = green_key;
+            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            entry.previous_tokens.push(old_token);
+            entry
+                .traces
+                .get_mut(&trace_id)
+                .expect("compiled trace")
+                .exit_layouts
+                .remove(&fail_index);
+        }
+
+        let (ptrs, ints) = meta
+            .handle_async_forcing(green_key, trace_id, fail_index, &[42])
+            .expect("async forcing should fall back to previous token backend layout");
+        assert_eq!(ptrs, Vec::<i64>::new());
+        assert_eq!(ints, Vec::<i64>::new());
+    }
+
     #[derive(Debug)]
     struct TestCallDescr {
         arg_types: Vec<Type>,
@@ -15567,7 +16294,6 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "cranelift")]
     fn attach_procedure_to_interp_entry(
         meta: &mut MetaInterp<()>,
         green_key: u64,
@@ -15650,6 +16376,271 @@ mod tests {
                 next_global_opref: 0,
             },
         );
+    }
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[test]
+    fn guard_exit_getters_fall_back_to_previous_token_backend_layouts() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 77;
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        let (trace_id, fail_index) = {
+            let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
+            let trace_id = entry.root_trace_id;
+            let fail_index = *entry
+                .traces
+                .get(&trace_id)
+                .and_then(|trace| trace.exit_layouts.keys().next())
+                .expect("compiled guard exit");
+            (trace_id, fail_index)
+        };
+
+        {
+            let entry = meta
+                .compiled_loops
+                .get_mut(&green_key)
+                .expect("compiled entry");
+            let mut fresh_token = JitCellToken::new(9001);
+            fresh_token.green_key = green_key;
+            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            entry.previous_tokens.push(old_token);
+            entry
+                .traces
+                .get_mut(&trace_id)
+                .expect("compiled trace")
+                .exit_layouts
+                .remove(&fail_index);
+        }
+
+        let layout = meta
+            .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+            .expect("previous token backend layout should remain visible");
+        assert_eq!(layout.exit_types, vec![Type::Int]);
+        assert!(!layout.is_finish);
+        assert_eq!(
+            meta.get_exit_types(green_key, trace_id, fail_index),
+            Some(vec![Type::Int])
+        );
+        let fail_descr = meta
+            .get_fail_descr_for_bridge(green_key, trace_id, fail_index)
+            .expect("bridge fail descr should search previous tokens too");
+        assert_eq!(fail_descr.fail_arg_types(), &[Type::Int]);
+    }
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[test]
+    fn guard_fail_descr_proxy_falls_back_to_trace_exit_types_when_backend_types_are_empty() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 87;
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        let (trace_id, fail_index) = {
+            let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
+            let trace_id = entry.root_trace_id;
+            // Both the GuardTrue and the Finish op end up in exit_layouts
+            // (each backend's collect_guards emits a FailDescr for the
+            // Finish too). HashMap iteration order is randomized per
+            // process, so pick the guard deterministically via
+            // is_finish == false.
+            let fail_index = *entry
+                .traces
+                .get(&trace_id)
+                .and_then(|trace| {
+                    trace
+                        .exit_layouts
+                        .iter()
+                        .find(|(_, layout)| !layout.is_finish)
+                        .map(|(k, _)| k)
+                })
+                .expect("compiled guard exit");
+            (trace_id, fail_index)
+        };
+
+        {
+            let entry = meta
+                .compiled_loops
+                .get_mut(&green_key)
+                .expect("compiled entry");
+            patch_dynasm_fail_descr_types(&mut entry.token, fail_index, vec![]);
+        }
+
+        assert_eq!(meta.fail_arg_count_for(green_key, trace_id, fail_index), 1);
+        let fail_descr = meta
+            .get_fail_descr_for_bridge(green_key, trace_id, fail_index)
+            .expect("empty backend fail_arg_types should fall back to trace exit layout");
+        assert_eq!(fail_descr.fail_arg_types(), &[Type::Int]);
+    }
+
+    #[test]
+    fn guard_failure_recovery_uses_previous_token_backend_exit_layout() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 88;
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
+            let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
+            let trace_id = entry.root_trace_id;
+            let trace = entry.traces.get(&trace_id).expect("compiled trace");
+            let fail_index = *trace
+                .exit_layouts
+                .keys()
+                .next()
+                .expect("compiled guard exit");
+            let layout = trace
+                .exit_layouts
+                .get(&fail_index)
+                .expect("stored exit layout");
+            (
+                trace_id,
+                fail_index,
+                layout.source_op_index,
+                layout
+                    .storage
+                    .as_ref()
+                    .map(|storage| storage.rd_numb.clone()),
+                layout.exit_types.clone(),
+            )
+        };
+
+        {
+            let entry = meta
+                .compiled_loops
+                .get_mut(&green_key)
+                .expect("compiled entry");
+            let mut fresh_token = JitCellToken::new(9002);
+            fresh_token.green_key = green_key;
+            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            entry.previous_tokens.push(old_token);
+            entry
+                .traces
+                .get_mut(&trace_id)
+                .expect("compiled trace")
+                .exit_layouts
+                .remove(&fail_index);
+        }
+
+        let recovery = meta
+            .handle_guard_failure_in_trace_with_savedata(
+                green_key,
+                trace_id,
+                fail_index,
+                &[42],
+                Some(&[Value::Int(42)]),
+                None,
+                ExceptionState::default(),
+            )
+            .expect("guard recovery should fall back to previous token backend layout");
+
+        assert_eq!(
+            recovery.exit_layout.source_op_index,
+            expected_source_op_index
+        );
+        assert_eq!(
+            recovery
+                .exit_layout
+                .storage
+                .as_ref()
+                .map(|storage| storage.rd_numb.clone()),
+            expected_rd_numb
+        );
+        assert_eq!(recovery.exit_layout.exit_types, expected_exit_types);
+    }
+
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    #[test]
+    fn test_start_retrace_from_guard_uses_previous_token_backend_resume_data() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let green_key = 89;
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
+
+        let (trace_id, fail_index) = {
+            let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
+            let trace_id = entry.root_trace_id;
+            let trace = entry.traces.get(&trace_id).expect("compiled trace");
+            let fail_index = *trace
+                .exit_layouts
+                .keys()
+                .next()
+                .expect("compiled guard exit");
+            (trace_id, fail_index)
+        };
+
+        let mut writer = crate::resumecode::Writer::new(4);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count
+        writer.append_int(0); // vable_size
+        writer.append_int(0); // vref_size
+        writer.patch_current_size(0);
+        let expected_rd_numb = writer.create_numbering();
+
+        {
+            let entry = meta
+                .compiled_loops
+                .get_mut(&green_key)
+                .expect("compiled entry");
+            patch_dynasm_fail_descr_resume_data(
+                &mut entry.token,
+                fail_index,
+                expected_rd_numb.clone(),
+                vec![],
+            );
+            let mut fresh_token = JitCellToken::new(9004);
+            fresh_token.green_key = green_key;
+            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            entry.previous_tokens.push(old_token);
+            entry
+                .traces
+                .get_mut(&trace_id)
+                .expect("compiled trace")
+                .exit_layouts
+                .remove(&fail_index);
+        }
+
+        let retrace = meta
+            .start_retrace_from_guard(green_key, trace_id, fail_index, &[42])
+            .expect("retrace should use previous token backend resume data");
+
+        assert_eq!(retrace.fail_types, vec![Type::Int]);
+        let storage = retrace
+            .storage
+            .as_ref()
+            .expect("retrace storage should be present");
+        assert_eq!(storage.rd_numb, expected_rd_numb);
+        assert!(unsafe { (*storage.rd_consts.get()).is_empty() });
+        assert!(storage.rd_virtuals.is_empty());
     }
 
     #[cfg(feature = "cranelift")]
@@ -15763,7 +16754,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
     fn finish_trace_for_parity_preserves_captured_snapshots() {
         let mut meta = MetaInterp::<()>::new(10);
         let action = meta.force_start_tracing(777, (0, 0), None, &[Value::Int(17)]);
@@ -15825,6 +16815,39 @@ mod tests {
         meta.set_vable_array_lengths(vec![1]);
 
         assert_eq!(meta.trace_entry_vable_lengths(&info), vec![4]);
+    }
+
+    #[test]
+    fn initialize_virtualizable_appends_read_boxes_to_red_only_trace_entry() {
+        let mut meta = MetaInterp::<()>::new(10);
+        let info = std::sync::Arc::new(test_vable_info_static_only());
+        meta.set_virtualizable_info(info.clone());
+
+        let mut obj = ResidualCallVableObj { token: 0, pc: 41 };
+        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+
+        let descriptor = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        let frame = Value::Ref(majit_ir::GcRef(
+            (&mut obj as *mut ResidualCallVableObj) as usize,
+        ));
+        let action = meta.force_start_tracing(777, (0, 0), Some(descriptor), &[frame]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let ctx = meta.trace_ctx().expect("expected active trace context");
+        assert_eq!(ctx.recorder.num_inputargs(), 2);
+        assert_eq!(ctx.inputarg_types(), vec![Type::Ref, Type::Int]);
+        assert_eq!(
+            ctx.collect_virtualizable_boxes().unwrap(),
+            vec![OpRef(1), OpRef(0)]
+        );
+        assert_eq!(
+            ctx.virtualizable_entry_at(0),
+            Some((OpRef(1), Value::Int(41)))
+        );
     }
 
     #[test]

@@ -3518,11 +3518,8 @@ impl TraceCtx {
     /// active `JitDriverStaticData`, matching RPython's
     /// `rewrite.py:684 jd.index_of_virtualizable` lookup.
     ///
-    /// Dormant until Task #11 Step 3 migrates the tracer's
-    /// `call_assembler_with_vable_expansion_args` sites. Covered by
-    /// `call_assembler_red_only_ref_emits_no_vable_expansion` so the
-    /// descriptor shape stays honest until the call-site flip lands.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Covered by `call_assembler_red_only_ref_emits_no_vable_expansion`
+    /// to verify the emitted descriptor shape.
     pub fn call_assembler_red_only_ref(
         &mut self,
         target_number: u64,

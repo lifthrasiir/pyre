@@ -55,11 +55,14 @@ use crate::pyframe::{PendingInlineResult, PyFrame};
 
 /// Store an inline-handled concrete result on the owning caller frame.
 pub fn set_pending_inline_result(frame: &mut PyFrame, result: PendingInlineResult) {
-    frame.pending_inline_results.push_back(result);
+    frame
+        .pending_inline_results
+        .get_or_insert_with(|| Box::new(std::collections::VecDeque::new()))
+        .push_back(result);
 }
 
 fn take_pending_inline_result(frame: &mut PyFrame) -> Option<PyObjectRef> {
-    match frame.pending_inline_results.pop_front()? {
+    match frame.pending_inline_results.as_mut()?.pop_front()? {
         PendingInlineResult::Ref(result) => Some(result),
         PendingInlineResult::Int(value) => Some(pyre_object::w_int_new(value)),
         PendingInlineResult::Float(value) => Some(pyre_object::floatobject::w_float_new(value)),

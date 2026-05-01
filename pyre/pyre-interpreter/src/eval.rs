@@ -44,16 +44,63 @@ impl Code {
 thread_local! {
     static CURRENT_EXCEPTION: Cell<PyObjectRef> = const { Cell::new(PY_NULL) };
     pub(crate) static CURRENT_FRAME: Cell<*mut PyFrame> = const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT_FRAME_PREVIOUS_ROOTS: std::cell::RefCell<Vec<majit_ir::GcRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 use crate::pyframe::PyFrame;
 
 pub struct CurrentFrameGuard {
-    previous: *mut PyFrame,
+    save_point: usize,
+    ec: *mut PyExecutionContext,
+    ec_top_root_index: Option<usize>,
 }
 
 impl Drop for CurrentFrameGuard {
     fn drop(&mut self) {
-        CURRENT_FRAME.with(|current| current.set(self.previous));
+        let (previous, previous_ec_top) = CURRENT_FRAME_PREVIOUS_ROOTS.with(|roots| {
+            let mut roots = roots.borrow_mut();
+            let previous = roots
+                .get(self.save_point)
+                .copied()
+                .unwrap_or(majit_ir::GcRef::NULL);
+            let previous_ec_top = self
+                .ec_top_root_index
+                .and_then(|idx| roots.get(idx).copied())
+                .unwrap_or(majit_ir::GcRef::NULL);
+            roots.truncate(self.save_point);
+            (previous, previous_ec_top)
+        });
+        CURRENT_FRAME.with(|current| current.set(previous.0 as *mut PyFrame));
+        if !self.ec.is_null() {
+            unsafe {
+                (*self.ec).topframeref = previous_ec_top.0 as *mut PyFrame;
+            }
+        }
+    }
+}
+
+fn push_current_frame_previous_root(
+    previous: *mut PyFrame,
+    ec: *mut PyExecutionContext,
+    previous_ec_top: *mut PyFrame,
+) -> CurrentFrameGuard {
+    let (save_point, ec_top_root_index) = CURRENT_FRAME_PREVIOUS_ROOTS.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        let save_point = roots.len();
+        roots.push(majit_ir::GcRef(previous as usize));
+        let ec_top_root_index = if ec.is_null() {
+            None
+        } else {
+            let idx = roots.len();
+            roots.push(majit_ir::GcRef(previous_ec_top as usize));
+            Some(idx)
+        };
+        (save_point, ec_top_root_index)
+    });
+    CurrentFrameGuard {
+        save_point,
+        ec,
+        ec_top_root_index,
     }
 }
 
@@ -64,12 +111,41 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
         previous
     });
     // executioncontext.py `enter()` parity: link the frame into the
-    // f_backref chain so walkers (GC roots, sys._getframe) can iterate
-    // all active frames. `eval_frame_plain` still calls
-    // `ExecutionContext::enter` which performs the same assignment; JIT
-    // path (`pyre-jit::eval::eval_with_jit`) relies on this helper.
-    frame.f_backref = previous;
-    CurrentFrameGuard { previous }
+    // topframeref/f_backref chain so walkers (GC roots, sys._getframe)
+    // can iterate all active frames. `eval_frame_plain` calls
+    // `ExecutionContext::enter` before installing TLS-only state, but
+    // the JIT portal path enters through this helper directly.
+    let ec = frame.execution_context as *mut PyExecutionContext;
+    let previous_ec_top = if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            let top = (*ec).topframeref;
+            (*ec).topframeref = frame as *mut PyFrame;
+            top
+        }
+    };
+    frame.f_backref = if ec.is_null() {
+        previous
+    } else {
+        previous_ec_top
+    };
+    push_current_frame_previous_root(previous, ec, previous_ec_top)
+}
+
+/// Install only the TLS current-frame root.
+///
+/// Use this after `ExecutionContext::enter()` has already linked
+/// `frame.f_backref`.  PyPy has one frame chain (`ec.topframeref`);
+/// pyre's `CURRENT_FRAME` is an extra GC/super() TLS root and must not
+/// overwrite the RPython `f_backref` chain once EC owns it.
+pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard {
+    let previous = CURRENT_FRAME.with(|current| {
+        let previous = current.get();
+        current.set(frame as *mut PyFrame);
+        previous
+    });
+    push_current_frame_previous_root(previous, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
@@ -92,7 +168,36 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
 /// `valuestackdepth` are skipped.
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     CURRENT_FRAME.with(|cf| {
+        // Forward `CURRENT_FRAME` itself: when the top frame is a
+        // nursery-allocated `PyFrame` (Phase 2.3 옵션 B
+        // `emit_new_pyframe_inline_self_recursive`) the visitor copies
+        // it to the survivor space and rewrites the cell to the new
+        // address. For `std::alloc`-backed frames the visitor's
+        // `is_nursery_object_start` guard short-circuits, leaving the
+        // pointer untouched. `Cell::as_ptr()` exposes the storage
+        // address; `*mut PyFrame` and `GcRef` share the `usize` repr
+        // (`GcRef` is `#[repr(transparent)]`).
+        //
+        // SAFETY: `CURRENT_FRAME`'s storage is a thread-local `Cell`
+        // that outlives this walker. We hold the with-borrow `cf` for
+        // the duration of the visit so no other code mutates the cell.
+        let cf_slot_ptr = cf.as_ptr() as *mut majit_ir::GcRef;
+        visitor(unsafe { &mut *cf_slot_ptr });
+        CURRENT_FRAME_PREVIOUS_ROOTS.with(|roots| {
+            let mut roots = roots.borrow_mut();
+            for root in roots.iter_mut() {
+                visitor(root);
+            }
+        });
+
         let mut frame = cf.get();
+        if !frame.is_null() {
+            let ec = unsafe { (*frame).execution_context as *mut PyExecutionContext };
+            if !ec.is_null() {
+                let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
+                visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
+            }
+        }
         while !frame.is_null() {
             // SAFETY: PyFrame pointers on the f_backref chain are valid
             // for the duration of the enclosing `eval_with_jit` call. A
@@ -102,18 +207,48 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             // We walk the FULL fixed-length array (not just the live
             // `valuestackdepth` prefix). Argument values in transit —
             // popped from the caller's stack before the callee frame
-            // is installed — are briefly invisible from `valuestackdepth`
-            // alone, yet still reachable from the popped-slot storage.
-            // Non-ref slots are filtered by `is_nursery_object_start`
-            // inside the collector, so walking past the live depth is
-            // harmless for the bump-pointer nursery.
-            let (arr_ptr, depth) = unsafe {
+            // is installed — are briefly invisible from
+            // `valuestackdepth` alone, yet still reachable from the
+            // popped-slot storage. Non-ref slots are filtered by
+            // `is_nursery_object_start` inside the collector, so
+            // walking past the live depth is harmless for the
+            // bump-pointer nursery.
+            //
+            // The walk runs for every frame on the chain, including
+            // ones the GC owns. For nursery-allocated frames the
+            // standard tracer ALSO covers their gc_ptr_offsets when it
+            // reaches the survivor copy; visiting the locals array
+            // items here from the original nursery payload is safe
+            // because Phase 1e runs before any internal-slot
+            // forwarding (the original payload is still intact). We
+            // intentionally do NOT call `majit_gc::gc_owns_object`
+            // here to gate this branch — that hook re-enters
+            // `with_cranelift_gc` with a `borrow_mut`, which panics
+            // when invoked from inside `collect_nursery` (the GC's
+            // own cell is already borrowed by the active alloc shim).
+            let (arr_ptr, depth, next_frame) = unsafe {
+                let f_back_slot = &mut (*(frame)).f_backref as *mut *mut PyFrame;
+                visitor(&mut *(f_back_slot as *mut majit_ir::GcRef));
+
+                // PyFrame is normally a GC object in PyPy, so its GCREF
+                // fields are traced before consumers dereference them.
+                // pyre also has stdalloc-backed frames, so the frame root
+                // walker must expose those fields explicitly.
+                let locals_slot =
+                    &mut (*(frame)).locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray;
+                visitor(&mut *(locals_slot as *mut majit_ir::GcRef));
+                let gen_slot = &mut (*(frame)).f_generator_nowref as *mut PyObjectRef;
+                visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
+                let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
+                visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
+
                 let f = &*frame;
+                let next_frame = (*frame).f_backref;
                 if f.locals_cells_stack_w.is_null() {
-                    (std::ptr::null_mut::<PyObjectRef>(), 0)
+                    (std::ptr::null_mut::<PyObjectRef>(), 0, next_frame)
                 } else {
                     let arr = &*f.locals_cells_stack_w;
-                    (arr.items_ptr() as *mut PyObjectRef, arr.len())
+                    (arr.items_ptr() as *mut PyObjectRef, arr.len(), next_frame)
                 }
             };
             if !arr_ptr.is_null() && depth > 0 {
@@ -121,12 +256,13 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     let slot_ptr = unsafe { arr_ptr.add(i) } as *mut majit_ir::GcRef;
                     // SAFETY: slot lies inside the FixedObjectArray's
                     // heap allocation, which outlives the frame. The
-                    // visitor reads, conditionally forwards, and stores
-                    // back a `GcRef` (same layout as `*mut PyObject`).
+                    // visitor reads, conditionally forwards, and
+                    // stores back a `GcRef` (same layout as
+                    // `*mut PyObject`).
                     visitor(unsafe { &mut *slot_ptr });
                 }
             }
-            frame = unsafe { (*frame).f_backref };
+            frame = next_frame;
         }
     });
 }
@@ -367,7 +503,11 @@ pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
 }
 
 fn eval_loop(frame: &mut PyFrame) -> PyResult {
-    let _current_frame_guard = install_current_frame(frame);
+    let _current_frame_guard = if frame.execution_context.is_null() {
+        install_current_frame(frame)
+    } else {
+        install_current_frame_tls_only(frame)
+    };
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     let mut next_instr = frame.next_instr();
 
@@ -800,6 +940,39 @@ impl ControlFlowOpcodeHandler for PyFrame {
     /// pyopcode.py:180-183 RETURN_VALUE — frame_finished_execution = True
     /// when the returning path exits the frame (matched by StepResult::Return).
     fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
+        if std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some() {
+            unsafe {
+                let code_ptr = crate::pyframe::pyframe_get_pycode(self);
+                let name = if !code_ptr.is_null() {
+                    (*code_ptr).obj_name.as_str()
+                } else {
+                    "?"
+                };
+                let arg0_intval = {
+                    let lw = self.locals_w();
+                    if lw.len() > 0 {
+                        let v = lw[0];
+                        if !v.is_null() && pyre_object::pyobject::is_int(v) {
+                            Some(pyre_object::intobject::w_int_get_value(v))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let ret_intval = if !value.is_null() && pyre_object::pyobject::is_int(value) {
+                    Some(pyre_object::intobject::w_int_get_value(value))
+                } else {
+                    None
+                };
+                let f_back = self.f_backref as usize;
+                eprintln!(
+                    "[interp] return name={} arg0={:?} ret={:?} frame={:p} f_back=0x{:x} ret_ref=0x{:x}",
+                    name, arg0_intval, ret_intval, self as *const _, f_back, value as usize
+                );
+            }
+        }
         self.frame_finished_execution = true;
         Ok(StepResult::Return(value))
     }

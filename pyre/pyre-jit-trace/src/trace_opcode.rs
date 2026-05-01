@@ -201,6 +201,105 @@ use crate::frame_layout::{
 };
 use crate::helpers::TraceHelperAccess;
 
+/// Build the red `frame` argument for PyPy-style recursive CALL_ASSEMBLER.
+///
+/// RPython `pyjitpl.py:3589-3609 direct_assembler_call` records the portal
+/// reds (`frame`, `ec`) directly. For the narrow fib-style case we can emit
+/// the callee `PyFrame` as ordinary trace IR; cases that need closure or
+/// debugdata setup keep the existing opaque helper fallback.
+///
+/// Returns `(frame, drop_needed)`. `drop_needed` is true only for the legacy
+/// arena helper path; trace-visible frames are GC-owned.
+fn emit_call_assembler_callee_frame(
+    this: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    callable: OpRef,
+    args: &[OpRef],
+    concrete_callable: PyObjectRef,
+    w_callee_code: *const (),
+    callee_code: &CodeObject,
+    is_self_recursive: bool,
+    self_recursive_raw_int_arg: Option<OpRef>,
+) -> Result<(OpRef, bool), PyError> {
+    if is_self_recursive && args.len() == 1 {
+        if let Some(raw_arg) = self_recursive_raw_int_arg {
+            let nlocals = callee_code.varnames.len();
+            let ncells = pyre_interpreter::ncells(callee_code);
+            let max_stack = callee_code.max_stackdepth as usize;
+            let callee_globals = unsafe { function_get_globals(concrete_callable) };
+            let stores_global = unsafe {
+                pyre_interpreter::w_code_frame_stores_global(
+                    w_callee_code as PyObjectRef,
+                    callee_globals,
+                )
+            };
+            if ncells == 0 && !stores_global {
+                let pycode_const = ctx.const_ref(w_callee_code as i64);
+                let w_globals_const = ctx.const_ref(callee_globals as i64);
+                let ec_opref = this.sym().execution_context;
+                let ec = if ec_opref.is_none() {
+                    ctx.record_op_with_descr(
+                        majit_ir::OpCode::GetfieldGcR,
+                        &[this.frame()],
+                        crate::descr::pyframe_execution_context_descr(),
+                    )
+                } else {
+                    ec_opref
+                };
+                let frame = crate::helpers::emit_new_pyframe_inline_self_recursive(
+                    ctx,
+                    raw_arg,
+                    nlocals + ncells + max_stack,
+                    nlocals + ncells,
+                    pycode_const,
+                    w_globals_const,
+                    ec,
+                );
+                return Ok((frame, false));
+            }
+        }
+    }
+
+    if args.len() == 1 {
+        let (helper, helper_arg_types, helper_args) = if is_self_recursive {
+            if let Some(raw_arg) = self_recursive_raw_int_arg {
+                let (helper, helper_arg_types) = one_arg_callee_frame_helper(Type::Int, true);
+                (helper, helper_arg_types, vec![this.frame(), raw_arg])
+            } else {
+                let (helper, helper_arg_types) =
+                    one_arg_callee_frame_helper(this.value_type(args[0]), true);
+                (helper, helper_arg_types, vec![this.frame(), args[0]])
+            }
+        } else {
+            let (helper, helper_arg_types) =
+                one_arg_callee_frame_helper(this.value_type(args[0]), false);
+            (
+                helper,
+                helper_arg_types,
+                vec![this.frame(), callable, args[0]],
+            )
+        };
+        let frame = ctx.call_ref_typed(helper, &helper_args, &helper_arg_types);
+        return Ok((frame, true));
+    }
+
+    if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(args.len()) {
+        let mut helper_args = if is_self_recursive {
+            vec![this.frame()]
+        } else {
+            vec![this.frame(), callable]
+        };
+        helper_args.extend_from_slice(args);
+        let helper_arg_types = frame_callable_arg_types(args.len());
+        let frame = ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
+        return Ok((frame, true));
+    }
+
+    Err(PyError::type_error(
+        "call_assembler: no frame helper for nargs",
+    ))
+}
+
 /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity helper.
 ///
 /// `PyreSym.vable_*` is a pyre-only parallel symbolic cache that
@@ -2259,8 +2358,54 @@ impl MIFrame {
             self.sym().nlocals > 0 || !self.sym().is_active_vable_owner,
             "nlocals must be set by init_symbolic before close_loop_args_at"
         );
+        // RPython close_loop_args parity: JUMP args must match the target
+        // label's types (inputarg_types). materialize_loop_carried_value
+        // boxes values to match (e.g. Int → Ref for virtualizable locals).
+        //
+        // For bridge traces, ctx.inputarg_types() returns the bridge's
+        // guard fail_arg types, NOT the root loop's label types. The JUMP
+        // targets the root loop label, so resolve the root loop's LABEL/
+        // inputargs types via `front_target_inputarg_types` (peeled-entry
+        // LABEL when unrolled, root TreeLoop.inputargs otherwise — see
+        // `MetaInterp::front_target_inputarg_types` doc).
+        let inputarg_types = {
+            let (driver, _) = crate::driver::driver_pair();
+            if driver.is_bridge_tracing() {
+                if let Some(gk) = driver.current_trace_green_key() {
+                    driver
+                        .front_target_inputarg_types(gk)
+                        .unwrap_or_else(|| ctx.inputarg_types())
+                } else {
+                    ctx.inputarg_types()
+                }
+            } else {
+                ctx.inputarg_types()
+            }
+        };
+        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        // `extra_reds` reflects the canonical ec/red layout (NUM_EXTRA_REDS).
+        // Drives the conditional ec push at args[1] and the dedup-side
+        // OpRef ↔ virtualizable_box mapping below.
+        let extra_reds = crate::virtualizable_gen::NUM_EXTRA_REDS;
+        // pyjitpl.py:2954-2965 reached_loop_header parity: once the
+        // descriptor-driven virtualizable path is active, JUMP args must carry
+        // the full virtualizable array capacity. compile.rs later expands the
+        // loop entry from the same heap lengths; emitting only the live stack
+        // window here leaves too few source args for that expansion.
+        let target_array_capacity = ctx
+            .virtualizable_array_lengths()
+            .map(|lengths| lengths.iter().copied().sum::<usize>())
+            .filter(|&len| len >= self.sym().nlocals)
+            .unwrap_or_else(|| {
+                self.sym().nlocals
+                    + self
+                        .sym()
+                        .valuestackdepth
+                        .saturating_sub(self.sym().nlocals)
+            });
         let (
             frame,
+            execution_context,
             next_instr,
             code,
             stack_depth,
@@ -2276,17 +2421,30 @@ impl MIFrame {
             let s = self.sym();
             let nlocals = s.nlocals;
             let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
-            // Stage 3.4 Phase C: `close_loop_args_at` builds JUMP args
-            // from the unified register file. Locals = `[..nlocals]`
-            // and stack = `[nlocals..nlocals+stack_only]`. RPython
-            // `flatten.py:306` / `regalloc.py:79` treat link.args the
-            // same way: a single contiguous register window per kind.
+            // virtualizable.py:86-98 `read_boxes` + pyjitpl.py:2954-2965
+            // `reached_loop_header`: `virtualizable_boxes` length is the
+            // target vable array capacity (`nlocals + ncells + co_stacksize`),
+            // not the live Python stack depth. JUMP args carry that full
+            // capacity so every target LABEL slot has a matching source.
+            // Slots beyond the live prefix are left as `OpRef::NONE` and
+            // filled by `materialize_fail_arg_slot` below, which reads
+            // `concrete_value_at` and falls back to `PY_NULL` for dead
+            // capacity slots — mirroring RPython's null-padded
+            // virtualizable_boxes tail.
             let reg_len = s.registers_r.len();
+            let target_stack_capacity = target_array_capacity.saturating_sub(nlocals);
             let locals_len = nlocals.min(reg_len);
-            let stack_end = (nlocals + stack_only).min(reg_len);
-            let stack_slice_start = nlocals.min(reg_len);
+            let live_stack_len = stack_only.min(reg_len.saturating_sub(locals_len));
+            let stack_slice_start = locals_len;
+            let stack_slice_end = stack_slice_start + live_stack_len;
+            let mut stack_vec = s.registers_r[stack_slice_start..stack_slice_end].to_vec();
+            stack_vec.resize(target_stack_capacity, OpRef::NONE);
+            let mut stack_types_vec =
+                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec();
+            stack_types_vec.resize(target_stack_capacity, Type::Ref);
             (
                 s.frame,
+                s.execution_context,
                 s.vable_last_instr,
                 s.vable_pycode,
                 s.vable_valuestackdepth,
@@ -2295,46 +2453,26 @@ impl MIFrame {
                 s.vable_w_globals,
                 nlocals,
                 s.registers_r[..locals_len].to_vec(),
-                s.registers_r[stack_slice_start..stack_end].to_vec(),
+                stack_vec,
                 s.symbolic_local_types.clone(),
-                s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec(),
+                stack_types_vec,
             )
         };
-        // RPython close_loop_args parity: JUMP args must match the target
-        // label's types (inputarg_types). materialize_loop_carried_value
-        // boxes values to match (e.g. Int → Ref for virtualizable locals).
-        //
-        // For bridge traces, ctx.inputarg_types() returns the bridge's
-        // guard fail_arg types, NOT the root loop's label types. The JUMP
-        // targets the root loop label, so we must use the root loop token's
-        // inputarg_types instead.
-        let inputarg_types = {
-            let (driver, _) = crate::driver::driver_pair();
-            if driver.is_bridge_tracing() {
-                if let Some(gk) = driver.current_trace_green_key() {
-                    driver
-                        .get_loop_token(gk)
-                        .map(|token| token.inputarg_types.clone())
-                        .unwrap_or_else(|| ctx.inputarg_types())
-                } else {
-                    ctx.inputarg_types()
-                }
-            } else {
-                ctx.inputarg_types()
-            }
-        };
-        let mut args = vec![
-            frame,
+        let mut args = vec![frame];
+        if extra_reds == 1 {
+            args.push(execution_context);
+        }
+        args.extend_from_slice(&[
             next_instr,
             code,
             stack_depth,
             debugdata,
             lastblock,
             namespace,
-        ];
+        ]);
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types
-                .get(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + idx)
+                .get(num_scalars + idx)
                 .copied()
                 .unwrap_or(Type::Ref);
             // Materialize NONE slots from concrete frame before boxing.
@@ -2345,7 +2483,7 @@ impl MIFrame {
         }
         for (stack_idx, value) in stack.into_iter().enumerate() {
             let target_type = inputarg_types
-                .get(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + nlocals + stack_idx)
+                .get(num_scalars + nlocals + stack_idx)
                 .copied()
                 .unwrap_or(Type::Ref);
             let value =
@@ -2465,13 +2603,14 @@ impl MIFrame {
         // pyre fails to close at a merge point and continues tracing,
         // which pyre's tracer does not currently expose.
         for &(idx, new_opref) in &dedup_changed {
-            if idx == 0 {
+            if idx <= extra_reds {
                 // args[0] = frame = ctx.virtualizable_boxes[len-1].
-                // RPython's `remove_consts_and_duplicates(boxes, len-1, ...)`
-                // skips this trailing slot.
+                // Any extra reds that follow it are not part of
+                // `virtualizable_boxes`, so only the virtualizable payload
+                // starting after `[frame, extra_reds...]` is mirrored back.
                 continue;
             }
-            let vb_idx = idx - 1;
+            let vb_idx = idx - (1 + extra_reds);
             ctx.set_virtualizable_box_at(vb_idx, new_opref);
         }
         // pyjitpl.py:1578 put_back_list_of_boxes3: write dedup'd values back
@@ -2480,22 +2619,27 @@ impl MIFrame {
         // reached_loop_header returns without closing. Harmless on the "close
         // loop" path since the frame won't be reused.
         {
-            let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            // `num_scalars` (NUM_SCALAR_INPUTARGS) already counts extra_reds
+            // (frame + extra_reds + vable static fields) post-Phase 2.1.
+            let total_scalar_prefix = num_scalars;
             let s = self.sym_mut();
             for &(idx, new_opref) in &dedup_changed {
-                if idx < num_scalars {
+                if idx < total_scalar_prefix {
                     match idx {
                         0 => s.frame = new_opref,
-                        1 => s.vable_last_instr = new_opref,
-                        2 => s.vable_pycode = new_opref,
-                        3 => s.vable_valuestackdepth = new_opref,
-                        4 => s.vable_debugdata = new_opref,
-                        5 => s.vable_lastblock = new_opref,
-                        6 => s.vable_w_globals = new_opref,
-                        _ => {}
+                        1 if extra_reds == 1 => s.execution_context = new_opref,
+                        _ => match idx - extra_reds {
+                            1 => s.vable_last_instr = new_opref,
+                            2 => s.vable_pycode = new_opref,
+                            3 => s.vable_valuestackdepth = new_opref,
+                            4 => s.vable_debugdata = new_opref,
+                            5 => s.vable_lastblock = new_opref,
+                            6 => s.vable_w_globals = new_opref,
+                            _ => {}
+                        },
                     }
                 } else {
-                    let local_idx = idx - num_scalars;
+                    let local_idx = idx - total_scalar_prefix;
                     // `registers_r` is the unified abstract register
                     // file; locals + stack tail share the same addr
                     // space, so the dedup'd rename writes to the single
@@ -2546,21 +2690,31 @@ impl MIFrame {
     }
 
     /// pyjitpl.py:2586 capture_resumedata: build fail_args for CURRENT
-    /// top frame. Returns [frame, ni, code, vsd, ns, active_boxes...].
+    /// top frame. Returns [frame, (ec)?, ni, code, vsd, debugdata, lastblock,
+    /// ns, active_boxes...]. Layout matches the inputarg stream produced by
+    /// `extract_live_values` — `NUM_EXTRA_REDS` controls whether the ec slot
+    /// (interp_jit.py:67 `reds = ['frame', 'ec']`) is present between frame
+    /// and the vable static fields. Dormant under NUM_EXTRA_REDS=0 (skips
+    /// ec push, preserves pre-ec 7-scalar layout).
     /// virtualizable.py:86 read_boxes: all static fields in order.
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
         let s = self.sym();
-        let mut fa = vec![
-            s.frame,
+        let mut fa =
+            Vec::with_capacity(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + active_boxes.len());
+        fa.push(s.frame);
+        if crate::virtualizable_gen::NUM_EXTRA_REDS > 0 {
+            fa.push(s.execution_context);
+        }
+        fa.extend_from_slice(&[
             s.vable_last_instr,
             s.vable_pycode,
             s.vable_valuestackdepth,
             s.vable_debugdata,
             s.vable_lastblock,
             s.vable_w_globals,
-        ];
+        ]);
         fa.extend_from_slice(&active_boxes);
         fa
     }
@@ -4283,8 +4437,9 @@ impl MIFrame {
                 // `is_recursive=True` on the single PyPyJitDriver every
                 // framestack entry is a portal frame, so the upstream
                 // filter is automatically satisfied and the count equals
-                // `ctx.recursive_depth(callee_key)` (1 if the root trace's
-                // greenkey matches + number of matching inlined frames).
+                // `ctx.recursive_depth(callee_key)`: only already-inlined
+                // portal frames count, matching PyPy's root frame whose
+                // `greenkey` is None.
                 let recursive_count = recursive_depth;
                 let recursion_exceeded =
                     callee_inline_eligible && recursive_count >= max_unroll_recursion;
@@ -4305,12 +4460,10 @@ impl MIFrame {
                 }
 
                 // pyjitpl.py:1376-1423 _opimpl_recursive_call: compute
-                // assembler_call boolean. Self-recursive InlineDecision::
-                // Inline still degrades to CALL_ASSEMBLER in pyre when a
-                // token exists because recursive framestack transitions
-                // (pyjitpl.py:1579-1602 `jit_merge_point(depth > 0)`) are
-                // not modelled yet; promote to assembler_call when
-                // possible, leave residual call otherwise.
+                // assembler_call boolean.  While recursive depth stays under
+                // `max_unroll_recursion`, InlineDecision::Inline takes the
+                // perform_call path below; CALL_ASSEMBLER is reserved for
+                // the same fall-through cases as PyPy.
                 let assembler_call = if is_self_recursive
                     && inline_decision == majit_metainterp::InlineDecision::Inline
                     && !recursion_exceeded
@@ -4330,13 +4483,11 @@ impl MIFrame {
 
                 // pyjitpl.py:1414-1416 / pyjitpl.py:2174-2186 parity:
                 // perform_call when callee is inlinable and the recursion
-                // count is below `max_unroll_recursion`. Self-recursive
-                // perform_call remains disabled in pyre.
-                let can_trace_through = if is_self_recursive {
-                    false
-                } else {
-                    callee_inline_eligible && nargs <= 4 && !callee_has_loop && !recursion_exceeded
-                };
+                // count is below `max_unroll_recursion`.  PyPy does not
+                // special-case self-recursive calls here; the framestack
+                // depth check is the gate.
+                let can_trace_through =
+                    callee_inline_eligible && nargs <= 4 && !callee_has_loop && !recursion_exceeded;
 
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -4353,9 +4504,7 @@ impl MIFrame {
                 }
 
                 if can_trace_through {
-                    // pyjitpl.py:1414-1416 perform_call parity for
-                    // non-self-recursive calls only. Self-recursive
-                    // perform_call is still disabled above.
+                    // pyjitpl.py:1414-1416 perform_call parity.
                     match self.build_pending_inline_frame(
                         callable,
                         args,
@@ -4422,20 +4571,9 @@ impl MIFrame {
                     );
                 }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
-                    // pyframe.py:107 locals_cells_stack_w =
-                    //   nlocals + ncellvars + nfreevars + co_stacksize.
-                    // virtualizable.py:95-98 read_boxes walks len(lst) —
-                    // the full heap capacity. Match the compiled-meta path
-                    // at L4474 (`callee_nlocals + callee_stack_only`) so
-                    // both pre-compiled and pending-token CALL_ASSEMBLER
-                    // emissions size num_array_items the same.
-                    let code_ptr =
-                        pyre_interpreter::get_pycode(concrete_callable) as *const CodeObject;
-                    let code = &*code_ptr;
-                    let (_callee_nlocals, callee_array_capacity) =
-                        crate::state::callee_layout_for_call_assembler(code);
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
                     {
+                        let call_pc = self.fallthrough_pc.saturating_sub(1);
                         return self.with_ctx(|this, ctx| {
                             if !is_self_recursive {
                                 this.implement_guard_value(ctx, callable, concrete_callable as i64);
@@ -4448,91 +4586,47 @@ impl MIFrame {
                             } else {
                                 None
                             };
-                            let callee_frame = if let Some(raw_arg) = self_recursive_raw_arg {
-                                let (helper, helper_arg_types) =
-                                    one_arg_callee_frame_helper(Type::Int, true);
-                                ctx.call_ref_typed(
-                                    helper,
-                                    &[this.frame(), raw_arg],
-                                    &helper_arg_types,
-                                )
-                            } else if nargs == 1 {
-                                let (helper, helper_arg_types) = one_arg_callee_frame_helper(
-                                    this.value_type(args[0]),
+                            let (callee_frame, drop_callee_frame) =
+                                emit_call_assembler_callee_frame(
+                                    this,
+                                    ctx,
+                                    callable,
+                                    args,
+                                    concrete_callable,
+                                    w_callee_code,
+                                    callee_code,
                                     is_self_recursive,
-                                );
-                                let helper_args = if is_self_recursive {
-                                    vec![this.frame(), args[0]]
-                                } else {
-                                    vec![this.frame(), callable, args[0]]
-                                };
-                                ctx.call_ref_typed(helper, &helper_args, &helper_arg_types)
-                            } else {
-                                let frame_helper =
-                                    (crate::callbacks::get().callee_frame_helper)(nargs).unwrap();
-                                let mut helper_args = if is_self_recursive {
-                                    vec![this.frame()]
-                                } else {
-                                    vec![this.frame(), callable]
-                                };
-                                helper_args.extend_from_slice(args);
-                                let helper_arg_types = frame_callable_arg_types(args.len());
-                                ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types)
-                            };
-                            // pyjitpl.py:3589 direct_assembler_call: pass only
-                            // red args. rewrite.py:665 handle_call_assembler:
-                            // backend reads remaining fields from callee_frame
-                            // via VableExpansion.
-                            let ca_locals: Vec<OpRef> =
-                                if let Some(raw_arg) = self_recursive_raw_arg {
-                                    vec![wrapint(ctx, raw_arg)]
-                                } else {
-                                    args.iter()
-                                        .map(|&arg| ensure_boxed_for_ca(ctx, &*this, arg))
-                                        .collect()
-                                };
-                            let first_array_slot = 1 + 6; // frame + 6 scalars
-                            let arg_overrides: Vec<(usize, usize)> = (0..ca_locals.len())
-                                .map(|i| (first_array_slot + i, 1 + i))
-                                .collect();
-                            let expansion = majit_ir::VableExpansion {
-                                scalar_fields: vec![
-                                    (crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET, Type::Int),
-                                    (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
-                                    (
-                                        crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
-                                        Type::Int,
-                                    ),
-                                    (crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET, Type::Ref),
-                                    (crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET, Type::Ref),
-                                    (crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET, Type::Ref),
-                                ],
-                                array_struct_offset:
-                                    crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                                array_ptr_offset: pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-                                num_array_items: callee_array_capacity,
-                                const_overrides: vec![],
-                                arg_overrides,
-                            };
-                            let mut ca_args = vec![callee_frame];
-                            ca_args.extend_from_slice(&ca_locals);
-                            let ca_arg_types = vec![Type::Ref; ca_args.len()];
-                            // warmspot.py:449 portal result_type == REF → CALL_ASSEMBLER_R
-                            let ca_result = ctx.call_assembler_with_vable_expansion_args(
+                                    self_recursive_raw_arg,
+                                )?;
+                            // pyjitpl.py:2017: do_residual_call step 1
+                            this.vable_and_vrefs_before_residual_call(ctx);
+                            let ca_result = ctx.call_assembler_red_only_ref(
                                 token_number,
-                                &ca_args,
-                                &ca_arg_types,
-                                Type::Ref,
-                                expansion,
+                                &[callee_frame, this.sym().execution_context],
+                                &[Type::Ref, Type::Ref],
                             );
                             // pyjitpl.py:2080-2081 direct_assembler_call:
                             // record KEEPALIVE on callee virtualizable so
                             // it survives until the result is consumed.
                             ctx.record_op(OpCode::Keepalive, &[callee_frame]);
-                            ctx.call_void(
-                                crate::callbacks::get().jit_drop_callee_frame,
-                                &[callee_frame],
-                            );
+                            if drop_callee_frame {
+                                // Only the opaque arena-helper path needs the
+                                // explicit drop. Trace-visible PyFrames are
+                                // GC-owned and must not go through arena.put.
+                                ctx.call_void(
+                                    crate::callbacks::get().jit_drop_callee_frame,
+                                    &[callee_frame],
+                                );
+                            }
+                            // pyjitpl.py:2049
+                            this.vrefs_after_residual_call(ctx);
+                            // pyjitpl.py:2078
+                            this.vable_after_residual_call()?;
+                            // pyjitpl.py:2079
+                            this.push_call_replay_stack(ctx, callable, args, call_pc);
+                            this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                            ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                            this.pop_call_replay_stack(ctx, args.len())?;
                             let result = if inline_framestack_active {
                                 ca_result // already Ref — no unbox+rebox needed
                             } else {
@@ -4597,25 +4691,12 @@ impl MIFrame {
                         };
 
                         {
-                            // pyre adaptation: when a `compiled_meta` entry
-                            // exists (callee already compiled), read the
-                            // shape from it; otherwise (tmp_callback target
-                            // or pending-only) fall back to the layout
-                            // derived from `concrete_callable`'s CodeObject.
-                            // Slice 4.5a prep — the fallback is dead code
-                            // until Slice 4.5c removes the L4424 None
-                            // short-circuit, but lifting the panic is the
-                            // architectural unblock for that step.
-                            let (callee_nlocals, callee_vsd) = match driver
-                                .get_compiled_meta(callee_key)
-                            {
-                                Some(m) => (m.num_locals, m.valuestackdepth),
-                                None => crate::state::callee_layout_for_call_assembler(callee_code),
-                            };
-                            let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
-                            let target_num_inputs =
-                                driver.get_compiled_num_inputs(callee_key).unwrap_or(1);
-
+                            let _callee_meta = driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
+                                panic!(
+                                    "compiled loop for callee_key={callee_key} is missing compiled meta"
+                                )
+                            });
+                            let call_pc = self.fallthrough_pc.saturating_sub(1);
                             return self.with_ctx(|this, ctx| {
                                 // Self-recursive: no callable guard needed (same function).
                                 // Non-self-recursive: guard on callable value.
@@ -4626,144 +4707,56 @@ impl MIFrame {
                                         concrete_callable as i64,
                                     );
                                 }
-                                let callee_frame = if args.len() == 1 {
-                                    let (helper, helper_arg_types) = one_arg_callee_frame_helper(
-                                        this.value_type(args[0]),
-                                        is_self_recursive,
-                                    );
-                                    let helper_args = if is_self_recursive {
-                                        vec![this.frame(), args[0]]
-                                    } else {
-                                        vec![this.frame(), callable, args[0]]
-                                    };
-                                    ctx.call_ref_typed(helper, &helper_args, &helper_arg_types)
-                                } else if let Some(frame_helper) =
-                                    (crate::callbacks::get().callee_frame_helper)(nargs)
+                                let self_recursive_raw_arg = if is_self_recursive
+                                    && args.len() == 1
+                                    && matches!(concrete_arg0, Some(arg) if is_int(arg))
                                 {
-                                    let mut helper_args = if is_self_recursive {
-                                        vec![this.frame()]
-                                    } else {
-                                        vec![this.frame(), callable]
-                                    };
-                                    helper_args.extend_from_slice(args);
-                                    let helper_arg_types = frame_callable_arg_types(args.len());
-                                    ctx.call_ref_typed(
-                                        frame_helper,
-                                        &helper_args,
-                                        &helper_arg_types,
-                                    )
+                                    Some(this.trace_guarded_int_payload(ctx, args[0]))
                                 } else {
-                                    // Fallback: can't create callee frame in trace
-                                    return Err(pyre_interpreter::PyError::type_error(
-                                        "call_assembler: no frame helper for nargs",
-                                    ));
+                                    None
                                 };
+                                let (callee_frame, drop_callee_frame) =
+                                    emit_call_assembler_callee_frame(
+                                        this,
+                                        ctx,
+                                        callable,
+                                        args,
+                                        concrete_callable,
+                                        w_callee_code,
+                                        callee_code,
+                                        is_self_recursive,
+                                        self_recursive_raw_arg,
+                                    )?;
 
-                                // pyjitpl.py:3589 direct_assembler_call: pass only
-                                // red args. rewrite.py:665 handle_call_assembler:
-                                // backend reads remaining fields from callee_frame
-                                // via VableExpansion.
-                                let num_array_items = callee_nlocals + callee_stack_only;
-                                let ca_result = if target_num_inputs <= 1 {
-                                    let expansion = majit_ir::VableExpansion {
-                                        scalar_fields: vec![
-                                            (
-                                                crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
-                                                Type::Int,
-                                            ),
-                                            (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
-                                            (
-                                                crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
-                                                Type::Int,
-                                            ),
-                                            (
-                                                crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
-                                                Type::Ref,
-                                            ),
-                                            (
-                                                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
-                                                Type::Ref,
-                                            ),
-                                        ],
-                                        array_struct_offset:
-                                            crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                                        array_ptr_offset: pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-                                        num_array_items,
-                                        const_overrides: vec![],
-                                        arg_overrides: vec![],
-                                    };
-                                    ctx.call_assembler_with_vable_expansion_args(
-                                        token_number,
-                                        &[callee_frame],
-                                        &[Type::Ref],
-                                        Type::Ref,
-                                        expansion,
-                                    )
+                                // pyjitpl.py:2017: do_residual_call step 1
+                                this.vable_and_vrefs_before_residual_call(ctx);
+                                let ec = this.sym().execution_context;
+                                let (ca_args, ca_types): (Vec<OpRef>, Vec<Type>) = if ec.is_none() {
+                                    (vec![callee_frame], vec![Type::Ref])
                                 } else {
-                                    let boxed_args: Vec<OpRef> = args
-                                        .iter()
-                                        .map(|&arg| {
-                                            crate::state::ensure_boxed_for_ca(ctx, &*this, arg)
-                                        })
-                                        .collect();
-                                    // virtualizable.py:86 read_boxes: all static
-                                    // fields first, then array slots. 6 scalars
-                                    // (last_instr, pycode, valuestackdepth,
-                                    // debugdata, lastblock, w_globals) + frame.
-                                    let first_array_slot = 1 + 6;
-                                    let arg_overrides: Vec<(usize, usize)> = (0..boxed_args.len())
-                                        .map(|i| (first_array_slot + i, 1 + i))
-                                        .collect();
-                                    let expansion = majit_ir::VableExpansion {
-                                        scalar_fields: vec![
-                                            (
-                                                crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET,
-                                                Type::Int,
-                                            ),
-                                            (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
-                                            (
-                                                crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
-                                                Type::Int,
-                                            ),
-                                            (
-                                                crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
-                                                Type::Ref,
-                                            ),
-                                            (
-                                                crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
-                                                Type::Ref,
-                                            ),
-                                            (
-                                                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
-                                                Type::Ref,
-                                            ),
-                                        ],
-                                        array_struct_offset:
-                                            crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                                        array_ptr_offset: pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-                                        num_array_items,
-                                        const_overrides: vec![],
-                                        arg_overrides,
-                                    };
-                                    let mut ca_args = vec![callee_frame];
-                                    ca_args.extend_from_slice(&boxed_args);
-                                    let ca_arg_types = vec![Type::Ref; ca_args.len()];
-                                    ctx.call_assembler_with_vable_expansion_args(
-                                        token_number,
-                                        &ca_args,
-                                        &ca_arg_types,
-                                        Type::Ref,
-                                        expansion,
-                                    )
+                                    (vec![callee_frame, ec], vec![Type::Ref, Type::Ref])
                                 };
-                                // pyjitpl.py:2080-2081 direct_assembler_call:
-                                // record KEEPALIVE on callee virtualizable so
-                                // it survives until the result is consumed.
-                                ctx.record_op(OpCode::Keepalive, &[callee_frame]);
-                                ctx.call_void(
-                                    crate::callbacks::get().jit_drop_callee_frame,
-                                    &[callee_frame],
+                                let ca_result = ctx.call_assembler_red_only_ref(
+                                    token_number,
+                                    &ca_args,
+                                    &ca_types,
                                 );
+                                ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+                                if drop_callee_frame {
+                                    ctx.call_void(
+                                        crate::callbacks::get().jit_drop_callee_frame,
+                                        &[callee_frame],
+                                    );
+                                }
+                                // pyjitpl.py:2049
+                                this.vrefs_after_residual_call(ctx);
+                                // pyjitpl.py:2078
+                                this.vable_after_residual_call()?;
+                                // pyjitpl.py:2079
+                                this.push_call_replay_stack(ctx, callable, args, call_pc);
+                                this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                                ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                                this.pop_call_replay_stack(ctx, args.len())?;
                                 let result = if inline_framestack_active {
                                     ca_result // already Ref
                                 } else {
@@ -5091,8 +5084,6 @@ impl MIFrame {
                     } else {
                         crate::callbacks::get().jit_force_recursive_call_argraw_boxed_1
                     };
-                    // pyjitpl.py:2017: do_residual_call step 1
-                    this.vable_and_vrefs_before_residual_call(ctx);
                     // pyjitpl.py:2053-2055: direct_assembler_call only when
                     // assembler_call=True (computed in _opimpl_recursive_call).
                     // Token lookup happens AFTER the decision, not before.
@@ -5103,102 +5094,59 @@ impl MIFrame {
                     } else {
                         None
                     };
-                    let result = if let Some(token_number) = ca_token {
-                        // pyjitpl.py:3589-3609 direct_assembler_call parity:
-                        // CALL_ASSEMBLER takes [caller_frame, boxed_arg].
-                        // Backend reads scalar fields from caller_frame via
-                        // VableExpansion. For self-recursive, code/ns come
-                        // from the frame; for non-self-recursive, they're
-                        // const_overrides with the callee's values.
-                        let boxed_arg = wrapint(ctx, raw_arg);
-                        let callee_code_ptr =
-                            unsafe { pyre_interpreter::get_pycode(concrete_callable) };
-                        let callee_code =
-                            unsafe { &*(callee_code_ptr as *const pyre_interpreter::CodeObject) };
-                        // pyframe.py:107 locals_cells_stack_w =
-                        //   nlocals + ncellvars + nfreevars + co_stacksize.
-                        // virtualizable.py:95-98 read_boxes walks len(lst) — full
-                        // heap capacity. Match L4316 pending-token + L4474 compiled-
-                        // meta paths so callee receives the same number of inputargs
-                        // independent of which CALL_ASSEMBLER emission site emitted
-                        // the op.
-                        let (callee_nlocals, callee_array_capacity) =
-                            crate::state::callee_layout_for_call_assembler(callee_code);
-                        let callee_ns_ptr = unsafe { function_get_globals(concrete_callable) };
-                        // interp_jit.py:25-31: 6 scalar fields + frame = 7 slots.
-                        let first_array_slot = 1 + 6; // frame + 6 scalars
-                        // Callee entry overrides: last_instr=-1, vsd=nlocals,
-                        // debugdata=0 (None), lastblock=0 (None).
-                        // Non-self-recursive also overrides pycode and
-                        // w_globals.
-                        let mut const_overrides = vec![
-                            (1, -1),                    // slot 1 = last_instr = -1
-                            (3, callee_nlocals as i64), // slot 3 = vsd = nlocals
-                            (4, 0),                     // slot 4 = debugdata = None
-                            (5, 0),                     // slot 5 = lastblock = None
-                        ];
-                        if !is_self_recursive {
-                            const_overrides.push((2, callee_code_ptr as i64)); // slot 2 = pycode
-                            const_overrides.push((6, callee_ns_ptr as i64)); // slot 6 = w_globals
-                        }
-                        // Site 2 reads slot 0 from caller frame, not callee
-                        // frame — array_struct_offset points at caller's
-                        // locals_cells_stack array. Without callee-frame
-                        // allocation, the only known-safe values for callee
-                        // inputarg slots [first_array_slot+1 .. capacity] are
-                        // None (uninit locals[1..nlocals]) and 0 (empty stack
-                        // [0..max_stackdepth] at portal entry). NULL-pad them
-                        // so the backend does not leak caller frame items into
-                        // the callee.
-                        for slot in
-                            (first_array_slot + 1)..(first_array_slot + callee_array_capacity)
-                        {
-                            const_overrides.push((slot, 0));
-                        }
-                        let expansion = majit_ir::VableExpansion {
-                            scalar_fields: vec![
-                                (crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET, Type::Int),
-                                (crate::frame_layout::PYFRAME_PYCODE_OFFSET, Type::Ref),
-                                (
-                                    crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET,
-                                    Type::Int,
-                                ),
-                                (crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET, Type::Ref),
-                                (crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET, Type::Ref),
-                                (crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET, Type::Ref),
-                            ],
-                            array_struct_offset:
-                                crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                            array_ptr_offset: pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-                            num_array_items: callee_array_capacity,
-                            const_overrides,
-                            // locals[0] = boxed_arg (CALL_ASSEMBLER arg[1])
-                            arg_overrides: vec![(first_array_slot, 1)],
+                    let raw_result = if let Some(token_number) = ca_token {
+                        let w_callee_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
+                        let callee_code = unsafe {
+                            &*(pyre_interpreter::w_code_get_ptr(w_callee_code as PyObjectRef)
+                                as *const CodeObject)
                         };
-                        let ca_result = ctx.call_assembler_with_vable_expansion_args(
-                            token_number,
-                            &[this.frame(), boxed_arg],
-                            &[Type::Ref, Type::Ref],
-                            Type::Ref,
-                            expansion,
-                        );
-                        // pyjitpl.py:2079: GUARD_NOT_FORCED
-                        this.push_call_replay_stack(ctx, callable, args, call_pc);
-                        this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
-                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
-                        this.pop_call_replay_stack(ctx, args.len())?;
-                        // Caller unboxes: guard_class + getfield_gc_i
-                        let unboxed = this.trace_guarded_int_payload(ctx, ca_result);
-                        unboxed
+                        let self_recursive_raw_arg = if is_self_recursive {
+                            Some(raw_arg)
+                        } else {
+                            None
+                        };
+                        let (callee_frame, drop_callee_frame) = emit_call_assembler_callee_frame(
+                            this,
+                            ctx,
+                            callable,
+                            args,
+                            concrete_callable,
+                            w_callee_code,
+                            callee_code,
+                            is_self_recursive,
+                            self_recursive_raw_arg,
+                        )?;
+                        // pyjitpl.py:2017: do_residual_call step 1
+                        this.vable_and_vrefs_before_residual_call(ctx);
+                        let ec = this.sym().execution_context;
+                        let (ca_args, ca_types): (Vec<OpRef>, Vec<Type>) = if ec.is_none() {
+                            (vec![callee_frame], vec![Type::Ref])
+                        } else {
+                            (vec![callee_frame, ec], vec![Type::Ref, Type::Ref])
+                        };
+                        let ca_result =
+                            ctx.call_assembler_red_only_ref(token_number, &ca_args, &ca_types);
+                        ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+                        if drop_callee_frame {
+                            ctx.call_void(
+                                crate::callbacks::get().jit_drop_callee_frame,
+                                &[callee_frame],
+                            );
+                        }
+                        ca_result
                     } else if force_fn
                         == crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
                     {
+                        // pyjitpl.py:2017: do_residual_call step 1
+                        this.vable_and_vrefs_before_residual_call(ctx);
                         ctx.call_may_force_ref_typed(
                             force_fn,
                             &[this.frame(), raw_arg],
                             &[Type::Ref, Type::Int],
                         )
                     } else {
+                        // pyjitpl.py:2017: do_residual_call step 1
+                        this.vable_and_vrefs_before_residual_call(ctx);
                         ctx.call_may_force_ref_typed(
                             force_fn,
                             &[this.frame(), callable, raw_arg],
@@ -5209,13 +5157,18 @@ impl MIFrame {
                     this.vrefs_after_residual_call(ctx);
                     // pyjitpl.py:2078: vable_after_residual_call
                     this.vable_after_residual_call()?;
-                    if ca_token.is_none() {
-                        // CALL_MAY_FORCE path: GUARD_NOT_FORCED
-                        this.push_call_replay_stack(ctx, callable, args, call_pc);
-                        this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
-                        ctx.heap_cache_mut().invalidate_caches_for_escaped();
-                        this.pop_call_replay_stack(ctx, args.len())?;
-                    }
+                    // pyjitpl.py:2079: GUARD_NOT_FORCED — emitted on every
+                    // residual-call path (CA and CALL_MAY_FORCE alike).
+                    this.push_call_replay_stack(ctx, callable, args, call_pc);
+                    this.generate_guard(ctx, OpCode::GuardNotForced, &[]);
+                    ctx.heap_cache_mut().invalidate_caches_for_escaped();
+                    this.pop_call_replay_stack(ctx, args.len())?;
+                    // CA-path-only: unbox boxed result via guard_class + getfield_gc_i.
+                    let result = if ca_token.is_some() {
+                        this.trace_guarded_int_payload(ctx, raw_result)
+                    } else {
+                        raw_result
+                    };
                     result
                 } else {
                     let force_fn = crate::callbacks::get().jit_force_recursive_call_1;

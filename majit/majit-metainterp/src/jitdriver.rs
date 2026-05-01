@@ -667,6 +667,10 @@ impl<S: JitState> JitDriver<S> {
         self.meta.get_loop_token(green_key)
     }
 
+    pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
+        self.meta.front_target_inputarg_types(green_key)
+    }
+
     /// Get the compiled loop's num_inputs (after preamble patching).
     pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
         self.meta.get_compiled_num_inputs(green_key)
@@ -1081,6 +1085,7 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::CloseLoop => {
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
+                let has_partial_trace = self.meta.partial_trace().is_some();
                 if let Some(bridge) = self.meta.bridge_info() {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
@@ -1205,6 +1210,7 @@ impl<S: JitState> JitDriver<S> {
                 loop_header_pc,
             } => {
                 // pyjitpl.py:2979-2990 reached_loop_header parity.
+                let has_partial_trace = self.meta.partial_trace().is_some();
                 if let Some(bridge) = self.meta.bridge_info() {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
@@ -1676,14 +1682,12 @@ impl<S: JitState> JitDriver<S> {
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
-            // Extract guard_resume_pc from fail_args (last Int value).
-            // compile.py:800-809: use owning_key (rd_loop_token) for bridge attachment.
-            let num_inputs = self.meta.compiled_num_inputs(owning_key);
-            let guard_resume_pc = if raw_values.len() > num_inputs {
-                raw_values[raw_values.len() - 1] as usize
-            } else {
-                target_pc
-            };
+            // compile.py:710 recovery_layout header_pc parity:
+            // guard resume_pc comes from the guard's recovery metadata.
+            let guard_resume_pc = self
+                .get_merge_point_pc(owning_key, trace_id, fail_index)
+                .map(|pc| pc as usize)
+                .unwrap_or(target_pc);
 
             if should_bridge {
                 // compile.py:704-709: _trace_and_compile_from_bridge
@@ -1693,8 +1697,8 @@ impl<S: JitState> JitDriver<S> {
                     fail_index,
                     state,
                     env,
+                    &raw_values,
                     guard_resume_pc,
-                    target_pc,
                 );
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -2011,11 +2015,16 @@ impl<S: JitState> JitDriver<S> {
             return true;
         };
         let reds = descriptor.reds();
-        reds.len() == live_values.len()
-            && reds
-                .iter()
-                .zip(live_values.iter())
-                .all(|(var, value)| var.tp == value.get_type())
+        // warmstate.py:387 execute_assembler parity: the runtime entrypoint
+        // is called with the JitDriver reds only. If the state reports any
+        // other live-value shape while a descriptor is active, refuse the
+        // run instead of silently accepting a pyre-specific prefix match.
+        if live_values.len() != reds.len() {
+            return false;
+        }
+        reds.iter()
+            .zip(live_values.iter())
+            .all(|(var, value)| var.tp == value.get_type())
     }
 
     fn flatten_virtualizable_values(
@@ -3067,7 +3076,6 @@ impl<S: JitState> JitDriver<S> {
     /// Uses the compiled loop's stored meta so that the sym's
     /// storage_layout matches the parent loop's inputargs format.
     /// `resume_pc` is where interpretation resumes after the guard failure.
-    /// `loop_header_pc` is the parent loop's back-edge target.
     pub fn start_bridge_tracing(
         &mut self,
         green_key: u64,
@@ -3075,8 +3083,8 @@ impl<S: JitState> JitDriver<S> {
         fail_index: u32,
         state: &mut S,
         env: &S::Env,
+        raw_fail_values: &[i64],
         resume_pc: usize,
-        _loop_header_pc: usize,
     ) -> bool {
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             return false;
@@ -3093,15 +3101,18 @@ impl<S: JitState> JitDriver<S> {
         // position and traces forward from there.
         let mut trace_meta = state.build_meta(resume_pc, env);
 
-        let live_values = state.extract_live(&trace_meta);
-        let live_types = state.live_value_types(&trace_meta);
+        let fail_arg_count = self
+            .meta
+            .fail_arg_count_for(green_key, trace_id, fail_index);
+        let Some(frontend_fail_values) = raw_fail_values.get(..fail_arg_count) else {
+            return false;
+        };
 
         let retrace = match self.meta.start_retrace_from_guard(
             green_key,
             trace_id,
             fail_index,
-            &live_values,
-            &live_types,
+            frontend_fail_values,
         ) {
             Some(r) => r,
             None => return false,
@@ -3122,7 +3133,11 @@ impl<S: JitState> JitDriver<S> {
             retrace.storage.as_ref(),
         );
         if resume_data_result.is_none() {
-            S::update_meta_for_bridge(&mut trace_meta, &retrace.fail_types);
+            self.meta.abort_trace(false);
+            self.clear_tracing_session_state();
+            self.resume_data_result = None;
+            self.last_bridge_is_exception_guard = false;
+            return false;
         }
 
         let mut sym = S::create_sym(&trace_meta, resume_pc);
@@ -3189,14 +3204,14 @@ impl<S: JitState> JitDriver<S> {
         //   raw `RebuiltFrame.values` section.
         //
         // `RebuiltFrame.values` contains only the frame's register slots;
-        // it does NOT have the synthetic [frame, ni, vsd] header used by
-        // pyre's fallback `update_meta_for_bridge()` path.  Reinterpreting
-        // those slot values as header-prefixed fail_arg types shifts the
-        // frame layout and can mis-bind bridge return values.
+        // it does NOT have pyre's old synthetic [frame, ni, vsd] bridge
+        // header. Reinterpreting those slot values as header-prefixed
+        // fail_arg types shifts the frame layout and can mis-bind bridge
+        // return values.
         //
         // Keep `trace_meta` as built from the restored state when rd_numb
-        // is available; only the no-rd_numb fallback should call
-        // `update_meta_for_bridge()`.
+        // is available; the bridge path should not synthesize a separate
+        // header-shaped meta layer.
         //
         // Constants are NOT injected into the pool up-front: resume.py:1245
         // `decode_box` returns live ConstInt/ConstPtr boxes at the moment
@@ -3374,14 +3389,12 @@ impl<S: JitState> JitDriver<S> {
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
-            // Extract guard_resume_pc from fail_args.
-            // compile.py:800-809: use owning_key (rd_loop_token).
-            let num_inputs = self.meta.compiled_num_inputs(owning_key);
-            let guard_resume_pc = if raw_values.len() > num_inputs {
-                raw_values[raw_values.len() - 1] as usize
-            } else {
-                target_pc
-            };
+            // compile.py:710 recovery_layout header_pc parity:
+            // guard resume_pc comes from the guard's recovery metadata.
+            let guard_resume_pc = self
+                .get_merge_point_pc(owning_key, trace_id, fail_index)
+                .map(|pc| pc as usize)
+                .unwrap_or(target_pc);
 
             if should_bridge {
                 // compile.py:704-709: _trace_and_compile_from_bridge
@@ -3392,7 +3405,13 @@ impl<S: JitState> JitDriver<S> {
                 self.sync_after(state, &result_meta, descriptor.as_ref());
 
                 let bridge_ok = self.start_bridge_tracing(
-                    owning_key, trace_id, fail_index, state, env, resume_pc, target_pc,
+                    owning_key,
+                    trace_id,
+                    fail_index,
+                    state,
+                    env,
+                    &raw_values,
+                    resume_pc,
                 );
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -4255,6 +4274,7 @@ mod tests {
             .expect("guard should fail");
         let trace_id = failure.trace_id;
         let fail_index = failure.fail_index;
+        let fail_values = failure.values.clone();
 
         let started = driver.start_bridge_tracing(
             green_key,
@@ -4262,7 +4282,7 @@ mod tests {
             fail_index,
             &mut NonTraceableState,
             &(),
-            0,
+            &fail_values,
             0,
         );
         assert!(!started);

@@ -81,6 +81,13 @@ pub struct PyreArrayDescr {
     type_id: u32,
     item_type: Type,
     signed: bool,
+    /// `descr.py:359-362 ArrayDescr.lendescr` parity. `None` for the
+    /// `nolength=True` shape (ints/floats backing arrays where items
+    /// start at offset 0); `Some` for length-prefixed `Ptr(GcArray(T))`
+    /// shapes whose `gen_initialize_len` (`rewrite.py:565,572`) writes
+    /// the runtime length so `ArraylenGc` / `bhimpl_arraylen_vable`
+    /// can read it back.
+    len_descr: Option<DescrRef>,
 }
 
 impl Descr for PyreFieldDescr {
@@ -158,6 +165,10 @@ impl ArrayDescr for PyreArrayDescr {
     fn is_item_signed(&self) -> bool {
         self.signed
     }
+
+    fn len_descr(&self) -> Option<&dyn FieldDescr> {
+        self.len_descr.as_ref().and_then(|d| d.as_field_descr())
+    }
 }
 
 /// Create a field descriptor for an object field.
@@ -207,7 +218,9 @@ pub fn make_field_descr_with_parent(
                 .find(|(_, fd)| fd.as_field_descr().map_or(false, |f| f.offset() == offset))
                 .map(|(i, _)| i)
         })
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            panic!("FieldDescr offset {offset} is not present in parent SizeDescr all_fielddescrs")
+        });
     Arc::new(PyreFieldDescr {
         offset,
         field_size,
@@ -445,6 +458,12 @@ pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
 pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
 pub use pyre_object::strobject::W_STR_GC_TYPE_ID;
+// `PYFRAME_GC_TYPE_ID` lives in `pyre-interpreter::pyframe` alongside
+// the `PyFrame` struct it describes. Re-exported for the JIT
+// registration site (`pyre-jit/src/eval.rs`). Phase 2.3 옵션 B
+// foundation — registered ahead of any future
+// `NewWithVtable(PyFrame)` in trace IR.
+pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
     let field_descr = group
@@ -863,14 +882,14 @@ static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
-        0,
+        PYFRAME_GC_TYPE_ID,
         0,
         &[
             (
                 "PyFrame.locals_cells_stack_w",
                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
                 8,
-                Type::Int,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -923,6 +942,46 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.lastblock",
                 crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            // Phase 2.3 옵션 B prerequisite: inline PyFrame 생성 시 새 frame 의
+            // execution_context 슬롯에 caller 의 ec 를 SetfieldGc 로 쓰기 위해
+            // 필요. RPython parity 는 interp_jit.py:67 reds=[frame, ec] 의 ec
+            // 슬롯과 동등 — pyre 는 ec 를 PyFrame 헤더에 inline 저장.
+            (
+                "PyFrame.execution_context",
+                crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyFrame.f_generator_nowref",
+                crate::frame_layout::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyFrame.w_yielding_from",
+                crate::frame_layout::PYFRAME_W_YIELDING_FROM_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyFrame.f_backref",
+                crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -995,6 +1054,38 @@ pub fn make_size_descr_with_type_and_vtable(
     })
 }
 
+/// Synthetic `len` field descriptor matching upstream
+/// `descr.py:264 FieldDescr("len", ofs, WORD, FLAG_SIGNED)`. Lives at
+/// offset 0 of the `Ptr(GcArray(T))` block (FixedObjectArray /
+/// pyobject_gcarray layout): items start at `base_size`, so the word
+/// before items is the length header. Returned from
+/// `PyreArrayDescr::len_descr()` so `gen_initialize_len`
+/// (`rewrite.py:565,572`) emits the runtime length store after
+/// `CallMallocNurseryVarsize`.
+fn array_lendescr_at_offset_zero() -> DescrRef {
+    Arc::new(PyreFieldDescr {
+        offset: 0,
+        field_size: std::mem::size_of::<usize>(),
+        field_type: Type::Int,
+        signed: true,
+        immutable: false,
+        quasi_immutable: false,
+        name: "len",
+        index_in_parent: 0,
+        parent_descr: None,
+    })
+}
+
+/// Construct the optional `len_descr` for an array layout. RPython
+/// `descr.py:359 nolength` flag parity: arrays without a length-prefix
+/// header (`base_size == 0`, used by raw int/float-backed varsize
+/// stores) return `None`; length-prefixed layouts (`base_size >= WORD`,
+/// e.g. `Ptr(GcArray(PyObjectRef))` whose first word IS the length
+/// header) return a synthetic FieldDescr at offset 0.
+fn maybe_array_lendescr(base_size: usize) -> Option<DescrRef> {
+    (base_size >= std::mem::size_of::<usize>()).then(array_lendescr_at_offset_zero)
+}
+
 /// Create an array descriptor for a pointer-backed array field.
 pub fn make_array_descr(
     base_size: usize,
@@ -1008,6 +1099,7 @@ pub fn make_array_descr(
         type_id: 0,
         item_type,
         signed,
+        len_descr: maybe_array_lendescr(base_size),
     })
 }
 
@@ -1024,6 +1116,7 @@ pub fn make_array_descr_with_type(
         type_id,
         item_type,
         signed,
+        len_descr: maybe_array_lendescr(base_size),
     })
 }
 
@@ -1283,6 +1376,25 @@ pub fn pyframe_debugdata_descr() -> DescrRef {
 /// `lastblock` slot of the virtualizable expansion (Phase D-1 prereq).
 pub fn pyframe_lastblock_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
+}
+
+/// Phase 2.3 옵션 B prerequisite: PyFrame.execution_context FieldDescr.
+/// inline PyFrame 생성 시 caller 의 ec 를 새 frame 으로 SetfieldGc 하기 위해.
+/// 호출 사이트는 다음 세션의 `helpers.rs::emit_new_pyframe_inline*`.
+pub fn pyframe_execution_context_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
+}
+
+pub fn pyframe_f_generator_nowref_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
+}
+
+pub fn pyframe_w_yielding_from_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 9)
+}
+
+pub fn pyframe_f_backref_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 10)
 }
 
 #[cfg(test)]

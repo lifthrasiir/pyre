@@ -160,6 +160,19 @@ fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::arena_jitframe_descrs;
+    use majit_metainterp::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
+
+    #[test]
+    fn arena_jitframe_descrs_uses_frame_relative_offsets() {
+        let descrs = arena_jitframe_descrs();
+        assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
+        assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
+    }
+}
+
 #[cfg(feature = "cranelift")]
 pub fn arena_global_info() -> majit_backend_cranelift::JitFrameLayoutInfo {
     majit_backend_cranelift::JitFrameLayoutInfo {
@@ -1599,11 +1612,9 @@ pub fn install_jit_call_bridge() {
                 materialize_str_call_for_cranelift,
             );
             // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
-            // parity. Cranelift's prologue calls pyre_stack_check_for_jit_prologue
-            // directly (combined fast path + slowpath in one function call, since
-            // Cranelift IR does not expose a "read current SP" intrinsic). The
-            // inline-style addresses are also registered for symmetry with the
-            // dynasm probe path (consumed when Cranelift gains a get-SP intrinsic).
+            // parity. Cranelift consumes these addresses to emit the same
+            // load/sub/cmp fast path as dynasm, using a stack-slot address as
+            // its current-stack approximation and calling slowpath only on miss.
             majit_backend_cranelift::register_stack_check_addresses(
                 pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
                 pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
@@ -2216,8 +2227,6 @@ pub fn trace_and_compile_from_bridge(
     // RPython rebuild_from_resumedata (pyjitpl.py:2901,3400)
     // restores the complete frame stack before bridge tracing.
     // Bridge tracing sees the full frame layout — no truncation.
-    let loop_header_pc = 0; // not used by start_bridge_tracing
-
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][bridge-trace] start key={} trace={} fail={} resume_pc={}",
@@ -2255,17 +2264,6 @@ pub fn trace_and_compile_from_bridge(
         }
     }
 
-    // bridgeopt.py:124 parity: frontend_boxes = raw dead frame values
-    // (aligned with guard exit_types order, not virtualizable field order).
-    // Must be set BEFORE start_bridge_tracing, which internally calls
-    // start_retrace_from_guard that overwrites pending_frontend_boxes with
-    // extract_live values (wrong order for cls_of_box).
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .set_pending_frontend_boxes(raw_values);
-    }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
@@ -2275,8 +2273,8 @@ pub fn trace_and_compile_from_bridge(
             fail_index,
             &mut jit_state,
             &env,
+            raw_values,
             resume_pc,
-            loop_header_pc,
         )
     };
     if !started {
@@ -2524,13 +2522,19 @@ fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.valuestackdepth = frame.stack_base();
     frame.set_last_instr_from_next_instr(0);
     frame.vable_token = 0;
-    // pyframe.py:80-81,86: new frame starts with debugdata=None, lastblock=None.
+    frame.frame_finished_execution = false;
+    frame.f_generator_nowref = PY_NULL;
+    frame.w_yielding_from = PY_NULL;
+    frame.f_backref = std::ptr::null_mut();
+    // pyframe.py:78-86: reused arena frames must look like new frames.
     // debugdata and lastblock are GC-managed refs — release references only,
     // never manually free (JIT snapshots may still hold these pointers).
     frame.debugdata = std::ptr::null_mut();
     frame.escaped = false;
     frame.set_blocklist(&[]);
-    frame.pending_inline_results.clear();
+    if let Some(buf) = frame.pending_inline_results.as_mut() {
+        buf.clear();
+    }
     frame.pending_inline_resume_pc = None;
 }
 
@@ -2634,6 +2638,13 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
             }
             arena.mark_initialized();
         }
+        if majit_metainterp::majit_log_enabled() {
+            let f = unsafe { &*ptr };
+            eprintln!(
+                "[jit][ca-frame] ptr={ptr:p} locals=0x{:x} vsd={} reused={} boxed_arg=0x{:x}",
+                f.locals_cells_stack_w as usize, f.valuestackdepth, was_init, boxed_arg as usize,
+            );
+        }
         return ptr as i64;
     }
 
@@ -2644,6 +2655,13 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
         execution_context,
     ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
+    if majit_metainterp::majit_log_enabled() {
+        let f = unsafe { &*frame_ptr };
+        eprintln!(
+            "[jit][ca-frame] ptr={frame_ptr:p} locals=0x{:x} vsd={} reused=false boxed_arg=0x{:x}",
+            f.locals_cells_stack_w as usize, f.valuestackdepth, boxed_arg as usize,
+        );
+    }
     frame_ptr as i64
 }
 
@@ -2776,6 +2794,17 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
                 arena.mark_initialized();
             }
         }
+        if majit_metainterp::majit_log_enabled() {
+            let f = unsafe { &*ptr };
+            eprintln!(
+                "[jit][ca-frame-raw] ptr={ptr:p} locals=0x{:x} local0=0x{:x} vsd={} reused={} raw_arg={}",
+                f.locals_cells_stack_w as usize,
+                f.locals_w()[0] as usize,
+                f.valuestackdepth,
+                was_init,
+                raw_int_arg,
+            );
+        }
         return ptr as i64;
     }
 
@@ -2786,6 +2815,16 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
         execution_context,
     ));
     unsafe { &mut *frame_ptr }.fix_array_ptrs();
+    if majit_metainterp::majit_log_enabled() {
+        let f = unsafe { &*frame_ptr };
+        eprintln!(
+            "[jit][ca-frame-raw] ptr={frame_ptr:p} locals=0x{:x} local0=0x{:x} vsd={} reused=false raw_arg={}",
+            f.locals_cells_stack_w as usize,
+            f.locals_w()[0] as usize,
+            f.valuestackdepth,
+            raw_int_arg,
+        );
+    }
     frame_ptr as i64
 }
 
@@ -2880,8 +2919,14 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
         return;
     }
     let ptr = frame_ptr as *mut PyFrame;
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!("[jit][ca-drop] ptr={ptr:p}");
+    }
     let arena = arena_ref();
     let reused = arena.put(ptr);
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!("[jit][ca-drop] ptr={ptr:p} arena_reused={reused}");
+    }
     if !reused {
         // Not an arena frame (heap fallback) — free GcPyFrame allocation.
         heap_free_frame(ptr);
@@ -2894,9 +2939,46 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
 // RPython blackhole.py: bhimpl_recursive_call_i, bhimpl_residual_call_*
 //
 // These are called by the BlackholeInterpreter through JitCode.fn_ptrs.
-// They execute Python operations WITHOUT JIT re-entry, matching RPython's
-// structural isolation: the blackhole never calls maybe_compile_and_run.
+// Residual calls execute without accidental JIT re-entry; recursive portal
+// calls are routed explicitly through the jitdriver's portal runner.
 // ===========================================================================
+
+fn bh_call_self_recursive_portal(
+    parent_frame_ptr: *const PyFrame,
+    callable: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Option<i64> {
+    if parent_frame_ptr.is_null() {
+        return None;
+    }
+    let parent_frame = unsafe { &*parent_frame_ptr };
+    let callable_code = unsafe { pyre_interpreter::getcode(callable) };
+    if parent_frame.pycode != callable_code {
+        return None;
+    }
+    if !recursive_force_cache_safe(callable) {
+        return None;
+    }
+
+    // blackhole.py:1095-1116 bhimpl_recursive_call_* reaches the
+    // jitdriver's portal runner.  This branch narrows pyre's generic
+    // Python CALL helper back to that shape for self-recursive portal
+    // calls; non-recursive residual calls below remain opaque plain calls.
+    let frame_ptr = create_callee_frame_impl(parent_frame_ptr as i64, callable as i64, args);
+    let result = {
+        let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+        crate::eval::portal_runner_result(frame)
+    };
+    jit_drop_callee_frame(frame_ptr);
+    Some(match result {
+        Ok(result) => result as i64,
+        Err(err) => {
+            let exc_obj = err.to_exc_object();
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            0
+        }
+    })
+}
 
 /// RPython: bhimpl_recursive_call_i — call a Python function in blackhole mode.
 ///
@@ -3072,9 +3154,26 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
         }
         let parent_frame_ptr =
             majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+        if let Some(result) = bh_call_self_recursive_portal(parent_frame_ptr, callable, args) {
+            return result;
+        }
+        let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+        if !parent_frame_ptr.is_null() {
+            unsafe {
+                pyre_interpreter::call::set_last_exec_ctx((*parent_frame_ptr).execution_context);
+            }
+        }
         let parent_frame = unsafe { &*parent_frame_ptr };
-        return match pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args)
-        {
+        let result = {
+            // blackhole.py:1225 bhimpl_residual_call_* is an opaque CPU
+            // call.  Only blackhole.py:1095 bhimpl_recursive_call_* reaches
+            // the portal runner, so nested Python CALLs from this residual
+            // path must stay on eval_frame_plain as well.
+            let _plain_guard = pyre_interpreter::call::force_plain_eval();
+            pyre_interpreter::call::call_user_function_plain(parent_frame, callable, args)
+        };
+        pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+        return match result {
             Ok(result) => result as i64,
             Err(err) => {
                 let exc_obj = err.to_exc_object();
@@ -3401,7 +3500,7 @@ pub extern "C" fn bh_set_current_exception(exc: i64) {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_bh_normalize_raise {
     use super::*;
     use majit_metainterp::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
     use pyre_interpreter::eval::eval_frame_plain;

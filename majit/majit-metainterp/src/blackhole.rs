@@ -2343,6 +2343,18 @@ impl BlackholeInterpreter {
                 // (e.g., None object has non-zero address in pyre, so this
                 // only happens for actual PY_NULL returns which are rare
                 // but legal in generic majit jitcode::BC_CALL_REF semantics).
+                if crate::majit_log_enabled() {
+                    // Heuristic: assume W_IntObject layout (intval at +0x10).
+                    let intval_at_10 = if result != 0 {
+                        unsafe { Some(*((result + 0x10) as *const i64)) }
+                    } else {
+                        None
+                    };
+                    eprintln!(
+                        "[bh] call_ref result fn={} pos={} ref=0x{:x} maybe_intval={:?}",
+                        fn_ptr_idx, self.last_opcode_position, result, intval_at_10
+                    );
+                }
                 self.registers_r[dst] = result;
             }
             // -- Float-typed calls --
@@ -2596,10 +2608,28 @@ impl BlackholeInterpreter {
     /// Read call arguments from bytecode (kind:u8, reg:u16 per arg).
     fn read_call_args(&mut self, num_args: usize) -> Vec<i64> {
         let mut args = Vec::with_capacity(num_args);
+        let mut metas: Vec<(u8, u16)> = Vec::with_capacity(num_args);
         for _ in 0..num_args {
-            let kind = JitArgKind::decode(self.next_u8());
+            let kind_byte = self.next_u8();
+            let kind = JitArgKind::decode(kind_byte);
             let reg = self.next_u16();
+            metas.push((kind_byte, reg));
             args.push(self.read_call_arg(kind, reg));
+        }
+        if crate::majit_log_enabled() {
+            // Heuristic: for Ref args, peek intval at +0x10 (W_IntObject layout).
+            let mut intvals: Vec<Option<i64>> = Vec::with_capacity(args.len());
+            for ((kind_byte, _reg), val) in metas.iter().zip(args.iter()) {
+                if *kind_byte == 1 && *val != 0 {
+                    intvals.push(Some(unsafe { *((*val as usize + 0x10) as *const i64) }));
+                } else {
+                    intvals.push(None);
+                }
+            }
+            eprintln!(
+                "[bh] read_call_args pos={} num={} kinds_regs={:?} vals={:?} maybe_intvals={:?}",
+                self.last_opcode_position, num_args, metas, args, intvals
+            );
         }
         args
     }

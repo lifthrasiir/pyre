@@ -1528,7 +1528,18 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     constants: &mut HashMap<u32, i64>,
     constant_types: &mut HashMap<u32, Type>,
 ) {
-    use majit_ir::{Op, OpCode, OpRef};
+    // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
+    // divergence): RPython `compile.py:425-461` calls
+    // `box.set_forwarded(extra_ops[-1])` to set Python-Box-attached
+    // forwarding pointers, which `emit_op`'s default `get_box_replacement`
+    // walks transitively when later body ops reference the original box.
+    // Pyre uses a flat-`OpRef` IR (no per-Box mutable forwarding cell),
+    // so the equivalent rewrite uses a function-local
+    // `forwarding: Vec<OpRef>` indexed by source `OpRef.0`. The Vec is
+    // discarded when the function returns; its lifetime mirrors the
+    // single in-place loop rewrite that RPython's `_forwarded` model
+    // accomplishes via Box mutation. No semantic divergence.
+    use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
     // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
     // divergence): RPython `compile.py:425-461` calls
@@ -1569,6 +1580,50 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         }
     }
 
+    fn emit_forwarded_patch_op(
+        extra_ops: &mut Vec<Op>,
+        op: &Op,
+        forwarding: &mut Vec<OpRef>,
+        next_opref: &mut u32,
+    ) {
+        let mut emitted = op.clone();
+        let mut replaced = false;
+
+        for i in 0..op.args.len() {
+            let orig_arg = op.args[i];
+            let arg = get_local_box_replacement(forwarding, orig_arg);
+            if orig_arg != arg {
+                if !replaced {
+                    emitted = op.copy_and_change(op.opcode, None, None);
+                    if op.result_type() != Type::Void && !op.pos.is_none() {
+                        let new_pos = OpRef(*next_opref);
+                        *next_opref += 1;
+                        emitted.pos = new_pos;
+                        // compile.py:414-418 `orig_op.set_forwarded(op)`:
+                        // in the flat OpRef model this temporary vector is
+                        // the local equivalent of Box._forwarded.
+                        set_local_forwarded(forwarding, op.pos, new_pos);
+                    }
+                    replaced = true;
+                }
+                emitted.args[i] = arg;
+            }
+        }
+
+        if op.opcode.is_guard() {
+            if !replaced {
+                emitted = op.copy_and_change(op.opcode, None, None);
+            }
+            if let Some(fail_args) = emitted.fail_args.as_mut() {
+                for arg in fail_args.iter_mut() {
+                    *arg = get_local_box_replacement(forwarding, *arg);
+                }
+            }
+        }
+
+        extra_ops.push(emitted);
+    }
+
     assert!(
         index_of_virtualizable < num_red_args,
         "virtualizable must live inside the red args (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
@@ -1578,38 +1633,54 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         return;
     }
 
-    // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
-    let vable_box = OpRef(inputargs[index_of_virtualizable].index);
+    let expanded_inputargs = inputargs.clone();
 
-    // Allocate fresh OpRefs above existing op positions AND inputarg indices.
-    let max_op_pos = ops
+    // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
+    let vable_box = OpRef(expanded_inputargs[index_of_virtualizable].index);
+
+    // compile.py keeps Box identities disjoint automatically; in the flat
+    // OpRef model we must allocate above every runtime ref already reachable
+    // from the trace so copied ops can stand in for `orig_op.set_forwarded(op)`.
+    let max_runtime_ref = ops
         .iter()
-        .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
+        .flat_map(|op| {
+            std::iter::once(op.pos)
+                .chain(op.args.iter().copied())
+                .chain(op.fail_args.iter().flatten().copied())
+        })
+        .chain(expanded_inputargs.iter().map(|ia| OpRef(ia.index)))
+        .filter(|opref| !opref.is_none() && !opref.is_constant())
+        .map(|opref| opref.0)
         .max()
         .unwrap_or(0);
-    let max_inputarg = inputargs.iter().map(|ia| ia.index).max().unwrap_or(0);
-    let mut next_opref = max_op_pos.max(max_inputarg) + 1;
+    let mut next_opref = max_runtime_ref + 1;
 
     // Allocate fresh const indices above the existing max.
     let mut next_const_idx = constants
         .keys()
-        .map(|&k| OpRef(k).const_index())
+        .filter_map(|&k| {
+            let opref = OpRef(k);
+            opref.is_constant().then(|| opref.const_index())
+        })
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
 
-    let mut forwarding: Vec<OpRef> = vec![OpRef::NONE; (max_inputarg as usize).saturating_add(1)];
+    let mut forwarding = vec![OpRef::NONE; (max_runtime_ref as usize).saturating_add(1)];
     let mut extra_ops: Vec<Op> = Vec::new();
     let mut i = num_red_args;
+
+    // compile.py:432 — loop.inputargs = inputargs[:i].
+    inputargs.truncate(num_red_args);
 
     // compile.py:433-440 — GETFIELD_GC per static field.
     let static_descrs = vinfo.static_field_descrs();
     for (fi, field) in vinfo.static_fields.iter().enumerate() {
         assert!(
-            i < inputargs.len(),
+            i < expanded_inputargs.len(),
             "static field {fi} exceeds inputargs ({} <= {})",
             i,
-            inputargs.len()
+            expanded_inputargs.len()
         );
         let descr = static_descrs
             .get(fi)
@@ -1621,7 +1692,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             Type::Float => OpCode::GetfieldGcF,
             Type::Void => panic!("virtualizable static field {fi} has Void type"),
         };
-        let old_opref = OpRef(inputargs[i].index);
+        let old_opref = OpRef(expanded_inputargs[i].index);
         let new_opref = OpRef(next_opref);
         next_opref += 1;
         let mut op = Op::new(opcode, &[vable_box]);
@@ -1637,9 +1708,9 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     for (ai, array_field_descr) in array_descrs_list.iter().enumerate() {
         let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
         assert!(
-            i + array_len <= inputargs.len(),
+            i + array_len <= expanded_inputargs.len(),
             "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
-            inputargs.len()
+            expanded_inputargs.len()
         );
         // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer.
         let array_opref = OpRef(next_opref);
@@ -1654,11 +1725,57 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             .get(ai)
             .cloned()
             .expect("VirtualizableInfo.array_descrs must cover every array_field");
-        let item_opcode = match vinfo.array_fields[ai].item_type {
-            Type::Int => OpCode::GetarrayitemGcI,
-            Type::Ref => OpCode::GetarrayitemGcR,
-            Type::Float => OpCode::GetarrayitemGcF,
+        let array_info = &vinfo.array_fields[ai];
+        let (item_opcode, item_descr, item_base) = match array_info.item_type {
+            Type::Int => (OpCode::GetarrayitemGcI, array_descr.clone(), array_opref),
+            Type::Ref => (OpCode::GetarrayitemGcR, array_descr.clone(), array_opref),
+            Type::Float => (OpCode::GetarrayitemGcF, array_descr.clone(), array_opref),
             Type::Void => panic!("virtualizable array {ai} has Void item_type"),
+        };
+        let (item_opcode, item_descr, item_base) = match array_info.storage {
+            crate::virtualizable::VableArrayStorage::DirectPointer => {
+                (item_opcode, item_descr, item_base)
+            }
+            crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
+                // PRE-EXISTING-ADAPTATION (heap layout divergence):
+                // RPython's `vinfo.array_field_descrs` points at a real
+                // GC array field; `compile.py:445 ResOperation(GETFIELD_GC_R)`
+                // returns the array Box and `:451 ResOperation(GETARRAYITEM_GC_*)`
+                // reads the items directly. Pyre's `FixedObjectArray` is
+                // a `{ ptr: *T, len: usize }` container struct, so we
+                // first emit `GetfieldGcI` to project the backing-storage
+                // pointer (via `ptr_offset`), then use `GetarrayitemRaw*`
+                // (raw because the items live behind a non-GC pointer).
+                // The `make_array_descr(0, item_size, item_type)` mirrors
+                // RPython's `array_descrs[arrayindex]` shape; only the
+                // base-pointer indirection step is added. Convergence
+                // would require switching pyre's `FixedObjectArray` to
+                // RPython's flat GC-array layout — out of scope.
+                let ptr_opref = OpRef(next_opref);
+                next_opref += 1;
+                let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_opref]);
+                ptr_load.pos = ptr_opref;
+                ptr_load.descr = Some(majit_ir::descr::make_field_descr(
+                    ptr_offset,
+                    std::mem::size_of::<usize>(),
+                    Type::Int,
+                    ArrayFlag::Unsigned,
+                ));
+                extra_ops.push(ptr_load);
+
+                let raw_opcode = match array_info.item_type {
+                    Type::Int => OpCode::GetarrayitemRawI,
+                    Type::Ref => OpCode::GetarrayitemRawR,
+                    Type::Float => OpCode::GetarrayitemRawF,
+                    Type::Void => unreachable!(),
+                };
+                let raw_descr = majit_ir::descr::make_array_descr(
+                    0,
+                    crate::virtualizable::item_size_for_type(array_info.item_type),
+                    array_info.item_type,
+                );
+                (raw_opcode, raw_descr, ptr_opref)
+            }
         };
         for index in 0..array_len {
             // compile.py:453 — ConstInt(index) for the array subscript.
@@ -1667,12 +1784,12 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             constants.insert(const_opref.0, index as i64);
             constant_types.insert(const_opref.0, Type::Int);
 
-            let old_opref = OpRef(inputargs[i].index);
+            let old_opref = OpRef(expanded_inputargs[i].index);
             let new_opref = OpRef(next_opref);
             next_opref += 1;
-            let mut elem_op = Op::new(item_opcode, &[array_opref, const_opref]);
+            let mut elem_op = Op::new(item_opcode, &[item_base, const_opref]);
             elem_op.pos = new_opref;
-            elem_op.descr = Some(array_descr.clone());
+            elem_op.descr = Some(item_descr.clone());
             extra_ops.push(elem_op);
             set_local_forwarded(&mut forwarding, old_opref, new_opref);
             i += 1;
@@ -1680,42 +1797,18 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     }
 
     assert!(
-        i == inputargs.len(),
+        i == expanded_inputargs.len(),
         "compile.py:458 assert i == len(inputargs) failed ({i} != {})",
-        inputargs.len()
+        expanded_inputargs.len()
     );
 
-    // compile.py:432 — loop.inputargs = inputargs[:num_red_args].
-    inputargs.truncate(num_red_args);
-
-    // compile.py:459-461 — emit_op walks existing ops through
-    // get_box_replacement; in pyre we apply the forwarding Vec directly.
-    for op in ops.iter_mut() {
-        for arg in op.args.iter_mut() {
-            *arg = get_local_box_replacement(&forwarding, *arg);
-        }
-        if let Some(fa) = op.fail_args.as_mut() {
-            for arg in fa.iter_mut() {
-                *arg = get_local_box_replacement(&forwarding, *arg);
-            }
-        }
+    // compile.py:459-461 — emit_op walks the existing ops re-emitting
+    // each one with `get_box_replacement` applied to args + fail_args.
+    let original_ops = std::mem::take(ops);
+    for op in original_ops.iter() {
+        emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
     }
-
-    // Prepend extra_ops to loop operations (compile.py:459-461 reconstructs
-    // loop.operations in the same order).
-    //
-    // In RPython the closing `JUMP` targets the `TargetToken`'s internal
-    // `LABEL`, whose arity is SEPARATE from `loop.inputargs`; truncating
-    // inputargs therefore never touches JUMP/LABEL inside operations. pyre's
-    // current JUMP-terminated paths (compile_loop at pyjitpl/mod.rs:1936,
-    // retry-without-unroll at 3094, simple-loop at 3803) inline a
-    // `LABEL(inputargs)` whose arity is coupled to the inputargs array, so
-    // this helper is not yet wired into those paths — see
-    // `MetaInterp::patch_new_loop_to_load_virtualizable_fields` for the
-    // finish-only call site and the JUMP-path TODO.
-    let mut combined = extra_ops;
-    combined.append(ops);
-    *ops = combined;
+    *ops = extra_ops;
 }
 
 /// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
@@ -2496,7 +2589,7 @@ mod tests {
     use super::*;
     use crate::compile::make_fail_descr_with_index;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
-    use majit_ir::{Op, OpCode, OpRef};
+    use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
     #[test]
     fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
@@ -2598,6 +2691,110 @@ mod tests {
             exit.exit_types,
             vec![Type::Ref, Type::Ref, Type::Int, Type::Int]
         );
+    }
+
+    #[test]
+    fn test_patch_new_loop_reemits_ops_through_forwarded_results() {
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("obj", Type::Ref, 8);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let mut ops = vec![
+            {
+                let mut op = Op::new(OpCode::SameAsR, &[OpRef(1)]);
+                op.pos = OpRef(10);
+                op
+            },
+            Op::new(OpCode::Label, &[OpRef(0), OpRef(10)]),
+            {
+                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(10)]);
+                op.pos = OpRef(11);
+                op.descr = Some(majit_ir::descr::make_field_descr(
+                    16,
+                    8,
+                    Type::Int,
+                    ArrayFlag::Signed,
+                ));
+                op
+            },
+        ];
+        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let mut constants = HashMap::new();
+        let mut constant_types = HashMap::new();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[],
+            1,
+            0,
+            &mut constants,
+            &mut constant_types,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        let vable_field = ops[0].pos;
+
+        assert_eq!(ops[1].opcode, OpCode::SameAsR);
+        assert_eq!(ops[1].args.as_slice(), &[vable_field]);
+        let forwarded_same_as = ops[1].pos;
+        assert_ne!(forwarded_same_as, OpRef(10));
+
+        assert_eq!(ops[2].opcode, OpCode::Label);
+        assert_eq!(ops[2].args.as_slice(), &[OpRef(0), forwarded_same_as]);
+
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
+        assert_eq!(ops[3].args.as_slice(), &[forwarded_same_as]);
+    }
+
+    #[test]
+    fn test_patch_new_loop_reads_embedded_array_items_from_backing_storage() {
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            8,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let mut ops = vec![Op::new(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)])];
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+        ];
+        let mut constants = HashMap::new();
+        let mut constant_types = HashMap::new();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[2],
+            1,
+            0,
+            &mut constants,
+            &mut constant_types,
+        );
+
+        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[1].args.as_slice(), &[ops[0].pos]);
+        assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawR);
+        assert_eq!(ops[2].args[0], ops[1].pos);
+        assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
+        assert_eq!(ops[3].args[0], ops[1].pos);
+        assert_eq!(ops[4].opcode, OpCode::Label);
+        assert_eq!(ops[4].args.as_slice(), &[OpRef(0), ops[2].pos, ops[3].pos]);
     }
 }
 /// `compile.py:855` ResumeGuardDescr `_attrs_ = ('rd_numb', 'rd_consts',

@@ -29,11 +29,48 @@ pub struct GcConfig {
     pub card_page_indices: u32,
 }
 
+fn read_size_from_env(varname: &str) -> Option<usize> {
+    // rpython/memory/gc/env.py:17-40 `_read_float_and_factor_from_env`
+    // accepts plain numbers plus K/M/G suffixes, optionally followed by B.
+    let raw = std::env::var(varname).ok()?;
+    let mut value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.len() > 1 && matches!(value.as_bytes().last(), Some(b'b' | b'B')) {
+        value = &value[..value.len() - 1];
+    }
+    if value.is_empty() {
+        return None;
+    }
+    let (number, factor) = match value.as_bytes().last().copied() {
+        Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1024.0),
+        Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1024.0 * 1024.0),
+        Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
+        Some(_) => (value, 1.0),
+        None => return None,
+    };
+    let parsed = number.parse::<f64>().ok()?;
+    let bytes = parsed * factor;
+    (bytes > 0.0).then_some(bytes as usize)
+}
+
+fn default_nursery_size() -> usize {
+    // incminimark.py:459-470:
+    //   newsize = env.read_from_env('PYPY_GC_NURSERY')
+    //   if newsize <= 0: newsize = env.estimate_best_nursery_size()
+    //   if newsize <= 0: newsize = defaultsize
+    //
+    // Pyre does not yet port the platform-specific cache estimator, so use
+    // env.py:441's 4MB unknown-cache fallback.
+    read_size_from_env("PYPY_GC_NURSERY").unwrap_or(DEFAULT_NURSERY_SIZE)
+}
+
 impl Default for GcConfig {
     fn default() -> Self {
         // large_object = (16384+512)*8 from incminimark for 64-bit
         GcConfig {
-            nursery_size: DEFAULT_NURSERY_SIZE,
+            nursery_size: default_nursery_size(),
             large_object_threshold: (16384 + 512) * 8,
             card_page_indices: 128,
         }
@@ -171,13 +208,6 @@ pub struct MiniMarkGC {
     ///
     /// Mirrors incminimark's `threshold_objects_made_old`.
     threshold_bytes_made_old: usize,
-    /// Exact payload addresses of objects currently resident in the nursery.
-    ///
-    /// In RPython, roots are always exact GC object addresses. In this hybrid
-    /// runtime, root slots can transiently contain non-GC refs or interior raw
-    /// pointers, so the root-walker seam must distinguish exact nursery object
-    /// starts from arbitrary addresses within the nursery range.
-    nursery_object_starts: HashSet<usize>,
     /// Pinned nursery objects that must not be moved during minor collection.
     pinned_objects: HashSet<usize>,
     /// Registry of compiled code regions for GC root scanning.
@@ -231,7 +261,6 @@ impl MiniMarkGC {
             last_major_bytes: 0,
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
-            nursery_object_starts: HashSet::new(),
             pinned_objects: HashSet::new(),
             compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: HashMap::new(),
@@ -363,16 +392,16 @@ impl MiniMarkGC {
         self.nursery.contains(addr)
     }
 
-    /// incminimark.py range-check parity: use nursery range check instead
-    /// of nursery_object_starts HashSet. JIT inline nursery bump-alloc
-    /// creates objects not registered in the HashSet; range check covers them.
+    /// incminimark.py range-check parity: nursery membership is a pure
+    /// range check; JIT inline nursery bump-alloc must produce GcRefs
+    /// indistinguishable from the slow path's, so a side table would
+    /// not stay in sync.
     #[inline]
     fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.nursery.contains(addr) || self.oldgen.contains(addr)
     }
 
     /// incminimark.py:1208 is_in_nursery parity.
-    /// RPython has NO nursery_object_starts set — uses pure range check.
     #[inline]
     fn is_nursery_object_start(&self, addr: usize) -> bool {
         self.nursery.contains(addr)
@@ -399,15 +428,11 @@ impl MiniMarkGC {
                 return self.alloc_in_oldgen(type_id, total_size);
             }
             Self::init_nursery_object(ptr, type_id);
-            let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-            self.nursery_object_starts.insert(obj.0);
-            return obj;
+            return GcRef((ptr as usize) + GcHeader::SIZE);
         }
 
         Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.nursery_object_starts.insert(obj.0);
-        obj
+        GcRef((ptr as usize) + GcHeader::SIZE)
     }
 
     /// Allocate without triggering collection.
@@ -428,9 +453,7 @@ impl MiniMarkGC {
         }
 
         Self::init_nursery_object(ptr, type_id);
-        let obj = GcRef((ptr as usize) + GcHeader::SIZE);
-        self.nursery_object_starts.insert(obj.0);
-        obj
+        GcRef((ptr as usize) + GcHeader::SIZE)
     }
 
     /// Initialize a nursery object's header.
@@ -461,9 +484,8 @@ impl MiniMarkGC {
     pub fn do_collect_nursery(&mut self) {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
-                "[gc][minor] start count={} nursery_objects={} remembered={} cards_set={}",
+                "[gc][minor] start count={} remembered={} cards_set={}",
                 self.minor_collections + 1,
-                self.nursery_object_starts.len(),
                 self.remembered_set.len(),
                 self.old_objects_with_cards_set.len(),
             );
@@ -632,10 +654,8 @@ impl MiniMarkGC {
         // Reset nursery for new allocations, preserving pinned objects.
         if self.pinned_objects.is_empty() {
             self.nursery.reset();
-            self.nursery_object_starts.clear();
         } else {
             self.reset_nursery_with_pinned();
-            self.nursery_object_starts = self.pinned_objects.clone();
         }
 
         // Minor collections must also drive incremental major-collection
@@ -822,20 +842,6 @@ impl MiniMarkGC {
                 }
             }
         }
-        crate::walk_active_extra_roots(&mut |gcref| {
-            if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
-                let hdr = unsafe { header_of(gcref.0) };
-                // SAFETY: header_of returns `*mut GcHeader`; materialize a
-                // short-lived reference for each single-method access to
-                // avoid stacked-borrows violations (see 363dd31413).
-                unsafe {
-                    if !(*hdr).has_flag(flags::VISITED) {
-                        (*hdr).set_flag(flags::VISITED);
-                        self.incr_state.gray_stack.push(gcref.0);
-                    }
-                }
-            }
-        });
     }
 
     fn seed_major_roots(&mut self) {

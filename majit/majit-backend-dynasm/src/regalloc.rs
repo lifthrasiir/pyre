@@ -2020,6 +2020,23 @@ impl RegAlloc {
         });
     }
 
+    fn perform_with_gcmap_ptr(
+        &mut self,
+        op_index: usize,
+        arglocs: Vec<Loc>,
+        result_loc: Option<Loc>,
+        gcmap: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.flush_moves(output);
+        output.push(RegAllocOp::Perform {
+            op_index,
+            arglocs,
+            result_loc,
+            gcmap: Some(gcmap),
+        });
+    }
+
     /// Variant of `perform` that captures the current regalloc state as a
     /// GC bitmap, for collecting-call ops such as CallMallocNursery. The
     /// emit path stores the returned pointer into `jf_gcmap` before the
@@ -4751,6 +4768,17 @@ impl RegAlloc {
             &self.value_types,
         );
 
+        // aarch64/regalloc.py:625-628 + llsupport/gcmap.py parity:
+        // a collecting residual call needs a gcmap for the live Ref slots
+        // that before_call just synced to the jitframe.  In particular,
+        // call_assembler frame helpers allocate PyFrames and can collect
+        // before the following vable_token materialization reads inputarg 0.
+        let gcmap = if calldescr.get_extra_info().check_can_collect() {
+            Some(self.get_gcmap(&[], false) as usize)
+        } else {
+            None
+        };
+
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
             let r = if result_tp == Type::Float {
@@ -4764,7 +4792,11 @@ impl RegAlloc {
         };
         arglocs[0] = result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0)));
 
-        self.perform(i, arglocs, result_loc, output);
+        if let Some(gcmap) = gcmap {
+            self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
+        } else {
+            self.perform(i, arglocs, result_loc, output);
+        }
     }
 
     fn consider_call_j2(
@@ -4899,7 +4931,8 @@ impl RegAlloc {
         } else {
             None
         };
-        self.perform(i, arglocs, result_loc, output);
+        let gcmap = self.get_gcmap(&[call_result_gpr()], false) as usize;
+        self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
     }
 
     fn consider_call_assembler_j2(
@@ -4959,7 +4992,8 @@ impl RegAlloc {
         } else {
             None
         };
-        self.perform(i, arglocs, result_loc, output);
+        let gcmap = self.get_gcmap(&[call_result_gpr()], false) as usize;
+        self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
     }
 
     fn consider_raw_call_like(
@@ -5127,17 +5161,23 @@ impl RegAlloc {
         output: &mut Vec<RegAllocOp>,
     ) {
         // aarch64/regalloc.py:984: sizeloc = make_sure_var_in_reg(size_box)
-        let sizeloc = self.make_sure_var_in_reg(op.args[0], Type::Int, &[], None, false);
-        // aarch64/regalloc.py:985
+        let size_box = op.args[0];
+        let sizeloc = self.make_sure_var_in_reg(size_box, Type::Int, &[], None, false);
+        // aarch64/regalloc.py:985: only move values away from x0/x1.
+        // The slow path saves/restores all managed registers except
+        // x0/x1, so spilling every register here is both unnecessary and
+        // diverges from the upstream calling convention.
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
             &self.value_types,
         );
+        // aarch64/regalloc.py:986
+        self.possibly_free_var(size_box, Type::Int);
         // aarch64/regalloc.py:988
         let result_reg = self.rm.force_allocate_reg(
             op.pos,
@@ -5147,6 +5187,22 @@ impl RegAlloc {
             &mut self.longevity,
             &mut self.fm,
         );
+        // aarch64/regalloc.py:990-993: reserve x1 as the malloc temp and
+        // exclude it from the gcmap before emitting malloc_cond_varsize_frame.
+        let tmp = OpRef(u32::MAX - 11);
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        self.value_types.insert(tmp.0, Type::Int);
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(MALLOC_NURSERY_CLOBBER[1]),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         self.perform_with_gcmap(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
     }
 
@@ -5165,12 +5221,13 @@ impl RegAlloc {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
             &self.value_types,
         );
+        self.possibly_free_var(size_arg, Type::Int);
         let result_reg = self.rm.force_allocate_reg(
             dst.unwrap_or(OpRef(u32::MAX)),
             &[],
@@ -5179,6 +5236,20 @@ impl RegAlloc {
             &mut self.longevity,
             &mut self.fm,
         );
+        let tmp = OpRef(u32::MAX - 11);
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        self.value_types.insert(tmp.0, Type::Int);
+        self.rm.force_allocate_reg(
+            tmp,
+            &[],
+            Some(MALLOC_NURSERY_CLOBBER[1]),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         self.perform_with_gcmap(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
     }
 
@@ -6108,5 +6179,34 @@ mod tests {
         assert_eq!(get_scale(2), 1);
         assert_eq!(get_scale(4), 2);
         assert_eq!(get_scale(8), 3);
+    }
+
+    #[test]
+    #[ignore = "GuardNotForced2 frame-depth argloc emission (assembler.py:935 check_frame_depth wiring) not yet ported on side3; test added ahead of supporting code"]
+    fn test_guard_not_forced_2_carries_frame_depth_argloc() {
+        let i0 = OpRef(100);
+        let inputargs = vec![InputArg {
+            index: i0.0,
+            tp: Type::Ref,
+        }];
+        let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
+
+        let mut ra = RegAlloc::new(HashMap::new(), HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let output = ra.walk_operations(&inputargs, &ops);
+
+        match &output[0] {
+            RegAllocOp::PerformGuard {
+                arglocs, faillocs, ..
+            } => {
+                assert_eq!(faillocs.len(), 1);
+                assert_eq!(arglocs.len(), 1);
+                match arglocs[0] {
+                    Loc::Immed(imm) => assert_eq!(imm.value, 1),
+                    ref other => panic!("expected frame-depth immed, got {other:?}"),
+                }
+            }
+            other => panic!("expected PerformGuard, got {other:?}"),
+        }
     }
 }

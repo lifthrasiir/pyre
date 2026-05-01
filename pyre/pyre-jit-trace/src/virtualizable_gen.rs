@@ -21,26 +21,21 @@ majit_macros::virtualizable! {
     // Frame pointer field in PyreJitState
     frame_field = frame,
 
-    // Scalar inputarg fields: included in extract_live / jump_args.
-    // Must match `fields` order — RPython includes ALL static fields
-    // in unroll_static_fields (virtualizable.py:90-93 read_boxes).
-    // Layout: [frame:Ref, last_instr:Int, pycode:Ref, valuestackdepth:Int,
-    //          debugdata:Ref, lastblock:Ref, w_globals:Ref, array...].
+    // Non-vable JitDriver reds (`interp_jit.py:67 reds = ['frame', 'ec']`).
+    // `frame` is implicit at OpRef(0); each entry here shifts
+    // `NUM_SCALAR_INPUTARGS` and `SYM_ARRAY_BASE` by one and occupies
+    // `OpRef(1..1+NUM_EXTRA_REDS)` between frame and the vable static
+    // fields.
+    extra_reds = {
+        ec: Ref,
+    },
+
+    // Layout: [frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
+    //          valuestackdepth:Int, debugdata:Ref, lastblock:Ref,
+    //          w_globals:Ref, array...]
     // Mirrors `pypy/module/pypyjit/interp_jit.py:25-31`'s
-    // `_virtualizable_` declaration line by line.
-    //
-    // NOTE on `extra_reds`: the macro now also accepts an `extra_reds`
-    // block for non-vable JitDriver reds (`interp_jit.py:67 reds =
-    // ['frame', 'ec']`). Wiring `ec` here is deferred — adding ec to
-    // the canonical scalar block shifts `SYM_ARRAY_BASE` /
-    // `NUM_SCALAR_INPUTARGS` and requires a coordinated audit of every
-    // call site that hardcodes `NUM_SCALAR_INPUTARGS + idx` (~30 sites
-    // in `state.rs` / `trace_opcode.rs` / `eval.rs`) so the array_base
-    // arithmetic stays correct. Macro support,
-    // `PYFRAME_EXECUTION_CONTEXT_OFFSET`, and
-    // `PyreJitState::{ec_as_usize, set_ec}` already landed; this comment
-    // marks where `extra_reds = { ec: Ref }` will go once the cascading
-    // layout fix lands as a separate slice.
+    // `_virtualizable_` declaration line by line; `ec` is from
+    // `interp_jit.py:67 reds = ['frame', 'ec']` (extra_reds above).
     inputargs = {
         last_instr: Int,
         pycode: Ref,

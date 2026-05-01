@@ -116,15 +116,16 @@ enum JitAction {
 
 use crate::jit::descr::{
     BUILTIN_CODE_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID,
-    PY_OBJECT_ARRAY_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
-    SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
-    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
-    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_EXCEPTION_GC_TYPE_ID,
-    W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID,
-    W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID, W_MODULE_GC_TYPE_ID,
-    W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID,
-    W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID, W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID,
-    W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
+    PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
+    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
+    SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID,
+    W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID,
+    W_DICT_GC_TYPE_ID, W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID,
+    W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID,
+    W_METHOD_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
+    W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
+    W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID,
+    W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -927,6 +928,45 @@ thread_local! {
             &pyre_object::MODULE_TYPE as *const _ as usize,
             w_module_tid,
         );
+        // `pyre-interpreter::pyframe::PyFrame` — execution frame for a
+        // Python code block. NOT an `rclass.OBJECT`-shaped instance
+        // (no `ob_type` header — virtualizable struct laid out for the
+        // JIT virtualize pass), so register through `with_gc_ptrs`
+        // rather than `object_subclass`.
+        //
+        // GC-traceable fields (the standard nursery tracer forwards
+        // these when a nursery `PyFrame` survives a minor collection):
+        //   - `locals_cells_stack_w`: `*mut FixedObjectArray` — when
+        //     `emit_new_pyframe_inline_self_recursive` emits
+        //     `NewArrayClear` for the locals array the array itself
+        //     lives in the nursery, so its pointer must be forwarded.
+        //   - `f_generator_nowref` / `w_yielding_from`: `PyObjectRef`
+        //     slots that may point at nursery objects.
+        //   - `f_backref`: `*mut PyFrame` — once chained inline calls
+        //     produce nested nursery `PyFrame`s the parent pointer
+        //     must be forwarded to the new address.
+        // Excluded: `execution_context` (Rc::into_raw, persistent),
+        // `pycode` (static W_CodeObject), `debugdata` / `lastblock`
+        // (heap-allocated, not GC), `w_globals` (Box-allocated
+        // DictStorage, not GC), `pending_inline_results`
+        // (`Option<Box<VecDeque>>`, not GC).
+        //
+        // `walk_pyframe_roots` (`pyre-interpreter::eval`) still walks
+        // `CURRENT_FRAME → f_backref` and visits the items inside
+        // `locals_cells_stack_w`; that path covers `std::alloc`-backed
+        // PyFrames today and is the entry point that hands control to
+        // the standard tracer for nursery-backed frames once
+        // Slice 2 Step 2 teaches it about forwarding.
+        let pyframe_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
+            vec![
+                pyre_interpreter::pyframe::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
+                pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
+                pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET,
+                pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET,
+            ],
+        ));
+        debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
         // W_InstanceObject is intentionally NOT pre-registered: its
         // PyType (`INSTANCE_TYPE`) is the `object` root, already
         // covered by `object_tid` (`OBJECT_GC_TYPE_ID = 0`). Adding
@@ -2028,12 +2068,15 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // bhimpl_recursive_call_* paths.
     frame.fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
-    let result = if let Some(result) = try_function_entry_jit(frame) {
+    portal_runner_dispatch(frame)
+}
+
+fn portal_runner_dispatch(frame: &mut PyFrame) -> PyResult {
+    if let Some(result) = try_function_entry_jit(frame) {
         result
     } else {
         handle_jitexception(frame)
-    };
-    result
+    }
 }
 
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
@@ -2153,7 +2196,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             }
         }
         if let pyre_interpreter::bytecode::Instruction::Call { argc } = instruction {
-            if !frame.pending_inline_results.is_empty() {
+            if frame
+                .pending_inline_results
+                .as_ref()
+                .is_some_and(|b| !b.is_empty())
+            {
                 frame.set_last_instr_from_next_instr(opcode_pc + 1);
                 if pyre_interpreter::call::replay_pending_inline_call(
                     frame,
@@ -3197,6 +3244,26 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         }
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {
+                                if majit_metainterp::majit_log_enabled() {
+                                    let returned_intval = match &r {
+                                        Ok(obj)
+                                            if !obj.is_null()
+                                                && unsafe {
+                                                    pyre_object::pyobject::is_int(*obj)
+                                                } =>
+                                        {
+                                            Some(unsafe {
+                                                pyre_object::intobject::w_int_get_value(*obj)
+                                            })
+                                        }
+                                        _ => None,
+                                    };
+                                    eprintln!(
+                                        "[jit][handle-outcome] bh-return arg0={:?} intval={:?}",
+                                        debug_first_arg_int(frame),
+                                        returned_intval,
+                                    );
+                                }
                                 return Some(r);
                             }
                         }
@@ -3325,6 +3392,20 @@ fn handle_jit_outcome(
                     )));
                 }
             };
+            if majit_metainterp::majit_log_enabled() {
+                let returned_intval =
+                    if !value.is_null() && unsafe { pyre_object::pyobject::is_int(value) } {
+                        Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
+                    } else {
+                        None
+                    };
+                eprintln!(
+                    "[jit][handle-outcome] return arg0={:?} intval={:?} ref=0x{:x}",
+                    debug_first_arg_int(frame),
+                    returned_intval,
+                    value as usize
+                );
+            }
             JitAction::Return(Ok(value))
         }
         DetailedDriverRunOutcome::Jump { .. } => {
@@ -4457,24 +4538,41 @@ fn rebuild_typed_from_rd_numb(
     // synchronize_virtualizable writes them back to the heap.
     // Frame registers fill frame.registers_i/r/f independently.
 
-    // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
-    //                 valuestackdepth(3), debugdata(4), lastblock(5),
-    //                 w_globals(6), array...]  (6 scalars + frame ptr,
-    // line-by-line PyPy parity with `interp_jit.py:25-31` — see
-    // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`).
-    // virtualizable.py:86-99 read_boxes: ALL static fields in declared order.
+    // `vable_values` is heap-layout (opencoder.py:718 `_list_of_boxes_virtualizable`):
+    //   [frame_ptr, vable_static_fields..., array_items...]
+    // `_list_of_boxes_virtualizable` excludes any reds that are not virtualizable
+    // static fields (ec is a per-thread global), so the encoded prefix has
+    // `1 + NUM_VABLE_SCALARS` entries — never `NUM_SCALAR_INPUTARGS`, which counts
+    // `NUM_EXTRA_REDS` ec slot(s) on the trace inputarg side.
+    //
+    // `restore_guard_failure_values` and downstream consumers index this header
+    // with `SYM_*_IDX`, which include the `NUM_EXTRA_REDS` shift. Inject placeholder
+    // ec slot(s) between the frame and the static fields here so the trace-layout
+    // indices align. The ec value itself is never written back (ec is reloaded from
+    // `get_execution_context()` on resume), so a `Value::Void` placeholder is safe.
     let num_scalars = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let header: Vec<Value> = if vable_values.len() >= num_scalars {
-        (0..num_scalars)
-            .map(|i| {
-                decode_rv(
-                    &vable_values[i],
-                    &dead_frame_typed,
-                    exit_layout,
-                    &mut virtuals_cache,
-                )
-            })
-            .collect()
+    let num_extra_reds = pyre_jit_trace::virtualizable_gen::NUM_EXTRA_REDS;
+    let heap_scalar_count = 1 + pyre_jit_trace::virtualizable_gen::NUM_VABLE_SCALARS;
+    let header: Vec<Value> = if vable_values.len() >= heap_scalar_count {
+        let mut h = Vec::with_capacity(num_scalars);
+        h.push(decode_rv(
+            &vable_values[0],
+            &dead_frame_typed,
+            exit_layout,
+            &mut virtuals_cache,
+        ));
+        for _ in 0..num_extra_reds {
+            h.push(Value::Void);
+        }
+        for i in 1..heap_scalar_count {
+            h.push(decode_rv(
+                &vable_values[i],
+                &dead_frame_typed,
+                exit_layout,
+                &mut virtuals_cache,
+            ));
+        }
+        h
     } else {
         Vec::new()
     };
@@ -4730,12 +4828,15 @@ fn build_resumed_frames(
     }
 
     // opencoder.py:722 _list_of_boxes_virtualizable: snapshot reorders
-    // virtualizable_ptr from end to front.
-    // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
-    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize;
-    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_PYCODE_IDX as usize;
-    let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize;
-    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize;
+    // virtualizable_ptr from end to front. `vable_values` is heap-layout
+    // (no ec): [frame, vable_static_fields..., array_items...]. SYM_*_IDX
+    // include the `NUM_EXTRA_REDS` shift for trace inputarg layout, so
+    // subtract `NUM_EXTRA_REDS` to land on heap-layout positions.
+    let extra = pyre_jit_trace::virtualizable_gen::NUM_EXTRA_REDS;
+    let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize - extra;
+    let code_idx = pyre_jit_trace::virtualizable_gen::SYM_PYCODE_IDX as usize - extra;
+    let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize - extra;
+    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize - extra;
 
     // Resolve ALL vable fields from resume data.
     // vable_values = [frame_ptr(0), ni(1), code(2), vsd(3), ns(4), array...]
@@ -5733,15 +5834,17 @@ mod tests {
             ns_len: 0,
             valuestackdepth: 4,
             array_capacity: 4,
-            trace_extra_reds: 0,
+            trace_extra_reds: 1,
             has_virtualizable: true,
             // Trace-entry slot types can be stale; guard failure must still
             // respect the runtime Value tags recovered from resume data.
             slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
         };
 
+        let ec_value = unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize };
         let mut values = vec![
             Value::Ref(GcRef(frame_ptr)),                // frame
+            Value::Ref(GcRef(ec_value)),                 // ec extra red
             Value::Int(8),                               // last_instr
             Value::Ref(GcRef(frame.pycode as usize)),    // pycode
             Value::Int(4),                               // valuestackdepth
@@ -5749,7 +5852,6 @@ mod tests {
             Value::Ref(GcRef(0)),                        // lastblock
             Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
-        let ec_value = unsafe { (*(frame_ptr as *const PyFrame)).execution_context as i64 };
         for reg in live_regs.iter() {
             match reg {
                 0 => values.push(Value::Ref(GcRef(w_int_new(1) as usize))), // local a
@@ -5765,7 +5867,7 @@ mod tests {
                     values.push(Value::Ref(GcRef(frame_ptr)));
                 }
                 _ if Some(reg) == live_regs.iter().rev().next() => {
-                    values.push(Value::Int(ec_value));
+                    values.push(Value::Ref(GcRef(ec_value)));
                 }
                 other => panic!("unexpected live reg {other} at resume pc {resume_pc}"),
             }
@@ -5846,6 +5948,8 @@ mod tests {
             vable_lastblock: ctx.const_ref(0xcafe),
             vable_w_globals: ctx.const_ref(0xfeed),
         });
+        let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
+        sym.set_test_execution_context(ec_ref);
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let fail_args = state.capture_current_fail_args();
@@ -5855,19 +5959,20 @@ mod tests {
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
         );
         assert_eq!(fail_args[0], frame_ref);
+        assert_eq!(fail_args[1], ec_ref);
         // last_instr / valuestackdepth are guard-time-overridden by
         // flush_to_frame_for_guard (orgpc - 1, pre-opcode depth).
-        assert_eq!(fail_args[1], ctx.const_int(resume_pc as i64 - 1));
-        assert_eq!(fail_args[3], ctx.const_int(4));
+        assert_eq!(fail_args[2], ctx.const_int(resume_pc as i64 - 1));
+        assert_eq!(fail_args[4], ctx.const_int(4));
         // pycode / debugdata / lastblock / w_globals are JIT-scope
         // invariant under CPython 3.14 bytecode (`lastblock` is mutated
         // only by SETUP_*/POP_BLOCK paths the tracer never enters) and
         // stay bound to the trace-start inputarg OpRefs the fixture
         // seeded above.
-        assert_eq!(fail_args[2], ctx.const_ref(0xdead));
-        assert_eq!(fail_args[4], ctx.const_ref(0xbeef));
-        assert_eq!(fail_args[5], ctx.const_ref(0xcafe));
-        assert_eq!(fail_args[6], ctx.const_ref(0xfeed));
+        assert_eq!(fail_args[3], ctx.const_ref(0xdead));
+        assert_eq!(fail_args[5], ctx.const_ref(0xbeef));
+        assert_eq!(fail_args[6], ctx.const_ref(0xcafe));
+        assert_eq!(fail_args[7], ctx.const_ref(0xfeed));
     }
 
     #[test]
@@ -5924,6 +6029,8 @@ mod tests {
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
+        let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
+        sym.set_test_execution_context(ec_ref);
         trace_state::seed_compiled_trace_jitcode_test_state(
             &mut sym,
             &mut ctx,
@@ -5957,6 +6064,20 @@ mod tests {
                 .all(|opref| !opref.is_none()),
             "live stack slots should be materialized into the symbolic register file"
         );
+        for (depth, &color) in stack_colors.iter().enumerate() {
+            let color = color as usize;
+            if color < 2 {
+                let stack_value = [stack0, stack1][depth];
+                assert_ne!(
+                    state.symbolic_registers_r()[color],
+                    stack_value,
+                    "Ref-bank color {} for stack depth {} must not overwrite semantic local slot {}",
+                    color,
+                    depth,
+                    color
+                );
+            }
+        }
     }
 
     #[test]

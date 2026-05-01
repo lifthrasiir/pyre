@@ -199,12 +199,6 @@ pub trait JitState: Sized {
     ) {
     }
 
-    /// resume.py:1042: adjust trace meta to match fail_arg_types shape.
-    /// Bridge inputargs come from rebuild_from_resumedata, which produces
-    /// boxes matching fail_arg_types. The meta must describe this shape,
-    /// not the interpreter frame's shape (which may have more live values).
-    fn update_meta_for_bridge(_meta: &mut Self::Meta, _fail_arg_types: &[Type]) {}
-
     /// resume.py:1042 parity: set up bridge-specific symbolic local mapping.
     /// Called after rebuild_from_resumedata to map frame locals to bridge
     /// InputArg OpRefs. In RPython, MIFrame.registers are populated with

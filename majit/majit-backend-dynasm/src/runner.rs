@@ -296,9 +296,33 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
             .as_mut()
             .map(|gc| gc.alloc_nursery(total_size as usize - gc_hdr).0 as u64)
     });
-    result.unwrap_or_else(|| unsafe {
+    let ptr = result.unwrap_or_else(|| unsafe {
         let raw = libc::calloc(1, total_size as usize) as u64;
         raw + gc_hdr as u64
+    });
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!("[dynasm][nursery-frame] total_size={total_size} payload=0x{ptr:x}");
+    }
+    ptr
+}
+
+/// malloc_cond_varsize_frame slow path for JITFRAME allocation.
+///
+/// `frame_size` is `jfi_frame_size`: bytes from the JITFRAME payload base
+/// through the trailing array, i.e. it excludes the GC header that the
+/// allocator prepends internally.
+pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_mut() {
+            if let Some(type_id) = crate::jitframe_gc_type_id() {
+                gc.alloc_nursery_typed(type_id, frame_size as usize).0 as u64
+            } else {
+                gc.alloc_nursery(frame_size as usize).0 as u64
+            }
+        } else {
+            unsafe { libc::calloc(1, frame_size as usize) as u64 }
+        }
     })
 }
 
@@ -822,7 +846,20 @@ impl DynasmBackend {
             .collect();
         // rewrite.py:489 parity: inject str_descr/unicode_descr for NEWSTR/NEWUNICODE
         inject_builtin_string_descrs(&mut normalized);
-        let constant_types = self.constant_types.clone();
+        // Clone so self.constant_types remains populated for later
+        // backend calls. rewrite.py:930 `v.type` — RPython Box carries
+        // its type on the object itself, so InputArg / ResOperation /
+        // Const all return the same `.type` attribute. Pyre's flat
+        // `OpRef` stores types in side maps keyed by the raw u32;
+        // `constant_types` already carries op-position and constant
+        // types (disjoint key spaces via `OpRef::CONST_BIT = 1 << 31`).
+        // Inputargs occupy raw u32 0..num_inputs, so merging their
+        // types into the rewriter's view gives the same `v.type` lookup
+        // RPython has on inputargs.
+        let mut constant_types = self.constant_types.clone();
+        for (i, ia) in inputargs.iter().enumerate() {
+            constant_types.entry(i as u32).or_insert(ia.tp);
+        }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
             let constants = &self.constants;
@@ -1274,12 +1311,12 @@ impl DynasmBackend {
         // `regalloc.py:861-871` `_set_initial_bindings`: each input lands at
         // `loc.value - base_ofs = (JITFRAME_FIXED_SIZE + i) * SIZEOFSIGNED` —
         // the same formula `Self::input_initial_loc` uses when finalising
-        // a real compile. Self-recursive CALL_ASSEMBLER registers this stub
-        // before its own trace finalises, so the rewriter's
-        // `handle_call_assembler` reads these pending offsets to emit the
-        // callee inputarg `GcStore`s; if they omit the JITFRAME_FIXED_SIZE
-        // shift the stores land in the managed-register save area and the
-        // callee enters with NULL inputs.
+        // a real compile (see `compile_loop` ll_initial_locs assignment).
+        // Self-recursive CALL_ASSEMBLER registers this stub before its own
+        // trace finalises, so the rewriter's `handle_call_assembler` reads
+        // these pending offsets to emit the callee inputarg `GcStore`s; if
+        // they omit the JITFRAME_FIXED_SIZE shift the stores land in the
+        // managed-register save area and the callee enters with NULL inputs.
         *pending_clt._ll_initial_locs.lock() =
             (0..num_inputs).map(Self::input_initial_loc).collect();
         CALL_ASSEMBLER_TARGETS
@@ -1310,10 +1347,10 @@ impl Backend for DynasmBackend {
         ops: &[Op],
         token: &mut JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        token.inputarg_types = inputargs.iter().map(|ia| ia.tp).collect();
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
-
         // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
@@ -1373,7 +1410,8 @@ impl Backend for DynasmBackend {
             // (JITFRAME_FIXED_SIZE + i) * SIZEOFSIGNED` so the GcStores
             // synthesized by `handle_call_assembler` (rewrite.py:673)
             // hit the actual input slots, not the managed-register save
-            // area at the head of `jf_frame`.
+            // area at the head of `jf_frame`. The list length must match
+            // `inputargs.len()` so `handle_call_assembler` can index it.
             let locs: Vec<i32> = (0..inputargs.len()).map(Self::input_initial_loc).collect();
             *clt._ll_initial_locs.lock() = locs;
         }
@@ -1499,6 +1537,31 @@ impl Backend for DynasmBackend {
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
+        // `rpython/jit/backend/x86/assembler.py:691-693` `assemble_bridge`:
+        // `frame_depth = max(current_clt.frame_info.jfi_frame_depth,
+        //                    frame_depth_no_fixed_size + JITFRAME_FIXED_SIZE)`
+        // → `self.update_frame_depth(frame_depth)` which calls
+        // `self.current_clt.frame_info.update_frame_depth(baseofs, frame_depth)`.
+        //
+        // Without this, self-recursive CALL_ASSEMBLER allocates callee
+        // jitframes with the loop's original (smaller) jfi_frame_depth,
+        // so regalloc spill slots past that depth overrun into the next
+        // nursery allocation (observed: jf_L[272] aliases the next
+        // callee's jf_frame_info, so llfi ends up at input0).
+        let bridge_frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
+        let baseofs = Self::get_baseofs_of_frame_field();
+        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+            clt.frame_info
+                .lock()
+                .update_frame_depth(baseofs, bridge_frame_depth);
+        }
+        // Keep the existing loop CompiledCode.frame_depth in lockstep
+        // (same rationale as `redirect_call_assembler` — dynasm codegen
+        // reads `CompiledCode.frame_depth` in addition to
+        // `frame_info.jfi_frame_depth`).
+        Self::get_compiled(original_token)
+            .frame_depth
+            .fetch_max(bridge_frame_depth as usize, Ordering::Release);
 
         // assembler.py:987 patch_jump_for_descr — redirect guard to bridge.
         // Use the exact guard descr found above, not a fail_index search.
@@ -2148,8 +2211,237 @@ impl Backend for DynasmBackend {
 mod tests {
     use super::*;
     use majit_backend::Backend;
-    use majit_gc::collector::MiniMarkGC;
+    use majit_backend::jitframe::{
+        FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS,
+        JF_FRAME_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JITFRAME_FIXED_SIZE, LENGTHOFS, SIGN_SIZE,
+    };
+    use majit_gc::collector::{GcConfig, MiniMarkGC};
+    use majit_gc::header::header_of;
     use majit_gc::trace::TypeInfo;
+    use majit_ir::{
+        CallDescr, DescrRef, EffectInfo, ExtraEffect, InputArg, OopSpecIndex, OpCode, Type, Value,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn install_test_libc_jitframe_tracer() {
+        majit_gc::shadow_stack::register_libc_jitframe_tracer(
+            majit_backend::jitframe::jitframe_custom_trace,
+        );
+    }
+
+    #[derive(Debug)]
+    struct TestCallAssemblerDescr {
+        arg_types: Vec<Type>,
+        result_type: Type,
+        target_token: u64,
+        vable_expansion: Option<majit_ir::VableExpansion>,
+    }
+
+    #[derive(Debug)]
+    struct TestPlainCallDescr {
+        arg_types: Vec<Type>,
+        result_type: Type,
+    }
+
+    impl majit_ir::Descr for TestCallAssemblerDescr {
+        fn index(&self) -> u32 {
+            u32::MAX
+        }
+
+        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+            Some(self)
+        }
+
+        fn as_loop_token_descr(&self) -> Option<&dyn majit_ir::LoopTokenDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::LoopTokenDescr for TestCallAssemblerDescr {
+        fn loop_token_number(&self) -> u64 {
+            self.target_token
+        }
+    }
+
+    impl CallDescr for TestCallAssemblerDescr {
+        fn arg_types(&self) -> &[Type] {
+            &self.arg_types
+        }
+
+        fn result_type(&self) -> Type {
+            self.result_type
+        }
+
+        fn result_size(&self) -> usize {
+            8
+        }
+
+        fn call_target_token(&self) -> Option<u64> {
+            Some(self.target_token)
+        }
+
+        fn get_extra_info(&self) -> &EffectInfo {
+            static INFO: EffectInfo =
+                EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
+            &INFO
+        }
+
+        fn vable_expansion(&self) -> Option<&majit_ir::VableExpansion> {
+            self.vable_expansion.as_ref()
+        }
+    }
+
+    impl majit_ir::Descr for TestPlainCallDescr {
+        fn index(&self) -> u32 {
+            u32::MAX
+        }
+
+        fn as_call_descr(&self) -> Option<&dyn CallDescr> {
+            Some(self)
+        }
+    }
+
+    impl CallDescr for TestPlainCallDescr {
+        fn arg_types(&self) -> &[Type] {
+            &self.arg_types
+        }
+
+        fn result_type(&self) -> Type {
+            self.result_type
+        }
+
+        fn result_size(&self) -> usize {
+            8
+        }
+
+        fn get_extra_info(&self) -> &EffectInfo {
+            static INFO: EffectInfo =
+                EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
+            &INFO
+        }
+    }
+
+    fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let mut op = Op::new(opcode, args);
+        op.pos = OpRef(pos);
+        op
+    }
+
+    fn make_call_assembler_descr(
+        target: &JitCellToken,
+        arg_types: Vec<Type>,
+        result_type: Type,
+    ) -> DescrRef {
+        Arc::new(TestCallAssemblerDescr {
+            arg_types,
+            result_type,
+            target_token: target.number,
+            vable_expansion: None,
+        })
+    }
+
+    fn make_call_assembler_descr_with_expansion(
+        target: &JitCellToken,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        expansion: majit_ir::VableExpansion,
+    ) -> DescrRef {
+        Arc::new(TestCallAssemblerDescr {
+            arg_types,
+            result_type,
+            target_token: target.number,
+            vable_expansion: Some(expansion),
+        })
+    }
+
+    fn make_plain_call_descr(arg_types: Vec<Type>, result_type: Type) -> DescrRef {
+        Arc::new(TestPlainCallDescr {
+            arg_types,
+            result_type,
+        })
+    }
+
+    extern "C" fn return_ref_passthrough(arg: i64) -> i64 {
+        arg
+    }
+
+    static TEST_HELPER_ALLOC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    const TEST_HELPER_MARKER: i64 = 0x5a5a5a5a_i64;
+
+    extern "C" fn alloc_marked_ref() -> i64 {
+        DYNASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let gc = guard
+                .as_mut()
+                .expect("alloc_marked_ref requires an active dynasm GC");
+            let type_id = TEST_HELPER_ALLOC_TYPE_ID.load(Ordering::Relaxed);
+            assert_ne!(type_id, u32::MAX, "test helper type id not initialized");
+            let obj = gc.alloc_nursery_typed(type_id, 16);
+            unsafe {
+                *(obj.0 as *mut i64) = TEST_HELPER_MARKER;
+            }
+            obj.0 as i64
+        })
+    }
+
+    extern "C" fn alloc_marked_ref_collecting() -> i64 {
+        DYNASM_ACTIVE_GC.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let gc = guard
+                .as_mut()
+                .expect("alloc_marked_ref_collecting requires an active dynasm GC");
+            let type_id = TEST_HELPER_ALLOC_TYPE_ID.load(Ordering::Relaxed);
+            assert_ne!(type_id, u32::MAX, "test helper type id not initialized");
+            let obj = gc.alloc_nursery_typed(type_id, 16);
+            unsafe {
+                *(obj.0 as *mut i64) = TEST_HELPER_MARKER;
+            }
+            let root_depth = majit_gc::shadow_stack::depth();
+            let ss_idx = majit_gc::shadow_stack::push(obj);
+            let _bump = gc.alloc_nursery_typed(type_id, 80);
+            let updated = majit_gc::shadow_stack::get(ss_idx);
+            majit_gc::shadow_stack::pop_to(root_depth);
+            updated.0 as i64
+        })
+    }
+
+    fn install_call_assembler_test_layout() {
+        crate::register_jitframe_layout(crate::JitFrameLayoutInfo {
+            jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
+                jitframe_tid: crate::jitframe_gc_type_id().unwrap_or(u32::MAX),
+                jitframe_fixed_size: JITFRAME_FIXED_SIZE,
+                jf_frame_info_ofs: JF_FRAME_INFO_OFS,
+                jf_descr_ofs: JF_DESCR_OFS,
+                jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+                jf_savedata_ofs: JF_SAVEDATA_OFS,
+                jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+                jf_forward_ofs: JF_FORWARD_OFS,
+                jf_frame_ofs: JF_FRAME_OFS,
+                jf_frame_baseitemofs: FIRST_ITEM_OFFSET,
+                jf_frame_lengthofs: JF_FRAME_OFS + LENGTHOFS,
+                sign_size: SIGN_SIZE,
+            }),
+        });
+    }
+
+    fn make_call_assembler_backend() -> DynasmBackend {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+        backend
+    }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
@@ -2184,6 +2476,1390 @@ mod tests {
         assert!(majit_gc::check_is_object(obj));
         assert_eq!(majit_gc::get_actual_typeid(obj), Some(obj_tid));
         assert_eq!(majit_gc::typeid_is_object(obj_tid), Some(true));
+    }
+
+    #[test]
+    fn test_input_initial_locs_match_frame_relative_entry_offsets() {
+        assert_eq!(
+            DynasmBackend::input_initial_loc(0),
+            (DynasmBackend::input_slot(0) * crate::jitframe::SIZEOFSIGNED) as i32
+        );
+        assert_eq!(
+            DynasmBackend::input_initial_loc(1),
+            (DynasmBackend::input_slot(1) * crate::jitframe::SIZEOFSIGNED) as i32
+        );
+    }
+
+    #[test]
+    fn compile_loop_records_token_inputarg_types() {
+        let mut backend = DynasmBackend::new();
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let ops = vec![mk_op(OpCode::Finish, &[OpRef(0), OpRef(1)], OpRef::NONE.0)];
+
+        let mut token = JitCellToken::new(1499);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        assert_eq!(token.inputarg_types, vec![Type::Ref, Type::Int]);
+    }
+
+    #[test]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn compile_loop_accepts_nonzero_inputarg_indices() {
+        let mut backend = DynasmBackend::new();
+        let inputargs = vec![InputArg::new_int(10), InputArg::new_int(20)];
+        let ops = vec![
+            mk_op(OpCode::IntAdd, &[OpRef(10), OpRef(20)], 30),
+            mk_op(OpCode::Finish, &[OpRef(30)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(1500);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(4), Value::Int(5)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 9);
+    }
+
+    #[test]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_gc_alloc_and_init_with_configured_runtime() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::new();
+        gc.register_type(TypeInfo::simple(16));
+        gc.register_type(TypeInfo::simple(24));
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(10000, 32_i64);
+        consts.insert(10001, -8_i64);
+        consts.insert(10002, 1_i64);
+        consts.insert(10003, 8_i64);
+        consts.insert(10004, 0_i64);
+        consts.insert(10005, 0xDEAD_i64);
+        consts.insert(10006, 16_i64);
+        consts.insert(10007, 1_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 0),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10001), OpRef(10002), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10004), OpRef(10005), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10006), OpRef(10007), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(1500);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 1);
+        assert_eq!(unsafe { *(obj.0 as *const u64) }, 0xDEAD);
+        assert_eq!(unsafe { *((obj.0 + 16) as *const i64) }, 1);
+    }
+
+    #[test]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_collecting_alloc_preserves_initialized_header_and_payload() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        gc.register_type(TypeInfo::simple(24));
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(10000, 32_i64);
+        consts.insert(10001, -8_i64);
+        consts.insert(10002, 1_i64);
+        consts.insert(10003, 8_i64);
+        consts.insert(10004, 0_i64);
+        consts.insert(10005, 0xDEAD_i64);
+        consts.insert(10006, 16_i64);
+        consts.insert(10007, 1_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 0),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10001), OpRef(10002), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10004), OpRef(10005), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10006), OpRef(10007), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 3),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef(0), OpRef(1), OpRef(2), OpRef(3)],
+                OpRef::NONE.0,
+            ),
+        ];
+
+        let mut token = JitCellToken::new(1501);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 1);
+        assert_eq!(unsafe { *(obj.0 as *const u64) }, 0xDEAD);
+        assert_eq!(unsafe { *((obj.0 + 16) as *const i64) }, 1);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_varsize_frame_fastpath_does_not_overlap_previous_object_payload() {
+        let mut gc = MiniMarkGC::new();
+        gc.register_type(TypeInfo::simple(24));
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(10000, 32_i64);
+        consts.insert(10001, -8_i64);
+        consts.insert(10002, 1_i64);
+        consts.insert(10003, 8_i64);
+        consts.insert(10004, 0_i64);
+        consts.insert(10005, 16_i64);
+        consts.insert(10006, 111_i64);
+        consts.insert(10007, 3_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef(10000)], 0),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10001), OpRef(10002), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10004), OpRef(10004), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(0), OpRef(10005), OpRef(10006), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(OpCode::CallMallocNurseryVarsizeFrame, &[OpRef(0)], 1),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(1), OpRef(10001), OpRef(10007), OpRef(10003)],
+                OpRef::NONE.0,
+            ),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(1502);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(64)]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { *((obj.0 + 16) as *const i64) }, 111);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_varsize_frame_gcstore_round_trips_first_user_slot() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(10000, 264_i64);
+        consts.insert(10001, 256_i64);
+        consts.insert(10002, 8_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0)];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNurseryVarsizeFrame, &[OpRef(10000)], 1),
+            mk_op(
+                OpCode::GcStore,
+                &[OpRef(1), OpRef(10001), OpRef(0), OpRef(10002)],
+                OpRef::NONE.0,
+            ),
+            mk_op(OpCode::GcLoadR, &[OpRef(1), OpRef(10001), OpRef(10002)], 2),
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(1503);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_round_trips_ref_input_through_rewritten_jitframe() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+        install_test_libc_jitframe_tracer();
+        install_call_assembler_test_layout();
+
+        let callee_inputargs = vec![InputArg::new_ref(0)];
+        let callee_ops = vec![mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0)];
+        let mut callee_token = JitCellToken::new(1600);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+        let direct = backend.execute_token(&callee_token, &[Value::Ref(payload)]);
+        assert_eq!(backend.get_ref_value(&direct, 0), payload);
+
+        let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef(0)], 1);
+        call.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref],
+            Type::Ref,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0)];
+        let caller_ops = vec![call, mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0)];
+        let mut caller_token = JitCellToken::new(1601);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload)]);
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_supports_direct_self_recursive_dispatch() {
+        let mut backend = make_call_assembler_backend();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1602);
+        backend.register_pending_target(token.number, vec![Type::Int], 1, 1, -1);
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(1)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 1),
+            guard,
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(100)], 2),
+            {
+                let mut call = mk_op(OpCode::CallAssemblerI, &[OpRef(2)], 3);
+                call.descr = Some(make_call_assembler_descr(
+                    &token,
+                    vec![Type::Int],
+                    Type::Int,
+                ));
+                call
+            },
+            mk_op(OpCode::IntAdd, &[OpRef(3), OpRef(100)], 4),
+            mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(0)]);
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        backend.set_constants(HashMap::new());
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(&*guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(4)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 4);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_supports_direct_self_recursive_ref_dispatch() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1603);
+        backend.register_pending_target(token.number, vec![Type::Int, Type::Ref], 2, 2, -1);
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0), OpRef(1)].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 2),
+            guard,
+            mk_op(OpCode::IntSub, &[OpRef(0), OpRef(100)], 3),
+            {
+                let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef(3), OpRef(1)], 4);
+                call.descr = Some(make_call_assembler_descr(
+                    &token,
+                    vec![Type::Int, Type::Ref],
+                    Type::Ref,
+                ));
+                call
+            },
+            mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Int(0), Value::Ref(payload)]);
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        backend.set_constants(HashMap::new());
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(&*guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(4), Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_self_recursive_virtualizable_ref_arg_preserves_input0() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1614);
+        token.virtualizable_arg_index = Some(0);
+        backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
+
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(1), OpRef(101)], 2),
+            guard,
+            mk_op(OpCode::IntSub, &[OpRef(1), OpRef(100)], 3),
+            {
+                let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef(0), OpRef(3)], 4);
+                call.descr = Some(make_call_assembler_descr(
+                    &token,
+                    vec![Type::Ref, Type::Int],
+                    Type::Ref,
+                ));
+                call
+            },
+            mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(0)]);
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        backend.set_constants(HashMap::new());
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(
+                &*guard_descr,
+                &[InputArg::new_ref(0)],
+                &bridge_ops,
+                &token,
+                &[],
+            )
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(32)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_uses_gc_rewritten_vable_frame_without_double_materializing() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(24));
+        let payload = gc.alloc_with_type(payload_tid, 24);
+        const MARKER: i64 = 0x3456_789a_i64;
+        unsafe {
+            *((payload.0 as *mut u8).add(16) as *mut i64) = MARKER;
+        }
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let field_descr: DescrRef =
+            Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
+        let mut entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef(0)], 2);
+        entry_getfield.descr = Some(field_descr);
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            entry_getfield,
+            mk_op(OpCode::IntAdd, &[OpRef(1), OpRef(2)], 3),
+            mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
+        ];
+        let mut callee_token = JitCellToken::new(1617);
+        callee_token.virtualizable_arg_index = Some(0);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+
+        let expansion = majit_ir::VableExpansion {
+            scalar_fields: vec![(16, Type::Int)],
+            array_struct_offset: 0,
+            array_ptr_offset: 0,
+            num_array_items: 0,
+            const_overrides: vec![],
+            arg_overrides: vec![],
+        };
+        let mut call = mk_op(OpCode::CallAssemblerI, &[OpRef(0), OpRef(1)], 2);
+        call.descr = Some(make_call_assembler_descr_with_expansion(
+            &callee_token,
+            vec![Type::Ref, Type::Int],
+            Type::Int,
+            expansion,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let caller_ops = vec![call, mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0)];
+        let mut caller_token = JitCellToken::new(1618);
+        caller_token.virtualizable_arg_index = Some(0);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload), Value::Int(7)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), MARKER + 7);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_self_recursive_virtualizable_bridge_reads_input0_from_compiled_bridge() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(24));
+        let payload = gc.alloc_with_type(payload_tid, 24);
+        const MARKER: i64 = 0x5a5a_1234_7788_i64;
+        unsafe {
+            *((payload.0 as *mut u8).add(16) as *mut i64) = MARKER;
+        }
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 0);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1615);
+        token.virtualizable_arg_index = Some(0);
+        backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
+
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntGt, &[OpRef(1), OpRef(101)], 2),
+            guard,
+            mk_op(OpCode::IntSub, &[OpRef(1), OpRef(100)], 3),
+            {
+                let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef(0), OpRef(3)], 4);
+                call.descr = Some(make_call_assembler_descr(
+                    &token,
+                    vec![Type::Ref, Type::Int],
+                    Type::Ref,
+                ));
+                call
+            },
+            mk_op(OpCode::Finish, &[OpRef(4)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(0)]);
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        backend.set_constants(HashMap::new());
+        let field_descr: DescrRef =
+            Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
+        let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef(0)], 1);
+        getfield.descr = Some(field_descr);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            getfield,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(
+                &*guard_descr,
+                &[InputArg::new_ref(0)],
+                &bridge_ops,
+                &token,
+                &[],
+            )
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(32)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), MARKER);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_double_recursive_virtualizable_call_assembler_keeps_entry_input0_live() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(24));
+        let payload = gc.alloc_with_type(payload_tid, 24);
+        unsafe {
+            *((payload.0 as *mut u8).add(16) as *mut i64) = 1;
+        }
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let mut constants = HashMap::new();
+        constants.insert(100, 1);
+        constants.insert(101, 2);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1616);
+        token.virtualizable_arg_index = Some(0);
+        backend.register_pending_target(token.number, vec![Type::Ref, Type::Int], 2, 2, 0);
+
+        let field_descr: DescrRef =
+            Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
+        let mut entry_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef(0)], 2);
+        entry_getfield.descr = Some(field_descr.clone());
+
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(3)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+
+        let mut call1 = mk_op(OpCode::CallAssemblerI, &[OpRef(0), OpRef(4)], 6);
+        call1.descr = Some(make_call_assembler_descr(
+            &token,
+            vec![Type::Ref, Type::Int],
+            Type::Int,
+        ));
+        let mut call2 = mk_op(OpCode::CallAssemblerI, &[OpRef(0), OpRef(5)], 7);
+        call2.descr = Some(make_call_assembler_descr(
+            &token,
+            vec![Type::Ref, Type::Int],
+            Type::Int,
+        ));
+
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            entry_getfield,
+            mk_op(OpCode::IntGe, &[OpRef(1), OpRef(101)], 3),
+            guard,
+            mk_op(OpCode::IntSub, &[OpRef(1), OpRef(100)], 4),
+            mk_op(OpCode::IntSub, &[OpRef(1), OpRef(101)], 5),
+            call1,
+            call2,
+            mk_op(OpCode::IntAdd, &[OpRef(6), OpRef(7)], 8),
+            mk_op(OpCode::Finish, &[OpRef(8)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(1)]);
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        backend.set_constants(HashMap::new());
+        let mut bridge_getfield = mk_op(OpCode::GetfieldRawI, &[OpRef(0)], 1);
+        bridge_getfield.descr = Some(field_descr);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            bridge_getfield,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(
+                &*guard_descr,
+                &[InputArg::new_ref(0)],
+                &bridge_ops,
+                &token,
+                &[],
+            )
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(payload), Value::Int(10)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 89);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_bridge_materializes_register_ref_inputs_for_resolve_opref_ops() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let wrong_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        let wrong_vtable: usize = 0x2222_4400;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, wrong_vtable, wrong_tid);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0)];
+        let mut constants = HashMap::new();
+        constants.insert(100, wrong_vtable as i64);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1604);
+        let mut guard = mk_op(OpCode::GuardClass, &[OpRef(0), OpRef(100)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0)].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(&token, &[Value::Ref(payload)]);
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+
+        let mut bridge_constants = HashMap::new();
+        bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
+        backend.set_constants(bridge_constants);
+        let mut bridge_value = mk_op(OpCode::CondCallValueR, &[OpRef(0), OpRef(200)], 1);
+        bridge_value.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            bridge_value,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(&*guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_bridge_materializes_two_register_ref_inputs_before_unused_raw_load() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let frame_tid = gc.register_type(TypeInfo::simple(24));
+        let other_tid = gc.register_type(TypeInfo::simple(16));
+        let wrong_tid = gc.register_type(TypeInfo::simple(16));
+        let frame_payload = gc.alloc_with_type(frame_tid, 24);
+        let second_payload = gc.alloc_with_type(other_tid, 16);
+
+        const MARKER: i64 = 0x1357_2468_1122_i64;
+        unsafe {
+            *((frame_payload.0 as *mut u8).add(16) as *mut i64) = MARKER;
+        }
+
+        let wrong_vtable: usize = 0x3333_5500;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, wrong_vtable, wrong_tid);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let mut constants = HashMap::new();
+        constants.insert(100, wrong_vtable as i64);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1618);
+        let mut guard = mk_op(OpCode::GuardClass, &[OpRef(1), OpRef(100)], OpRef::NONE.0);
+        guard.fail_args = Some(vec![OpRef(0), OpRef(1)].into());
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let failed = backend.execute_token(
+            &token,
+            &[Value::Ref(frame_payload), Value::Ref(second_payload)],
+        );
+        let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
+        let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
+        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+
+        backend.set_constants(HashMap::new());
+        let field_descr: DescrRef =
+            Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
+        let mut getfield = mk_op(OpCode::GetfieldRawI, &[OpRef(0)], 2);
+        getfield.descr = Some(field_descr);
+        let bridge_ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            getfield,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend
+            .compile_bridge(&*guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .unwrap();
+
+        let frame = backend.execute_token(
+            &token,
+            &[Value::Ref(frame_payload), Value::Ref(second_payload)],
+        );
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), second_payload);
+    }
+
+    #[test]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_label_uses_absolute_jitframe_input_slots_for_resolve_opref_ops() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0)];
+        let mut constants = HashMap::new();
+        constants.insert(200, return_ref_passthrough as *const () as usize as i64);
+        backend.set_constants(constants);
+
+        let mut token = JitCellToken::new(1605);
+        let mut passthrough = mk_op(OpCode::CondCallValueR, &[OpRef(0), OpRef(200)], 1);
+        passthrough.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            passthrough,
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_preserves_ref_from_immediately_preceding_callr() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0)];
+        let callee_ops = vec![mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0)];
+        let mut callee_token = JitCellToken::new(1604);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+
+        let mut constants = HashMap::new();
+        constants.insert(200, return_ref_passthrough as usize as i64);
+        backend.set_constants(constants);
+
+        let mut plain_call = mk_op(OpCode::CallR, &[OpRef(200), OpRef(0)], 1);
+        plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef(1)], 2);
+        call_asm.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref],
+            Type::Ref,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0)];
+        let caller_ops = vec![
+            plain_call,
+            call_asm,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut caller_token = JitCellToken::new(1605);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_preserves_helper_ref_when_rewritten_with_second_ref_arg() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+        let ec = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        install_test_libc_jitframe_tracer();
+
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let callee_ops = vec![mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0)];
+        let mut callee_token = JitCellToken::new(1606);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+
+        let mut constants = HashMap::new();
+        constants.insert(201, return_ref_passthrough as *const () as usize as i64);
+        backend.set_constants(constants);
+
+        let mut plain_call = mk_op(OpCode::CallR, &[OpRef(201), OpRef(0)], 2);
+        plain_call.descr = Some(make_plain_call_descr(vec![Type::Ref], Type::Ref));
+        let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef(2), OpRef(1)], 3);
+        call_asm.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let caller_ops = vec![
+            plain_call,
+            call_asm,
+            mk_op(OpCode::Finish, &[OpRef(3)], OpRef::NONE.0),
+        ];
+        let mut caller_token = JitCellToken::new(1607);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload), Value::Ref(ec)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_preserves_fresh_callr_ref_with_second_ref_arg_across_collecting_callee_alloc()
+     {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let ec = gc.alloc_with_type(payload_tid, 16);
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(
+            203,
+            alloc_marked_ref_collecting as *const () as usize as i64,
+        );
+        consts.insert(202, 32_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let callee_ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef(202)], 2),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut callee_token = JitCellToken::new(1610);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+
+        let mut plain_call = mk_op(OpCode::CallR, &[OpRef(203)], 1);
+        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef(1), OpRef(0)], 2);
+        call_asm.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0)];
+        let caller_ops = vec![
+            plain_call,
+            call_asm,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut caller_consts = HashMap::new();
+        caller_consts.insert(
+            203,
+            alloc_marked_ref_collecting as *const () as usize as i64,
+        );
+        backend.set_constants(caller_consts);
+        let mut caller_token = JitCellToken::new(1611);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(ec)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let result = backend.get_ref_value(&frame, 0);
+        assert!(!result.is_null());
+        unsafe {
+            assert_eq!(*(result.0 as *const i64), TEST_HELPER_MARKER);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_preserves_two_ref_inputs_across_collecting_callee_alloc() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(24));
+        let ec_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 24);
+        let ec = gc.alloc_with_type(ec_tid, 16);
+        const MARKER: i64 = 0x1357_2468_1122_i64;
+        unsafe {
+            *((payload.0 as *mut u8).add(16) as *mut i64) = MARKER;
+        }
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(202, 32_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let callee_ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef(202)], 2),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut callee_token = JitCellToken::new(1612);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+
+        let mut call_asm = mk_op(OpCode::CallAssemblerR, &[OpRef(0), OpRef(1)], 2);
+        call_asm.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let caller_ops = vec![call_asm, mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0)];
+        let mut caller_token = JitCellToken::new(1613);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload), Value::Ref(ec)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let result = backend.get_ref_value(&frame, 0);
+        unsafe {
+            assert_eq!(*((result.0 as *const u8).add(16) as *const i64), MARKER);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_preserves_ref_input_across_collecting_callee_alloc() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.alloc_with_type(payload_tid, 16);
+        assert!(gc.pin(payload));
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(202, 32_i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef(202)], 1),
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut callee_token = JitCellToken::new(1608);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+        let direct = backend.execute_token(&callee_token, &[Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&direct).is_finish());
+        assert_eq!(backend.get_ref_value(&direct, 0), payload);
+
+        let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef(0)], 1);
+        call.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref],
+            Type::Ref,
+        ));
+        let caller_inputargs = vec![InputArg::new_ref(0)];
+        let caller_ops = vec![call, mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0)];
+        let mut caller_token = JitCellToken::new(1609);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[Value::Ref(payload)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_ref_value(&frame, 0), payload);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_call_assembler_preserves_fresh_callr_ref_across_collecting_frame_alloc() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(203, alloc_marked_ref as *const () as usize as i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let callee_inputargs = vec![InputArg::new_ref(0)];
+        let callee_ops = vec![mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0)];
+        let mut callee_token = JitCellToken::new(1610);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &mut callee_token)
+            .unwrap();
+
+        let mut consts = HashMap::new();
+        consts.insert(203, alloc_marked_ref as *const () as usize as i64);
+        backend.set_constants(consts);
+
+        let mut plain_call = mk_op(OpCode::CallR, &[OpRef(203)], 1);
+        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        let mut call = mk_op(OpCode::CallAssemblerR, &[OpRef(1)], 2);
+        call.descr = Some(make_call_assembler_descr(
+            &callee_token,
+            vec![Type::Ref],
+            Type::Ref,
+        ));
+        let caller_ops = vec![
+            plain_call,
+            call,
+            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+        ];
+        let mut caller_token = JitCellToken::new(1611);
+        backend
+            .compile_loop(&[], &caller_ops, &mut caller_token)
+            .unwrap();
+
+        let frame = backend.execute_token(&caller_token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let result = backend.get_ref_value(&frame, 0);
+        assert!(!result.is_null());
+        unsafe {
+            assert_eq!(*(result.0 as *const i64), TEST_HELPER_MARKER);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_plain_call_returns_fresh_gc_ref_without_call_assembler() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(205, alloc_marked_ref as *const () as usize as i64);
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let mut plain_call = mk_op(OpCode::CallR, &[OpRef(205)], 0);
+        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        let ops = vec![
+            plain_call,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut token = JitCellToken::new(1612);
+        backend.compile_loop(&[], &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let result = backend.get_ref_value(&frame, 0);
+        assert!(!result.is_null());
+        unsafe {
+            assert_eq!(*(result.0 as *const i64), TEST_HELPER_MARKER);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    #[ignore = "find_descr_by_ptr 0x0 — backend FINISH/CALL_ASSEMBLER/varsize-alloc paths do not yet write jf_descr in this test harness; tracked under Task #11/#21/#22 (CALL_ASSEMBLER red-only + recursive frame contract)"]
+    fn test_plain_call_preserves_ref_result_across_collecting_helper_call() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 96,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        let payload_tid = gc.register_type(TypeInfo::simple(16));
+
+        crate::set_jitframe_gc_type_id(jitframe_tid);
+        install_call_assembler_test_layout();
+        TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
+
+        let mut backend = DynasmBackend::new();
+        let mut consts = HashMap::new();
+        consts.insert(
+            206,
+            alloc_marked_ref_collecting as *const () as usize as i64,
+        );
+        backend.set_constants(consts);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let mut plain_call = mk_op(OpCode::CallR, &[OpRef(206)], 0);
+        plain_call.descr = Some(make_plain_call_descr(vec![], Type::Ref));
+        let ops = vec![
+            plain_call,
+            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+        ];
+        let mut token = JitCellToken::new(1613);
+        backend.compile_loop(&[], &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let result = backend.get_ref_value(&frame, 0);
+        assert!(!result.is_null());
+        unsafe {
+            assert_eq!(*(result.0 as *const i64), TEST_HELPER_MARKER);
+        }
+    }
+
+    #[test]
+    fn test_jit_threadlocalref_base_round_trips_slot_contents() {
+        crate::jit_threadlocalref_set(0, 0x1234);
+        crate::jit_threadlocalref_set(8, 0x5678);
+        let base = crate::jit_threadlocalref_base();
+        assert!(!base.is_null());
+        unsafe {
+            assert_eq!(*base.add(0), 0x1234);
+            assert_eq!(*base.add(1), 0x5678);
+        }
     }
 }
 

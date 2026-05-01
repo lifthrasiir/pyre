@@ -508,6 +508,171 @@ pub fn emit_box_float_inline(
     new_op
 }
 
+/// Emit a fresh callee `PyFrame` directly into the trace IR for the
+/// self-recursive single-int-argument fast path.
+///
+/// Replaces the opaque `jit_create_self_recursive_callee_frame_1_raw_int`
+/// CallR that today (`call_jit.rs:2814`) wraps `arena.take()` + reuse
+/// check + locals zero-fill + raw_int boxing in an opaque helper. The
+/// helper is `#[dont_look_inside]` so the optimizer cannot virtualize
+/// the new frame nor fold the boxing — every fib(35) iteration pays
+/// the full helper trampoline (~336k calls/run, observed in
+/// `phase2_3_self_recursive_call_perf_plan_2026_04_28.md`). PyPy emits
+/// `direct_assembler_call` with `NewWithVtable(jitframe) + SetfieldGc(...)`
+/// in trace IR (`backend/aarch64/opassembler.py:1080-1200`); this helper
+/// is the closest pyre analogue given that pyre's `PyFrame` plays the
+/// role both of CPython's `PyFrame` and of PyPy's separate `jitframe` /
+/// virtualizable.
+///
+/// Restrictions held by the caller:
+///   - self-recursive (callee `pycode` ≡ caller `pycode`), so the
+///     caller passes `pycode` / `w_globals` / `execution_context` in
+///     directly: `pycode` and `w_globals` arrive as trace-time
+///     constants (the bound `W_CodeObject` and its `function.w_globals`,
+///     both immutable for the trace's lifetime), and `execution_context`
+///     arrives as the loop's already-materialised `sym.execution_context`
+///     OpRef (per-thread; not safe to const-fold across thread entries).
+///     This mirrors PyPy aarch64 `direct_assembler_call` (`backend/aarch64/
+///     opassembler.py:1080-1200`) which writes the callee jitframe's vable
+///     scalars from constants known at trace-compile time.
+///   - 1 raw-int argument (no boxed-arg path; caller is responsible
+///     for the `trace_guarded_int_payload` unbox).
+///   - no cellvars/freevars on the callee — `init_cells` is skipped.
+///     The caller verifies this against the concrete `W_CodeObject`
+///     before invoking the helper.
+///
+/// The IR sequence mirrors `pyframe.rs::PyFrame::new_for_call_with_closure`:
+///
+/// 1. `emit_box_int_inline(raw_int_arg)` → `boxed` W_IntObject (one
+///    nursery alloc, optimizer can fold into a virtual when the boxed
+///    value never escapes through `GuardNotForced`).
+/// 2. `NewArrayClear(array_size)` with `pyobject_gcarray_descr()` —
+///    the locals_cells_stack_w `FixedObjectArray<PyObjectRef>`
+///    backing storage. Clear so unset slots read as `PY_NULL`.
+/// 3. `SetarrayitemGc(locals_array, 0, boxed)` — bind the lone
+///    positional argument. Other slots stay `PY_NULL`.
+/// 4. `NewWithVtable(pyframe_size_descr())` — `vtable=0` because
+///    `PyFrame` is not an `rclass.OBJECT` instance (registered via
+///    `TypeInfo::with_gc_ptrs`, see `pyre-jit/src/eval.rs::initialize_gc`),
+///    so `handle_new` skips the vtable setfield (rewrite.py:925-933
+///    `gen_new_with_vtable` early-out for `vtable == 0`).
+/// 5. `SetfieldGc` ops for the constructor-visible fields. The non-zero
+///    fields (`execution_context`, `pycode`, `w_globals`,
+///    `locals_cells_stack_w`, `valuestackdepth`, `last_instr=-1`) mirror
+///    `new_for_call_with_closure`; the nullable GC fields
+///    (`f_generator_nowref`, `w_yielding_from`, `f_backref`) are written
+///    explicitly to match the same constructor shape instead of relying on
+///    an implicit backend zero-fill side effect. `pending_inline_results`
+///    stays bit-zero because its Rust representation is `Option<Box<...>>`.
+pub fn emit_new_pyframe_inline_self_recursive(
+    ctx: &mut TraceCtx,
+    raw_int_arg: OpRef,
+    array_size: usize,
+    valuestackdepth: usize,
+    pycode: OpRef,
+    w_globals: OpRef,
+    ec: OpRef,
+) -> OpRef {
+    use crate::descr::{
+        int_intval_descr, pyframe_code_descr, pyframe_dict_storage_descr,
+        pyframe_execution_context_descr, pyframe_f_backref_descr, pyframe_f_generator_nowref_descr,
+        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
+        pyframe_stack_depth_descr, pyframe_w_yielding_from_descr, w_int_size_descr,
+    };
+    use crate::state::pyobject_gcarray_descr;
+
+    // Step 1 — box the raw int into a fresh W_IntObject. Mirrors the
+    // `w_int_new(raw_int_arg)` call inside the opaque helper.
+    let boxed = emit_box_int_inline(ctx, raw_int_arg, w_int_size_descr(), int_intval_descr());
+
+    // Step 2 — allocate the locals_cells_stack_w array. `NewArrayClear`
+    // zeros every slot so any future LOAD_FAST on an unbound local
+    // observes `PY_NULL` (UnboundLocalError parity).
+    let len_ref = ctx.const_int(array_size as i64);
+    let array_descr = pyobject_gcarray_descr();
+    let locals_array =
+        ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
+    ctx.heap_cache_mut().new_object(locals_array);
+
+    // Step 3 — locals[0] = boxed. The single positional argument of
+    // the self-recursive call.
+    let zero = ctx.const_int(0);
+    ctx.record_op_with_descr(
+        OpCode::SetarrayitemGc,
+        &[locals_array, zero, boxed],
+        array_descr,
+    );
+
+    // Step 4 — allocate the new PyFrame. NewWithVtable zero-fills the
+    // payload; the GC tags it with `PYFRAME_GC_TYPE_ID` because the
+    // size descr's parent type id is registered in `pyre-jit/src/eval.rs`.
+    let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
+    ctx.heap_cache_mut().new_object(new_frame);
+
+    // Step 5 — SetfieldGc for the constructor-visible fields, mirroring
+    // the explicit assignments inside `new_for_call_with_closure`.
+    // Order matches the field declaration so the optimizer's lazy-set
+    // replace logic groups them together.
+    let ec_descr = pyframe_execution_context_descr();
+    let ec_idx = ec_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
+    ctx.heap_cache_mut().setfield_cached(new_frame, ec_idx, ec);
+
+    let code_descr = pyframe_code_descr();
+    let code_idx = code_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, code_idx, pycode);
+
+    let globals_descr = pyframe_dict_storage_descr();
+    let globals_idx = globals_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, w_globals], globals_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, globals_idx, w_globals);
+
+    let locals_descr = pyframe_locals_cells_stack_descr();
+    let locals_idx = locals_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, locals_array], locals_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, locals_idx, locals_array);
+
+    let vsd = ctx.const_int(valuestackdepth as i64);
+    let vsd_descr = pyframe_stack_depth_descr();
+    let vsd_idx = vsd_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, vsd], vsd_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, vsd_idx, vsd);
+
+    let neg_one = ctx.const_int(-1);
+    let last_instr_descr = pyframe_next_instr_descr();
+    let last_instr_idx = last_instr_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, last_instr_idx, neg_one);
+
+    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+
+    let generator_descr = pyframe_f_generator_nowref_descr();
+    let generator_idx = generator_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], generator_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, generator_idx, null_ref);
+
+    let yielding_descr = pyframe_w_yielding_from_descr();
+    let yielding_idx = yielding_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], yielding_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, yielding_idx, null_ref);
+
+    let backref_descr = pyframe_f_backref_descr();
+    let backref_idx = backref_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], backref_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_frame, backref_idx, null_ref);
+
+    new_frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

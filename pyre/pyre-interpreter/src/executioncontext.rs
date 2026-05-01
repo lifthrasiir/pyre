@@ -414,8 +414,26 @@ impl ExecutionContext {
         if !self.space.is_null() && self.is_tracing > 0 {
             self._revdb_enter(frame);
         }
+        let top = self.topframeref;
+        if !top.is_null() && (top as usize) < 0x10000 {
+            eprintln!(
+                "[ec][enter] CORRUPT topframeref=0x{:x} new_frame={:p}",
+                top as usize, frame
+            );
+            std::process::abort();
+        }
         unsafe {
-            (*frame).f_backref = self.topframeref;
+            // Also check the new frame's f_back slot — if it's a small int,
+            // some other write has stomped on it. enter() is about to clobber
+            // it with topframeref anyway, but the source of garbage matters.
+            let f_back_pre = (*frame).f_backref;
+            if !f_back_pre.is_null() && (f_back_pre as usize) < 0x10000 {
+                eprintln!(
+                    "[ec][enter] new_frame={:p} arrives with CORRUPT f_back=0x{:x} (will be overwritten with topframeref={:p})",
+                    frame, f_back_pre as usize, top
+                );
+            }
+            (*frame).f_backref = top;
         }
         self.topframeref = frame;
     }
@@ -431,7 +449,23 @@ impl ExecutionContext {
         if !self.topframeref.is_null() {
             // SAFETY: current top frame can be queried with raw pointer.
             unsafe {
-                self.topframeref = (*self.topframeref).get_f_back();
+                let top = self.topframeref;
+                if (top as usize) < 0x1000 {
+                    eprintln!(
+                        "[ec][leave] CORRUPT topframeref=0x{:x} popped_frame={:p}",
+                        top as usize, frame
+                    );
+                    std::process::abort();
+                }
+                let f_back = (*top).get_f_back();
+                if !f_back.is_null() && (f_back as usize) < 0x1000 {
+                    eprintln!(
+                        "[ec][leave] CORRUPT f_back=0x{:x} top_frame={:p} popped_frame={:p}",
+                        f_back as usize, top, frame
+                    );
+                    std::process::abort();
+                }
+                self.topframeref = f_back;
             }
         }
         if self.space.is_null() && self.gettopframe().is_null() {

@@ -1,4 +1,3 @@
-use majit_ir::Type;
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use pyre_interpreter::pyframe::PyFrame;
 
@@ -37,6 +36,16 @@ pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastbl
 pub const PYFRAME_EXECUTION_CONTEXT_OFFSET: usize =
     std::mem::offset_of!(PyFrame, execution_context);
 
+/// Byte offset of `f_generator_nowref` in `PyFrame`.
+pub const PYFRAME_F_GENERATOR_NOWREF_OFFSET: usize =
+    std::mem::offset_of!(PyFrame, f_generator_nowref);
+
+/// Byte offset of `w_yielding_from` in `PyFrame`.
+pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, w_yielding_from);
+
+/// Byte offset of `f_backref` in `PyFrame`.
+pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
+
 // Backward-compat aliases used by JIT descriptor helpers.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
@@ -56,6 +65,14 @@ const _: () = {
     assert!(PYFRAME_DEBUGDATA_OFFSET == pyre_interpreter::pyframe::PYFRAME_DEBUGDATA_OFFSET);
     assert!(PYFRAME_LASTBLOCK_OFFSET == pyre_interpreter::pyframe::PYFRAME_LASTBLOCK_OFFSET);
     assert!(PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET);
+    assert!(
+        PYFRAME_F_GENERATOR_NOWREF_OFFSET
+            == pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_NOWREF_OFFSET
+    );
+    assert!(
+        PYFRAME_W_YIELDING_FROM_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET
+    );
+    assert!(PYFRAME_F_BACKREF_OFFSET == pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET);
 };
 
 /// Build the virtualizable layout description for `PyFrame`.

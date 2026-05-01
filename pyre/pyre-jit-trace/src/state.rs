@@ -1027,15 +1027,17 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
 /// This helper mirrors what production code does:
 ///   1. `setup_kind_register_banks` to size the three banks +
 ///      copy-constants per `pyjitpl.py:97-119`.
-///   2. Place each `(stack_depth, opref)` at the post-regalloc
-///      Ref-bank color from `stack_slot_color_map[depth]` AND at the
-///      semantic prefix slot `registers_r[nlocals + depth]`. Both
-///      writes target the same `registers_r` Vec — the two indices
-///      differ once `apply_rename` reshuffles colors.
-///   3. Fill any still-`OpRef::NONE` slot listed in `live_pc`'s
-///      bank-split liveness with a typed dummy constant (`const_int`
-///      / `const_ref` / `const_float`) so `get_list_of_active_boxes`
-///      returns a hole-free `Vec<OpRef>`.
+///   2. Place each `(stack_depth, opref)` at the semantic prefix slot
+///      `registers_r[nlocals + depth]`. The post-regalloc Ref-bank
+///      color from `stack_slot_color_map[depth]` is intentionally not
+///      written into `registers_r`: Pyre stores the semantic
+///      locals_cells_stack_w view there, and `get_list_of_active_boxes`
+///      rebuilds the transient color-indexed bank from liveness.
+///   3. Fill any still-`OpRef::NONE` Int/Float bank slot listed in
+///      `live_pc`'s bank-split liveness with a typed dummy constant.
+///      Ref slots are deliberately not filled by color here: the tracer
+///      materializes them from the semantic locals_cells_stack_w slot at
+///      snapshot time, matching the production path.
 #[cfg(any(test, feature = "test-support"))]
 pub fn seed_compiled_trace_jitcode_test_state(
     sym: &mut PyreSym,
@@ -1048,19 +1050,11 @@ pub fn seed_compiled_trace_jitcode_test_state(
         sym.setup_kind_register_banks(ctx);
     }
 
-    let stack_color_map = stack_slot_color_map_at(jitcode_index);
     let nlocals = sym.nlocals;
     for &(depth, opref) in stack_slots {
         let semantic_idx = nlocals + depth;
         if semantic_idx < sym.registers_r.len() {
             sym.registers_r[semantic_idx] = opref;
-        }
-        if let Some(&color) = stack_color_map.get(depth) {
-            let ridx = color as usize;
-            if ridx >= sym.registers_r.len() {
-                sym.registers_r.resize(ridx + 1, OpRef::NONE);
-            }
-            sym.registers_r[ridx] = opref;
         }
     }
 
@@ -1072,15 +1066,6 @@ pub fn seed_compiled_trace_jitcode_test_state(
         }
         if sym.registers_i[r].is_none() {
             sym.registers_i[r] = ctx.const_int(0xfeed);
-        }
-    }
-    for &reg in &banks.ref_ {
-        let r = reg as usize;
-        if r >= sym.registers_r.len() {
-            sym.registers_r.resize(r + 1, OpRef::NONE);
-        }
-        if sym.registers_r[r].is_none() {
-            sym.registers_r[r] = ctx.const_ref(0xfeed);
         }
     }
     for &reg in &banks.float {
@@ -1338,7 +1323,8 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
 use pyre_interpreter::{DictStorage, decode_instruction_at};
 
 use crate::descr::{
-    float_floatval_descr, int_intval_descr, make_array_descr, w_float_size_descr, w_int_size_descr,
+    PY_OBJECT_ARRAY_GC_TYPE_ID, float_floatval_descr, int_intval_descr, make_array_descr,
+    make_array_descr_with_type, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -1718,7 +1704,22 @@ pub(crate) fn pyobject_array_descr() -> DescrRef {
 /// skips the length prefix so `GETARRAYITEM_GC_R(array_ptr, i)` lands
 /// on items[i] directly.
 pub(crate) fn pyobject_gcarray_descr() -> DescrRef {
-    make_array_descr(pyre_object::FIXED_ARRAY_ITEMS_OFFSET, 8, Type::Ref, false)
+    // type_id = PY_OBJECT_ARRAY_GC_TYPE_ID so the GC tracer walks each
+    // item slot as a Ref. Without this, gen_initialize_tid stamps
+    // OBJECT_GC_TYPE_ID into the GC header, the tracer treats the
+    // allocation as a 16-byte PyObject, and the variable-part items
+    // (the inline-emitted PyFrame.locals_cells_stack_w) survive the
+    // first young collection without forwarding — manifesting as
+    // wrong fib values on dynasm and SIGSEGV on cranelift once the
+    // recursion depth fills the nursery (rgc parity:
+    // gctypelayout.py:266-291 T_IS_VARSIZE / T_IS_GCARRAY_OF_GCPTR).
+    make_array_descr_with_type(
+        pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
+        8,
+        PY_OBJECT_ARRAY_GC_TYPE_ID,
+        Type::Ref,
+        false,
+    )
 }
 
 pub(crate) fn int_array_descr() -> DescrRef {
@@ -2738,7 +2739,11 @@ impl PyreSym {
         sym
     }
 
-    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub fn set_test_execution_context(&mut self, execution_context: OpRef) {
+        self.execution_context = execution_context;
+    }
+
     pub(crate) fn shift_virtualizable_input_indices(&mut self, extra_reds: u32) {
         if extra_reds == 0 {
             return;
@@ -2826,11 +2831,14 @@ impl PyreSym {
                         .unwrap_or(Type::Ref)
                 })
                 .collect();
-            // Bridges have no symbolic stack at entry — the stack is
-            // empty when control resumes from the failing guard. Leave
-            // the stack-types vector empty so it gets reconstructed from
-            // the concrete frame below.
-            Some((locals, Vec::<Type>::new()))
+            // resume.py:1042 consume_boxes + pyjitpl.py:2899 parity:
+            // guard-failure resume reconstructs the CURRENT frame state,
+            // including the live Python stack. `bridge_local_oprefs`
+            // overrides only the locals slice; stack slots still follow
+            // the virtualizable Ref contract until setup_bridge_sym
+            // overwrites the rebuilt tail with the precise resume-data
+            // OpRefs.
+            Some((locals, vec![Type::Ref; stack_only_depth]))
         } else {
             self.vable_array_base.map(|base| {
                 let inputarg_types = ctx.inputarg_types();
@@ -3093,7 +3101,6 @@ impl PyreJitState {
         descriptor
     }
 
-    #[allow(dead_code)]
     fn execution_context_as_usize(&self) -> usize {
         let Some(frame_ptr) = self.frame_ptr() else {
             return 0;
@@ -3101,7 +3108,6 @@ impl PyreJitState {
         unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize }
     }
 
-    #[allow(dead_code)]
     fn expanded_virtualizable_live_values_with_extra_reds(
         &self,
         meta: &PyreMeta,
@@ -3109,6 +3115,7 @@ impl PyreJitState {
     ) -> Vec<Value> {
         let base = crate::virtualizable_gen::virt_extract_live_values(
             self.frame,
+            self.execution_context_as_usize(),
             self.last_instr_as_usize(),
             self.pycode_as_usize(),
             self.valuestackdepth(),
@@ -3116,7 +3123,7 @@ impl PyreJitState {
             self.lastblock_as_usize(),
             self.w_globals_as_usize(),
             meta.num_locals,
-            meta.array_capacity,
+            meta.valuestackdepth,
             |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
             |i| self.stack_at(i).unwrap_or(PY_NULL) as usize,
         );
@@ -3130,7 +3137,6 @@ impl PyreJitState {
         values
     }
 
-    #[allow(dead_code)]
     fn expanded_virtualizable_live_value_types_with_extra_reds(
         meta: &PyreMeta,
         extra_red_types: &[Type],
@@ -3191,8 +3197,14 @@ impl PyreJitState {
     fn pypyjit_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
         let mut sym = PyreSym::new_uninit(OpRef(0));
         sym.execution_context = OpRef(1);
+        // `become_active_vable_owner` calls `init_vable_indices(FIRST_VABLE_SCALAR_IDX)`
+        // where `FIRST_VABLE_SCALAR_IDX = 1 + NUM_EXTRA_REDS` already accounts for
+        // the `ec` extra red.  An extra `shift_virtualizable_input_indices(1)`
+        // here would double-count, leaving e.g. `vable_pycode = OpRef(4)` (= the
+        // valuestackdepth slot, type Int) instead of `OpRef(3)` — the resume-time
+        // type assertion in `value_to_static_vable_bits` then catches the Int(1)
+        // value flowing into a Ref-typed slot.
         sym.become_active_vable_owner();
-        sym.shift_virtualizable_input_indices(1);
         sym.nlocals = meta.num_locals;
         sym.valuestackdepth = meta.valuestackdepth;
         sym.symbolic_local_types = vec![Type::Ref; meta.num_locals];
@@ -3202,7 +3214,6 @@ impl PyreJitState {
         sym
     }
 
-    #[allow(dead_code)]
     fn restore_expanded_virtualizable_values_with_extra_reds(
         &mut self,
         meta: &PyreMeta,
@@ -3218,10 +3229,13 @@ impl PyreJitState {
         }
 
         if meta.has_virtualizable {
+            // next_instr is already synced to the PyFrame heap by the
+            // compiled code's virtualizable sync before JUMP.
             self.set_valuestackdepth(meta.valuestackdepth);
             let nlocals = self.local_count();
             let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
-            let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + extra_reds;
+            let _ = extra_reds; // already folded into NUM_SCALAR_INPUTARGS
+            let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             for local_idx in 0..nlocals {
                 if let Some(value) = values.get(idx) {
                     let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
@@ -4347,12 +4361,27 @@ impl JitState for PyreJitState {
         let num_locals = self.local_count();
         let vsd = self.valuestackdepth();
         let slot_types = concrete_slot_types(self.frame, num_locals, vsd);
+        // commit 4 (valuestackdepth → heap array capacity flip) was dropped
+        // because it activates the broken VableExpansion path. The
+        // `capacity` reference here is left over from the dropped change;
+        // restore the pre-flip semantics: array_capacity == self.array_capacity().
+        let capacity = self.array_capacity();
         PyreMeta {
             num_locals,
             ns_len: self.namespace_len(),
             valuestackdepth: vsd,
-            array_capacity: self.array_capacity(),
-            trace_extra_reds: 0,
+            array_capacity: capacity,
+            // virtualizable_gen.rs:24-31 wires `extra_reds = { ec: Ref }` per
+            // interp_jit.py:67 `reds = ['frame', 'ec']`, so the per-Sym
+            // helpers (vable_collect_jump_args, NUM_EXTRA_REDS) already
+            // thread the ec slot. The runtime flag here remains 0 because
+            // pypy/module/pypyjit/interp_jit.py:67 PyPyJitDriver reds=
+            // ['frame', 'ec']. With Task #21 Slice 2 + Slice 3 landed
+            // (vable heap-writeback active behind the reduced-LABEL
+            // gate), the descriptor activation chain is unblocked.
+            // Cluster 2 flip — pairs with `driver_descriptor() = Some(...)`
+            // below.
+            trace_extra_reds: 1,
             has_virtualizable: self.has_virtualizable_info(),
             slot_types,
         }
@@ -4371,19 +4400,11 @@ impl JitState for PyreJitState {
     }
 
     fn extract_live_values(&self, meta: &Self::Meta) -> Vec<Value> {
-        crate::virtualizable_gen::virt_extract_live_values(
-            self.frame,
-            self.last_instr_as_usize(),
-            self.pycode_as_usize(),
-            self.valuestackdepth(),
-            self.debugdata_as_usize(),
-            self.lastblock_as_usize(),
-            self.w_globals_as_usize(),
-            meta.num_locals,
-            meta.valuestackdepth,
-            |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
-            |i| self.stack_at(i).unwrap_or(PY_NULL) as usize,
-        )
+        if meta.trace_extra_reds == 1 {
+            self.pypyjit_live_values_with_ec(meta)
+        } else {
+            self.expanded_virtualizable_live_values_with_extra_reds(meta, &[])
+        }
     }
 
     // virtualizable.py:86 read_boxes() + warmstate.py:73 wrap() parity:
@@ -4393,23 +4414,55 @@ impl JitState for PyreJitState {
     // encounter Ref-typed operands.
 
     fn live_value_types(&self, meta: &Self::Meta) -> Vec<Type> {
-        crate::virtualizable_gen::virt_live_value_types(meta.slot_types.len())
+        if meta.trace_extra_reds == 1 {
+            Self::pypyjit_live_value_types_with_ec(meta)
+        } else {
+            Self::expanded_virtualizable_live_value_types_with_extra_reds(meta, &[])
+        }
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.become_active_vable_owner();
-        sym.nlocals = _meta.num_locals;
-        sym.valuestackdepth = _meta.valuestackdepth;
-        // virtualizable.py:44 + interp_jit.py:25-31: all locals_cells_stack_w
-        // items are W_Root → Type::Ref. Unboxing happens inside trace opcode
-        // handlers (guard_class + getfield_gc_pure_i/_f), not at slot setup.
-        sym.symbolic_local_types = vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
-        sym.symbolic_stack_types =
-            vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
-        let stack_only = _meta.vable_stack_only_depth();
-        sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
-        sym
+        if _meta.trace_extra_reds == 1 {
+            Self::pypyjit_create_sym(_meta, _header_pc)
+        } else {
+            let mut sym = PyreSym::new_uninit(OpRef(0));
+            // `extra_reds = { ec: Ref }` in virtualizable_gen.rs places ec
+            // at OpRef(1). `init_vable_indices` shifts the vable static
+            // field + array_base OpRefs but does not own the extra_red
+            // sym storage; initialize it explicitly when the constant
+            // declares an ec slot.
+            if crate::virtualizable_gen::NUM_EXTRA_REDS > 0 {
+                sym.execution_context = OpRef(1);
+            }
+            sym.become_active_vable_owner();
+            sym.nlocals = _meta.num_locals;
+            sym.valuestackdepth = _meta.valuestackdepth;
+            // virtualizable.py:44 + interp_jit.py:25-31: all locals_cells_stack_w
+            // items are W_Root → Type::Ref. Unboxing happens inside trace opcode
+            // handlers (guard_class + getfield_gc_pure_i/_f), not at slot setup.
+            sym.symbolic_local_types =
+                vec![Type::Ref; _meta.num_locals.min(_meta.slot_types.len())];
+            sym.symbolic_stack_types =
+                vec![Type::Ref; _meta.slot_types.len().saturating_sub(_meta.num_locals)];
+            let stack_only = _meta.vable_stack_only_depth();
+            sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
+            sym
+        }
+    }
+
+    fn initialize_sym(&self, sym: &mut Self::Sym, _meta: &Self::Meta) {
+        // jitdriver.rs:2947-2992 sequencing parity: `start_bridge_tracing`
+        // calls `create_sym` → `initialize_sym` → `setup_bridge_sym` BEFORE
+        // `trace_bytecode` (which is where `init_symbolic` would otherwise
+        // populate `concrete_vable_ptr`). `setup_bridge_sym` reads
+        // `sym.concrete_vable_ptr` to size the vable shadow via
+        // `concrete_frame_array_len`; without this seed the pointer is
+        // null, the helper falls back to `nlocals`, and stack pushes
+        // beyond the first array slot panic at `set_virtualizable_entry_at`
+        // on recursive benchmarks (fib_recursive). Mirror PyreJitState's
+        // live frame pointer so the bridge seed sees the real
+        // `locals_cells_stack_w` length.
+        sym.concrete_vable_ptr = self.frame as *mut u8;
     }
 
     fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
@@ -4418,8 +4471,9 @@ impl JitState for PyreJitState {
         //   greens = ['next_instr', 'is_being_profiled', 'pycode']
         //   virtualizables = ['frame']
         //
-        // Held disabled: the atomic flip needs a vable heap-writeback
-        // pass that pyre's tracer does not yet emit. Concretely,
+        // History (now landed): the atomic flip needed a vable
+        // heap-writeback pass that pyre's tracer originally did not
+        // emit. Concretely,
         // `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461)
         // collapses the patched LABEL to `[reds]` and prepends a
         // GETFIELD_GC + GETARRAYITEM_GC preamble. The body then reads
@@ -4435,19 +4489,21 @@ impl JitState for PyreJitState {
         // and breaks that invariant.
         //
         // Prerequisites for the flip (all atomic with descriptor=Some):
-        //   (a) `trace_extra_reds=1` — emit `live_values=[frame, ec]`
-        //       matching descriptor reds. The legacy `extract_live_values`
-        //       shape relies on `descriptor=None`; flipping (a) alone
-        //       breaks dynasm nested_loop / fannkuch / nbody (live_values
-        //       consumers expect the expanded shape) and panics on
+        //   (a) `trace_extra_reds=1` (build_meta:3970) — emit
+        //       `live_values=[frame, ec]` matching descriptor reds. The
+        //       legacy `extract_live_values` shape relies on
+        //       `descriptor=None`; flipping (a) alone breaks dynasm
+        //       nested_loop / fannkuch / nbody (live_values consumers
+        //       expect the expanded shape) and panics on
         //       `live_values[index>1]` access without (b).
-        //   (b) `initialize_virtualizable` short-live_values gate: allow
-        //       the heap-read branch when `vable_ptr` is non-null.
-        //       Required to consume (a)'s reds-only live_values.
-        //   (c1) `pending_frontend_boxes.clone()`: the second
-        //        `compile_bridge` call needs the same stash as the
-        //        first; current `take()` empties on the first call and
-        //        the second hits `frontend_boxes.len()=0 vs
+        //   (b) `initialize_virtualizable` short-live_values gate
+        //       (pyjitpl/mod.rs:1744): allow the heap-read branch when
+        //       `vable_ptr` is non-null. Required to consume (a)'s
+        //       reds-only live_values.
+        //   (c1) `pending_frontend_boxes.clone()` (pyjitpl/mod.rs:7338):
+        //        the second `compile_bridge` call needs the same stash
+        //        as the first; current `take()` empties on the first
+        //        call and the second hits `frontend_boxes.len()=0 vs
         //        liveboxes.len()=N`.
         //   (c2) Bridge JUMP arity vs patched LABEL: source emits the
         //        live-window shape (`num_scalars + valuestackdepth`) but
@@ -4458,27 +4514,29 @@ impl JitState for PyreJitState {
         //        `locals_cells_stack_array_ref` is the correct shape.
         //   (d) **Vable heap-writeback infrastructure** — *blocking*. With
         //       (a)+(b)+(c1) applied, cranelift nested_loop dispatches
-        //       the bridge 5622+ times with identical inputs because the
-        //       patched parent reloads stale state from heap each
-        //       iteration; the bridge body has no `SetfieldGc` /
-        //       `SetarrayitemGc` to advance the heap. RPython's
-        //       OptVirtualize emits these via `force_at_end_of_preamble`;
-        //       pyre's `OptVirtualize::force_virtualizable` has the
-        //       SETFIELD_RAW emission machinery but is not wired to fire
-        //       at JUMP. The smallest-delta fix is a new
-        //       `gen_writeback_vable_to_heap` helper (modeled on
-        //       `trace_ctx.rs gen_store_back_in_vable` minus the
+        //       the bridge 5622+ times with identical inputs `[fr, ec,
+        //       500, 2507475000]` because the patched parent reloads
+        //       stale state from heap each iteration; the bridge body
+        //       has no `SetfieldGc`/`SetarrayitemGc` to advance the
+        //       heap. RPython's OptVirtualize emits these via its
+        //       `force_at_end_of_preamble` pass; pyre's
+        //       `OptVirtualize::force_virtualizable` (virtualize.rs:348)
+        //       has the SETFIELD_RAW emission machinery but is not
+        //       wired to fire at JUMP. The smallest-delta fix is a
+        //       new `gen_writeback_vable_to_heap` helper (modeled on
+        //       `trace_ctx.rs:1702 gen_store_back_in_vable` minus the
         //       force-virtualizable bookkeeping) invoked from
-        //       `close_loop_args_at`.
+        //       `close_loop_args_at`. Plan:
+        //       memory/task21_fix_implementation_plan.md.
         //   (e) Task #24 dynasm recursive CA frame contract — *blocking*
         //       for dynasm SIGSEGV at fib(24).
         //
-        // Until (d) lands, descriptor=Some alone (no (a)/(b)/(c1))
-        // measures as a ~10x perf cliff on cranelift nested_loop
-        // (5000x5000: 0.70s baseline → 6.35s under flip) but completes
-        // correctly. The bundle (a)+(b)+(c1) is what activates the
-        // ouroboros via the heap-writeback gap.
-        None
+        // Status (2026-04-28): (a)+(b)+(c1)+(c2) and Task #21 Slice 3
+        // (gen_writeback_vable_to_heap) have landed; descriptor is
+        // active. (e) Task #24 (dynasm recursive CA frame contract)
+        // remains as a separate open item driving fib_recursive on
+        // dynasm.
+        Some(Self::pypyjit_driver_descriptor())
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
@@ -4487,13 +4545,6 @@ impl JitState for PyreJitState {
         // the compiled code's preamble handles entry from any PC.
         // Shape checks (nlocals, namespace) ensure frame layout matches.
         self.local_count() == meta.num_locals && self.namespace_len() == meta.ns_len
-    }
-
-    fn update_meta_for_bridge(meta: &mut Self::Meta, fail_arg_types: &[Type]) {
-        meta.vable_update_vsd_from_len(
-            fail_arg_types.len(),
-            crate::virtualizable_gen::NUM_SCALAR_INPUTARGS,
-        );
     }
 
     fn setup_bridge_sym(
@@ -4588,6 +4639,7 @@ impl JitState for PyreJitState {
         };
 
         let nlocals = sym.nlocals;
+        let mut bridge_valuestackdepth = sym.valuestackdepth.max(nlocals);
         // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
         // items are declared Ref (W_Root array). Bridge resume slots stay
         // Ref at the virtualizable contract; any Int/Float unboxing must
@@ -4766,6 +4818,39 @@ impl JitState for PyreJitState {
         // the vable_array_base branch uses the heap-array path instead
         // of synthesizing parent OpRefs.
         sym.clear_active_vable();
+        // pypy/module/pypyjit/interp_jit.py:68 `reds = ['frame', 'ec']`:
+        // PyPy threads ec as a JIT red so it survives guard resume.
+        // pyre's macro flip lands the same shape (`extra_reds = { ec:
+        // Ref }`, `_meta.trace_extra_reds = 1` at state.rs:4967) and the
+        // root portal seeds `sym.execution_context = OpRef(1)` from the
+        // ec inputarg.
+        //
+        // Bridge resume in pyre rebuilds the MIFrame register banks from
+        // `frame0.values` via jitcode liveness (see the int/ref/float
+        // loops above): each value lands in `sym.registers_{i,r,f}` at
+        // its register-bank index, not at a fixed trace inputarg
+        // position.  ec is a TRACE inputarg, not a frame register, so it
+        // does not appear in any bank — there is no "ec slot" in
+        // `frame0.values` to read out.  Recovering ec from
+        // `frame0.values` would require either Box identity (so the
+        // optimizer's forwarding chain for the original OpRef(1) survives
+        // through to the bridge resume layout) or a side-table on the
+        // guard descr recording "ec lives at fail_arg[X]" — both touch
+        // the resume encoder and the optimizer across crates.
+        //
+        // Read ec from `PyFrame.execution_context` instead.  This is a
+        // pyre layout that PyPy does not have (PyPy fetches ec via
+        // `space.getexecutioncontext()` thread-local in
+        // `pyframe.py:282`); pyre stores it on the frame at frame entry
+        // (`pyre-interpreter/src/pyframe.rs:51`).  The load is
+        // semantically identical to RPython's resume-data ec recovery
+        // because ec is invariant during a `dispatch()` call and PyPy's
+        // and pyre's frame entries both seed it from the same source.
+        sym.execution_context = ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[sym.frame],
+            crate::descr::pyframe_execution_context_descr(),
+        );
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable
@@ -4848,48 +4933,16 @@ impl JitState for PyreJitState {
             &concrete_values,
             sym.concrete_vable_ptr as *const u8,
         );
-        // Bridge stack: the target loop header has stack_only=0, so no
-        // stack tail needs to be appended to registers_r.
-        sym.symbolic_stack_types = Vec::new();
-        // Phase 0.5 probe-C — `MAJIT_PROBE_BRIDGE` gated. Captures the
-        // hardcoded `sym.valuestackdepth = sym.nlocals` against the static
-        // depth the codewriter recorded for `frame0.pc` (the bridge entry
-        // PC) so we can verify the Phase 0.4 hypothesis: bridges resumed
-        // mid-stack hit `push_typed_value` with `flat_idx == boxes.len()`
-        // because this initialisation ignores `depth_at_py_pc[bridge_pc]`.
-        // No behaviour change — log only.
-        if std::env::var_os("MAJIT_PROBE_BRIDGE").is_some() {
-            let (depth_at_pc, stack_base_meta) = METAINTERP_SD.with(|r| {
-                let sd = r.borrow();
-                sd.jitcodes
-                    .get(frame0.jitcode_index as usize)
-                    .map(|jc| {
-                        let depth = jc
-                            .payload
-                            .metadata
-                            .depth_at_py_pc
-                            .get(frame0.pc as usize)
-                            .copied()
-                            .unwrap_or(u16::MAX);
-                        (depth, jc.payload.metadata.stack_base)
-                    })
-                    .unwrap_or((u16::MAX, usize::MAX))
-            });
-            eprintln!(
-                "[probe-C][setup_bridge_sym] jitcode_index={} bridge_pc={} \
-                 nlocals={} depth_at_py_pc={} stack_base_meta={} \
-                 bridge_array_len={} vable_boxes_len={:?} setting valuestackdepth={}",
-                frame0.jitcode_index,
-                frame0.pc,
-                sym.nlocals,
-                depth_at_pc,
-                stack_base_meta,
-                bridge_array_len,
-                ctx.virtualizable_boxes_len(),
-                sym.nlocals,
-            );
-        }
-        sym.valuestackdepth = sym.nlocals;
+        // resume.py:1042-1057 `rebuild_from_resumedata` parity: bridge
+        // tracing resumes from the full restored frame state via the
+        // vable scalar reads + consume_boxes — `valuestackdepth` is
+        // recovered from the heap (`bridge_valuestackdepth` derived
+        // from concrete `vable.valuestackdepth` at line 4347), not
+        // hardcoded to `nlocals`. Keep the stack tail in the unified
+        // register file and expose Ref-typed virtualizable slots to
+        // subsequent LOAD_FAST / close_loop_args_at calls.
+        sym.symbolic_stack_types = vec![Type::Ref; stack_only];
+        sym.valuestackdepth = bridge_valuestackdepth;
         sym.bridge_local_oprefs = Some(bridge_locals);
         sym.bridge_local_types = Some(bridge_local_types);
     }
@@ -4907,6 +4960,10 @@ impl JitState for PyreJitState {
     ) -> Option<majit_metainterp::ResumeDataResult> {
         use majit_ir::resumedata::rebuild_from_numbering;
 
+        // interp_jit.py:67-74 PyPyJitDriver portal reds are `[frame, ec]`;
+        // virtualizable boxes are appended later by
+        // MetaInterp::initialize_virtualizable(), not carried as reds.
+        _meta.trace_extra_reds = 1;
         let storage = storage?;
         let rd_numb = storage.rd_numb.as_slice();
         // resume.py:1071 `self.consts = storage.rd_consts` — borrow
@@ -4957,18 +5014,24 @@ impl JitState for PyreJitState {
     }
 
     fn update_meta_for_cut(meta: &mut Self::Meta, _header_pc: usize, original_box_types: &[Type]) {
-        // Update valuestackdepth from the merge point's box layout.
-        // Layout: [Ref(frame), Int(ni), Ref(code), Int(vsd), Ref(ns), locals..., stack...]
-        // PyreMeta.valuestackdepth is ABSOLUTE (nlocals + stack_items).
+        // Current pyre cut traces still recover only the expanded array-item
+        // count from the merge-point box vector. Preserve the provisional live
+        // depth and update just the heap-array capacity until the later
+        // red-only/virtualizable-box migration lands.
+        // `NUM_SCALAR_INPUTARGS` already counts `NUM_EXTRA_REDS` (frame +
+        // extra_reds + vable scalars), so do NOT add `trace_extra_reds`.
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let _ = meta.trace_extra_reds; // staging copy retained for activation gates only
         if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            let new_vsd = original_box_types.len() - NUM_SCALAR_INPUTARGS;
-            if new_vsd < meta.valuestackdepth && meta.slot_types.len() > new_vsd {
-                meta.slot_types.truncate(new_vsd);
-            } else if new_vsd > meta.valuestackdepth && meta.slot_types.len() < new_vsd {
-                meta.slot_types.resize(new_vsd, Type::Ref);
+            let new_capacity = original_box_types
+                .len()
+                .saturating_sub(NUM_SCALAR_INPUTARGS);
+            if meta.slot_types.len() > new_capacity {
+                meta.slot_types.truncate(new_capacity);
+            } else if meta.slot_types.len() < new_capacity {
+                meta.slot_types.resize(new_capacity, Type::Ref);
             }
-            meta.valuestackdepth = new_vsd;
+            meta.array_capacity = new_capacity;
         }
     }
 
@@ -4977,23 +5040,33 @@ impl JitState for PyreJitState {
         _header_pc: usize,
         original_box_types: &[Type],
     ) -> PyreMeta {
+        // `NUM_SCALAR_INPUTARGS` already counts `NUM_EXTRA_REDS` (frame +
+        // extra_reds + vable scalars), so do NOT add `trace_extra_reds`.
         use crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let _ = provisional.trace_extra_reds; // staging copy only
         // RPython parity: Python locals/stack are always Ref.
         let slot_types = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            vec![Type::Ref; original_box_types.len() - NUM_SCALAR_INPUTARGS]
+            vec![
+                Type::Ref;
+                original_box_types
+                    .len()
+                    .saturating_sub(NUM_SCALAR_INPUTARGS)
+            ]
         } else {
             Vec::new()
         };
-        let vsd = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
-            original_box_types.len() - NUM_SCALAR_INPUTARGS
+        let array_capacity = if original_box_types.len() >= NUM_SCALAR_INPUTARGS {
+            original_box_types
+                .len()
+                .saturating_sub(NUM_SCALAR_INPUTARGS)
         } else {
-            provisional.valuestackdepth
+            provisional.array_capacity
         };
         PyreMeta {
             num_locals: provisional.num_locals,
             ns_len: provisional.ns_len,
-            valuestackdepth: vsd,
-            array_capacity: provisional.array_capacity,
+            valuestackdepth: provisional.valuestackdepth,
+            array_capacity,
             trace_extra_reds: provisional.trace_extra_reds,
             has_virtualizable: provisional.has_virtualizable,
             slot_types,
@@ -5025,10 +5098,9 @@ impl JitState for PyreJitState {
     }
 
     fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
-        let Some(frame) = values.first() else {
+        let Some(_frame) = values.first() else {
             return;
         };
-        self.frame = value_to_usize(frame);
         if majit_metainterp::majit_log_enabled() {
             let arg0 = self.local_at(0).and_then(|value| {
                 if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
@@ -5041,59 +5113,11 @@ impl JitState for PyreJitState {
                 arg0, meta.valuestackdepth, meta.has_virtualizable, values
             );
         }
-        if values.len() == 1 {
-            return;
-        }
-
-        if meta.has_virtualizable {
-            // next_instr is already synced to the PyFrame heap by the
-            // compiled code's virtualizable sync before JUMP.
-            self.set_valuestackdepth(meta.valuestackdepth);
-            let nlocals = self.local_count();
-            let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
-            let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            for local_idx in 0..nlocals {
-                if let Some(value) = values.get(idx) {
-                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                    let _ =
-                        self.set_local_at(local_idx, boxed_slot_value_for_type(slot_type, value));
-                }
-                idx += 1;
-            }
-            for i in 0..stack_only {
-                if let Some(value) = values.get(idx) {
-                    let slot_type = meta
-                        .slot_types
-                        .get(nlocals + i)
-                        .copied()
-                        .unwrap_or(Type::Ref);
-                    let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, value));
-                }
-                idx += 1;
-            }
-        } else {
-            let nlocals = self.local_count();
-            let stack_only_depth = meta.valuestackdepth.saturating_sub(nlocals);
-            let mut idx = 1;
-            for local_idx in 0..nlocals {
-                let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                let _ = self.set_local_at(
-                    local_idx,
-                    boxed_slot_value_for_type(slot_type, &values[idx]),
-                );
-                idx += 1;
-            }
-            for i in 0..stack_only_depth {
-                let slot_type = meta
-                    .slot_types
-                    .get(nlocals + i)
-                    .copied()
-                    .unwrap_or(Type::Ref);
-                let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, &values[idx]));
-                idx += 1;
-            }
-            self.set_valuestackdepth(meta.valuestackdepth);
-        }
+        self.restore_expanded_virtualizable_values_with_extra_reds(
+            meta,
+            values,
+            meta.trace_extra_reds,
+        );
         if majit_metainterp::majit_log_enabled() {
             let arg0 = self.local_at(0).and_then(|value| {
                 if value.is_null() || !unsafe { pyre_object::pyobject::is_int(value) } {
@@ -6661,6 +6685,178 @@ mod tests {
     }
 
     #[test]
+    fn test_pypyjit_live_values_with_ec_insert_execution_context_after_frame() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        let code = compile_exec("x = 1").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut state = empty_state();
+        state.frame = frame_ptr;
+        let meta = state.build_meta(0, &PyreEnv);
+        let with_ec = state.extract_live_values(&meta);
+
+        assert_eq!(with_ec.len(), 2);
+        assert_eq!(with_ec[0], Value::Ref(majit_ir::GcRef(frame_ptr)));
+        assert_eq!(
+            with_ec[1],
+            Value::Ref(majit_ir::GcRef(frame.execution_context as usize))
+        );
+    }
+
+    #[test]
+    fn test_pypyjit_live_value_types_with_ec_match_descriptor_red_prefix() {
+        let meta = PyreMeta {
+            num_locals: 2,
+            ns_len: 0,
+            valuestackdepth: 3,
+            array_capacity: 4,
+            trace_extra_reds: 1,
+            has_virtualizable: true,
+            slot_types: vec![Type::Ref; 4],
+        };
+
+        let descriptor = PyreJitState::pypyjit_driver_descriptor();
+        let with_ec = <PyreJitState as JitState>::live_value_types(&empty_state(), &meta);
+
+        assert_eq!(
+            with_ec,
+            vec![descriptor.reds()[0].tp, descriptor.reds()[1].tp]
+        );
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_pypyjit_collect_jump_args_inserts_ec_after_frame() {
+        let mut ctx = TraceCtx::for_test(0);
+        let frame_ref = ctx.const_ref(0x1000);
+        let ec_ref = ctx.const_ref(0x7000);
+        let code_ref = ctx.const_ref(0x2000);
+        let namespace_ref = ctx.const_ref(0x3000);
+        let local0 = ctx.const_ref(0x4000);
+        let stack0 = ctx.const_ref(0x5000);
+        let stack1 = ctx.const_ref(0x6000);
+
+        let mut sym = PyreSym::new_uninit(frame_ref);
+        sym.nlocals = 1;
+        sym.valuestackdepth = 3;
+        sym.vable_last_instr = ctx.const_int(33);
+        sym.vable_pycode = code_ref;
+        sym.vable_valuestackdepth = ctx.const_int(3);
+        sym.vable_debugdata = ctx.const_ref(0);
+        sym.vable_lastblock = ctx.const_ref(0);
+        sym.vable_w_globals = namespace_ref;
+        sym.execution_context = ec_ref;
+        sym.registers_r = vec![local0, stack0, stack1];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
+
+        let base = sym.vable_collect_jump_args();
+        let with_ec = PyreJitState::pypyjit_collect_jump_args(&sym);
+        let typed_with_ec = PyreJitState::pypyjit_collect_typed_jump_args(&sym);
+
+        assert_eq!(with_ec.len(), base.len() + 1);
+        assert_eq!(with_ec[0], frame_ref);
+        assert_eq!(with_ec[1], ec_ref);
+        assert_eq!(&with_ec[2..], &base[1..]);
+        assert_eq!(typed_with_ec[0], (frame_ref, Type::Ref));
+        assert_eq!(typed_with_ec[1], (ec_ref, Type::Ref));
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_pypyjit_create_sym_shifts_virtualizable_indices_after_ec() {
+        let meta = PyreMeta {
+            num_locals: 2,
+            ns_len: 0,
+            valuestackdepth: 4,
+            array_capacity: 5,
+            trace_extra_reds: 1,
+            has_virtualizable: true,
+            slot_types: vec![Type::Ref; 5],
+        };
+
+        let sym = PyreJitState::pypyjit_create_sym(&meta, 0);
+
+        assert_eq!(sym.frame, OpRef(0));
+        assert_eq!(sym.execution_context, OpRef(1));
+        assert_eq!(sym.vable_last_instr, OpRef(2));
+        assert_eq!(sym.vable_pycode, OpRef(3));
+        assert_eq!(sym.vable_valuestackdepth, OpRef(4));
+        assert_eq!(sym.vable_debugdata, OpRef(5));
+        assert_eq!(sym.vable_lastblock, OpRef(6));
+        assert_eq!(sym.vable_w_globals, OpRef(7));
+        assert_eq!(sym.vable_array_base, Some(8));
+        assert_eq!(sym.symbolic_local_types.len(), 2);
+        assert_eq!(sym.symbolic_stack_types.len(), 2);
+    }
+
+    #[test]
+    fn test_restore_expanded_virtualizable_values_with_extra_reds_skips_ec_slot() {
+        use majit_ir::GcRef;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_interpreter::{ConstantData, compile_exec};
+
+        let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
+            .expect("test code should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .expect("test source should contain function code");
+
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            resume_pc: None,
+        };
+        state.set_next_instr(0);
+        state.set_valuestackdepth(4);
+        let meta = PyreMeta {
+            num_locals: 4,
+            ns_len: 0,
+            valuestackdepth: 4,
+            array_capacity: 4,
+            trace_extra_reds: 1,
+            has_virtualizable: true,
+            slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+        };
+        let values = vec![
+            Value::Ref(GcRef(frame_ptr)),                        // frame
+            Value::Ref(GcRef(frame.execution_context as usize)), // ec
+            Value::Int(8),                                       // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)),            // pycode
+            Value::Int(4),                                       // valuestackdepth
+            Value::Ref(GcRef(0)),                                // debugdata
+            Value::Ref(GcRef(0)),                                // lastblock
+            Value::Ref(GcRef(0)),                                // w_globals
+            Value::Ref(GcRef(w_int_new(1) as usize)),            // local a
+            Value::Ref(GcRef(w_int_new(2) as usize)),            // local b
+            Value::Ref(GcRef(w_int_new(3) as usize)),            // local c
+            Value::Int(7),                                       // local i
+        ];
+
+        state.restore_expanded_virtualizable_values_with_extra_reds(&meta, &values, 1);
+
+        assert_eq!(state.valuestackdepth(), 4);
+        let restored_i = state.local_at(3).expect("local i should be restored");
+        assert!(unsafe { is_int(restored_i) });
+        assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
+    }
+
+    #[test]
     #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
                 debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_guard_class_uses_guard_nonnull_class() {
@@ -6687,8 +6883,8 @@ mod tests {
             this.guard_class(ctx, obj, &INT_TYPE as *const PyType);
         });
 
-        let recorder = ctx.into_recorder();
-        let op = recorder.ops().last().expect("guard op should be present");
+        let tree_loop = ctx.into_tree_loop();
+        let op = tree_loop.ops.last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
         assert_eq!(op.args[0], obj);
     }
@@ -7094,6 +7290,114 @@ mod tests {
             ),
             Some(vec![full_len])
         );
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_restore_guard_failure_uses_runtime_value_kinds_for_virtualizable_locals() {
+        use majit_ir::GcRef;
+        use pyre_interpreter::pyframe::PyFrame;
+        use pyre_interpreter::{ConstantData, compile_exec};
+
+        let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
+            .expect("test code should compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .expect("test source should contain function code");
+
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            resume_pc: None,
+        };
+        state.set_next_instr(0);
+        state.set_valuestackdepth(4);
+        let meta = PyreMeta {
+            num_locals: 4,
+            ns_len: 0,
+            valuestackdepth: 4,
+            array_capacity: 4,
+            trace_extra_reds: 0,
+            has_virtualizable: true,
+            // Stale trace-entry types: all locals looked boxed refs when the
+            // trace started, but guard failure can still carry a raw int in
+            // slot `i`.
+            slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+        };
+        let values = vec![
+            Value::Ref(GcRef(frame_ptr)),             // frame
+            Value::Int(8),                            // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)), // pycode
+            Value::Int(4),                            // valuestackdepth
+            Value::Ref(GcRef(0)),                     // debugdata
+            Value::Ref(GcRef(0)),                     // lastblock
+            Value::Ref(GcRef(0)),                     // w_globals
+            Value::Ref(GcRef(w_int_new(1) as usize)), // local a
+            Value::Ref(GcRef(w_int_new(2) as usize)), // local b
+            Value::Ref(GcRef(w_int_new(3) as usize)), // local c
+            Value::Int(7),                            // local i
+        ];
+
+        assert!(<PyreJitState as JitState>::restore_guard_failure_values(
+            &mut state,
+            &meta,
+            &values,
+            &majit_metainterp::blackhole::ExceptionState::default(),
+        ));
+
+        assert_eq!(state.next_instr(), 9);
+        assert_eq!(state.valuestackdepth(), 4);
+        let restored_i = state.local_at(3).expect("local i should be restored");
+        assert!(unsafe { is_int(restored_i) });
+        assert_eq!(unsafe { w_int_get_value(restored_i) }, 7);
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_load_local_checked_value_respects_symbolic_local_type() {
+        let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
+            let mut ctx = TraceCtx::for_test(1);
+            let local = OpRef(0);
+            let mut sym = PyreSym::new_uninit(OpRef::NONE);
+            sym.registers_r = vec![local];
+            sym.symbolic_local_types = vec![symbolic_type];
+            sym.nlocals = 1;
+
+            let mut state = MIFrame {
+                ctx: &mut ctx,
+                sym: &mut sym,
+                fallthrough_pc: 0,
+                parent_frames: Vec::new(),
+                pending_result_stack_idx: None,
+                pending_inline_frame: None,
+                orgpc: 0,
+                concrete_frame_addr: 0,
+                pre_opcode_registers_r: None,
+            };
+
+            let loaded =
+                <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
+                    .expect("local should load");
+            assert_eq!(loaded.opref, local);
+
+            let tree_loop = ctx.into_tree_loop();
+            assert_eq!(tree_loop.ops.last().map(|op| op.opcode), expected_guard);
+        };
+
+        run_case(Type::Int, "j", None);
+        run_case(Type::Ref, "b", Some(OpCode::GuardNonnull));
     }
 
     #[test]
@@ -7583,6 +7887,271 @@ mod tests {
         assert_eq!(sym.registers_i.len(), 0);
         assert_eq!(sym.registers_f.len(), 0);
         assert_eq!(sym.registers_r.len(), 0);
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_setup_bridge_sym_preserves_resumed_stack_tail() {
+        use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+
+        let raw_code = compile_exec("len(x)").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(raw_code));
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let code_ref = frame.pycode as *const ();
+
+        let live_off = crate::state::intern_liveness(&[], &[0, 1, 2], &[])
+            .expect("bridge liveness must fit in the shared buffer");
+        let mut builder = JitCodeBuilder::new();
+        let patch = builder.live_placeholder();
+        builder.patch_live_offset(patch, live_off);
+        let runtime_jitcode = std::sync::Arc::new(builder.finish());
+        let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
+            runtime_jitcode,
+            crate::PyJitCodeMetadata {
+                pc_map: vec![0],
+                depth_at_py_pc: vec![2],
+                portal_frame_reg: 0,
+                portal_ec_reg: 0,
+                stack_base: 1,
+                stack_slot_color_map: Vec::new(),
+                pyre_color_for_semantic_local: Vec::new(),
+            },
+            std::ptr::null(),
+            code_ref,
+            false,
+            None,
+        ));
+        let jitcode_index = METAINTERP_SD.with(|r| unsafe {
+            let ptr = r.borrow_mut().jitcode_for(code_ref, Some(pyjit));
+            (*ptr).index
+        });
+
+        let input_types = [
+            Type::Ref, // frame
+            Type::Ref, // ec
+            Type::Int, // next_instr
+            Type::Ref, // pycode
+            Type::Int, // valuestackdepth
+            Type::Ref, // debugdata
+            Type::Ref, // lastblock
+            Type::Ref, // w_globals
+            Type::Ref, // local0
+            Type::Ref, // stack0
+            Type::Ref, // stack1
+        ];
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.frame = OpRef(0);
+        sym.execution_context = OpRef(1);
+        sym.nlocals = 1;
+        sym.valuestackdepth = 1;
+        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+
+        let local0 = w_int_new(41) as i64;
+        let stack0 = w_int_new(42) as i64;
+        let stack1 = w_int_new(43) as i64;
+        let globals = w_int_new(44) as i64;
+        let fail_values = [
+            frame_ptr as i64,
+            0,
+            77,
+            code_ref as i64,
+            3,
+            0,
+            0,
+            globals,
+            local0,
+            stack0,
+            stack1,
+        ];
+        let fail_types = [
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+        ];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: vec![RebuiltFrame {
+                jitcode_index,
+                pc: 0,
+                values: vec![
+                    RebuiltValue::Box(8, Type::Ref),
+                    RebuiltValue::Box(9, Type::Ref),
+                    RebuiltValue::Box(10, Type::Ref),
+                ],
+            }],
+            virtualizable_values: vec![
+                RebuiltValue::Box(0, Type::Ref),
+                RebuiltValue::Box(2, Type::Int),
+                RebuiltValue::Box(3, Type::Ref),
+                RebuiltValue::Box(4, Type::Int),
+                RebuiltValue::Box(5, Type::Ref),
+                RebuiltValue::Box(6, Type::Ref),
+                RebuiltValue::Box(7, Type::Ref),
+                RebuiltValue::Box(8, Type::Ref),
+                RebuiltValue::Box(9, Type::Ref),
+                RebuiltValue::Box(10, Type::Ref),
+            ],
+            virtualref_values: Vec::new(),
+            storage: None,
+            num_failargs: fail_values.len() as i32,
+        };
+
+        <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+        );
+
+        assert_eq!(sym.valuestackdepth, 3);
+        assert_eq!(sym.registers_r, vec![OpRef(8), OpRef(9), OpRef(10)]);
+        assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
+        assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
+        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef(8)]));
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_close_loop_args_preserves_ec_between_frame_and_virtualizable_header() {
+        ensure_test_callbacks();
+        let input_types = [
+            Type::Ref, // frame
+            Type::Ref, // ec
+            Type::Int, // next_instr
+            Type::Ref, // pycode
+            Type::Int, // valuestackdepth
+            Type::Ref, // debugdata
+            Type::Ref, // lastblock
+            Type::Ref, // w_globals
+            Type::Ref, // local0
+            Type::Ref, // stack0
+            Type::Ref, // stack1
+        ];
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.execution_context = OpRef(1);
+        sym.nlocals = 1;
+        sym.valuestackdepth = 3;
+        sym.vable_last_instr = OpRef(2);
+        sym.vable_pycode = OpRef(3);
+        sym.vable_valuestackdepth = OpRef(4);
+        sym.vable_debugdata = OpRef(5);
+        sym.vable_lastblock = OpRef(6);
+        sym.vable_w_globals = OpRef(7);
+        sym.registers_r = vec![OpRef(8), OpRef(9), OpRef(10)];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
+        sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+
+        assert_eq!(jump_args.len(), 11);
+        assert_eq!(jump_args[0], OpRef(0));
+        assert_eq!(jump_args[1], OpRef(1));
+        assert_eq!(&jump_args[8..], &[OpRef(8), OpRef(9), OpRef(10)]);
+        assert_eq!(state.sym().execution_context, OpRef(1));
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_close_loop_args_uses_full_root_virtualizable_array_capacity() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+        let code = compile_exec("len(x)").expect("test code should compile");
+        let mut frame = Box::new(PyFrame::new(code));
+        frame.locals_w_mut()[0] = w_int_new(41);
+        frame.locals_w_mut()[1] = w_int_new(7);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let array_len =
+            concrete_frame_array_len(frame_ptr).expect("frame should expose locals_cells_stack_w");
+        assert!(
+            array_len >= 2,
+            "test frame must have stack capacity beyond nlocals"
+        );
+
+        let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        let mut input_types = vec![
+            Type::Ref, // frame
+            Type::Int, // next_instr
+            Type::Ref, // pycode
+            Type::Int, // valuestackdepth
+            Type::Ref, // debugdata
+            Type::Ref, // lastblock
+            Type::Ref, // w_globals
+        ];
+        input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.nlocals = 1;
+        sym.valuestackdepth = 1;
+        sym.vable_last_instr = OpRef(1);
+        sym.vable_pycode = OpRef(2);
+        sym.vable_valuestackdepth = OpRef(3);
+        sym.vable_debugdata = OpRef(4);
+        sym.vable_lastblock = OpRef(5);
+        sym.vable_w_globals = OpRef(6);
+        sym.registers_r = vec![OpRef(7)];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.symbolic_stack_types = Vec::new();
+        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: frame_ptr,
+            pre_opcode_registers_r: None,
+        };
+
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
+
+        assert_eq!(
+            jump_args.len(),
+            n + array_len,
+            "root close_loop_args must carry full virtualizable array capacity"
+        );
+        assert!(
+            jump_args[n..].iter().all(|arg| !arg.is_none()),
+            "full-capacity root jump args must materialize missing stack slots"
+        );
     }
 }
 

@@ -1063,6 +1063,26 @@ impl Assembler386 {
         );
     }
 
+    /// RPython `AbstractCallBuilder.emit`: CALL_ASSEMBLER is a collecting
+    /// call, so the caller jitframe must publish the regalloc gcmap before
+    /// entering the callee/helper and clear it only after reloading a possibly
+    /// moved frame pointer.
+    fn push_pending_call_gcmap(&mut self) -> bool {
+        if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+            self.push_gcmap(gcmap as *mut usize);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn pop_pending_call_gcmap_after_collect(&mut self, pushed: bool) {
+        self.reload_frame_if_necessary();
+        if pushed {
+            self.pop_gcmap();
+        }
+    }
+
     /// assembler.py:405-412 _reload_frame_if_necessary parity:
     /// after a helper or collecting call, follow jf_forward so rbp/x29
     /// points at the current jitframe location.
@@ -2302,6 +2322,7 @@ impl Assembler386 {
                     ; call rax
                 );
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                self.reload_frame_if_necessary();
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
                 }
@@ -4780,6 +4801,147 @@ impl Assembler386 {
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
         let call_descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
         let expansion = call_descr.and_then(|d| d.vable_expansion());
+        if expansion.is_none() {
+            let frame_loc = arglocs
+                .first()
+                .copied()
+                .expect("call_assembler missing rewritten jitframe arg");
+            let vable_loc = arglocs.get(1).copied();
+            dynasm!(self.mc ; .arch x64
+                ; mov r12, rbp
+            );
+            self.emit_load_to_rax(frame_loc);
+            dynasm!(self.mc ; .arch x64
+                ; mov rdx, rax
+            );
+
+            let target_addr: Option<usize> = op
+                .descr
+                .as_ref()
+                .and_then(|d| d.as_call_descr())
+                .and_then(|cd| cd.call_target_token())
+                .and_then(|token| self.call_assembler_targets.get(&token).copied())
+                .filter(|&addr| addr != 0);
+            let is_resolved = target_addr.is_some() || self.self_entry_label.is_some();
+            let result_type = op.opcode.result_type();
+            let done_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
+            let helper_addr = crate::call_assembler_helper_addr() as i64;
+            let green_key = self.header_pc as i64;
+
+            if !is_resolved {
+                let force_addr = crate::call_assembler_force_fn_addr() as i64;
+                dynasm!(self.mc ; .arch x64
+                    ; mov rbp, r12
+                );
+                if force_addr != 0 {
+                    if let Some(vloc) = vable_loc {
+                        self.emit_load_to_rax(vloc);
+                        dynasm!(self.mc ; .arch x64
+                            ; mov rdi, rax
+                        );
+                    } else {
+                        dynasm!(self.mc ; .arch x64
+                            ; mov rdi, [rdx + FIRST_ITEM_OFFSET as i32]
+                        );
+                    }
+                    let pushed_gcmap = self.push_pending_call_gcmap();
+                    dynasm!(self.mc ; .arch x64
+                        ; sub rsp, 8
+                        ; mov rax, QWORD force_addr
+                        ; call rax
+                        ; add rsp, 8
+                    );
+                    self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+                } else {
+                    dynasm!(self.mc ; .arch x64
+                        ; xor eax, eax
+                    );
+                }
+                if !op.pos.is_none() {
+                    self.store_rax_to_result(op.pos);
+                }
+                return;
+            }
+
+            let trampoline_addr = crate::call_assembler_execute_addr() as i64;
+            let pushed_gcmap = self.push_pending_call_gcmap();
+            dynasm!(self.mc ; .arch x64
+                ; mov rdi, rdx
+                ; sub rsp, 8
+            );
+            if let Some(addr) = target_addr {
+                let addr = addr as i64;
+                dynasm!(self.mc ; .arch x64
+                    ; mov rsi, QWORD addr
+                    ; mov rax, QWORD trampoline_addr
+                    ; call rax
+                );
+            } else if self.self_entry_label.is_some() {
+                let addr_ptr = self.self_entry_addr_ptr as i64;
+                dynasm!(self.mc ; .arch x64
+                    ; mov rsi, QWORD addr_ptr
+                    ; mov rsi, [rsi]
+                    ; mov rax, QWORD trampoline_addr
+                    ; call rax
+                );
+            }
+            dynasm!(self.mc ; .arch x64
+                ; add rsp, 8
+                ; mov rbp, r12
+            );
+            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+            dynasm!(self.mc ; .arch x64
+                ; mov rdx, rax
+            );
+
+            let fast_path = self.mc.new_dynamic_label();
+            let merge = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; .arch x64
+                ; mov rcx, [rdx + JF_DESCR_OFS]
+                ; mov rax, QWORD done_descr_ptr
+                ; cmp rcx, rax
+                ; je =>fast_path
+            );
+            // `compile.py:665` parity: helper signature is
+            // `(cpu_handle, callee_jf_ptr, green_key)`. Pass cpu_ptr as
+            // arg0 (rdi) so the trampoline can resolve the attached
+            // `done_with_this_frame_descr_*` /
+            // `exit_frame_with_exception_descr_ref` identities.
+            let cpu_ptr = self.cpu_handle_ptr();
+            dynasm!(self.mc ; .arch x64
+                ; mov rdi, QWORD cpu_ptr            // arg0 = cpu_handle
+                ; mov rsi, rdx                      // arg1 = callee_jf_ptr
+                ; mov rdx, QWORD green_key as i64   // arg2 = green_key
+                ; sub rsp, 8
+                ; mov rax, QWORD helper_addr
+            );
+            let pushed_gcmap = self.push_pending_call_gcmap();
+            dynasm!(self.mc ; .arch x64
+                ; call rax
+                ; add rsp, 8
+            );
+            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
+            dynasm!(self.mc ; .arch x64
+                ; jmp =>merge
+                ; =>fast_path
+            );
+            if result_type == Type::Float {
+                dynasm!(self.mc ; .arch x64
+                    ; movsd xmm0, [rdx + FIRST_ITEM_OFFSET as i32]
+                    ; movq rax, xmm0
+                    ; =>merge
+                );
+            } else {
+                dynasm!(self.mc ; .arch x64
+                    ; mov rax, [rdx + FIRST_ITEM_OFFSET as i32]
+                    ; =>merge
+                );
+            }
+            if !op.pos.is_none() {
+                self.store_rax_to_result(op.pos);
+            }
+            return;
+        }
 
         let num_args = op.args.len();
         let num_expanded_items = expansion

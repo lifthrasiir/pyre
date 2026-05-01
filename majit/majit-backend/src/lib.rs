@@ -953,7 +953,17 @@ pub struct JitCellToken {
     /// Set by MetaInterp before compile_loop. Used by the backend's
     /// bridge threshold callback to find the compiled loop metadata.
     pub green_key: u64,
-    /// Types of the input arguments.
+    /// Types of the input arguments, recorded at compile_loop time from
+    /// the finalised inputargs. RPython does not carry this list on
+    /// `JitCellToken` itself — there, backend code recovers types by
+    /// re-walking the LABEL op (`history.py:501 TreeLoop.inputargs` /
+    /// `regalloc.py:861-871 _set_initial_bindings`). pyre's external-jump
+    /// and bridge-link paths (`compiler.rs:2362/2468/2720/3998/4027`,
+    /// `runner.rs:1281`) touch the target token without access to the
+    /// trace ops, so this field caches the typed signature for them.
+    /// Front-end (tracer) code MUST NOT read this; use
+    /// `MetaInterp::front_target_inputarg_types` instead, which derives
+    /// types from the LABEL op + `TreeLoop.inputargs` per RPython.
     pub inputarg_types: Vec<Type>,
     /// virtualizable.py:86 read_boxes: number of scalar inputargs
     /// (frame + static fields). First local is at this index.

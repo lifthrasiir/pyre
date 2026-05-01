@@ -2482,18 +2482,8 @@ impl GcRewriterImpl {
     ///   3. store each arg at _ll_initial_locs[i] offset
     ///   4. replace multi-arg CALL_ASSEMBLER with single-arg [frame]
     ///
-    /// Currently uncalled — the dispatch arm at the CALL_ASSEMBLER opcodes
-    /// goes through the generic `rewrite_op` path because both backends
-    /// do `vable_expansion` + JitFrame init at the BACKEND level
-    /// (cranelift `compiler.rs:8138` TODO), expecting the multi-arg
-    /// CALL_ASSEMBLER shape.  Wiring this function (RPython
-    /// `rewrite.py:413-416` parity) requires migrating `vable_expansion`
-    /// from backend to tracer (so op.args carries the expanded slot
-    /// values) AND rewriting both backend arms to consume the
-    /// post-rewriter `[frame]` / `[frame, vable]` shape.  Tracked as a
-    /// multi-session port; this function stays alive as the canonical
-    /// landing target.
-    #[allow(dead_code)]
+    /// Dispatched from the `CallAssembler{I,R,F,N}` arm of `rewrite_loop`
+    /// (rewrite.py:413-416 parity).
     fn handle_call_assembler(&self, op: &Op, st: &mut RewriteState) {
         let descrs = self.jitframe_info.as_ref().unwrap();
         let lookup = self.call_assembler_callee_locs.as_ref().unwrap();
@@ -2800,21 +2790,12 @@ impl GcRewriter for GcRewriterImpl {
                 }
 
                 // ── call_assembler: rewrite.py:414 handle_call_assembler ──
-                // Convergence path: replace the generic rewrite_op fallback
-                // with `self.handle_call_assembler(op, &mut st)` once both
-                // backends consume the post-rewriter `[frame]` shape and
-                // `vable_expansion` has been migrated from backend to tracer
-                // (tracked in handle_call_assembler's doc comment).
                 OpCode::CallAssemblerI
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    // rewrite.py:379-380 can_malloc → emitting_an_operation_that_can_collect.
-                    // That helper itself calls emit_pending_zeros (rewrite.py:707), so do not
-                    // call it twice.
-                    st.emitting_an_operation_that_can_collect();
-                    let rewritten = st.rewrite_op(op);
-                    st.emit_rewritten_from(op, rewritten);
+                    self.handle_call_assembler(op, &mut st);
+                    continue;
                 }
 
                 // ── Operations that can trigger GC ──

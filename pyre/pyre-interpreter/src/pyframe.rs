@@ -108,7 +108,16 @@ pub struct PyFrame {
     /// multiple inline-handled CALL results on the same caller frame before
     /// the interpreter replays the first CALL opcode, so this must preserve
     /// ordering instead of using a single overwrite-prone slot.
-    pub pending_inline_results: VecDeque<PendingInlineResult>,
+    ///
+    /// `Option<Box<VecDeque<...>>>` rather than `VecDeque<...>` directly so
+    /// the all-zero bit pattern is a valid initial state (`None` =
+    /// 8-byte NULL pointer). `VecDeque`'s inline `RawVec::dangling()`
+    /// stores an alignment-shaped pointer, NOT zero — making zero-init UB
+    /// the moment any `push_back`/`pop_front`/`clear` runs. Phase 2.3
+    /// 옵션 B prep: a future `NewWithVtable(PyFrame)` in trace IR would
+    /// hand back zeroed nursery memory, so this field had to be made
+    /// zero-init safe before that lands.
+    pub pending_inline_results: Option<Box<VecDeque<PendingInlineResult>>>,
     /// Outermost inline trace-through resumed this frame past the CALL at the
     /// recorded pc.
     ///
@@ -118,6 +127,19 @@ pub struct PyFrame {
     /// unrelated next_instr changes.
     pub pending_inline_resume_pc: Option<usize>,
 }
+
+/// GC type id for `PyFrame`. Reserved ahead of any callsite that allocates
+/// frames through `NewWithVtable` / `New` in trace IR — the GC consults
+/// the registered `TypeInfo` to write the type tag into the header. Today
+/// every `PyFrame` is heap-allocated outside the nursery (`std::alloc`
+/// + a leaked `Box`) and roots are visited by the custom walker
+/// (`pyre-interpreter::eval::walk_pyframe_roots`); this id is therefore
+/// metadata-only at registration time. Phase 2.3 옵션 B's
+/// `emit_new_pyframe_inline_self_recursive` will be the first writer.
+///
+/// Asserts the same id is returned by `gc.register_type(...)` so any
+/// drift panics on startup.
+pub const PYFRAME_GC_TYPE_ID: u32 = 37;
 
 /// GC header size in bytes.  Matches `majit_gc::header::GcHeader::SIZE`.
 /// Every PyObjectArray and PyFrame allocation prepends this many zero bytes
@@ -447,6 +469,21 @@ pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastbl
 /// Byte offset of `w_globals` in `PyFrame`.
 pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
+/// Byte offset of `f_generator_nowref` in `PyFrame`.
+/// `PyObjectRef` slot — points into the GC heap (possibly nursery).
+pub const PYFRAME_F_GENERATOR_NOWREF_OFFSET: usize =
+    std::mem::offset_of!(PyFrame, f_generator_nowref);
+
+/// Byte offset of `w_yielding_from` in `PyFrame`.
+/// `PyObjectRef` slot — points into the GC heap (possibly nursery).
+pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, w_yielding_from);
+
+/// Byte offset of `f_backref` in `PyFrame`.
+/// `*mut PyFrame` — once `NewWithVtable(PyFrame)` lands in trace IR,
+/// chained recursive callees may have a nursery-allocated parent frame
+/// reachable through this pointer.
+pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
+
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
@@ -588,7 +625,9 @@ impl PyFrame {
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
             self.getorcreate_debug_data(-1).w_globals = w_globals;
         }
-        self.pending_inline_results.clear();
+        if let Some(buf) = self.pending_inline_results.as_mut() {
+            buf.clear();
+        }
         self.pending_inline_resume_pc = None;
         self.initialize_frame_scopes(outer_func, code);
     }
@@ -731,7 +770,7 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            pending_inline_results: std::collections::VecDeque::new(),
+            pending_inline_results: None,
             pending_inline_resume_pc: None,
         };
         if stores_global {
@@ -800,7 +839,7 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            pending_inline_results: VecDeque::new(),
+            pending_inline_results: None,
             pending_inline_resume_pc: None,
         };
         if stores_global {
@@ -1634,7 +1673,7 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            pending_inline_results: VecDeque::new(),
+            pending_inline_results: None,
             pending_inline_resume_pc: None,
         };
         frame.init_cells();

@@ -154,6 +154,38 @@ pub struct CraneliftFailDescr {
     pub bridge: UnsafeCell<Option<BridgeData>>,
     /// Atomic cache of bridge code_ptr for lock-free dispatch.
     pub bridge_code_ptr_cache: std::sync::atomic::AtomicUsize,
+    /// Frame slot count required by the attached bridge's prologue. Set
+    /// at `attach_bridge` time from `BridgeData::{max_output_slots,
+    /// num_inputs, num_ref_roots}`.
+    ///
+    /// When a guard fires, the parent's already-allocated JITFrame may
+    /// have fewer slots than the bridge needs (the parent was sized at
+    /// allocation time using the CompiledLoopToken's then-current
+    /// `frame_info.jfi_frame_depth`, before this bridge bumped it via
+    /// `compiler.rs:13144 update_frame_depth`).  RPython recovers by
+    /// running `_frame_realloc_slowpath` (`aarch64/assembler.py:434-493`
+    /// → `llmodel.py:127-154 realloc_frame`) which allocates a deeper
+    /// JITFrame, copies the old slots, sets `jf_forward`, and continues
+    /// into the bridge with the new pointer.  pyre's
+    /// `majit-backend/src/jitframe.rs:realloc_frame` ports the helper,
+    /// but two pieces are missing for cranelift to call it inline:
+    ///   1. cranelift's `run_compiled_code_inner` allocates each JITFrame
+    ///      without setting `jf_frame_info`, so `realloc_frame`'s
+    ///      `(*old_jf).jf_frame_info` would null-deref;
+    ///   2. there is no `cranelift_realloc_jitframe_slowpath` shim
+    ///      analogous to dynasm's runtime helper, and
+    ///      `emit_attached_bridge_dispatch` cannot call one without
+    ///      adding a CFG join.
+    /// Until both are wired, `emit_attached_bridge_dispatch` gates
+    /// dispatch on `frame_len >= required_frame_len` and falls through
+    /// to the deadframe exit when the parent frame is too small.  The
+    /// fallback is functionally correct: the deadframe returns to the
+    /// interpreter, which re-enters via the green key, allocating a
+    /// fresh JITFrame sized from the CLT's now-updated `frame_info`,
+    /// and dispatching the bridge cleanly.  Same end-state as RPython,
+    /// one extra interpreter round-trip on the guard fire that first
+    /// triggers it.
+    pub bridge_frame_depth_cache: std::sync::atomic::AtomicUsize,
     /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
     /// Populated at compile time from the frontend's `StoredExitLayout` so
     /// `compiled_exit_layout_from_backend` can reconstruct the blackhole
@@ -284,6 +316,7 @@ impl CraneliftFailDescr {
             vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
+            bridge_frame_depth_cache: std::sync::atomic::AtomicUsize::new(0),
             rd_numb: None,
             rd_consts: None,
             rd_virtuals: None,
@@ -326,6 +359,7 @@ impl CraneliftFailDescr {
             vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
+            bridge_frame_depth_cache: std::sync::atomic::AtomicUsize::new(0),
             rd_numb: None,
             rd_consts: None,
             rd_virtuals: None,
@@ -390,7 +424,14 @@ impl CraneliftFailDescr {
     /// Attach a compiled bridge to this guard.
     pub fn attach_bridge(&self, bridge: BridgeData) {
         let code_ptr = bridge.code_ptr as usize;
+        let frame_depth = bridge
+            .max_output_slots
+            .max(bridge.num_inputs)
+            .max(1)
+            .saturating_add(bridge.num_ref_roots);
         unsafe { *self.bridge.get() = Some(bridge) };
+        self.bridge_frame_depth_cache
+            .store(frame_depth, std::sync::atomic::Ordering::Release);
         self.bridge_code_ptr_cache
             .store(code_ptr, std::sync::atomic::Ordering::Release);
     }
@@ -450,6 +491,8 @@ impl CraneliftFailDescr {
         let bridge = unsafe { &mut *self.bridge.get() }.take();
         if bridge.is_some() {
             self.bridge_code_ptr_cache
+                .store(0, std::sync::atomic::Ordering::Release);
+            self.bridge_frame_depth_cache
                 .store(0, std::sync::atomic::Ordering::Release);
         }
         bridge

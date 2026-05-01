@@ -1266,6 +1266,13 @@ impl Optimizer {
     /// Flush all passes' postponed state.
     pub fn flush(&mut self, ctx: &mut OptContext) {
         for pass_idx in 0..self.passes.len() {
+            // heap.flush() resolves the "next_optimization" emit_extra
+            // target through `ctx.current_pass_idx`. Set it to the
+            // currently-flushing pass so any ops force_all_lazy_sets
+            // emits land at `(pass_idx + 1, op)` and skip the flushing
+            // pass on the subsequent drain — RPython parity with
+            // `self.next_optimization`.
+            ctx.current_pass_idx = pass_idx;
             let pass = &mut self.passes[pass_idx];
             pass.flush(ctx);
             // RPython Optimization.emit_extra() routes newly forced ops to

@@ -111,7 +111,6 @@ pub fn set_jitframe_gc_type_id(id: u32) {
     JITFRAME_GC_TYPE_ID.store(id, Ordering::Release);
 }
 
-#[allow(dead_code)]
 pub(crate) fn jitframe_gc_type_id() -> Option<u32> {
     match JITFRAME_GC_TYPE_ID.load(Ordering::Acquire) {
         u32::MAX => None,
@@ -132,7 +131,6 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 }
 
 /// Return the base pointer passed to compiled entrypoints as x1.
-#[allow(dead_code)]
 pub(crate) fn jit_threadlocalref_base() -> *const i64 {
     JIT_THREADLOCAL_SLOTS.with(|slots| {
         let slots = slots.borrow();
@@ -317,13 +315,17 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 /// Output: the int interpretation of the handled result (the caller
 ///         re-casts to the portal's return type).
 ///
-/// Always frees the callee jitframe before returning.
+/// The callee jitframe is GC-managed by the rewriter's
+/// `handle_call_assembler` path, so the helper must not free it here.
 pub extern "C" fn call_assembler_helper_trampoline(
     cpu_handle: *const std::sync::RwLock<guard::CpuDescrAttachments>,
     callee_jf_ptr: *mut jitframe::JitFrame,
     green_key: u64,
 ) -> i64 {
     if callee_jf_ptr.is_null() {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[dynasm][ca-helper] null callee_jf_ptr green_key={green_key}");
+        }
         return 0;
     }
     let frame_ptr = callee_jf_ptr;
@@ -348,9 +350,12 @@ pub extern "C" fn call_assembler_helper_trampoline(
         unsafe { (*cpu_handle).read().unwrap().descr_ptrs() }
     };
     // warmspot.py:1023-1028 `fail_descr.handle_fail(deadframe, ...)`.
-    let result = handle_fail_dispatch(&attached, descr_raw, frame_ptr, green_key);
-    unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
-    result
+    // Callee jitframe is GC-managed by the rewriter's
+    // `handle_call_assembler` path (rewrite.py:665 `gen_malloc_frame`),
+    // so this helper must not free it here — upstream
+    // `assembler_call_helper` (warmspot.py:1022-1028) likewise does not
+    // free `deadframe`.
+    handle_fail_dispatch(&attached, descr_raw, frame_ptr, green_key)
 }
 
 /// Dispatch to the `handle_fail` variant that matches `descr_raw`.
@@ -568,8 +573,18 @@ fn handle_fail_resume_guard(
             raw_values.as_ptr(),
             raw_values.len(),
         ) {
+            if std::env::var_os("MAJIT_LOG").is_some() {
+                eprintln!(
+                    "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} result=0x{bh_result:x}"
+                );
+            }
             return bh_result;
         }
+    }
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!(
+            "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p}"
+        );
     }
     // `assert 0, "unreachable"` upstream — pyre returns 0 when neither
     // hook is registered (e.g. bare-backend tests exercise the helper
@@ -599,9 +614,30 @@ pub extern "C" fn call_assembler_execute_trampoline(
     jf_ptr: *mut jitframe::JitFrame,
     callee_addr: usize,
 ) -> *mut jitframe::JitFrame {
+    if std::env::var_os("MAJIT_LOG").is_some() && !jf_ptr.is_null() {
+        let input0_ofs =
+            jitframe::FIRST_ITEM_OFFSET + crate::arch::JITFRAME_FIXED_SIZE * jitframe::SIZEOFSIGNED;
+        let input1_ofs = input0_ofs + jitframe::SIZEOFSIGNED;
+        let frame_len = unsafe {
+            *((jf_ptr as *const u8).add(jitframe::JF_FRAME_OFS + jitframe::LENGTHOFS)
+                as *const isize)
+        };
+        let frame_info = unsafe {
+            *((jf_ptr as *const u8).add(jitframe::JF_FRAME_INFO_OFS as usize) as *const usize)
+        };
+        let input0 = unsafe { *((jf_ptr as *const u8).add(input0_ofs) as *const usize) };
+        let input1 = unsafe { *((jf_ptr as *const u8).add(input1_ofs) as *const usize) };
+        eprintln!(
+            "[dynasm][ca-exec] enter jf={jf_ptr:p} callee=0x{callee_addr:x} len={frame_len} frame_info=0x{frame_info:x} input0=0x{input0:x} input1=0x{input1:x}"
+        );
+    }
     let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
         unsafe { std::mem::transmute(callee_addr) };
-    unsafe { func(jf_ptr) }
+    let result = unsafe { func(jf_ptr) };
+    if std::env::var_os("MAJIT_LOG").is_some() {
+        eprintln!("[dynasm][ca-exec] leave jf={result:p}");
+    }
+    result
 }
 
 /// Return the address of the execute trampoline.
