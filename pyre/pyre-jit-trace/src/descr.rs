@@ -613,6 +613,52 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+/// `W_MethodObject` field layout — `w_function`, `w_self`, `w_class` per
+/// `methodobject.rs:9-15`. All three are Ref slots; the JIT only consumes
+/// `w_function` (for guarding which method) and `w_self` (for recovering
+/// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
+/// for layout completeness so the descrs match the struct order.
+static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::methodobject::{
+        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET,
+        W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
+    };
+    build_object_descr_group(
+        W_METHOD_OBJECT_SIZE,
+        W_METHOD_GC_TYPE_ID,
+        &pyre_object::methodobject::METHOD_TYPE as *const _ as usize,
+        &[
+            (
+                "W_MethodObject.w_function",
+                METHOD_W_FUNCTION_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_MethodObject.w_self",
+                METHOD_W_SELF_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_MethodObject.w_class",
+                METHOD_W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+    )
+});
+
 static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // Upstream `rpython/rtyper/lltypesystem/rlist.py:116`
     //     GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))
@@ -1175,6 +1221,23 @@ pub fn range_iter_step_descr() -> DescrRef {
 /// rlist.py:116 `l.length` — live length of a list under the Object
 /// strategy. Under Integer/Float strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.
+/// `W_MethodObject.w_function` — the underlying function (W_FunctionObject
+/// or W_BuiltinFunction) bound by `getattr(obj, name)`. Mutable in storage
+/// (the field is a Ref slot the GC traces) but the value the JIT observes is
+/// stable across calls to the same bound method. Used by the
+/// bound-method specialization in `call_callable_value`.
+pub fn method_w_function_descr() -> DescrRef {
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
+}
+
+/// `W_MethodObject.w_self` — the receiver object. The bound-method
+/// specialization extracts this via `GetfieldGcR` to recover the receiver
+/// `OpRef` after `LOAD_METHOD` discarded it (load_method.rs:6334 pushes
+/// `null_value` for `is_method` attrs).
+pub fn method_w_self_descr() -> DescrRef {
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 1)
+}
+
 pub fn list_length_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 0)
 }

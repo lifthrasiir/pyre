@@ -182,6 +182,7 @@ use pyre_interpreter::{
 
 use pyre_object::PyObjectRef;
 use pyre_object::listobject::w_list_getitem;
+use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
     FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list, is_tuple,
 };
@@ -4674,6 +4675,46 @@ impl MIFrame {
                 "concrete_callable should always be available during tracing"
             );
             return self.trace_call_callable(callable, args);
+        }
+
+        // `lst.append(item)` flow: `baseobjspace::getattr` returns a fresh
+        // `W_MethodObject` per iteration, so the receiver is pushed by
+        // `load_method` as `null_value` (load_method:6334) and call sees
+        // `concrete_callable = W_MethodObject`, `args = [item]`. Recover the
+        // receiver via `GetfieldGcR(callable, w_self)` after guarding the
+        // method object's class. The function pointer inside the method
+        // object IS stable across iterations, so the optimizer can fold the
+        // method-object's getfield_gc reads against a guard_value on the
+        // function slot instead of paying for the generic
+        // `jit_call_callable_1` dispatcher.
+        if unsafe { is_method(concrete_callable) } {
+            let inner_func = unsafe { w_method_get_func(concrete_callable) };
+            let inner_self = unsafe { w_method_get_self(concrete_callable) };
+            if !inner_func.is_null()
+                && !inner_self.is_null()
+                && unsafe { is_function(inner_func) }
+            {
+                let func_name = unsafe { pyre_interpreter::function_get_name(inner_func) };
+                if args.len() == 1 && func_name == "append" && unsafe { is_list(inner_self) } {
+                    let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
+                    let self_ref = self.with_ctx(|this, ctx| {
+                        this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
+                        let func_ref = ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldGcR,
+                            &[callable],
+                            crate::descr::method_w_function_descr(),
+                        );
+                        this.implement_guard_value(ctx, func_ref, inner_func as i64);
+                        ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldGcR,
+                            &[callable],
+                            crate::descr::method_w_self_descr(),
+                        )
+                    });
+                    self.list_append_value(self_ref, args[0], inner_self, c_arg)?;
+                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                }
+            }
         }
 
         unsafe {
