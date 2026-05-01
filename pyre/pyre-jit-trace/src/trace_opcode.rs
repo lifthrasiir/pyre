@@ -4776,7 +4776,7 @@ impl MIFrame {
                     // detection from `list_append_value`.
                     if concrete_len > 0 {
                         let self_ref = recover_self(self);
-                        return self.list_pop_value(self_ref, inner_self, concrete_len);
+                        return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
                     }
                 }
             }
