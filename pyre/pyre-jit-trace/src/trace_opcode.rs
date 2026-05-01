@@ -4540,19 +4540,22 @@ impl MIFrame {
 
     /// Mirror of `list_append_value` for `lst.pop()`. Caller has already
     /// verified `concrete_len > 0`; this function picks a strategy fast
-    /// path or falls back to generic call dispatch (which routes through
-    /// `trace_call_callable` since pyre has no `jit_list_pop` residual
-    /// helper yet — the bound-method call dispatcher handles the slow
-    /// case).
+    /// path or falls back to generic call dispatch.
+    ///
+    /// `callable` is the bound `W_MethodObject` OpRef: fallback paths pass
+    /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
+    /// on the *method*, not on the receiver (calling the list itself would be
+    /// a TypeError).
     pub(crate) fn list_pop_value(
         &mut self,
+        callable: OpRef,
         list: OpRef,
         concrete_list: PyObjectRef,
         concrete_len: usize,
     ) -> Result<OpRef, PyError> {
         if concrete_list.is_null() || concrete_len == 0 {
             // Caller's guard ensures concrete_len > 0; defensive fallback.
-            return self.trace_call_callable(list, &[]);
+            return self.trace_call_callable(callable, &[]);
         }
         unsafe {
             if is_list(concrete_list) {
