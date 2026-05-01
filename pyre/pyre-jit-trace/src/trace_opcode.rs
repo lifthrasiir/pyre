@@ -4538,6 +4538,43 @@ impl MIFrame {
         self.trace_list_append(list, value)
     }
 
+    /// Mirror of `list_append_value` for `lst.pop()`. Caller has already
+    /// verified `concrete_len > 0`; this function picks a strategy fast
+    /// path or falls back to generic call dispatch (which routes through
+    /// `trace_call_callable` since pyre has no `jit_list_pop` residual
+    /// helper yet — the bound-method call dispatcher handles the slow
+    /// case).
+    pub(crate) fn list_pop_value(
+        &mut self,
+        list: OpRef,
+        concrete_list: PyObjectRef,
+        concrete_len: usize,
+    ) -> Result<OpRef, PyError> {
+        if concrete_list.is_null() || concrete_len == 0 {
+            // Caller's guard ensures concrete_len > 0; defensive fallback.
+            return self.trace_call_callable(list, &[]);
+        }
+        unsafe {
+            if is_list(concrete_list) {
+                let strategy_id = if w_list_uses_object_storage(concrete_list) {
+                    Some(0i64)
+                } else if w_list_uses_int_storage(concrete_list) {
+                    Some(1i64)
+                } else if w_list_uses_float_storage(concrete_list) {
+                    Some(2i64)
+                } else {
+                    None
+                };
+                if let Some(sid) = strategy_id {
+                    return Ok(self.with_ctx(|this, ctx| {
+                        crate::generated_list_pop_by_strategy(this, ctx, list, sid)
+                    }));
+                }
+            }
+        }
+        self.trace_call_callable(list, &[])
+    }
+
     pub(crate) fn concrete_iter_continues(
         &self,
         concrete_iter: PyObjectRef,
@@ -4677,27 +4714,27 @@ impl MIFrame {
             return self.trace_call_callable(callable, args);
         }
 
-        // `lst.append(item)` flow: `baseobjspace::getattr` returns a fresh
+        // `lst.<method>(...)` flow: `baseobjspace::getattr` returns a fresh
         // `W_MethodObject` per iteration, so the receiver is pushed by
         // `load_method` as `null_value` (load_method:6334) and call sees
-        // `concrete_callable = W_MethodObject`, `args = [item]`. Recover the
-        // receiver via `GetfieldGcR(callable, w_self)` after guarding the
-        // method object's class. The function pointer inside the method
-        // object IS stable across iterations, so the optimizer can fold the
-        // method-object's getfield_gc reads against a guard_value on the
-        // function slot instead of paying for the generic
-        // `jit_call_callable_1` dispatcher.
+        // `concrete_callable = W_MethodObject`, with the receiver missing
+        // from `args`. Recover the receiver via `GetfieldGcR(callable,
+        // w_self)` after guarding the method object's class. The function
+        // pointer inside the method object IS stable across iterations
+        // (unlike the freshly-allocated method-object pointer itself), so
+        // a `guard_value` on the `w_function` slot pins the specialization
+        // without invalidating on the next iteration's fresh allocation.
         if unsafe { is_method(concrete_callable) } {
             let inner_func = unsafe { w_method_get_func(concrete_callable) };
             let inner_self = unsafe { w_method_get_self(concrete_callable) };
             if !inner_func.is_null()
                 && !inner_self.is_null()
                 && unsafe { is_function(inner_func) }
+                && unsafe { is_list(inner_self) }
             {
                 let func_name = unsafe { pyre_interpreter::function_get_name(inner_func) };
-                if args.len() == 1 && func_name == "append" && unsafe { is_list(inner_self) } {
-                    let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
-                    let self_ref = self.with_ctx(|this, ctx| {
+                let recover_self = |this: &mut Self| {
+                    this.with_ctx(|this, ctx| {
                         this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
                         let func_ref = ctx.record_op_with_descr(
                             majit_ir::OpCode::GetfieldGcR,
@@ -4710,9 +4747,24 @@ impl MIFrame {
                             &[callable],
                             crate::descr::method_w_self_descr(),
                         )
-                    });
+                    })
+                };
+                if args.len() == 1 && func_name == "append" {
+                    let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
+                    let self_ref = recover_self(self);
                     self.list_append_value(self_ref, args[0], inner_self, c_arg)?;
                     return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                }
+                if args.len() == 0 && func_name == "pop" {
+                    let concrete_len = unsafe { w_list_len(inner_self) };
+                    // Empty-list pop raises IndexError; let the generic
+                    // dispatcher handle that. Strategy-unknown lists also
+                    // fall through; `list_pop_value` mirrors the strategy
+                    // detection from `list_append_value`.
+                    if concrete_len > 0 {
+                        let self_ref = recover_self(self);
+                        return self.list_pop_value(self_ref, inner_self, concrete_len);
+                    }
                 }
             }
         }

@@ -1523,6 +1523,113 @@ pub fn generated_list_append_by_strategy(
     ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
 }
 
+/// Trace `lst.pop()` (no-arg form, equivalent to `pop_end`): guard_class
+/// → guard_strategy → read items[len-1] → update len → box result for
+/// typed strategies.
+///
+/// Mirror of `generated_list_append_by_strategy`, but the *length* must
+/// be read dynamically rather than passed as a `concrete_len` constant.
+/// `list_append_value` only emits IR — it does not concretely mutate the
+/// list — and `lst.append(i); lst.pop()` is recorded as two consecutive
+/// trace_opcode calls. By the time pop runs at trace time the actual
+/// list length still reflects the *post-iteration* concrete state (e.g.
+/// 5 in `list_pop_append`'s steady state), but the runtime length the
+/// compiled code reads is the post-append length (6). Hard-coding the
+/// concrete length into a `GuardValue` therefore mismatched at runtime
+/// and corrupted both the load index and the `SetfieldGc` write
+/// (verified empirically — cranelift output became "6 0" instead of
+/// "5 0" with that shape). Reading length via `GetfieldGcI` lets the
+/// JIT heap cache resolve it to the correct cached constant from
+/// append's prior `setfield_cached`, and the optimizer's constant-fold
+/// pass derives `len - 1` from there.
+///
+/// strategy_id: 0=object, 1=int, 2=float. Returns the popped value as a
+/// boxed `PyObjectRef`. Object strategy yields the raw `Ref` from
+/// items_block; Int/Float strategies inline a `NewWithVtable +
+/// SetfieldGc` so `OptVirtualize` can fold the box away when unused
+/// (e.g. `lst.append(i); lst.pop()` discards via `POP_TOP`).
+#[inline]
+pub fn generated_list_pop_by_strategy(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    list: majit_ir::OpRef,
+    strategy_id: i64,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+
+    frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
+    frame.guard_list_strategy(ctx, list, strategy_id);
+
+    let len_descr = match strategy_id {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
+        _ => unreachable!(),
+    };
+    let len_descr_idx = len_descr.index();
+
+    let len = crate::state::opimpl_getfield_gc_i(ctx, list, len_descr.clone());
+    let one = ctx.const_int(1);
+    // `IntSub(cached_const, 1)` is constant-folded by the optimizer when
+    // heap_cache resolved `len` to a constant; otherwise it remains a
+    // dynamic compute. Either way `last_index` and `new_len` are the
+    // same value — both naming kept for readability.
+    let last_index = ctx.record_op(OpCode::IntSub, &[len, one]);
+    let new_len = last_index;
+
+    let popped = match strategy_id {
+        0 => {
+            let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
+            let item = crate::state::trace_items_block_getitem_value(ctx, items_block, last_index);
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
+            ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+            item
+        }
+        1 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                list,
+                crate::descr::list_int_items_ptr_descr(),
+            );
+            let raw =
+                crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, last_index);
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
+            ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            crate::generated::trace_box_int(
+                ctx,
+                raw,
+                crate::descr::w_int_size_descr(),
+                crate::descr::ob_type_descr(),
+                crate::descr::int_intval_descr(),
+                int_type_addr,
+            )
+        }
+        2 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                list,
+                crate::descr::list_float_items_ptr_descr(),
+            );
+            let raw =
+                crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, last_index);
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
+            ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
+            let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            crate::trace_box_float(
+                ctx,
+                raw,
+                crate::descr::w_float_size_descr(),
+                crate::descr::ob_type_descr(),
+                crate::descr::float_floatval_descr(),
+                float_type_addr,
+            )
+        }
+        _ => unreachable!(),
+    };
+    popped
+}
+
 /// Trace len() for known container types.
 ///
 /// RPython jitcode parity: guard_class → getfield(length/len) for each type.
