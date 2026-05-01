@@ -4728,6 +4728,42 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn wire_bhimpl_handlers_leaves_mixed_ref_int_int_ops_unwired() {
+            // RPython blackhole integer arithmetic is `@arguments("i", "i",
+            // returns="i")` (blackhole.py:458+). Ref/int-mixed `int_*`
+            // opnames are kind-flow bugs, not alternate blackhole surfaces.
+            let mut insns = HashMap::new();
+            let fake_opnames = [
+                "int_add/ri>i",
+                "int_add/ir>i",
+                "int_add/rr>i",
+                "int_lshift/ri>i",
+                "int_rshift/ir>i",
+                "int_xor/rr>i",
+                "int_same_as/r>i",
+                "int_neg/r>i",
+                "int_invert/r>i",
+            ];
+            for (opcode, opname) in fake_opnames.iter().enumerate() {
+                insns.insert((*opname).to_string(), opcode as u8);
+            }
+
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_insns(&insns);
+            super::wire_bhimpl_handlers(&mut builder);
+
+            let placeholder = super::unwired_handler_placeholder as *const () as usize;
+            for slot in 0usize..fake_opnames.len() {
+                assert_eq!(
+                    builder.dispatch_table[slot] as *const () as usize, placeholder,
+                    "slot {slot} ({}) must stay unwired; mixed ref/int int \
+                     opnames should be fixed at the codewriter/rtyper source",
+                    fake_opnames[slot],
+                );
+            }
+        }
     }
 }
 
@@ -4760,81 +4796,6 @@ macro_rules! bhhandler_ii_i {
             let b = bh.registers_i[code[position + 1] as usize];
             bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
             Ok(position + 3)
-        }
-    };
-}
-
-/// Decode pattern `@arguments("r", "i", returns="i")` — argcodes `"ri>i"`.
-///
-/// Not an RPython-canonical argcode pattern. pyre's build-time codewriter
-/// emits this form when a binary int primitive's lhs operand lands in a
-/// Ref register due to the tagged-int representation pyre still uses
-/// for some untyped integer paths (majit-translate/src/jit_codewriter/
-/// assembler.rs OpKind::BinOp selects the register's kind at assembly
-/// time). The runtime storage is still `i64` — `registers_r` and
-/// `registers_i` are both `Vec<i64>` in majit — so treating the ref
-/// slot's raw bits as an i64 value matches whatever value pyre emitted
-/// into the register without any tag decoding.
-///
-/// When pyre migrates away from storing unboxed ints in Ref registers
-/// (or introduces an explicit unbox op), this `/ri>i` argcode pattern
-/// disappears from the build-time insns table and this macro becomes
-/// dead code.
-macro_rules! bhhandler_ri_i {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let a = bh.registers_r[code[position] as usize];
-            let b = bh.registers_i[code[position + 1] as usize];
-            bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
-            Ok(position + 3)
-        }
-    };
-}
-
-/// Decode pattern `@arguments("i", "r", returns="i")` — argcodes `"ir>i"`.
-///
-/// Mirror of `bhhandler_ri_i` with the operand order flipped. Emerges when
-/// the binary int primitive's rhs operand (rather than lhs) lands in a
-/// Ref register due to the tagged-int-in-ref-slot deviation. Since
-/// `registers_r` and `registers_i` are both `Vec<i64>`, the raw i64 read
-/// from the ref slot matches whatever the builder wrote. Becomes dead
-/// code once pyre emits `ref_*` for Ref-typed operands or introduces an
-/// explicit unbox op.
-macro_rules! bhhandler_ir_i {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let a = bh.registers_i[code[position] as usize];
-            let b = bh.registers_r[code[position + 1] as usize];
-            bh.registers_i[code[position + 2] as usize] = $bhimpl(a, b);
-            Ok(position + 3)
-        }
-    };
-}
-
-/// Decode pattern `@arguments("r", returns="i")` — argcodes `"r>i"`.
-///
-/// pyre-specific companion of bhhandler_ri_i: the unary int primitive's
-/// operand sits in a Ref register (tagged-int-in-ref-slot deviation,
-/// same root as `/ri>i`). `registers_r`/`registers_i` are both `Vec<i64>`
-/// so reading the raw bits works without tag decoding.
-macro_rules! bhhandler_r_i {
-    ($name:ident, $bhimpl:ident) => {
-        fn $name(
-            bh: &mut BlackholeInterpreter,
-            code: &[u8],
-            position: usize,
-        ) -> Result<usize, DispatchError> {
-            let a = bh.registers_r[code[position] as usize];
-            bh.registers_i[code[position + 1] as usize] = $bhimpl(a);
-            Ok(position + 2)
         }
     };
 }
@@ -4991,13 +4952,6 @@ fn bhimpl_int_force_ge_zero(a: i64) -> i64 {
 bhhandler_i_i!(handler_int_same_as, bhimpl_int_same_as);
 bhhandler_i_i!(handler_int_neg, bhimpl_int_neg);
 bhhandler_i_i!(handler_int_invert, bhimpl_int_invert);
-// pyre-specific r>i variant for Rust `!x` on i64 (bitwise NOT) when
-// the operand lands in a Ref register. Same primitive as int_invert.
-// jtransform now inserts cast_ptr_to_int for most sites
-// (`coerce_operand_to_int` rewrites ~97% of `not` UnaryOps with Ref
-// operands), but a small residual still emits this argcode shape;
-// keep the wire until the residual is run to ground.
-bhhandler_r_i!(handler_int_not_r, bhimpl_int_invert);
 bhhandler_i_i!(handler_int_is_true, bhimpl_int_is_true);
 bhhandler_i_i!(handler_int_is_zero, bhimpl_int_is_zero);
 bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
@@ -5005,25 +4959,6 @@ bhhandler_i_i!(handler_int_force_ge_zero, bhimpl_int_force_ge_zero);
 // @arguments("i", "i", returns="i") → argcodes "ii>i" → 2 src regs + 1 dst reg = 3 bytes
 bhhandler_ii_i!(handler_int_add, bhimpl_int_add);
 bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
-// pyre-specific ri>i / ir>i argcode variants — see bhhandler_ri_i /
-// bhhandler_ir_i macro docs. Each wraps the same canonical `bhimpl_*` as
-// its `ii>i` sibling; only the register-class of one operand differs.
-bhhandler_ri_i!(handler_int_add_ri, bhimpl_int_add);
-bhhandler_ri_i!(handler_int_and_ri, bhimpl_int_and);
-bhhandler_ri_i!(handler_int_lshift_ri, bhimpl_int_lshift);
-bhhandler_ri_i!(handler_int_rshift_ri, bhimpl_int_rshift);
-bhhandler_ir_i!(handler_int_add_ir, bhimpl_int_add);
-bhhandler_ir_i!(handler_int_and_ir, bhimpl_int_and);
-bhhandler_ir_i!(handler_int_eq_ir, bhimpl_int_eq);
-bhhandler_ir_i!(handler_int_ne_ir, bhimpl_int_ne);
-bhhandler_ir_i!(handler_int_lt_ir, bhimpl_int_lt);
-bhhandler_ir_i!(handler_int_gt_ir, bhimpl_int_gt);
-bhhandler_ir_i!(handler_int_rshift_ir, bhimpl_int_rshift);
-bhhandler_ri_i!(handler_int_or_ri, bhimpl_int_or);
-bhhandler_ir_i!(handler_int_or_ir, bhimpl_int_or);
-bhhandler_ri_i!(handler_int_eq_ri, bhimpl_int_eq);
-bhhandler_ri_i!(handler_int_ne_ri, bhimpl_int_ne);
-bhhandler_ri_i!(handler_int_gt_ri, bhimpl_int_gt);
 
 // pyre-only: `a += b` in Rust front-end (`front/ast.rs:1604` maps
 // `syn::BinOp::AddAssign` to the BinOp name `"add_assign"`). Under SSA
@@ -5369,31 +5304,6 @@ bhhandler_rr_i!(handler_instance_ptr_eq, bhimpl_ptr_eq);
 bhhandler_rr_i!(handler_instance_ptr_ne, bhimpl_ptr_ne);
 bhhandler_r_i!(handler_ptr_iszero, bhimpl_ptr_iszero);
 bhhandler_r_i!(handler_ptr_nonzero, bhimpl_ptr_nonzero);
-
-// pyre-only `/rr>i` arithmetic aliases: both operands land in Ref
-// registers (tagged-int-in-ref deviation, see `bhhandler_ri_i` docs).
-// RPython never emits `int_*` keys with Ref operands because rtyper
-// always classifies integer values as `Signed`; pyre's Abort→GcRef
-// fallback (rtyper.rs `infer_concrete_from_op`) puts miscategorized
-// integer values in Ref registers. `registers_r`/`registers_i` are
-// both `Vec<i64>` so the raw bits read correctly without tag decoding.
-// These aliases disappear once rtyper coverage eliminates the
-// Abort→GcRef fallback (tracked as structural debt).
-bhhandler_rr_i!(handler_int_add_rr, bhimpl_int_add);
-bhhandler_rr_i!(handler_int_sub_rr, bhimpl_int_sub);
-bhhandler_rr_i!(handler_int_sub_assign_rr, bhimpl_int_sub);
-bhhandler_rr_i!(handler_int_mod_rr, bhimpl_int_mod);
-bhhandler_rr_i!(handler_int_or_rr, bhimpl_int_or);
-bhhandler_rr_i!(handler_int_and_rr, bhimpl_int_and);
-bhhandler_rr_i!(handler_int_xor_rr, bhimpl_int_xor);
-bhhandler_rr_i!(handler_int_lt_rr, bhimpl_int_lt);
-
-// pyre-only `int_same_as/r>i`: identity op where source is Ref-classified
-// but result is Int-classified. Same root cause as the `/rr>i` family.
-// RPython uses `same_as_r` / `same_as_i` with matching register class on
-// both sides.
-bhhandler_r_i!(handler_int_same_as_r, bhimpl_int_same_as);
-bhhandler_r_i!(handler_int_neg_r, bhimpl_int_neg);
 
 // ref/float copy (blackhole.py:641-645)
 fn handler_ref_copy(
@@ -6499,9 +6409,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_same_as/i>i", handler_int_same_as);
     builder.wire_handler("int_neg/i>i", handler_int_neg);
     builder.wire_handler("int_invert/i>i", handler_int_invert);
-    // pyre-specific `int_invert/r>i`: residual after jtransform's
-    // `coerce_operand_to_int` (~97% of sites) — see handler comment.
-    builder.wire_handler("int_invert/r>i", handler_int_not_r);
     builder.wire_handler("int_is_true/i>i", handler_int_is_true);
     builder.wire_handler("int_is_zero/i>i", handler_int_is_zero);
     builder.wire_handler("int_force_ge_zero/i>i", handler_int_force_ge_zero);
@@ -6509,39 +6416,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // @arguments("i", "i", returns="i") pattern
     builder.wire_handler("int_add/ii>i", handler_int_add);
     builder.wire_handler("int_sub/ii>i", handler_int_sub);
-    // pyre-specific ri>i / ir>i variants: one operand sits in a Ref
-    // register due to the tagged-int representation pyre uses for some
-    // untyped int paths (assembler.rs OpKind::BinOp). Same primitive,
-    // different register source. See `bhhandler_ri_i` / `bhhandler_ir_i`
-    // macro docs for the tagged-int deviation.
-    builder.wire_handler("int_add/ri>i", handler_int_add_ri);
-    builder.wire_handler("int_and/ri>i", handler_int_and_ri);
-    builder.wire_handler("int_lshift/ri>i", handler_int_lshift_ri);
-    builder.wire_handler("int_rshift/ri>i", handler_int_rshift_ri);
-    builder.wire_handler("int_add/ir>i", handler_int_add_ir);
-    builder.wire_handler("int_and/ir>i", handler_int_and_ir);
-    builder.wire_handler("int_eq/ir>i", handler_int_eq_ir);
-    builder.wire_handler("int_ne/ir>i", handler_int_ne_ir);
-    builder.wire_handler("int_lt/ir>i", handler_int_lt_ir);
-    builder.wire_handler("int_gt/ir>i", handler_int_gt_ir);
-    builder.wire_handler("int_rshift/ir>i", handler_int_rshift_ir);
-    builder.wire_handler("int_or/ri>i", handler_int_or_ri);
-    builder.wire_handler("int_or/ir>i", handler_int_or_ir);
-    builder.wire_handler("int_eq/ri>i", handler_int_eq_ri);
-    builder.wire_handler("int_ne/ri>i", handler_int_ne_ri);
-    builder.wire_handler("int_gt/ri>i", handler_int_gt_ri);
-    // pyre-only `/rr>i` arithmetic aliases (see handler defs): rtyper
-    // coverage gap classifies both operands as Ref for tagged-int values.
-    builder.wire_handler("int_add/rr>i", handler_int_add_rr);
-    builder.wire_handler("int_sub/rr>i", handler_int_sub_rr);
-    builder.wire_handler("int_sub_assign/rr>i", handler_int_sub_assign_rr);
-    builder.wire_handler("int_mod/rr>i", handler_int_mod_rr);
-    builder.wire_handler("int_or/rr>i", handler_int_or_rr);
-    builder.wire_handler("int_and/rr>i", handler_int_and_rr);
-    builder.wire_handler("int_xor/rr>i", handler_int_xor_rr);
-    builder.wire_handler("int_lt/rr>i", handler_int_lt_rr);
-    builder.wire_handler("int_same_as/r>i", handler_int_same_as_r);
-    builder.wire_handler("int_neg/r>i", handler_int_neg_r);
     // pyre-only primitives — see handler comments for rationale.
     builder.wire_handler("int_add_assign/ii>i", handler_int_add_assign_pyre);
     builder.wire_handler("int_sub_assign/ii>i", handler_int_sub_assign_pyre);

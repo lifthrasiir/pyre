@@ -53,6 +53,21 @@ fn main() {
     let eval_path = format!("{pyre_base}/pyre-jit/src/eval.rs");
     collect_single_file(&eval_path, &mut sources, &mut source_paths);
 
+    // `materialize_virtual_from_rd` (`pyre-jit/src/eval.rs`) destructures
+    // `majit_ir::RdVirtualInfo` enum variants whose named fields carry
+    // primitive concretetypes (`kind: u8`, `descr_index: u32`, ...).
+    // Without the enum declaration in the analyser source set the variant
+    // arms surface as untyped, and the rtyper's exitswitch emission for
+    // `match descr.kind { 0 => ..., 1 => ..., 2 => ..., }` falls back to
+    // 'r' (Ref), which `flatten.rs:385` rejects as
+    // `switch exitswitch must be int`.  Single-file inclusion mirrors the
+    // `pyre-jit/src/eval.rs` carve-out above: only the resoperation enum
+    // declarations belong in the analyser closure, not the rest of
+    // majit-ir which would inflate analysis time and pull JIT
+    // infrastructure into the user-code BFS.
+    let resoperation_path = format!("{repo_root}/majit/majit-ir/src/resoperation.rs");
+    collect_single_file(&resoperation_path, &mut sources, &mut source_paths);
+
     eprintln!(
         "[pyre-jit-trace build.rs] reading {} source files from {} dirs (+ pyre-jit/src/eval.rs): {:?}",
         sources.len(),

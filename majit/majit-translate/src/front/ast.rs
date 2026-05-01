@@ -10,7 +10,7 @@ use syn::{Item, ItemFn};
 use crate::ParsedInterpreter;
 use crate::flowspace::model::ConstValue;
 use crate::model::{
-    BlockId, CallTarget, ExitSwitch, FunctionGraph, ImmutableRank, Link, LinkArg, OpKind,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, ImmutableRank, Link, LinkArg, OpKind,
     UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind, ValueId, ValueType,
     exception_exitcase,
 };
@@ -516,6 +516,57 @@ fn collect_fields_and_returns(
                             fn_return_types
                                 .insert(format!("{}::{}", trait_root, method.sig.ident), ret_ty);
                         }
+                    }
+                }
+            }
+            Item::Enum(e) => {
+                // RPython sum types are multiple subclasses inheriting from a
+                // common ancestor; each subclass owns its own
+                // `concretetype` field set keyed by the lltype object
+                // identity.  Pyre carries identity as a flat string
+                // table, and the only stable identity for a variant is
+                // the fully-qualified `prefix::Enum::Variant` path.
+                // Earlier drafts also registered the bare `Variant`
+                // fallback and the bare-enum `Enum::Variant` (without
+                // module prefix), but both forms collided across
+                // unrelated enums with the same variant name (e.g.
+                // `a::Foo::Empty` vs `b::Foo::Empty`, or
+                // `Foo::Empty` vs `Bar::Empty`) — `field_type`'s suffix
+                // walk would then bind the wrong field set.  Register
+                // only the fully-qualified key.  The walk still
+                // resolves shorter callers like
+                // `majit_ir::RdVirtualInfo::VirtualInfo` →
+                // `RdVirtualInfo::VirtualInfo` because the strip
+                // happens left-to-right on the caller's owner string,
+                // and the registered fully-qualified key is matched
+                // when the caller's tail equals it.  Tuple/unit
+                // variants carry no named fields and need no entry.
+                let bare_enum = e.ident.to_string();
+                let qualified_enum = if prefix.is_empty() {
+                    bare_enum.clone()
+                } else {
+                    format!("{}::{}", prefix, bare_enum)
+                };
+                for variant in &e.variants {
+                    if let syn::Fields::Named(named) = &variant.fields {
+                        let var_name = variant.ident.to_string();
+                        let fields: Vec<(String, String)> = named
+                            .named
+                            .iter()
+                            .filter_map(|f| {
+                                let field_name = f.ident.as_ref()?.to_string();
+                                let field_type = qualified_full_type_string(
+                                    &f.ty,
+                                    prefix,
+                                    known_struct_names,
+                                    known_trait_names,
+                                )?;
+                                Some((field_name, field_type))
+                            })
+                            .collect();
+                        struct_fields
+                            .fields
+                            .insert(format!("{}::{}", qualified_enum, var_name), fields);
                     }
                 }
             }
@@ -1280,7 +1331,7 @@ fn lower_stmt(
                 }
             }
             if let Some(init) = &local.init {
-                let init_type_string = expression_type_string(&init.expr, ctx);
+                let init_type_string = infer_init_type_string(&init.expr, ctx);
                 let lowered = lower_expr(graph, block, &init.expr, options, ctx)?;
                 if lowered.path_closed {
                     return Ok(true);
@@ -1318,6 +1369,19 @@ fn lower_stmt(
                             }
                             ctx.local_type_strings.insert(name, type_string);
                         }
+                    } else if !matches!(&local.pat, syn::Pat::Ident(_) | syn::Pat::Type(_)) {
+                        // Destructure let (`let Some(x) = ...;`,
+                        // `let Foo { a, b } = ...;`, `let A | B { f, .. }
+                        // = ...;`) introduces names that the simple
+                        // Pat::Ident / Pat::Type binding above misses.
+                        // RPython parity: `flowspace/flowcontext.py` walks
+                        // the BUILD_TUPLE_UNPACK / unpack_sequence paths
+                        // and binds each leaf name with its rtyped
+                        // concretetype.  Pyre routes the same shape
+                        // through `bind_pattern_locals`, which already
+                        // unwraps `Some(_)` / `Ok(_)` / `Err(_)` and
+                        // recurses into struct / or patterns.
+                        bind_pattern_locals(&local.pat, init_type_string.as_deref(), ctx);
                     }
                 }
             }
@@ -2059,6 +2123,12 @@ fn lower_expr(
             if m.arms.is_empty() {
                 return Ok(Lowered::no_value());
             }
+            let bool_exitcases = classify_match_bool_exitcases(&m.arms);
+            let switch_exitcases = if bool_exitcases.is_none() {
+                classify_match_switch_exitcases(&m.arms)
+            } else {
+                None
+            };
 
             // Lower each arm body into its own block, collecting both
             // the ENTRY block (what the outer Branch/Goto jumps to)
@@ -2134,14 +2204,48 @@ fn lower_expr(
                 graph.set_goto(*tail, merge, goto_args);
             }
 
-            // First arm as default branch (simplified).
-            // In the else branch `m.arms.len() >= 2` → `arm_entries` has
-            // at least 2 entries, so `second_block` is always a real arm
-            // entry block (never `merge`), and no false_args workaround
-            // is needed.
-            if m.arms.len() == 1 {
+            if let Some(arm_exitcases) = bool_exitcases {
+                // RPython `flatten.py:240-267` lowers Bool exitswitch
+                // blocks through the two-link `goto_if_not` path, not the
+                // integer `switch` path.  A Rust `match flag { true => ...,
+                // _ => ... }` is therefore expanded to explicit
+                // True/False exitcases instead of using the switch
+                // `"default"` sentinel.
+                let mut exits = Vec::new();
+                for (entry, exitcases) in arm_entries.iter().zip(arm_exitcases.iter()) {
+                    for exitcase in exitcases {
+                        exits.push(
+                            Link::new_mixed(Vec::new(), *entry, Some(exitcase.clone()))
+                                .with_llexitcase_from_exitcase(),
+                        );
+                    }
+                }
+                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee)), exits);
+            } else if let Some(arm_exitcases) = switch_exitcases {
+                // RPython `flatten.py:278-308` switch shape:
+                // `exitswitch` is the scrutinee and each primitive arm
+                // contributes one Link with a concrete `exitcase`.  A
+                // wildcard arm uses the same `"default"` sentinel that
+                // upstream treats as the fall-through switch path.
+                let mut exits = Vec::new();
+                for (entry, exitcases) in arm_entries.iter().zip(arm_exitcases.iter()) {
+                    for exitcase in exitcases {
+                        exits.push(
+                            Link::new_mixed(Vec::new(), *entry, Some(exitcase.clone()))
+                                .with_llexitcase_from_exitcase(),
+                        );
+                    }
+                }
+                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee)), exits);
+            } else if m.arms.len() == 1 {
                 graph.set_goto(*block, arm_entries[0], vec![]);
             } else {
+                // Structural adaptation for Rust composite patterns
+                // (`if let Some(_)`, `Err(_)`, tuple/struct variants).
+                // This front-end lacks a typed enum-discriminant op; keep
+                // the existing two-arm truthy split for those cases rather
+                // than inventing a fake switch key. Primitive literal
+                // patterns use the switch path above.
                 graph.set_branch(
                     *block,
                     scrutinee,
@@ -2395,7 +2499,14 @@ fn lower_expr(
         // are prevblock-side values" invariant at
         // `flowspace/model.py:114`.
         syn::Expr::Try(t) => {
+            let ok_ty = expression_type_string(&t.expr, ctx)
+                .as_deref()
+                .and_then(transparent_result_ok_type)
+                .map(type_string_to_value_type);
             let inner = get_value!(lower_expr(graph, block, &t.expr, options, ctx)?);
+            if let Some(ok_ty) = ok_ty {
+                retag_result_value_type(graph, inner, ok_ty);
+            }
             let continuation = graph.create_block();
             let continuation_arg = graph.alloc_value();
             graph
@@ -2947,6 +3058,159 @@ fn parse_matches_pat_and_guard(
     Ok((pat, guard))
 }
 
+fn classify_match_bool_exitcases(arms: &[syn::Arm]) -> Option<Vec<Vec<ExitCase>>> {
+    if arms.len() != 2 {
+        return None;
+    }
+    let mut all = Vec::with_capacity(arms.len());
+    let mut seen_bools = Vec::<bool>::new();
+    for (arm_idx, arm) in arms.iter().enumerate() {
+        if arm.guard.is_some() {
+            return None;
+        }
+        let is_last_arm = arm_idx + 1 == arms.len();
+        let mut sub_pats = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+        if sub_pats.len() > 1 && sub_pats.iter().any(|pat| matches!(pat, syn::Pat::Wild(_))) {
+            return None;
+        }
+        let mut arm_cases = Vec::with_capacity(sub_pats.len());
+        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
+            let is_last = is_last_arm && sub_idx + 1 == sub_pats.len();
+            match classify_bool_pattern(sub_pat, is_last, &seen_bools)? {
+                BoolPatternCase::Value(value) => {
+                    if seen_bools.contains(&value) {
+                        return None;
+                    }
+                    seen_bools.push(value);
+                    arm_cases.push(ExitCase::Bool(value));
+                }
+                BoolPatternCase::Default(values) => {
+                    if values.is_empty() {
+                        return None;
+                    }
+                    for value in values {
+                        seen_bools.push(value);
+                        arm_cases.push(ExitCase::Bool(value));
+                    }
+                }
+            }
+        }
+        all.push(arm_cases);
+    }
+    let mut sorted = seen_bools;
+    sorted.sort();
+    sorted.dedup();
+    if sorted.as_slice() == &[false, true] {
+        Some(all)
+    } else {
+        None
+    }
+}
+
+enum BoolPatternCase {
+    Value(bool),
+    Default(Vec<bool>),
+}
+
+fn classify_bool_pattern(
+    pat: &syn::Pat,
+    is_last: bool,
+    seen_bools: &[bool],
+) -> Option<BoolPatternCase> {
+    match pat {
+        syn::Pat::Wild(_) if is_last => {
+            let mut values = Vec::new();
+            if !seen_bools.contains(&false) {
+                values.push(false);
+            }
+            if !seen_bools.contains(&true) {
+                values.push(true);
+            }
+            Some(BoolPatternCase::Default(values))
+        }
+        syn::Pat::Wild(_) => None,
+        syn::Pat::Lit(lit) => match &lit.lit {
+            syn::Lit::Bool(value) => Some(BoolPatternCase::Value(value.value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn classify_match_switch_exitcases(arms: &[syn::Arm]) -> Option<Vec<Vec<ExitCase>>> {
+    if arms.len() < 2 {
+        return None;
+    }
+    let mut all = Vec::with_capacity(arms.len());
+    let mut seen = Vec::<ExitCase>::new();
+    for (arm_idx, arm) in arms.iter().enumerate() {
+        if arm.guard.is_some() {
+            return None;
+        }
+        let is_last_arm = arm_idx + 1 == arms.len();
+        let mut sub_pats = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+        if sub_pats.len() > 1 && sub_pats.iter().any(|pat| matches!(pat, syn::Pat::Wild(_))) {
+            return None;
+        }
+        let mut arm_cases = Vec::with_capacity(sub_pats.len());
+        for (sub_idx, sub_pat) in sub_pats.iter().enumerate() {
+            let is_last = is_last_arm && sub_idx + 1 == sub_pats.len();
+            let exitcase = classify_switch_pattern(sub_pat, is_last)?;
+            if !is_default_exitcase(&exitcase) {
+                if seen.iter().any(|existing| existing == &exitcase) {
+                    return None;
+                }
+                seen.push(exitcase.clone());
+            }
+            arm_cases.push(exitcase);
+        }
+        all.push(arm_cases);
+    }
+    Some(all)
+}
+
+fn flatten_or_pattern<'a>(pat: &'a syn::Pat, out: &mut Vec<&'a syn::Pat>) {
+    match pat {
+        syn::Pat::Or(or_pat) => {
+            for case in &or_pat.cases {
+                flatten_or_pattern(case, out);
+            }
+        }
+        syn::Pat::Paren(paren) => flatten_or_pattern(&paren.pat, out),
+        other => out.push(other),
+    }
+}
+
+fn classify_switch_pattern(pat: &syn::Pat, is_last: bool) -> Option<ExitCase> {
+    match pat {
+        syn::Pat::Wild(_) if is_last => Some(default_exitcase()),
+        syn::Pat::Wild(_) => None,
+        syn::Pat::Lit(lit) => match &lit.lit {
+            syn::Lit::Int(int_lit) => int_lit
+                .base10_parse::<i64>()
+                .ok()
+                .map(|value| ExitCase::Const(ConstValue::Int(value))),
+            syn::Lit::Byte(value) => Some(ExitCase::Const(ConstValue::Int(value.value() as i64))),
+            syn::Lit::Char(value) => Some(ExitCase::Const(ConstValue::Int(value.value() as i64))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn default_exitcase() -> ExitCase {
+    ExitCase::Const(ConstValue::byte_str("default"))
+}
+
+fn is_default_exitcase(exitcase: &ExitCase) -> bool {
+    matches!(
+        exitcase,
+        ExitCase::Const(ConstValue::ByteStr(bytes)) if bytes.as_slice() == b"default"
+    )
+}
+
 fn unary_op_name(op: &syn::UnOp) -> &'static str {
     match op {
         syn::UnOp::Deref(_) => "deref",
@@ -3169,6 +3433,30 @@ fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<Valu
 
 fn graph_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
     graph_result_value_type(graph, value).or_else(|| graph_link_input_value_type(graph, value))
+}
+
+fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueType) {
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            if op.result != Some(value) {
+                continue;
+            }
+            match &mut op.kind {
+                OpKind::Input { ty: result_ty, .. }
+                | OpKind::FieldRead { ty: result_ty, .. }
+                | OpKind::VableFieldRead { ty: result_ty, .. }
+                | OpKind::BinOp { result_ty, .. }
+                | OpKind::UnaryOp { result_ty, .. }
+                | OpKind::Call { result_ty, .. }
+                | OpKind::IndirectCall { result_ty, .. } => *result_ty = ty,
+                OpKind::ArrayRead { item_ty, .. }
+                | OpKind::InteriorFieldRead { item_ty, .. }
+                | OpKind::VableArrayRead { item_ty, .. } => *item_ty = ty,
+                _ => {}
+            }
+            return;
+        }
+    }
 }
 
 fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
@@ -3599,18 +3887,143 @@ fn bind_pattern_locals(
                 ) {
                     bind_pattern_locals(inner_pat, Some(inner), ctx);
                 }
+            } else if matches_constructor_path(&path, "Err") {
+                if let (Some(inner), Some(inner_pat)) = (
+                    matched_type.and_then(transparent_result_err_type),
+                    tuple_struct.elems.first(),
+                ) {
+                    bind_pattern_locals(inner_pat, Some(inner), ctx);
+                }
+            }
+        }
+        syn::Pat::Struct(pat_struct) => {
+            // RPython rtyper field-access shape: pattern destructure on
+            // `Enum::Variant { f, .. }` resolves each field's concretetype
+            // through the per-class field table (see Item::Enum branch of
+            // `collect_fields_and_returns`).  Pyre's
+            // `StructFieldRegistry::field_type` runs a suffix walk on the
+            // owner key, so both fully-qualified
+            // (`majit_ir::RdVirtualInfo::VirtualInfo`) and bare
+            // (`VirtualInfo`) destructure paths land on the same field set.
+            let owner: String = pat_struct
+                .path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            for field_pat in &pat_struct.fields {
+                let field_name = match &field_pat.member {
+                    syn::Member::Named(ident) => ident.to_string(),
+                    syn::Member::Unnamed(_) => continue,
+                };
+                let field_type = ctx
+                    .struct_fields
+                    .field_type(&owner, &field_name)
+                    .map(|s| s.to_string());
+                bind_pattern_locals(&field_pat.pat, field_type.as_deref(), ctx);
+            }
+        }
+        syn::Pat::Or(pat_or) => {
+            // RPython `flowspace/flowcontext.py` does not have or-patterns;
+            // `match A | B { kind, .. } => ...` desugars to two parallel
+            // arms in upstream's translator.  Recurse into each case so
+            // shared destructure names get bound under each variant's
+            // concretetype — both variants are required to expose the
+            // same field set, so the resulting concretetype is consistent
+            // across the cases.
+            for case in &pat_or.cases {
+                bind_pattern_locals(case, matched_type, ctx);
+            }
+        }
+        syn::Pat::Tuple(pat_tuple) => {
+            // RPython `BUILD_TUPLE_UNPACK` (`flowspace/flowcontext.py`)
+            // unpacks each element with the per-position concretetype
+            // recorded on the source `SomeTuple`.  The matched type
+            // string carries the parenthesised list of element types
+            // (`(VirtualKind, &[FieldDescrInfo], &[i16], usize)`);
+            // `split_tuple_type_elements` walks balanced angle / paren /
+            // bracket depth so nested generics (`Option<Result<T, E>>`)
+            // do not split prematurely.  When the element count
+            // disagrees with the type-string arity, fall back to
+            // unbound recursion — better than asserting on a
+            // tuple-typed value the inference rules do not yet handle.
+            let elem_types = matched_type.and_then(split_tuple_type_elements);
+            for (idx, elem_pat) in pat_tuple.elems.iter().enumerate() {
+                let elem_type = elem_types
+                    .as_ref()
+                    .and_then(|v| v.get(idx))
+                    .map(|s| s.as_str());
+                bind_pattern_locals(elem_pat, elem_type, ctx);
             }
         }
         _ => {}
     }
 }
 
+/// Split a parenthesised tuple type string into its element types.
+/// Mirrors `extract_element_type_from_str`'s prefix walk for `&` /
+/// `*const` / `*mut` so a `&(A, B)` reference is treated as `(A, B)`,
+/// then walks balanced `<>` / `()` / `[]` depth so nested generics
+/// (`Option<Result<T, E>>`) and inner tuples (`Vec<(A, B)>`) survive
+/// the split intact.
+fn split_tuple_type_elements(type_str: &str) -> Option<Vec<String>> {
+    let mut s = type_str.trim();
+    loop {
+        let stripped = s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .or_else(|| s.strip_prefix("&mut "))
+            .or_else(|| s.strip_prefix("&"));
+        match stripped {
+            Some(rest) => s = rest.trim_start(),
+            None => break,
+        }
+    }
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    let mut elements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+    for ch in inner.chars() {
+        match ch {
+            '(' | '<' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | '>' | ']' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    elements.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let last = current.trim();
+    if !last.is_empty() {
+        elements.push(last.to_string());
+    }
+    Some(elements)
+}
+
 fn bind_ident_type(ident: &syn::Ident, type_str: &str, ctx: &mut GraphBuildContext<'_>) {
     let name = ident.to_string();
     ctx.local_value_types
         .insert(name.clone(), type_string_to_value_type(type_str));
-    ctx.local_type_strings
-        .insert(name.clone(), type_str.trim().to_string());
+    let trimmed = type_str.trim().to_string();
+    ctx.local_type_strings.insert(name.clone(), trimmed.clone());
+    // Mirror Stmt::Local Pat::Type binding (line 1085-1087 / 1318-1320):
+    // every named local with a known full-type string seeds
+    // `local_array_types` so that downstream
+    // `array_type_id_from_expr` / `extract_element_type_from_str`
+    // resolve the element type via the same channel an explicit
+    // `let x: Vec<T> = ...` would.
+    ctx.local_array_types.insert(name.clone(), trimmed);
     if let Some(root) = type_root_from_type_string(type_str) {
         ctx.local_type_roots.insert(name, root);
     }
@@ -3709,6 +4122,12 @@ pub(crate) fn classify_fn_arg_ty(ty: &syn::Type) -> crate::model::ValueType {
                 Some(s) => s,
                 None => return ValueType::Ref,
             };
+            if path.path.segments.len() == 2
+                && path.path.segments[0].ident == "Self"
+                && path.path.segments[1].ident == "Truth"
+            {
+                return ValueType::Int;
+            }
             let name = last.ident.to_string();
             // `Box<T>` / `Rc<T>` / `Arc<T>` — classify on the inner type
             // so `Box<i64>` stays Int (RPython `lltype.Ptr(Signed)`
@@ -4171,7 +4590,7 @@ fn type_string_to_value_type(type_str: &str) -> ValueType {
     let type_str = type_str.trim();
     match type_str {
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-        | "bool" => ValueType::Int,
+        | "bool" | "char" | "Self::Truth" => ValueType::Int,
         "f32" | "f64" => ValueType::Float,
         "()" => ValueType::Void,
         _ => ValueType::Ref,
@@ -4192,6 +4611,24 @@ fn transparent_result_ok_type(type_str: &str) -> Option<&str> {
             return None;
         }
         return Some(ok_type);
+    }
+    None
+}
+
+fn transparent_result_err_type(type_str: &str) -> Option<&str> {
+    let trimmed = type_str.trim();
+    for prefix in ["Result<", "std::result::Result<", "core::result::Result<"] {
+        let Some(inner) = trimmed
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        let err_type = second_top_level_generic_arg(inner).map(str::trim)?;
+        if err_type == "()" {
+            return None;
+        }
+        return Some(err_type);
     }
     None
 }
@@ -4223,6 +4660,22 @@ fn first_top_level_generic_arg(args: &str) -> Option<&str> {
     if args.is_empty() { None } else { Some(args) }
 }
 
+fn second_top_level_generic_arg(args: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (idx, ch) in args.char_indices() {
+        match ch {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let rest = args[idx + 1..].trim();
+                return if rest.is_empty() { None } else { Some(rest) };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn field_value_type_from_expr(
     base: &syn::Expr,
     member: &syn::Member,
@@ -4242,6 +4695,35 @@ fn field_type_string_from_expr(
     ctx.struct_fields
         .field_type(&owner, &field_name)
         .map(ToOwned::to_owned)
+}
+
+/// Type-string inference for `let pat = init;` initialisers, with the
+/// extra power of binding match-arm patterns into a borrowed snapshot of
+/// `ctx` so an arm body's expression can be typed against the
+/// destructured names the body actually uses
+/// (`fielddescrs.as_slice()` after `VirtualInfo { fielddescrs, .. }`).
+/// Non-match initialisers fall through to the immutable
+/// `expression_type_string`.
+///
+/// RPython's annotator handles the same shape via `SomeBuiltin.unionof`
+/// over per-branch annotations; pyre takes the first arm whose body
+/// types successfully and trusts the type-checker to keep the
+/// remaining arms in sync.
+fn infer_init_type_string(expr: &syn::Expr, ctx: &mut GraphBuildContext<'_>) -> Option<String> {
+    if let syn::Expr::Match(m) = expr {
+        let scrutinee_type = expression_type_string(&m.expr, ctx);
+        for arm in &m.arms {
+            let saved = LocalBindingSnapshot::capture(ctx);
+            bind_pattern_locals(&arm.pat, scrutinee_type.as_deref(), ctx);
+            let body_type = expression_type_string(&arm.body, ctx);
+            saved.restore(ctx);
+            if body_type.is_some() {
+                return body_type;
+            }
+        }
+        return None;
+    }
+    expression_type_string(expr, ctx)
 }
 
 fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
@@ -4278,9 +4760,79 @@ fn expression_type_string(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<S
         syn::Expr::MethodCall(mc) => {
             let receiver_root = receiver_type_root(&mc.receiver, ctx);
             let trait_bound_root = trait_bound_root_for_receiver(&mc.receiver, ctx);
-            lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
+            if let Some(ret) = lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
                 .or_else(|| lookup_method_return_type(ctx, trait_bound_root.as_deref(), &mc.method))
                 .cloned()
+            {
+                return Some(ret);
+            }
+            // RPython annotator `SomeList.method_get / .method_first /
+            // .method_last`-style result inference, narrowed to the
+            // stdlib `Vec<T>` / `[T]` accessors that `let Some(x) =
+            // lst.get(i) else { ... }` desugars from.  Pyre's
+            // `local_array_types` carries the full container type
+            // (`Vec<FieldDescrInfo>`); the `Option<&T>` shape is the
+            // Rust-language adaptation of RPython's `lst[i]` access.
+            let method = mc.method.to_string();
+            if matches!(method.as_str(), "get" | "first" | "last") {
+                if let Some(arr_ty) = array_type_id_from_expr(&mc.receiver, ctx)
+                    && let Some(elem) = extract_element_type_from_str(&arr_ty)
+                {
+                    return Some(format!("Option<&{}>", elem));
+                }
+            }
+            if method == "as_ref" {
+                if let Some(receiver_ty) = expression_type_string(&mc.receiver, ctx)
+                    && let Some(ret) = method_as_ref_return_type(&receiver_ty)
+                {
+                    return Some(ret);
+                }
+            }
+            // `Vec::as_slice` / `slice::as_ref` view the receiver as
+            // `&[T]` while preserving element identity.  Same parity
+            // rationale as the `get` arm — RPython's `lst.tolist()` /
+            // `lst[:]` aliases keep the underlying `GcArray(T)` type
+            // identity for downstream `getarrayitem` lookups.
+            if matches!(method.as_str(), "as_slice" | "as_ref") {
+                if let Some(arr_ty) = array_type_id_from_expr(&mc.receiver, ctx)
+                    && let Some(elem) = extract_element_type_from_str(&arr_ty)
+                {
+                    return Some(format!("&[{}]", elem));
+                }
+            }
+            None
+        }
+        // RPython `BUILD_TUPLE` produces a `SomeTuple(elems)`; the type
+        // surfaces as a parenthesised list of element annotations.  Pyre
+        // mirrors this with a flat string so `Pat::Tuple` /
+        // `split_tuple_type_elements` can route each element back to its
+        // originating concretetype.
+        syn::Expr::Tuple(t) => {
+            let mut element_types: Vec<String> = Vec::with_capacity(t.elems.len());
+            for elem in &t.elems {
+                let ty = expression_type_string(elem, ctx)?;
+                element_types.push(ty);
+            }
+            Some(format!("({})", element_types.join(", ")))
+        }
+        // `VirtualKind::Instance { ... }` — Rust struct-init for an enum
+        // variant.  RPython's annotator returns `SomeInstance(cls)` for
+        // class-instantiation; here the parent enum name is the
+        // closest analog (the variant's per-class subclass identity is
+        // not carried as a separate type root).  Falls back to the
+        // joined path for plain struct constructors.
+        syn::Expr::Struct(es) => {
+            let segments: Vec<String> = es
+                .path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .collect();
+            if segments.len() >= 2 {
+                Some(segments[..segments.len() - 1].join("::"))
+            } else {
+                Some(segments.join("::"))
+            }
         }
         _ => None,
     }
@@ -4312,14 +4864,12 @@ fn array_item_value_type_from_array_type_id(array_type_id: Option<&str>) -> Opti
 /// - `Vec<Point>` → `"Point"` (angle brackets)
 /// - `[i64]` → `"i64"` (slice)
 /// - `[Point; 10]` → `"Point"` (fixed-size array)
+/// - `&[Point]` / `&mut [Point]` — reference / mut-reference prefixes are
+///   stripped before the slice form is matched, mirroring
+///   `type_root_from_type_string`'s prefix walk so chained
+///   `Vec::as_slice` results retain their element type.
 fn extract_element_type_from_str(type_str: &str) -> Option<String> {
-    let s = type_str.trim();
-    // Angle brackets: Vec<T>, Box<T>, etc.
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        if start < end {
-            return Some(s[start + 1..end].trim().to_string());
-        }
-    }
+    let s = strip_pointer_like_prefixes(type_str);
     // Square brackets: [T] or [T; N]
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
@@ -4333,7 +4883,57 @@ fn extract_element_type_from_str(type_str: &str) -> Option<String> {
             return Some(elem.to_string());
         }
     }
+    // Angle brackets: Vec<T>, Box<T>, etc.  This is checked after the
+    // outer slice form so `[Rc<T>]` yields `Rc<T>`, not `T`.
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
+        if start < end {
+            return first_top_level_generic_arg(&s[start + 1..end])
+                .map(str::trim)
+                .filter(|elem| !elem.is_empty())
+                .map(ToOwned::to_owned);
+        }
+    }
     None
+}
+
+fn strip_pointer_like_prefixes(type_str: &str) -> &str {
+    let mut s = type_str.trim();
+    loop {
+        let stripped = s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .or_else(|| s.strip_prefix("&mut "))
+            .or_else(|| s.strip_prefix("&"));
+        match stripped {
+            Some(rest) => s = rest.trim_start(),
+            None => break,
+        }
+    }
+    s
+}
+
+fn outer_generic_inner_type(type_str: &str, wrappers: &[&str]) -> Option<String> {
+    let s = strip_pointer_like_prefixes(type_str);
+    let start = s.find('<')?;
+    let inner = s[start + 1..].strip_suffix('>')?;
+    let head = s[..start].trim().rsplit("::").next().unwrap_or("").trim();
+    if !wrappers.contains(&head) {
+        return None;
+    }
+    first_top_level_generic_arg(inner)
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn method_as_ref_return_type(receiver_ty: &str) -> Option<String> {
+    if let Some(inner) = outer_generic_inner_type(receiver_ty, &["Rc", "Arc", "Box", "NonNull"]) {
+        return Some(format!("&{}", strip_pointer_like_prefixes(&inner)));
+    }
+    if let Some(inner) = outer_generic_inner_type(receiver_ty, &["Option"]) {
+        return Some(format!("Option<&{}>", strip_pointer_like_prefixes(&inner)));
+    }
+    extract_element_type_from_str(receiver_ty).map(|elem| format!("&[{}]", elem))
 }
 
 fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
@@ -4376,6 +4976,12 @@ fn array_type_id_from_expr(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<
         // RPython resolves via the exact callee graph — no bare name fallback.
         syn::Expr::MethodCall(mc) => {
             let method_name = mc.method.to_string();
+            if matches!(method_name.as_str(), "as_slice" | "as_ref")
+                && let Some(ret) = expression_type_string(expr, ctx)
+                && extract_element_type_from_str(&ret).is_some()
+            {
+                return Some(ret);
+            }
             let receiver_ty = receiver_type_root(&mc.receiver, ctx)?;
             let key = format!("{}::{}", receiver_ty, method_name);
             ctx.fn_return_types.get(&key).cloned()
@@ -4442,6 +5048,107 @@ mod tests {
     }
 
     #[test]
+    fn type_string_helpers_preserve_outer_slice_and_as_ref_wrapper_identity() {
+        assert_eq!(
+            extract_element_type_from_str("[std::rc::Rc<majit_ir::RdVirtualInfo>]"),
+            Some("std::rc::Rc<majit_ir::RdVirtualInfo>".to_string())
+        );
+        assert_eq!(
+            extract_element_type_from_str("&[FieldDescrInfo]"),
+            Some("FieldDescrInfo".to_string())
+        );
+        assert_eq!(
+            method_as_ref_return_type("&std::rc::Rc<majit_ir::RdVirtualInfo>"),
+            Some("&majit_ir::RdVirtualInfo".to_string())
+        );
+        assert_eq!(
+            method_as_ref_return_type("Vec<FieldDescrInfo>"),
+            Some("&[FieldDescrInfo]".to_string())
+        );
+        assert_eq!(
+            method_as_ref_return_type("Option<FieldDescrInfo>"),
+            Some("Option<&FieldDescrInfo>".to_string())
+        );
+    }
+
+    #[test]
+    fn binds_slice_get_result_from_enum_variant_tuple_destructure() {
+        let ir = crate::parse::parse_source(
+            r#"
+            enum Type {
+                Ref,
+                Float,
+                Int,
+            }
+            struct FieldDescrInfo {
+                field_type: Type,
+                field_size: usize,
+            }
+            enum RdVirtualInfo {
+                VirtualInfo {
+                    fielddescrs: Vec<FieldDescrInfo>,
+                    descr_size: usize,
+                },
+                Empty,
+            }
+        "#,
+        );
+        let eval = crate::parse::parse_source(
+            r#"
+            fn read_field_size(
+                rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                vidx: usize,
+                i: usize,
+            ) -> i64 {
+                let Some(virtuals) = rd_virtuals else {
+                    return 0;
+                };
+                let Some(entry) = virtuals.get(vidx) else {
+                    return 0;
+                };
+                let (fielddescrs, _descr_size) = match entry.as_ref() {
+                    majit_ir::RdVirtualInfo::VirtualInfo {
+                        fielddescrs,
+                        descr_size,
+                    } => (fielddescrs.as_slice(), *descr_size),
+                    _ => return 0,
+                };
+                let Some(descr) = fielddescrs.get(i) else {
+                    return 0;
+                };
+                match descr.field_size {
+                    1 => 1,
+                    _ => 8,
+                }
+            }
+        "#,
+        );
+        let program =
+            build_semantic_program_from_parsed_files(&[ir, eval]).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|func| func.name == "read_field_size")
+            .expect("read_field_size graph")
+            .graph;
+        let field_size_read = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "field_size" => {
+                    Some((field.owner_root.clone(), ty.clone()))
+                }
+                _ => None,
+            })
+            .expect("field_size FieldRead");
+        assert_eq!(
+            field_size_read,
+            (Some("FieldDescrInfo".to_string()), ValueType::Int)
+        );
+    }
+
+    #[test]
     fn binds_option_some_inner_type_in_match_arm() {
         let parsed = crate::parse::parse_source(
             r#"
@@ -4475,6 +5182,37 @@ mod tests {
                 })
             }),
             "expected Some(depth) to bind depth as Int; graph:\n{}",
+            graph.dump()
+        );
+    }
+
+    #[test]
+    fn binds_result_err_inner_type_in_if_let_arm() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(result: Result<i64, f64>) -> f64 {
+                if let Err(err) = result {
+                    err
+                } else {
+                    0.0
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Input { name, ty }
+                            if name == "err" && *ty == ValueType::Float
+                    )
+                })
+            }),
+            "expected Err(err) to bind err as Float; graph:\n{}",
             graph.dump()
         );
     }
@@ -4887,6 +5625,141 @@ mod tests {
             entry.exitswitch,
         );
         assert_eq!(entry.exits.len(), 2, "bool branch has two exits");
+    }
+
+    #[test]
+    fn match_literals_emit_switch_exitcases_for_all_arms() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn pick(x: i64) -> i64 {
+                match x {
+                    0 => 11,
+                    1 => 22,
+                    _ => 33,
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        let entry = graph.block(graph.startblock);
+
+        assert!(
+            matches!(entry.exitswitch, Some(crate::model::ExitSwitch::Value(_))),
+            "primitive match should switch on the scrutinee, got {:?}",
+            entry.exitswitch,
+        );
+        let exitcases: Vec<_> = entry
+            .exits
+            .iter()
+            .map(|link| link.exitcase.clone())
+            .collect();
+        assert_eq!(
+            exitcases,
+            vec![
+                Some(ExitCase::Const(ConstValue::Int(0))),
+                Some(ExitCase::Const(ConstValue::Int(1))),
+                Some(ExitCase::Const(ConstValue::byte_str("default"))),
+            ],
+        );
+        let llexitcases: Vec<_> = entry
+            .exits
+            .iter()
+            .map(|link| link.llexitcase.clone())
+            .collect();
+        assert_eq!(
+            llexitcases,
+            vec![Some(ConstValue::Int(0)), Some(ConstValue::Int(1)), None],
+        );
+    }
+
+    #[test]
+    fn match_negative_int_literals_are_classified_as_switch() {
+        // RPython `flatten.py:269` reads `link.llexitcase` as Signed,
+        // so `match x { -1 => ... }` lands in the switch path the same
+        // way `match x { 1 => ... }` does.  syn 2.x represents `-1` as
+        // `Pat::Lit(ExprLit { lit: Lit::Int })` whose token text
+        // includes the `-`; `LitInt::base10_parse::<i64>` returns
+        // `Ok(-1)` for that token.  This guard catches a future
+        // regression where `classify_switch_pattern`'s `Pat::Lit` arm
+        // narrows to non-negative literals only.
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn pick(x: i64) -> i64 {
+                match x {
+                    -1 => 11,
+                    -2 | -3 => 22,
+                    5 => 33,
+                    _ => 44,
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        let entry = graph.block(graph.startblock);
+
+        assert!(
+            matches!(entry.exitswitch, Some(crate::model::ExitSwitch::Value(_))),
+            "negative int literals must remain on the switch path, got {:?}",
+            entry.exitswitch,
+        );
+        let exitcases: Vec<_> = entry
+            .exits
+            .iter()
+            .map(|link| link.exitcase.clone())
+            .collect();
+        assert_eq!(
+            exitcases,
+            vec![
+                Some(ExitCase::Const(ConstValue::Int(-1))),
+                Some(ExitCase::Const(ConstValue::Int(-2))),
+                Some(ExitCase::Const(ConstValue::Int(-3))),
+                Some(ExitCase::Const(ConstValue::Int(5))),
+                Some(ExitCase::Const(ConstValue::byte_str("default"))),
+            ],
+        );
+    }
+
+    #[test]
+    fn bool_match_wildcard_emits_true_false_exitcases() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn pick(flag: bool) -> i64 {
+                match flag {
+                    true => 11,
+                    _ => 22,
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        let entry = graph.block(graph.startblock);
+
+        assert!(
+            matches!(entry.exitswitch, Some(crate::model::ExitSwitch::Value(_))),
+            "bool match should branch on the scrutinee, got {:?}",
+            entry.exitswitch,
+        );
+        let exitcases: Vec<_> = entry
+            .exits
+            .iter()
+            .map(|link| link.exitcase.clone())
+            .collect();
+        assert_eq!(
+            exitcases,
+            vec![Some(ExitCase::Bool(true)), Some(ExitCase::Bool(false))],
+        );
+        let llexitcases: Vec<_> = entry
+            .exits
+            .iter()
+            .map(|link| link.llexitcase.clone())
+            .collect();
+        assert_eq!(
+            llexitcases,
+            vec![Some(ConstValue::Bool(true)), Some(ConstValue::Bool(false))],
+        );
     }
 
     #[test]

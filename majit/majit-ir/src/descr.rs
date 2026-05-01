@@ -658,6 +658,13 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_jitcode_descr(&self) -> Option<&dyn JitCodeDescr> {
         None
     }
+    /// Downcast to `SwitchDescr` for codewriter-emitted `switch/id`
+    /// descriptors. RPython stores a concrete `SwitchDictDescr` object
+    /// in `Assembler.descrs`; Rust keeps the same descriptor shape behind
+    /// this trait object.
+    fn as_switch_descr(&self) -> Option<&dyn SwitchDescr> {
+        None
+    }
     fn as_loop_token_descr(&self) -> Option<&dyn LoopTokenDescr> {
         None
     }
@@ -1572,6 +1579,20 @@ pub trait JitCodeDescr: Descr {
     /// `AssemblerDescr::PendingJitCode { jitcode, .. }` → resolved
     /// `BhDescr::JitCode { jitcode_index, .. }` at snapshot time.
     fn jitcode_index(&self) -> usize;
+}
+
+/// Descriptor carrying `switch/id` dispatch metadata.
+///
+/// RPython `jitcode.py:131-143 SwitchDictDescr` stores both
+/// `dict: {int: target_pc}` for lookup and `const_keys_in_order`
+/// for deterministic miss-path guard generation. Keep both surfaces
+/// here instead of reconstructing order from a Rust `HashMap`.
+pub trait SwitchDescr: Descr {
+    /// RPython `switchdict.dict[search_value]`.
+    fn lookup(&self, value: i64) -> Option<usize>;
+
+    /// RPython `switchdict.const_keys_in_order`.
+    fn const_keys_in_order(&self) -> &[i64];
 }
 
 /// Descriptor carrying a `CALL_ASSEMBLER` loop token.

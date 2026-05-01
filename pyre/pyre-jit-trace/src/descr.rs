@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Weak;
 
-use majit_ir::{ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, Type};
+use majit_ir::{
+    ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, SwitchDescr, Type,
+};
 
 // PRE-EXISTING-ADAPTATION: tag bits in the high nibble of the descr
 // index discriminate Field/Array/Size descrs. RPython stores all descrs
@@ -1897,19 +1899,65 @@ pub fn make_jitcode_descr(jitcode_index: usize) -> DescrRef {
 #[derive(Debug)]
 pub struct PyreSwitchDescr {
     dict: std::collections::HashMap<i64, usize>,
+    const_keys_in_order: Vec<i64>,
 }
 
 impl PyreSwitchDescr {
     pub fn new(dict: std::collections::HashMap<i64, usize>) -> Self {
-        Self { dict }
+        let mut const_keys_in_order: Vec<i64> = dict.keys().copied().collect();
+        const_keys_in_order.sort_unstable();
+        Self {
+            dict,
+            const_keys_in_order,
+        }
     }
 }
 
 impl Descr for PyreSwitchDescr {
     fn repr(&self) -> String {
-        let mut keys: Vec<_> = self.dict.keys().copied().collect();
-        keys.sort_unstable();
-        format!("SwitchDictDescr({keys:?})")
+        let entries = self
+            .const_keys_in_order
+            .iter()
+            .map(|key| {
+                let target = self
+                    .dict
+                    .get(key)
+                    .expect("const_keys_in_order must mirror SwitchDictDescr.dict");
+                format!("{key}: {target}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("<SwitchDictDescr {{{entries}}}>")
+    }
+
+    fn as_switch_descr(&self) -> Option<&dyn SwitchDescr> {
+        Some(self)
+    }
+}
+
+impl SwitchDescr for PyreSwitchDescr {
+    fn lookup(&self, value: i64) -> Option<usize> {
+        self.dict.get(&value).copied()
+    }
+
+    fn const_keys_in_order(&self) -> &[i64] {
+        &self.const_keys_in_order
+    }
+}
+
+#[cfg(test)]
+mod switch_descr_tests {
+    use super::*;
+
+    #[test]
+    fn pyre_switch_descr_repr_matches_rpython_switchdictdescr() {
+        let descr = PyreSwitchDescr::new(std::collections::HashMap::from([(9, 23), (5, 17)]));
+
+        assert_eq!(
+            <PyreSwitchDescr as Descr>::repr(&descr),
+            "<SwitchDictDescr {5: 17, 9: 23}>"
+        );
+        assert_eq!(descr.const_keys_in_order(), &[5, 9]);
     }
 }
 

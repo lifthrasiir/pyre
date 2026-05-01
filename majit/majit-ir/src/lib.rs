@@ -10,7 +10,7 @@ pub use descr::{
     AccumInfo, ArrayDescr, ArrayFlag, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
     DescrRef, FailDescr, FieldDescr, GcCache, InteriorFieldDescr, JitCodeDescr, LLType,
     LoopTargetDescr, LoopTokenDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
-    TargetArgLoc, UnpackAtExitInfo, VableExpansion, descr_identity, make_array_descr,
+    SwitchDescr, TargetArgLoc, UnpackAtExitInfo, VableExpansion, descr_identity, make_array_descr,
     make_field_descr, make_loop_target_descr, make_malloc_array_calldescr,
     make_malloc_array_nonstandard_calldescr, make_malloc_big_fixedsize_calldescr,
     make_malloc_str_calldescr, make_malloc_unicode_calldescr, make_memcpy_calldescr,

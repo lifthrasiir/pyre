@@ -138,6 +138,16 @@ impl Assembler {
         self.emit_descr(AssemblerDescr::PendingJitCode { jitcode })
     }
 
+    fn emit_pending_switch_descr(&mut self, cases: Vec<(i64, Label)>) -> usize {
+        let index = self.descrs.len();
+        assert!(index <= 0xFFFF, "too many AbstractDescrs!");
+        // RPython creates a fresh SwitchDictDescr per switch site; do
+        // not route through `_descr_dict`, because labels are local to
+        // the currently assembled JitCode.
+        self.descrs.push(AssemblerDescr::PendingSwitch { cases });
+        index
+    }
+
     /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
     ///
     /// Takes the SSARepr (flattened instruction sequence) and register
@@ -234,12 +244,46 @@ impl Assembler {
 
         // RPython assembler.py:45,250-258: self.fix_labels()
         for (label, fixup_pos) in &state.tlabel_fixups {
-            let target = state.label_positions.get(label).copied().unwrap_or(0);
+            // RPython `assembler.py:254 target = self.label_positions[insn[1].name]`
+            // — direct dict access, raises KeyError when the TLabel
+            // references a label that was never defined. Mirror with
+            // a fail-loud panic instead of silently writing 0.
+            let target = *state
+                .label_positions
+                .get(label)
+                .unwrap_or_else(|| panic!("undefined TLabel {label:?} at fixup {fixup_pos}"));
             let target_u16 = target as u16;
-            if fixup_pos + 1 < state.code.len() {
-                state.code[*fixup_pos] = (target_u16 & 0xFF) as u8;
-                state.code[*fixup_pos + 1] = (target_u16 >> 8) as u8;
-            }
+            // RPython `assembler.py:255 assert 0 <= target <= 0xFFFF`.
+            assert!(target <= 0xFFFF, "label target {target} exceeds u16 range");
+            // RPython `assembler.py:252-253 assert self.code[pos] == "temp 1"`
+            // — the fixup must point to two reserved placeholder
+            // bytes still in range.
+            assert!(
+                fixup_pos + 1 < state.code.len(),
+                "tlabel fixup position {fixup_pos} past end of code (len={})",
+                state.code.len(),
+            );
+            state.code[*fixup_pos] = (target_u16 & 0xFF) as u8;
+            state.code[*fixup_pos + 1] = (target_u16 >> 8) as u8;
+        }
+        for descr in &mut self.descrs {
+            let AssemblerDescr::PendingSwitch { cases } = descr else {
+                continue;
+            };
+            let dict = cases
+                .iter()
+                .map(|(key, label)| {
+                    // RPython `assembler.py:261 target =
+                    // self.label_positions[switchlabel.name]` — KeyError
+                    // for a missing switch case label. Same fail-loud
+                    // policy as the TLabel fixup loop above.
+                    let target = *state.label_positions.get(label).unwrap_or_else(|| {
+                        panic!("undefined SwitchDictDescr label {label:?} for key {key}")
+                    });
+                    (*key, target)
+                })
+                .collect();
+            *descr = AssemblerDescr::Ready(crate::jitcode::BhDescr::Switch { dict });
         }
 
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
@@ -337,7 +381,20 @@ impl Assembler {
             }
 
             // RPython assembler.py:141-142: '---' → skip
-            FlatOp::Unreachable => {}
+            FlatOp::EndOfBlock => {}
+
+            // RPython `flatten.py:292` `emitline("unreachable")` →
+            // single-byte opcode for `bhimpl_unreachable`.  Mirrors the
+            // `assembler.py:140-159` general opcode path: a fresh
+            // `startposition = len(self.code)` is recorded before the
+            // opcode byte goes in so the `_check_no_branch_to_inside_an_op`
+            // pass at `assembler.py:283` sees `unreachable/` as a valid
+            // start address even though execution never reaches it.
+            FlatOp::Unreachable => {
+                let opnum = self.get_opnum("unreachable/");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+            }
 
             // RPython assembler.py:159-223: regular operation
             FlatOp::Op(inner_op) => {
@@ -396,6 +453,18 @@ impl Assembler {
                 state.tlabel_fixups.push((*target, state.code.len()));
                 state.code.push(0);
                 state.code.push(0);
+            }
+
+            FlatOp::Switch { value, targets } => {
+                let (reg, kind) = self.lookup_reg_with_kind(*value, regallocs);
+                assert_eq!(kind, 'i', "switch/id expects an int register");
+                let descr_idx = self.emit_pending_switch_descr(targets.clone());
+                let opnum = self.get_opnum("switch/id");
+                state.startpoints.insert(state.code.len());
+                state.code.push(opnum);
+                state.code.push(reg);
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
             }
 
             FlatOp::IntBinOpJumpIfOvf {
@@ -1664,6 +1733,11 @@ impl Assembler {
                     s.use_count += 1;
                     s.first_use_tag.get_or_insert("GotoIfNot");
                 }
+                FlatOp::Switch { value, .. } => {
+                    let s = sites.entry(*value).or_default();
+                    s.use_count += 1;
+                    s.first_use_tag.get_or_insert("Switch");
+                }
                 FlatOp::IntBinOpJumpIfOvf { lhs, rhs, dst, .. } => {
                     sites.entry(*dst).or_default().has_def = true;
                     for v in [*lhs, *rhs] {
@@ -1709,6 +1783,7 @@ impl Assembler {
                 FlatOp::Label(_)
                 | FlatOp::Jump(_)
                 | FlatOp::VoidReturn
+                | FlatOp::EndOfBlock
                 | FlatOp::Unreachable
                 | FlatOp::CatchException { .. }
                 | FlatOp::GotoIfExceptionMismatch { .. }
@@ -2639,6 +2714,9 @@ impl Assembler {
                     fnaddr: jitcode.fnaddr,
                     calldescr: jitcode.calldescr().clone(),
                 },
+                AssemblerDescr::PendingSwitch { .. } => {
+                    panic!("snapshot_descrs called before switch descriptors were resolved")
+                }
             })
             .collect()
     }
@@ -2765,6 +2843,9 @@ impl AssemblerDescrKey {
         match descr {
             AssemblerDescr::Ready(descr) => Self::from_ready(descr),
             AssemblerDescr::PendingJitCode { jitcode } => Self::JitCode(jitcode.clone()),
+            AssemblerDescr::PendingSwitch { .. } => {
+                unreachable!("switch descriptors bypass `_descr_dict`")
+            }
         }
     }
 
@@ -2872,6 +2953,9 @@ enum AssemblerDescr {
     Ready(crate::jitcode::BhDescr),
     PendingJitCode {
         jitcode: crate::jitcode::JitCodeHandle,
+    },
+    PendingSwitch {
+        cases: Vec<(i64, Label)>,
     },
 }
 

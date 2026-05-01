@@ -320,7 +320,15 @@ fn analyze_pipeline_from_parsed(
     // a graph.
     let program = front::build_semantic_program_from_parsed_files(parsed_files)
         .expect("pyre-interpreter source must lower without FlowingError");
-    let mut pipeline = legacy_pipeline::analyze_program(&program, &config.pipeline);
+    // legacy_pipeline::analyze_program is now invoked after
+    // `call_control.find_all_graphs` so the BFS-from-portal candidate
+    // set drives the per-function annotate → rtype → jtransform →
+    // flatten chain.  RPython parity: `annrpython.py:215
+    // schedule_pending` walks pending blocks reachable from the
+    // entry-point closure; unreachable helpers stay outside the
+    // translator and never trip the strict-typing assertions the JIT
+    // path enforces.  See the
+    // `legacy_pipeline::analyze_program_filtered` call site below.
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
@@ -734,6 +742,21 @@ fn analyze_pipeline_from_parsed(
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
 
+    // RPython parity: `RPythonAnnotator.build_types(entry_point, args)`
+    // only analyses functions reachable from the entry-point closure.
+    // Pyre's legacy whole-program iteration ran annotate / rtype /
+    // jtransform / flatten on every parsed function, including
+    // runtime-only resume helpers (`materialize_virtual_from_rd`,
+    // `replay_pending_fields`) the JIT never traces.  Filtering by
+    // `call_control.is_candidate` mirrors annrpython's BFS-from-entry
+    // shape so unreachable helpers stay outside the analyser the same
+    // way `annotator/translator/translator.py:55 buildflowgraph`
+    // skips them upstream.
+    let mut pipeline =
+        legacy_pipeline::analyze_program_filtered(&program.functions, &config.pipeline, |func| {
+            function_is_candidate_for_analysis(func, &call_control)
+        });
+
     let (opcode_dispatch, jitcodes, insns, descrs) = build_canonical_opcode_dispatch(
         parsed_files,
         &canonical_trait_impls,
@@ -753,6 +776,42 @@ fn analyze_pipeline_from_parsed(
     pipeline.descrs = descrs;
 
     pipeline
+}
+
+/// Decide whether `func` falls inside the BFS-from-portal closure that
+/// the canonical jitcode emitter consumes.  RPython's
+/// `RPythonAnnotator.build_types` schedules pending graphs from
+/// `entry_point` outwards via `annrpython.py:215 schedule_pending`;
+/// pyre mirrors that closure with `call_control.candidate_graphs`,
+/// populated by `find_all_graphs_bfs`.  We probe both unprefixed and
+/// `crate::`-prefixed forms because `register_function_graph` records
+/// free functions under both keys (see the `for func in
+/// &program.functions` loop earlier in this function).  Impl methods
+/// surface as `(self_ty_root, method_name)` paths via
+/// `canonical_trait_impls` registration; the same two-segment lookup
+/// covers both inherent and trait impls.
+fn function_is_candidate_for_analysis(
+    func: &front::SemanticFunction,
+    call_control: &call::CallControl,
+) -> bool {
+    if let Some(ref owner) = func.self_ty_root {
+        let path = parse::CallPath::from_segments([owner.as_str(), func.name.as_str()]);
+        if call_control.is_candidate(&path) {
+            return true;
+        }
+        let crate_path =
+            parse::CallPath::from_segments(["crate", owner.as_str(), func.name.as_str()]);
+        return call_control.is_candidate(&crate_path);
+    }
+    let segments: Vec<&str> = func.name.split("::").collect();
+    let path = parse::CallPath::from_segments(segments.iter().copied());
+    if call_control.is_candidate(&path) {
+        return true;
+    }
+    let mut crate_segs = vec!["crate"];
+    crate_segs.extend(segments.iter().copied());
+    let crate_path = parse::CallPath::from_segments(crate_segs);
+    call_control.is_candidate(&crate_path)
 }
 
 /// Build opcode dispatch arms and produce JitCodes for discovered callee graphs.

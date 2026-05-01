@@ -277,6 +277,12 @@ enum RewriteResult {
     Keep,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedCallResult {
+    kind: char,
+    ir_type: majit_ir::value::Type,
+}
+
 /// RPython: the `key` value stored as `op.args[0]` of a
 /// `SpaceOperation('jit_marker', [key, jitdriver, *args])` operation
 /// (`jtransform.py:1658-1663`). pyre's front-end does not carry the
@@ -526,6 +532,56 @@ impl<'a> Transformer<'a> {
         self.stamp_value_kind(value, ty);
     }
 
+    /// RPython `op.result.concretetype` is set by the rtyper, so jtransform
+    /// reads it directly. Pyre's front-end can leave a callee return type
+    /// as `ValueType::Unknown` when the callee path is unresolved (re-export
+    /// shadowing, cross-crate paths). When that happens, the rtyper's
+    /// backward-inference pass classifies `op.result` from its consumer-op
+    /// constraints. Consult `type_state` for a definitive kind so call
+    /// rewrites propagate the same `result_kind` the rtyper already chose,
+    /// instead of falling back to `value_type_to_kind(Unknown) == 'r'`.
+    fn resolve_call_result_kind(
+        &self,
+        result: Option<ValueId>,
+        result_ty: &ValueType,
+    ) -> Option<char> {
+        if !matches!(result_ty, ValueType::Unknown) {
+            return None;
+        }
+        let value = result?;
+        let ts = self.type_state?;
+        match ts.get(value) {
+            crate::jit_codewriter::type_state::ConcreteType::Signed => Some('i'),
+            crate::jit_codewriter::type_state::ConcreteType::GcRef => Some('r'),
+            crate::jit_codewriter::type_state::ConcreteType::Float => Some('f'),
+            crate::jit_codewriter::type_state::ConcreteType::Void => Some('v'),
+            crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
+        }
+    }
+
+    /// RPython uses one `op.result.concretetype` for both
+    /// `getkind(...)[0]` (opcode suffix) and `getcalldescr(..., RESULT)`.
+    /// Keep the Rust port on that same source of truth so `Unknown`
+    /// results resolved by `type_state` cannot produce `_i` opnames with
+    /// Ref-return calldescrs.
+    fn resolve_call_result(
+        &self,
+        result: Option<ValueId>,
+        result_ty: &ValueType,
+    ) -> ResolvedCallResult {
+        let kind = self
+            .resolve_call_result_kind(result, result_ty)
+            .unwrap_or_else(|| value_type_to_kind(result_ty));
+        let ir_type = match kind {
+            'i' => majit_ir::value::Type::Int,
+            'r' => majit_ir::value::Type::Ref,
+            'f' => majit_ir::value::Type::Float,
+            'v' => majit_ir::value::Type::Void,
+            other => panic!("unsupported call result kind '{other}'"),
+        };
+        ResolvedCallResult { kind, ir_type }
+    }
+
     fn direct_funcptr_value(&mut self, target: &CallTarget) -> (ValueId, SpaceOperation) {
         let fnaddr = self
             .callcontrol
@@ -653,10 +709,30 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "same_as" || unop_name == "deref" => {
-                // RPython `jtransform.py:246 rewrite_op_same_as`
-                // returns None: the op is removed and its result is
-                // renamed to its argument. Rust reference/deref sugar
-                // has the same identity shape at this IR level.
+                // RPython `jtransform.py:246-248 rewrite_op_same_as`:
+                //
+                //     def rewrite_op_same_as(self, op):
+                //         if op.args[0] in self.vable_array_vars:
+                //             self.vable_array_vars[op.result] = \
+                //                 self.vable_array_vars[op.args[0]]
+                //
+                // `rewrite_op_same_as` returns `None` implicitly.  In
+                // `optimize_block` that means "remove the op and rename
+                // the result to args[0]" (`jtransform.py:106-111`).
+                //
+                // Pyre instead drops the op (`RewriteResult::Identity`)
+                // and records `op.result -> *operand` in `self.aliases`
+                // (line 446-450). Subsequent ops in the same block
+                // (and `block.exitswitch` / `link.args` via
+                // `remap_control_flow_metadata`) go through
+                // `remap_op` at line 441 before dispatch, so a
+                // consumer that originally referenced `op.result` is
+                // rewritten to reference `*operand` directly. The
+                // later `vable_array_vars.get(&base)` lookup in
+                // `rewrite_op_getarrayitem`/`_setarrayitem` then
+                // hits the original `(*operand)` entry — same outcome
+                // as RPython's explicit propagation, without keeping
+                // a redundant alias key.
                 RewriteResult::Identity(*operand)
             }
             // RPython `jtransform.py:1243-1255` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
@@ -1414,7 +1490,7 @@ impl<'a> Transformer<'a> {
                     // for a configured effect override, keep the signature from
                     // getcalldescr() instead of accepting an effect-only descr.
                     let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-                    let result_ir_type = value_type_to_ir_type(result_ty);
+                    let result_ir_type = self.resolve_call_result(op.result, result_ty).ir_type;
                     let extraeffect = classify_call(target, &self.config.call_effects)
                         .map(|(d, _)| d.extra_info.extraeffect);
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
@@ -1441,8 +1517,10 @@ impl<'a> Transformer<'a> {
         // RPython: always residual_call_*, effect only in calldescr.
         if let Some((descriptor, _effect)) = classify_call(target, &self.config.call_effects) {
             let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-            let descriptor =
-                descriptor.with_signature(&non_void_args, value_type_to_ir_type(result_ty));
+            let descriptor = descriptor.with_signature(
+                &non_void_args,
+                self.resolve_call_result(op.result, result_ty).ir_type,
+            );
             self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
         } else {
             RewriteResult::Keep
@@ -1520,7 +1598,7 @@ impl<'a> Transformer<'a> {
         // RPython reuses the same calldescr for both the op and callinfocollection.
         // We compute arg types once and clone for the collection.
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-        let result_ir_type = value_type_to_ir_type(result_ty);
+        let result_ir_type = self.resolve_call_result(op.result, result_ty).ir_type;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -1600,7 +1678,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:480: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
         let (args_i, args_r, args_f) = self.make_three_lists(args);
-        let result_kind = value_type_to_kind(result_ty);
+        let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
 
         self.notes.push(GraphTransformNote {
@@ -1667,7 +1745,7 @@ impl<'a> Transformer<'a> {
         };
         let (greens_i, greens_r, greens_f) = self.make_three_lists(green_args);
         let (reds_i, reds_r, reds_f) = self.make_three_lists(red_args);
-        let result_kind = value_type_to_kind(result_ty);
+        let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
 
         self.notes.push(GraphTransformNote {
@@ -1864,7 +1942,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         // jtransform.py:1990-1993
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-        let result_ir_type = value_type_to_ir_type(result_ty);
+        let result_ir_type = self.resolve_call_result(op.result, result_ty).ir_type;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -1941,7 +2019,8 @@ impl<'a> Transformer<'a> {
         let condition_or_value = args[0];
         let func_args = if args.len() > 1 { &args[1..] } else { &[] };
         let non_void_args = resolve_non_void_arg_types(func_args, self.type_state);
-        let result_ir_type = value_type_to_ir_type(result_ty);
+        let resolved_result = self.resolve_call_result(op.result, result_ty);
+        let result_ir_type = resolved_result.ir_type;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -1966,7 +2045,7 @@ impl<'a> Transformer<'a> {
             args_f.is_empty(),
             "force_ir: no float args in conditional_call"
         );
-        let result_kind = value_type_to_kind(result_ty);
+        let result_kind = resolved_result.kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
         let rewritten_opname = if is_value {
             "conditional_call_value"
@@ -2296,7 +2375,15 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         // RPython jtransform.py:467: rewrite_call(op, 'residual_call', ...)
         let (args_i, args_r, args_f) = self.make_three_lists(args);
-        let result_kind = value_type_to_kind(result_ty);
+        // RPython reads `op.result.concretetype` directly because rtyper
+        // has typed every Variable. Pyre's front-end can leave a callee's
+        // declared return as `ValueType::Unknown` (re-export shadowing,
+        // unresolved cross-crate path); the rtyper's backward-inference
+        // pass then assigns a definitive kind via the consumer-op
+        // constraint. Honour that kind so the residual_call's
+        // `result_kind` matches what every downstream consumer sees,
+        // instead of falling back to `'r'` from the Unknown default.
+        let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
@@ -2355,10 +2442,11 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         let (args_i, args_r, args_f) = self.make_three_lists(args);
-        let result_kind = value_type_to_kind(result_ty);
+        let resolved_result = self.resolve_call_result(op.result, result_ty);
+        let result_kind = resolved_result.kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-        let result_ir_type = value_type_to_ir_type(result_ty);
+        let result_ir_type = resolved_result.ir_type;
         let cc_mut = self
             .callcontrol
             .as_mut()
@@ -2482,7 +2570,7 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
-        let result_kind = value_type_to_kind(result_ty);
+        let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         RewriteResult::Replace(vec![
@@ -2521,7 +2609,7 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists(args);
-        let result_kind = value_type_to_kind(result_ty);
+        let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
         // RPython: call_may_force always followed by -live-
@@ -3247,7 +3335,7 @@ fn classify_call(
 mod tests {
     use super::*;
     use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
-    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, ValueType};
+    use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
     #[test]
     fn rewrite_graph_canonicalizes_frontend_bitops() {
@@ -3273,6 +3361,48 @@ mod tests {
             OpKind::BinOp { op, .. } => assert_eq!(op, "xor"),
             other => panic!("expected canonical BinOp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_graph_removes_same_as_and_remaps_return() {
+        let mut graph = FunctionGraph::new("same_as_identity");
+        let input = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let alias = graph
+            .push_op(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: input,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(alias));
+
+        let transformed = rewrite_graph(&graph, &GraphTransformConfig::default());
+        let block = transformed.graph.block(graph.startblock);
+
+        assert!(
+            !block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "same_as"
+            )),
+            "same_as must be eliminated before assembly: {:?}",
+            block.operations
+        );
+        assert_eq!(block.exits.len(), 1);
+        assert_eq!(block.exits[0].target, transformed.graph.returnblock);
+        assert_eq!(block.exits[0].args, vec![LinkArg::from(input)]);
     }
 
     #[test]
@@ -3494,7 +3624,9 @@ mod tests {
             }
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
-        assert!(matches!(ops[3].kind, OpKind::ConstInt(_)));
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["ll_math_fmod"]));
+        assert!(matches!(&ops[3].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
         match &ops[4].kind {
             OpKind::CallResidual {
                 funcptr,
@@ -3822,6 +3954,53 @@ mod tests {
             result.graph.block(graph.startblock).operations[1].kind,
             OpKind::CallResidual { .. }
         ));
+    }
+
+    #[test]
+    fn residual_call_unknown_result_uses_resolved_type_for_opcode_and_descr() {
+        let mut graph = FunctionGraph::new("outer");
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["unknown_external_int"]),
+                    args: vec![],
+                    result_ty: ValueType::Unknown,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Signed);
+
+        let mut cc = crate::call::CallControl::new();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_type_state(&type_state)
+            .transform(&graph);
+
+        let (result_kind, descriptor) = transformed
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    result_kind,
+                    descriptor,
+                    ..
+                } => Some((*result_kind, descriptor)),
+                _ => None,
+            })
+            .expect("residual call must be emitted");
+
+        assert_eq!(result_kind, 'i');
+        assert_eq!(descriptor.result_ir_type(), majit_ir::Type::Int);
     }
 
     #[test]

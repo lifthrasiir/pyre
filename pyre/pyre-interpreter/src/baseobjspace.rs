@@ -168,6 +168,21 @@ fn bigint_result(value: BigInt) -> PyObjectRef {
 }
 
 #[majit_macros::elidable]
+fn bigint_add(a: BigInt, b: BigInt) -> BigInt {
+    a + b
+}
+
+#[majit_macros::elidable]
+fn bigint_sub(a: BigInt, b: BigInt) -> BigInt {
+    a - b
+}
+
+#[majit_macros::elidable]
+fn bigint_mul(a: BigInt, b: BigInt) -> BigInt {
+    a * b
+}
+
+#[majit_macros::elidable]
 fn bigint_and(a: BigInt, b: BigInt) -> BigInt {
     a & b
 }
@@ -180,6 +195,46 @@ fn bigint_or(a: BigInt, b: BigInt) -> BigInt {
 #[majit_macros::elidable]
 fn bigint_xor(a: BigInt, b: BigInt) -> BigInt {
     a ^ b
+}
+
+#[majit_macros::elidable]
+fn bigint_lshift(a: BigInt, shift: usize) -> BigInt {
+    a << shift
+}
+
+#[majit_macros::elidable]
+fn bigint_rshift(a: BigInt, shift: usize) -> BigInt {
+    a >> shift
+}
+
+#[majit_macros::elidable]
+fn bigint_neg(a: BigInt) -> BigInt {
+    -a
+}
+
+#[majit_macros::elidable]
+fn bigint_invert(a: BigInt) -> BigInt {
+    !a
+}
+
+#[majit_macros::elidable]
+fn bigint_eq(a: BigInt, b: BigInt) -> bool {
+    a == b
+}
+
+#[majit_macros::elidable]
+fn bigint_lt(a: BigInt, b: BigInt) -> bool {
+    a < b
+}
+
+#[majit_macros::elidable]
+fn bigint_gt(a: BigInt, b: BigInt) -> bool {
+    a > b
+}
+
+#[majit_macros::elidable]
+fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
+    a % b
 }
 
 // ── Arithmetic operations ─────────────────────────────────────────────
@@ -199,7 +254,7 @@ unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_add(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(BigInt::from(va) + BigInt::from(vb))),
+        None => Ok(w_long_new(bigint_add(BigInt::from(va), BigInt::from(vb)))),
     }
 }
 
@@ -208,7 +263,7 @@ unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_sub(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(BigInt::from(va) - BigInt::from(vb))),
+        None => Ok(w_long_new(bigint_sub(BigInt::from(va), BigInt::from(vb)))),
     }
 }
 
@@ -217,7 +272,7 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_mul(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(BigInt::from(va) * BigInt::from(vb))),
+        None => Ok(w_long_new(bigint_mul(BigInt::from(va), BigInt::from(vb)))),
     }
 }
 
@@ -254,20 +309,20 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
 
 unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(as_bigint(a) + as_bigint(b)))
+    Ok(bigint_result(bigint_add(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(as_bigint(a) - as_bigint(b)))
+    Ok(bigint_result(bigint_sub(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bigint_result(as_bigint(a) * as_bigint(b)))
+    Ok(bigint_result(bigint_mul(as_bigint(a), as_bigint(b))))
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
-    if vb == BigInt::from(0) {
+    if bigint_eq(vb.clone(), BigInt::from(0)) {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     Ok(bigint_result(as_bigint(a).div_floor(&vb)))
@@ -275,7 +330,7 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
-    if vb == BigInt::from(0) {
+    if bigint_eq(vb.clone(), BigInt::from(0)) {
         return Err(PyError::zero_division("integer division or modulo by zero"));
     }
     Ok(bigint_result(as_bigint(a).mod_floor(&vb)))
@@ -403,7 +458,7 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
-    if vb < BigInt::from(0) {
+    if bigint_lt(vb.clone(), BigInt::from(0)) {
         let fa = as_float(a);
         let fb = as_float(b);
         return Ok(w_float_new(fa.powf(fb)));
@@ -424,7 +479,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // happily returns a wrapped result when the VALUE overflows (e.g.
     // `(10**18) << 4`). Detect real value overflow by computing the shift
     // in BigInt and demoting to i64 only when the result fits.
-    let big = BigInt::from(va) << (vb as usize);
+    let big = bigint_lshift(BigInt::from(va), vb as usize);
     Ok(bigint_result(big))
 }
 
@@ -440,20 +495,20 @@ unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
-    if vb < BigInt::from(0) {
+    if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
     let shift = vb.to_u32().unwrap_or(u32::MAX);
-    Ok(bigint_result(as_bigint(a) << shift))
+    Ok(bigint_result(bigint_lshift(as_bigint(a), shift as usize)))
 }
 
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_bigint(b);
-    if vb < BigInt::from(0) {
+    if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
     let shift = vb.to_u32().unwrap_or(u32::MAX);
-    Ok(bigint_result(as_bigint(a) >> shift))
+    Ok(bigint_result(bigint_rshift(as_bigint(a), shift as usize)))
 }
 
 // ── bool-as-int helpers ──────────────────────────────────────────────
@@ -1320,27 +1375,30 @@ pub(crate) fn try_int_long_pow_with_modulo(
         let exp = crate::builtins::obj_to_bigint(exp);
         let modulus = crate::builtins::obj_to_bigint(modulus);
 
-        if modulus == BigInt::from(0) {
+        if bigint_eq(modulus.clone(), BigInt::from(0)) {
             return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
         }
-        if exp < BigInt::from(0) {
+        if bigint_lt(exp.clone(), BigInt::from(0)) {
             return Err(PyError::type_error(
                 "pow() 2nd argument cannot be negative when 3rd argument specified",
             ));
         }
-        if exp == BigInt::from(0) {
-            return Ok(Some(box_bigint_result(BigInt::from(1) % modulus)));
+        if bigint_eq(exp.clone(), BigInt::from(0)) {
+            return Ok(Some(box_bigint_result(bigint_mod(
+                BigInt::from(1),
+                modulus,
+            ))));
         }
 
-        let negative_modulus = modulus < BigInt::from(0);
+        let negative_modulus = bigint_lt(modulus.clone(), BigInt::from(0));
         let abs_modulus = if negative_modulus {
-            -modulus.clone()
+            bigint_neg(modulus.clone())
         } else {
             modulus.clone()
         };
         let mut result = base.modpow(&exp, &abs_modulus);
-        if negative_modulus && result > BigInt::from(0) {
-            result -= abs_modulus;
+        if negative_modulus && bigint_gt(result.clone(), BigInt::from(0)) {
+            result = bigint_sub(result, abs_modulus);
         }
         Ok(Some(box_bigint_result(result)))
     }
@@ -2168,7 +2226,7 @@ pub fn is_true(obj: PyObjectRef) -> bool {
             return w_int_get_value(obj) != 0;
         }
         if is_long(obj) {
-            return *w_long_get_value(obj) != BigInt::from(0);
+            return !bigint_eq(w_long_get_value(obj).clone(), BigInt::from(0));
         }
         if is_float(obj) {
             return w_float_get_value(obj) != 0.0;
@@ -2264,11 +2322,11 @@ pub fn neg(a: PyObjectRef) -> PyResult {
             let v = int_value(a);
             return match v.checked_neg() {
                 Some(r) => Ok(w_int_new(r)),
-                None => Ok(w_long_new(-BigInt::from(v))),
+                None => Ok(w_long_new(bigint_neg(BigInt::from(v)))),
             };
         }
         if is_long(a) {
-            return Ok(bigint_result(-w_long_get_value(a).clone()));
+            return Ok(bigint_result(bigint_neg(w_long_get_value(a).clone())));
         }
         if is_float(a) {
             return Ok(w_float_new(-w_float_get_value(a)));
@@ -2298,7 +2356,7 @@ pub fn invert(a: PyObjectRef) -> PyResult {
             return Ok(w_int_new(!int_value(a)));
         }
         if is_long(a) {
-            return Ok(bigint_result(!w_long_get_value(a).clone()));
+            return Ok(bigint_result(bigint_invert(w_long_get_value(a).clone())));
         }
         if let Some(result) = try_instance_unaryop(a, "__invert__") {
             return result;

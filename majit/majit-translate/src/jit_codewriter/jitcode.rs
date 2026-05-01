@@ -738,6 +738,14 @@ pub struct SwitchDictDescr {
     pub dict: std::collections::HashMap<i64, usize>,
     /// RPython `attach`: sorted ConstInt keys for replay/serialization.
     pub const_keys_in_order: Vec<i64>,
+    /// `True` once `attach` has run, even if the supplied `as_dict` was
+    /// empty.  RPython distinguishes the two states via attribute
+    /// presence: `getattr(self, 'dict', '?')` returns `'?'` only when
+    /// `attach` never set `self.dict`, while an attached empty dict
+    /// renders as `{}`.  Pyre's `dict` field is always present (default
+    /// `HashMap::new()`), so we carry an explicit flag to keep the
+    /// repr distinction intact.
+    attached: bool,
 }
 
 impl SwitchDictDescr {
@@ -747,12 +755,42 @@ impl SwitchDictDescr {
         keys.sort();
         self.const_keys_in_order = keys;
         self.dict = as_dict;
+        self.attached = true;
     }
 }
 
 impl std::fmt::Display for SwitchDictDescr {
+    /// RPython `jitcode.py:138-140`:
+    ///
+    /// ```python
+    /// def __repr__(self):
+    ///     dict = getattr(self, 'dict', '?')
+    ///     return '<SwitchDictDescr %s>' % (dict,)
+    /// ```
+    ///
+    /// `attach` populates `as_dict` in `_labels` insertion order
+    /// (`assembler.py:258-263`), and `_labels` itself is the
+    /// post-`switches.sort(key=lambda link: link.llexitcase)` order
+    /// from `flatten.py:274`. Iterate `const_keys_in_order` so the
+    /// rendered dict matches Python's repr in sorted-key order.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<SwitchDictDescr {:?}>", self.dict)
+        if !self.attached {
+            // RPython `getattr(self, 'dict', '?')` falls back to '?'
+            // only when `attach` has not run.  An attached empty dict
+            // renders as `{}` below, mirroring Python's `repr({})`.
+            return write!(f, "<SwitchDictDescr ?>");
+        }
+        f.write_str("<SwitchDictDescr {")?;
+        for (i, key) in self.const_keys_in_order.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match self.dict.get(key) {
+                Some(target) => write!(f, "{key}: {target}")?,
+                None => write!(f, "{key}: ?")?,
+            }
+        }
+        f.write_str("}>")
     }
 }
 
@@ -1297,8 +1335,11 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                     .collect();
                 writeln!(out, "  -live- {}", regs.join(", ")).ok();
             }
-            FlatOp::Unreachable => {
+            FlatOp::EndOfBlock => {
                 writeln!(out, "  ---").ok();
+            }
+            FlatOp::Unreachable => {
+                writeln!(out, "  unreachable").ok();
             }
             FlatOp::Op(space_op) => {
                 let result = space_op
@@ -1347,6 +1388,20 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
                     kind_char(*cond),
                     cond.0,
                     target.0
+                )
+                .ok();
+            }
+            FlatOp::Switch { value, targets } => {
+                let cases: Vec<String> = targets
+                    .iter()
+                    .map(|(key, label)| format!("{key}:L{}", label.0))
+                    .collect();
+                writeln!(
+                    out,
+                    "  switch %{}{}, <SwitchDictDescr {}>",
+                    kind_char(*value),
+                    value.0,
+                    cases.join(", ")
                 )
                 .ok();
             }
@@ -1409,4 +1464,46 @@ pub fn format_assembler(ssarepr: &crate::flatten::SSARepr) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_dict_descr_unattached_renders_question_mark() {
+        // RPython `jitcode.py:138 def __repr__(self): dict =
+        // getattr(self, 'dict', '?')` returns `'?'` only when
+        // `self.dict` attribute is missing entirely (i.e. `attach`
+        // never ran).  Pyre has to track the attach event explicitly
+        // because the `dict` field is always present (default empty
+        // HashMap); regression-guard the unattached branch so a
+        // future refactor cannot silently collapse it back to "empty
+        // implies unattached".
+        let descr = SwitchDictDescr::default();
+        assert_eq!(descr.to_string(), "<SwitchDictDescr ?>");
+    }
+
+    #[test]
+    fn switch_dict_descr_attached_empty_renders_empty_braces() {
+        // RPython `repr({}) == '{}'`, and an attached SwitchDictDescr
+        // whose `as_dict` was empty must render the same way to keep
+        // debug-output parity with upstream.  Without the
+        // `attached: bool` flag this state collapsed into the
+        // unattached `'?'` branch.
+        let mut descr = SwitchDictDescr::default();
+        descr.attach(std::collections::HashMap::new());
+        assert_eq!(descr.to_string(), "<SwitchDictDescr {}>");
+    }
+
+    #[test]
+    fn switch_dict_descr_attached_renders_sorted_dict() {
+        let mut descr = SwitchDictDescr::default();
+        let mut dict = std::collections::HashMap::new();
+        dict.insert(7, 30);
+        dict.insert(1, 10);
+        dict.insert(3, 20);
+        descr.attach(dict);
+        assert_eq!(descr.to_string(), "<SwitchDictDescr {1: 10, 3: 20, 7: 30}>");
+    }
 }

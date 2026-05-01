@@ -53,6 +53,11 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             | FlatOp::GotoIfNot { target: label, .. } => {
                 name_label(*label, &mut seenlabels, &mut next_label);
             }
+            FlatOp::Switch { targets, .. } => {
+                for (_, label) in targets {
+                    name_label(*label, &mut seenlabels, &mut next_label);
+                }
+            }
             _ => {}
         }
     }
@@ -62,7 +67,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
     //   if insns and insns[-1] == ('---',):
     //       insns = insns[:-1]
     let insns: &[FlatOp] = match ssarepr.insns.last() {
-        Some(FlatOp::Unreachable) => &ssarepr.insns[..ssarepr.insns.len() - 1],
+        Some(FlatOp::EndOfBlock) => &ssarepr.insns[..ssarepr.insns.len() - 1],
         _ => &ssarepr.insns[..],
     };
 
@@ -111,6 +116,21 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     out,
                     "{prefix}goto_if_not {}, L{num}",
                     register_repr(*cond, &ssarepr.value_kinds)
+                );
+            }
+            FlatOp::Switch { value, targets } => {
+                let cases: Vec<String> = targets
+                    .iter()
+                    .map(|(key, label)| {
+                        let num = name_label(*label, &mut seenlabels, &mut next_label);
+                        format!("{key}:L{num}")
+                    })
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "{prefix}switch {}, <SwitchDictDescr {}>",
+                    register_repr(*value, &ssarepr.value_kinds),
+                    cases.join(", ")
                 );
             }
             FlatOp::IntBinOpJumpIfOvf {
@@ -222,8 +242,11 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                     linkarg_repr(v, &ssarepr.value_kinds)
                 );
             }
-            FlatOp::Unreachable => {
+            FlatOp::EndOfBlock => {
                 let _ = writeln!(out, "{prefix}---");
+            }
+            FlatOp::Unreachable => {
+                let _ = writeln!(out, "{prefix}unreachable");
             }
         }
     }
@@ -658,19 +681,34 @@ mod tests {
     }
 
     #[test]
-    fn format_unreachable_marker() {
+    fn format_switch_uses_switchdictdescr_repr() {
         let mut ssa = empty_ssa();
-        ssa.insns.push(FlatOp::Unreachable);
+        ssa.value_kinds.insert(ValueId(0), RegKind::Int);
+        ssa.insns.push(FlatOp::Switch {
+            value: ValueId(0),
+            targets: vec![(4, Label(2)), (5, Label(1))],
+        });
+        let text = format_assembler(&ssa);
+        assert!(
+            text.contains("switch %i0, <SwitchDictDescr 4:L1, 5:L2>"),
+            "unexpected switch format: {text}"
+        );
+    }
+
+    #[test]
+    fn format_end_of_block_marker() {
+        let mut ssa = empty_ssa();
+        ssa.insns.push(FlatOp::EndOfBlock);
         let text = format_assembler(&ssa);
         // format.py:54-55 trims a trailing ('---',) sentinel.
         assert_eq!(text, "");
     }
 
     #[test]
-    fn format_unreachable_in_middle_is_kept() {
+    fn format_end_of_block_in_middle_is_kept() {
         // Trim only when `---` is the last instruction (format.py:54-55).
         let mut ssa = empty_ssa();
-        ssa.insns.push(FlatOp::Unreachable);
+        ssa.insns.push(FlatOp::EndOfBlock);
         ssa.insns.push(FlatOp::Jump(Label(0)));
         let text = format_assembler(&ssa);
         assert!(text.contains("---"));
@@ -682,7 +720,7 @@ mod tests {
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Jump(Label(0)));
         ssa.insns.push(FlatOp::Label(Label(0)));
-        ssa.insns.push(FlatOp::Unreachable);
+        ssa.insns.push(FlatOp::EndOfBlock);
         assert_format(
             &ssa,
             "

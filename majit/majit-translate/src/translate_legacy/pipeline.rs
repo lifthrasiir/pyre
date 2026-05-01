@@ -111,21 +111,49 @@ pub fn analyze_program(
     program: &crate::front::SemanticProgram,
     config: &PipelineConfig,
 ) -> ProgramPipelineResult {
-    let mut functions = Vec::new();
+    analyze_program_filtered(&program.functions, config, |_| true)
+}
+
+/// Run the full pipeline on a filtered subset of functions.
+///
+/// RPython parity: `RPythonAnnotator.build_types(entry_point, args)` only
+/// annotates / rtypes / lowers functions reachable from `entry_point` via
+/// the call graph; unreachable helpers stay outside the translator
+/// (`translator/translator.py:55 buildflowgraph` is invoked from BFS in
+/// `annrpython.py:215 schedule_pending`).  Pyre's pre-cutover whole-
+/// program iteration was a deviation: it dragged runtime-only resume
+/// helpers (`materialize_virtual_from_rd`, `replay_pending_fields`)
+/// through annotator → rtyper → flatten even though no JIT trace ever
+/// reaches them, surfacing strict typing failures the JIT does not
+/// actually need.  The filter closure lets the canonical caller pass a
+/// `CallControl::is_candidate`-driven test so legacy_pipeline iterates
+/// the same BFS-reachable set the canonical jitcode emitter consumes.
+pub fn analyze_program_filtered<F>(
+    functions: &[crate::front::SemanticFunction],
+    config: &PipelineConfig,
+    keep: F,
+) -> ProgramPipelineResult
+where
+    F: Fn(&crate::front::SemanticFunction) -> bool,
+{
+    let mut analyzed = Vec::new();
     let mut total_blocks = 0;
     let mut total_ops = 0;
     let mut total_vable_rewrites = 0;
 
-    for func in &program.functions {
+    for func in functions {
+        if !keep(func) {
+            continue;
+        }
         let result = analyze_function(func, config);
         total_blocks += result.original_blocks;
         total_ops += result.flattened.insns.len();
         total_vable_rewrites += result.vable_rewrites;
-        functions.push(result);
+        analyzed.push(result);
     }
 
     ProgramPipelineResult {
-        functions,
+        functions: analyzed,
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
         jitcodes_by_path: std::collections::HashMap::new(),

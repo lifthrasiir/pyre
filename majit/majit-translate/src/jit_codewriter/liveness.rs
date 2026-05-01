@@ -113,9 +113,16 @@ fn compute_liveness_pass(
                     live_values: alive.iter().copied().collect(),
                 };
             }
-            FlatOp::Unreachable => {
-                // RPython: '---' resets the alive set.
+            FlatOp::EndOfBlock => {
+                // RPython `liveness.py:55-57`: `'---'` resets the alive set.
                 alive.clear();
+            }
+            FlatOp::Unreachable => {
+                // RPython `unreachable` is just an opcode (no operands)
+                // and goes through `liveness.py:59+`'s args-loop with
+                // an empty arg list, so the alive set is unchanged.
+                // The trailing `---` (always emitted right after) is
+                // what resets it.
             }
             FlatOp::Op(inner_op) => {
                 // Result is defined here — remove from alive
@@ -151,6 +158,14 @@ fn compute_liveness_pass(
                 alive.insert(cond);
                 if let Some(alive_at_target) = label2alive.get(&target) {
                     alive.extend(alive_at_target.iter());
+                }
+            }
+            FlatOp::Switch { value, targets } => {
+                alive.insert(*value);
+                for (_, target) in targets {
+                    if let Some(alive_at_target) = label2alive.get(target) {
+                        alive.extend(alive_at_target.iter());
+                    }
                 }
             }
             FlatOp::IntBinOpJumpIfOvf {

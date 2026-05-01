@@ -1715,7 +1715,7 @@ fn return_type_string_to_kind(s: &str) -> char {
     match s {
         "" | "()" => 'v',
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
-        | "bool" => 'i',
+        | "bool" | "char" | "Self::Truth" => 'i',
         "f32" | "f64" => 'f',
         _ => 'r',
     }
@@ -1778,7 +1778,8 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
     match s.map(String::as_str) {
         None | Some("") | Some("()") => Type::Void,
         Some("i8") | Some("i16") | Some("i32") | Some("i64") | Some("isize") | Some("u8")
-        | Some("u16") | Some("u32") | Some("u64") | Some("usize") | Some("bool") => Type::Int,
+        | Some("u16") | Some("u32") | Some("u64") | Some("usize") | Some("bool") | Some("char")
+        | Some("Self::Truth") => Type::Int,
         Some("f32") | Some("f64") => Type::Float,
         _ => Type::Ref,
     }

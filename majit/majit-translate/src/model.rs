@@ -776,6 +776,21 @@ impl Link {
         self
     }
 
+    /// Structural counterpart of RPython rtyper's
+    /// `convert_link()` (`rtyper.py:1338`): copy the flow-level
+    /// `exitcase` into the low-level `llexitcase` slot for primitive
+    /// branch values.  The `"default"` switch sentinel is not a
+    /// low-level case and stays `None`.
+    pub fn with_llexitcase_from_exitcase(mut self) -> Self {
+        self.llexitcase = match &self.exitcase {
+            Some(ExitCase::Bool(value)) => Some(ConstValue::Bool(*value)),
+            Some(ExitCase::Const(value)) if value.string_eq("default") => None,
+            Some(ExitCase::Const(value)) => Some(value.clone()),
+            None => None,
+        };
+        self
+    }
+
     pub fn extravars(
         mut self,
         last_exception: Option<LinkArg>,
@@ -1139,8 +1154,10 @@ impl FunctionGraph {
             block,
             Some(ExitSwitch::Value(cond)),
             vec![
-                Link::new(false_args, if_false, Some(ExitCase::Bool(false))),
-                Link::new(true_args, if_true, Some(ExitCase::Bool(true))),
+                Link::new(false_args, if_false, Some(ExitCase::Bool(false)))
+                    .with_llexitcase_from_exitcase(),
+                Link::new(true_args, if_true, Some(ExitCase::Bool(true)))
+                    .with_llexitcase_from_exitcase(),
             ],
         );
     }

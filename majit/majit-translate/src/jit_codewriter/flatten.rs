@@ -43,6 +43,14 @@ pub enum FlatOp {
     /// There is NO goto_if_true — RPython only uses goto_if_not.
     /// The true path is always the fallthrough.
     GotoIfNot { cond: ValueId, target: Label },
+    /// RPython `flatten.py:278-308` integer switch:
+    /// `('switch', value, SwitchDictDescr)` after a preceding `-live-`.
+    /// The default path is the fall-through after the switch op; each
+    /// `(key, label)` entry jumps to the corresponding case landing pad.
+    Switch {
+        value: ValueId,
+        targets: Vec<(i64, Label)>,
+    },
     /// RPython `flatten.py:190-197`
     /// `int_add_jump_if_ovf` / `int_sub_jump_if_ovf` / `int_mul_jump_if_ovf`.
     IntBinOpJumpIfOvf {
@@ -122,8 +130,20 @@ pub enum FlatOp {
     /// final block: emit `raise` on the `evalue` (second inputarg).
     /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
     Raise(LinkArg),
-    /// Unreachable marker — marks the end of a code path.
-    /// RPython: `---` operation. Resets the alive set in liveness analysis.
+    /// RPython `flatten.py:146` / `:238` / `:293` `emitline('---')`.
+    /// End-of-block marker placed after every terminator (return /
+    /// raise / reraise / unreachable / goto-back-to-seen-block).
+    /// Resets the alive set in liveness analysis (`liveness.py:55-57`)
+    /// and is skipped during bytecode emission
+    /// (`assembler.py:141-142`).
+    EndOfBlock,
+    /// RPython `flatten.py:292` `emitline("unreachable")` and
+    /// `blackhole.py:962-964` `bhimpl_unreachable()`.
+    ///
+    /// Emitted after a switch with no `default` exit so that an
+    /// unmatched switch value lands on a real opcode that raises
+    /// `AssertionError`. Distinct from [`FlatOp::EndOfBlock`] which
+    /// is a placement separator and emits no bytecode.
     Unreachable,
 }
 
@@ -152,6 +172,66 @@ pub struct SSARepr {
     /// the position when set.  `None` when the SSARepr has not yet been
     /// assembled, matching upstream's `if ssarepr._insns_pos:` guard.
     pub insns_pos: Option<Vec<usize>>,
+}
+
+fn is_bool_branch(block: &crate::model::Block) -> bool {
+    if !matches!(block.exitswitch, Some(ExitSwitch::Value(_))) || block.exits.len() != 2 {
+        return false;
+    }
+    // RPython `flatten.py:244-246` accepts both orderings: `linkfalse,
+    // linktrue = block.exits` followed by an `if linkfalse.llexitcase
+    // == True: linkfalse, linktrue = linktrue, linkfalse` swap.
+    let cases = (
+        bool_llexitcase(&block.exits[0]),
+        bool_llexitcase(&block.exits[1]),
+    );
+    matches!(cases, (Some(false), Some(true)) | (Some(true), Some(false)),)
+}
+
+fn bool_llexitcase(link: &Link) -> Option<bool> {
+    match link.llexitcase.as_ref() {
+        Some(ConstValue::Bool(value)) => return Some(*value),
+        Some(_) => return None,
+        None => {}
+    }
+    // Structural adaptation for direct semantic graphs that have not
+    // gone through the Rust rtyper analogue yet.  RPython's codewriter
+    // path reads `link.llexitcase` here.
+    match &link.exitcase {
+        Some(ExitCase::Bool(value)) => Some(*value),
+        Some(ExitCase::Const(ConstValue::Bool(value))) => Some(*value),
+        _ => None,
+    }
+}
+
+fn is_default_exitcase(exitcase: &Option<ExitCase>) -> bool {
+    matches!(
+        exitcase,
+        Some(ExitCase::Const(value)) if value.string_eq("default")
+    )
+}
+
+fn signed_switch_key(value: &ConstValue) -> Option<i64> {
+    match value {
+        ConstValue::Int(value) => Some(*value),
+        ConstValue::Bool(value) => Some(i64::from(*value)),
+        _ => None,
+    }
+}
+
+fn switch_llexitcase_key(link: &Link) -> Option<i64> {
+    if let Some(llexitcase) = &link.llexitcase {
+        return signed_switch_key(llexitcase);
+    }
+    // Structural adaptation for the Rust front-end's semantic graphs:
+    // RPython's rtyper has already materialized `link.llexitcase`
+    // before `flatten.py:274,296-298`, but direct front-end tests and
+    // narrow graph builders can still carry the low-level integer only
+    // in `exitcase`.
+    match &link.exitcase {
+        Some(ExitCase::Const(value)) => signed_switch_key(value),
+        _ => None,
+    }
 }
 
 /// Flatten a FunctionGraph into a linear instruction sequence.
@@ -286,19 +366,24 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                     }
                     if !catches_all {
                         ops.push(FlatOp::Reraise);
-                        ops.push(FlatOp::Unreachable);
+                        ops.push(FlatOp::EndOfBlock);
                     }
                 }
             }
-        } else if block.exits.len() == 2 && matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+        } else if is_bool_branch(block) {
             let cond = match block.exitswitch {
                 Some(ExitSwitch::Value(cond)) => cond,
                 _ => unreachable!(),
             };
-            let linkfalse = &block.exits[0];
-            let linktrue = &block.exits[1];
-            debug_assert_eq!(linkfalse.exitcase, Some(ExitCase::Bool(false)));
-            debug_assert_eq!(linktrue.exitcase, Some(ExitCase::Bool(true)));
+            // RPython `flatten.py:244-246`:
+            //   linkfalse, linktrue = block.exits
+            //   if linkfalse.llexitcase == True:
+            //       linkfalse, linktrue = linktrue, linkfalse
+            let (linkfalse, linktrue) = if bool_llexitcase(&block.exits[0]) == Some(true) {
+                (&block.exits[1], &block.exits[0])
+            } else {
+                (&block.exits[0], &block.exits[1])
+            };
 
             // RPython flatten.py:259: -live- before goto_if_not.
             ops.push(FlatOp::Live {
@@ -319,6 +404,67 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             // + make_link(linkfalse).
             ops.push(FlatOp::Label(false_landing));
             make_link(graph, &mut ops, &block_labels, linkfalse, regallocs);
+        } else if block.exits.len() >= 2 && matches!(block.exitswitch, Some(ExitSwitch::Value(_))) {
+            let cond = match block.exitswitch {
+                Some(ExitSwitch::Value(cond)) => cond,
+                _ => unreachable!(),
+            };
+            let kind = value_kind(cond, regallocs);
+            assert_eq!(kind, 'i', "switch exitswitch must be int");
+            let default_link = block
+                .exits
+                .last()
+                .filter(|link| is_default_exitcase(&link.exitcase));
+            let mut switches: Vec<(i64, &Link)> = Vec::new();
+            for link in &block.exits {
+                if !is_default_exitcase(&link.exitcase) {
+                    let key = switch_llexitcase_key(link).unwrap_or_else(|| {
+                        panic!(
+                            "unsupported switch llexitcase {:?} (exitcase {:?}) in block {:?}",
+                            link.llexitcase, link.exitcase, block.id
+                        )
+                    });
+                    switches.push((key, link));
+                }
+            }
+            switches.sort_by_key(|(key, _)| *key);
+            let mut targets = Vec::with_capacity(switches.len());
+            for (key, _) in &switches {
+                let landing = Label(next_label);
+                next_label += 1;
+                targets.push((*key, landing));
+            }
+
+            // RPython `flatten.py:302`: `-live-` before `switch` so the
+            // guard_value path can reconstruct state.
+            ops.push(FlatOp::Live {
+                live_values: Vec::new(),
+            });
+            ops.push(FlatOp::Switch {
+                value: cond,
+                targets: targets.clone(),
+            });
+
+            if let Some(link) = default_link {
+                make_link(graph, &mut ops, &block_labels, link, regallocs);
+            } else {
+                // RPython `flatten.py:292-293`:
+                //     self.emitline("unreachable")
+                //     self.emitline("---")
+                // The real `unreachable` opcode raises `AssertionError`
+                // at runtime if the switch value matches no key; the
+                // `---` resets liveness past this point.
+                ops.push(FlatOp::Unreachable);
+                ops.push(FlatOp::EndOfBlock);
+            }
+
+            for ((_, link), (_, landing)) in switches.into_iter().zip(targets.into_iter()) {
+                ops.push(FlatOp::Label(landing));
+                ops.push(FlatOp::Live {
+                    live_values: Vec::new(),
+                });
+                make_link(graph, &mut ops, &block_labels, link, regallocs);
+            }
         } else if block.exits.is_empty() {
             // RPython `flatten.py:106-109` `make_bytecode_block`:
             //   if block.exits == (): self.make_return(block.inputargs)
@@ -373,6 +519,9 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
             }
             FlatOp::GotoIfNot {
                 cond: ValueId(c), ..
+            }
+            | FlatOp::Switch {
+                value: ValueId(c), ..
             } => {
                 max_value = max_value.max(*c + 1);
             }
@@ -591,7 +740,7 @@ fn make_return(
         other => panic!("make_return: unexpected final-block inputarg count {other}"),
     }
     // RPython `flatten.py:146` `emitline('---')`.
-    ops.push(FlatOp::Unreachable);
+    ops.push(FlatOp::EndOfBlock);
 }
 
 fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
@@ -719,7 +868,7 @@ fn make_exception_link(
         } else {
             ops.push(FlatOp::Reraise);
         }
-        ops.push(FlatOp::Unreachable);
+        ops.push(FlatOp::EndOfBlock);
         return;
     }
     make_link(graph, ops, block_labels, link, regallocs);
@@ -1149,6 +1298,156 @@ mod tests {
     }
 
     #[test]
+    fn flatten_bool_branch_orders_by_llexitcase() {
+        let mut graph = FunctionGraph::new("branch_llexitcase");
+        let entry = graph.startblock;
+        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let true_block = graph.create_block();
+        let false_block = graph.create_block();
+        graph.set_return(true_block, None);
+        graph.set_return(false_block, None);
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(cond)),
+            vec![
+                Link::new(Vec::new(), true_block, Some(ExitCase::Bool(false)))
+                    .with_llexitcase(ConstValue::Bool(true)),
+                Link::new(Vec::new(), false_block, Some(ExitCase::Bool(true)))
+                    .with_llexitcase(ConstValue::Bool(false)),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(8));
+        let goto_idx = flat
+            .insns
+            .iter()
+            .position(|op| matches!(op, FlatOp::GotoIfNot { .. }))
+            .expect("bool branch must emit goto_if_not");
+        assert!(
+            matches!(flat.insns.get(goto_idx + 1), Some(FlatOp::Jump(Label(1)))),
+            "true fallthrough path must follow link.llexitcase, not flow-level exitcase: {:?}",
+            flat.insns
+        );
+    }
+
+    #[test]
+    fn flatten_integer_switch_emits_switch_op() {
+        let mut graph = FunctionGraph::new("switch");
+        let entry = graph.startblock;
+        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let case0 = graph.create_block();
+        let case1 = graph.create_block();
+        let default = graph.create_block();
+        graph.set_return(case0, None);
+        graph.set_return(case1, None);
+        graph.set_return(default, None);
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(cond)),
+            vec![
+                Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
+                    .with_llexitcase(ConstValue::Int(0)),
+                Link::new_mixed(Vec::new(), case1, Some(ExitCase::Const(ConstValue::Int(1))))
+                    .with_llexitcase(ConstValue::Int(1)),
+                Link::new_mixed(
+                    Vec::new(),
+                    default,
+                    Some(ExitCase::Const(ConstValue::byte_str("default"))),
+                ),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(8));
+        assert!(
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::Switch { value, targets }
+                    if *value == cond && targets.iter().map(|(key, _)| *key).collect::<Vec<_>>() == vec![0, 1]
+            )),
+            "integer switch should emit a Switch op: {:?}",
+            flat.insns
+        );
+    }
+
+    #[test]
+    fn flatten_integer_switch_sorts_and_keys_by_llexitcase() {
+        let mut graph = FunctionGraph::new("switch_llexitcase");
+        let entry = graph.startblock;
+        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let case_lowlevel_2 = graph.create_block();
+        let case_lowlevel_1 = graph.create_block();
+        graph.set_return(case_lowlevel_2, None);
+        graph.set_return(case_lowlevel_1, None);
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(cond)),
+            vec![
+                Link::new_mixed(
+                    Vec::new(),
+                    case_lowlevel_2,
+                    Some(ExitCase::Const(ConstValue::Int(10))),
+                )
+                .with_llexitcase(ConstValue::Int(2)),
+                Link::new_mixed(
+                    Vec::new(),
+                    case_lowlevel_1,
+                    Some(ExitCase::Const(ConstValue::Int(20))),
+                )
+                .with_llexitcase(ConstValue::Int(1)),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(8));
+        assert!(
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::Switch { targets, .. }
+                    if targets.iter().map(|(key, _)| *key).collect::<Vec<_>>() == vec![1, 2]
+            )),
+            "switch keys must come from sorted link.llexitcase, not flow-level exitcase: {:?}",
+            flat.insns
+        );
+    }
+
+    #[test]
+    fn flatten_integer_zero_one_switch_is_not_bool_branch() {
+        let mut graph = FunctionGraph::new("switch_zero_one");
+        let entry = graph.startblock;
+        let cond = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let case0 = graph.create_block();
+        let case1 = graph.create_block();
+        graph.set_return(case0, None);
+        graph.set_return(case1, None);
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(cond)),
+            vec![
+                Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
+                    .with_llexitcase(ConstValue::Int(0)),
+                Link::new_mixed(Vec::new(), case1, Some(ExitCase::Const(ConstValue::Int(1))))
+                    .with_llexitcase(ConstValue::Int(1)),
+            ],
+        );
+
+        let flat = flatten(&graph, &identity_regallocs(8));
+        assert!(
+            flat.insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::Switch { .. })),
+            "integer 0/1 switch must stay a switch/id, not collapse to goto_if_not: {:?}",
+            flat.insns
+        );
+        assert!(
+            !flat
+                .insns
+                .iter()
+                .any(|op| matches!(op, FlatOp::GotoIfNot { .. })),
+            "integer 0/1 switch must not use the bool-branch lowering: {:?}",
+            flat.insns
+        );
+    }
+
+    #[test]
     fn flatten_while_loop_has_back_edge() {
         let mut graph = FunctionGraph::new("loop");
         let entry = graph.startblock;
@@ -1394,7 +1693,7 @@ mod tests {
             "final exceptblock should emit -live- before raise"
         );
         assert!(
-            matches!(flat.insns.get(raise_idx + 1), Some(FlatOp::Unreachable)),
+            matches!(flat.insns.get(raise_idx + 1), Some(FlatOp::EndOfBlock)),
             "raise should still terminate with ---"
         );
     }

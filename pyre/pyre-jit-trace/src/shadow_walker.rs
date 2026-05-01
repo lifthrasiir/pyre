@@ -110,6 +110,21 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             | Instruction::Resume { .. }
             | Instruction::Cache
             | Instruction::NotTaken
+            // PopTop is the first non-Nop-family entry: the codewriter
+            // arm wraps the helper in `inline_call_r_r/dR>r` to a
+            // pop_top sub-jitcode followed by a `live/ ;
+            // catch_exception/L ; goto/L ; reraise/ ; ref_return/r ;
+            // live/ ; raise/r ; ref_return/r` skeleton.  Every opname
+            // in that arm has a matching `dispatch_via_miframe`
+            // handler (`inline_call_r_r/dR>r` recurses into the
+            // sub-jitcode, `catch_exception/L` / `ref_return/r` /
+            // `raise/r` / `reraise/` / `live/` / `goto/L` all have
+            // entries in `jitcode_dispatch.rs`'s op table).  Trait
+            // dispatch runs `executor.pop_top()?; Ok(StepResult::
+            // Continue)` and the recorder records the same sub-jitcode
+            // body the walker dispatches into, so the two paths
+            // produce identical IR slices.
+            | Instruction::PopTop
     )
 }
 
