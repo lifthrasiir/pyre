@@ -4572,7 +4572,7 @@ impl MIFrame {
                 }
             }
         }
-        self.trace_call_callable(list, &[])
+        self.trace_call_callable(callable, &[])
     }
 
     pub(crate) fn concrete_iter_continues(
