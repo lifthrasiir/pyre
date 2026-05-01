@@ -25,5 +25,5 @@ malachite-bigint = { workspace = true }
 num-traits = { workspace = true }
 num-integer = { workspace = true }
 pymath = { version = "0.2.0", features = ["malachite-bigint"] }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "a693a0c8aa41ad88772fe2f3713cd99cda7e12c6" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "e79df4a6fb788eb8c0c8ea823621e175396612e5" }
 libc = "0.2"
