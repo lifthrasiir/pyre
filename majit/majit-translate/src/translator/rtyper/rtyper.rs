@@ -4554,6 +4554,34 @@ impl LowLevelOpList {
         })
     }
 
+    /// PyPy parity proxy for upstream's `llops.gendirectcall(ll_function,
+    /// *args)` shape. Upstream callers (e.g. `rstr.py:812,820 convert_from_to`)
+    /// hand `gendirectcall` a host Python helper function and let the
+    /// `LowLevelOpList` consult its own `self.rtyper` internally to
+    /// annotate and resolve the helper graph. Pyre cannot annotate Python
+    /// source at this stage of the port (the host helper objects do not
+    /// exist), so the helper graph is built explicitly through a
+    /// `builder` closure.
+    ///
+    /// Routing the build through `LowLevelOpList` instead of asking
+    /// callers to dance through `llops.require_rtyper(...)?
+    /// .lowlevel_helper_function_with_builder(...)` keeps the upstream
+    /// caller-side shape intact: `pair_*` conversions and other
+    /// `convert_from_to` ports never touch `llops.rtyper` directly.
+    pub fn lowlevel_helper_function_with_builder<F>(
+        &self,
+        name: impl Into<String>,
+        args: Vec<LowLevelType>,
+        result: LowLevelType,
+        builder: F,
+    ) -> Result<LowLevelFunction, TyperError>
+    where
+        F: FnOnce(&RPythonTyper, &[LowLevelType], &LowLevelType) -> Result<PyGraph, TyperError>,
+    {
+        let rtyper = self.require_rtyper("lowlevel_helper_function_with_builder")?;
+        rtyper.lowlevel_helper_function_with_builder(name, args, result, builder)
+    }
+
     /// RPython `LowLevelOpList.hasparentgraph(self)` (rtyper.py:800-801).
     pub fn hasparentgraph(&self) -> bool {
         self.originalblock.is_some()

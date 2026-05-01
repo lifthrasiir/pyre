@@ -90,7 +90,16 @@ pub(crate) const BC_REF_GUARD_VALUE: u8 = 85;
 /// pyjitpl.py opimpl_float_guard_value: promote float to constant via GUARD_VALUE.
 pub(crate) const BC_FLOAT_GUARD_VALUE: u8 = 86;
 /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
+/// `iIRFIRF` form: jdindex byte is a `registers_i` pool slot index
+/// (assembler.py:106-107 emit_const default path when `allow_short=False`
+/// or value > 127).
 pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
+/// `cIRFIRF` form of `bhimpl_jit_merge_point` selected by
+/// assembler.py:312 `USE_C_FORM` membership when jdindex fits in
+/// `signed i8` (`-128..=127`). The jdindex byte is the raw signed
+/// value (assembler.py:99-107 emit_const short branch +
+/// blackhole.py:121-123 `argcode == 'c'` handler reads `signedord`).
+pub(crate) const BC_JIT_MERGE_POINT_C: u8 = 131;
 pub const BC_LIVE: u8 = 88;
 pub const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
@@ -305,10 +314,16 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     // flatten.py:347 emits `last_exc_value, '->', reg`, so
     // assembler.py grows the canonical key `last_exc_value/>r`.
     m.insert("last_exc_value/>r", BC_LAST_EXC_VALUE);
-    // pyre codewriter emits the portal subset of
-    // `jit_merge_point`: green-int list, green-ref list, red-ref list.
-    // The canonical SSA key is therefore `jit_merge_point/IRR`.
-    m.insert("jit_merge_point/IRR", BC_JIT_MERGE_POINT);
+    // assembler.py:163,181-220 builds the canonical key from the full
+    // 7-arg shape (`jdindex + I/R/F + I/R/F`). assembler.py:312 places
+    // `jit_merge_point` in `USE_C_FORM`, so the jdindex argcode is `c`
+    // when the value fits in a signed byte and `i` (constants-pool
+    // slot index) otherwise. Both forms reach the same
+    // `bhimpl_jit_merge_point` (blackhole.py:1066) because the
+    // `@arguments("i", ...)` decoder dispatches on the runtime argcode
+    // (blackhole.py:113-123 `argtype == 'i'` branch).
+    m.insert("jit_merge_point/cIRFIRF", BC_JIT_MERGE_POINT_C);
+    m.insert("jit_merge_point/iIRFIRF", BC_JIT_MERGE_POINT);
     // jtransform.py:292-313 / 1672-1688 conditional/known-result family
     // intentionally omitted. The helper-side `BC_COND_CALL_*` /
     // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags

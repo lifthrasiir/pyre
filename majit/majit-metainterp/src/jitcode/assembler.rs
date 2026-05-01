@@ -66,6 +66,24 @@ pub struct JitCodeBuilder {
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
+    /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
+    /// per-instruction result-kind char keyed by end-of-instruction
+    /// position (`assembler.py:217-219`).  Consumed by
+    /// `pyjitpl.py:264 make_result_of_lastop` as a non-translated
+    /// debug-only type check; pyre fires the same assertion in
+    /// `MIFrame::make_result_of_lastop` (`frame.rs`).
+    ///
+    /// Populated as the LAST step of every typed-result emit helper
+    /// — pyre's encoding writes operands AFTER the opcode byte, so
+    /// `self.code.len()` after the last `push_u*` call equals the
+    /// end-of-instruction position the reader sees as `frame.pc`.
+    resulttypes: std::collections::HashMap<usize, char>,
+    /// Pending result-kind for a generic `write_insn("...>X")` call.
+    /// RPython records the kind after all operands have been emitted
+    /// (`assembler.py:217-219`).  In this builder the opcode helper
+    /// runs before operands are pushed, so we defer recording until the
+    /// next instruction starts or `finish()` seals the code.
+    pending_resulttype: Option<char>,
     has_abort: bool,
     /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`. RPython hands
     /// `fnaddr` to `JitCode.__init__` *before* the assembler fills the
@@ -298,6 +316,7 @@ impl JitCodeBuilder {
         self.start_instr(jitcode::BC_GETFIELD_VABLE_I);
         self.push_u16(field_idx);
         self.push_u16(dest);
+        self.record_resulttype('i');
     }
 
     pub fn vable_getfield_ref(&mut self, dest: u16, field_idx: u16) {
@@ -305,6 +324,7 @@ impl JitCodeBuilder {
         self.start_instr(jitcode::BC_GETFIELD_VABLE_R);
         self.push_u16(field_idx);
         self.push_u16(dest);
+        self.record_resulttype('r');
     }
 
     pub fn vable_getfield_float(&mut self, dest: u16, field_idx: u16) {
@@ -312,6 +332,7 @@ impl JitCodeBuilder {
         self.start_instr(jitcode::BC_GETFIELD_VABLE_F);
         self.push_u16(field_idx);
         self.push_u16(dest);
+        self.record_resulttype('f');
     }
 
     pub fn vable_setfield_int(&mut self, field_idx: u16, src: u16) {
@@ -342,6 +363,7 @@ impl JitCodeBuilder {
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
+        self.record_resulttype('i');
     }
 
     pub fn vable_getarrayitem_ref(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
@@ -351,6 +373,7 @@ impl JitCodeBuilder {
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
+        self.record_resulttype('r');
     }
 
     pub fn vable_getarrayitem_float(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
@@ -360,6 +383,7 @@ impl JitCodeBuilder {
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
+        self.record_resulttype('f');
     }
 
     pub fn vable_setarrayitem_int(&mut self, array_idx: u16, index_reg: u16, src: u16) {
@@ -423,6 +447,7 @@ impl JitCodeBuilder {
         self.start_instr(jitcode::BC_ARRAYLEN_VABLE);
         self.push_u16(array_idx);
         self.push_u16(dest);
+        self.record_resulttype('i');
     }
 
     pub fn vable_force(&mut self) {
@@ -731,18 +756,22 @@ impl JitCodeBuilder {
     }
 
     /// RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
-    /// SpaceOperation('loop_header', [c_index], None). blackhole.py:1063
+    /// SpaceOperation('loop_header', [c_index], None) with
+    /// `Constant(jd.index, lltype.Signed)`. blackhole.py:1063
     /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
     /// opimpl_loop_header records the jitdriver index for the trace.
     ///
     /// `@arguments("i")` (blackhole.py:1062) parity: jdindex is encoded
     /// as a single register-index byte pointing into the post-regs
-    /// constants suffix of `registers_i`. `add_const_i` registers the
+    /// constants suffix of `registers_i`. `loop_header` is not in
+    /// `assembler.py:312-346 USE_C_FORM`, so the only valid argcode is
+    /// `i` (constants-pool slot) — the short-form `c` is never emitted
+    /// regardless of jdindex magnitude. `add_const_i` registers the
     /// value; the placeholder is patched at `finish()` once `num_regs_i`
     /// is final.
-    pub fn loop_header(&mut self, jdindex: u8) {
+    pub fn loop_header(&mut self, jdindex: i64) {
         self.write_insn("loop_header/i");
-        let const_idx = self.add_const_i(jdindex as i64);
+        let const_idx = self.add_const_i(jdindex);
         let offset = self.code.len();
         self.push_u8(0);
         self.const_patches_u8
@@ -838,48 +867,52 @@ impl JitCodeBuilder {
     /// lists (greens_i, greens_r, greens_f, reds_i, reds_r, reds_f).
     /// Each list is [length:u8][reg_indices:u8...].
     ///
-    /// interp_jit.py:64 portal contract:
+    /// jdindex is emitted per assembler.py:163,312 USE_C_FORM rules —
+    /// `'c'` (raw signed byte) when fitting in `i8`, otherwise `'i'`
+    /// (constants-pool slot). The blackhole `@arguments("i", ...)`
+    /// decoder (blackhole.py:113-123) interprets the byte per the
+    /// runtime argcode.
+    ///
+    /// jtransform.py:1704 emits `Constant(self.portal_jd.index,
+    /// lltype.Signed)` so the assembler-side jdindex is signed; the
+    /// USE_C_FORM short-form check is `-128 <= value <= 127`
+    /// (assembler.py:99-107).
+    ///
+    /// interp_jit.py:64 portal contract for pyre's current
+    /// `pypyjitdriver`:
     ///   greens = ['next_instr', 'is_being_profiled', 'pycode']
     ///   reds = ['frame', 'ec']
-    ///
-    /// `greens_i` = [next_instr_reg, is_being_profiled_reg] (constant slots)
-    /// `greens_r` = [pycode_reg] (constant slot)
-    /// `reds_r`   = [frame_reg, ec_reg] (dedicated portal registers)
-    ///
-    /// jdindex is emitted as a `registers_i` register index via
-    /// `add_const_i` (upstream `@arguments("i")` — blackhole.py:1066),
-    /// matching `loop_header` above. The hard-coded `0` here reflects
-    /// pyre's single-portal invariant — once multiple jitdrivers are
-    /// supported the caller passes the index, but the encoding stays
-    /// pool-routed.
-    pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
-        self.write_insn("jit_merge_point/IRR");
-        let jdindex_const = self.add_const_i(0); // single jitdriver
-        let jdindex_offset = self.code.len();
-        self.push_u8(0);
-        self.const_patches_u8
-            .push((jdindex_offset, ConstKind::Int, jdindex_const));
-        // gi: green int registers (next_instr, is_being_profiled)
-        self.push_u8(greens_i.len() as u8);
-        for &idx in greens_i {
-            self.push_u8(idx);
+    /// — so `greens_f`, `reds_i`, `reds_f` arrive empty today. The
+    /// helper does not assume that: a future jitdriver with float
+    /// greens or red ints flows through the same code path with
+    /// non-empty lists.
+    pub fn jit_merge_point(
+        &mut self,
+        jdindex: i64,
+        greens_i: &[u8],
+        greens_r: &[u8],
+        greens_f: &[u8],
+        reds_i: &[u8],
+        reds_r: &[u8],
+        reds_f: &[u8],
+    ) {
+        if (-128..=127).contains(&jdindex) {
+            self.write_insn("jit_merge_point/cIRFIRF");
+            self.push_u8((jdindex & 0xFF) as u8);
+        } else {
+            self.write_insn("jit_merge_point/iIRFIRF");
+            let jdindex_const = self.add_const_i(jdindex);
+            let jdindex_offset = self.code.len();
+            self.push_u8(0);
+            self.const_patches_u8
+                .push((jdindex_offset, ConstKind::Int, jdindex_const));
         }
-        // gr: green ref registers (pycode)
-        self.push_u8(greens_r.len() as u8);
-        for &idx in greens_r {
-            self.push_u8(idx);
+        for list in [greens_i, greens_r, greens_f, reds_i, reds_r, reds_f] {
+            self.push_u8(list.len() as u8);
+            for &idx in list {
+                self.push_u8(idx);
+            }
         }
-        // gf: empty
-        self.push_u8(0);
-        // ri: empty
-        self.push_u8(0);
-        // rr: red ref registers (frame, ec)
-        self.push_u8(reds_r.len() as u8);
-        for &idx in reds_r {
-            self.push_u8(idx);
-        }
-        // rf: empty
-        self.push_u8(0);
     }
 
     pub fn abort(&mut self) {
@@ -1144,6 +1177,23 @@ impl JitCodeBuilder {
         self.push_return_slot(return_i);
         self.push_return_slot(return_r);
         self.push_return_slot(return_f);
+        // RPython `assembler.py:217-219` — record the result kind at
+        // end-of-instruction position.  Inline-call's typed result
+        // (consumed by `MIFrame::make_result_of_lastop` at the caller
+        // frame after the callee's `finishframe_*_return`,
+        // `pyjitpl/mod.rs:9975`) is determined by which
+        // `return_{i,r,f}` slot the helper received.  At most one is
+        // `Some` for a typed variant; all `None` for the void
+        // variant (no record).
+        match (return_i, return_r, return_f) {
+            (Some(_), None, None) => self.record_resulttype('i'),
+            (None, Some(_), None) => self.record_resulttype('r'),
+            (None, None, Some(_)) => self.record_resulttype('f'),
+            (None, None, None) => {} // _v variant — no result
+            slots => {
+                panic!("inline_call_typed: at most one return slot may be Some, got {slots:?}")
+            }
+        }
     }
 
     fn push_return_slot(&mut self, ret: Option<u16>) {
@@ -1302,6 +1352,7 @@ impl JitCodeBuilder {
             value_reg,
             typed_args,
             dst,
+            'i',
         );
     }
 
@@ -1321,6 +1372,7 @@ impl JitCodeBuilder {
             value_reg,
             typed_args,
             dst,
+            'r',
         );
     }
 
@@ -1357,7 +1409,7 @@ impl JitCodeBuilder {
     }
 
     fn call_cond_like(&mut self, bc: u8, fn_ptr_idx: u16, first_reg: u16, args: &[JitCallArg]) {
-        self.push_u8(bc);
+        self.start_instr(bc);
         self.push_u16(first_reg);
         self.push_u16(fn_ptr_idx);
         self.push_u8(args.len() as u8);
@@ -1376,8 +1428,9 @@ impl JitCodeBuilder {
         value_reg: u16,
         args: &[JitCallArg],
         dst: u16,
+        result_kind: char,
     ) {
-        self.push_u8(bc);
+        self.start_instr(bc);
         self.push_u16(value_reg);
         self.push_u16(fn_ptr_idx);
         self.push_u8(args.len() as u8);
@@ -1388,6 +1441,7 @@ impl JitCodeBuilder {
             self.push_u16(arg.reg);
         }
         self.push_u16(dst);
+        self.record_resulttype(result_kind);
     }
 
     /// RPython `blackhole.py:638-640` `bhimpl_int_copy(a) returns=i`.
@@ -1779,9 +1833,33 @@ impl JitCodeBuilder {
     }
 
     pub fn finish(mut self) -> JitCode {
+        self.flush_pending_resulttype();
         self.patch_labels();
         self.patch_const_refs();
         self.patch_const_u8_refs();
+        // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
+        // Upstream `assembler.py:217-219` records the result-kind
+        // char at the end-of-instruction position (`len(self.code)`
+        // after operands, before the next instruction's opcode) for
+        // every instruction whose argcodes contain `>X`.  Consumed
+        // by `pyjitpl.py:264 make_result_of_lastop` in non-translated
+        // builds as a debug-only type check:
+        //
+        // ```python
+        // assert typeof[self.jitcode._resulttypes[self.pc]] == got_type
+        // ```
+        //
+        // pyre fires the same assertion in
+        // `MIFrame::make_result_of_lastop` (`frame.rs`).  Each
+        // typed-result emit helper (`call_*_like`,
+        // `call_assembler_*_like`, `inline_call_typed`) records the
+        // kind via `self.record_resulttype(...)` as its LAST step.
+        // Generic `write_insn("...>X")` stores `X` in
+        // `pending_resulttype` and `start_instr` / `finish` flush it
+        // after the operand bytes have been pushed.  The map handed
+        // off to `JitCodeBody::resulttypes` is therefore keyed by
+        // every typed-result instruction's end-of-instruction PC.
+        let resulttypes = Some(self.resulttypes);
         let body = majit_translate::jitcode::JitCodeBody {
             // RPython `jitcode.py:17 self.calldescr = calldescr` — the
             // value was stored on the builder via `set_calldescr` (the
@@ -1797,9 +1875,16 @@ impl JitCodeBuilder {
             c_num_regs_i: self.num_regs_i,
             c_num_regs_r: self.num_regs_r,
             c_num_regs_f: self.num_regs_f,
-            startpoints: self.startpoints,
-            alllabels: self.alllabels,
-            resulttypes: Default::default(),
+            // RPython `assembler.py:271-281 make_jitcode(startpoints=
+            // self.startpoints, alllabels=self.alllabels, ...)` —
+            // assembled jitcodes always carry the recorded set, never
+            // `None`. Wrap in `Some(...)` so the upstream None sentinel
+            // is reserved for hand-built helper jitcodes that bypass the
+            // builder (matching `JitCode.setup(..., startpoints=None,
+            // alllabels=None)` defaults at jitcode.py:24).
+            startpoints: Some(self.startpoints),
+            alllabels: Some(self.alllabels),
+            resulttypes,
             _ssarepr: None,
         };
         let mut jc = JitCode::new(self.name);
@@ -1837,6 +1922,10 @@ impl JitCodeBuilder {
     /// `emit_const` encoding on the RPython side.
     fn write_insn(&mut self, key: &'static str) {
         self.start_instr(jitcode::insn_byte(key));
+        self.pending_resulttype = key
+            .split_once('>')
+            .and_then(|(_, suffix)| suffix.chars().next())
+            .filter(|kind| matches!(kind, 'i' | 'r' | 'f'));
     }
 
     /// Record the current bytecode offset as an instruction start
@@ -1846,8 +1935,33 @@ impl JitCodeBuilder {
     /// `JitCode.get_live_vars_info` (RPython `jitcode.py:85-90`) can
     /// fire its non-translated `assert pc in self._startpoints` check.
     fn start_instr(&mut self, opcode: u8) {
+        self.flush_pending_resulttype();
         self.startpoints.insert(self.code.len());
         self.push_u8(opcode);
+    }
+
+    /// RPython `assembler.py:217-219`:
+    ///
+    /// ```python
+    /// if '>' in argcodes:
+    ///     assert argcodes.index('>') == len(argcodes) - 2
+    ///     self.resulttypes[len(self.code)] = argcodes[-1]
+    /// ```
+    ///
+    /// Called by typed-result emit helpers as their LAST step (after
+    /// every operand byte has been pushed) so `self.code.len()`
+    /// matches the upstream `len(self.code)` after-operands-before-
+    /// next-instruction value.  Consumed by
+    /// `MIFrame::make_result_of_lastop` (RPython `pyjitpl.py:264`)
+    /// where `frame.pc` has already advanced past the instruction.
+    fn record_resulttype(&mut self, kind: char) {
+        self.resulttypes.insert(self.code.len(), kind);
+    }
+
+    fn flush_pending_resulttype(&mut self) {
+        if let Some(kind) = self.pending_resulttype.take() {
+            self.record_resulttype(kind);
+        }
     }
 
     fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
@@ -1863,6 +1977,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
         }
+        self.record_resulttype('i');
     }
 
     fn call_void_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
@@ -1934,6 +2049,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
         }
+        self.record_resulttype('r');
     }
 
     fn call_assembler_int_like(
@@ -1955,6 +2071,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
         }
+        self.record_resulttype('i');
     }
 
     fn call_assembler_ref_like(
@@ -1976,6 +2093,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
         }
+        self.record_resulttype('r');
     }
 
     fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
@@ -1991,6 +2109,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
         }
+        self.record_resulttype('f');
     }
 
     fn call_assembler_float_like(
@@ -2012,6 +2131,7 @@ impl JitCodeBuilder {
             self.push_u8(arg.kind.encode());
             self.push_u16(arg.reg);
         }
+        self.record_resulttype('f');
     }
 
     fn touch_call_arg(&mut self, arg: JitCallArg) {
@@ -2111,6 +2231,70 @@ pub fn live_slots_for_state_field_jit(
 mod tests {
     use super::*;
     use majit_translate::jit_codewriter::assembler::Assembler;
+
+    fn assert_resulttype_after(emit: impl FnOnce(&mut JitCodeBuilder), kind: char) {
+        let mut builder = JitCodeBuilder::new();
+        emit(&mut builder);
+        let pc = builder.current_pos();
+        let jitcode = builder.finish();
+        assert_eq!(
+            jitcode
+                .body()
+                .resulttypes
+                .as_ref()
+                .and_then(|resulttypes| resulttypes.get(&pc).copied()),
+            Some(kind)
+        );
+    }
+
+    fn assert_no_resulttype_after(emit: impl FnOnce(&mut JitCodeBuilder)) {
+        let mut builder = JitCodeBuilder::new();
+        emit(&mut builder);
+        let pc = builder.current_pos();
+        let jitcode = builder.finish();
+        assert_eq!(
+            jitcode
+                .body()
+                .resulttypes
+                .as_ref()
+                .and_then(|resulttypes| resulttypes.get(&pc).copied()),
+            None
+        );
+    }
+
+    #[test]
+    fn typed_vable_helpers_record_resulttypes_at_end_pc() {
+        // RPython assembler.py:217-219 records `argcodes[-1]` at
+        // `len(code)` after all operands are emitted. These helper-side
+        // adapters are not canonical argcode layouts, but their result
+        // byte is still the last operand consumed by make_result_of_lastop.
+        assert_resulttype_after(|b| b.vable_getfield_int(0, 1), 'i');
+        assert_resulttype_after(|b| b.vable_getfield_ref(0, 1), 'r');
+        assert_resulttype_after(|b| b.vable_getfield_float(0, 1), 'f');
+        assert_resulttype_after(|b| b.vable_getarrayitem_int(0, 1, 2), 'i');
+        assert_resulttype_after(|b| b.vable_getarrayitem_ref(0, 1, 2), 'r');
+        assert_resulttype_after(|b| b.vable_getarrayitem_float(0, 1, 2), 'f');
+        assert_resulttype_after(|b| b.vable_arraylen(0, 1), 'i');
+    }
+
+    #[test]
+    fn typed_call_adapters_record_resulttypes_at_end_pc() {
+        assert_resulttype_after(
+            |b| b.conditional_call_value_ir_i_typed_args(0, 1, &[], 2),
+            'i',
+        );
+        assert_resulttype_after(
+            |b| b.conditional_call_value_ir_r_typed_args(0, 1, &[], 2),
+            'r',
+        );
+        assert_resulttype_after(|b| b.call_assembler_float_typed(0, &[], 1), 'f');
+    }
+
+    #[test]
+    fn typed_void_call_adapters_do_not_record_resulttypes() {
+        assert_no_resulttype_after(|b| b.residual_call_void_typed_args(0, &[]));
+        assert_no_resulttype_after(|b| b.call_assembler_void_typed_args(0, &[]));
+    }
 
     #[test]
     fn live_writes_opcode_byte_then_two_offset_bytes() {

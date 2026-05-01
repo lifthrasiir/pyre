@@ -180,11 +180,11 @@ pub fn func_with_new_name(
 /// post-construction `f.__module__ = globals.get('__name__')` rule
 /// (`Objects/funcobject.c:func_new_impl`).
 fn module_from_globals(globals: &Constant) -> Option<String> {
+    use crate::flowspace::model::ConstValue;
     let dict = match &globals.value {
-        crate::flowspace::model::ConstValue::Dict(d) => d,
+        ConstValue::Dict(d) => d,
         _ => return None,
     };
-    use crate::flowspace::model::ConstValue;
     let key_uni = ConstValue::UniStr("__name__".to_string());
     let key_byte = ConstValue::ByteStr(b"__name__".to_vec());
     let entry = dict.get(&key_uni).or_else(|| dict.get(&key_byte))?;

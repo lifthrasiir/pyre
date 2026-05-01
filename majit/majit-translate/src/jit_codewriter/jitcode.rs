@@ -94,13 +94,24 @@ pub struct JitCodeBody {
     pub c_num_regs_f: u16,
     /// RPython `jitcode.py:40` `self._startpoints = startpoints` —
     /// debug-only set of bytecode offsets where instructions start.
-    pub startpoints: HashSet<usize>,
+    /// `setup(..., startpoints=None)` (jitcode.py:24) is the upstream
+    /// default; `None` here means "the assembler did not record start
+    /// positions for this jitcode" (e.g. hand-built helper jitcodes).
+    /// Assembled jitcodes always populate `Some(set)`, even when the
+    /// set is empty. `blackhole.py:86 dispatch_loop` consults
+    /// `_startpoints is not None` to gate its non-translated `pc in
+    /// self._startpoints` assertion.
+    pub startpoints: Option<HashSet<usize>>,
     /// RPython `jitcode.py:41` `self._alllabels = alllabels` — debug-only
     /// set of bytecode offsets that are label targets.
-    pub alllabels: HashSet<usize>,
+    /// `setup(..., alllabels=None)` (jitcode.py:24) is the upstream
+    /// default; assembled jitcodes always populate `Some(set)`.
+    pub alllabels: Option<HashSet<usize>>,
     /// RPython `jitcode.py:42` `self._resulttypes = resulttypes` —
-    /// debug-only map from bytecode offset to result type char.
-    pub resulttypes: HashMap<usize, char>,
+    /// debug-only map from bytecode offset to result type char.  `None`
+    /// is the exact `JitCode.setup(..., resulttypes=None)` sentinel;
+    /// assembled jitcodes store `Some(dict)`, even when the dict is empty.
+    pub resulttypes: Option<HashMap<usize, char>>,
     /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
     /// flattened SSA representation, kept for `dump()` output. Set by
     /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
@@ -395,7 +406,7 @@ impl JitCode {
         self.num_regs_f() + self.constants_f.len()
     }
 
-    /// RPython `jitcode.py:102-112` `def follow_jump(self, position)`:
+    /// RPython `jitcode.py:102-114` `def follow_jump(self, position)`:
     /// "Assuming that 'position' points just after a bytecode instruction
     /// that ends with a label, follow that label."
     ///
@@ -404,20 +415,39 @@ impl JitCode {
     ///     code = self.code
     ///     position -= 2
     ///     assert position >= 0
+    ///     if not we_are_translated():
+    ///         assert position in self._alllabels
     ///     labelvalue = ord(code[position]) | (ord(code[position+1])<<8)
     ///     assert labelvalue < len(code)
     ///     return labelvalue
     /// ```
+    ///
+    /// pyre is "non-translated" today, so the
+    /// `position in self._alllabels` assertion fires unconditionally
+    /// — every label-bearing bytecode emit must record its position
+    /// in `_alllabels` (RPython `assembler.py:setup_labels`, pyre
+    /// `JitCodeBuilder::finish` derives it from the builder's
+    /// `labels: Vec<Option<usize>>`).
     pub fn follow_jump(&self, position: usize) -> usize {
-        let position = position - 2;
-        // RPython `:108-109`: `if not we_are_translated(): assert
-        // position in self._alllabels`. `debug_assert` mirrors the
-        // non-translated guard — fires in dev/test builds, elided in
-        // release just like RPython skips the check post-translation.
+        // RPython `:104-105`: `position -= 2; assert position >= 0`.
+        // `checked_sub` + `expect` mirrors the non-negativity assert.
+        let position = position
+            .checked_sub(2)
+            .expect("follow_jump: position underflow before 2-byte label slot");
+        // RPython `:107-108`: `if not we_are_translated(): assert
+        // position in self._alllabels`. PyPy upstream does not gate the
+        // assert on `_alllabels is not None` — `pc in None` would raise
+        // TypeError; the contract is that any jitcode reaching
+        // `follow_jump` was assembled (so `_alllabels = Some(set)`).
+        // `debug_assert!` mirrors the non-translated guard — fires in
+        // dev/test builds, elided in release just like RPython skips
+        // the check post-translation.
         debug_assert!(
-            self.alllabels.contains(&position),
-            "follow_jump: position {position} not in alllabels for {}",
-            self.name,
+            self.alllabels
+                .as_ref()
+                .expect("follow_jump: _alllabels is None on a non-assembled jitcode")
+                .contains(&position),
+            "follow_jump: position {position} is not in _alllabels"
         );
         let labelvalue = (self.code[position] as usize) | ((self.code[position + 1] as usize) << 8);
         assert!(labelvalue < self.code.len(), "follow_jump out of range");
@@ -449,12 +479,27 @@ impl JitCode {
         // pc in self._startpoints`. Pyre is "non-translated" today so the
         // assertion fires in both canonical and runtime jitcodes — the
         // runtime `JitCodeBuilder` populates `startpoints` from each
-        // opcode emit position.
-        debug_assert!(self.startpoints.contains(&pc), "pc not in startpoints");
+        // opcode emit position. PyPy does not gate on `_startpoints is
+        // not None` here — `pc in None` would raise TypeError; the
+        // contract is that any jitcode whose liveness map is consulted
+        // was assembled (`_startpoints = Some(set)`).
+        debug_assert!(
+            self.startpoints
+                .as_ref()
+                .expect("get_live_vars_info: _startpoints is None on a non-assembled jitcode")
+                .contains(&pc),
+            "pc not in startpoints",
+        );
         let mut pc = pc;
         if self.code[pc] != op_live {
             pc -= crate::liveness::OFFSET_SIZE + 1;
-            debug_assert!(self.startpoints.contains(&pc), "pc not in startpoints");
+            debug_assert!(
+                self.startpoints
+                    .as_ref()
+                    .expect("get_live_vars_info: _startpoints is None on a non-assembled jitcode")
+                    .contains(&pc),
+                "pc not in startpoints",
+            );
             if self.code[pc] != op_live {
                 self.missing_liveness(pc);
             }

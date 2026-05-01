@@ -261,9 +261,15 @@ impl Assembler {
             c_num_regs_i: num_regs_i as u16,
             c_num_regs_r: num_regs_r as u16,
             c_num_regs_f: num_regs_f as u16,
-            startpoints: state.startpoints,
-            alllabels: state.alllabels,
-            resulttypes: state.resulttypes,
+            // RPython `assembler.py:271-281 make_jitcode(startpoints=
+            // self.startpoints, alllabels=self.alllabels, ...)` — the
+            // assembler always hands its set, never `None`. Wrap in
+            // `Some(...)` so the assembled jitcode parities the upstream
+            // shape (helper jitcodes that bypass the assembler keep the
+            // `None` default).
+            startpoints: Some(state.startpoints),
+            alllabels: Some(state.alllabels),
+            resulttypes: Some(state.resulttypes),
             _ssarepr: Some(ssarepr.clone()),
         };
 
@@ -1319,18 +1325,17 @@ impl Assembler {
             // (`blackhole.py:1066 @arguments("self","i","I","R","F",
             // "I","R","F")`) reads jdindex + six typed register lists, each
             // encoded as `[len:u8][reg:u8 * N]` (assembler.py:181-196 ListOfKind).
-            // pyre's runtime (`blackhole.rs:2012-2029`) consumes exactly this
-            // six-list shape. The canonical runtime key is
-            // `jit_merge_point/IRR` (`majit-metainterp/src/jitcode/mod.rs:309`)
-            // — the argcodes label is historical (original pyre portal only
-            // used greens_i / greens_r / reds_r), but the payload matches
-            // the full six-list shape per
-            // `majit-metainterp/src/jitcode/assembler.rs:706-729`. The
-            // jdindex byte is `emit_const_i`-routed (`@arguments("i")` =
-            // register-file pool slot, same as OpKind::LoopHeader). The
-            // generic fallback would flatten SSA register bytes without the
-            // length prefix and without the jdindex byte, corrupting the
-            // stream.
+            // assembler.py:163 reads `allow_short = (insn[0] in USE_C_FORM)`
+            // and assembler.py:312 puts `jit_merge_point` in `USE_C_FORM`,
+            // so a jdindex in the signed-byte range is emitted inline as
+            // `'c'` (canonical key `jit_merge_point/cIRFIRF`); otherwise
+            // the value is constants-pool-promoted and emitted as `'i'`
+            // (canonical key `jit_merge_point/iIRFIRF`). Both keys are
+            // registered in `wellknown_bh_insns()` mapping to distinct
+            // opcodes (`BC_JIT_MERGE_POINT_C` vs `BC_JIT_MERGE_POINT`); the
+            // blackhole `@arguments("i", ...)` decoder
+            // (`blackhole.py:113-123`) interprets the byte per the runtime
+            // argcode.
             OpKind::JitMergePoint {
                 jitdriver_index,
                 greens_i,
@@ -1340,22 +1345,30 @@ impl Assembler {
                 reds_r,
                 reds_f,
             } => {
-                let jdindex_byte = self.emit_const_i(*jitdriver_index as i64, state);
-                state.code.push(jdindex_byte);
+                let jdindex_value = *jitdriver_index as i64;
+                let jdindex_argcode = if (-128..=127).contains(&jdindex_value) {
+                    state.code.push(jdindex_value as u8);
+                    'c'
+                } else {
+                    let jdindex_byte = self.emit_const_i(jdindex_value, state);
+                    state.code.push(jdindex_byte);
+                    'i'
+                };
                 self.emit_list_of_kind(greens_i, RegKind::Int, regallocs, state);
                 self.emit_list_of_kind(greens_r, RegKind::Ref, regallocs, state);
                 self.emit_list_of_kind(greens_f, RegKind::Float, regallocs, state);
                 self.emit_list_of_kind(reds_i, RegKind::Int, regallocs, state);
                 self.emit_list_of_kind(reds_r, RegKind::Ref, regallocs, state);
                 self.emit_list_of_kind(reds_f, RegKind::Float, regallocs, state);
-                // Preserve the legacy `/IRR` key shape so the runtime
-                // dispatch table continues to resolve to BC_JIT_MERGE_POINT.
-                // Upstream argcodes would be `iIRRIRF`; pyre keeps the
-                // three-letter historical label.
+                argcodes.push(jdindex_argcode);
                 argcodes.push('I');
                 argcodes.push('R');
+                argcodes.push('F');
+                argcodes.push('I');
                 argcodes.push('R');
-                let opnum = self.get_opnum("jit_merge_point/IRR");
+                argcodes.push('F');
+                let key = format!("jit_merge_point/{argcodes}");
+                let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
 
@@ -3140,7 +3153,7 @@ mod tests {
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FunctionGraph, OpKind, ValueType};
         use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translate_legacy::rtyper::rtyper::{resolve_rewritten_types, resolve_types};
 
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("caller");
@@ -3172,7 +3185,12 @@ mod tests {
             .with_callcontrol(&mut cc)
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
-        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
+        let rewritten_types = resolve_rewritten_types(
+            &type_state,
+            &rewritten.graph,
+            &annotations,
+            &rewritten.synth_kinds,
+        );
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat =
@@ -3207,7 +3225,7 @@ mod tests {
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
         use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::resolve_types;
+        use crate::translate_legacy::rtyper::rtyper::{resolve_rewritten_types, resolve_types};
         use crate::translator::rtyper::rpbc::lower_indirect_calls;
 
         fn build_run_impl(name: &str) -> FunctionGraph {
@@ -3265,7 +3283,12 @@ mod tests {
             .with_callcontrol(&mut cc)
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
-        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
+        let rewritten_types = resolve_rewritten_types(
+            &type_state,
+            &rewritten.graph,
+            &annotations,
+            &rewritten.synth_kinds,
+        );
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat =

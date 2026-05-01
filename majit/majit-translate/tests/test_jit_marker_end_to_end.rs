@@ -244,6 +244,27 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
         );
         body.constants_i[pool_idx]
     };
+    // assembler.py:163,312 places `jit_merge_point` in `USE_C_FORM`, so a
+    // jdindex in the signed-byte range emits as `'c'` (raw inline byte
+    // per assembler.py:99-107) and the rest fall back to `'i'`
+    // (constants-pool index).  Both forms route through
+    // `bhimpl_jit_merge_point` (blackhole.py:1066 `@arguments("i", ...)`)
+    // and the runtime `argcode == 'c'` branch (blackhole.py:121-123)
+    // recovers the raw value via `signedord`.
+    let resolve_jdindex_byte = |jdindex_byte: u8, expected: i64| -> i64 {
+        if jdindex_byte as usize >= num_regs_i {
+            resolve_int_const(jdindex_byte)
+        } else {
+            // `'c'` form: the byte is the raw signed value.
+            assert_eq!(
+                (jdindex_byte as i8) as i64,
+                expected,
+                "jdindex byte {jdindex_byte} must equal jitdriver_index {expected} \
+                 in `'c'` form"
+            );
+            (jdindex_byte as i8) as i64
+        }
+    };
 
     let mut canonical_merge_points = 0usize;
     let mut canonical_loop_headers = 0usize;
@@ -266,10 +287,10 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
                     "jit_merge_point at {pos} truncated before jdindex"
                 );
                 assert_eq!(
-                    resolve_int_const(code[pos + 1]) as usize,
+                    resolve_jdindex_byte(code[pos + 1], *jitdriver_index as i64) as usize,
                     *jitdriver_index,
-                    "jit_merge_point jdindex byte (pool index) must resolve \
-                     to OpKind.jitdriver_index"
+                    "jit_merge_point jdindex byte must resolve to OpKind.jitdriver_index \
+                     (`'c'` raw byte or `'i'` pool index per assembler.py:163,312)"
                 );
                 let mut cursor = pos + 2;
                 let expected_counts = [

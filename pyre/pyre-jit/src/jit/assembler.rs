@@ -693,82 +693,61 @@ fn dispatch_op(
             state.builder.goto_if_exception_mismatch(vtable, label_id);
         }
         "jit_merge_point" => {
-            // Two shapes accepted during the graph-path transition
-            // (Task #225 Phase 2):
-            //
-            // 1. 3-list pyre-native: `[greens_i, greens_r, reds_r]` —
-            //    the shape produced by `ssa_emitter.rs::emit_portal_jit_merge_point`.
-            //    float greens/reds and the jd_index constant are
-            //    elided (pyre has a single jitdriver and no float
-            //    slots in the portal contract).
-            // 2. 7-arg upstream-orthodox: `[jd_index_const, greens_i,
-            //    greens_r, greens_f, reds_i, reds_r, reds_f]` — the
-            //    shape produced by
-            //    `codewriter.rs::portal_jit_merge_point_graph_args`
-            //    matching `jtransform.py:1690-1712` +
-            //    `jtransform.py:437-445 make_three_lists`.
-            //
-            // The runtime builder takes only `(greens_i, greens_r,
-            // reds_r)`, so the 7-arg form lowers to 3 by extracting
-            // positions 1, 2, 5 after asserting the other slots are
-            // empty (pyre portal reds/greens contain no ints beyond
-            // greens_i and no floats at all) and the jd_index is 0
-            // (pyre single jitdriver).
-            let (greens_i, greens_r, reds_r) = match args.len() {
-                3 => (
-                    expect_list_regs_or_pool(state, &args[0], Kind::Int),
-                    expect_list_regs_or_pool(state, &args[1], Kind::Ref),
-                    expect_list_regs_or_pool(state, &args[2], Kind::Ref),
-                ),
-                7 => {
-                    let jd_index = match &args[0] {
-                        Operand::ConstInt(v) => *v,
-                        other => panic!(
-                            "jit_merge_point 7-arg expects ConstInt jd_index at arg[0], got {other:?}"
-                        ),
-                    };
-                    assert_eq!(
-                        jd_index, 0,
-                        "pyre has a single jitdriver; jd_index must be 0, got {jd_index}"
-                    );
-                    let greens_f = expect_list_regs_or_pool(state, &args[3], Kind::Float);
-                    let reds_i = expect_list_regs_or_pool(state, &args[4], Kind::Int);
-                    let reds_f = expect_list_regs_or_pool(state, &args[6], Kind::Float);
-                    assert!(
-                        greens_f.is_empty(),
-                        "pyre portal greens_f must be empty, got {greens_f:?}"
-                    );
-                    assert!(
-                        reds_i.is_empty(),
-                        "pyre portal reds_i must be empty, got {reds_i:?}"
-                    );
-                    assert!(
-                        reds_f.is_empty(),
-                        "pyre portal reds_f must be empty, got {reds_f:?}"
-                    );
-                    (
-                        expect_list_regs_or_pool(state, &args[1], Kind::Int),
-                        expect_list_regs_or_pool(state, &args[2], Kind::Ref),
-                        expect_list_regs_or_pool(state, &args[5], Kind::Ref),
-                    )
-                }
-                n => panic!(
-                    "jit_merge_point: expected 3 (pyre-native) or 7 (upstream-orthodox) args, got {n}"
-                ),
+            // RPython jtransform.py:1690-1712 emits the upstream shape:
+            // `[jd_index_const, greens_i, greens_r, greens_f, reds_i,
+            // reds_r, reds_f]`. blackhole.py:1066
+            // `@arguments("self","i","I","R","F","I","R","F")` reads
+            // jdindex + the six typed register lists generally; the
+            // helper writes the same byte stream regardless of which
+            // lists are empty for the current jitdriver.
+            let [
+                jdindex_arg,
+                greens_i_arg,
+                greens_r_arg,
+                greens_f_arg,
+                reds_i_arg,
+                reds_r_arg,
+                reds_f_arg,
+            ] = args
+            else {
+                panic!(
+                    "jit_merge_point: expected 7 upstream-orthodox args, got {}",
+                    args.len()
+                );
             };
-            state.builder.jit_merge_point(&greens_i, &greens_r, &reds_r);
+            // jtransform.py:1704 emits `Constant(self.portal_jd.index,
+            // lltype.Signed)`, so the assembler-side jdindex flows
+            // through as a signed integer. The builder selects the
+            // USE_C_FORM short byte vs the constants-pool `i` slot per
+            // `assembler.py:99-107` (`-128 <= value <= 127`); no
+            // pre-builder narrowing here.
+            let jdindex = match jdindex_arg {
+                Operand::ConstInt(v) => *v,
+                other => {
+                    panic!("jit_merge_point expects ConstInt jd_index at arg[0], got {other:?}")
+                }
+            };
+            let greens_i = expect_list_regs_or_pool(state, greens_i_arg, Kind::Int);
+            let greens_r = expect_list_regs_or_pool(state, greens_r_arg, Kind::Ref);
+            let greens_f = expect_list_regs_or_pool(state, greens_f_arg, Kind::Float);
+            let reds_i = expect_list_regs_or_pool(state, reds_i_arg, Kind::Int);
+            let reds_r = expect_list_regs_or_pool(state, reds_r_arg, Kind::Ref);
+            let reds_f = expect_list_regs_or_pool(state, reds_f_arg, Kind::Float);
+            state.builder.jit_merge_point(
+                jdindex, &greens_i, &greens_r, &greens_f, &reds_i, &reds_r, &reds_f,
+            );
         }
         "loop_header" => {
             // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header
-            // emits SpaceOperation('loop_header', [c_index], None). Arg is
-            // the jitdriver index as a Signed constant (pyre has a single
-            // jitdriver, so jdindex is always 0).
+            // emits SpaceOperation('loop_header', [c_index], None) with
+            // `Constant(jd.index, lltype.Signed)`. `loop_header` is not
+            // in `assembler.py:312-346 USE_C_FORM`, so the builder
+            // always emits the constants-pool `i` form regardless of
+            // jdindex magnitude — pass the signed value through.
             let jdindex = match &args[0] {
                 Operand::ConstInt(v) => *v,
                 other => panic!("loop_header expects ConstInt jdindex, got {:?}", other),
             };
-            let jdindex: u8 = u8::try_from(jdindex)
-                .unwrap_or_else(|_| panic!("loop_header jdindex {jdindex} out of u8 range"));
             state.builder.loop_header(jdindex);
         }
         "ref_return" => {
@@ -1748,15 +1727,13 @@ fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
 /// argcodes ('i'/'r'/'f' for Register, 'c' for Constant) and routing
 /// Constants through the per-kind constant table at write time.
 ///
-/// Pyre's production jit_merge_point historically emitted
-/// pre-pool-routed `Register` operands (via
-/// `ssa_emitter.rs::emit_portal_jit_merge_point`), so this function
-/// keeps that path working.  It also makes the 7-arg
-/// upstream-orthodox shape produced by
+/// Pyre's portal `jit_merge_point` graph path produces the 7-arg
+/// upstream-orthodox shape via
 /// `codewriter.rs::portal_jit_merge_point_graph_args` +
 /// `GraphFlattener` (which emits raw `ConstInt`/`ConstRef` inside
 /// `ListOfKind` because pyre's flow-graph constants are not
-/// pool-routed upstream) work end-to-end.
+/// pool-routed upstream), so this helper accepts both already-colored
+/// registers and constants inside those lists.
 fn expect_list_regs_or_pool(state: &mut AssemblyState, op: &Operand, expected: Kind) -> Vec<u8> {
     let ListOfKind { kind, content } = match op {
         Operand::ListOfKind(list) => list,
@@ -1942,6 +1919,7 @@ mod tests {
         ssarepr.insns.push(Insn::op(
             "jit_merge_point",
             vec![
+                Operand::ConstInt(0),
                 Operand::ListOfKind(ListOfKind::new(
                     Kind::Int,
                     vec![
@@ -1953,6 +1931,8 @@ mod tests {
                     Kind::Ref,
                     vec![Operand::Register(Register::new(Kind::Ref, 0))],
                 )),
+                Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
+                Operand::ListOfKind(ListOfKind::new(Kind::Int, Vec::new())),
                 Operand::ListOfKind(ListOfKind::new(
                     Kind::Ref,
                     vec![
@@ -1960,6 +1940,7 @@ mod tests {
                         Operand::Register(Register::new(Kind::Ref, 2)),
                     ],
                 )),
+                Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
             ],
         ));
         ssarepr.insns.push(Insn::op_with_result(
@@ -1979,9 +1960,13 @@ mod tests {
 
         let insns = assembler.insns_snapshot();
         let wellknown = majit_metainterp::jitcode::wellknown_bh_insns();
+        // The fixture above passes `ConstInt(0)` for jdindex which is in
+        // the signed-byte range, so `assembler.py:163,312 USE_C_FORM`
+        // selects the `'c'` argcode and the canonical key is
+        // `jit_merge_point/cIRFIRF`.
         assert_eq!(
-            insns.get("jit_merge_point/IRR"),
-            wellknown.get("jit_merge_point/IRR")
+            insns.get("jit_merge_point/cIRFIRF"),
+            wellknown.get("jit_merge_point/cIRFIRF")
         );
         assert_eq!(
             insns.get("last_exc_value/>r"),

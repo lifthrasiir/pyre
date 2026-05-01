@@ -2028,17 +2028,27 @@ impl BlackholeInterpreter {
                 let target = self.next_u16() as usize;
                 self.position = target;
             }
-            jitcode::BC_JIT_MERGE_POINT => {
+            jitcode::BC_JIT_MERGE_POINT | jitcode::BC_JIT_MERGE_POINT_C => {
                 // blackhole.py:1066-1093 bhimpl_jit_merge_point parity.
                 // @arguments("self", "i", "I", "R", "F", "I", "R", "F")
                 // Decode jdindex + 6 typed register lists from bytecode.
-                // jdindex is a `registers_i` index — the constant value
-                // lives in the constants_i pool and was copied into the
-                // register file at setup
-                // (`init_register_files_from_runtime_jitcode`).
+                //
+                // The jdindex byte is decoded per the runtime argcode
+                // (blackhole.py:113-123): for `'i'` (BC_JIT_MERGE_POINT)
+                // it is a `registers_i` pool slot index — the constant
+                // value lives in the constants_i pool and was copied
+                // into the register file at setup
+                // (`init_register_files_from_runtime_jitcode`); for
+                // `'c'` (BC_JIT_MERGE_POINT_C, assembler.py:312
+                // `USE_C_FORM`) it is the raw signed byte
+                // (blackhole.py:121-123 `signedord`).
                 let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
-                let jdindex_reg = self.next_u8() as usize;
-                let jdindex = self.registers_i[jdindex_reg] as usize;
+                let jdindex_byte = self.next_u8();
+                let jdindex = if opcode == jitcode::BC_JIT_MERGE_POINT_C {
+                    (jdindex_byte as i8) as usize
+                } else {
+                    self.registers_i[jdindex_byte as usize] as usize
+                };
                 let gi = self._get_list_of_values_i();
                 let gr = self._get_list_of_values_r();
                 let gf = self._get_list_of_values_f();
@@ -3204,6 +3214,29 @@ impl BlackholeInterpBuilder {
         mut position: usize,
     ) -> Result<(), DispatchError> {
         loop {
+            // RPython `blackhole.py:86-91`:
+            //
+            // ```python
+            // if (not we_are_translated()
+            //     and self.jitcode._startpoints is not None):
+            //     assert position in self.jitcode._startpoints, (
+            //         "the current position %d is in the middle of "
+            //         "an instruction!" % position)
+            // ```
+            //
+            // pyre is "non-translated" today; `_startpoints is None`
+            // (jitcode.py:24 default) is the assembler's opt-out
+            // signal. Assembled jitcodes always carry `Some(set)`
+            // (assembler.rs `make_jitcode`); helper jitcodes built
+            // without the assembler keep `None` and skip the check.
+            if let Some(startpoints) = bh.jitcode.startpoints.as_ref() {
+                debug_assert!(
+                    startpoints.contains(&position),
+                    "dispatch_loop: position {position} is in the middle of an instruction \
+                     (jitcode {:?})",
+                    bh.jitcode.name,
+                );
+            }
             let opcode = code[position] as usize;
             position += 1;
             if opcode >= self.dispatch_table.len() {

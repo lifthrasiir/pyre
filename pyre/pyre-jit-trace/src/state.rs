@@ -232,25 +232,32 @@ impl MetaInterpStaticData {
 
     /// codewriter.py:67-68 parity — stamp the SD-local `idx` onto the
     /// shared `Arc<majit_metainterp::jitcode::JitCode>` carried by the
-    /// payload, but **only when the inner `JitCode` has not been
-    /// stamped yet**.  Build-time `make_jitcodes()` already calls
-    /// `set_index` on every drained `Arc<JitCode>`
-    /// (`codewriter.rs:279`), so a re-stamp here would violate the
-    /// canonical RPython `OnceLock` single-set invariant.  Skipping
-    /// the second stamp preserves the build-time index, which is what
-    /// snapshot encoders read via `frame.jitcode.try_index()`
-    /// (`opencoder.rs:2086`).
+    /// payload.  RPython relies on the `metainterp_sd.jitcodes[i].index
+    /// == i` invariant (`codewriter.py:80`,
+    /// `warmspot.py:281-282`); a JitCode that lands at SD slot `i`
+    /// with a different stamped index would let
+    /// `frame.jitcode.index` and `metainterp_sd.jitcodes[frame_idx]`
+    /// disagree, breaking blackhole resume.
+    ///
+    /// Two paths reach here:
+    ///   * Build-time `make_jitcodes()` already called `set_index(i)`
+    ///     on every drained `Arc<JitCode>` (`codewriter.rs:279`); the
+    ///     SD list now publishes those same Arcs at the same offsets
+    ///     so a re-stamp with the same value is a no-op (the
+    ///     `OnceLock` accepts the equal-value second `set` —
+    ///     `jitcode.rs:333-348`).
+    ///   * Pyre-only fresh runtime jitcodes (skeletons, portal-bridge
+    ///     installs) reach here without a build-time stamp; the
+    ///     SD-local position is the only meaningful index they have
+    ///     and the first `set_index` succeeds.
+    ///
+    /// Both paths therefore funnel through `JitCode::set_index(idx)`
+    /// unconditionally — the canonical helper asserts `existing ==
+    /// idx` on a re-stamp and panics on a divergent one, which is
+    /// exactly the parity gate Codex flagged: a previously-stamped
+    /// payload merged into a different SD slot will trip the assert
+    /// instead of silently violating the upstream invariant.
     fn stamp_payload_index(idx: i32, payload: &std::sync::Arc<crate::PyJitCode>) {
-        if payload.jitcode.try_index().is_some() {
-            // Pre-stamped at build time: leave the canonical index
-            // intact.  The SD wrapper's own `index` field continues to
-            // record the SD-local position for callers that need it.
-            return;
-        }
-        // First-set path: pyre-only fresh runtime jitcodes (skeletons,
-        // portal-bridge installs) reach here without a build-time
-        // stamp.  The SD-local position is the only meaningful index
-        // they have.
         payload.jitcode.set_index(idx as usize);
     }
 
@@ -591,29 +598,35 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
         return existing;
     }
-    if let Some(callbacks) = crate::callbacks::try_get() {
-        let raw_code = unsafe {
-            if code.is_null() {
-                std::ptr::null()
-            } else {
-                pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            }
-        };
-        if !raw_code.is_null() {
-            (callbacks.ensure_majit_jitcode)(raw_code, code);
-            if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code))
-            {
-                return existing;
-            }
+    if code.is_null() {
+        return METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None));
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if !raw_code.is_null() {
+        let callbacks = crate::callbacks::try_get().unwrap_or_else(|| {
+            panic!(
+                "CallJitCallbacks not initialized while resolving JitCode for W_CodeObject {:p}",
+                code
+            )
+        });
+        (callbacks.ensure_published_jitcode)(raw_code, code);
+        if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
+            return existing;
         }
+        panic!(
+            "ensure_published_jitcode did not install a populated JitCode for W_CodeObject {:p}",
+            code
+        );
     }
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None))
 }
 
 /// Install one CodeWriter-owned PyJitCode payload into trace-side
-/// MetaInterpStaticData. Used by the lazy CallControl.get_jitcode drain path
-/// to publish the same Arc that CallControl.jitcodes stores.
+/// MetaInterpStaticData. Used by the CallControl.get_jitcode drain path to
+/// publish the same Arc that CallControl.jitcodes stores.
 pub fn install_jitcode_for(
     code: *const (),
     payload: std::sync::Arc<crate::PyJitCode>,
@@ -5914,7 +5927,7 @@ mod tests {
                 jit_create_self_recursive_callee_frame_1: std::ptr::null(),
                 jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
                 driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
-                ensure_majit_jitcode: |_, _| {},
+                ensure_published_jitcode: |_, _| {},
             }));
             crate::callbacks::init(cb);
         });

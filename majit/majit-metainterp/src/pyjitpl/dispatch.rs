@@ -1452,23 +1452,23 @@ where
                 let unique_id = self.frames.current_mut().int_values[unique_id_idx].unwrap_or(0);
                 crate::rvmprof::cintf::jit_rvmprof_code(leaving, unique_id);
             }
-            jitcode::BC_JIT_MERGE_POINT => {
+            jitcode::BC_JIT_MERGE_POINT | jitcode::BC_JIT_MERGE_POINT_C => {
                 // blackhole.py:1066 bhimpl_jit_merge_point parity.
                 // Portal merge point: close the loop if at the traced header.
                 //
                 // Payload shape mirrors upstream `@arguments("self", "i",
                 // "I", "R", "F", "I", "R", "F")` (blackhole.py:1066) and
                 // pyre's own `majit-metainterp/src/jitcode/assembler.rs:692`
-                // — 1-byte jdindex (an `int_values` register index, with
-                // the constant pool slot resolved by `MIFrame::copy_constants`
-                // at frame setup) + six typed register lists
-                // (`[len:u8][reg:u8 * N]`). Metainterp dispatch doesn't use
-                // jdindex yet (trace-level opimpl_jit_merge_point 는
-                // pyjitpl.py:1538 참조), but the cursor must advance past the
-                // operands so the following opcode byte is read at the
-                // correct offset.
+                // — 1-byte jdindex (assembler.py:312 `USE_C_FORM` membership
+                // selects between `'c'` raw signed byte and `'i'` register
+                // pool slot at compile time; both opcodes route here) + six
+                // typed register lists (`[len:u8][reg:u8 * N]`). Metainterp
+                // dispatch doesn't use jdindex yet (trace-level
+                // opimpl_jit_merge_point 는 pyjitpl.py:1538 참조), but the
+                // cursor must advance past the operands so the following
+                // opcode byte is read at the correct offset.
                 let frame = self.frames.current_mut();
-                let _jdindex_reg = frame.next_u8();
+                let _jdindex_byte = frame.next_u8();
                 for _ in 0..6 {
                     let count = frame.next_u8() as usize;
                     for _ in 0..count {

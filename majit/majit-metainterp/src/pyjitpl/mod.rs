@@ -3969,12 +3969,15 @@ impl<M: Clone> MetaInterp<M> {
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        &backend_layouts,
+                        backend_layouts.as_slice(),
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -4767,12 +4770,15 @@ impl<M: Clone> MetaInterp<M> {
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        &backend_layouts,
+                        backend_layouts.as_slice(),
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -5238,12 +5244,15 @@ impl<M: Clone> MetaInterp<M> {
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        &backend_layouts,
+                        backend_layouts.as_slice(),
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -5553,12 +5562,15 @@ impl<M: Clone> MetaInterp<M> {
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        &backend_layouts,
+                        backend_layouts.as_slice(),
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -7392,12 +7404,15 @@ impl<M: Clone> MetaInterp<M> {
                 let mut terminal_exit_layouts =
                     compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        &backend_layouts,
+                        backend_layouts.as_slice(),
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -7843,7 +7858,10 @@ impl<M: Clone> MetaInterp<M> {
                         source_trace_id,
                         fail_index,
                     ) {
-                        compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                        compile::merge_backend_exit_layouts(
+                            &mut exit_layouts,
+                            backend_layouts.as_slice(),
+                        );
                     }
                     if let Some(backend_layouts) =
                         self.backend.compiled_bridge_terminal_exit_layouts(
@@ -7854,7 +7872,7 @@ impl<M: Clone> MetaInterp<M> {
                     {
                         compile::merge_backend_terminal_exit_layouts(
                             &mut terminal_exit_layouts,
-                            &backend_layouts,
+                            backend_layouts.as_slice(),
                         );
                     }
                     let bridge_trace_info = self
@@ -16317,12 +16335,12 @@ mod tests {
         );
         let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
-            compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+            compile::merge_backend_exit_layouts(&mut exit_layouts, backend_layouts.as_slice());
         }
         if let Some(backend_layouts) = meta.backend.compiled_terminal_exit_layouts(&token) {
             compile::merge_backend_terminal_exit_layouts(
                 &mut terminal_exit_layouts,
-                &backend_layouts,
+                backend_layouts.as_slice(),
             );
         }
         let trace_info = meta.backend.compiled_trace_info(&token, trace_id);

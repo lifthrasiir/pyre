@@ -27,10 +27,10 @@ pub struct CallJitCallbacks {
     pub jit_create_self_recursive_callee_frame_1_raw_int: *const (),
     // eval.rs driver access (opaque pointer to JitDriverPair)
     pub driver_pair: fn() -> *mut u8,
-    /// codewriter.py:make_jitcodes parity: build the majit JitCode for
-    /// `code` through CallControl.get_jitcode + the pending-graph drain, then
-    /// publish the same populated PyJitCode Arc into trace-side staticdata.
-    pub ensure_majit_jitcode: fn(*const CodeObject, *const ()),
+    /// codewriter.py:make_jitcodes parity: build the writer-owned JitCode
+    /// for `code` through CallControl.get_jitcode + the pending-graph drain,
+    /// then publish the same populated PyJitCode Arc into trace-side SD.
+    pub ensure_published_jitcode: fn(*const CodeObject, *const ()),
 }
 
 // Safety: function pointers are 'static and never mutated after init
@@ -52,8 +52,8 @@ pub fn get() -> &'static CallJitCallbacks {
     CALLBACKS.with(|c| c.get().expect("CallJitCallbacks not initialized"))
 }
 
-/// Optional callback table lookup for cold paths that can fall back to
-/// skeleton-only behavior in tests before pyre-jit initializes callbacks.
+/// Optional callback table lookup for paths that can either fail loudly
+/// or handle null-code skeletons before pyre-jit initializes callbacks.
 #[inline]
 pub fn try_get() -> Option<&'static CallJitCallbacks> {
     CALLBACKS.with(|c| c.get())

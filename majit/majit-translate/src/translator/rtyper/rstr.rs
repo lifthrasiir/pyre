@@ -896,13 +896,22 @@ pub fn pair_charlike_string_convert_from_to(
             _ => return Ok(None),
         };
 
-    let helper = lowlevel_chr2str_function(
-        llops
-            .require_rtyper("pair_char_string_convert_from_to")?
-            .as_ref(),
-        helper_name,
+    // PyPy `rstr.py:810-814 convert_from_to` calls
+    // `llops.gendirectcall(r_from.ll.ll_chr2str, v)` with a host helper
+    // function — `llops` consults its own `self.rtyper` internally.
+    // Pyre routes the helper build through the same `LowLevelOpList`
+    // entry (`lowlevel_helper_function_with_builder`) so the caller
+    // never reaches for `llops.rtyper` directly.
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    let elem_for_builder = elem_lltype.clone();
+    let helper = llops.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![elem_lltype],
         ptr_lltype,
-        elem_lltype,
+        move |_rtyper, _args, _result| {
+            build_ll_chr2str_helper_graph(&helper_name_owned, ptr_for_builder, elem_for_builder)
+        },
     )?;
     let result = llops.gendirectcall(&helper, vec![v.clone()])?;
     Ok(result.map(Hlvalue::Variable))
@@ -922,16 +931,19 @@ pub fn pair_string_char_convert_from_to(
     {
         return Ok(None);
     }
-    let helper = llops
-        .require_rtyper("pair_string_char_convert_from_to")?
-        .lowlevel_helper_function_with_builder(
-            "ll_stritem_nonneg".to_string(),
-            vec![STRPTR.clone(), LowLevelType::Signed],
-            LowLevelType::Char,
-            move |_rtyper, _args, _result| {
-                build_ll_stritem_nonneg_helper_graph("ll_stritem_nonneg", STRPTR.clone())
-            },
-        )?;
+    // PyPy `rstr.py:817-820 convert_from_to` calls
+    // `llops.gendirectcall(r_from.ll.ll_stritem_nonneg, v, c_zero)` —
+    // the rtyper lives behind `llops`, never at the call site. Pyre
+    // routes the helper build through `LowLevelOpList::
+    // lowlevel_helper_function_with_builder` for the same effect.
+    let helper = llops.lowlevel_helper_function_with_builder(
+        "ll_stritem_nonneg".to_string(),
+        vec![STRPTR.clone(), LowLevelType::Signed],
+        LowLevelType::Char,
+        move |_rtyper, _args, _result| {
+            build_ll_stritem_nonneg_helper_graph("ll_stritem_nonneg", STRPTR.clone())
+        },
+    )?;
     let zero = Hlvalue::Constant(HighLevelOp::inputconst(
         &LowLevelType::Signed,
         &ConstValue::Int(0),
