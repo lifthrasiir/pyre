@@ -772,6 +772,44 @@ mod tests {
     use super::*;
     use crate::config::translationoption::get_combined_translation_config;
     use crate::translator::translator::TranslationContext;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static PYPY_SRCROOT_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct PypySrcrootEnvGuard {
+        prior: Option<String>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl PypySrcrootEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = PYPY_SRCROOT_ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let prior = std::env::var("PYPY_SRCROOT").ok();
+            // Process environment is global; these tests serialize the
+            // mutation so parallel Rust tests cannot observe a half-fixture.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var("PYPY_SRCROOT", value),
+                    None => std::env::remove_var("PYPY_SRCROOT"),
+                }
+            }
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for PypySrcrootEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(value) => std::env::set_var("PYPY_SRCROOT", value),
+                    None => std::env::remove_var("PYPY_SRCROOT"),
+                }
+            }
+        }
+    }
 
     fn fixture_translator_and_config() -> (Rc<TranslationContext>, Rc<Config>) {
         let translator = Rc::new(TranslationContext::new());
@@ -813,21 +851,11 @@ mod tests {
         // `[pypy_include_dir, ?revdb]` where `pypy_include_dir =
         // py.path.local(__file__).join('..')` resolves to
         // `${PYPY_SRCROOT}/rpython/translator/c`. The local port
-        // honours `PYPY_SRCROOT`; when unset it returns an empty list
-        // rather than silently substituting a Rust source dir.
+        // honours `PYPY_SRCROOT`.
         let (translator, config) = fixture_translator_and_config();
-        let prior = std::env::var("PYPY_SRCROOT").ok();
-        unsafe {
-            std::env::set_var("PYPY_SRCROOT", "/tmp/pypy-fake-srcroot");
-        }
+        let _env = PypySrcrootEnvGuard::set(Some("/tmp/pypy-fake-srcroot"));
         let cb = CBuilder::new(translator, None, config, None, None, Vec::new());
         let eci = cb.get_eci();
-        unsafe {
-            match &prior {
-                Some(v) => std::env::set_var("PYPY_SRCROOT", v),
-                None => std::env::remove_var("PYPY_SRCROOT"),
-            }
-        }
 
         assert_eq!(eci.include_dirs.len(), 1);
         assert!(
@@ -838,19 +866,11 @@ mod tests {
     }
 
     #[test]
-    fn get_eci_returns_empty_include_dirs_without_srcroot() {
+    fn get_eci_returns_sentinel_include_dir_without_srcroot() {
         let (translator, config) = fixture_translator_and_config();
-        let prior = std::env::var("PYPY_SRCROOT").ok();
-        unsafe {
-            std::env::remove_var("PYPY_SRCROOT");
-        }
+        let _env = PypySrcrootEnvGuard::set(None);
         let cb = CBuilder::new(translator, None, config, None, None, Vec::new());
         let eci = cb.get_eci();
-        if let Some(v) = prior {
-            unsafe {
-                std::env::set_var("PYPY_SRCROOT", v);
-            }
-        }
 
         // Upstream `:80-85 get_eci` ALWAYS returns a non-empty
         // include_dirs list. The local port surfaces an explicit
