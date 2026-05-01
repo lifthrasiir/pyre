@@ -4,6 +4,10 @@
 # On main, first insert() called items_to_vec() → Object strategy;
 # on this branch, stays Integer throughout (no boxing overhead).
 # insert(0, x) is O(n) per call → total O(n^2); small N is intentional.
+#
+# NOTE: kept at module level intentionally — wrapping in def main() lets the
+# JIT fire and exposes a dynasm-side wrong-output bug. Re-wrap once that's
+# fixed.
 
 N = 50000
 

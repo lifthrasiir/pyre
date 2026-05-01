@@ -3,6 +3,11 @@
 # PYPYLOG confirms: guard_class(IntegerListStrategy) + new_array(3, ArrayS 8).
 # On main, there was no setslice op (Object-only fallback).
 # On this branch, setslice stays in Integer strategy when new items are plain ints.
+#
+# NOTE: kept at module level intentionally — wrapping in def main() lets the
+# JIT fire and exposes a TypeError("list indices must be integers, not tuple")
+# panic in opcode_ops.rs:178 (slice assignment lowering bug). Re-wrap once
+# that's fixed.
 
 N = 200000
 
