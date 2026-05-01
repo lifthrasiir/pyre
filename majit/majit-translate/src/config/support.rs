@@ -177,7 +177,10 @@ pub fn detect_pax_with_path(path: &str) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
 
     /// Serialise every test that touches `MAKEFLAGS` so the
     /// remove-var/read-var window is not raced by another test
@@ -185,6 +188,12 @@ mod tests {
     /// threaded; without this lock the macOS / Linux sub-tests below
     /// observe `MAKEFLAGS=-j4` set by the dedicated MAKEFLAGS test.
     static MAKEFLAGS_LOCK: Mutex<()> = Mutex::new(());
+    static TEMP_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_fixture_path(name: &str) -> std::path::PathBuf {
+        let id = TEMP_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("majit-{name}-{}-{id}", std::process::id()))
+    }
 
     #[test]
     fn detect_number_of_processors_returns_positive() {
@@ -280,8 +289,7 @@ mod tests {
     /// observable independent of the host machine.
     #[test]
     fn read_cpu_count_from_cpuinfo_parses_processor_max_id_plus_one() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("majit-cpuinfo-fixture-basic");
+        let path = temp_fixture_path("cpuinfo-fixture-basic");
         let _ = fs::write(
             &path,
             "processor\t: 0\nvendor_id\t: AuthenticAMD\nprocessor\t: 7\n",
@@ -297,8 +305,7 @@ mod tests {
     /// and the caller turns that into `1`.
     #[test]
     fn read_cpu_count_from_cpuinfo_returns_none_for_missing_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("majit-cpuinfo-fixture-missing");
+        let path = temp_fixture_path("cpuinfo-fixture-missing");
         let _ = fs::remove_file(&path);
         assert!(read_cpu_count_from_cpuinfo(path.to_str().unwrap()).is_none());
     }
@@ -307,8 +314,7 @@ mod tests {
     /// Garbage lines must not poison the max.
     #[test]
     fn read_cpu_count_from_cpuinfo_ignores_non_processor_lines() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("majit-cpuinfo-fixture-mixed");
+        let path = temp_fixture_path("cpuinfo-fixture-mixed");
         let _ = fs::write(
             &path,
             "model name\t: Threadripper\nprocessor\t: 3\nflags\t: fpu vme de\n",
@@ -324,8 +330,7 @@ mod tests {
     /// collapses to `1`. The Rust parser surfaces `None`.
     #[test]
     fn read_cpu_count_from_cpuinfo_returns_none_for_processor_line_without_digits() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("majit-cpuinfo-fixture-no-digits");
+        let path = temp_fixture_path("cpuinfo-fixture-no-digits");
         let _ = fs::write(&path, "processor\t: not-a-number\n");
         let count = read_cpu_count_from_cpuinfo(path.to_str().unwrap());
         let _ = fs::remove_file(&path);
@@ -336,8 +341,7 @@ mod tests {
     /// the contents of `/proc/self/status`.
     #[test]
     fn detect_pax_returns_true_when_status_contains_pax() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("majit-pax-fixture-positive");
+        let path = temp_fixture_path("pax-fixture-positive");
         let _ = fs::write(
             &path,
             "Name:\tcat\nState:\tR (running)\nPaX:\tPemRs\n".as_bytes(),
@@ -353,8 +357,7 @@ mod tests {
 
     #[test]
     fn detect_pax_returns_false_when_status_lacks_pax() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("majit-pax-fixture-negative");
+        let path = temp_fixture_path("pax-fixture-negative");
         let _ = fs::write(&path, "Name:\tcat\nState:\tR (running)\n".as_bytes());
         let result = detect_pax_with_path(path.to_str().unwrap()).expect("path readable");
         let _ = fs::remove_file(&path);
@@ -366,7 +369,7 @@ mod tests {
     /// error rather than silently treat a missing file as "no PaX".
     #[test]
     fn detect_pax_propagates_missing_file_on_linux() {
-        let path = std::env::temp_dir().join("majit-pax-fixture-absent");
+        let path = temp_fixture_path("pax-fixture-absent");
         let _ = fs::remove_file(&path);
         let result = detect_pax_with_path(path.to_str().unwrap());
         if cfg!(target_os = "linux") {
