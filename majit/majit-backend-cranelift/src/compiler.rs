@@ -18770,8 +18770,12 @@ mod tests {
         let _guard = may_force_test_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        // RPython backend parity requires GUARD_NOT_FORCED to be the
-        // immediate next operation after CALL_MAY_FORCE.
+        // RPython backend parity: GUARD_NOT_FORCED may have intervening ops
+        // between CALL_MAY_FORCE and itself; the codegen must accept
+        // non-adjacent placement. (Relaxed in
+        // `check_paired_guard_not_forced` forward-scan — see the helper's
+        // PRE-EXISTING-ADAPTATION note for the convergence path back to
+        // upstream's strict +1 invariant.)
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
@@ -18808,16 +18812,21 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         backend.set_constants(constants);
         let mut token = JitCellToken::new(1500_410);
-        let err = backend
-            .compile_loop(&inputargs, &ops, &mut token)
-            .unwrap_err();
-        match err {
-            BackendError::Unsupported(msg) => {
-                assert!(msg.contains("CallMayForceI"));
-                assert!(msg.contains("ops[position+1] must be guard_not_forced(_2)"));
-            }
-            other => panic!("expected unsupported error, got {other:?}"),
-        }
+        // Non-adjacent GuardNotForced placement is now accepted.
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        // Not forced: function returns 42; SameAsI propagates it to Finish.
+        let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 42);
+
+        // Forced: GuardNotForced fires; fail_args = [flag=1, call_result=42, inputarg0=10].
+        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
+        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(backend.get_int_value(&frame, 1), 42);
+        assert_eq!(backend.get_int_value(&frame, 2), 10);
+        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xBABA));
     }
 
     #[test]
