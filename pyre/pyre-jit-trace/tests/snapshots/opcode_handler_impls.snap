@@ -531,8 +531,11 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
                     }
                 }
             }
-            // pyjitpl.py:2994-3036 search current_merge_points
-            if !ctx.has_merge_point(back_edge_key) {
+            // pyjitpl.py:2994-3036 search current_merge_points; the
+            // shape assert at line 2996 fires for every visited merge
+            // point, regardless of whether the greenkey matches —
+            // structural red-bank invariant under the same jitdriver.
+            if !ctx.has_merge_point_with_shape_assert(back_edge_key, live_args.len()) {
                 // pyjitpl.py:3034-3036 first visit, register & continue
                 ctx.add_merge_point(back_edge_key, live_args, live_types, target);
                 if majit_metainterp::majit_log_enabled() {

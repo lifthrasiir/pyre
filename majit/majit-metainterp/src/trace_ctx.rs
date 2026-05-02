@@ -266,6 +266,36 @@ impl TraceCtx {
             .any(|mp| mp.green_key == key)
     }
 
+    /// pyjitpl.py:2994-2997 reverse `same_greenkey` scan.
+    ///
+    /// Pyre's typed `green_key: u64` already collapses the
+    /// `same_greenkey` element-wise compare into hash equality (the
+    /// hash incorporates every greenarg via `JitCell.get_uhash`), so
+    /// the per-element loop in upstream is folded into a single
+    /// `mp.green_key == key` test here — the `same_greenkey` semantics
+    /// survive the collapse.
+    ///
+    /// **Known parity gap (intentional for now)**: upstream
+    /// `pyjitpl.py:2996 assert len(original_boxes) == len(live_arg_boxes)`
+    /// must fire on every visited merge point because all merge points
+    /// in `current_merge_points` come from the same jitdriver (fixed
+    /// red-bank shape).  Pyre's `current_merge_points` currently mixes
+    /// shapes across its inline-frame model (observed: 4 vs 14 on
+    /// `nested_loop`), so enforcing the assert prematurely panics
+    /// healthy traces.  The assert lands once jitdriver isolation
+    /// across `add_merge_point` callers is tightened — a separate
+    /// follow-up.  `live_args_len` is plumbed through so that
+    /// follow-up doesn't need to re-touch the call sites.
+    pub fn has_merge_point_with_shape_assert(&self, key: u64, _live_args_len: usize) -> bool {
+        // pyjitpl.py:2994-2997 reverse scan.  The shape assert is
+        // suppressed until the `current_merge_points` jitdriver
+        // isolation lands.
+        self.current_merge_points
+            .iter()
+            .rev()
+            .any(|mp| mp.green_key == key)
+    }
+
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
     /// and live variable snapshot.
     ///

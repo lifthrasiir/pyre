@@ -1222,18 +1222,27 @@ impl<S: JitState> JitDriver<S> {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
                     let bridge_fail_index = bridge.fail_index;
-                    let has_targets = self.meta.has_compiled_targets(bridge_key);
+                    // pyjitpl.py:2981-2982:
+                    //     ptoken = self.get_procedure_token(greenboxes)
+                    //     if has_compiled_targets(ptoken): ...
+                    // `greenboxes` is the *current* loop header — i.e. the
+                    // trace ctx's typed green_key after `set_green_key`,
+                    // not the bridge origin from the failed guard.  Bridge
+                    // origin only applies when the trace has not yet been
+                    // retargeted by `reached_loop_header`.
+                    let target_key = self.current_trace_green_key().unwrap_or(bridge_key);
+                    let has_targets = self.meta.has_compiled_targets(target_key);
                     if has_targets {
                         if crate::majit_log_enabled() {
                             eprintln!(
-                                "[bridge] CloseLoop -> close_bridge key={} trace={} fail={}",
-                                bridge_key, bridge_trace_id, bridge_fail_index
+                                "[bridge] CloseLoop -> close_bridge target_key={} (bridge_origin={}) trace={} fail={}",
+                                target_key, bridge_key, bridge_trace_id, bridge_fail_index
                             );
                         }
                         if let Some(sym) = self.sym.as_ref() {
                             let finish_args = S::collect_jump_args(sym);
                             let result = self.meta.close_bridge(
-                                bridge_key,
+                                target_key,
                                 bridge_trace_id,
                                 bridge_fail_index,
                                 &finish_args,
