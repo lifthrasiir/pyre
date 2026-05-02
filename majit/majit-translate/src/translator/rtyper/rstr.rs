@@ -3465,6 +3465,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for func in ["eq", "ne", "lt", "le", "gt", "ge"] {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -3498,6 +3501,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for func in ["eq", "ne"] {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -3531,6 +3537,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for func in ["lt", "le", "gt", "ge"] {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -3566,6 +3575,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3601,6 +3613,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3638,6 +3653,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for func in ["lt", "le", "gt", "ge"] {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -3687,6 +3705,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3724,6 +3745,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for func in ["lt", "le", "gt", "ge"] {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -3766,6 +3790,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3810,6 +3837,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3851,6 +3881,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3909,6 +3942,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -3968,6 +4004,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for (method, expected_helper) in [
             ("find", "ll_find_char"),
@@ -4058,6 +4097,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4117,6 +4159,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4163,6 +4208,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4229,6 +4277,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4293,6 +4344,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4359,6 +4413,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4428,6 +4485,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4482,6 +4542,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4542,6 +4605,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for (method, expected_helper) in [
             ("isdigit", "ll_isdigit"),
@@ -4596,6 +4662,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for (method, expected_helper) in [("upper", "ll_upper"), ("lower", "ll_lower")] {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -4643,6 +4712,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for (method, expected_helper) in [
             ("isdigit", "ll_unicode_isdigit"),
@@ -4697,6 +4769,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for (method, expected_message) in [
             ("upper", "Cannot do toupper on unicode string"),
@@ -4776,6 +4851,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for case in cases {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -4846,6 +4924,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -4903,6 +4984,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5185,6 +5269,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
 
         for case in cases {
             let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
@@ -5276,6 +5363,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5320,6 +5410,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5363,6 +5456,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5406,6 +5502,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5452,6 +5551,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5495,6 +5597,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5540,6 +5645,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5584,6 +5692,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5621,6 +5732,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5682,6 +5796,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5745,6 +5862,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5784,6 +5904,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5829,6 +5952,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5885,6 +6011,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,
@@ -5941,6 +6070,9 @@ mod tests {
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
             rtyper.clone(),
             None,

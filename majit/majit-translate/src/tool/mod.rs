@@ -8,6 +8,7 @@
 //! | majit                 | rpython/tool/                 |
 //! |-----------------------|-------------------------------|
 //! | `algo::unionfind`     | `algo/unionfind.py`           |
+//! | `ansi_print`          | `ansi_print.py`               |
 //! | `error`               | `error.py`                    |
 //! | `flattenrec`          | `flattenrec.py`               |
 //! | `pairtype`            | `pairtype.py`                 |
@@ -15,6 +16,7 @@
 //! | `udir`                | `udir.py`                     |
 
 pub mod algo;
+pub mod ansi_print;
 pub mod error;
 pub mod flattenrec;
 pub mod pairtype;

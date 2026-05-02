@@ -1227,6 +1227,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let v_left = Variable::new();
         v_left.set_concretetype(Some(LowLevelType::Bool));
@@ -1272,6 +1275,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = unary_integer_hop(
             "abs_ovf",
@@ -1310,6 +1316,9 @@ mod tests {
         // the same `0 - x` lowering as rtype_neg.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = unary_integer_hop(
             "neg_ovf",
@@ -1339,6 +1348,9 @@ mod tests {
         // returns false and the check helper is not emitted.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = unary_integer_hop(
             "chr",
@@ -1366,6 +1378,9 @@ mod tests {
         // rint.py:76-83. Mirrors rtype_chr with UniChar result type.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = unary_integer_hop(
             "unichr",

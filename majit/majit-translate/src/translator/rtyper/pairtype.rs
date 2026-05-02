@@ -1229,6 +1229,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(
             rtyper.clone(),
@@ -1286,6 +1289,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(
             rtyper.clone(),
@@ -1344,6 +1350,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(
             rtyper.clone(),
@@ -1402,6 +1411,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let hop = HighLevelOp::new(
             rtyper.clone(),
@@ -1472,6 +1484,9 @@ mod tests {
 
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         let mut v_int = Variable::new();
         v_int.set_concretetype(Some(LowLevelType::Signed));

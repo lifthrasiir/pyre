@@ -13,12 +13,9 @@
 //! * `compute_reachability(graph)` (`:72-90`).
 //! * `find_loop_blocks(graph)` (`:92-112`).
 //! * `md5digest(translator)` (`:114-124`).
-//!
-//! Deferred:
-//!
-//! * `log = AnsiLogger("backendopt")` (`:6`) — pyre's logger
-//!   channels are unported; helpers that emit through `log` use
-//!   no-op stubs in their callers.
+//! * `log = AnsiLogger("backendopt")` (`:6`) — exposed via
+//!   [`LOG`]; consumers call `LOG.method("<subname>", &text)` to
+//!   mirror upstream's dynamic `log.<subname>(text)` channel.
 //!
 //! The legacy `crate::model::FunctionGraph` carries an unrelated
 //! `find_backedges` in `jit_codewriter/policy.rs:316` keyed on a
@@ -37,11 +34,20 @@ use crate::flowspace::model::{
     BlockKey, BlockRef, ConstValue, Constant, FunctionGraph, GraphKey, GraphRef, Hlvalue, LinkRef,
     SpaceOperation, Variable,
 };
+use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::lltypesystem::lltype::{FuncType, LowLevelType, functionptr};
 use crate::translator::rtyper::rmodel::inputconst_from_lltype;
 use crate::translator::simplify::get_graph_for_call;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
+
+/// RPython `support.log = AnsiLogger("backendopt")` (`:6`).
+///
+/// `log.<subname>("text")` upstream maps to `LOG.method("<subname>",
+/// &text)` here — the dynamic-method synthesis upstream gets through
+/// `AnsiLogger.__getattr__` is replaced by an explicit `subname`
+/// argument because Rust has no equivalent.
+pub static LOG: AnsiLogger = AnsiLogger::new("backendopt");
 
 /// `graph_operations(graph)` at `support.py:9-12`.
 ///

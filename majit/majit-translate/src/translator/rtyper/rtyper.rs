@@ -710,19 +710,54 @@ impl RPythonTyper {
             // except AttributeError: pass`.
             let sandbox_name = graph.func._sandbox_external_name.clone();
             if let Some(name) = sandbox_name {
-                // rtyper.py:577-582 — sandbox trampoline path.
-                // `make_sandbox_trampoline` lives in `rsandbox.py`
-                // and is currently unported (see
-                // `annotator/policy.rs:42` — same gate). Surface a
-                // structured TaskError-equivalent so the missing
-                // dep is visible at the right call site.
+                // PRE-EXISTING-ADAPTATION: rtyper.py:577-582 sandbox
+                // trampoline path. Upstream:
+                //
+                //     args_s = [v.annotation for v in graph.getargs()]
+                //     s_result = graph.getreturnvar().annotation
+                //     sandboxed = make_sandbox_trampoline(name, args_s, s_result)
+                //     return self.getannmixlevel().delayedfunction(
+                //             sandboxed, args_s, s_result)
+                //
+                // The downstream half is already ported locally:
+                // `MixLevelHelperAnnotator.delayedfunction`
+                // (`annlowlevel.rs:764`, mirroring
+                // `annlowlevel.py:151`) and `getannmixlevel`
+                // (`rtyper.rs` :191-equivalent) accept the
+                // `(sandboxed, args_s, s_result)` triple as-is.
+                //
+                // The upstream half is blocked on
+                // `rsandbox.make_sandbox_trampoline`
+                // (`rpython/translator/sandbox/rsandbox.py:143-170`),
+                // whose body chains through `rmarshal.get_marshaller` /
+                // `rmarshal.get_loader` (raising `CannotMarshal` /
+                // `CannotUnmarshall` on unsupported types) and
+                // `dump_string` / `sandboxed_io` / `load_result`. None
+                // of those are ported. A naive partial port would
+                // build a stub that always errors at runtime — that
+                // would diverge silently because annotation must
+                // succeed before the sandbox boundary fires.
+                //
+                // Convergence path:
+                //   1. Port `rmarshal.get_marshaller` /
+                //      `get_loader` + `CannotMarshal` /
+                //      `CannotUnmarshall` exception types.
+                //   2. Port `rsandbox.make_sandbox_trampoline` +
+                //      `make_stub` + `_annotate` (the local
+                //      `MixLevelHelperAnnotator` thin wrapper).
+                //   3. Replace this `Err(...)` with the upstream
+                //      `make_sandbox_trampoline(...)` →
+                //      `getannmixlevel().delayedfunction(...)` chain.
+                //
+                // Surfacing as `TyperError` keeps the behavior strict
+                // — main's silent fallthrough was a NEW-DEVIATION;
+                // the error preserves "sandbox not yet supported"
+                // visibility without inventing a stub trampoline.
                 return Err(TyperError::message(format!(
                     "rtyper.py:577-582 getcallable sandbox path: \
-                     make_sandbox_trampoline({name}) is unported \
-                     (rsandbox.py). Convergence path: port \
-                     rsandbox.make_sandbox_trampoline alongside \
-                     LowLevelAnnotatorPolicy sandbox_external lookup; \
-                     then route through self.getannmixlevel().delayedfunction(...)."
+                     make_sandbox_trampoline({name}) blocked on \
+                     unported rsandbox.py + rmarshal.py \
+                     (CannotMarshal / get_marshaller / get_loader)"
                 )));
             }
         }
@@ -4781,11 +4816,149 @@ impl LowLevelOpList {
 
     /// RPython `LowLevelOpList.gendirectcall(self, ll_function, *args_v)`
     /// (`rtyper.py:845-882`).
+    ///
+    /// Upstream body verbatim:
+    ///
+    /// ```python
+    /// def gendirectcall(self, ll_function, *args_v):
+    ///     rtyper = self.rtyper
+    ///     args_s = []
+    ///     newargs_v = []
+    ///     with rtyper.annotator.using_policy(rtyper.lowlevel_ann_policy):  # :849
+    ///         for v in args_v:
+    ///             if v.concretetype is Void:                                # :851
+    ///                 s_value = rtyper.annotation(v)
+    ///                 if s_value is None:
+    ///                     s_value = annmodel.s_None
+    ///                 if not s_value.is_constant():
+    ///                     raise TyperError(...)
+    ///                 if not isinstance(s_value, (SomePBC, SomeNone)):
+    ///                     raise TyperError(...)
+    ///                 args_s.append(s_value)
+    ///             else:
+    ///                 args_s.append(lltype_to_annotation(v.concretetype))   # :861
+    ///             newargs_v.append(v)
+    ///         self.rtyper.call_all_setups()                                 # :864
+    ///         if hasattr(ll_function, 'im_func'):                           # :867
+    ///             args_s.insert(0, bk.immutablevalue(ll_function.im_self))
+    ///             newargs_v.insert(0, inputconst(Void, ll_function.im_self))
+    ///             ll_function = ll_function.im_func
+    ///     graph = annotate_lowlevel_helper(rtyper.annotator, ll_function,  # :873
+    ///                                      args_s, rtyper.lowlevel_ann_policy)
+    ///     self.record_extra_call(graph)                                     # :875
+    ///     f = self.rtyper.getcallable(graph)                                # :878
+    ///     ...
+    ///     return self.genop('direct_call', [c]+newargs_v,
+    ///                       resulttype=typeOf(fobj).RESULT)
+    /// ```
+    ///
+    /// What this Rust port preserves verbatim from the upstream body:
+    ///
+    ///   * `using_policy(self.lowlevel_ann_policy)` RAII guard
+    ///     mirroring upstream `:849`. Scope: the guard is dropped
+    ///     after `call_all_setups()` returns, matching upstream's
+    ///     `with` block which closes at `:871` before the
+    ///     `annotate_lowlevel_helper` / `record_extra_call` /
+    ///     `getcallable` / `genop` block at `:873-882`.
+    ///   * `rtyper.call_all_setups()` per call, mirroring upstream
+    ///     `:864` — drains pending `_reprs_must_call_setup` entries
+    ///     (idempotent no-op when nothing pending).
+    ///   * `record_extra_call(graph)` mirroring upstream `:875`.
+    ///   * `getcallable(graph)` + `inputconst(typeOf(f), f)` +
+    ///     `genop('direct_call', ...)` mirroring upstream
+    ///     `:878-882`.
+    ///
+    /// PRE-EXISTING-ADAPTATIONs (parity debt — not "by API choice";
+    /// each is reachable only after the multi-session
+    /// `LowLevelFunction → HostObject` refactor lands):
+    ///
+    ///   * **`args_s` derivation** at upstream `:850-862`. Local
+    ///     `LowLevelFunction.args: Vec<LowLevelType>` carries concrete
+    ///     low-level types declared at construction time, so the
+    ///     args_s shape is fixed up-front rather than recomputed per
+    ///     call. The Void/PBC branch at `:851-859` is unreachable
+    ///     because no current `gendirectcall` caller passes a Void
+    ///     argument slot — every callsite supplies concretely-typed
+    ///     Hlvalues whose `concretetype` matches the helper's
+    ///     declared `LowLevelType`.
+    ///   * **Operand-side bound-method prepend** at upstream
+    ///     `:866-871`. The `inputconst(Void, im_self)` slot is not
+    ///     prepended to `args_v` because the helper graph was
+    ///     pre-built via `annotate_helper:792-803`, which already
+    ///     swapped `function = bound_method_func()`. The graph's
+    ///     arity therefore matches `args_v.len()` without a Void
+    ///     prepend.
+    ///   * **`annotate_lowlevel_helper` per call** at upstream
+    ///     `:873-874`. Local helpers are synthesized as `PyGraph`s
+    ///     directly inside `lowlevel_helper_function_with_builder`
+    ///     (`rtyper.rs:870-905`) — that path **bypasses**
+    ///     `annotate_lowlevel_helper` / `bookkeeper.getdesc` /
+    ///     `cachedgraph` / `buildgraph` entirely; the synthesized
+    ///     graph is memoised under `(name, args, result)` in
+    ///     `RPythonTyper.lowlevel_helper_graphs`. Successive
+    ///     `gendirectcall` calls reuse the cached graph and never
+    ///     reach the annotator.
+    ///   * **Pre-drain Rust-side argument validation**. The
+    ///     concretetype-vs-`ll_function.args` check at the head of
+    ///     this function (Rust-only — upstream has no equivalent)
+    ///     returns `Err(TyperError)` before reaching
+    ///     `call_all_setups`. Upstream always drains setups (the
+    ///     `with` block opens before any failure path); the local
+    ///     short-circuit treats validation failure as fatal so the
+    ///     un-drained setups are not load-bearing for the failing
+    ///     call.
+    ///
+    /// Convergence path (full upstream-shape parity): replace
+    /// `LowLevelFunction`'s pre-built-graph carrier with a
+    /// `HostObject` reference, and have helper construction sites
+    /// register a `HostObject::UserFunction { graph_func }` plus seed
+    /// `translator._prebuilt_graphs[host] = pygraph`. Then
+    /// `gendirectcall` can: (1) build `args_s` from
+    /// `args_v[i].concretetype` (with `rtyper.annotation(v)` for Void
+    /// slots), (2) apply the bound-method hack on the operand list,
+    /// and (3) invoke `annotate_lowlevel_helper(annotator, host,
+    /// args_s, policy)` per call — which runs through `getdesc` →
+    /// `cachedgraph((args_s,), …)` → `buildgraph` → `buildflowgraph`
+    /// (the prebuilt-graph hook returns the seeded graph on first
+    /// call; subsequent calls hit `cachedgraph`). The synthesized
+    /// helper graphs at `lowlevel_range_check_helper_graph` etc. need
+    /// their `Variable`-with-pre-set-`concretetype` shape adapted to
+    /// be valid annotator input first. Touches the ~56 sites that
+    /// today build a `LowLevelFunction` ahead of `gendirectcall`,
+    /// plus the helper-graph builders in `rtyper.rs:2715-` and
+    /// `:4516-`.
     pub fn gendirectcall(
         &mut self,
         ll_function: &LowLevelFunction,
         args_v: Vec<Hlvalue>,
     ) -> Result<Option<Variable>, TyperError> {
+        // Upstream `:849`:
+        //     with rtyper.annotator.using_policy(rtyper.lowlevel_ann_policy):
+        //         ...
+        // The `require_rtyper` borrow returns `&Rc<RPythonTyper>`,
+        // which would conflict with the later `&mut self`
+        // `record_extra_call` / `genop` calls; clone the Rc here so
+        // the rtyper handle does not borrow `self`.
+        let rtyper = Rc::clone(self.require_rtyper("gendirectcall")?);
+        let annotator = rtyper
+            .annotator
+            .upgrade()
+            .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+        // Upstream `:849`: `self.lowlevel_ann_policy` is set in
+        // `RPythonTyper.__init__` (`rtyper.py:53`) and is always
+        // present at `with using_policy(self.lowlevel_ann_policy):`.
+        // Mirror the strict-init invariant that local
+        // [`RPythonTyper::annotate_helper`] already enforces
+        // (`rtyper.rs:811-818`).
+        let policy = rtyper.lowlevel_ann_policy.borrow().clone().ok_or_else(|| {
+            TyperError::message(
+                "RPythonTyper.lowlevel_ann_policy not set — call \
+                 initialize_exceptiondata() on an Rc<RPythonTyper> \
+                 before invoking gendirectcall",
+            )
+        })?;
+        let policy_guard = annotator.using_policy(policy);
+
         for (i, (arg, expected)) in args_v.iter().zip(ll_function.args.iter()).enumerate() {
             let got = hlvalue_concretetype(arg).ok_or_else(|| {
                 TyperError::message(format!(
@@ -4809,6 +4982,18 @@ impl LowLevelOpList {
             )));
         }
 
+        // Upstream `:864`: `self.rtyper.call_all_setups()` to drain
+        // pending ForwardReference reprs. Last statement inside
+        // upstream's `with using_policy` block.
+        rtyper.call_all_setups()?;
+
+        // Upstream `:849+:871`: the `with using_policy(...)` block
+        // closes at `:871` before `annotate_lowlevel_helper`,
+        // `record_extra_call`, `getcallable`, and `genop` at
+        // `:873-882`. Drop the guard explicitly so the lifetime
+        // matches upstream rather than extending to function exit.
+        drop(policy_guard);
+
         let graph = ll_function.graph.as_ref().ok_or_else(|| {
             TyperError::missing_rtype_operation(format!(
                 "low-level helper {} has no annotated helper graph",
@@ -4817,7 +5002,6 @@ impl LowLevelOpList {
         })?;
         self.record_extra_call(&graph.graph)?;
 
-        let rtyper = self.require_rtyper("gendirectcall")?;
         let func_ptr = rtyper.getcallable(graph)?;
         let PtrTarget::Func(func_type) = &func_ptr._TYPE.TO else {
             return Err(TyperError::message(format!(

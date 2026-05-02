@@ -10,6 +10,7 @@ use std::rc::Rc;
 use crate::flowspace::model::{
     BlockRefExt, ConstValue, Constant, FunctionGraph, GraphRef, HOST_ENV, Hlvalue, LinkRef,
 };
+use crate::translator::backendopt::support::LOG;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::rmodel::inputconst_from_lltype;
 use crate::translator::rtyper::rtyper::{GenopResult, LowLevelOpList};
@@ -55,14 +56,8 @@ pub fn remove_asserts(
             message: format!("removeassert.py:12 get_standard_ll_exc_instance: {e}"),
         })?;
     // Upstream `:13 total_count = [0, 0]`. The accumulator feeds the
-    // final `log.removeassert(...)` summary at `:42-53`. Pyre's
-    // `AnsiLogger("backendopt")` channel is a documented
-    // PRE-EXISTING-ADAPTATION (`support.rs` module doc); the
-    // accumulator structure is preserved here so the body mirrors
-    // upstream line-for-line and lights up the moment the logger
-    // lands.
+    // final `log.removeassert(...)` summary at `:42-53`.
     let mut total_count: [usize; 2] = [0, 0];
-
     for graph in graphs {
         // Upstream `:16-17 count = 0; morework = True`.
         let mut count = 0usize;
@@ -87,7 +82,8 @@ pub fn remove_asserts(
                 // Upstream `:26-33 if kill_assertion_link(graph, link):
                 //     count += 1; morework = True; break
                 // else: total_count[0] += 1
-                //     if verbose: log.removeassert("cannot remove ...")`.
+                //     if translator.config.translation.verbose:
+                //         log.removeassert("cannot remove ...")`.
                 //
                 // `kill_assertion_link` builds a `LowLevelOpList()` to
                 // emit `bool_not` / `debug_assert` (no rtyper required
@@ -100,8 +96,15 @@ pub fn remove_asserts(
                     break;
                 } else {
                     total_count[0] += 1;
-                    // log.removeassert("cannot remove ...") — no-op
-                    // (logger unported).
+                    // Upstream `:32-33 if translator.config.translation.verbose:
+                    //     log.removeassert("cannot remove an assert from %s" % (graph.name,))`.
+                    if translator.config.translation.verbose {
+                        let name = graph.borrow().name.clone();
+                        LOG.method(
+                            "removeassert",
+                            &format!("cannot remove an assert from {name}"),
+                        );
+                    }
                 }
             }
             if !morework {
@@ -112,15 +115,43 @@ pub fn remove_asserts(
         // checkgraph(graph)`.
         if count != 0 {
             total_count[1] += count;
-            // log.removeassert("removed %d asserts in %s") — no-op.
+            // Upstream `:37-39 if translator.config.translation.verbose:
+            //     log.removeassert("removed %d asserts in %s" % (count, graph.name))`.
+            if translator.config.translation.verbose {
+                let name = graph.borrow().name.clone();
+                LOG.method(
+                    "removeassert",
+                    &format!("removed {count} asserts in {name}"),
+                );
+            }
             crate::flowspace::model::checkgraph(&graph.borrow());
         }
     }
-    // Upstream `:41-53 if total_count[0] == 0: msg = ... else: ...
-    // if msg is not None: log.removeassert(msg)`. Logger no-op
-    // gates the entire emission; the accumulator computation is
-    // still preserved above.
-    let _ = total_count;
+    // Upstream `:41-53 total_count = tuple(total_count); if
+    // total_count[0] == 0: ...; if msg is not None:
+    // log.removeassert(msg)`.
+    let msg = if total_count[0] == 0 {
+        if total_count[1] == 0 {
+            None
+        } else {
+            // `:46 msg = "Removed %d asserts" % (total_count[1],)`.
+            Some(format!("Removed {} asserts", total_count[1]))
+        }
+    } else if total_count[1] == 0 {
+        // `:49 msg = "Could not remove %d asserts" % (total_count[0],)`.
+        Some(format!("Could not remove {} asserts", total_count[0]))
+    } else {
+        // `:51-52 msg = "Could not remove %d asserts, but removed %d
+        // asserts." % total_count`.
+        Some(format!(
+            "Could not remove {} asserts, but removed {} asserts.",
+            total_count[0], total_count[1]
+        ))
+    };
+    if let Some(msg) = msg {
+        // `:53 log.removeassert(msg)`.
+        LOG.method("removeassert", &msg);
+    }
     Ok(())
 }
 
