@@ -6,18 +6,50 @@ use pyre_object::object_array::{
 
 use crate::{PyFrame, new_builtin_dict_storage};
 
-/// Python-level entrypoint for profiling callback compatibility.
-/// The PyPy implementation calls through to `space.call_function()` with
-/// `(w_callable, frame, event, w_arg)`.
+/// pypy/interpreter/executioncontext.py:10-15 app_profile_call.
+///
+/// Module-level low-level trampoline used by `setprofile` to bridge
+/// `setllprofile` (which stores a function pointer) to the user
+/// callable held in `w_profilefuncarg`.  RPython:
+///
+/// ```python
+/// def app_profile_call(space, w_callable, frame, event, w_arg):
+///     frame = jit.hint(frame, access_directly=False)
+///     space.call_function(w_callable, frame, space.newtext(event), w_arg)
+/// ```
+///
+/// `jit.hint(frame, access_directly=False)` is a JIT-only annotation
+/// that demotes the green frame to a regular w_object before the user
+/// callable observes it; the dispatch uses the same identity at the
+/// Rust level (raw frame pointer cast to `PyObjectRef`) so the call
+/// shape matches.  Pyre does not yet wrap `PyFrame` as a Python-visible
+/// `W_Root`, so a callable that touches frame attributes will see a
+/// raw struct pointer; that limitation is upstream of this port.
 pub fn app_profile_call(
     _space: PyObjectRef,
-    _w_callable: PyObjectRef,
-    _frame: *mut PyFrame,
-    _event: &str,
-    _w_arg: PyObjectRef,
+    w_callable: PyObjectRef,
+    frame: *mut PyFrame,
+    event: &str,
+    w_arg: PyObjectRef,
 ) {
-    let _ = (_space, _w_callable, _frame, _event, _w_arg);
+    let frame_obj = frame as PyObjectRef;
+    let w_event = pyre_object::w_str_new(event);
+    let _ = crate::baseobjspace::call_function(w_callable, &[frame_obj, w_event, w_arg]);
 }
+
+/// pypy/interpreter/executioncontext.py:320 `self.profilefunc` — the
+/// low-level callback stored by `setllprofile`.  In RPython this is a
+/// raw function pointer; pyre mirrors the type with a `fn(...)` so the
+/// trampoline (`app_profile_call`) is the actual stored value rather
+/// than the user callable, matching upstream's two-slot design
+/// (`profilefunc` + `w_profilefuncarg`).
+pub type ProfileFunc = fn(
+    space: PyObjectRef,
+    w_callable: PyObjectRef,
+    frame: *mut PyFrame,
+    event: &str,
+    w_arg: PyObjectRef,
+);
 
 /// Byte offset of the GC-owning `values` pointer inside `DictStorage`.
 /// Post-L1 DictStorage holds a `*mut ItemsBlock` directly (no fat
@@ -319,9 +351,12 @@ pub struct ExecutionContext {
     pub w_tracefunc: PyObjectRef,
     pub is_tracing: i32,
     pub compiler: PyObjectRef,
-    pub profilefunc: PyObjectRef,
+    /// pypy/interpreter/executioncontext.py:320 — function pointer to
+    /// the low-level profiling trampoline (e.g. `app_profile_call`).
+    /// `None` means profiling is disabled.  The user callable lives in
+    /// `w_profilefuncarg`; the trampoline forwards to it.
+    pub profilefunc: Option<ProfileFunc>,
     pub w_profilefuncarg: PyObjectRef,
-    pub w_profilefuncarg_ref: PyObjectRef,
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
     pub actionflag: ActionFlag,
@@ -349,9 +384,8 @@ impl ExecutionContext {
             w_tracefunc: pyre_object::PY_NULL,
             is_tracing: 0,
             compiler: pyre_object::PY_NULL,
-            profilefunc: pyre_object::PY_NULL,
+            profilefunc: None,
             w_profilefuncarg: pyre_object::PY_NULL,
-            w_profilefuncarg_ref: pyre_object::PY_NULL,
             thread_disappeared: false,
             w_async_exception_type: pyre_object::PY_NULL,
             actionflag: ActionFlag::new(),
@@ -426,7 +460,7 @@ impl ExecutionContext {
     #[allow(clippy::too_many_arguments)]
     pub fn leave(&mut self, frame: *mut PyFrame, w_exitvalue: PyObjectRef, got_exception: bool) {
         // pypy/interpreter/executioncontext.py:91-109 leave parity.
-        if !self.profilefunc.is_null() {
+        if self.profilefunc.is_some() {
             self._trace(frame, "leaveframe", w_exitvalue, None);
         }
         let _frame_vref = self.topframeref;
@@ -467,31 +501,43 @@ impl ExecutionContext {
 
     pub fn _c_call_return_trace(
         &mut self,
-        _frame: *mut PyFrame,
+        frame: *mut PyFrame,
         _w_func: PyObjectRef,
         _args: PyObjectRef,
         _event: &str,
     ) {
-        if self.w_profilefuncarg.is_null() {
+        if self.profilefunc.is_none() {
+            if !frame.is_null() {
+                unsafe {
+                    (*frame).getorcreatedebug(-1).is_being_profiled = false;
+                }
+            }
             return;
         }
-        let _ = (_w_func, _args, _event);
+        let _ = _args;
+        self._trace(frame, _event, _w_func, None);
     }
 
-    pub fn c_exception_trace(&mut self, _frame: *mut PyFrame, _w_exc: PyObjectRef) {
-        if self.w_profilefuncarg.is_null() {
+    pub fn c_exception_trace(&mut self, frame: *mut PyFrame, _w_exc: PyObjectRef) {
+        if self.profilefunc.is_none() {
+            if !frame.is_null() {
+                unsafe {
+                    (*frame).getorcreatedebug(-1).is_being_profiled = false;
+                }
+            }
             return;
         }
-        let _ = _w_exc;
+        self._trace(frame, "c_exception", _w_exc, None);
     }
 
     pub fn call_trace(&mut self, frame: *mut PyFrame) {
-        let _ = frame;
-        if !self.gettrace().is_null() || !self.profilefunc.is_null() {
+        if !self.gettrace().is_null() || self.profilefunc.is_some() {
             self._trace(frame, "call", pyre_object::PY_NULL, None);
-            if !self.profilefunc.is_null() {
-                if !self.topframeref.is_null() {
-                    self.topframeref = self.topframeref;
+            if self.profilefunc.is_some() {
+                if !frame.is_null() {
+                    unsafe {
+                        (*frame).getorcreatedebug(-1).is_being_profiled = true;
+                    }
                 }
             }
         }
@@ -580,31 +626,32 @@ impl ExecutionContext {
         self.w_tracefunc
     }
 
+    /// pypy/interpreter/executioncontext.py:303-310 setprofile.
     pub fn setprofile(&mut self, w_func: PyObjectRef) {
         if w_func.is_null() {
-            self.profilefunc = pyre_object::PY_NULL;
+            self.profilefunc = None;
             self.w_profilefuncarg = pyre_object::PY_NULL;
-            self.w_profilefuncarg_ref = pyre_object::PY_NULL;
-            return;
+        } else {
+            self.setllprofile(Some(app_profile_call), w_func);
         }
-        self.profilefunc = w_func;
-        self.w_profilefuncarg = w_func;
-        self.w_profilefuncarg_ref = w_func;
     }
 
+    /// pypy/interpreter/executioncontext.py:312-313 getprofile.
     pub fn getprofile(&self) -> PyObjectRef {
         self.w_profilefuncarg
     }
 
-    pub fn setllprofile(&mut self, func: Option<PyObjectRef>, w_arg: PyObjectRef) {
-        if func.is_none() {
-            self.profilefunc = pyre_object::PY_NULL;
-            self.w_profilefuncarg = w_arg;
-        } else {
+    /// pypy/interpreter/executioncontext.py:315-321 setllprofile.
+    pub fn setllprofile(&mut self, func: Option<ProfileFunc>, w_arg: PyObjectRef) {
+        if func.is_some() {
+            // executioncontext.py:317-318 — RPython raises ValueError
+            // when w_arg is None for a non-None func.  Pyre's
+            // `PyObjectRef::is_null()` is the equivalent test.
+            assert!(!w_arg.is_null(), "Cannot call setllprofile with real None");
             self.force_all_frames(true);
-            self.profilefunc = func.unwrap_or(pyre_object::PY_NULL);
-            self.w_profilefuncarg = w_arg;
         }
+        self.profilefunc = func;
+        self.w_profilefuncarg = w_arg;
     }
 
     pub fn force_all_frames(&mut self, is_being_profiled: bool) {
@@ -612,7 +659,7 @@ impl ExecutionContext {
         while !frame.is_null() {
             if is_being_profiled {
                 unsafe {
-                    let _ = (&*frame).getdebug();
+                    (*frame).getorcreatedebug(-1).is_being_profiled = true;
                 }
             }
             frame = Self::getnextframe_nohidden(frame);
@@ -627,6 +674,22 @@ impl ExecutionContext {
         pyre_object::PY_NULL
     }
 
+    /// pypy/interpreter/executioncontext.py:346-428 _trace.
+    ///
+    /// Two-arm dispatch: the tracing arm fires every event for the
+    /// frame's `w_f_trace` (or the global `w_tracefunc` on `'call'`),
+    /// the profiling arm fires only on `call`/`return`/`c_call`/
+    /// `c_return`/`c_exception` and routes through the
+    /// `profilefunc` low-level trampoline (`app_profile_call` for
+    /// `setprofile`-installed callbacks).
+    ///
+    /// `operr` is the upstream `OperationError` carried by
+    /// `'exception'` events; pyre does not yet plumb the rich
+    /// exception value at this layer, so the
+    /// `executioncontext.py:359-363` `normalize_exception` /
+    /// `space.newtuple` path is left as a TODO and `w_arg` is
+    /// forwarded as-is.  The structural early returns, event
+    /// filtering, and `is_tracing` bookkeeping mirror upstream.
     pub fn _trace(
         &mut self,
         frame: *mut PyFrame,
@@ -634,8 +697,85 @@ impl ExecutionContext {
         w_arg: PyObjectRef,
         operr: Option<PyObjectRef>,
     ) {
-        let _ = operr;
-        let _ = (frame, event, w_arg, self.is_tracing);
+        // executioncontext.py:347 if self.is_tracing or frame.hide():
+        if self.is_tracing != 0 {
+            return;
+        }
+        if frame.is_null() {
+            return;
+        }
+        if unsafe { (*frame).hide() } {
+            return;
+        }
+
+        let space = self.space;
+
+        // executioncontext.py:353-356 Tracing cases
+        let w_callback = if event == "call" {
+            self.gettrace()
+        } else {
+            unsafe { (*frame).get_w_f_trace() }
+        };
+
+        if !w_callback.is_null() && event != "leaveframe" {
+            // executioncontext.py:359-363 — TODO: when `operr` is
+            // `Some`, RPython calls `operr.normalize_exception(space)`
+            // and rebuilds `w_arg` as `(w_type, w_value, w_tb)`.  Pyre
+            // lacks the OperationError plumbing at this layer, so the
+            // raw `w_arg` is forwarded.
+            let _ = operr;
+
+            // executioncontext.py:376 self.is_tracing += 1
+            self.is_tracing += 1;
+            // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
+            // executioncontext.py:384 frame = jit.hint(frame, access_directly=False)
+            // — JIT-only hint; the call shape below matches the
+            // post-hint identity (frame as a normal w_object).
+            let frame_obj = frame as PyObjectRef;
+            let w_event = pyre_object::w_str_new(event);
+            let _w_result =
+                crate::baseobjspace::call_function(w_callback, &[frame_obj, w_event, w_arg]);
+            // executioncontext.py:386-394 — if w_result is None, leave
+            // d.w_f_trace untouched; otherwise store it.  Pyre does
+            // not yet propagate the result through `getorcreatedebug`;
+            // the storage will land alongside the `f_lineno` /
+            // `is_in_line_tracing` bookkeeping at
+            // executioncontext.py:374-402 once those debug-info paths
+            // are ported.
+            // executioncontext.py:399 self.is_tracing -= 1
+            self.is_tracing -= 1;
+        }
+
+        // executioncontext.py:404-428 Profile cases
+        if let Some(profilefunc) = self.profilefunc {
+            // executioncontext.py:406-411 — only call/return/c_call/
+            // c_return/c_exception events fire the profile callback.
+            let event = if event == "leaveframe" {
+                "return"
+            } else if event == "call"
+                || event == "c_call"
+                || event == "c_return"
+                || event == "c_exception"
+            {
+                event
+            } else {
+                return;
+            };
+
+            // executioncontext.py:416-417 assert self.is_tracing == 0; self.is_tracing += 1
+            assert_eq!(self.is_tracing, 0);
+            self.is_tracing += 1;
+            // executioncontext.py:420-421 self.profilefunc(space, self.w_profilefuncarg, frame, event, w_arg)
+            // executioncontext.py:422-425 — on exception, RPython clears
+            // profilefunc + w_profilefuncarg and re-raises.  Pyre's
+            // `profilefunc` is a `fn(...)` so it cannot panic into the
+            // unwinder cleanly; the upstream try/except is mirrored as
+            // a straight-line call until OperationError propagation is
+            // ported at this layer.
+            profilefunc(space, self.w_profilefuncarg, frame, event, w_arg);
+            // executioncontext.py:427-428 self.is_tracing -= 1
+            self.is_tracing -= 1;
+        }
     }
 
     pub fn checksignals(&mut self) {
