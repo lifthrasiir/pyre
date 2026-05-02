@@ -598,12 +598,14 @@ impl Optimizer {
             .unwrap_or(&[]);
         // virtualstate.py:111-116 `enum` parity: a single visited map
         // tracked via `Rc::as_ptr` dedups shared subtrees across all
-        // top-level state entries, matching the
-        // `build_sequential_slot_schedule` dedup so `label_slot` advances
-        // by the same number of leaves as `imported_label_args.len()`.
-        // The map value caches the imported Phase 2 OpRef for the first
-        // visit so subsequent revisits resolve to the same box (mirroring
-        // RPython's setinfo_from_preamble.get_forwarded sharing).
+        // top-level state entries so `label_slot` advances by the same
+        // number of leaves as `imported_label_args.len()`. The map value
+        // caches the imported Phase 2 OpRef for the first visit so
+        // subsequent revisits resolve to the same box (mirroring RPython's
+        // `setinfo_from_preamble` get_forwarded sharing). The dedup itself
+        // is also expressible via the per-node `position` cell — the
+        // Rc::as_ptr key persists pending Phase D follow-up that migrates
+        // the OpRef cache to a position-based map.
         let mut walk_visited: std::collections::HashMap<usize, OpRef> =
             std::collections::HashMap::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
@@ -674,13 +676,19 @@ impl Optimizer {
                 });
             } else {
                 // Non-virtual state: advance label_slot to match RPython's
-                // position_in_notvirtuals enumeration order. Top-level Rc
-                // dedup is handled inside count_forced_boxes_for_entry_static.
-                let count = crate::optimizeopt::virtualstate::VirtualState::count_forced_boxes_for_entry_static(
-                    state_info,
-                    &mut walk_visited,
-                );
-                label_slot += count;
+                // position_in_notvirtuals enumeration order. The subtree
+                // leaf count itself uses the position-based gate from
+                // virtualstate.py:196, 274, 352, while the helper also
+                // populates `walk_visited` with each visited Rc::as_ptr
+                // identity so the downstream
+                // `import_virtual_state_from_label_args_recurse` walker
+                // (still Rc-keyed pending Phase A2c / D follow-up)
+                // recognises shared substates.
+                label_slot +=
+                    crate::optimizeopt::virtualstate::VirtualState::subtree_notvirtual_leaf_count(
+                        state_info,
+                        &mut walk_visited,
+                    );
             }
         }
 

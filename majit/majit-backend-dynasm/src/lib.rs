@@ -171,24 +171,6 @@ static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
 
-/// JitFrame field descriptors supplied by the interpreter crate so the
-/// GC rewriter's `handle_call_assembler` pass (rewrite.py:665-695) can
-/// emit the correct GC_LOAD / GC_STORE sequence for callee jitframes.
-#[derive(Clone)]
-pub struct JitFrameLayoutInfo {
-    pub jitframe_descrs: Option<majit_gc::rewrite::JitFrameDescrs>,
-}
-
-static JITFRAME_LAYOUT: OnceLock<JitFrameLayoutInfo> = OnceLock::new();
-
-pub fn register_jitframe_layout(info: JitFrameLayoutInfo) {
-    let _ = JITFRAME_LAYOUT.set(info);
-}
-
-pub(crate) fn jitframe_layout() -> Option<JitFrameLayoutInfo> {
-    JITFRAME_LAYOUT.get().cloned()
-}
-
 /// Pyre dynasm extension: CALL_ASSEMBLER builds some callee jitframes via
 /// `libc::calloc`, so the GC needs an explicit registration hook before the
 /// callee pushes that frame on the jitframe shadow stack.

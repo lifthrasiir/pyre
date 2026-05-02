@@ -1,4 +1,4 @@
-use majit_backend::ExitValueSourceLayout;
+use majit_backend::{Backend, ExitValueSourceLayout};
 
 /// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
 fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
@@ -577,6 +577,17 @@ impl<S: JitState> JitDriver<S> {
             blackhole_allocator: None,
             portal_runner: None,
         }
+    }
+
+    /// `llsupport/gc.py:115-126 getframedescrs(cpu)` parity — install the
+    /// JitFrame field descriptors on this driver's backend.  RPython
+    /// attaches them via `cpu.gc_ll_descr.getframedescrs(cpu)`; majit
+    /// threads them in from the interpreter crate (`pyre-jit`) once the
+    /// JitDriver has constructed its backend so the GC rewriter's
+    /// `handle_call_assembler` pass can emit `gen_malloc_frame` against
+    /// a known layout.
+    pub fn set_jitframe_layout(&mut self, descrs: Option<majit_gc::rewrite::JitFrameDescrs>) {
+        self.meta.backend.set_jitframe_layout(descrs);
     }
 
     /// Install the state-field JIT canonical liveness payload before

@@ -1301,6 +1301,16 @@ pub trait Backend: Send {
     /// (`x86/assembler.py:870`, `aarch64/assembler.py:566-572`).
     fn set_propagate_exception_descr(&mut self, _descr: Arc<dyn Descr>) {}
 
+    /// `llsupport/gc.py:115-126 getframedescrs(cpu)` — JitFrame field
+    /// descriptors consumed by the GC rewriter's `handle_call_assembler`
+    /// pass (`rewrite.py:613-695`).  RPython attaches these per-instance
+    /// via `cpu.gc_ll_descr.getframedescrs(cpu)`; majit threads them in
+    /// from the interpreter crate (`pyre-jit`) once the JitDriver has
+    /// constructed its backend.  Backends that don't lower
+    /// CALL_ASSEMBLER (wasm, no-op test backends) leave this as the
+    /// default no-op.
+    fn set_jitframe_layout(&mut self, _descrs: Option<majit_gc::rewrite::JitFrameDescrs>) {}
+
     /// Register a placeholder for a pending token (RPython compile_tmp_callback).
     /// The placeholder has null code_ptr; call_assembler_fast_path detects this
     /// and falls back to force_fn. Replaced by the real target on compile_loop.

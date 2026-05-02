@@ -306,7 +306,16 @@ fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
     if jitframe_gc_type_id_is_explicit() {
         let id = jitframe_gc_type_id();
         assert_ne!(id, u32::MAX, "explicit JITFRAME GC type id missing");
-        return Some(id);
+        // The explicit id is process-global, so a fresh `gc` from a later
+        // call site (notably back-to-back tests with separate GC instances)
+        // may not yet hold a TypeInfo at that index. Fall through to lazy
+        // registration in that case so the new gc has the type populated;
+        // production has a single gc per process, where this branch
+        // returns immediately because the explicit setter was paired with
+        // the same gc's `register_type` call.
+        if (id as usize) < gc.type_count() {
+            return Some(id);
+        }
     }
     let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     set_jitframe_gc_type_id_lazy(id);
@@ -1922,22 +1931,6 @@ pub fn take_pending_frame_restore() -> Option<FrameRestore> {
     PENDING_FRAME_RESTORE.with(|c| c.take())
 }
 
-// ── JitFrame layout registration for the GC rewriter ────────────────
-
-/// JitFrame field descriptors supplied by the interpreter crate so the
-/// GC rewriter's `handle_call_assembler` pass (rewrite.py:665-695) can
-/// emit the correct GC_LOAD / GC_STORE sequence for callee jitframes.
-#[derive(Clone)]
-pub struct JitFrameLayoutInfo {
-    pub jitframe_descrs: Option<majit_gc::rewrite::JitFrameDescrs>,
-}
-
-static JITFRAME_LAYOUT: OnceLock<JitFrameLayoutInfo> = OnceLock::new();
-
-pub fn register_jitframe_layout(info: JitFrameLayoutInfo) {
-    let _ = JITFRAME_LAYOUT.set(info);
-}
-
 // ── Call-assembler dispatch table ──
 // Each token gets a stable dispatch entry holding code_ptr + finish_index.
 // Compiled code loads both from the entry via memory reads.
@@ -2384,6 +2377,14 @@ fn install_call_assembler_expectations(
 
     for (&target_token, &expected_result_kind) in &expectations {
         if let Some(target) = lookup_call_assembler_target(target_token) {
+            // Skip pending placeholders (null code_ptr): the runtime
+            // dispatches them via the force_fn fallback (compile_tmp_callback
+            // parity). They have no fail_descrs yet, so checking the actual
+            // finish kind would always fail — defer the validation until the
+            // real target compiles and replaces this entry.
+            if target.code_ptr.is_null() {
+                continue;
+            }
             let actual_result_kind = actual_call_assembler_target_result_kind(&target.fail_descrs)?;
             validate_call_assembler_target_result_kind(
                 target_token,
@@ -4087,7 +4088,10 @@ fn missing_gc_runtime(opcode: OpCode) -> BackendError {
 /// emitted code would dispatch on a null callee jitframe. Refuse to
 /// compile with the same error shape RPython surfaces from
 /// `gc_ll_descr.gen_malloc_frame` when the descrs are missing.
-fn validate_call_assembler_rewrite_prereqs(ops: &[Op]) -> Result<(), BackendError> {
+fn validate_call_assembler_rewrite_prereqs(
+    ops: &[Op],
+    jitframe_descrs: Option<&majit_gc::rewrite::JitFrameDescrs>,
+) -> Result<(), BackendError> {
     for op in ops {
         if !matches!(
             op.opcode,
@@ -4101,11 +4105,7 @@ fn validate_call_assembler_rewrite_prereqs(ops: &[Op]) -> Result<(), BackendErro
         if !cranelift_gc_active() {
             return Err(missing_gc_runtime(op.opcode));
         }
-        if JITFRAME_LAYOUT
-            .get()
-            .and_then(|info| info.jitframe_descrs.as_ref())
-            .is_none()
-        {
+        if jitframe_descrs.is_none() {
             return Err(unsupported_semantics(
                 op.opcode,
                 "call-assembler requires a registered jitframe layout for rewrite parity",
@@ -6404,6 +6404,12 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
+    /// `llsupport/gc.py:115-126 getframedescrs(cpu)` — JitFrame field
+    /// descriptors consumed by `gen_malloc_frame` / `handle_call_assembler`
+    /// (`rewrite.py:613-695`).  Installed per-instance via
+    /// `Backend::set_jitframe_layout`, mirroring how RPython attaches
+    /// the descrs to `cpu.gc_ll_descr` rather than to a global.
+    jitframe_descrs: Option<majit_gc::rewrite::JitFrameDescrs>,
 }
 
 impl CraneliftBackend {
@@ -6574,6 +6580,7 @@ impl CraneliftBackend {
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
+            jitframe_descrs: None,
         }
     }
 
@@ -6694,9 +6701,7 @@ impl CraneliftBackend {
                 }
                 descr
             },
-            jitframe_info: JITFRAME_LAYOUT
-                .get()
-                .and_then(|info| info.jitframe_descrs.clone()),
+            jitframe_info: self.jitframe_descrs.clone(),
             constant_types: ct,
             // llmodel.py:39 default. Cranelift lowers GcStoreIndexed via
             // ir::MemFlags and explicit offset arithmetic rather than an
@@ -7030,7 +7035,7 @@ impl CraneliftBackend {
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<CompiledLoop, BackendError> {
-        validate_call_assembler_rewrite_prereqs(ops)?;
+        validate_call_assembler_rewrite_prereqs(ops, self.jitframe_descrs.as_ref())?;
         let prepared_ops = self.prepare_ops_for_compile(
             inputargs,
             ops,
@@ -13122,6 +13127,10 @@ impl majit_backend::Backend for CraneliftBackend {
             .propagate_exception_descr = Some(descr);
     }
 
+    fn set_jitframe_layout(&mut self, descrs: Option<majit_gc::rewrite::JitFrameDescrs>) {
+        self.jitframe_descrs = descrs;
+    }
+
     fn register_pending_target(
         &mut self,
         token_number: u64,
@@ -14432,6 +14441,59 @@ mod tests {
         // assertion that only exists for half-initialized test runtimes.
         gc.register_type(TypeInfo::simple(16));
         CraneliftBackend::with_gc_allocator(Box::new(gc))
+    }
+
+    /// Register a placeholder for a deferred-compilation CALL_ASSEMBLER
+    /// target. Mirrors what `Backend::register_pending_call_assembler` does
+    /// in production (`compiler.rs:13110`) so test callers that compile a
+    /// caller with a CallAssembler op before its target has been compiled
+    /// can satisfy `validate_call_assembler_rewrite_prereqs` /
+    /// `gc/rewrite.rs:2505 handle_call_assembler`.
+    fn register_test_pending_ca(target_number: u64, arg_types: Vec<majit_ir::Type>) {
+        super::register_pending_call_assembler_target(
+            target_number,
+            arg_types.clone(),
+            arg_types.len(),
+            arg_types.len(),
+            -1,
+            Arc::new(std::sync::RwLock::new(super::CpuDescrAttachments::default())),
+        );
+    }
+
+    /// `rewrite.py:613-695 handle_call_assembler` parity fixture.
+    /// Mirrors the production wiring (`pyre-jit/src/call_jit.rs`): register
+    /// JITFRAME with the GC, publish its tid via `set_jitframe_gc_type_id`,
+    /// and install the JitFrame field descriptors on the backend instance
+    /// so the rewriter can emit `gen_malloc_frame` against a known layout.
+    fn make_call_assembler_backend() -> CraneliftBackend {
+        use majit_backend::jitframe::{
+            FIRST_ITEM_OFFSET, JF_FRAME_INFO_OFS, JITFRAME_FIXED_SIZE, LENGTHOFS, SIGN_SIZE,
+        };
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        super::set_jitframe_gc_type_id(jitframe_tid);
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        backend.set_jitframe_layout(Some(majit_gc::rewrite::JitFrameDescrs {
+            jitframe_tid,
+            jitframe_fixed_size: JITFRAME_FIXED_SIZE,
+            jf_frame_info_ofs: JF_FRAME_INFO_OFS,
+            jf_descr_ofs: JF_DESCR_OFS,
+            jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+            jf_savedata_ofs: JF_SAVEDATA_OFS,
+            jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+            jf_forward_ofs: JF_FORWARD_OFS,
+            jf_frame_ofs: JF_FRAME_OFS,
+            jf_frame_baseitemofs: FIRST_ITEM_OFFSET,
+            jf_frame_lengthofs: JF_FRAME_OFS + LENGTHOFS,
+            sign_size: SIGN_SIZE,
+        }));
+        backend
     }
 
     #[derive(Default)]
@@ -18193,9 +18255,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_i_executes_finish_only_target() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
@@ -18272,11 +18333,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_compiles_before_target_is_registered() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let mut deferred_target = JitCellToken::new(1500_240);
+        register_test_pending_ca(deferred_target.number, vec![Type::Int]);
         backend.set_next_trace_id(1500_241);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
@@ -18314,11 +18375,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_late_bound_ref_result_supports_plain_ref_finish() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let mut deferred_target = JitCellToken::new(1500_245);
+        register_test_pending_ca(deferred_target.number, vec![Type::Ref]);
         let caller_inputargs = vec![InputArg::new_ref(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
@@ -18355,11 +18416,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_late_bound_ref_result_rejects_force_token_finish_shape() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let mut deferred_target = JitCellToken::new(1500_247);
+        register_test_pending_ca(deferred_target.number, vec![Type::Int]);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
@@ -18401,9 +18462,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_redirect_rejects_incompatible_force_token_result_shape() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let ref_inputargs = vec![InputArg::new_ref(0)];
         let plain_ref_ops = vec![
@@ -18454,9 +18514,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_supports_direct_self_recursive_dispatch() {
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut constants = HashMap::new();
@@ -18465,6 +18524,7 @@ mod tests {
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(1500_250);
+        register_test_pending_ca(token.number, vec![Type::Int]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
             mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 1),
@@ -18521,12 +18581,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "CALL_ASSEMBLER tests need GC runtime + jitframe layout setup (rewrite.py:613-695 handle_call_assembler / gen_malloc_frame parity); test harness still uses pre-rewrite shape from before validate_call_assembler_rewrite_prereqs landed"]
     fn test_call_assembler_reused_token_resets_stale_pending_dispatch_slot() {
         let token_number = 1500_252;
 
         {
-            let mut backend = CraneliftBackend::new();
+            let mut backend = make_call_assembler_backend();
             let inputargs = vec![InputArg::new_int(0)];
             let mut constants = HashMap::new();
             constants.insert(100, 1);
@@ -18534,6 +18593,7 @@ mod tests {
             backend.set_constants(constants);
 
             let mut token = JitCellToken::new(token_number);
+            register_test_pending_ca(token.number, vec![Type::Int]);
             let ops = vec![
                 mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
                 mk_op(OpCode::IntGt, &[OpRef(0), OpRef(101)], 1),
@@ -18566,8 +18626,9 @@ mod tests {
             assert_eq!(backend.get_int_value(&frame, 0), 4);
         }
 
-        let mut backend = CraneliftBackend::new();
+        let mut backend = make_call_assembler_backend();
         let mut deferred_target = JitCellToken::new(token_number);
+        register_test_pending_ca(deferred_target.number, vec![Type::Int]);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),

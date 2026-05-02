@@ -504,6 +504,19 @@ pub(crate) struct CompiledEntry<M> {
     /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
     /// in `compile_bridge` below).
     pub(crate) next_global_opref: u32,
+    /// Box identity plan Phase E.2b: parent loop's `value_types` snapshot.
+    ///
+    /// RPython bridges share the parent's `Optimizer` instance, so the
+    /// per-Box `_forwarded` chain naturally provides typing info for any
+    /// parent OpRef the bridge references via fail_args / JUMP / snapshot.
+    /// In pyre's per-phase `OptContext` model the bridge's `value_types`
+    /// is fresh, so parent OpRefs (e.g. inputargs at `[0..parent_num_inputs)`
+    /// referenced through fail_args after `bridge_inputarg_base` shift)
+    /// would have no type entry without this carry. Seeded from
+    /// `unroll_opt.phase1_value_types` at compile_loop completion;
+    /// consumed by `compile_bridge` / `start_retrace_from_guard` via
+    /// `optimizer.prev_phase_value_types` before `optimize_bridge`.
+    pub(crate) phase1_value_types: HashMap<u32, majit_ir::Type>,
 }
 
 /// compile.py compile_trace return parity.
@@ -4069,6 +4082,11 @@ impl<M: Clone> MetaInterp<M> {
                         // TraceIterator (opencoder.py:249-273); pyre flat u32
                         // OpRefs need this explicit baseline.
                         next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
+                        // Box Identity Phase E.2b: snapshot the parent loop's
+                        // value_types so bridges can seed their own ctx with
+                        // typing info for parent OpRefs they inherit via
+                        // fail_args / JUMP / snapshot_boxes.
+                        phase1_value_types: unroll_opt.phase1_value_types.clone(),
                     },
                 );
                 // PRE-EXISTING-ADAPTATION: pass a freshly-allocated
@@ -4859,6 +4877,8 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                         // Box Identity Phase E Step 1: see main compile site.
                         next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
+                        // Box Identity Phase E.2b: see main compile site.
+                        phase1_value_types: unroll_opt.phase1_value_types.clone(),
                     },
                 );
                 // PRE-EXISTING-ADAPTATION: see compile_loop site for the
@@ -5335,6 +5355,7 @@ impl<M: Clone> MetaInterp<M> {
                             traces,
                             previous_tokens,
                             next_global_opref: 0,
+                            phase1_value_types: HashMap::new(),
                         },
                     );
                 }
@@ -5644,6 +5665,7 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref: 0,
+                        phase1_value_types: HashMap::new(),
                     },
                 );
                 self.stats.loops_compiled += 1;
@@ -7282,6 +7304,12 @@ impl<M: Clone> MetaInterp<M> {
         // decode (resume.py:1245-1282).
         let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
+            // Box Identity Phase E.2b: seed parent loop's value_types so the
+            // bridge's optimizer can resolve types for parent OpRefs the bridge
+            // inherits via fail_args / JUMP / snapshot_boxes after the
+            // bridge_inputarg_base shift moves bridge inputargs out of the
+            // legacy [0..num_inputs) aliasing range.
+            optimizer.prev_phase_value_types = compiled.phase1_value_types.clone();
             (
                 compiled.retraced_count,
                 compiled.num_inputs,
@@ -7516,6 +7544,7 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref: 0,
+                        phase1_value_types: HashMap::new(),
                     },
                 );
                 // PRE-EXISTING-ADAPTATION: see compile_loop site for the
@@ -7670,6 +7699,12 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_inputarg_base = compiled
             .next_global_opref
             .max(bridge_inputargs.len() as u32);
+        // Box Identity Phase E.2b: seed parent loop's value_types so the
+        // bridge's optimizer can resolve types for parent OpRefs the bridge
+        // inherits via fail_args / JUMP / snapshot_boxes after the
+        // bridge_inputarg_base shift moves bridge inputargs out of the
+        // legacy [0..num_inputs) aliasing range.
+        optimizer.prev_phase_value_types = compiled.phase1_value_types.clone();
         if crate::majit_log_enabled() {
             eprintln!(
                 "--- bridge trace (before opt) ninputs={} ---",
@@ -15847,6 +15882,7 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
+                phase1_value_types: HashMap::new(),
             },
         );
 
@@ -16026,6 +16062,7 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
+                phase1_value_types: HashMap::new(),
             },
         );
 
@@ -16125,6 +16162,7 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
+                phase1_value_types: HashMap::new(),
             },
         );
 
@@ -16419,6 +16457,7 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
+                phase1_value_types: HashMap::new(),
             },
         );
     }
@@ -17180,6 +17219,7 @@ mod tests {
                 traces: HashMap::new(),
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
+                phase1_value_types: HashMap::new(),
             },
         );
         let action = meta.force_start_tracing(777, (0, 0), None, &[]);

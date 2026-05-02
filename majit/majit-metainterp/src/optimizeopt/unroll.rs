@@ -105,7 +105,7 @@ pub struct UnrollOptimizer {
     /// that no Phase 1 emit op covers (alias seeds, virtual heads,
     /// short-preamble PreambleOp tombstones).  Mirrors RPython's
     /// persistent `box.type` attribute across the export/import boundary.
-    phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
+    pub phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,
@@ -1790,11 +1790,12 @@ impl ExportedState {
     /// share one VirtualStateInfo" invariant. Rust's `Rc<...>` is immutable
     /// after construction, so each per-slot GcRef refresh would otherwise
     /// allocate an independent new `Rc` for every shared slot, breaking
-    /// the `Rc::as_ptr` dedup that `build_sequential_slot_schedule` relies
-    /// on. Snapshot the original `Rc::as_ptr` per slot, group slots that
-    /// originally shared an `Rc`, and after the GcRef updates re-clone a
-    /// single canonical `Rc` into every slot of each group so the
-    /// post-refresh tree preserves the pre-GC aliasing.
+    /// the shared-substate dedup the position-based walker
+    /// (`enum_forced_boxes_for_entry` virtualstate.py:196 / 274 / 352)
+    /// depends on. Snapshot the original `Rc::as_ptr` per slot, group
+    /// slots that originally shared an `Rc`, and after the GcRef updates
+    /// re-clone a single canonical `Rc` into every slot of each group so
+    /// the post-refresh tree preserves the pre-GC aliasing.
     pub fn refresh_from_gc(&mut self) {
         use crate::optimizeopt::info::PtrInfo;
         use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
@@ -1885,9 +1886,12 @@ impl ExportedState {
                     self.virtual_state.state[slot_idx] = Rc::clone(entry);
                 }
             }
-            // Rc identities have shifted, so the dedup walkers'
-            // numnotvirtuals / slot_schedule need to be recomputed.
-            self.virtual_state.rebuild_slot_schedule();
+            // Rc identities have shifted, so position cells (which are
+            // assigned in DFS order over the live `state` graph) need to
+            // be re-derived. virtualstate.py:628-634 `VirtualState.__init__`
+            // re-runs `enum` over fresh subclass instances; pyre mirrors
+            // that by re-running `enum_top_level` over the rebuilt Rc set.
+            self.virtual_state.enum_top_level();
         }
     }
 

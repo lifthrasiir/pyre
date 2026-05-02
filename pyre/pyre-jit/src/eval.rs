@@ -144,6 +144,11 @@ thread_local! {
     static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
         let info = build_pyframe_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
+        // llsupport/gc.py:115-126 getframedescrs(cpu) parity — attach the
+        // JitFrame field descriptors to the backend instance owned by
+        // this driver, so the GC rewriter's `handle_call_assembler`
+        // pass can emit `gen_malloc_frame` against a known layout.
+        d.set_jitframe_layout(Some(crate::call_jit::arena_jitframe_descrs()));
         d.set_virtualizable_info(info.clone());
         d.meta_interp_mut().num_scalar_inputargs =
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
