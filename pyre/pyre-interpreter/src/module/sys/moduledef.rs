@@ -38,6 +38,50 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
+fn current_execution_context() -> *mut crate::PyExecutionContext {
+    crate::call::take_last_exec_ctx() as *mut crate::PyExecutionContext
+}
+
+fn sys_gettrace_impl(_args: &[PyObjectRef]) -> crate::PyResult {
+    let ec = current_execution_context();
+    if ec.is_null() {
+        return Ok(w_none());
+    }
+    let w_trace = unsafe { (*ec).gettrace() };
+    Ok(if w_trace.is_null() { w_none() } else { w_trace })
+}
+
+fn sys_settrace_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    let ec = current_execution_context();
+    if !ec.is_null() {
+        let w_func = args.first().copied().unwrap_or_else(w_none);
+        unsafe { (*ec).settrace(w_func) };
+    }
+    Ok(w_none())
+}
+
+fn sys_getprofile_impl(_args: &[PyObjectRef]) -> crate::PyResult {
+    let ec = current_execution_context();
+    if ec.is_null() {
+        return Ok(w_none());
+    }
+    let w_profile = unsafe { (*ec).getprofile() };
+    Ok(if w_profile.is_null() {
+        w_none()
+    } else {
+        w_profile
+    })
+}
+
+fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    let ec = current_execution_context();
+    if !ec.is_null() {
+        let w_func = args.first().copied().unwrap_or_else(w_none);
+        unsafe { (*ec).setprofile(w_func) };
+    }
+    Ok(w_none())
+}
+
 pub fn init(ns: &mut DictStorage) {
     dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
     dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
@@ -421,27 +465,27 @@ pub fn init(ns: &mut DictStorage) {
         "exc_clear",
         crate::make_builtin_function("exc_clear", |_| Ok(w_none())),
     );
-    // sys.gettrace / settrace — no-op
+    // sys.gettrace / settrace
     dict_storage_store(
         ns,
         "gettrace",
-        crate::make_builtin_function("gettrace", |_| Ok(w_none())),
+        crate::make_builtin_function("gettrace", sys_gettrace_impl),
     );
     dict_storage_store(
         ns,
         "settrace",
-        crate::make_builtin_function("settrace", |_| Ok(w_none())),
+        crate::make_builtin_function("settrace", sys_settrace_impl),
     );
-    // sys.getprofile / setprofile — no-op
+    // sys.getprofile / setprofile
     dict_storage_store(
         ns,
         "getprofile",
-        crate::make_builtin_function("getprofile", |_| Ok(w_none())),
+        crate::make_builtin_function("getprofile", sys_getprofile_impl),
     );
     dict_storage_store(
         ns,
         "setprofile",
-        crate::make_builtin_function("setprofile", |_| Ok(w_none())),
+        crate::make_builtin_function("setprofile", sys_setprofile_impl),
     );
     // sys.getfilesystemencoding
     dict_storage_store(

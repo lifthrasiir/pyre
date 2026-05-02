@@ -1,10 +1,76 @@
 use pyre_object::PyObjectRef;
 use pyre_object::object_array::{
-    ITEMS_BLOCK_ITEMS_OFFSET, ItemsBlock, alloc_list_items_block, dealloc_list_items_block,
-    grow_list_items_block, items_block_capacity, items_block_items_base,
+    ItemsBlock, alloc_list_items_block, dealloc_list_items_block, grow_list_items_block,
+    items_block_capacity, items_block_items_base,
 };
+use std::sync::OnceLock;
 
 use crate::{PyFrame, new_builtin_dict_storage};
+
+fn trace_frame_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    let raw = *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("frame", |ns| {
+            crate::dict_storage_store(ns, "__dict__", pyre_object::w_none());
+        });
+        tp as usize
+    });
+    raw as PyObjectRef
+}
+
+fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
+    if frame.is_null() {
+        return pyre_object::w_none();
+    }
+    let w_frame = pyre_object::w_instance_new(trace_frame_type());
+    unsafe {
+        let frame_ref = &mut *frame;
+        let w_globals = frame_ref.get_w_globals();
+        let w_locals = frame_ref.get_w_locals();
+        let w_trace = frame_ref.get_w_f_trace();
+        let _ = crate::baseobjspace::setattr(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
+        let _ = crate::baseobjspace::setattr(w_frame, "f_back", pyre_object::w_none());
+        let _ = crate::baseobjspace::setattr(w_frame, "f_builtins", frame_ref.get_builtin());
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_globals",
+            if w_globals.is_null() {
+                pyre_object::w_none()
+            } else {
+                pyre_object::dictobject::w_dict_new_with_dict_storage(w_globals as *mut u8)
+            },
+        );
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_locals",
+            if w_locals.is_null() {
+                pyre_object::w_none()
+            } else {
+                pyre_object::dictobject::w_dict_new_with_dict_storage(w_locals as *mut u8)
+            },
+        );
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_lineno",
+            pyre_object::w_int_new(frame_ref.fget_f_lineno() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_lasti",
+            pyre_object::w_int_new(frame_ref.fget_f_lasti() as i64),
+        );
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_trace",
+            if w_trace.is_null() {
+                pyre_object::w_none()
+            } else {
+                w_trace
+            },
+        );
+    }
+    w_frame
+}
 
 /// pypy/interpreter/executioncontext.py:10-15 app_profile_call.
 ///
@@ -20,21 +86,19 @@ use crate::{PyFrame, new_builtin_dict_storage};
 ///
 /// `jit.hint(frame, access_directly=False)` is a JIT-only annotation
 /// that demotes the green frame to a regular w_object before the user
-/// callable observes it; the dispatch uses the same identity at the
-/// Rust level (raw frame pointer cast to `PyObjectRef`) so the call
-/// shape matches.  Pyre does not yet wrap `PyFrame` as a Python-visible
-/// `W_Root`, so a callable that touches frame attributes will see a
-/// raw struct pointer; that limitation is upstream of this port.
+/// callable observes it.  Pyre's internal `PyFrame` is not itself a
+/// `PyObject`, so the callback sees a frame wrapper carrying the same
+/// Python-visible fields instead of a raw struct pointer.
 pub fn app_profile_call(
     _space: PyObjectRef,
     w_callable: PyObjectRef,
     frame: *mut PyFrame,
     event: &str,
     w_arg: PyObjectRef,
-) {
-    let frame_obj = frame as PyObjectRef;
+) -> Result<(), crate::PyError> {
+    let frame_obj = wrap_trace_frame(frame);
     let w_event = pyre_object::w_str_new(event);
-    let _ = crate::baseobjspace::call_function(w_callable, &[frame_obj, w_event, w_arg]);
+    crate::call::call_function_impl_result(w_callable, &[frame_obj, w_event, w_arg]).map(|_| ())
 }
 
 /// pypy/interpreter/executioncontext.py:320 `self.profilefunc` — the
@@ -49,7 +113,7 @@ pub type ProfileFunc = fn(
     frame: *mut PyFrame,
     event: &str,
     w_arg: PyObjectRef,
-);
+) -> Result<(), crate::PyError>;
 
 /// Byte offset of the GC-owning `values` pointer inside `DictStorage`.
 /// Post-L1 DictStorage holds a `*mut ItemsBlock` directly (no fat
@@ -502,9 +566,9 @@ impl ExecutionContext {
     pub fn _c_call_return_trace(
         &mut self,
         frame: *mut PyFrame,
-        _w_func: PyObjectRef,
-        _args: PyObjectRef,
-        _event: &str,
+        mut w_func: PyObjectRef,
+        args: PyObjectRef,
+        event: &str,
     ) {
         if self.profilefunc.is_none() {
             if !frame.is_null() {
@@ -514,8 +578,32 @@ impl ExecutionContext {
             }
             return;
         }
-        let _ = _args;
-        self._trace(frame, _event, _w_func, None);
+        // executioncontext.py:125-134 FunctionWithFixedCode method-call
+        // rebinding. Pyre represents FunctionWithFixedCode and builtin
+        // functions as Function records; builtin-code functions are the
+        // fixed-code subset that can appear here.
+        unsafe {
+            if crate::is_function(w_func)
+                && crate::is_builtin_code(crate::function_get_code(w_func) as PyObjectRef)
+                && !args.is_null()
+            {
+                let w_firstarg = if pyre_object::is_tuple(args) {
+                    pyre_object::w_tuple_getitem(args, 0)
+                } else if pyre_object::is_list(args) {
+                    pyre_object::w_list_getitem(args, 0)
+                } else {
+                    None
+                };
+                if let Some(w_firstarg) = w_firstarg {
+                    if !w_firstarg.is_null() {
+                        let w_type =
+                            crate::typedef::r#type(w_firstarg).unwrap_or(pyre_object::PY_NULL);
+                        w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
+                    }
+                }
+            }
+        }
+        self._trace(frame, event, w_func, None);
     }
 
     pub fn c_exception_trace(&mut self, frame: *mut PyFrame, _w_exc: PyObjectRef) {
@@ -532,7 +620,7 @@ impl ExecutionContext {
 
     pub fn call_trace(&mut self, frame: *mut PyFrame) {
         if !self.gettrace().is_null() || self.profilefunc.is_some() {
-            self._trace(frame, "call", pyre_object::PY_NULL, None);
+            self._trace(frame, "call", pyre_object::w_none(), None);
             if self.profilefunc.is_some() {
                 if !frame.is_null() {
                     unsafe {
@@ -615,7 +703,7 @@ impl ExecutionContext {
 
     pub fn settrace(&mut self, w_func: PyObjectRef) {
         self.w_tracefunc = w_func;
-        if w_func.is_null() {
+        if w_func.is_null() || w_func == pyre_object::w_none() {
             self.w_tracefunc = pyre_object::PY_NULL;
         } else {
             self.force_all_frames(false);
@@ -628,7 +716,7 @@ impl ExecutionContext {
 
     /// pypy/interpreter/executioncontext.py:303-310 setprofile.
     pub fn setprofile(&mut self, w_func: PyObjectRef) {
-        if w_func.is_null() {
+        if w_func.is_null() || w_func == pyre_object::w_none() {
             self.profilefunc = None;
             self.w_profilefuncarg = pyre_object::PY_NULL;
         } else {
@@ -667,11 +755,11 @@ impl ExecutionContext {
     }
 
     pub fn call_tracing(&mut self, w_func: PyObjectRef, w_args: PyObjectRef) -> PyObjectRef {
-        let _ = (w_func, w_args);
         let was_tracing = self.is_tracing;
         self.is_tracing = 0;
+        let result = crate::baseobjspace::call(w_func, w_args, None);
         self.is_tracing = was_tracing;
-        pyre_object::PY_NULL
+        result
     }
 
     /// pypy/interpreter/executioncontext.py:346-428 _trace.
@@ -725,25 +813,71 @@ impl ExecutionContext {
             // raw `w_arg` is forwarded.
             let _ = operr;
 
+            let lineno = unsafe { (*frame).get_last_lineno() };
+            let init_lineno = if unsafe { (*frame).last_instr } >= 1 {
+                lineno
+            } else {
+                -1
+            };
+            let had_locals = unsafe {
+                let d = (*frame).getorcreatedebug(init_lineno);
+                !d.w_locals.is_null()
+            };
+            if had_locals {
+                unsafe { (*frame).fast2locals() };
+            }
+            let (prev_line_tracing, old_lineno) = unsafe {
+                let d = (*frame).getorcreatedebug(init_lineno);
+                (d.is_in_line_tracing, d.f_lineno)
+            };
+
             // executioncontext.py:376 self.is_tracing += 1
             self.is_tracing += 1;
-            // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
-            // executioncontext.py:384 frame = jit.hint(frame, access_directly=False)
-            // — JIT-only hint; the call shape below matches the
-            // post-hint identity (frame as a normal w_object).
-            let frame_obj = frame as PyObjectRef;
-            let w_event = pyre_object::w_str_new(event);
-            let _w_result =
-                crate::baseobjspace::call_function(w_callback, &[frame_obj, w_event, w_arg]);
-            // executioncontext.py:386-394 — if w_result is None, leave
-            // d.w_f_trace untouched; otherwise store it.  Pyre does
-            // not yet propagate the result through `getorcreatedebug`;
-            // the storage will land alongside the `f_lineno` /
-            // `is_in_line_tracing` bookkeeping at
-            // executioncontext.py:374-402 once those debug-info paths
-            // are ported.
-            // executioncontext.py:399 self.is_tracing -= 1
+            let call_result = (|| {
+                unsafe {
+                    let d = (*frame).getorcreatedebug(init_lineno);
+                    if event == "line" {
+                        d.is_in_line_tracing = true;
+                    }
+                    d.f_lineno = lineno;
+                }
+                // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
+                let frame_obj = wrap_trace_frame(frame);
+                let w_event = pyre_object::w_str_new(event);
+                let w_result = crate::call::call_function_impl_result(
+                    w_callback,
+                    &[frame_obj, w_event, w_arg],
+                )?;
+                if w_result != pyre_object::w_none() {
+                    unsafe {
+                        (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
+                    }
+                }
+                Ok::<(), crate::PyError>(())
+            })();
+
+            if call_result.is_err() {
+                self.settrace(pyre_object::w_none());
+                unsafe {
+                    (*frame).getorcreatedebug(init_lineno).w_f_trace = pyre_object::PY_NULL;
+                }
+            }
+
+            unsafe {
+                let d = (*frame).getorcreatedebug(init_lineno);
+                if d.f_lineno == lineno {
+                    d.f_lineno = old_lineno;
+                }
+                d.is_in_line_tracing = prev_line_tracing;
+            }
             self.is_tracing -= 1;
+            if had_locals {
+                unsafe { (*frame).locals2fast(false) };
+            }
+            if let Err(err) = call_result {
+                crate::call::set_call_error(err);
+                return;
+            }
         }
 
         // executioncontext.py:404-428 Profile cases
@@ -765,14 +899,16 @@ impl ExecutionContext {
             // executioncontext.py:416-417 assert self.is_tracing == 0; self.is_tracing += 1
             assert_eq!(self.is_tracing, 0);
             self.is_tracing += 1;
-            // executioncontext.py:420-421 self.profilefunc(space, self.w_profilefuncarg, frame, event, w_arg)
-            // executioncontext.py:422-425 — on exception, RPython clears
-            // profilefunc + w_profilefuncarg and re-raises.  Pyre's
-            // `profilefunc` is a `fn(...)` so it cannot panic into the
-            // unwinder cleanly; the upstream try/except is mirrored as
-            // a straight-line call until OperationError propagation is
-            // ported at this layer.
-            profilefunc(space, self.w_profilefuncarg, frame, event, w_arg);
+            // executioncontext.py:420-425 self.profilefunc(...), clearing
+            // profile slots on exceptions.
+            let profile_result = profilefunc(space, self.w_profilefuncarg, frame, event, w_arg);
+            if let Err(err) = profile_result {
+                self.profilefunc = None;
+                self.w_profilefuncarg = pyre_object::PY_NULL;
+                self.is_tracing -= 1;
+                crate::call::set_call_error(err);
+                return;
+            }
             // executioncontext.py:427-428 self.is_tracing -= 1
             self.is_tracing -= 1;
         }
