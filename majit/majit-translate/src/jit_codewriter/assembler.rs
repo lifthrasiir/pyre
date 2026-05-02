@@ -243,6 +243,8 @@ impl Assembler {
         ssarepr.insns_pos = Some(insns_pos);
 
         // RPython assembler.py:45,250-258: self.fix_labels()
+        // Upstream `target = self.label_positions[name]` raises KeyError
+        // when the label is missing — never writes a silent 0 target.
         for (label, fixup_pos) in &state.tlabel_fixups {
             // RPython `assembler.py:254 target = self.label_positions[insn[1].name]`
             // — direct dict access, raises KeyError when the TLabel
@@ -384,7 +386,8 @@ impl Assembler {
             FlatOp::EndOfBlock => {}
 
             // RPython `flatten.py:292` `emitline("unreachable")` →
-            // single-byte opcode for `bhimpl_unreachable`.  Mirrors the
+            // single-byte opcode for `bhimpl_unreachable`
+            // (`blackhole.py:962-964`). Mirrors the
             // `assembler.py:140-159` general opcode path: a fresh
             // `startposition = len(self.code)` is recorded before the
             // opcode byte goes in so the `_check_no_branch_to_inside_an_op`

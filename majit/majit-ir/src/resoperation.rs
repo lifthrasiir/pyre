@@ -531,6 +531,11 @@ pub struct Op {
     pub descr: Option<DescrRef>,
     /// Index of this op in the trace (set by the trace builder).
     pub pos: OpRef,
+    /// resoperation.py:1693 `opclasses[opnum].type` parity (Box.type intrinsic).
+    /// Mirrors RPython's `op.type` class attribute set by `optypes[opnum]`
+    /// (`resoperation.py:1597`). Populated at construction from
+    /// `opcode.result_type()`. Replaces side-table `value_types: HashMap<u32, Type>`.
+    pub type_: Type,
     /// For guard ops: values to store in the dead frame on guard failure.
     /// Mirrors rpython/jit/metainterp/resoperation.py getfailargs/setfailargs.
     /// If None, the backend falls back to storing input args.
@@ -621,6 +626,7 @@ impl Op {
             args: SmallVec::from_slice(args),
             descr: None,
             pos: OpRef::NONE,
+            type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
             rd_resume_position: -1,
@@ -634,6 +640,7 @@ impl Op {
             args: SmallVec::from_slice(args),
             descr: Some(descr),
             pos: OpRef::NONE,
+            type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
             rd_resume_position: -1,
@@ -650,7 +657,7 @@ impl Op {
     }
 
     pub fn result_type(&self) -> Type {
-        self.opcode.result_type()
+        self.type_
     }
 
     /// resoperation.py:323-334 AbstractResOp.copy_and_change +
@@ -684,10 +691,16 @@ impl Op {
             args: new_args,
             descr: new_descr,
             pos: self.pos,
+            type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
             rd_resume_position: -1,
-            vecinfo: None,
+            // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
+            // copy datatype/bytesize/signed/count from the source.  pyre
+            // collapses VectorOp/VectorGuardOp into Op, so the same copy
+            // happens unconditionally — None for scalar ops, Some(_) for
+            // vector ops which is what RPython's Vector* subclasses do.
+            vecinfo: self.vecinfo.clone(),
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
@@ -765,7 +778,7 @@ impl std::fmt::Display for Op {
                 write!(f, "]")?;
             }
             Ok(())
-        } else if self.opcode.result_type() != Type::Void {
+        } else if self.result_type() != Type::Void {
             write!(f, "v{} = {:?}(", self.pos.0, self.opcode)?;
             for (i, arg) in self.args.iter().enumerate() {
                 if i > 0 {
@@ -796,7 +809,7 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
         write!(out, "  ").unwrap();
         if op.opcode.is_guard() {
             write!(out, "{:?}(", op.opcode).unwrap();
-        } else if op.opcode.result_type() != Type::Void {
+        } else if op.type_ != Type::Void {
             write!(out, "v{} = {:?}(", op.pos.0, op.opcode).unwrap();
         } else {
             write!(out, "{:?}(", op.opcode).unwrap();
@@ -2615,12 +2628,15 @@ mod tests {
     use super::*;
 
     macro_rules! op {
-        ($($field:tt)*) => {
-            Op {
+        ($($field:tt)*) => {{
+            let mut __op = Op {
                 $($field)*
+                type_: Type::Void,
                 vecinfo: None,
-            }
-        };
+            };
+            __op.type_ = __op.opcode.result_type();
+            __op
+        }};
     }
 
     /// Iterate over all defined OpCode variants.

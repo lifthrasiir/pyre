@@ -3421,20 +3421,6 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
     }
 }
 
-fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|block| block.operations.iter())
-        .find_map(|op| {
-            if op.result == Some(value) {
-                op_result_value_type(&op.kind)
-            } else {
-                None
-            }
-        })
-}
-
 fn graph_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
     graph_result_value_type(graph, value).or_else(|| graph_link_input_value_type(graph, value))
 }
@@ -3549,6 +3535,20 @@ fn const_value_value_type(c: &ConstValue) -> Option<ValueType> {
         ConstValue::SpecTag(_) => None,
         ConstValue::Placeholder => None,
     }
+}
+
+fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .find_map(|op| {
+            if op.result == Some(value) {
+                op_result_value_type(&op.kind)
+            } else {
+                None
+            }
+        })
 }
 
 fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {

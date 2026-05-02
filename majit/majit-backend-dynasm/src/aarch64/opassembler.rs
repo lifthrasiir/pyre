@@ -12,7 +12,7 @@ use dynasmrt::{DynasmApi, dynasm};
 use super::assembler::AssemblerARM64;
 use crate::regloc::{Loc, RegLoc};
 
-impl AssemblerARM64 {
+impl<'a> AssemblerARM64<'a> {
     // ── emit_op_setfield_gc ──
     // aarch64/opassembler.py: emit_op_setfield_gc
     // x86/assembler.py: genop_discard_setfield_gc

@@ -424,6 +424,7 @@ mod tests {
             args: args.iter().copied().collect(),
             descr,
             pos: OpRef(0),
+            type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
             rd_resume_position: -1,

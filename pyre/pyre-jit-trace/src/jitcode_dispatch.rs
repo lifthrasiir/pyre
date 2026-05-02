@@ -2920,11 +2920,14 @@ fn handle(
         "int_and/ii>i" => binop_int_record(code, op, ctx, OpCode::IntAnd),
         "int_or/ii>i" => binop_int_record(code, op, ctx, OpCode::IntOr),
         "int_xor/ii>i" => binop_int_record(code, op, ctx, OpCode::IntXor),
-        // `blackhole.py:516-519 bhimpl_int_lshift(a, b): return
-        // intmask(a << b)`. Mixed shapes such as `int_lshift/ri>i` stay
-        // unwired: those are Task #85 kind-flow bugs, and adding a
-        // handler for them would mask a Ref register flowing into an
-        // Int op.
+        // RPython `pyjitpl.py:281` enumerates `int_lshift` alongside
+        // `int_rshift` in the exec-generated `(box, box)` opimpl loop;
+        // the canonical operand shape is therefore `ii>i`
+        // (`blackhole.py:516-519 bhimpl_int_lshift(a, b): return
+        // intmask(a << b)`). Mixed shapes such as `int_lshift/ri>i`
+        // stay unwired: those are Task #85 kind-flow bugs, and adding
+        // a handler for them would mask a Ref register flowing into
+        // an Int op.
         "int_lshift/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLshift),
         "int_rshift/ii>i" => binop_int_record(code, op, ctx, OpCode::IntRshift),
         // RPython `pyjitpl.py:326-336` — comparison opimpls have a `b1

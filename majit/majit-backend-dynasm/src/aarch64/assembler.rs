@@ -17,7 +17,9 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
-use majit_ir::{FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, TargetArgLoc, Type};
+use majit_ir::{
+    FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type,
+};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -190,7 +192,11 @@ fn invert_cc(cc: u8) -> u8 {
 /// assembler.py:47 AssemblerARM64.
 /// In Rust, this is a transient builder — created per compilation,
 /// not a long-lived object like RPython's.
-pub struct AssemblerARM64 {
+///
+/// Borrows the trace's `inputargs` and `operations` for its lifetime so
+/// `OpRef → Type` resolves through `op.type_` / `inputarg.tp` directly
+/// (RPython `box.type` parity); no `value_types: HashMap` side-table.
+pub struct AssemblerARM64<'a> {
     /// The dynasm assembler (rx86.py + codebuf.py combined).
     pub(crate) mc: Assembler,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
@@ -216,10 +222,15 @@ pub struct AssemblerARM64 {
     // ── State tracking for code generation ──
     /// Maps OpRef index → jitframe slot index.
     opref_to_slot: HashMap<u32, usize>,
-    /// resoperation.py Box.type parity: OpRef → Type for fail_arg_types
-    /// inference. Populated during code generation from input types and
-    /// op result types.
-    value_types: HashMap<u32, Type>,
+    /// Trace inputargs — borrowed for `opref_type` lookups.
+    inputargs: &'a [InputArg],
+    /// Trace operations — borrowed for `opref_type` lookups (reads
+    /// `op.type_` directly, RPython `box.type` parity).
+    operations: &'a [Op],
+    /// OpRef.0 → index into `inputargs`. Pre-computed at construction.
+    inputarg_index: HashMap<u32, usize>,
+    /// OpRef.0 → index into `operations`. Pre-computed at construction.
+    op_index: HashMap<u32, usize>,
     /// Constants: OpRef index (>= 10000) → i64 value.
     constants: HashMap<u32, i64>,
     /// Constant type annotations for float immediates and fail args.
@@ -330,7 +341,44 @@ pub struct CompiledCode {
 }
 
 #[allow(dead_code)]
-impl AssemblerARM64 {
+impl<'a> AssemblerARM64<'a> {
+    /// rpython/jit/metainterp/history.py:220 `box.type` parity.
+    /// Single source of truth: `op.type_` for ops, `inputarg.tp` for
+    /// inputargs, `constant_types` for constants.
+    #[inline]
+    fn opref_type(&self, opref: OpRef) -> Option<Type> {
+        self.opref_type_at(opref, None)
+    }
+
+    #[inline]
+    fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
+        if opref.is_none() {
+            return None;
+        }
+        if opref.is_constant() {
+            return self.constant_types.get(&opref.0).copied();
+        }
+        if let Some(&idx) = self.op_index.get(&opref.0) {
+            let tp = self.operations[idx].type_;
+            if tp == Type::Void {
+                return None;
+            }
+            if at_op_index.map_or(true, |at| idx <= at) {
+                return Some(tp);
+            }
+        }
+        if let Some(&idx) = self.inputarg_index.get(&opref.0) {
+            return Some(self.inputargs[idx].tp);
+        }
+        if let Some(&idx) = self.op_index.get(&opref.0) {
+            let tp = self.operations[idx].type_;
+            if tp != Type::Void {
+                return Some(tp);
+            }
+        }
+        None
+    }
+
     /// assembler.py:54 __init__
     pub(crate) fn new(
         trace_id: u64,
@@ -342,7 +390,11 @@ impl AssemblerARM64 {
         classptr_to_subclass_range: HashMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
+        inputargs: &'a [InputArg],
+        operations: &'a [Op],
     ) -> Self {
+        let inputarg_index = OpTypeIndex::build_inputarg_index(inputargs);
+        let op_index = OpTypeIndex::build_op_index(operations);
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
@@ -354,7 +406,10 @@ impl AssemblerARM64 {
             input_types: Vec::new(),
             bridge_input_locs: None,
             opref_to_slot: HashMap::new(),
-            value_types: HashMap::new(),
+            inputargs,
+            operations,
+            inputarg_index,
+            op_index,
             constants,
             constant_types: HashMap::new(),
             next_slot: 0,
@@ -933,13 +988,11 @@ impl AssemblerARM64 {
                         max_abs_slot = abs_slot + 1;
                     }
                 }
-                self.value_types.insert(ia.index, ia.tp);
             }
             self.next_slot = max_abs_slot;
         } else {
             for (i, ia) in inputargs.iter().enumerate() {
                 self.opref_to_slot.insert(ia.index, JITFRAME_FIXED_SIZE + i);
-                self.value_types.insert(ia.index, ia.tp);
             }
             self.next_slot = JITFRAME_FIXED_SIZE + inputargs.len();
         }
@@ -1269,12 +1322,8 @@ impl AssemblerARM64 {
     /// assembler.py:501 assemble_loop: compile a loop trace.
     ///
     /// Returns compiled code with fail descriptors and entry point.
-    pub fn assemble_loop(
-        mut self,
-        inputargs: &[InputArg],
-        ops: &[Op],
-    ) -> Result<CompiledCode, BackendError> {
-        self.input_types = inputargs.iter().map(|ia| ia.tp).collect();
+    pub fn assemble_loop(mut self) -> Result<CompiledCode, BackendError> {
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
 
         // assembler.py:537 prepare_loop — set up regalloc
         // For now, simplified: all args in frame slots
@@ -1286,7 +1335,7 @@ impl AssemblerARM64 {
         dynasm!(self.mc ; =>entry_label);
         self.self_entry_label = Some(entry_label);
         let entry = self.mc.offset();
-        self._assemble(inputargs, ops, true)?;
+        self._assemble(true)?;
 
         // regalloc sets fail_arg_locs in append_guard_token_with_faillocs.
         // No allocate_unmapped_fail_arg_slots needed.
@@ -1392,18 +1441,16 @@ impl AssemblerARM64 {
     pub fn assemble_bridge(
         mut self,
         _: &dyn FailDescr,
-        inputargs: &[InputArg],
-        ops: &[Op],
         arglocs: &[Loc],
     ) -> Result<CompiledCode, BackendError> {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[dynasm] assemble_bridge: input_types={:?} arglocs={:?}",
-                inputargs.iter().map(|ia| ia.tp).collect::<Vec<_>>(),
+                self.inputargs.iter().map(|ia| ia.tp).collect::<Vec<_>>(),
                 arglocs
             );
         }
-        self.input_types = inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
         self.bridge_input_locs = if arglocs.is_empty() {
             None
         } else {
@@ -1412,7 +1459,7 @@ impl AssemblerARM64 {
 
         // assembler.py:641 prepare_bridge
         let entry = self.mc.offset();
-        self._assemble(inputargs, ops, false)?;
+        self._assemble(false)?;
         let stub_offsets = self.write_pending_failure_recoveries();
 
         let buffer = self
@@ -1477,12 +1524,9 @@ impl AssemblerARM64 {
     /// Uses the register allocator (regalloc.rs) to assign registers/frame
     /// locations, then emits code using those locations. This replaces the
     /// old frame-slot model where every value went through [rbp+offset].
-    fn _assemble(
-        &mut self,
-        inputargs: &[InputArg],
-        ops: &[Op],
-        emit_prologue: bool,
-    ) -> Result<(), BackendError> {
+    fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
+        let inputargs: &'a [InputArg] = self.inputargs;
+        let ops: &'a [Op] = self.operations;
         if emit_prologue {
             self._call_header(inputargs);
         } else {
@@ -1499,14 +1543,19 @@ impl AssemblerARM64 {
             eprintln!("[dynasm:j2plan] {}", plan.summary());
         }
 
-        let mut ra = RegAlloc::new(self.constants.clone(), self.constant_types.clone());
+        let mut ra = RegAlloc::new(
+            self.constants.clone(),
+            self.constant_types.clone(),
+            inputargs,
+            ops,
+        );
         if let Some(ref arglocs) = self.bridge_input_locs {
-            ra.prepare_bridge(inputargs, arglocs, ops);
+            ra.prepare_bridge(arglocs);
         } else {
-            ra.prepare_loop(inputargs, ops);
+            ra.prepare_loop();
         }
         // assembler.py:374 walk_operations — get allocation decisions.
-        let ra_ops = ra.walk_operations(inputargs, ops);
+        let ra_ops = ra.walk_operations();
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
         let frame_slot_depth =
@@ -1523,7 +1572,6 @@ impl AssemblerARM64 {
         for iarg in inputargs {
             self.opref_to_slot
                 .insert(iarg.index, JITFRAME_FIXED_SIZE + iarg.index as usize);
-            self.value_types.insert(iarg.index, iarg.tp);
         }
         // Also sync any frame allocations from regalloc's FrameManager.
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
@@ -1587,9 +1635,6 @@ impl AssemblerARM64 {
                         ops,
                     );
                     self.pending_malloc_nursery_gcmap = None;
-                    if !op.pos.is_none() {
-                        self.value_types.insert(op.pos.0, op.result_type());
-                    }
                 }
                 RegAllocOp::PerformGuard {
                     op_index,
@@ -1620,9 +1665,6 @@ impl AssemblerARM64 {
                         fail_index,
                     );
                     fail_index += 1;
-                    if !op.pos.is_none() {
-                        self.value_types.insert(op.pos.0, op.result_type());
-                    }
                 }
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
                     let op = &ops[*op_index];
@@ -2441,8 +2483,7 @@ impl AssemblerARM64 {
                     let arg_tp = op
                         .args
                         .get(i)
-                        .and_then(|arg| self.value_types.get(&arg.0))
-                        .copied()
+                        .and_then(|arg| self.opref_type_at(*arg, Some(op_index)))
                         .unwrap_or(Type::Int);
                     if arg_tp == Type::Float {
                         src_locations2.push(*src_loc);
@@ -2479,7 +2520,7 @@ impl AssemblerARM64 {
                 // RPython: genop_finish stores result at jf_frame[0] (base_ofs),
                 // writes descr ptr to jf_descr, then calls _call_footer.
                 // arglocs[0] = result location (if any)
-                let fail_arg_types = self.infer_fail_arg_types(op);
+                let fail_arg_types = self.infer_fail_arg_types(op, Some(op_index));
                 let result_type = if fail_arg_types.is_empty() {
                     Type::Void
                 } else {
@@ -3285,7 +3326,7 @@ impl AssemblerARM64 {
         fail_label: DynamicLabel,
         faillocs: &[Option<Loc>],
     ) {
-        let fail_arg_types = self.infer_fail_arg_types(op);
+        let fail_arg_types = self.infer_fail_arg_types(op, Some(op_index));
         // assembler.py:2207 _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
@@ -3933,8 +3974,9 @@ impl AssemblerARM64 {
         self.append_guard_token(op, fail_index, fail_label);
     }
 
-    /// Infer fail_arg_types from value_types or op.fail_arg_types.
-    fn infer_fail_arg_types(&self, op: &Op) -> Vec<Type> {
+    /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
+    /// `op.fail_arg_types`.
+    fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> Vec<Type> {
         if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
             if let Some(descr_types) = op
                 .descr
@@ -3970,7 +4012,7 @@ impl AssemblerARM64 {
             } else if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.args
                     .iter()
-                    .map(|opref| self.value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                    .map(|opref| self.opref_type_at(*opref, op_index).unwrap_or(Type::Int))
                     .collect()
             } else if let Some(ref fa) = op.fail_args {
                 fa.iter()
@@ -3978,7 +4020,7 @@ impl AssemblerARM64 {
                         if opref.is_none() {
                             Type::Ref
                         } else {
-                            self.value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
+                            self.opref_type_at(*opref, op_index).unwrap_or(Type::Ref)
                         }
                     })
                     .collect()
@@ -3991,7 +4033,7 @@ impl AssemblerARM64 {
                     if opref.is_none() {
                         Type::Ref
                     } else {
-                        self.value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
+                        self.opref_type_at(*opref, op_index).unwrap_or(Type::Ref)
                     }
                 })
                 .collect()
@@ -4003,7 +4045,7 @@ impl AssemblerARM64 {
     /// Common tail: build DynasmFailDescr, create GuardToken, push to
     /// pending_guard_tokens and fail_descrs.
     fn append_guard_token(&mut self, op: &Op, fail_index: u32, fail_label: DynamicLabel) {
-        let fail_arg_types = self.infer_fail_arg_types(op);
+        let fail_arg_types = self.infer_fail_arg_types(op, None);
         let fail_args = op
             .fail_args
             .as_ref()
@@ -4178,7 +4220,7 @@ impl AssemblerARM64 {
         // Pre-allocate the fail descr for the next GUARD_NOT_FORCED.
         // The full metadata (faillocs, rd_numb, etc.) will be filled in
         // when the guard is actually emitted in append_guard_token_with_faillocs.
-        let fail_arg_types = self.infer_fail_arg_types(next_op);
+        let fail_arg_types = self.infer_fail_arg_types(next_op, Some(next_idx));
         let descr = Arc::new(DynasmFailDescr::new(
             fail_index,
             self.trace_id,
@@ -4408,13 +4450,13 @@ impl AssemblerARM64 {
             } else {
                 finish_refs
                     .iter()
-                    .map(|opref| self.value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                    .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
                     .collect()
             }
         } else {
             finish_refs
                 .iter()
-                .map(|opref| self.value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
                 .collect()
         };
         // compile.py:618-669 parity: use type-specific global singleton.

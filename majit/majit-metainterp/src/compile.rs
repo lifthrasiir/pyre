@@ -38,23 +38,16 @@ use crate::resume::{
 
 /// Resolve the type of an OpRef in guard fail_args.
 /// OpRef::NONE is a virtual slot placeholder (null GC ref).
-fn fail_arg_type(
-    opref: &OpRef,
-    value_types: &HashMap<u32, Type>,
-    constant_types: &HashMap<u32, Type>,
-) -> Type {
+/// RPython resume.py:389-452 parity: guard metadata sees only the
+/// Box.type values available at the guard's numbering point, not later
+/// operations in the same trace. `value_types` is the incremental
+/// guard-point map maintained by `build_guard_metadata`.
+fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
     if *opref == OpRef::NONE {
-        Type::Ref
-    } else if opref.is_constant() {
-        // RPython Box.type parity: constant type comes from constant_types
-        // (set by optimizer), then value_types, then default Int for
-        // numeric constants. Ref constants (GcRef/None) must appear in
-        // constant_types to avoid being mis-tagged as Int.
-        constant_types
-            .get(&opref.0)
-            .or_else(|| value_types.get(&opref.0))
-            .copied()
-            .unwrap_or(Type::Int)
+        return Type::Ref;
+    }
+    if opref.is_constant() {
+        value_types.get(&opref.0).copied().unwrap_or(Type::Int)
     } else {
         value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
     }
@@ -198,9 +191,22 @@ pub(crate) fn build_guard_metadata(
     let mut exit_layouts = HashMap::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
+    // RPython box.type parity: type lookup is `inputarg.tp` /
+    // `constant.type` / `op.type_` direct attribute access — pyre
+    // gathers these into OpTypeIndex since OpRef carries no type.
+    //
+    // RPython resume.py:389-520 captures each guard's livebox types at
+    // numbering time, so a guard at trace position K only sees ops
+    // that have already been emitted (positions <= K). pyre's flat
+    // `OpRef(u32)` namespace can re-use the same numeric position
+    // across phases (Phase 2 `shift_back` remaps fresh OpRefs onto
+    // Phase 1's inputarg slots), so a global `type_index.opref_type`
+    // would let later op result types leak back into earlier guards.
+    // Mirror main's incremental walk: maintain `value_types` seeded
+    // from inputargs + constants, then insert each op's result type
+    // before consulting it.
     let mut value_types: HashMap<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
-    // Merge constant types so fail_arg_type can resolve constant OpRefs.
     for (&idx, &tp) in constant_types {
         value_types.entry(idx).or_insert(tp);
     }
@@ -230,7 +236,7 @@ pub(crate) fn build_guard_metadata(
         // minted by `store_final_boxes_in_guard` carrying the
         // post-numbering type vector, so descr-first priority no longer
         // exposes stale tracer types. Fall back to `op.fail_arg_types`
-        // and finally `value_types`/constant pool.
+        // and finally the incremental guard-point `value_types` map.
         let descr_types = op
             .descr
             .as_ref()
@@ -250,8 +256,9 @@ pub(crate) fn build_guard_metadata(
                     types.to_vec()
                 } else {
                     // Arity mismatch (synthetic test ops without a
-                    // type-shaped descr): reconstruct per-arg from
-                    // value_types. Production FINISH always matches.
+                    // type-shaped descr): reconstruct per-arg from the
+                    // incremental `value_types`. Production FINISH always
+                    // matches the descr arity.
                     op.args
                         .iter()
                         .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
@@ -270,7 +277,8 @@ pub(crate) fn build_guard_metadata(
             // fail_arg_types (single source of truth, matches RPython
             // `ResumeGuardDescr.fail_arg_types`); fall back to op-level
             // `fail_arg_types` on sharing-path (no descr); fall back to
-            // per-arg reconstruction via value_types when arity mismatches.
+            // per-arg reconstruction via guard-point `value_types` when arity
+            // mismatches.
             let fa_types = op.fail_arg_types.as_ref();
             if let Some(types) = descr_types {
                 if types.len() == fail_args.len() {
@@ -291,7 +299,7 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = value_types.get(&opref.0) {
                                 return tp;
                             }
-                            fail_arg_type(opref, &value_types, constant_types)
+                            fail_arg_type(opref, &value_types)
                         })
                         .collect()
                 }
@@ -309,7 +317,7 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = value_types.get(&opref.0) {
                                 return tp;
                             }
-                            fail_arg_type(opref, &value_types, constant_types)
+                            fail_arg_type(opref, &value_types)
                         })
                         .collect()
                 }
@@ -320,7 +328,7 @@ pub(crate) fn build_guard_metadata(
                         if let Some(&tp) = value_types.get(&opref.0) {
                             return tp;
                         }
-                        fail_arg_type(opref, &value_types, constant_types)
+                        fail_arg_type(opref, &value_types)
                     })
                     .collect()
             }
@@ -1270,22 +1278,6 @@ pub(crate) fn enrich_resume_layout_with_trace_metadata(
     }
 }
 
-pub(crate) fn build_trace_value_maps(
-    inputargs: &[InputArg],
-    ops: &[majit_ir::Op],
-) -> (HashMap<u32, Type>, HashMap<u32, OpCode>) {
-    let mut value_types: HashMap<u32, Type> =
-        inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
-    let mut producers = HashMap::new();
-    for op in ops {
-        if !op.pos.is_none() && op.result_type() != Type::Void {
-            value_types.insert(op.pos.0, op.result_type());
-            producers.insert(op.pos.0, op.opcode);
-        }
-    }
-    (value_types, producers)
-}
-
 pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize) -> Option<u32> {
     let mut fail_index = 0u32;
     for (idx, op) in ops.iter().enumerate() {
@@ -1302,6 +1294,7 @@ pub(crate) fn find_fail_index_for_exit_op(ops: &[majit_ir::Op], op_index: usize)
 pub(crate) fn infer_terminal_exit_layout(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
+    constant_types: &HashMap<u32, Type>,
     owning_key: u64,
     trace_id: u64,
     op_index: usize,
@@ -1312,20 +1305,24 @@ pub(crate) fn infer_terminal_exit_layout(
         return None;
     }
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
-    let (value_types, producers) = build_trace_value_maps(inputargs, ops);
+    let type_index = majit_ir::OpTypeIndex::new(inputargs, ops, constant_types);
     let exit_types: Vec<Type> = op
         .args
         .iter()
-        .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+        .map(|opref| {
+            type_index
+                .opref_type_at(*opref, op_index)
+                .unwrap_or(Type::Int)
+        })
         .collect();
     let force_token_slots: Vec<usize> = op
         .args
         .iter()
         .enumerate()
         .filter_map(|(slot, opref)| {
-            producers
-                .get(&opref.0)
-                .copied()
+            type_index
+                .op_at(*opref)
+                .map(|op| op.opcode)
                 .filter(|opcode| *opcode == OpCode::ForceToken)
                 .map(|_| slot)
         })
@@ -1355,13 +1352,16 @@ pub(crate) fn infer_terminal_exit_layout(
 pub(crate) fn build_terminal_exit_layouts(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
+    constant_types: &HashMap<u32, Type>,
 ) -> HashMap<usize, StoredExitLayout> {
     let mut layouts = HashMap::new();
     for (op_index, op) in ops.iter().enumerate() {
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
             continue;
         }
-        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, 0, op_index) {
+        if let Some(layout) =
+            infer_terminal_exit_layout(inputargs, ops, constant_types, 0, 0, op_index)
+        {
             layouts.insert(
                 op_index,
                 StoredExitLayout {
@@ -1398,7 +1398,14 @@ pub(crate) fn terminal_exit_layout_for_trace(
             return Some(layout.public(owning_key, trace_id, fail_index));
         }
     }
-    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
+    infer_terminal_exit_layout(
+        &trace.inputargs,
+        &trace.ops,
+        &trace.constant_types,
+        owning_key,
+        trace_id,
+        op_index,
+    )
 }
 
 pub(crate) fn decode_values_with_layout(

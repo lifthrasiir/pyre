@@ -95,9 +95,16 @@ pub struct UnrollOptimizer {
     /// snapshot_boxes reference original trace positions, but the optimizer
     /// receives transformed ops (fold_box/elide). This map covers the gap.
     pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
-    /// RPython Box type parity: Phase 1's emitted op types.
-    /// Phase 2 references Phase 1 OpRefs via imported_label_args (NONE
-    /// resolution). These OpRefs may not exist in Phase 2's input ops.
+    /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
+    /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
+    /// directly via `op.type_` (history.py:220 box.type parity).
+    phase1_emit_ops: Vec<majit_ir::Op>,
+    /// Phase 1 `value_types` (full snapshot of `OptContext.value_types` at
+    /// end-of-phase) carried alongside `phase1_emit_ops` so the Phase 2
+    /// `OptContext.value_types` can be re-seeded with cross-phase types
+    /// that no Phase 1 emit op covers (alias seeds, virtual heads,
+    /// short-preamble PreambleOp tombstones).  Mirrors RPython's
+    /// persistent `box.type` attribute across the export/import boundary.
     phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
@@ -142,6 +149,7 @@ impl UnrollOptimizer {
             all_descrs: Vec::new(),
             trace_inputarg_types: Vec::new(),
             original_trace_op_types: std::collections::HashMap::new(),
+            phase1_emit_ops: Vec::new(),
             phase1_value_types: std::collections::HashMap::new(),
             phase1_patchguardop: None,
             next_global_opref: 0,
@@ -403,8 +411,7 @@ impl UnrollOptimizer {
                     // with `p1_iter_fresh_hw` keeps Phase 2's inputarg base
                     // strictly above every OpRef Phase 1 ever allocated,
                     // so Phase 2's own fresh OpRefs cannot collide with
-                    // values already keyed in `phase1_value_types` /
-                    // `original_trace_op_types`.
+                    // positions in `phase1_emit_ops` / `original_trace_op_types`.
                     self.next_global_opref = opt_p1
                         .final_ctx
                         .as_ref()
@@ -412,10 +419,13 @@ impl UnrollOptimizer {
                         .unwrap_or(num_inputs as u32)
                         .max(num_inputs as u32)
                         .max(p1_iter_fresh_hw);
-                    // RPython Box type parity: Phase 1's emitted op types
-                    // must be accessible to Phase 2 (imported_label_args
-                    // reference Phase 1 OpRefs). Save Phase 1 value_types.
-                    self.phase1_value_types = opt_p1.prev_phase_value_types.clone();
+                    // RPython Box type parity: Phase 1's emit ops carry
+                    // `op.type_` intrinsically; Phase 2's `op_at` reads it
+                    // directly to resolve cross-phase OpRefs that appear as
+                    // imported_label_args / fail_args / record_same_as
+                    // sources (history.py:220 parity).
+                    self.phase1_emit_ops = std::mem::take(&mut opt_p1.phase1_emit_ops);
+                    self.phase1_value_types = std::mem::take(&mut opt_p1.prev_phase_value_types);
                     // RPython: same Optimizer instance keeps patchguardop.
                     if self.phase1_patchguardop.is_none() {
                         self.phase1_patchguardop = opt_p1.patchguardop.clone();
@@ -440,7 +450,7 @@ impl UnrollOptimizer {
                         short_inputargs: Vec::new(),
                         runtime_boxes: Vec::new(),
                         patchguardop: None,
-                        phase1_value_types: HashMap::new(),
+                        phase1_emit_high_water: state.phase1_emit_high_water,
                         rooted_refs: Vec::new(),
                         shadow_stack_base: 0,
                     });
@@ -509,6 +519,7 @@ impl UnrollOptimizer {
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
         opt_p2.original_trace_op_types = self.original_trace_op_types.clone();
+        opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
         opt_p2.prev_phase_value_types = self.phase1_value_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -647,11 +658,11 @@ impl UnrollOptimizer {
             .map(|(&k, &v)| (translate_opref(OpRef(k)).0, v))
             .collect();
         opt_p2.original_trace_op_types = translated_op_types;
-        // Phase 1's emitted op types are already in Phase 1's emitted
+        // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
-        // `phase1_value_types` untranslated.
+        // `phase1_emit_ops` untranslated.
         let mut p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
@@ -1403,19 +1414,13 @@ pub struct ExportedState {
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
     pub patchguardop: Option<majit_ir::Op>,
-    /// Complete Phase 1 `value_types` map (OpRef position → result type).
-    ///
-    /// RPython's `Box` carries its type intrinsically (InputArgInt /
-    /// InputArgRef / ResOp with typed opcode), so a retrace inherits the
-    /// type automatically through the shared Box object. Pyre's `OpRef(u32)`
-    /// is untyped, so Phase 1 types must be serialized here and re-seeded
-    /// into Phase 2's `prev_phase_value_types` on the retrace path where
-    /// Phase 1 is skipped (see `compile_retrace` in unroll.rs).
-    ///
-    /// Default `HashMap::new()` — populated by the export site once the
-    /// retrace path starts reading it; consumers without Phase 1 types
-    /// continue to fall back to `OptContext.value_types` lookups.
-    pub phase1_value_types: HashMap<u32, Type>,
+    /// Smallest fresh OpRef strictly above every Phase 1 emit position
+    /// (i.e. `max(op.pos.0) + 1` over `phase1_emit_ops`). Used by
+    /// `opref_high_water` so retrace's Phase 2 namespace stays disjoint
+    /// from intermediate Phase 1 emit OpRefs that were forwarded /
+    /// folded and never survive as an end_arg / short_op source.
+    /// `0` when there are no Phase 1 emit positions to track.
+    pub phase1_emit_high_water: u32,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1533,7 +1538,7 @@ impl ExportedState {
             short_inputargs,
             runtime_boxes: Vec::new(),
             patchguardop: None,
-            phase1_value_types: HashMap::new(),
+            phase1_emit_high_water: 0,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1679,15 +1684,12 @@ impl ExportedState {
             }
         }
 
-        // phase1_value_types carries the full Phase 1 value_types map, which
-        // can include positions that are not reachable via any of the
-        // structure-stored OpRef fields above (e.g. intermediate ops that
-        // were forwarded and never survive as an end_arg / short_op source).
-        // Retrace must keep its Phase 2 namespace disjoint from every one
-        // of those, so factor their max position into the high water too.
-        if let Some(&max) = self.phase1_value_types.keys().max() {
-            visit(OpRef(max));
-        }
+        // `phase1_emit_high_water` covers Phase 1 emit positions that are
+        // not reachable via any of the structure-stored OpRef fields above
+        // (e.g. intermediate ops that were forwarded and never survive as
+        // an end_arg / short_op source). Retrace must keep its Phase 2
+        // namespace disjoint from every one of those.
+        high = high.max(self.phase1_emit_high_water);
 
         high
     }
@@ -1924,7 +1926,7 @@ impl Clone for ExportedState {
             short_inputargs: self.short_inputargs.clone(),
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
-            phase1_value_types: self.phase1_value_types.clone(),
+            phase1_emit_high_water: self.phase1_emit_high_water,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2321,11 +2323,12 @@ impl OptUnroll {
         // RPython sidesteps this naturally because `box._forwarded` persists
         // across phases. virtualstate.py make_inputargs assumes shared state
         // ⇒ same forwarded target.
+        // unroll.py:458 `end_args = [get_box_replacement(arg) for arg in end_args]`.
         let resolved_next_iteration_args: Vec<OpRef> = end_args
             .iter()
             .map(|&a| ctx.get_box_replacement(a))
             .collect();
-        ExportedState::new(
+        let mut state = ExportedState::new(
             label_args.clone(),
             resolved_next_iteration_args,
             virtual_state,
@@ -2335,7 +2338,19 @@ impl OptUnroll {
             renamed_inputargs.to_vec(),
             renamed_inputarg_types,
             short_args,
-        )
+        );
+        // Smallest fresh OpRef strictly above every Phase 1 emit position.
+        // Retrace's `opref_high_water` consults this so Phase 2's namespace
+        // stays disjoint from intermediate Phase 1 ops that were forwarded
+        // and never survive as an end_arg / short_op source. `op.pos.0`
+        // is already non-NONE / non-Void by the rebuild filter.
+        state.phase1_emit_high_water = optimizer
+            .phase1_emit_ops
+            .iter()
+            .map(|op| op.pos.0.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        state
     }
 
     /// unroll.py:432-443: _expand_info

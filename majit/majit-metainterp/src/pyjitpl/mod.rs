@@ -3967,8 +3967,11 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_constant_types,
                         self.callinfocollection.as_deref(),
                     );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
+                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
+                    &inputargs,
+                    &compiled_ops,
+                    &compiled_constant_types,
+                );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
@@ -4768,8 +4771,11 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_constant_types,
                         self.callinfocollection.as_deref(),
                     );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
+                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
+                    &inputargs,
+                    &combined_ops,
+                    &compiled_constant_types,
+                );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
@@ -5242,8 +5248,11 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_constant_types,
                         self.callinfocollection.as_deref(),
                     );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
+                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
+                    &inputargs,
+                    &optimized_ops,
+                    &compiled_constant_types,
+                );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
@@ -5560,8 +5569,11 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_constant_types,
                         self.callinfocollection.as_deref(),
                     );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
+                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
+                    &inputargs,
+                    &compiled_ops,
+                    &compiled_constant_types,
+                );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
@@ -6547,9 +6559,11 @@ impl<M: Clone> MetaInterp<M> {
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
         if let Some(front_target) = compiled.front_target_tokens.first() {
             let target_descr = front_target.as_jump_target_descr();
-            let (value_types, _) =
-                crate::compile::build_trace_value_maps(&root_trace.inputargs, &root_trace.ops);
-            if let Some(label) = root_trace.ops.iter().find(|op| {
+            let constant_types: std::collections::HashMap<u32, Type> =
+                std::collections::HashMap::new();
+            let type_index =
+                majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops, &constant_types);
+            if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op
                         .descr
@@ -6560,7 +6574,11 @@ impl<M: Clone> MetaInterp<M> {
                     label
                         .args
                         .iter()
-                        .map(|arg| value_types.get(&arg.0).copied().unwrap_or(Type::Ref))
+                        .map(|arg| {
+                            type_index
+                                .opref_type_at(*arg, label_index)
+                                .unwrap_or(Type::Ref)
+                        })
                         .collect(),
                 );
             }
@@ -7402,8 +7420,11 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_constant_types,
                         self.callinfocollection.as_deref(),
                     );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
+                let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
+                    bridge_inputargs,
+                    &optimized_ops,
+                    &compiled_constant_types,
+                );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
@@ -7852,8 +7873,11 @@ impl<M: Clone> MetaInterp<M> {
                             &compiled_constant_types,
                             self.callinfocollection.as_deref(),
                         );
-                    let mut terminal_exit_layouts =
-                        compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
+                    let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
+                        bridge_inputargs,
+                        &optimized_ops,
+                        &compiled_constant_types,
+                    );
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
                         &compiled.token,
                         source_trace_id,
@@ -16335,7 +16359,8 @@ mod tests {
             &HashMap::new(),
             meta.callinfocollection.as_deref(),
         );
-        let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
+        let mut terminal_exit_layouts =
+            compile::build_terminal_exit_layouts(inputargs, &ops, &HashMap::new());
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, backend_layouts.as_slice());
         }

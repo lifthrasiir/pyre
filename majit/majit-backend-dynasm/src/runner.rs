@@ -1371,10 +1371,12 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
+            inputargs,
+            &prepared_ops,
         );
         asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
-        let compiled = asm.assemble_loop(inputargs, &prepared_ops)?;
+        let compiled = asm.assemble_loop()?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -1521,6 +1523,8 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
+            inputargs,
+            &prepared_ops,
         );
         asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
@@ -1533,7 +1537,7 @@ impl Backend for DynasmBackend {
             fail_descr.fail_index(),
         );
         let arglocs = Asm::rebuild_faillocs_from_descr(&guard_descr, inputargs);
-        let compiled = asm.assemble_bridge(fail_descr, inputargs, &prepared_ops, &arglocs)?;
+        let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();

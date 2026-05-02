@@ -366,6 +366,8 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
                     }
                     if !catches_all {
                         ops.push(FlatOp::Reraise);
+                        // RPython `flatten.py:238` `emitline('---')` after
+                        // `reraise_xxx` — close the block in liveness.
                         ops.push(FlatOp::EndOfBlock);
                     }
                 }
@@ -868,6 +870,7 @@ fn make_exception_link(
         } else {
             ops.push(FlatOp::Reraise);
         }
+        // RPython `flatten.py:238` `emitline('---')` after raise/reraise.
         ops.push(FlatOp::EndOfBlock);
         return;
     }

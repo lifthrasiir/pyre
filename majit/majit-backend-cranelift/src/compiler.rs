@@ -30,7 +30,7 @@ use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
     AccumInfo, CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef,
-    Type, Value,
+    OpTypeIndex, Type, Value,
 };
 
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
@@ -4305,53 +4305,36 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
     Ok(force_tokens)
 }
 
-/// Returns (value_types, inputarg_types, op_def_positions).
-/// - value_types: merged map (ops override inputargs) — used for most lookups
-/// - inputarg_types: inputarg-only types — used for positional type inference
-/// - op_def_positions: OpRef → op_index of the defining operation
-///   (only for OpRefs that are both inputargs and op results with different types)
-fn build_value_type_map(
+/// Auxiliary LABEL type overrides on top of `OpTypeIndex`.
+///
+/// `OpTypeIndex` covers the RPython `box.type` parity surface — every
+/// OpRef yields its declared type from the corresponding inputarg/op/const
+/// object.  The only pyre-only flat-OpRef effect handled here is the
+/// JUMP→LABEL edge rewrite: when a JUMP delivers a value of a different
+/// runtime type to a LABEL arg, the label arg's value at runtime carries
+/// the jump's type, not the inputarg's declared type. RPython's Box.type
+/// does not need this because each iteration allocates fresh Boxes with
+/// fresh `.type` attributes.
+///
+/// `op_def_positions` records the op_index where an OpRef was redefined
+/// from its inputarg type (or by a JUMP→LABEL rewrite). It drives the
+/// "guard fired before redefinition → use original inputarg type"
+/// fallback in `resolve_fail_arg_types`.
+fn build_type_overrides(
     inputargs: &[InputArg],
     ops: &[Op],
-) -> (HashMap<u32, Type>, HashMap<u32, Type>, HashMap<u32, usize>) {
-    let mut value_types = HashMap::new();
-    let mut inputarg_types = HashMap::new();
-    let mut op_def_positions = HashMap::new();
-    let mut runtime_refs = HashSet::new();
-
-    for input in inputargs {
-        value_types.insert(input.index, input.tp);
-        inputarg_types.insert(input.index, input.tp);
-        runtime_refs.insert(input.index);
-    }
+    type_index: &OpTypeIndex<'_>,
+) -> (HashMap<u32, Type>, HashMap<u32, usize>) {
+    let mut overrides: HashMap<u32, Type> = HashMap::new();
+    let mut op_def_positions: HashMap<u32, usize> = HashMap::new();
 
     for (op_idx, op) in ops.iter().enumerate() {
         let result_type = op.result_type();
         if result_type != Type::Void {
             let var_idx = op_var_index(op, op_idx, inputargs.len()) as u32;
-            if let Some(&ia_type) = inputarg_types.get(&var_idx) {
+            if let Some(ia_type) = type_index.inputarg_type(OpRef(var_idx)) {
                 if ia_type != result_type {
                     op_def_positions.insert(var_idx, op_idx);
-                }
-            }
-            value_types.insert(var_idx, result_type);
-            runtime_refs.insert(var_idx);
-        }
-        if op.opcode == OpCode::Label {
-            runtime_refs.extend(op.args.iter().filter(|arg| !arg.is_none()).map(|arg| arg.0));
-        }
-        // Propagate optimizer-provided fail_arg_types to value_types.
-        // This ensures constant OpRefs typed as Ref by the optimizer
-        // (e.g., function pointers in GuardValue) are correctly typed
-        // in the backend's infer_fail_arg_types fallback.
-        if let Some(ref fat) = op.fail_arg_types {
-            if let Some(ref fa) = op.fail_args {
-                for (i, &opref) in fa.iter().enumerate() {
-                    if runtime_refs.contains(&opref.0) && !value_types.contains_key(&opref.0) {
-                        if let Some(&tp) = fat.get(i) {
-                            value_types.insert(opref.0, tp);
-                        }
-                    }
                 }
             }
         }
@@ -4375,6 +4358,15 @@ fn build_value_type_map(
             }
         }
     }
+    let lookup =
+        |opref: OpRef, at_op_index: usize, fallback: Type, ovrs: &HashMap<u32, Type>| -> Type {
+            if let Some(&tp) = ovrs.get(&opref.0) {
+                return tp;
+            }
+            type_index
+                .opref_type_at(opref, at_op_index)
+                .unwrap_or(fallback)
+        };
     for (descr_idx, jump_idx) in &jumps_by_descr {
         let Some(&label_idx) = label_by_descr.get(descr_idx) else {
             continue;
@@ -4391,26 +4383,36 @@ fn build_value_type_map(
             if jump_arg.is_none() {
                 continue;
             }
-            let jump_type = value_types.get(&jump_arg.0).copied().unwrap_or(Type::Int);
-            let label_type = value_types.get(&label_arg.0).copied().unwrap_or(Type::Ref);
+            let jump_type = lookup(jump_arg, *jump_idx, Type::Int, &overrides);
+            let label_type = lookup(label_arg, label_idx, Type::Ref, &overrides);
             if jump_type != label_type {
-                value_types.insert(label_arg.0, jump_type);
+                overrides.insert(label_arg.0, jump_type);
                 op_def_positions.insert(label_arg.0, label_idx);
             }
         }
     }
 
-    (value_types, inputarg_types, op_def_positions)
+    (overrides, op_def_positions)
 }
 
-/// Lightweight variant for call sites that only need merged value_types.
-fn build_value_type_map_simple(inputargs: &[InputArg], ops: &[Op]) -> HashMap<u32, Type> {
-    build_value_type_map(inputargs, ops).0
+#[inline]
+fn lookup_type_at(
+    type_index: &OpTypeIndex<'_>,
+    overrides: &HashMap<u32, Type>,
+    opref: OpRef,
+    op_index: usize,
+) -> Option<Type> {
+    if let Some(&tp) = overrides.get(&opref.0) {
+        return Some(tp);
+    }
+    type_index.opref_type_at(opref, op_index)
 }
 
 fn build_ref_root_slots(
     inputargs: &[InputArg],
     ops: &[Op],
+    type_index: &OpTypeIndex<'_>,
+    overrides: &HashMap<u32, Type>,
     force_tokens: &HashSet<u32>,
 ) -> Result<Vec<(u32, usize)>, BackendError> {
     let mut seen = HashSet::new();
@@ -4425,33 +4427,34 @@ fn build_ref_root_slots(
     // (2) the preamble guard check would dereference non-pointer values.
     let mut non_ref_at_backedge: HashSet<u32> = HashSet::new();
     let mut has_float_at_ref_position = false;
+    // Find the closing JUMP and check arg types against inputarg types
+    if let Some((jump_idx, jump)) = ops
+        .iter()
+        .enumerate()
+        .rfind(|(_, op)| op.opcode == OpCode::Jump)
     {
-        let type_map = build_value_type_map_simple(inputargs, ops);
-        // Find the closing JUMP and check arg types against inputarg types
-        if let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
-            let num_inputs = inputargs.len();
-            for (i, &arg) in jump.args.iter().enumerate() {
-                if i >= num_inputs {
-                    break;
-                }
-                if inputargs[i].tp != Type::Ref {
-                    continue;
-                }
-                if (arg.0 as usize) < num_inputs && inputargs[arg.0 as usize].tp == Type::Ref {
-                    continue; // inputarg reference — always safe
-                }
-                if let Some(&actual_tp) = type_map.get(&arg.0) {
-                    if actual_tp != Type::Ref {
-                        non_ref_at_backedge.insert(i as u32);
-                        if actual_tp == Type::Float {
-                            has_float_at_ref_position = true;
-                        }
-                        if std::env::var_os("MAJIT_LOG").is_some() {
-                            eprintln!(
-                                "[ref-root] SKIP inputarg idx={}: backedge passes {:?} (arg={:?})",
-                                i, actual_tp, arg
-                            );
-                        }
+        let num_inputs = inputargs.len();
+        for (i, &arg) in jump.args.iter().enumerate() {
+            if i >= num_inputs {
+                break;
+            }
+            if inputargs[i].tp != Type::Ref {
+                continue;
+            }
+            if (arg.0 as usize) < num_inputs && inputargs[arg.0 as usize].tp == Type::Ref {
+                continue; // inputarg reference — always safe
+            }
+            if let Some(actual_tp) = lookup_type_at(type_index, overrides, arg, jump_idx) {
+                if actual_tp != Type::Ref {
+                    non_ref_at_backedge.insert(i as u32);
+                    if actual_tp == Type::Float {
+                        has_float_at_ref_position = true;
+                    }
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!(
+                            "[ref-root] SKIP inputarg idx={}: backedge passes {:?} (arg={:?})",
+                            i, actual_tp, arg
+                        );
                     }
                 }
             }
@@ -4639,13 +4642,15 @@ fn resolve_rewriter_immediate_i64(constants: &HashMap<u32, i64>, opref: OpRef) -
 }
 
 fn type_for_opref(
-    value_types: &HashMap<u32, Type>,
+    type_index: &OpTypeIndex<'_>,
+    overrides: &HashMap<u32, Type>,
     known_values: &HashSet<u32>,
     opcode: OpCode,
     opref: OpRef,
+    op_index: usize,
     what: &str,
 ) -> Result<Type, BackendError> {
-    if let Some(&tp) = value_types.get(&opref.0) {
+    if let Some(tp) = lookup_type_at(type_index, overrides, opref, op_index) {
         return Ok(tp);
     }
     if known_values.contains(&opref.0) {
@@ -6295,7 +6300,9 @@ fn patch_terminal_exit_recovery_layout(
 
 fn infer_fail_arg_types(
     fail_arg_refs: &[OpRef],
-    value_types: &HashMap<u32, Type>,
+    type_index: &OpTypeIndex<'_>,
+    overrides: &HashMap<u32, Type>,
+    op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
     let mut fail_arg_types = Vec::with_capacity(fail_arg_refs.len());
     for &opref in fail_arg_refs {
@@ -6309,7 +6316,8 @@ fn infer_fail_arg_types(
         // resoperation.py Box.type parity: default to Ref (GCREF).
         // RPython's Box carries an immutable .type attribute; unknown
         // boxes are RefOp-based (the most common case in pyre).
-        fail_arg_types.push(value_types.get(&opref.0).copied().unwrap_or(Type::Ref));
+        fail_arg_types
+            .push(lookup_type_at(type_index, overrides, opref, op_index).unwrap_or(Type::Ref));
     }
     Ok(fail_arg_types)
 }
@@ -6323,8 +6331,8 @@ fn infer_fail_arg_types(
 fn resolve_fail_arg_types(
     fail_arg_refs: &[OpRef],
     fd: Option<&dyn majit_ir::descr::FailDescr>,
-    value_types: &HashMap<u32, Type>,
-    inputarg_types: &HashMap<u32, Type>,
+    type_index: &OpTypeIndex<'_>,
+    overrides: &HashMap<u32, Type>,
     op_def_positions: &HashMap<u32, usize>,
     guard_op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
@@ -6334,10 +6342,10 @@ fn resolve_fail_arg_types(
         if dt.len() == fail_arg_refs.len() {
             dt.to_vec()
         } else {
-            infer_fail_arg_types(fail_arg_refs, value_types)?
+            infer_fail_arg_types(fail_arg_refs, type_index, overrides, guard_op_index)?
         }
     } else {
-        infer_fail_arg_types(fail_arg_refs, value_types)?
+        infer_fail_arg_types(fail_arg_refs, type_index, overrides, guard_op_index)?
     };
 
     // Fix positional conflicts: when a guard fires BEFORE the operation
@@ -6354,7 +6362,7 @@ fn resolve_fail_arg_types(
             if let Some(&def_pos) = op_def_positions.get(&opref.0) {
                 if guard_op_index < def_pos {
                     // Guard before redefinition: use inputarg type.
-                    return inputarg_types.get(&opref.0).copied().unwrap_or(tp);
+                    return type_index.inputarg_type(opref).unwrap_or(tp);
                 }
             }
             tp
@@ -7089,6 +7097,7 @@ impl CraneliftBackend {
             source_guard,
             caller_layout,
             &self.constants,
+            &self.constant_types,
             self.callinfocollection.as_deref(),
             attached_descrs,
         )?;
@@ -7101,6 +7110,7 @@ impl CraneliftBackend {
         let terminal_exit_layouts = collect_terminal_exit_layouts(
             ops,
             inputargs,
+            &self.constant_types,
             &force_tokens,
             trace_id,
             header_pc,
@@ -7110,8 +7120,10 @@ impl CraneliftBackend {
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
-        let value_types = build_value_type_map_simple(inputargs, ops);
-        let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens)?;
+        let type_index = OpTypeIndex::new(inputargs, ops, &self.constant_types);
+        let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
+        let ref_root_slots =
+            build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
         let gc_nursery_addrs =
             with_cranelift_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr()));
         // llmodel.py:64-69 self.vtable_offset — backend property used by
@@ -10505,10 +10517,12 @@ impl CraneliftBackend {
                             );
                         }
                         let value_type = type_for_opref(
-                            &value_types,
+                            &type_index,
+                            &type_overrides,
                             &known_values,
                             op.opcode,
                             op.arg(2),
+                            op_idx,
                             "GC_STORE value",
                         )?;
                         let addr = emit_dynamic_offset_addr(
@@ -10562,10 +10576,12 @@ impl CraneliftBackend {
                         "GC_STORE_INDEXED itemsize",
                     )?;
                     let value_type = type_for_opref(
-                        &value_types,
+                        &type_index,
+                        &type_overrides,
                         &known_values,
                         op.opcode,
                         op.arg(2),
+                        op_idx,
                         "GC_STORE_INDEXED value",
                     )?;
                     let addr = emit_scaled_index_addr(
@@ -12305,11 +12321,13 @@ fn collect_guards(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
     constants: &HashMap<u32, i64>,
+    constant_types: &HashMap<u32, Type>,
     callinfocollection: Option<&majit_ir::CallInfoCollection>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
-    let (value_types, inputarg_types, op_def_positions) = build_value_type_map(inputargs, ops);
+    let type_index = OpTypeIndex::new(inputargs, ops, constant_types);
+    let (type_overrides, op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
 
     // Map Label descr index → block arity, used to distinguish internal vs
     // external JUMPs.  rewriter.py LABEL/JUMP redirect parity: a JUMP whose
@@ -12354,10 +12372,10 @@ fn collect_guards(
                 if dt.len() == refs.len() {
                     dt.to_vec()
                 } else {
-                    infer_fail_arg_types(&refs, &value_types)?
+                    infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
                 }
             } else {
-                infer_fail_arg_types(&refs, &value_types)?
+                infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
             };
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
@@ -12380,8 +12398,8 @@ fn collect_guards(
                 _ => resolve_fail_arg_types(
                     &refs,
                     descr_fd,
-                    &value_types,
-                    &inputarg_types,
+                    &type_index,
+                    &type_overrides,
                     &op_def_positions,
                     op_idx,
                 )?,
@@ -12396,8 +12414,8 @@ fn collect_guards(
             let types = resolve_fail_arg_types(
                 &refs,
                 op.descr.as_ref().and_then(|d| d.as_fail_descr()),
-                &value_types,
-                &inputarg_types,
+                &type_index,
+                &type_overrides,
                 &op_def_positions,
                 op_idx,
             )?;
@@ -12933,13 +12951,15 @@ fn collect_guards(
 fn collect_terminal_exit_layouts(
     ops: &[Op],
     inputargs: &[InputArg],
+    constant_types: &HashMap<u32, Type>,
     force_tokens: &HashSet<u32>,
     trace_id: u64,
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let value_types = build_value_type_map_simple(inputargs, ops);
+    let type_index = OpTypeIndex::new(inputargs, ops, constant_types);
+    let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
     let mut layouts = Vec::new();
     let mut fail_index = 0u32;
 
@@ -12949,7 +12969,8 @@ fn collect_terminal_exit_layouts(
         let is_jump = op.opcode == OpCode::Jump;
 
         if is_finish || is_jump {
-            let exit_types = infer_fail_arg_types(op.args.as_slice(), &value_types)?;
+            let exit_types =
+                infer_fail_arg_types(op.args.as_slice(), &type_index, &type_overrides, op_index)?;
             let force_token_slots: Vec<usize> = op
                 .args
                 .iter()

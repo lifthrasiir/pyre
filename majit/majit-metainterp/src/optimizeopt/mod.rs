@@ -374,6 +374,35 @@ pub struct OptContext {
     /// (inputargs + operation results). Used by store_final_boxes_in_guard
     /// to infer fail_arg types correctly for OpRefs from earlier phases.
     pub value_types: HashMap<u32, majit_ir::Type>,
+    /// Inputarg types indexed by slot, mirroring `Optimizer.trace_inputarg_types`
+    /// (recorder side `InputArg{Int,Ref,Float}.tp`). Slot `i` corresponds to
+    /// `OpRef(inputarg_base + i)`. Populated in `setup_optimizations` so
+    /// readers can resolve inputarg `box.type` (history.py:220 parity)
+    /// without going through the `value_types` HashMap. Slice 0.5 prep —
+    /// once all inputarg-type readers route through here, the inputarg
+    /// fan-in into `value_types` (optimizer.rs:1816-1818) goes away.
+    pub inputarg_types: Vec<majit_ir::Type>,
+    /// Phase 1 emit ops carried into Phase 2's lookup surface.
+    ///
+    /// In RPython, a Box referenced cross-phase keeps its `.type` attribute
+    /// because the Box object survives both phases (history.py:220 parity).
+    /// Pyre's flat `OpRef(u32)` requires explicit carry: Phase 1's emit ops
+    /// — at positions in `[num_inputs, phase2_inputarg_base)` — appear as
+    /// `imported_label_args`, fail-arg sources, and `record_same_as` source
+    /// arguments inside Phase 2, but never inside Phase 2's own `new_operations`.
+    /// `op_at` falls back to this slice so `op.type_` stays the single source
+    /// of truth for Phase 1 emit OpRef types — closing the
+    /// `prev_phase_value_types` HashMap fan-in (Slice 0.6).
+    pub phase1_emit_ops: Vec<Op>,
+    /// Pre-fold recorder positions that no longer have a producing Op
+    /// in `new_operations` (constant-folded, elided, or replaced by a
+    /// fresh OpRef). Cloned from `Optimizer.original_trace_op_types` in
+    /// `setup_optimizations`. Read by `opref_type` after `value_types`
+    /// and before `inputarg_type` so retrace and snapshot consumers
+    /// resolve the recorder's original `box.type` (history.py:220
+    /// parity) — closing the recorder fan-in into `value_types`
+    /// (Slice 0.5).
+    pub original_trace_op_types: HashMap<u32, majit_ir::Type>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -483,50 +512,39 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_type(&self, opref: OpRef) -> majit_ir::Type {
-        // Check constant type first
+        // Check constant type first (history.py:220 ConstInt.type parity).
+        // The `constant_types_for_numbering` override is a raw-pointer
+        // marker on `'i'`-typed Boxes (RPython `getrawptrinfo` ConstInt
+        // path); it does NOT change `box.type` from `'i'` to `'r'`, so
+        // we never read it here as a type source.  This matches
+        // `OptContext::opref_type`'s documented invariant.
         if let Some(val) = self.ctx.get_constant(opref) {
             return val.get_type();
         }
-        // RPython: box.type — check constant_types_for_numbering (includes
-        // inputarg types and constant pool types registered by the tracer).
-        //
-        // resoperation.py Box.type parity: a Box's type is always one of
-        // `'i'` / `'r'` / `'f'`. Void is NOT a valid Box type — only
-        // value-producing ops have Boxes. pyre's recorder assigns `pos`
-        // to every op (including void ops like SetfieldGc and guards),
-        // so a stale lookup of a void op's pos would otherwise leak
-        // `Type::Void` here. Filter it out and fall through so it never
-        // reaches livebox_types / fail_arg_types, where it would propagate
-        // into bridge `exit_types` and produce `Value::Void` slots in
-        // `decode_exit_layout_values` that zero out the bridge fail-arg bank.
-        if let Some(&tp) = self.ctx.constant_types_for_numbering.get(&opref.0) {
-            if tp != majit_ir::Type::Void {
-                return tp;
+        // Producing op intrinsic type (resoperation.py:1693
+        // `opclasses[opnum].type` parity).
+        let resolved = self.ctx.get_box_replacement(opref);
+        if let Some(op) = self.ctx.op_at(resolved) {
+            if op.type_ != majit_ir::Type::Void {
+                return op.type_;
             }
         }
-        // RPython box.type parity: every Box carries its type intrinsically.
-        // `value_types` aggregates the four upstream sources (original trace
+        // value_types aggregates the four upstream sources (original trace
         // ops, prev-phase carry, inputarg types, transformed trace result
-        // types) seeded in `Optimizer::make_ctx`, plus every non-Void op
-        // emitted so far via `register_value_type`.
+        // types) seeded in `Optimizer::make_ctx`. Removed in Slice 0.5
+        // once writers feed Op.type_ exclusively.
         if let Some(&tp) = self.ctx.value_types.get(&opref.0) {
             if tp != majit_ir::Type::Void {
                 return tp;
             }
         }
-        // Check emitted op result type (most accurate for concrete values).
-        // Void result_type means the op produces no value (SetfieldGc,
-        // guards, …). RPython would never query Box.type for such an op;
-        // fall through to the PtrInfo / default-int probes below.
-        let resolved = self.ctx.get_box_replacement(opref);
-        for op in &self.ctx.new_operations {
-            if op.pos == resolved {
-                let tp = op.result_type();
-                if tp != majit_ir::Type::Void {
-                    return tp;
-                }
-                break;
-            }
+        // Inputarg slot (history.py:220 `InputArg{Int,Ref,Float}.type`
+        // parity). Slice 0.5 prep — placed last so legacy `value_types`
+        // writers keep priority during the transition; once Slice 0.5
+        // drops the inputarg fan-in this becomes the authoritative
+        // inputarg-type source.
+        if let Some(tp) = self.ctx.inputarg_type(resolved) {
+            return tp;
         }
         // PtrInfo presence → Ref type (for non-emitted ops like input args)
         if self.ctx.get_ptr_info(opref).is_some() {
@@ -1081,6 +1099,21 @@ impl OptContext {
                 opref, existing, tp,
             );
         }
+        // Phase 0 dual-source check: when the producing Op already lives
+        // in new_operations its intrinsic `type_` field (resoperation.py:1693
+        // `opclasses[opnum].type` parity) must agree with the registered
+        // `tp`. Caught here during development; once all readers migrate
+        // to `op.type_` (Slice 0.4) the side-table itself disappears.
+        #[cfg(debug_assertions)]
+        if let Some(producer) = self.new_operations.iter().rev().find(|o| o.pos == opref) {
+            debug_assert_eq!(
+                producer.type_, tp,
+                "register_value_type: Op.type_ ({:?}) disagrees with \
+                 registered tp ({:?}) at {:?} (opcode={:?}) — Box.type \
+                 parity violation",
+                producer.type_, tp, opref, producer.opcode,
+            );
+        }
         self.value_types.insert(opref.0, tp);
     }
 
@@ -1137,6 +1170,9 @@ impl OptContext {
 
             constant_types_for_numbering: HashMap::new(),
             value_types: HashMap::new(),
+            inputarg_types: Vec::new(),
+            phase1_emit_ops: Vec::new(),
+            original_trace_op_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
         }
@@ -1216,6 +1252,9 @@ impl OptContext {
 
             constant_types_for_numbering: HashMap::new(),
             value_types: HashMap::new(),
+            inputarg_types: Vec::new(),
+            phase1_emit_ops: Vec::new(),
+            original_trace_op_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
         }
@@ -1541,16 +1580,11 @@ impl OptContext {
             }
         }
 
-        // Track OpRef → Type for fail_arg_types inference
-        // (compile.rs value_types parity).
-        // emit() may re-write an existing value_types entry when the same
-        // Register the op's result type. RPython's Box.type is fixed,
-        // so this is either a first-time record or a same-type no-op;
-        // `register_value_type` surfaces any genuine cross-type reuse
-        // immediately.
-        if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-            self.register_value_type(op.pos, op.result_type());
-        }
+        // Slice 0.5: dropping the redundant `register_value_type` write —
+        // the op is about to be pushed into `new_operations`, after which
+        // `op_at` resolves its intrinsic `op.type_` (resoperation.py:1693
+        // parity) and `opref_type` returns it via the primary fast path.
+        // The side-table entry would be dead code.
         self.new_operations.push(op);
         pos_ref
     }
@@ -1566,12 +1600,10 @@ impl OptContext {
             self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
         }
         let pos_ref = op.pos;
-        // Box.type parity: mirror emit() — register the result type at
-        // the moment the op is queued so any subsequent `opref_type` /
-        // `replace_op` lookup observes the correct type.
-        if op.result_type() != majit_ir::Type::Void {
-            self.register_value_type(op.pos, op.result_type());
-        }
+        // Slice 0.5: queued ops carry their intrinsic `op.type_` (Slice
+        // 0.1 / resoperation.py:1693 parity). Once the queued op flushes
+        // through `propagate_one` into `new_operations`, `op_at` resolves
+        // its type without the side-table detour.
         self.extra_operations_after
             .push_back((after_pass_idx + 1, op));
         pos_ref
@@ -3770,16 +3802,46 @@ impl OptContext {
         }
     }
 
+    /// Look up the producing `Op` for an OpRef in `new_operations`.
+    /// Returns `None` for inputargs, constants, and OpRefs not yet emitted.
+    ///
+    /// RPython equivalent: holding a reference to the producing `Box`
+    /// itself (every Box is a Python object, so identity lookup is the
+    /// `is` operator — O(1)). pyre's flat `OpRef(u32)` cannot mirror
+    /// that in O(1) without an auxiliary index; mutation patterns on
+    /// `new_operations` (in-place replace at `optimizer.rs:3391`,
+    /// `rewrite.rs:1579/1674`, plus `remove(jump_idx)` at
+    /// `optimizer.rs:2605`) make a maintained `pos_to_index` brittle.
+    /// Slice 0.2 unifies on this single API; converting it to O(1)
+    /// (via a maintained index or layout invariant) is deferred to a
+    /// later slice once those mutation patterns are stabilised.
+    pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
+        if let Some(op) = self.new_operations.iter().rev().find(|op| op.pos == opref) {
+            return Some(op);
+        }
+        // Phase 1 emit-op fallback (history.py:220 box.type parity for
+        // cross-phase OpRefs). Reverse scan mirrors `new_operations` so a
+        // later replacement of the same `pos` wins. Returned `&Op` is
+        // safe to read for `.type_` and other intrinsic attributes; arg
+        // / descr fields refer to Phase 1's namespace and should not be
+        // dereferenced through this path (Phase 2 callers only consume
+        // `op.type_` via `get_op_result_type` / `opref_type`).
+        self.phase1_emit_ops.iter().rev().find(|op| op.pos == opref)
+    }
+
     /// RPython box.type parity: find the result type of the operation
     /// that produces this OpRef. Returns None if the OpRef is an
     /// inputarg or was not produced by any emitted operation.
     pub fn get_op_result_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
-        for op in self.new_operations.iter().rev() {
-            if op.pos == opref && op.result_type() != majit_ir::Type::Void {
-                return Some(op.result_type());
-            }
+        let op = self.op_at(opref)?;
+        // history.py:220 ConstInt.type, resoperation.py:567 IntOp.type:
+        // Box.type is intrinsic to the producing op. `op.type_` was
+        // populated at construction (Slice 0.1) from `opcode.result_type()`.
+        if op.type_ == majit_ir::Type::Void {
+            None
+        } else {
+            Some(op.type_)
         }
-        None
     }
 
     /// optimizer.py: clear_newoperations()
@@ -3852,19 +3914,111 @@ impl OptContext {
     /// assumptions about it.
     pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_box_replacement(opref);
-        // 1. Seeded constant — read the intrinsic Rust shape.
+        // 1. Seeded constant — read the intrinsic Rust shape (history.py:220
+        //    `ConstInt.type = INT` parity).
         //    The constant_types_for_numbering override is intentionally
         //    NOT consulted here — it is a raw-pointer marker on
         //    'i'-typed Boxes, not a type-changing annotation.
         if let Some(val) = self.get_constant(resolved) {
             return Some(val.get_type());
         }
-        // 2. value_types entry from a prior emit.
+        // 2. Producing op's intrinsic `type_` (resoperation.py:1693
+        //    `opclasses[opnum].type` parity). Slice 0.1 populates this
+        //    at construction; this is now the primary fast path.
+        if let Some(tp) = self.get_op_result_type(resolved) {
+            // Slice 0.3 dual-source check: when `value_types` carries an
+            // entry it must agree with the intrinsic. Disagreement = bug
+            // the side-table has been masking; surface during dev.
+            #[cfg(debug_assertions)]
+            if let Some(&table_tp) = self.value_types.get(&resolved.0) {
+                debug_assert_eq!(
+                    tp, table_tp,
+                    "opref_type: Op.type_ ({:?}) disagrees with \
+                     value_types entry ({:?}) for {:?}",
+                    tp, table_tp, resolved,
+                );
+            }
+            return Some(tp);
+        }
+        // 3. `value_types` side-table — covers OpRefs that have no
+        //    producing Op yet (e.g. registered via `register_value_type`
+        //    by passes that synthesize an aliased OpRef). Removed in
+        //    Slice 0.5 once all writers route through Op intrinsics or
+        //    the dedicated `inputarg_types` / `original_trace_op_types`
+        //    sources below.
         if let Some(&tp) = self.value_types.get(&resolved.0) {
             return Some(tp);
         }
-        // 3. Producing op result type.
-        self.get_op_result_type(resolved)
+        // 4. Pre-fold recorder positions (history.py:220 `box.type` for
+        //    raw recorder OpRefs that the optimizer transformed away).
+        //    Phase 2 / retrace paths inherit these via
+        //    `setup_optimizations` cloning `Optimizer.original_trace_op_types`.
+        //    Void slots are dropped at clone time so a stale entry never
+        //    overrides a fresh non-Void op result.
+        if let Some(&tp) = self.original_trace_op_types.get(&resolved.0) {
+            return Some(tp);
+        }
+        // 5. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
+        //    history.py:220 parity). Slice 0.5 prep — placed last so
+        //    legacy `value_types` writers keep priority during the
+        //    transition; once Slice 0.5 drops the inputarg fan-in this
+        //    becomes the authoritative inputarg-type source.
+        if let Some(tp) = self.inputarg_type(resolved) {
+            return Some(tp);
+        }
+        None
+    }
+
+    /// Inputarg slot lookup. Returns `Some(tp)` when `opref` falls in either
+    /// the current context's own inputarg range
+    /// `[inputarg_base, inputarg_base + num_inputs)` (RPython invariant) or
+    /// the shared low range `[0, num_inputs)` (Phase 1's inputarg slot OpRefs
+    /// referenced from Phase 2 via `imported_label_args`). Returns `None` for
+    /// constants, sentinels, out-of-range OpRefs, Void-typed slots, or empty
+    /// `inputarg_types` (test contexts that bypass `setup_optimizations`).
+    ///
+    /// `[0, num_inputs)` fallback: in RPython each `InputArgRef`/`InputArgInt`
+    /// Box carries its `.type` intrinsically, so Phase 2 reads the same
+    /// `box.type` regardless of which iteration's TraceIterator produced
+    /// the box. Pyre's flat `OpRef(u32)` namespace separates Phase 1
+    /// inputargs (at `[0, num_inputs)`) from Phase 2 inputargs (at
+    /// `[phase2_inputarg_base, phase2_inputarg_base + num_inputs)`), but
+    /// `Optimizer.trace_inputarg_types` is identical between phases (single
+    /// recorder source — see `unroll.rs:313` and `unroll.rs:510`). Indexing
+    /// the same `inputarg_types` Vec by raw position recovers Phase 1
+    /// slot types from Phase 2 without a separate side-table — closing the
+    /// `prev_phase_value_types` inputarg fan-in (history.py:220 parity).
+    ///
+    /// Note: `inputarg_types` may be over-allocated (auto-seeded
+    /// `vec![Ref; 1024]` test stubs from optimizer.rs:1751); the
+    /// authoritative inputarg-slot count is `num_inputs` and the cap
+    /// reflects opencoder's `inputargs occupy [inputarg_base,
+    /// inputarg_base + num_inputs)` invariant.
+    pub fn inputarg_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
+        if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        let raw = opref.0;
+        let ni = self.num_inputs as usize;
+        let idx = if raw >= self.inputarg_base && (raw - self.inputarg_base) < self.num_inputs {
+            (raw - self.inputarg_base) as usize
+        } else if self.inputarg_base > 0 && raw < self.num_inputs {
+            // Phase 1 inputarg slot, accessed from a non-Phase-1 context
+            // (Phase 2 / bridge). RPython resolves these through Box
+            // identity; flat-OpRef pyre uses the shared inputarg_types Vec.
+            raw as usize
+        } else {
+            return None;
+        };
+        if idx >= ni {
+            return None;
+        }
+        let tp = *self.inputarg_types.get(idx)?;
+        if tp == majit_ir::Type::Void {
+            None
+        } else {
+            Some(tp)
+        }
     }
 
     /// `Box.type` strict accessor. Panics when no source carries a type for

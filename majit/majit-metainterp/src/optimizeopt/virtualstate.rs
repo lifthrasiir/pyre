@@ -644,13 +644,16 @@ impl VirtualStateInfo {
             VirtualStateInfo::Unknown(tp) => Some(*tp),
             VirtualStateInfo::Constant(v) => Some(v.get_type()),
             VirtualStateInfo::IntBounded(_) => Some(Type::Int),
+            // info.py:867 `assert op.type == 'i'` in `getrawptrinfo`:
+            // raw pointer Boxes are int-typed; pointer-ness sits on
+            // RawBufferPtrInfo, not on the Box.type.
+            VirtualStateInfo::VirtualRawBuffer { .. } => Some(Type::Int),
             VirtualStateInfo::NonNull
             | VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::Virtual { .. }
             | VirtualStateInfo::VArray { .. }
             | VirtualStateInfo::VStruct { .. }
-            | VirtualStateInfo::VArrayStruct { .. }
-            | VirtualStateInfo::VirtualRawBuffer { .. } => Some(Type::Ref),
+            | VirtualStateInfo::VArrayStruct { .. } => Some(Type::Ref),
         }
     }
 }

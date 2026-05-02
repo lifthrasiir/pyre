@@ -1,5 +1,6 @@
 pub mod descr;
 pub mod effectinfo;
+pub mod op_type_index;
 pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
@@ -22,6 +23,7 @@ pub use effectinfo::{
     RandomEffectsAnalyzer, UnsupportedFieldExc, VirtualizableAnalyzer, consider_array,
     consider_struct, frozenset_or_none,
 };
+pub use op_type_index::OpTypeIndex;
 pub use resoperation::{
     ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode,
     OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,

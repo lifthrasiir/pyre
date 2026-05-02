@@ -114,15 +114,18 @@ fn compute_liveness_pass(
                 };
             }
             FlatOp::EndOfBlock => {
-                // RPython `liveness.py:55-57`: `'---'` resets the alive set.
+                // RPython `liveness.py:55-57`: `'---'` resets the alive
+                // set so the next block starts a fresh liveness region.
                 alive.clear();
             }
             FlatOp::Unreachable => {
-                // RPython `unreachable` is just an opcode (no operands)
-                // and goes through `liveness.py:59+`'s args-loop with
-                // an empty arg list, so the alive set is unchanged.
-                // The trailing `---` (always emitted right after) is
-                // what resets it.
+                // The real `unreachable` opcode (`blackhole.py:962-964
+                // bhimpl_unreachable`) ends the trace path with an
+                // `AssertionError`. RPython treats it as a regular
+                // operand-less opcode and goes through `liveness.py:59+`
+                // with an empty arg list, leaving the alive set
+                // unchanged. The trailing `EndOfBlock` (`flatten.py:292-293`
+                // always emits the pair) is what resets it.
             }
             FlatOp::Op(inner_op) => {
                 // Result is defined here — remove from alive

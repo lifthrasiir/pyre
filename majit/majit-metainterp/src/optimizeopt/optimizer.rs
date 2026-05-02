@@ -165,10 +165,27 @@ pub struct Optimizer {
     pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
-    /// RPython Box type parity: in RPython each Box carries its type
-    /// intrinsically. In majit, OpRef is an untyped u32, so we track
-    /// types in value_types. Phase 1 value_types are preserved here
-    /// so Phase 2 can resolve types for carried-over OpRefs.
+    /// Phase 1 emit ops carried into Phase 2's lookup surface (Slice 0.6).
+    ///
+    /// Mirror of `OptContext.phase1_emit_ops`; populated at the end of
+    /// `optimize_with_constants_and_inputs_at` from `ctx.new_operations`,
+    /// and propagated into the Phase 2 `OptContext` via `setup_optimizations`.
+    /// `OptContext::op_at` resolves Phase 1 emit OpRefs through `op.type_`
+    /// directly — single source of truth for cross-phase Box.type
+    /// (history.py:220 parity).
+    pub phase1_emit_ops: Vec<majit_ir::Op>,
+    /// Phase 1 `value_types` carried into Phase 2's lookup surface.
+    ///
+    /// RPython Box objects keep their `box.type` regardless of whether
+    /// the box ever made it into `loop.operations`; pyre's flat
+    /// `OpRef(u32)` namespace cannot rely on Python identity, so the
+    /// `register_value_type` writes from Phase 1 (virtual heads, alias
+    /// seeds, propagate refresh, short-preamble) need to flow into
+    /// Phase 2 to keep cross-phase OpRefs typed when neither
+    /// `phase1_emit_ops` nor `original_trace_op_types` covers them.
+    /// Populated at the end of `optimize_with_constants_and_inputs_at`
+    /// from `ctx.value_types`, then drained into `OptContext.value_types`
+    /// at Phase 2 `setup_optimizations` start.
     pub prev_phase_value_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython Box type parity: position→type for ALL original trace ops.
     /// snapshot_boxes reference original trace positions, but the optimizer
@@ -690,7 +707,10 @@ impl Optimizer {
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
             op.pos = ctx.reserve_pos();
             let fresh = op.pos;
-            ctx.register_value_type(fresh, tp);
+            // Op.type_ carries `tp` intrinsically (resoperation.py:1693
+            // SAME_AS_*.type parity); the immediate push below makes
+            // op_at(fresh) the authoritative type source. No
+            // `value_types` write needed (Slice 0.5).
             ctx.new_operations.push(op);
             // Update the field to reference the SameAs result.
             entries[*entry_idx].fields[*field_idx].1 = fresh;
@@ -800,7 +820,11 @@ impl Optimizer {
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
-                // unroll.py:454 Box carries its type. Virtual heads are Ref.
+                // unroll.py:454 Box carries its type. Virtual heads are
+                // Ref-typed. PtrInfo presence alone cannot stand in for
+                // box.type because PtrInfo can also describe int-typed
+                // raw pointers (info.py:865 RawBufferPtrInfo +
+                // getrawptrinfo()).
                 ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_fields: Vec<(u32, OpRef)> = fields
                     .iter()
@@ -846,7 +870,8 @@ impl Optimizer {
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let opref = ctx.alloc_op_position();
-                // unroll.py:454 Box carries its type. VArray heads are Ref.
+                // unroll.py:454 Box carries its type. VArray heads are
+                // Ref-typed.
                 ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
@@ -880,7 +905,8 @@ impl Optimizer {
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
-                // unroll.py:454 Box carries its type. VStruct heads are Ref.
+                // unroll.py:454 Box carries its type. VStruct heads are
+                // Ref-typed.
                 ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
@@ -917,7 +943,8 @@ impl Optimizer {
                 element_fields,
             } => {
                 let opref = ctx.alloc_op_position();
-                // unroll.py:454 Box carries its type. VArrayStruct heads are Ref.
+                // unroll.py:454 Box carries its type. VArrayStruct heads
+                // are Ref-typed.
                 ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
@@ -1057,6 +1084,7 @@ impl Optimizer {
             snapshot_frame_sizes: std::collections::HashMap::new(),
             snapshot_vable_boxes: std::collections::HashMap::new(),
             snapshot_frame_pcs: std::collections::HashMap::new(),
+            phase1_emit_ops: Vec::new(),
             prev_phase_value_types: std::collections::HashMap::new(),
             original_trace_op_types: std::collections::HashMap::new(),
             opt_ops_emitted: 0,
@@ -1783,68 +1811,78 @@ impl Optimizer {
 
         // RPython Box type parity: in RPython each Box carries its type
         // intrinsically (InputArgInt, InputArgRef, etc.). In majit, OpRef
-        // is an untyped u32. Seed value_types from ALL sources, lowest
-        // priority first (later entries override earlier).
+        // is an untyped u32. Carry recorder-side positions on a dedicated
+        // ctx field (rather than fanning them into value_types) so the
+        // `opref_type` chain reads them at a fixed priority below the
+        // pass-local `value_types` writers.
         //
-        // Skip Void entries: value_types tracks producing-op result types
-        // (register_value_type asserts against Void). original_trace_op_types
-        // and prev_phase_value_types still keep Void slots for snapshot
-        // resolution, but they must not reach the value_types map — a
-        // reserve_pos that later hands out a Void slot for a new typed op
-        // would otherwise fire the Box.type retype invariant.
-        // 1. Original trace ops (pre-transformation positions for snapshots)
-        for (&k, &v) in &self.original_trace_op_types {
-            if v != majit_ir::Type::Void {
-                ctx.value_types.insert(k, v);
-            }
-        }
-        // 2. Previous phase's emitted op types (Phase 1 → Phase 2 carry)
-        //
-        // These are only fallback types for carried-over OpRefs that do not
-        // appear in the current transformed trace. The current trace's own
-        // ops must win, matching PyPy's intrinsic Box.type on the current
-        // ResOperation objects.
-        for (&k, &v) in &self.prev_phase_value_types {
-            if v != majit_ir::Type::Void {
-                ctx.value_types.insert(k, v);
-            }
-        }
+        // Skip Void entries: a reserve_pos that later hands out a Void
+        // slot for a new typed op would otherwise fire the Box.type
+        // retype invariant once the same OpRef is queried via this map.
+        // 1. Original trace ops (pre-transformation positions for snapshots
+        //    and retrace) — surfaced through ctx.original_trace_op_types.
+        ctx.original_trace_op_types = self
+            .original_trace_op_types
+            .iter()
+            .filter(|&(_, v)| *v != majit_ir::Type::Void)
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        // 2. Phase 1 → Phase 2 carry: `phase1_emit_ops` below; `op_at`
+        //    resolves cross-phase OpRefs through `op.type_` directly
+        //    (history.py:220 box.type parity).
         // 3. Inputarg types (from recorder — RPython InputArgInt/Ref/Float).
-        //    Seeded BEFORE the current trace ops so an op at a position
-        //    inside the inputarg range wins on result-type conflict. In
-        //    production inputargs live at `[inputarg_base, inputarg_base
-        //    + num_inputs)` and ops live strictly above that range, so
-        //    the order is immaterial; the swap only matters for the
-        //    unit-test harnesses that seed `trace_inputarg_types =
-        //    vec![Ref; 1024]` and then place trace ops at low positions.
-        //    With ops winning, OpRef(0)=Int (from IntGe.pos=0) instead of
-        //    the Ref stub, so the Box.type invariant at
-        //    `register_value_type` sees a single authoritative type.
-        for (i, &tp) in self.trace_inputarg_types.iter().enumerate() {
-            ctx.value_types.insert(inputarg_base + i as u32, tp);
+        //    Slice 0.5: inputarg slot lookups live on the dedicated
+        //    `ctx.inputarg_types` Vec exclusively, mirroring RPython's
+        //    `InputArg{Int,Ref,Float}.type` (history.py:220 parity).
+        ctx.inputarg_types = self.trace_inputarg_types.clone();
+        // Phase 1 emit ops: single source of truth for cross-phase OpRef →
+        // `op.type_` lookup (history.py:220 parity).
+        ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
+        // Phase 1 → Phase 2 carry of `value_types` entries that are not
+        // covered by `phase1_emit_ops` (virtual heads, alias seeds, refresh
+        // writes, short-preamble PreambleOp tombstones).  RPython Box objects
+        // keep `box.type` regardless of whether they were emitted, so the
+        // pyre flat-OpRef equivalent must persist these types into Phase 2's
+        // `value_types` to keep cross-phase OpRef typing intact.
+        for (k, v) in self.prev_phase_value_types.drain() {
+            ctx.value_types.entry(k).or_insert(v);
         }
-        // 4. Transformed trace ops (optimizer input). Each op's
-        //    `result_type()` is the authoritative Box.type at `op.pos`.
-        for op in ops {
-            if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
-                ctx.value_types.insert(op.pos.0, op.result_type());
-            }
-        }
+        // 4. (removed) Slice 0.5: transformed trace ops carry `op.type_`
+        //    intrinsically (resoperation.py:1693 parity); the pipeline
+        //    emits each op into `new_operations` before moving to the
+        //    next, so `OptContext::op_at` resolves the type of any
+        //    earlier-emitted op without going through `value_types`.
+        //    The fan-in into `value_types` here was redundant book-
+        //    keeping that only fed the `next_pos` bump below — replaced
+        //    with a direct max over the input slice.
 
-        // Bump reserve_pos cursor past every seeded value_types position.
+        // Bump reserve_pos cursor past every seeded position.
         //
-        // `reserve_pos` only skips over `constants`; it does not consult
-        // `value_types`. Phase 2 / retrace contexts inherit Phase 1's
-        // positions through `original_trace_op_types` and
-        // `prev_phase_value_types`, and Phase 1's emit-side high water
-        // can sit above the caller-provided `start_next_pos` whenever
-        // the transformed `ops` slice ends below that mark. Without this
-        // bump, a later `get_or_make_const` / `emit` would hand out an
-        // already-seeded position and fire the Box.type retype invariant.
-        if let Some(&max_typed_pos) = ctx.value_types.keys().max() {
-            let next_after = max_typed_pos.saturating_add(1);
-            ctx.next_pos = ctx.next_pos.max(next_after);
-        }
+        // `reserve_pos` only skips over `constants`. Phase 2 / retrace
+        // contexts inherit Phase 1's positions through
+        // `original_trace_op_types` (raw recorder positions) and the
+        // input `ops` slice (post-fold transformed positions); the
+        // emit-side high water can sit above the caller-provided
+        // `start_next_pos` whenever the transformed `ops` slice ends
+        // below that mark. Without this bump, a later `get_or_make_const`
+        // / `emit` would hand out an already-seeded position and fire
+        // the Box.type retype invariant.
+        let max_orig = self
+            .original_trace_op_types
+            .iter()
+            .filter(|&(_, v)| *v != majit_ir::Type::Void)
+            .map(|(k, _)| *k)
+            .max()
+            .unwrap_or(0);
+        let max_input = ops
+            .iter()
+            .filter(|op| !op.pos.is_none() && op.result_type() != majit_ir::Type::Void)
+            .map(|op| op.pos.0)
+            .max()
+            .unwrap_or(0);
+        let max_typed_pos = max_orig.max(max_input);
+        let next_after = max_typed_pos.saturating_add(1);
+        ctx.next_pos = ctx.next_pos.max(next_after);
 
         // optimizer.py:293 patchguardop parity: propagate to Phase 2
         // OptContext so copy_and_change guards (unroll.py:409) can get
@@ -2176,11 +2214,26 @@ impl Optimizer {
         // RPython parity: store_final_boxes_in_guard in ctx.emit() handles
         // virtual tagging inline at each guard emit. No post-pass rescan.
 
-        // RPython Box type parity: preserve value_types from this phase
-        // so the next phase can resolve types for carried-over OpRefs.
-        self.prev_phase_value_types.clear();
-        self.prev_phase_value_types
-            .extend(ctx.value_types.iter().map(|(&k, &v)| (k, v)));
+        // RPython Box type parity: each Box carries its type intrinsically
+        // (resoperation.py:1693 `opclasses[opnum].type` for ResOps,
+        // history.py:220 `InputArg{Int,Ref,Float}.type` for inputargs).
+        // Phase 1 emit ops carry their own `op.type_`; Phase 1 inputarg slot
+        // OpRefs are resolved through `OptContext::inputarg_type` (which
+        // falls back to the shared `inputarg_types` Vec for low OpRefs in
+        // `[0, num_inputs)`). The slice carry covers emit ops via `op_at` →
+        // `op.type_`; the `value_types` carry below covers everything that
+        // Box-identity would have kept alive in RPython but flat-OpRef
+        // would otherwise lose at the phase boundary.
+        self.phase1_emit_ops.clear();
+        for op in &ctx.new_operations {
+            if !op.pos.is_none() && op.type_ != majit_ir::Type::Void {
+                self.phase1_emit_ops.push(op.clone());
+            }
+        }
+        // Capture Phase 1 `value_types` entries for Phase 2 setup_optimizations
+        // to seed back into the next ctx.  Mirrors RPython's persistent
+        // `box.type` attribute across the export/import boundary.
+        self.prev_phase_value_types = ctx.value_types.clone();
 
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
@@ -4985,27 +5038,66 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_seeded_value_types_skip_void_entries() {
+    fn test_phase_carry_holds_emit_only() {
+        // Slice 0.6: phase1_emit_ops is rebuilt at end-of-phase from
+        // `ctx.new_operations` filtered by non-NONE pos and non-Void type
+        // (resoperation.py:1693 parity). Phase 1 inputarg slot OpRefs are
+        // resolved from Phase 2 through `OptContext::inputarg_type`
+        // (history.py:220 parity) against the shared `inputarg_types`
+        // Vec, so they are NOT carried here.
         let mut opt = Optimizer::new();
+        opt.trace_inputarg_types = vec![Type::Void, Type::Int, Type::Ref];
         opt.original_trace_op_types.insert(40, Type::Void);
         opt.original_trace_op_types.insert(41, Type::Int);
-        opt.prev_phase_value_types.insert(50, Type::Void);
-        opt.prev_phase_value_types.insert(51, Type::Ref);
+        opt.phase1_emit_ops
+            .push(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(50)]));
 
         let mut constants = std::collections::HashMap::new();
-        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 0, 0, 0);
+        let result = opt.optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0);
 
         assert!(result.is_empty());
-        assert_eq!(opt.prev_phase_value_types.get(&41), Some(&Type::Int));
-        assert_eq!(opt.prev_phase_value_types.get(&51), Some(&Type::Ref));
-        assert!(!opt.prev_phase_value_types.contains_key(&40));
-        assert!(!opt.prev_phase_value_types.contains_key(&50));
-        assert!(
-            !opt.prev_phase_value_types
-                .values()
-                .any(|&tp| tp == Type::Void),
-            "value_types must only carry Box-producing i/r/f entries"
-        );
+        // Empty trace, no emitted ops — carry must be empty. Inputarg
+        // slots are reachable through `inputarg_type`, not via the carry.
+        assert!(opt.phase1_emit_ops.is_empty());
+    }
+
+    #[test]
+    fn test_inputarg_type_resolves_phase1_slots_from_phase2_context() {
+        // Slice 0.6 step 1: from a Phase-2-like context (`inputarg_base > 0`)
+        // `OptContext::inputarg_type` must resolve low OpRefs in
+        // `[0, num_inputs)` as Phase 1 inputarg slot lookups against the
+        // shared `inputarg_types` Vec (history.py:220 parity for
+        // `box.type` reads through `imported_label_args`).
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 3, 100, 103);
+        ctx.inputarg_types = vec![Type::Int, Type::Ref, Type::Float];
+        // Phase 2's own inputargs at [100..103) — own range still resolves.
+        assert_eq!(ctx.inputarg_type(OpRef(100)), Some(Type::Int));
+        assert_eq!(ctx.inputarg_type(OpRef(101)), Some(Type::Ref));
+        assert_eq!(ctx.inputarg_type(OpRef(102)), Some(Type::Float));
+        // Phase 1's inputarg slot OpRefs at [0..3) resolve through the
+        // new low-range fallback (Phase 2 inputarg_base=100 > 0).
+        assert_eq!(ctx.inputarg_type(OpRef(0)), Some(Type::Int));
+        assert_eq!(ctx.inputarg_type(OpRef(1)), Some(Type::Ref));
+        assert_eq!(ctx.inputarg_type(OpRef(2)), Some(Type::Float));
+        // Mid-range Phase 1 emit positions (`[num_inputs..inputarg_base)`)
+        // are NOT inputargs — `inputarg_type` returns None and the
+        // chain falls through to value_types / op.type_.
+        assert_eq!(ctx.inputarg_type(OpRef(50)), None);
+        assert_eq!(ctx.inputarg_type(OpRef(99)), None);
+    }
+
+    #[test]
+    fn test_inputarg_type_phase1_no_fallback() {
+        // In Phase 1 (`inputarg_base == 0`) the low-range fallback must
+        // NOT trigger — only the canonical own-range path applies.
+        let mut ctx = OptContext::with_num_inputs(8, 3);
+        ctx.inputarg_types = vec![Type::Int, Type::Ref, Type::Float];
+        // OpRefs in [0..3) resolve through the own range (inputarg_base=0).
+        assert_eq!(ctx.inputarg_type(OpRef(0)), Some(Type::Int));
+        assert_eq!(ctx.inputarg_type(OpRef(2)), Some(Type::Float));
+        // Out of range — None.
+        assert_eq!(ctx.inputarg_type(OpRef(3)), None);
+        assert_eq!(ctx.inputarg_type(OpRef(50)), None);
     }
 
     #[test]
