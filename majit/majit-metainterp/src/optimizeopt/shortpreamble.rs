@@ -729,10 +729,17 @@ impl ShortBoxes {
         // shortpreamble.py:255-259: register every label arg as a
         // ShortInputArg potential op.
         for (i, &arg) in label_args.iter().enumerate() {
-            let arg_type = label_arg_types
-                .get(i)
-                .copied()
-                .unwrap_or(majit_ir::Type::Int);
+            // shortpreamble.py:256 reads label_args[i].type intrinsically;
+            // pyre's parallel array must match label_args length.
+            let arg_type = label_arg_types.get(i).copied().unwrap_or_else(|| {
+                panic!(
+                    "missing label_arg_types[{}] (label_args.len()={}): \
+                     create_short_boxes needs the parallel type list in \
+                     lockstep with label_args",
+                    i,
+                    label_args.len()
+                )
+            });
             self.add_short_input_arg(arg, arg_type);
         }
 
@@ -1266,15 +1273,24 @@ fn build_short_preamble_struct_from_ops(
     // we snapshot the loop's constant pool entries for any OpRef referenced by
     // short preamble ops that isn't defined by the ops themselves.
     let mut constants: HashMap<u32, (i64, majit_ir::Type)> = HashMap::new();
+    // RPython parity: if a Const exists in loop_constants, its type must
+    // also exist in loop_constant_types — both maps are populated in
+    // lockstep by the optimizer (constant_pool.rs). Missing type entry
+    // for a known constant is a structural bug.
+    let const_type_for = |raw: u32| -> majit_ir::Type {
+        loop_constant_types.get(&raw).copied().unwrap_or_else(|| {
+            panic!(
+                "loop_constant_types missing entry for raw={} though loop_constants has it: \
+                 the two maps must be populated in lockstep",
+                raw
+            )
+        })
+    };
     for op in ops {
         for &arg in &op.args {
             if !defined_by_ops.contains(&arg.0) {
                 if let Some(&val) = loop_constants.get(&arg.0) {
-                    let tp = loop_constant_types
-                        .get(&arg.0)
-                        .copied()
-                        .unwrap_or(majit_ir::Type::Int);
-                    constants.insert(arg.0, (val, tp));
+                    constants.insert(arg.0, (val, const_type_for(arg.0)));
                 }
             }
         }
@@ -1282,11 +1298,7 @@ fn build_short_preamble_struct_from_ops(
             for &arg in fa {
                 if !defined_by_ops.contains(&arg.0) {
                     if let Some(&val) = loop_constants.get(&arg.0) {
-                        let tp = loop_constant_types
-                            .get(&arg.0)
-                            .copied()
-                            .unwrap_or(majit_ir::Type::Int);
-                        constants.insert(arg.0, (val, tp));
+                        constants.insert(arg.0, (val, const_type_for(arg.0)));
                     }
                 }
             }
@@ -1296,11 +1308,7 @@ fn build_short_preamble_struct_from_ops(
     for &arg in jump_args {
         if !defined_by_ops.contains(&arg.0) {
             if let Some(&val) = loop_constants.get(&arg.0) {
-                let tp = loop_constant_types
-                    .get(&arg.0)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Int);
-                constants.insert(arg.0, (val, tp));
+                constants.insert(arg.0, (val, const_type_for(arg.0)));
             }
         }
     }

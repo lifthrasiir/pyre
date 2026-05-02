@@ -688,7 +688,9 @@ impl ResumeValueLayoutSummary {
             ResumeValueKind::FailArg => ResumeValueSource::FailArg(self.raw_fail_arg_position()),
             ResumeValueKind::Constant => {
                 let raw = self.constant.expect("missing constant value");
-                let tp = self.constant_type.unwrap_or(Type::Int);
+                // Constant kind requires both raw and type to be set; the
+                // .expect() above already enforces raw, mirror it for type.
+                let tp = self.constant_type.expect("missing constant type");
                 ResumeValueSource::Constant(majit_ir::Const::from_raw_i64(raw, tp))
             }
             ResumeValueKind::Virtual => {

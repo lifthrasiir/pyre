@@ -7737,11 +7737,16 @@ impl<M: Clone> MetaInterp<M> {
                     .iter()
                     .enumerate()
                     .map(|(i, &opref)| {
-                        let tp = es
-                            .renamed_inputarg_types
-                            .get(i)
-                            .copied()
-                            .unwrap_or(Type::Int);
+                        // RPython retrace passes the original typed Box list
+                        // directly; pyre's renamed_inputarg_types side table
+                        // must be parallel to renamed_inputargs.
+                        let tp = es.renamed_inputarg_types.get(i).copied().unwrap_or_else(|| {
+                            panic!(
+                                "missing renamed_inputarg_types[{}] (renamed_inputargs.len()={}): \
+                                 export_state populates the parallel type list in lockstep",
+                                i, es.renamed_inputargs.len()
+                            )
+                        });
                         InputArg::from_type(tp, opref.0)
                     })
                     .collect();

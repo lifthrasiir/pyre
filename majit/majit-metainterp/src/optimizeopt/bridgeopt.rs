@@ -1061,7 +1061,17 @@ pub fn deserialize_optimizer_knowledge(
     let mut bitfield: i32 = 0;
     let mut mask: i32 = 0;
     for (i, &livebox) in liveboxes.iter().enumerate() {
-        let tp = livebox_types.get(i).copied().unwrap_or(majit_ir::Type::Int);
+        // bridgeopt.py:135 reads `box.type` (intrinsic on the Box).
+        // pyre's parallel side table must cover `liveboxes`.
+        let tp = livebox_types.get(i).copied().unwrap_or_else(|| {
+            panic!(
+                "missing livebox_types[{}] (liveboxes.len()={}): \
+                 RPython bridgeopt.py:135 reads box.type intrinsically; \
+                 pyre's parallel array must match liveboxes length",
+                i,
+                liveboxes.len()
+            )
+        });
         if tp != majit_ir::Type::Ref {
             continue;
         }

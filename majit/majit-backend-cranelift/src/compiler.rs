@@ -3786,36 +3786,32 @@ fn resolve_opref(
     if let Some(&c) = constants.get(&opref.0) {
         return builder.ins().iconst(cl_types::I64, c);
     }
-    // Safety net: verify this OpRef has a defined Cranelift variable
-    // (either an op result or a declared input arg) before calling
-    // use_var. RPython's regalloc tracks all Boxes; Cranelift only
-    // has def_var for emitted ops and input args.
-    //
-    // Pyre's optimizer occasionally leaves an unmaterialized OpRef in
-    // a non-dereferencing op's arg or in fail_args; for those cases
-    // we fall back to `iconst(0)` (the pre-existing legacy behaviour
-    // — wrong but non-crashing). The crash-causing path —
-    // `GuardClass(undefined)` and friends, which would lower to
-    // `mov x0, #0; ldr x0, [x0]` and SIGSEGV — is rejected at the
-    // entry to `do_compile` by `validate_oprefs_for_compile`, which
-    // returns `BackendError::CompilationFailed` so the bridge falls
-    // back to the blackhole resume path. The two checks together
-    // recover the RPython invariant ("any Box used as a guard arg
-    // is bound") without breaking traces that pyre's optimizer
-    // currently emits with undefined non-dereferencing OpRefs.
+    // RPython parity guard: every Box reaching codegen MUST be bound —
+    // an inputarg, a label arg, a constant, or a previous op result
+    // (regalloc.py invariant). Pyre's `validate_oprefs_for_compile`
+    // (compiler.rs:4013) already rejects undefined OpRefs that flow
+    // into a dereferencing first arg with `BackendError::CompilationFailed`
+    // (the equivalent of RPython's `InvalidLoop` abort, routing the
+    // bridge to the blackhole resume path). Anything that reaches this
+    // point without a `def_var` is a binding-invariant violation —
+    // panic so the parity hole surfaces at the optimizer site that
+    // emitted the unbound OpRef instead of being papered over with
+    // `iconst(0)`.
     let is_declared = DECLARED_VARS_DEBUG.with(|cell| {
         cell.borrow()
             .as_ref()
             .is_some_and(|dv| dv.contains(&opref.0))
     });
     if !is_declared {
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[cranelift] WARN: OpRef({}) has no def_var, using zero fallback",
-                opref.0
-            );
-        }
-        return builder.ins().iconst(cl_types::I64, 0);
+        panic!(
+            "cranelift resolve_opref: OpRef({}) (raw={}) has no def_var \
+             and is not in constants — RPython parity violation: every \
+             Box reaching codegen must be bound. The optimizer site that \
+             emitted this unbound OpRef must be fixed (or InvalidLoop'd in \
+             validate_oprefs_for_compile) instead of falling back to a \
+             zero load",
+            opref.0, opref.0
+        );
     }
     builder.use_var(var(opref.0))
 }
