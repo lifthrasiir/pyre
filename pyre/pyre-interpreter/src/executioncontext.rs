@@ -681,12 +681,29 @@ impl ExecutionContext {
     ///                     operationerr.get_w_value(self.space), operationerr)
     /// ```
     ///
-    /// Pyre's `operationerr` is the wrapped exception value directly
-    /// (no `OperationError.get_w_value` indirection at this layer), so
-    /// the same `PyObjectRef` plays both `w_value` and `operr` roles.
-    pub fn exception_trace(&mut self, frame: *mut PyFrame, operationerr: PyObjectRef) {
+    /// PyPy unpacks the `OperationError` inside `_trace` via
+    /// `operr.w_type` / `operr.normalize_exception(space)` /
+    /// `operr.get_w_traceback(space)` (executioncontext.py:359-363) to
+    /// build the `(w_type, w_value, w_traceback)` tuple passed to the
+    /// trace callback.  Pyre carries the equivalent fields explicitly
+    /// because there is no `OperationError` plumbed through the trace
+    /// surface yet — callers supply the raised type, the wrapped value,
+    /// and the traceback (the latter two may be `w_none()` while pyre
+    /// lacks traceback objects at this layer).
+    pub fn exception_trace(
+        &mut self,
+        frame: *mut PyFrame,
+        w_type: PyObjectRef,
+        w_value: PyObjectRef,
+        w_traceback: PyObjectRef,
+    ) {
         if !self.gettrace().is_null() {
-            self._trace(frame, "exception", operationerr, Some(operationerr));
+            self._trace(
+                frame,
+                "exception",
+                w_value,
+                Some((w_type, w_value, w_traceback)),
+            );
         }
     }
 
@@ -750,8 +767,10 @@ impl ExecutionContext {
         if func.is_some() {
             // executioncontext.py:317-318 `if w_arg is None: raise
             // ValueError("Cannot call setllprofile with real None")`.
-            // Pyre maps both null and `w_none()` to upstream's None.
-            if w_arg.is_null() || w_arg == pyre_object::w_none() {
+            // The check is against RPython-level None (== null in pyre);
+            // Python-level `w_none()` (`space.w_None`) is a valid user
+            // argument that flows through unchanged.
+            if w_arg.is_null() {
                 return Err(crate::PyError::value_error(
                     "Cannot call setllprofile with real None",
                 ));
@@ -792,19 +811,22 @@ impl ExecutionContext {
     /// `profilefunc` low-level trampoline (`app_profile_call` for
     /// `setprofile`-installed callbacks).
     ///
-    /// `operr` is the upstream `OperationError` carried by
-    /// `'exception'` events; pyre does not yet plumb the rich
-    /// exception value at this layer, so the
-    /// `executioncontext.py:359-363` `normalize_exception` /
-    /// `space.newtuple` path is left as a TODO and `w_arg` is
-    /// forwarded as-is.  The structural early returns, event
-    /// filtering, and `is_tracing` bookkeeping mirror upstream.
+    /// `operr` carries the `(w_type, w_value, w_traceback)` triple
+    /// `executioncontext.py:359-363` reads from the upstream
+    /// `OperationError` via `operr.w_type`,
+    /// `operr.normalize_exception(space)`, and
+    /// `operr.get_w_traceback(space)`.  Pyre passes the three fields
+    /// explicitly because no `OperationError` flows through the trace
+    /// surface yet; `w_traceback` is typically `w_none()` until pyre
+    /// gains traceback objects at this layer.  The structural early
+    /// returns, event filtering, and `is_tracing` bookkeeping mirror
+    /// upstream.
     pub fn _trace(
         &mut self,
         frame: *mut PyFrame,
         event: &str,
         w_arg: PyObjectRef,
-        operr: Option<PyObjectRef>,
+        operr: Option<(PyObjectRef, PyObjectRef, PyObjectRef)>,
     ) {
         // executioncontext.py:347 if self.is_tracing or frame.hide():
         if self.is_tracing != 0 {
@@ -829,18 +851,24 @@ impl ExecutionContext {
         if !w_callback.is_null() && event != "leaveframe" {
             // executioncontext.py:359-363 normalize_exception + rebuild
             // `w_arg` as `(w_type, w_value, w_traceback)` when an
-            // `operr` accompanies the trace event.  Pyre's `operr` is
-            // a single `PyObjectRef` carrying the exception value
-            // (RPython splits this into `OperationError.get_w_value`,
-            // `.w_type`, `.get_w_traceback`); the type comes from
-            // `typedef::r#type(value)` and the traceback slot is
-            // `w_none()` until pyre gains traceback objects at this
-            // layer (one of the few `OperationError` surfaces still
-            // reduced to a placeholder; see comment above
-            // `exception_trace` for the upstream call shape).
-            let w_arg = if let Some(operr) = operr {
-                let w_type = crate::typedef::r#type(operr).unwrap_or_else(pyre_object::w_none);
-                pyre_object::tupleobject::w_tuple_new(vec![w_type, operr, pyre_object::w_none()])
+            // `operr` triple accompanies the trace event.  Caller
+            // (`exception_trace`) already supplies the explicit raised
+            // type; only fall back to `typedef::r#type(w_value)` when
+            // it was passed as null, mirroring the cases where pyre
+            // cannot yet preserve `operr.w_type` distinct from the
+            // value's runtime type.
+            let w_arg = if let Some((w_type, w_value, w_traceback)) = operr {
+                let w_type = if w_type.is_null() {
+                    crate::typedef::r#type(w_value).unwrap_or_else(pyre_object::w_none)
+                } else {
+                    w_type
+                };
+                let w_traceback = if w_traceback.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_traceback
+                };
+                pyre_object::tupleobject::w_tuple_new(vec![w_type, w_value, w_traceback])
             } else {
                 w_arg
             };

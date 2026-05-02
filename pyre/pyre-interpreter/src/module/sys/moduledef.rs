@@ -59,9 +59,14 @@ fn sys_gettrace_impl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_settrace_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    // pypy/module/sys/vm.py:217 `def settrace(space, w_func)` — w_func is
+    // a required positional. Calling `sys.settrace()` with no args raises
+    // TypeError at the gateway layer in PyPy; reproduce that here.
+    let w_func = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("settrace() missing 1 required positional argument: 'function'")
+    })?;
     let ec = current_execution_context();
     if !ec.is_null() {
-        let w_func = args.first().copied().unwrap_or_else(w_none);
         unsafe { (*ec).settrace(w_func) };
     }
     Ok(w_none())
@@ -81,9 +86,16 @@ fn sys_getprofile_impl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
+    // pypy/module/sys/vm.py:227 `def setprofile(space, w_func)` — w_func
+    // is a required positional. Calling `sys.setprofile()` with no args
+    // raises TypeError at the gateway layer in PyPy.
+    let w_func = *args.first().ok_or_else(|| {
+        crate::PyError::type_error(
+            "setprofile() missing 1 required positional argument: 'function'",
+        )
+    })?;
     let ec = current_execution_context();
     if !ec.is_null() {
-        let w_func = args.first().copied().unwrap_or_else(w_none);
         // executioncontext.py:317-318 ValueError("Cannot call setllprofile
         // with real None") propagates via setprofile -> setllprofile.
         unsafe { (*ec).setprofile(w_func)? };
