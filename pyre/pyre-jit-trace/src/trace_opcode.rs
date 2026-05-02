@@ -2273,6 +2273,37 @@ impl MIFrame {
         self.close_loop_args_at(ctx, None)
     }
 
+    /// Pure-read shape predictor for `close_loop_args_at` output.
+    ///
+    /// Returns the LENGTH that `close_loop_args_at` would produce at
+    /// the current sym/ctx state, without mutating either.  Used by
+    /// the merge-point seed sites (`trace.rs::trace_bytecode`,
+    /// `TraceCtx::new`, `TraceCtx::with_green_key`) that need to
+    /// allocate `original_boxes` of the same shape future
+    /// `close_loop_args` calls will produce, so
+    /// `pyjitpl.py:2996 assert len(original_boxes) == len(live_arg_boxes)`
+    /// can fire (see memory
+    /// `merge_point_shape_assert_prerequisite_2026_05_03.md`).
+    ///
+    /// Shape derivation matches `close_loop_args_at`:
+    /// `1 (frame) + extra_reds (ec) + 6 (vable scalars) + target_array_capacity`
+    /// where the vable scalars are
+    /// `[next_instr, code, stack_depth, debugdata, lastblock, namespace]`
+    /// and `target_array_capacity` is either the virtualizable array
+    /// lengths sum (when known) or the fallback `nlocals + stack_only`.
+    pub(crate) fn live_args_shape_at(&self, ctx: &TraceCtx) -> usize {
+        let extra_reds = crate::virtualizable_gen::NUM_EXTRA_REDS;
+        let nlocals = self.sym().nlocals;
+        let stack_only = self.sym().valuestackdepth.saturating_sub(nlocals);
+        let target_array_capacity = ctx
+            .virtualizable_array_lengths()
+            .map(|lengths| lengths.iter().copied().sum::<usize>())
+            .filter(|&len| len >= nlocals)
+            .unwrap_or(nlocals + stack_only);
+        // 1 (frame) + extra_reds + 6 (vable_scalars) + target_array_capacity
+        7 + extra_reds + target_array_capacity
+    }
+
     /// PRE-EXISTING-ADAPTATION: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
     /// construction (`greenboxes + redboxes + virtualizable_boxes`,
     /// `pop()` the trailing token) with the `vable_last_instr` pin
@@ -2742,6 +2773,14 @@ impl MIFrame {
             "missing virtual_ref_finish()? close_loop_args_at reached with \
              virtualref_boxes={:?}",
             self.sym().virtualref_boxes.len()
+        );
+        // Verify `live_args_shape_at` formula matches actual output.
+        // If this fires, the helper's shape derivation is stale relative
+        // to `close_loop_args_at`'s args layout — update both in lockstep.
+        debug_assert_eq!(
+            args.len(),
+            self.live_args_shape_at(ctx),
+            "live_args_shape_at must predict close_loop_args_at output length",
         );
         args
     }
