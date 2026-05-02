@@ -340,23 +340,16 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
 }
 
 /// Merge the pre-jtransform rtyper state with the rewritten graph's
-/// concrete result kinds.
+/// concrete result kinds (legacy entry point).
 ///
-/// RPython has no merge step: every `Variable` carries
-/// `.concretetype` inline, and jtransform-created operations preserve or
-/// assign that type on the result variable. Pyre's legacy graph uses a
-/// `ValueId -> ConcreteType` table, so the codewriter has two partial
-/// sources after jtransform:
-///
-/// * `original_types`: first-pass backward inferences that can disappear
-///   after jtransform removes the consumer op that caused the inference.
-/// * `resolve_types(rewritten_graph, ...)`: explicit post-jtransform
-///   result kinds such as `CallResidual.result_kind`.
-///
-/// Keep the first-pass table for operands, but never let it override a
-/// result kind that the rewritten operation itself declares. That mirrors
-/// RPython's single authoritative `op.result.concretetype` instead of
-/// treating the stale pre-rewrite side table as stronger.
+/// Slice 3 relocated the merge logic itself to
+/// [`crate::jit_codewriter::type_state::merge_synth_kinds`] —
+/// `merge_synth_kinds` is the pyre-divergence piece that survives the
+/// rtyper cutover. This function remains as the legacy-pipeline entry
+/// point because it bundles two legacy-only graph walks
+/// (`resolve_types` + `authoritative_result_types`) with the merge.
+/// Real-path callers (Slice 4 onwards) call `merge_synth_kinds`
+/// directly with their own `post_resolve` / `post_result` inputs.
 pub fn resolve_rewritten_types(
     original_types: &TypeResolutionState,
     rewritten_graph: &FunctionGraph,
@@ -364,21 +357,13 @@ pub fn resolve_rewritten_types(
     stamped_kinds: &HashMap<ValueId, ConcreteType>,
 ) -> TypeResolutionState {
     let post_result_types = authoritative_result_types(rewritten_graph);
-    let mut merged = resolve_types(rewritten_graph, annotations);
-
-    for (&value, kind) in &original_types.concrete_types {
-        if *kind != ConcreteType::Unknown && !post_result_types.contains_key(&value) {
-            merged.concrete_types.insert(value, kind.clone());
-        }
-    }
-    for (value, kind) in post_result_types {
-        merged.concrete_types.insert(value, kind);
-    }
-    for (&value, kind) in stamped_kinds {
-        merged.concrete_types.insert(value, kind.clone());
-    }
-
-    merged
+    let post_resolve = resolve_types(rewritten_graph, annotations);
+    crate::jit_codewriter::type_state::merge_synth_kinds(
+        original_types,
+        post_resolve,
+        post_result_types,
+        stamped_kinds,
+    )
 }
 
 fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {

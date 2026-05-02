@@ -1133,16 +1133,20 @@ fn build_function_graph(
     // orderly termination: after `return x` there's nothing more to
     // walk but the graph is well-formed, so we break without
     // propagating.
-    for stmt in &func.block.stmts {
-        match lower_stmt(&mut graph, &mut entry, stmt, options, &mut ctx)? {
-            false => continue,
-            true => break,
-        }
-    }
+    let lowered = lower_stmt_list_with_tail_value(
+        &mut graph,
+        &mut entry,
+        &func.block.stmts,
+        options,
+        &mut ctx,
+    )?;
 
-    // Default terminator if none was set
-    if graph.block(entry).is_open() {
-        graph.set_return(entry, None);
+    // Default terminator if none was set. RPython `RETURN_VALUE`
+    // carries the evaluated tail expression into `graph.returnblock`;
+    // only statement-only / empty bodies synthesize the void return
+    // value.
+    if !lowered.path_closed && graph.block(entry).is_open() {
+        graph.set_return(entry, lowered.value);
     }
 
     // RPython: op.result.concretetype — module-qualified for exact type identity.
