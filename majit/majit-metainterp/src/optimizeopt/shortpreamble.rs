@@ -2105,19 +2105,33 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     }
 }
 
-pub fn build_short_preamble_from_exported_boxes(
+/// `unroll.py:497 ExportedState.short_boxes` shape: per-OpRef
+/// `ProducedShortOp` records derived from `ctx.exported_short_boxes`,
+/// with label-arg references in each preamble op renamed to the
+/// matching short-inputarg slot
+/// (`shortpreamble.py:269-270 ShortBoxes.create_short_boxes`).
+///
+/// OVF guards are filtered out: the guard entry depends on the
+/// preceding `Int*Ovf` op and is re-emitted by the builder through
+/// `append_to_short`'s `is_ovf` branch, so the standalone guard must
+/// not appear in the produced map.
+///
+/// Phase B prep: extracted from
+/// `build_short_preamble_from_exported_boxes` so that future B1 wiring
+/// can store the same shape on `ExportedState.produced_short_boxes`
+/// (audit memo `box_identity_phase_b_surface_audit_2026_05_02.md`
+/// option (b)) without duplicating the rename logic.
+pub fn produced_short_boxes_from_exported_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
-    loop_constants: &HashMap<u32, i64>,
-    loop_constant_types: &HashMap<u32, majit_ir::Type>,
-) -> ShortPreamble {
+) -> Vec<(OpRef, ProducedShortOp)> {
     let inputarg_map: HashMap<OpRef, OpRef> = label_args
         .iter()
         .copied()
         .zip(short_inputargs.iter().copied())
         .collect();
-    let produced: Vec<(OpRef, ProducedShortOp)> = exported_short_boxes
+    exported_short_boxes
         .iter()
         .filter(|entry| !entry.op.opcode.is_guard_overflow())
         .map(|entry| {
@@ -2144,8 +2158,25 @@ pub fn build_short_preamble_from_exported_boxes(
                 },
             )
         })
-        .collect();
-    let mut builder = ShortPreambleBuilder::new(label_args, &produced, short_inputargs);
+        .collect()
+}
+
+/// `unroll.py:497-504` build path: drive `ShortPreambleBuilder` from
+/// pre-derived `produced_short_boxes` (RPython `ExportedState.short_boxes`).
+///
+/// Phase B B1 first slice: separated from
+/// `build_short_preamble_from_exported_boxes` so callers that already
+/// hold the `Vec<(OpRef, ProducedShortOp)>` (e.g. `ExportedState.produced_short_boxes`
+/// at `unroll.rs:2349`) can invoke the builder directly without
+/// re-running the rename + filter pass.
+pub fn build_short_preamble_from_produced_boxes(
+    label_args: &[OpRef],
+    short_inputargs: &[OpRef],
+    produced: &[(OpRef, ProducedShortOp)],
+    loop_constants: &HashMap<u32, i64>,
+    loop_constant_types: &HashMap<u32, majit_ir::Type>,
+) -> ShortPreamble {
+    let mut builder = ShortPreambleBuilder::new(label_args, produced, short_inputargs);
     // RPython parity: populate known_constants so produce_arg can resolve
     // constant OpRefs (10000+ range) in short op args. Without this,
     // add_op_to_short fails for ops like GetfieldGcPure(constant_ptr)
@@ -2153,11 +2184,29 @@ pub fn build_short_preamble_from_exported_boxes(
     for &idx in loop_constants.keys() {
         builder.note_known_constant(OpRef(idx));
     }
-    for (result, _) in &produced {
+    for (result, _) in produced {
         let _ = builder.add_op_to_short(*result);
         let _ = builder.add_preamble_op(*result);
     }
     builder.build_short_preamble_struct(loop_constants, loop_constant_types)
+}
+
+pub fn build_short_preamble_from_exported_boxes(
+    label_args: &[OpRef],
+    short_inputargs: &[OpRef],
+    exported_short_boxes: &[PreambleOp],
+    loop_constants: &HashMap<u32, i64>,
+    loop_constant_types: &HashMap<u32, majit_ir::Type>,
+) -> ShortPreamble {
+    let produced =
+        produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
+    build_short_preamble_from_produced_boxes(
+        label_args,
+        short_inputargs,
+        &produced,
+        loop_constants,
+        loop_constant_types,
+    )
 }
 
 #[cfg(test)]

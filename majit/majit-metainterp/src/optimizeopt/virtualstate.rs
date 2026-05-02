@@ -844,9 +844,28 @@ impl VirtualState {
         rc: &Rc<VirtualStateInfoNode>,
         visited: &mut std::collections::HashMap<usize, OpRef>,
     ) -> usize {
+        // RPython virtualstate.py:111 first-visit guard via
+        // `position == -1` — every visited node is recorded so a later
+        // visit returns 0 without re-counting. Pyre's parallel:
+        //
+        // - If the entry is already present (real OpRef from
+        //   `import_virtual_state_from_label_args_recurse` at
+        //   optimizer.rs:795, or `NONE` from a prior counting visit),
+        //   return 0. unroll.py:53 `setinfo_from_preamble` parity:
+        //   preserve the existing real OpRef rather than overwriting.
+        // - Otherwise insert `NONE` to mark this node visited, then
+        //   recurse. Without this insert, repeated top-level visits
+        //   to leaf variants (Unknown/NonNull/IntBounded/KnownClass)
+        //   would each return 1 because they don't recurse through
+        //   `_rc` and therefore never insert themselves; the dedup
+        //   would silently fail and `numnotvirtuals` would over-count.
+        use std::collections::hash_map::Entry;
         let key = Rc::as_ptr(rc) as usize;
-        if visited.insert(key, OpRef::NONE).is_some() {
-            return 0;
+        match visited.entry(key) {
+            Entry::Occupied(_) => return 0,
+            Entry::Vacant(e) => {
+                e.insert(OpRef::NONE);
+            }
         }
         Self::count_forced_boxes_for_entry(rc, visited)
     }

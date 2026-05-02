@@ -762,7 +762,7 @@ impl UnrollOptimizer {
             exported_vs,
             exported_end_args,
             exported_short_inputargs,
-            exported_short_boxes,
+            exported_short_boxes_for_builder,
             exported_renamed_inputargs,
         ) = {
             let es = opt_p2
@@ -861,10 +861,21 @@ impl UnrollOptimizer {
                 )
             };
         let mut initial_sp = rebuilt_imported_short_preamble.unwrap_or_else(|| {
-            crate::optimizeopt::shortpreamble::build_short_preamble_from_exported_boxes(
+            // Phase B B1: derive `produced_short_boxes` from the
+            // canonical `exported_short_boxes` snapshot, then drive the
+            // builder. RPython `unroll.py:497-504 short_boxes` parity.
+            // Lazy derivation eliminates the stale-copy risk that came
+            // with caching the per-OpRef view on `ExportedState`.
+            let produced =
+                crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
+                    &exported_end_args,
+                    &exported_short_inputargs,
+                    &exported_short_boxes_for_builder,
+                );
+            crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
-                &exported_short_boxes,
+                &produced,
                 &consts_p1,
                 &self.constant_types,
             )
@@ -2293,24 +2304,29 @@ impl OptUnroll {
         // OpRefs from the renamed inputargs (and can have different types
         // when forcing virtuals replaces an InputArg slot with a fresh
         // NewWithVtable / SameAs alias).
+        // RPython unroll.py:452 `export_state()` reads each `info.inputargs`
+        // Box's `.type` (history.py:220 InputArg{Int,Ref,Float}) directly —
+        // the inputarg Box's intrinsic type, not the post-forwarding
+        // target's. Pyre's `renamed_inputargs` are the canonical inputarg
+        // slot OpRefs; reading `inputarg_type` *before* `opref_type`
+        // forwarding mirrors RPython's Box-identity lookup. If the slot
+        // was forwarded onto something that itself lacks a recorded type
+        // (e.g. a virtual-head SameAs alias whose `value_types` entry
+        // was Void-filtered upstream), the fall-through `opref_type` path
+        // still resolves it, and finally the strict panic surfaces the
+        // genuine missing-Box.type case RPython would never reach.
         let renamed_inputarg_types: Vec<Type> = renamed_inputargs
             .iter()
             .map(|&opref| {
-                ctx.opref_type(opref).unwrap_or_else(|| {
-                    // unroll.py ExportedState has no parity for this missing-type
-                    // case because RPython Boxes always carry `.type`. In pyre
-                    // a renamed inputarg OpRef may not have a value_types entry
-                    // when the corresponding inputarg slot was never referenced
-                    // by any emitted op — return Ref as a conservative default
-                    // (matches the pre-fix `end_arg_types` fallback shape).
-                    if crate::optimizeopt::majit_log_enabled() {
-                        eprintln!(
-                            "[jit][renamed_inputarg_types] missing type for {:?}; falling back to Ref",
+                ctx.inputarg_type(opref)
+                    .or_else(|| ctx.opref_type(opref))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing type for renamed inputarg {:?} in export_state \
+                             (history.py:220 Box.type invariant)",
                             opref
-                        );
-                    }
-                    Type::Ref
-                })
+                        )
+                    })
             })
             .collect();
         // RPython parity: store next_iteration_args in their post-forwarding
@@ -2331,6 +2347,12 @@ impl OptUnroll {
             .iter()
             .map(|&a| ctx.get_box_replacement(a))
             .collect();
+        // Phase B B1: `produced_short_boxes` is derived from
+        // `exported_short_boxes` lazily at the consumer site
+        // (`build_short_preamble_from_produced_boxes` in `import_state`)
+        // via `produced_short_boxes_from_exported_boxes`
+        // (`shortpreamble.rs:2100`). Storing both shapes on
+        // `ExportedState` would risk drift across mutations.
         let mut state = ExportedState::new(
             label_args.clone(),
             resolved_next_iteration_args,

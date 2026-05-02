@@ -276,9 +276,19 @@ fn snapshot_map_from_trace_snapshots(
             crate::recorder::SnapshotTagged::Box(n, tp) => {
                 SnapshotBox::typed(majit_ir::OpRef(*n), *tp)
             }
-            crate::recorder::SnapshotTagged::Virtual(n) => {
-                SnapshotBox::typed(majit_ir::OpRef(*n), majit_ir::Type::Ref)
-            }
+            // recorder.rs:73 `SnapshotTagged::Virtual(n)` carries a virtual
+            // object index, NOT a Box position. Wrapping it as
+            // `SnapshotBox::typed(OpRef(n), Ref)` would still leak the
+            // virtual id wherever downstream treats `SnapshotBox.opref` as
+            // a Box position (e.g. `translate_trace_iter_opref` cache
+            // lookup). No recorder site currently constructs `Virtual`; if
+            // one is added, the encoder must route TAGVIRTUAL through
+            // resume.py:_number_boxes / opencoder.py:603.
+            crate::recorder::SnapshotTagged::Virtual(n) => panic!(
+                "snapshot_map_from_trace_snapshots: SnapshotTagged::Virtual({n}) \
+                 cannot be flattened as a Box-position OpRef; \
+                 add a TAGVIRTUAL handling path (resume.py:_number_boxes parity)"
+            ),
             crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
                 // Register in pool so is_const → true, get_const → (0, Ref),
@@ -330,7 +340,6 @@ fn snapshot_map_from_trace_snapshots(
     (box_map, size_map, vable_map, pc_map)
 }
 
-#[allow(dead_code)]
 struct PreparedBridgeTrace {
     ops: Vec<Op>,
     inputargs: Vec<InputArg>,
@@ -341,19 +350,28 @@ struct PreparedBridgeTrace {
     pending_bridge_rd: Option<PendingBridgeRd>,
 }
 
-#[allow(dead_code)]
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
+    // opencoder.py:286-289 `_get(self, i)` parity — `assert _cache[i] is
+    // not None`. The bridge fresh-iterator
+    // (`prepare_bridge_trace_for_optimizer`) writes `_cache[old_pos] =
+    // new_opref` for every inputarg + emitted op position in the bridge
+    // trace. Snapshot/vable feeds that flow through here MUST reference
+    // OpRefs the recorder produced for this bridge.
     cache
         .get(opref.0 as usize)
         .copied()
         .flatten()
-        .unwrap_or(opref)
+        .unwrap_or_else(|| {
+            panic!(
+                "translate_trace_iter_opref cache miss for {opref:?} (cache_len={})",
+                cache.len(),
+            )
+        })
 }
 
-#[allow(dead_code)]
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
     cache: &[Option<OpRef>],
@@ -366,26 +384,20 @@ fn translate_trace_iter_box_map(
     box_map
 }
 
-/// PRE-EXISTING-ADAPTATION (parked, test-only).
+/// `unroll.py:187 trace = trace.get_iter()` parity.
 ///
-/// unroll.py:183 `trace = trace.get_iter()` mints fresh InputArg /
-/// ResOperation objects before `optimize_bridge()` consumes the trace,
-/// and opencoder.py:249 makes a per-iterator box namespace. This Rust
-/// wrapper is the structural analog: `TraceIterator` walks the bridge
-/// ops with `start_fresh = bridge_inputarg_base`, producing a renamed
-/// op vector whose OpRefs do not collide with the parent loop's.
+/// RPython mints fresh `InputArg` / `ResOperation` objects before
+/// `optimize_bridge()` consumes the trace; `opencoder.py:249-273
+/// TraceIterator.__init__` allocates a fresh inputarg per
+/// `self.trace.inputargs`, so bridge boxes carry distinct Python `is`
+/// identity from the parent loop's boxes automatically.
 ///
-/// Production is currently NOT wired: `compile_bridge`
-/// (`pyjitpl/mod.rs:7058 optimize_bridge`) keeps the raw
-/// `bridge_inputargs` numbering and passes `bridge_inputarg_base`
-/// through the optimizer interface where it is dropped (see
-/// `optimizer.rs:2808 #[allow(unused_variables)] bridge_inputarg_base`
-/// for the documented blocker — a partial activation SIGSEGV'd
-/// fib_recursive). The unblocking change set is shared with the
-/// descriptor=Some flip (state.rs:4058) and Task #21 vable
-/// heap-writeback; once those land, every site receiving
-/// `bridge_inputarg_base` (here + optimizer.rs) flips together.
-#[allow(dead_code)]
+/// Pyre's flat `OpRef(u32)` lacks identity, so this helper performs
+/// the same rename explicitly: `TraceIterator::new(.., start_fresh =
+/// bridge_inputarg_base)` walks the recorded bridge ops, allocates
+/// fresh OpRefs in `[bridge_inputarg_base..)`, and rewrites every
+/// reference (op args, fail_args, snapshot boxes, vable boxes,
+/// `pending_bridge_rd.liveboxes`) through the iterator's `_cache`.
 fn prepare_bridge_trace_for_optimizer(
     bridge_ops: &[Op],
     bridge_inputargs: &[InputArg],
@@ -523,6 +535,56 @@ pub(crate) struct CompiledEntry<M> {
     /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
     /// in `compile_bridge` below).
     pub(crate) next_global_opref: u32,
+}
+
+/// Compute the smallest fresh OpRef strictly above every position
+/// referenced by `inputargs` and `ops` (op positions, op args, and
+/// guard fail_args).
+///
+/// Box Identity Phase E.2b parity: every loop / bridge / entry-bridge
+/// stored in `compiled_loops` records its high-water mark so the next
+/// bridge's `bridge_inputarg_base` derives a disjoint
+/// `[bridge_inputarg_base..)` namespace. Without this the second
+/// bridge of the same loop, or a bridge-from-bridge chain, would
+/// re-use OpRef slots already owned by an earlier trace and lose the
+/// "fresh `InputArg` per `trace.get_iter()`" identity guarantee
+/// RPython gets for free (`opencoder.py:249-273`).
+///
+/// Args/fail_args are scanned in addition to op.pos because a port-side
+/// undefined-OpRef fallback path historically tolerated dangling refs.
+/// Scanning them mirrors RPython's Box-identity model where every
+/// referenced Box keeps the parent trace alive: any OpRef the trace
+/// touches must be reflected in the high-water mark.
+fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u32 {
+    fn opref_high_water(r: OpRef) -> u32 {
+        if r.is_none() || r.is_constant() {
+            0
+        } else {
+            r.0.saturating_add(1)
+        }
+    }
+    let from_inputargs = inputargs
+        .iter()
+        .map(|ia| ia.index.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    let from_ops = ops
+        .iter()
+        .map(|op| {
+            let mut hw = opref_high_water(op.pos);
+            for a in &op.args {
+                hw = hw.max(opref_high_water(*a));
+            }
+            if let Some(fa) = &op.fail_args {
+                for a in fa {
+                    hw = hw.max(opref_high_water(*a));
+                }
+            }
+            hw
+        })
+        .max()
+        .unwrap_or(0);
+    from_inputargs.max(from_ops)
 }
 
 /// compile.py compile_trace return parity.
@@ -4046,6 +4108,9 @@ impl<M: Clone> MetaInterp<M> {
                     &mut final_retraced_count,
                     self.warm_state.max_retrace_guards(),
                 );
+                let mut next_global_opref = unroll_opt
+                    .next_global_opref
+                    .max(compute_next_global_opref(&inputargs, &compiled_ops));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -4071,6 +4136,10 @@ impl<M: Clone> MetaInterp<M> {
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
                     self.backend.migrate_bridges(&old_entry.token, &token);
+                    // Box Identity Phase E.2b parity: preserve old entry's
+                    // high-water so previously stored bridges' OpRefs stay
+                    // disjoint from any future bridge.
+                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                     // RPython parity: ResumeGuardDescr lives on the guard
@@ -4101,7 +4170,7 @@ impl<M: Clone> MetaInterp<M> {
                         // free via fresh `InputArg` Python identities per
                         // TraceIterator (opencoder.py:249-273); pyre flat u32
                         // OpRefs need this explicit baseline.
-                        next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
+                        next_global_opref,
                     },
                 );
                 // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
@@ -4679,32 +4748,16 @@ impl<M: Clone> MetaInterp<M> {
             constants.entry(k).or_insert(v);
         }
 
-        // compile.py:341 parity (retrace path): reduced LABEL contract must
-        // come from `ExportedState.renamed_inputarg_types`. RPython has no
-        // silent recovery when this is absent; abort the retrace instead of
-        // synthesizing Int-padded InputArgs from the raw trace prefix.
-        let root_inputargs: Vec<InputArg> = match unroll_opt
-            .final_exported_state
-            .as_ref()
-            .map(|es| es.renamed_inputarg_types.as_slice())
-            .filter(|types| types.len() == final_num_inputs)
-        {
-            Some(types) => types
-                .iter()
-                .enumerate()
-                .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
-                .collect(),
-            None => {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] compile_retrace: missing ExportedState inputarg types \
-                         (final_num_inputs={final_num_inputs})",
-                    );
-                }
-                return false;
-            }
-        };
-        let (mut inputargs, combined_ops) =
+        // compile.py:1075-1085 + 379-393 parity: the partial trace saved by
+        // compile_trace already owns the bridge inputarg contract
+        // (`new_trace.inputargs = info.renamed_inputargs`), and
+        // compile_retrace reuses that same `partial_trace` object as the
+        // final loop/bridge. Do not reconstruct dense `[0..n)` inputargs from
+        // type side data here: bridge Phase E.2b renamed_inputargs may live in
+        // a shifted `[bridge_inputarg_base..)` namespace, exactly like
+        // RPython's fresh InputArg object identities.
+        let root_inputargs: Vec<InputArg> = partial.inputargs.clone();
+        let (inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
                 Ok(normalized) => normalized,
                 Err((expected, actual)) => {
@@ -4718,7 +4771,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             };
 
-        let mut combined_ops =
+        let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
 
         if crate::majit_log_enabled() {
@@ -4862,6 +4915,9 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
+                let mut next_global_opref = unroll_opt
+                    .next_global_opref
+                    .max(compute_next_global_opref(&inputargs, &combined_ops));
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -4885,6 +4941,8 @@ impl<M: Clone> MetaInterp<M> {
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
                     self.backend.migrate_bridges(&old_entry.token, &token);
+                    // Box Identity Phase E.2b parity: see compile_loop site.
+                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                     for (tid, ct) in old_entry.traces {
@@ -4910,7 +4968,7 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         // Box Identity Phase E Step 1: see main compile site.
-                        next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
+                        next_global_opref,
                     },
                 );
                 // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
@@ -5331,6 +5389,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
+                let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5361,6 +5420,10 @@ impl<M: Clone> MetaInterp<M> {
                         .unwrap_or(0);
                     let _had_old = self.compiled_loops.contains_key(&green_key);
                     if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                        // Box Identity Phase E.2b parity: preserve old entry's
+                        // high-water so previously stored bridges' OpRefs stay
+                        // disjoint from any future bridge.
+                        next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                         previous_tokens.push(old_entry.token);
                         previous_tokens.extend(old_entry.previous_tokens);
                         for (tid, ct) in old_entry.traces {
@@ -5378,7 +5441,7 @@ impl<M: Clone> MetaInterp<M> {
                             root_trace_id: trace_id,
                             traces,
                             previous_tokens,
-                            next_global_opref: 0,
+                            next_global_opref,
                         },
                     );
                     // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
@@ -5657,6 +5720,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
+                let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -5675,6 +5739,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
+                    // Box Identity Phase E.2b parity: see finish_and_compile.
+                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
                     for (tid, ct) in old_entry.traces {
@@ -5692,7 +5758,7 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
-                        next_global_opref: 0,
+                        next_global_opref,
                     },
                 );
                 // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
@@ -7658,19 +7724,6 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        let mut constants = constants;
-        optimizer.constant_types = constant_types.clone();
-        for arg in bridge_inputargs {
-            optimizer.constant_types.insert(arg.index, arg.tp);
-        }
-        optimizer.snapshot_boxes = snapshot_boxes;
-        optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
-        optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
-        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
-        optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
-
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py:1245-1282).
@@ -7682,12 +7735,44 @@ impl<M: Clone> MetaInterp<M> {
                 compiled.next_global_opref,
             )
         };
-        let retrace_limit = self.warm_state.retrace_limit();
         // Box Identity Phase E Step 2a: stage bridge_inputarg_base based
         // on the parent loop's recorded next_global_opref. See
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
+        // ResOperation objects in a disjoint OpRef namespace
+        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        let prepared = prepare_bridge_trace_for_optimizer(
+            bridge_ops,
+            bridge_inputargs,
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_frame_pcs,
+            None,
+            bridge_inputarg_base,
+        );
+        let bridge_inputargs = prepared.inputargs.as_slice();
+        let bridge_ops = prepared.ops.as_slice();
+
+        let mut optimizer = self.make_optimizer();
+        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        let mut constants = constants;
+        optimizer.constant_types = constant_types.clone();
+        for arg in bridge_inputargs {
+            optimizer.constant_types.insert(arg.index, arg.tp);
+        }
+        optimizer.snapshot_boxes = prepared.snapshot_boxes;
+        optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
+        optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
+        optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
+        optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
+
+        // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
+        // constant pool merge. Const objects flow via rd_consts + fresh
+        // decode (resume.py:1245-1282).
+        let retrace_limit = self.warm_state.retrace_limit();
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7858,6 +7943,8 @@ impl<M: Clone> MetaInterp<M> {
                     &mut terminal_exit_layouts,
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
+                let mut next_global_opref =
+                    compute_next_global_opref(bridge_inputargs, &optimized_ops);
                 let mut traces = HashMap::new();
                 traces.insert(
                     trace_id,
@@ -7896,6 +7983,8 @@ impl<M: Clone> MetaInterp<M> {
                     .unwrap_or(0);
                 let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
+                    // Box Identity Phase E.2b parity: see finish_and_compile.
+                    next_global_opref = next_global_opref.max(old_entry.next_global_opref);
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
@@ -7914,7 +8003,7 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
-                        next_global_opref: 0,
+                        next_global_opref,
                     },
                 );
                 // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
@@ -7966,24 +8055,8 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
-        let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
-        let mut constants = constants;
-        optimizer.constant_types = constant_types.clone();
-        // RPython Box.type parity: inputargs carry their types implicitly
-        // via Box subclass. In majit, register inputarg types explicitly
-        // so fail_arg_types inference can resolve them.
-        for arg in bridge_inputargs {
-            optimizer.constant_types.insert(arg.index, arg.tp);
-        }
-        optimizer.snapshot_boxes = snapshot_boxes;
-        optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
-        optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
-        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
-        let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-        let retraced_count = compiled.retraced_count;
         // RPython warmspot.py:93 retrace_limit=5: allow bridge to create
         // new target_token specializations when existing body token doesn't
         // match. Without this, bridges fall back to preamble (causing
@@ -7992,7 +8065,13 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py:124-185 deserialize_optimizer_knowledge:
         // Retrieve guard's rd_numb + frontend_boxes for deserialization.
         use crate::optimizeopt::optimizer::PendingBridgeRd;
-        let pending_bridge_rd: Option<PendingBridgeRd> = {
+        let (retraced_count, loop_num_inputs, parent_next_global_opref, pending_bridge_rd): (
+            u32,
+            usize,
+            u32,
+            Option<PendingBridgeRd>,
+        ) = {
+            let compiled = self.compiled_loops.get(&green_key).unwrap();
             let source_trace_id = {
                 let tid = fail_descr.trace_id();
                 if tid == 0 {
@@ -8001,7 +8080,7 @@ impl<M: Clone> MetaInterp<M> {
                     tid
                 }
             };
-            compiled.traces.get(&source_trace_id).and_then(|trace| {
+            let pending = compiled.traces.get(&source_trace_id).and_then(|trace| {
                 let guard_op_idx = trace.guard_op_indices.get(&fail_index)?;
                 let guard_op = trace.ops.get(*guard_op_idx)?;
                 // compile.py:853 `ResumeGuardDescr` storage — every
@@ -8048,8 +8127,50 @@ impl<M: Clone> MetaInterp<M> {
                     all_descrs: self.staticdata.all_descrs.lock().unwrap().clone(),
                     cls_of_box: self.cls_of_box,
                 })
-            })
+            });
+            (
+                compiled.retraced_count,
+                compiled.num_inputs,
+                compiled.next_global_opref,
+                pending,
+            )
         };
+        // Box Identity Phase E Step 2a: stage bridge_inputarg_base based on
+        // the parent loop's recorded next_global_opref. See
+        // Optimizer::optimize_bridge docstring for the RPython identity
+        // model this mirrors (opencoder.py:249-273).
+        let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
+        // ResOperation objects in a disjoint OpRef namespace
+        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        let prepared = prepare_bridge_trace_for_optimizer(
+            bridge_ops,
+            bridge_inputargs,
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_frame_pcs,
+            pending_bridge_rd,
+            bridge_inputarg_base,
+        );
+        let bridge_inputargs = prepared.inputargs.as_slice();
+        let bridge_ops = prepared.ops.as_slice();
+        let pending_bridge_rd = prepared.pending_bridge_rd;
+
+        let mut optimizer = self.make_optimizer();
+        optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        let mut constants = constants;
+        optimizer.constant_types = constant_types.clone();
+        // RPython Box.type parity: inputargs carry their types implicitly
+        // via Box subclass. In majit, register inputarg types explicitly
+        // so fail_arg_types inference can resolve them.
+        for arg in bridge_inputargs {
+            optimizer.constant_types.insert(arg.index, arg.tp);
+        }
+        optimizer.snapshot_boxes = prepared.snapshot_boxes;
+        optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
+        optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
+        optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         // Store bridge inputarg types so export_state can propagate them
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
         optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
@@ -8064,12 +8185,6 @@ impl<M: Clone> MetaInterp<M> {
         // serialized at guard compile time (bridgeopt.py:69-88). Only
         // classes that were known at the guard point are restored —
         // runtime class inspection is NOT used here.
-        let loop_num_inputs = compiled.num_inputs;
-        // Box Identity Phase E Step 2a: see other compile_bridge site
-        // and optimize_bridge's docstring for the identity model.
-        let bridge_inputarg_base = compiled
-            .next_global_opref
-            .max(bridge_inputargs.len() as u32);
         if crate::majit_log_enabled() {
             eprintln!(
                 "--- bridge trace (before opt) ninputs={} ---",
@@ -8083,20 +8198,23 @@ impl<M: Clone> MetaInterp<M> {
         // RPython catches it via the abstract jitexc handler and discards
         // the bridge. Mirror that here so the trace abort doesn't unwind
         // past compile_bridge.
-        let bridge_optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            optimizer.optimize_bridge(
-                bridge_ops,
-                &mut constants,
-                bridge_inputargs.len(),
-                &mut compiled.front_target_tokens,
-                inline_short_preamble,
-                retraced_count,
-                retrace_limit,
-                pending_bridge_rd,
-                Some(loop_num_inputs),
-                bridge_inputarg_base,
-            )
-        }));
+        let bridge_optimize_result = {
+            let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                optimizer.optimize_bridge(
+                    bridge_ops,
+                    &mut constants,
+                    bridge_inputargs.len(),
+                    &mut compiled.front_target_tokens,
+                    inline_short_preamble,
+                    retraced_count,
+                    retrace_limit,
+                    pending_bridge_rd,
+                    Some(loop_num_inputs),
+                    bridge_inputarg_base,
+                )
+            }))
+        };
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
             Ok(result) => result,
             Err(payload) => {
@@ -8122,7 +8240,9 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:1079: metainterp.retrace_needed(new_trace, info)
             // Save partial trace + exported state so the next loop-header's
             // compile_loop → compile_retrace can produce a new specialization.
-            compiled.retraced_count += 1;
+            if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
+                compiled.retraced_count += 1;
+            }
             let exported = optimizer.exported_loop_state.take();
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -8332,6 +8452,9 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_trace_id,
                         &mut terminal_exit_layouts,
                     );
+                    let new_high_water =
+                        compute_next_global_opref(bridge_inputargs, &optimized_ops);
+                    compiled.next_global_opref = compiled.next_global_opref.max(new_high_water);
                     compiled.traces.insert(
                         bridge_trace_id,
                         CompiledTrace {

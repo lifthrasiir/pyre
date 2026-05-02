@@ -2451,11 +2451,21 @@ impl Optimizer {
                 }
             }
             let exported_int_bounds = self.collect_exported_int_bounds(&jump.args, &mut ctx);
-            // RPython unroll.py passes optimize_preamble()'s inputargs here,
-            // i.e. the external loop-entry contract, not the optimizer's
-            // internal position base (`ctx.num_inputs`), which may be widened
-            // to avoid collisions with existing op positions.
-            let renamed_inputargs: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+            // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
+            // are the fresh per-iteration boxes from `trace.get_iter()`. They
+            // live in this run's iteration namespace, not the original
+            // frontend's. In pyre this maps to `[inputarg_base..inputarg_base
+            // + num_inputs)`: `inputarg_base = 0` for top-level loops
+            // (compile_loop / compile_retrace) where the frontend already
+            // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
+            // for bridges where Phase E.2b
+            // (`prepare_bridge_trace_for_optimizer` in pyjitpl/mod.rs) shifts
+            // the iteration into a disjoint range.  Use `num_inputs` (the
+            // external loop-entry contract count) rather than `ctx.num_inputs`
+            // (which may be widened by virtualizable expansion).
+            let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
+                .map(|i| OpRef(ctx.inputarg_base + i as u32))
+                .collect();
             crate::optimizeopt::unroll::export_state(
                 &original_jump_args,
                 &renamed_inputargs,
@@ -2841,32 +2851,19 @@ impl Optimizer {
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
         _loop_num_inputs: Option<usize>,
-        // Box Identity plan Phase E Step 2a (dormant): disjoint OpRef
-        // namespace for bridge inputargs. RPython opencoder.py:249-273
-        // `TraceIterator.__init__` allocates fresh `InputArg` Python
-        // objects per iteration, so bridges carry Python `is` identity
-        // distinct from the parent loop's boxes automatically. Pyre's
-        // flat `OpRef(u32)` threads the parent's recorded
-        // `CompiledEntry.next_global_opref` here.
-        //
-        // Step 2b (activation) requires parallel rewrites of every
-        // OpRef-keyed side channel: `snapshot_boxes`,
-        // `snapshot_vable_boxes`, `pending_bridge_rd.liveboxes`,
-        // `constant_types`, the export path's `renamed_inputargs`
-        // (`optimize_with_constants_and_inputs_at` still passes raw
-        // `[0..num_inputs)` for Phase 2 parity), and the caller's
-        // `pre_opt_jump_args` capture. The remap compaction at
-        // `optimizer.rs` (immediately below this signature) must coexist
-        // with the shifted namespace. Until all of those are unified in
-        // one patch, keep the param unused.
-        //
-        // A partial activation that only raised `start_next_pos` past
-        // `bridge_inputarg_base + num_inputs` (keeping `inputarg_base=0`)
-        // was attempted and also SIGSEGVs on fib_recursive: the backend's
-        // compile pipeline cannot handle the OpRef range gap introduced
-        // by forcing the first optimizer-emitted op far beyond the raw
-        // trace's max position.
-        #[allow(unused_variables)] bridge_inputarg_base: u32,
+        // Box Identity Phase E.2b: disjoint OpRef namespace for bridge
+        // inputargs. RPython `opencoder.py:249-273
+        // TraceIterator.__init__` allocates fresh `InputArg` Python
+        // objects per iteration so bridges carry Python `is` identity
+        // distinct from the parent loop's boxes. Pyre's flat
+        // `OpRef(u32)` lacks identity, so `compile_bridge` calls
+        // `prepare_bridge_trace_for_optimizer` (pyjitpl/mod.rs) which
+        // walks the recorded ops through a fresh `TraceIterator` with
+        // `start_fresh = bridge_inputarg_base`, allocating OpRefs in
+        // `[bridge_inputarg_base..)`. This signature carries the same
+        // base into `optimize_with_constants_and_inputs_at` so step 3
+        // seeds inputarg types at the shifted slots.
+        bridge_inputarg_base: u32,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
@@ -2882,7 +2879,35 @@ impl Optimizer {
             .unwrap_or_default();
 
         // unroll.py:193: info, ops = self.propagate_all_forward(trace, ...)
-        let optimized_ops = self.optimize_with_constants_and_inputs(ops, constants, num_inputs);
+        // Box Identity Phase E.2b: bridge ops use a disjoint OpRef
+        // namespace `[bridge_inputarg_base..)` (set by
+        // `prepare_bridge_trace_for_optimizer`). Drive the optimizer
+        // through the shifted entry point so `inputarg_base` /
+        // `start_next_pos` align with the prepared ops. Compute
+        // `start_next_pos` from the maximum raw `op.pos` so the
+        // optimizer's emit cursor does not collide with the bridge's
+        // own already-allocated result slots.
+        let max_op_pos = ops
+            .iter()
+            .filter_map(|op| {
+                if op.pos.is_none() || op.pos.is_constant() {
+                    None
+                } else {
+                    Some(op.pos.0)
+                }
+            })
+            .max();
+        let start_next_pos = max_op_pos
+            .map(|p| p + 1)
+            .unwrap_or(bridge_inputarg_base + num_inputs as u32)
+            .max(bridge_inputarg_base + num_inputs as u32);
+        let optimized_ops = self.optimize_with_constants_and_inputs_at(
+            ops,
+            constants,
+            num_inputs,
+            bridge_inputarg_base,
+            start_next_pos,
+        );
 
         // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
         let terminal_jump = self.terminal_op.take();

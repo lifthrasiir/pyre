@@ -4417,10 +4417,20 @@ fn build_ref_root_slots(
     // RPython parity: when jump_to_preamble is used without
     // force_box_for_end_of_preamble, the body JUMP may pass Float/Int
     // values at Ref-typed inputarg positions. Build a set of inputarg
-    // indices that receive non-Ref values from the backedge JUMP.
+    // OpRef raw values that receive non-Ref values from the backedge JUMP.
     // These positions must NOT be treated as GC ref roots, because
     // (1) the GC would try to trace Float/Int bits as pointers, and
     // (2) the preamble guard check would dereference non-pointer values.
+    //
+    // Phase E.2b: bridge `InputArg.index` is shifted into the disjoint
+    // `[bridge_inputarg_base..)` range, so `arg.0` and `inputargs[i].index`
+    // are not interchangeable. RPython relies on Box identity here
+    // (regalloc.py treats `box is inputarg` as the test); pyre's
+    // line-by-line analog is `arg.0 == inputargs[i].index`. Key both
+    // `non_ref_at_backedge` and `used_inputargs` by the InputArg's raw
+    // OpRef value so the downstream loop's `contains(&input.index)` checks
+    // line up with the keys we inserted.
+    let inputarg_oprefs: HashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
     let mut non_ref_at_backedge: HashSet<u32> = HashSet::new();
     let mut has_float_at_ref_position = false;
     // Find the closing JUMP and check arg types against inputarg types
@@ -4437,19 +4447,25 @@ fn build_ref_root_slots(
             if inputargs[i].tp != Type::Ref {
                 continue;
             }
-            if (arg.0 as usize) < num_inputs && inputargs[arg.0 as usize].tp == Type::Ref {
+            // RPython regalloc.py: backedge JUMP arg `is` an inputarg Box →
+            // GC roots already cover it. Pyre analog: arg.0 matches some
+            // InputArg.index whose .tp is Ref.
+            if inputargs
+                .iter()
+                .any(|ia| ia.index == arg.0 && ia.tp == Type::Ref)
+            {
                 continue; // inputarg reference — always safe
             }
             if let Some(actual_tp) = lookup_type_at(type_index, overrides, arg, jump_idx) {
                 if actual_tp != Type::Ref {
-                    non_ref_at_backedge.insert(i as u32);
+                    non_ref_at_backedge.insert(inputargs[i].index);
                     if actual_tp == Type::Float {
                         has_float_at_ref_position = true;
                     }
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
                             "[ref-root] SKIP inputarg idx={}: backedge passes {:?} (arg={:?})",
-                            i, actual_tp, arg
+                            inputargs[i].index, actual_tp, arg
                         );
                     }
                 }
@@ -4461,7 +4477,7 @@ fn build_ref_root_slots(
     // LIVE at some GC-triggering call site. Ref inputargs that the
     // optimizer replaced with constants (e.g. guard_value'd code/namespace)
     // are never referenced by ops — they don't need GC root slots.
-    // Build the set of inputarg indices actually used in ops.
+    // Build the set of inputarg OpRef raw values actually used in ops.
     let mut used_inputargs: HashSet<u32> = HashSet::new();
     for op in ops.iter() {
         for &arg in op
@@ -4469,9 +4485,8 @@ fn build_ref_root_slots(
             .iter()
             .chain(op.fail_args.iter().flat_map(|fa| fa.iter()))
         {
-            let idx = arg.0;
-            if idx < inputargs.len() as u32 {
-                used_inputargs.insert(idx);
+            if inputarg_oprefs.contains(&arg.0) {
+                used_inputargs.insert(arg.0);
             }
         }
     }
@@ -6797,13 +6812,16 @@ impl CraneliftBackend {
         // the same `.type` attribute.  Pyre's flat `OpRef` stores types
         // in side maps keyed by the raw u32; `constant_types` already
         // carries op-position and constant types (disjoint key spaces
-        // via `OpRef::CONST_BIT = 1 << 31`).  Inputargs occupy raw u32
-        // 0..num_inputs, so merging their types here gives the rewriter
-        // the same `v.type` lookup RPython has on inputargs.
+        // via `OpRef::CONST_BIT = 1 << 31`).  Each InputArg's raw OpRef
+        // value lives at `InputArg.index`: top-level loops occupy
+        // `[0, num_inputs)`, while Phase E.2b bridges occupy
+        // `[bridge_inputarg_base..)`. Key the merged map by the actual
+        // `ia.index` so the rewriter's `v.type` lookup matches the OpRef
+        // values that ops reference, regardless of namespace.
         let mut constant_types_with_inputargs = constant_types.clone();
-        for (i, ia) in inputargs.iter().enumerate() {
+        for ia in inputargs.iter() {
             constant_types_with_inputargs
-                .entry(i as u32)
+                .entry(ia.index)
                 .or_insert(ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types_with_inputargs) {
@@ -7294,12 +7312,19 @@ impl CraneliftBackend {
         // with a LABEL (preamble peeling). Preamble guards reference
         // inputarg OpRefs in fail_args and need declared variables.
         // The LABEL block later overrides these via block params + def_var.
-        for i in 0..num_inputs {
+        //
+        // Box Identity Phase E.2b: bridge inputargs carry OpRefs in the
+        // disjoint `[bridge_inputarg_base..)` namespace
+        // (`prepare_bridge_trace_for_optimizer` in pyjitpl/mod.rs); use
+        // each `InputArg.index` as the variable slot rather than a dense
+        // `0..num_inputs` so the entry `def_var` lands on the slot the
+        // ops actually reference.
+        for ia in inputargs {
             if debug_declares {
-                eprintln!("[jit][declare] input var{}", i);
+                eprintln!("[jit][declare] input var{}", ia.index);
             }
-            var_types.insert(i as u32, cl_types::I64);
-            declared_vars.insert(i as u32);
+            var_types.insert(ia.index, cl_types::I64);
+            declared_vars.insert(ia.index);
         }
         // Declare variables for op results
         for (op_idx, op) in ops.iter().enumerate() {
@@ -7425,8 +7450,8 @@ impl CraneliftBackend {
 
         // Save op-result positions for resolve_opref collision handling.
         let mut op_result_positions = std::collections::HashSet::new();
-        for i in 0..num_inputs {
-            op_result_positions.insert(i as u32);
+        for ia in inputargs {
+            op_result_positions.insert(ia.index);
         }
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
@@ -7456,14 +7481,25 @@ impl CraneliftBackend {
         // Always def_var inputargs in the entry block. When the trace
         // starts with LABEL, the LABEL block will override these via
         // block params. Preamble guards need the entry block values.
+        //
+        // Box Identity Phase E.2b: route the loaded jitframe slot value
+        // into the variable indexed by `inputargs[i].index` so bridge
+        // entries land in the `[bridge_inputarg_base..)` slot the ops
+        // reference. Slots beyond `num_inputs` (synthesized loop padding
+        // / `entry_mode` flag) keep the dense `var(i)` mapping.
         for (i, val) in entry_input_vals.iter().copied().enumerate() {
-            builder.def_var(var(i as u32), val);
+            let slot = if i < num_inputs {
+                inputargs[i].index
+            } else {
+                i as u32
+            };
+            builder.def_var(var(slot), val);
             if i < num_inputs {
                 sync_ref_root_var(
                     &mut builder,
                     jf_ptr,
                     &ref_root_slots,
-                    i as u32,
+                    slot,
                     val,
                     ref_root_base_ofs,
                     &mut synced_ref_vars,
@@ -12402,11 +12438,13 @@ fn collect_guards(
             };
             (refs, types)
         } else {
-            let refs: Vec<OpRef> = if let Some(ref fa) = op.fail_args {
-                fa.iter().copied().collect()
-            } else {
-                (0..num_inputs as u32).map(OpRef).collect()
-            };
+            // RPython parity: a guard with no explicit fail_args carries the
+            // current trace inputargs as live boxes. Phase E.2b shifted bridge
+            // inputargs into `[bridge_inputarg_base..)`, so the fallback must
+            // read each `InputArg.index` rather than assuming dense
+            // `[0..num_inputs)`.  The outer match arm at 12399 already handles
+            // `op.fail_args = Some(_)`; this branch is the `None` fallback.
+            let refs: Vec<OpRef> = inputargs.iter().map(|ia| OpRef(ia.index)).collect();
             let types = resolve_fail_arg_types(
                 &refs,
                 op.descr.as_ref().and_then(|d| d.as_fail_descr()),
