@@ -994,6 +994,17 @@ pub struct BlackholeInterpreter {
     /// PyFrame.locals_cells_stack_w. RPython does not need this because
     /// its JitCode already operates in register space.
     pub virtualizable_stack_base: usize,
+    /// RPython `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`.
+    /// Per-instance reference to the builder's dispatch table.  Cloned
+    /// from the builder via `Arc::clone` in `acquire_interp` so wired
+    /// handler lookup is one indirect call (`self.dispatch_table[opcode]`)
+    /// without going back to the builder.
+    ///
+    /// Empty default for direct `BlackholeInterpreter::new()` callers;
+    /// `dispatch_step_with_fallback` falls back to `dispatch_one` when
+    /// the table is empty or the opcode is out of range, preserving
+    /// behavior for legacy fixtures that bypass `acquire_interp`.
+    pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
 }
 
 // blackhole.py: last exception value from a residual call.
@@ -1133,6 +1144,7 @@ impl BlackholeInterpreter {
             virtualizable_info: std::ptr::null(),
             jitdrivers_sd: Vec::new(),
             virtualizable_stack_base: 0,
+            dispatch_table: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -1562,6 +1574,100 @@ impl BlackholeInterpreter {
         values
     }
 
+    /// blackhole.py:1066-1093 `bhimpl_jit_merge_point`. Decodes
+    /// `@arguments("self", "i", "I", "R", "F", "I", "R", "F")` from
+    /// `self.position` (advancing it past the jdindex byte and the six
+    /// typed register lists), then either raises `ContinueRunningNormally`
+    /// (bottommost level) or recursive_call's into the portal jitcode and
+    /// raises `LeaveFrame`.
+    ///
+    /// `opcode` selects how the jdindex byte is decoded
+    /// (blackhole.py:113-123): `BC_JIT_MERGE_POINT` reads it as a
+    /// `registers_i` pool slot index (`'i'` argcode); `BC_JIT_MERGE_POINT_C`
+    /// reads it as a raw signed byte (`'c'` argcode, assembler.py:312
+    /// `USE_C_FORM`).
+    pub(crate) fn bhimpl_jit_merge_point(&mut self, opcode: u8) -> Result<(), DispatchError> {
+        let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
+        let jdindex_byte = self.next_u8();
+        let jdindex = if opcode == jitcode::BC_JIT_MERGE_POINT_C {
+            (jdindex_byte as i8) as usize
+        } else {
+            self.registers_i[jdindex_byte as usize] as usize
+        };
+        let gi = self._get_list_of_values_i();
+        let gr = self._get_list_of_values_r();
+        let gf = self._get_list_of_values_f();
+        let ri = self._get_list_of_values_i();
+        let rr = self._get_list_of_values_r();
+        let rf = self._get_list_of_values_f();
+        if nbody_debug {
+            eprintln!(
+                "[nbody-debug][bh-jmp] pos={} jdindex={} gi={:?} gr={:?} ri={:?} rr={:#x?}",
+                self.last_opcode_position, jdindex, gi, gr, ri, rr,
+            );
+        }
+
+        if self.nextblackholeinterp.is_none() {
+            // blackhole.py:1068-1069: bottommost level.
+            //   raise ContinueRunningNormally(*args)
+            return Err(DispatchError::ContinueRunningNormally(MergePointArgs {
+                green_int: gi,
+                green_ref: gr,
+                green_float: gf,
+                red_int: ri,
+                red_ref: rr,
+                red_float: rf,
+            }));
+        }
+        // blackhole.py:1074-1093: recursive portal level.
+        //   sd = self.builder.metainterp_sd
+        //   result_type = sd.jitdrivers_sd[jdindex].result_type
+        //   if result_type == 'v': bhimpl_recursive_call_v + void_return
+        //   elif result_type == 'i': bhimpl_recursive_call_i + int_return
+        //   elif result_type == 'r': bhimpl_recursive_call_r + ref_return
+        //   elif result_type == 'f': bhimpl_recursive_call_f + float_return
+        //   assert False
+        let result_type = self.jitdrivers_sd[jdindex].result_type;
+        match result_type {
+            BhReturnType::Void => {
+                self.bhimpl_recursive_call_v(jdindex, gi, gr, gf, ri, rr, rf);
+                self.return_type = BhReturnType::Void;
+            }
+            BhReturnType::Int => {
+                let x = self.bhimpl_recursive_call_i(jdindex, gi, gr, gf, ri, rr, rf);
+                self.tmpreg_i = x;
+                self.return_type = BhReturnType::Int;
+            }
+            BhReturnType::Ref => {
+                let x = self.bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf);
+                self.tmpreg_r = x.0 as i64;
+                self.return_type = BhReturnType::Ref;
+            }
+            BhReturnType::Float => {
+                let x = self.bhimpl_recursive_call_f(jdindex, gi, gr, gf, ri, rr, rf);
+                self.tmpreg_f = x.to_bits() as i64;
+                self.return_type = BhReturnType::Float;
+            }
+        }
+        Err(DispatchError::LeaveFrame)
+    }
+
+    /// pyre-only `BC_ABORT_PERMANENT` body. Routes a TLS-stashed exception
+    /// through `RaiseException` (so `handle_exception_in_frame` can pick
+    /// the except handler); falls back to `aborted = true` + `LeaveFrame`
+    /// when no exception is set. RPython has no direct counterpart — the
+    /// canonical `abort_permanent/` handler is emitted by pyre's codegen
+    /// for fail-paths that should always terminate the blackhole frame.
+    pub(crate) fn bhimpl_abort_permanent(&mut self) -> Result<(), DispatchError> {
+        let exc = BH_LAST_EXC_VALUE.with(|c| c.get());
+        if exc != 0 {
+            BH_LAST_EXC_VALUE.with(|c| c.set(0));
+            return Err(DispatchError::RaiseException(exc));
+        }
+        self.aborted = true;
+        Err(DispatchError::LeaveFrame)
+    }
+
     fn finished(&self) -> bool {
         self.position >= self.jitcode.code.len()
     }
@@ -1683,7 +1789,7 @@ impl BlackholeInterpreter {
                     self.registers_i.get(1).copied().unwrap_or(-1),
                 );
             }
-            match self.dispatch_one(opcode) {
+            match self.dispatch_step_with_fallback(opcode) {
                 Ok(()) => {}
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
@@ -1718,6 +1824,48 @@ impl BlackholeInterpreter {
                 }
             }
         }
+    }
+
+    /// Dispatch a single bytecode instruction through the per-instance
+    /// `dispatch_table`, falling back to the legacy `dispatch_one` match
+    /// when the table entry is the unwired placeholder or the table is
+    /// shorter than `opcode + 1`.
+    ///
+    /// RPython parity: `blackhole.py:83-100` `dispatch_loop` calls
+    /// `self.dispatch_table[opcode_byte](self, code, position)`
+    /// unconditionally — every opcode is wired before the loop runs.
+    /// Pyre's pyre-legacy assembler (`majit-metainterp/src/jitcode/
+    /// assembler.rs::JitCodeBuilder`) emits `BC_*` bytes that have no
+    /// canonical opname-key registration yet, so wired-handler coverage
+    /// is incomplete.  The placeholder fallback bridges that gap by
+    /// routing unwired opcodes through `dispatch_one` until the
+    /// per-family migration of Stage 2 closes them.
+    ///
+    /// `position` invariant: caller is `run_inner`, which has already
+    /// advanced `self.position` past the opcode byte via `next_u8`.
+    /// Wired handlers expect `position` to point at the first operand
+    /// byte (handler signature `(bh, code, position) -> Result<usize>`)
+    /// and return the post-operand position; we then store it back into
+    /// `self.position`.  Fallback handlers (`dispatch_one`) mutate
+    /// `self.position` directly, so no sync is needed for that branch.
+    fn dispatch_step_with_fallback(&mut self, opcode: u8) -> Result<(), DispatchError> {
+        let placeholder_addr = unwired_handler_placeholder as *const () as usize;
+        let table_handler = self
+            .dispatch_table
+            .get(opcode as usize)
+            .copied()
+            .filter(|h| (*h as *const () as usize) != placeholder_addr);
+        let Some(handler) = table_handler else {
+            return self.dispatch_one(opcode);
+        };
+        // Clone the Arc to detach the `code` borrow from `self`, so the
+        // handler can take `&mut self` without aliasing the code slice.
+        // `Arc::clone` is a single atomic increment.
+        let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
+        let code: &[u8] = &jitcode_arc.code;
+        let new_pos = handler(self, code, self.position)?;
+        self.position = new_pos;
+        Ok(())
     }
 
     /// Dispatch a single bytecode instruction with concrete execution.
@@ -2029,86 +2177,7 @@ impl BlackholeInterpreter {
                 self.position = target;
             }
             jitcode::BC_JIT_MERGE_POINT | jitcode::BC_JIT_MERGE_POINT_C => {
-                // blackhole.py:1066-1093 bhimpl_jit_merge_point parity.
-                // @arguments("self", "i", "I", "R", "F", "I", "R", "F")
-                // Decode jdindex + 6 typed register lists from bytecode.
-                //
-                // The jdindex byte is decoded per the runtime argcode
-                // (blackhole.py:113-123): for `'i'` (BC_JIT_MERGE_POINT)
-                // it is a `registers_i` pool slot index — the constant
-                // value lives in the constants_i pool and was copied
-                // into the register file at setup
-                // (`init_register_files_from_runtime_jitcode`); for
-                // `'c'` (BC_JIT_MERGE_POINT_C, assembler.py:312
-                // `USE_C_FORM`) it is the raw signed byte
-                // (blackhole.py:121-123 `signedord`).
-                let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
-                let jdindex_byte = self.next_u8();
-                let jdindex = if opcode == jitcode::BC_JIT_MERGE_POINT_C {
-                    (jdindex_byte as i8) as usize
-                } else {
-                    self.registers_i[jdindex_byte as usize] as usize
-                };
-                let gi = self._get_list_of_values_i();
-                let gr = self._get_list_of_values_r();
-                let gf = self._get_list_of_values_f();
-                let ri = self._get_list_of_values_i();
-                let rr = self._get_list_of_values_r();
-                let rf = self._get_list_of_values_f();
-                if nbody_debug {
-                    eprintln!(
-                        "[nbody-debug][bh-jmp] pos={} jdindex={} gi={:?} gr={:?} ri={:?} rr={:#x?}",
-                        self.last_opcode_position, jdindex, gi, gr, ri, rr,
-                    );
-                }
-
-                if self.nextblackholeinterp.is_none() {
-                    // blackhole.py:1068-1069: bottommost level.
-                    //   raise ContinueRunningNormally(*args)
-                    return Err(DispatchError::ContinueRunningNormally(MergePointArgs {
-                        green_int: gi,
-                        green_ref: gr,
-                        green_float: gf,
-                        red_int: ri,
-                        red_ref: rr,
-                        red_float: rf,
-                    }));
-                }
-                // blackhole.py:1074-1093: recursive portal level.
-                //   sd = self.builder.metainterp_sd
-                //   result_type = sd.jitdrivers_sd[jdindex].result_type
-                //   if result_type == 'v': bhimpl_recursive_call_v + void_return
-                //   elif result_type == 'i': bhimpl_recursive_call_i + int_return
-                //   elif result_type == 'r': bhimpl_recursive_call_r + ref_return
-                //   elif result_type == 'f': bhimpl_recursive_call_f + float_return
-                //   assert False
-                let result_type = self.jitdrivers_sd[jdindex].result_type;
-                match result_type {
-                    BhReturnType::Void => {
-                        // blackhole.py:1081-1083
-                        self.bhimpl_recursive_call_v(jdindex, gi, gr, gf, ri, rr, rf);
-                        self.return_type = BhReturnType::Void;
-                    }
-                    BhReturnType::Int => {
-                        // blackhole.py:1084-1086
-                        let x = self.bhimpl_recursive_call_i(jdindex, gi, gr, gf, ri, rr, rf);
-                        self.tmpreg_i = x;
-                        self.return_type = BhReturnType::Int;
-                    }
-                    BhReturnType::Ref => {
-                        // blackhole.py:1087-1089
-                        let x = self.bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf);
-                        self.tmpreg_r = x.0 as i64;
-                        self.return_type = BhReturnType::Ref;
-                    }
-                    BhReturnType::Float => {
-                        // blackhole.py:1090-1092
-                        let x = self.bhimpl_recursive_call_f(jdindex, gi, gr, gf, ri, rr, rf);
-                        self.tmpreg_f = x.to_bits() as i64;
-                        self.return_type = BhReturnType::Float;
-                    }
-                }
-                return Err(DispatchError::LeaveFrame);
+                self.bhimpl_jit_merge_point(opcode)?;
             }
             jitcode::BC_LOOP_HEADER => {
                 // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
@@ -2151,17 +2220,7 @@ impl BlackholeInterpreter {
                 return Err(DispatchError::LeaveFrame);
             }
             jitcode::BC_ABORT_PERMANENT => {
-                // blackhole.py bhimpl_raise parity: exception path bytecodes
-                // trigger RaiseException so handle_exception_in_frame can route
-                // to the except handler. If no TLS exception is available,
-                // fall back to abort.
-                let exc = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc != 0 {
-                    BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                    return Err(DispatchError::RaiseException(exc));
-                }
-                self.aborted = true;
-                return Err(DispatchError::LeaveFrame);
+                self.bhimpl_abort_permanent()?;
             }
             jitcode::BC_UNREACHABLE => {
                 // blackhole.py:962 `bhimpl_unreachable()` raises
@@ -3019,7 +3078,15 @@ pub struct BlackholeInterpBuilder {
     /// Dispatch table: opcode byte → handler fn pointer.
     /// RPython builds `dispatch_loop` closure via `unrolling_iterable`;
     /// Rust uses indirect call through this table.
-    pub(crate) dispatch_table: Vec<BhOpcodeHandler>,
+    ///
+    /// `Arc<Vec<...>>` so each `acquire_interp` cheaply shares the same
+    /// table snapshot with the returned interpreter (RPython
+    /// `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`
+    /// instance binding).  Wiring mutators (`setup_insns`,
+    /// `wire_handler`) take `&mut self` and use `Arc::make_mut`; once
+    /// wiring is done before the first `acquire_interp`, the inner Vec
+    /// is uniquely owned and `make_mut` is cheap.
+    pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
 }
 
 impl Default for BlackholeInterpBuilder {
@@ -3038,7 +3105,7 @@ impl BlackholeInterpBuilder {
             op_catch_exception: u8::MAX,
             op_rvmprof_code: u8::MAX,
             descrs: Vec::new(),
-            dispatch_table: Vec::new(),
+            dispatch_table: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -3110,8 +3177,11 @@ impl BlackholeInterpBuilder {
         // We match that behavior: the default handler panics with the
         // opname so missing bhimpl_* methods surface at dispatch time
         // instead of being silently swallowed.
-        self.dispatch_table =
-            vec![unwired_handler_placeholder as BhOpcodeHandler; self._insns.len()];
+        self.dispatch_table = std::sync::Arc::new(vec![
+            unwired_handler_placeholder
+                as BhOpcodeHandler;
+            self._insns.len()
+        ]);
     }
 
     /// List of opnames whose dispatch table entry is still the
@@ -3314,7 +3384,7 @@ impl BlackholeInterpBuilder {
     pub(crate) fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
         for (i, key) in self._insns.iter().enumerate() {
             if key == opname_key {
-                self.dispatch_table[i] = handler;
+                std::sync::Arc::make_mut(&mut self.dispatch_table)[i] = handler;
                 return true;
             }
         }
@@ -3351,6 +3421,8 @@ impl BlackholeInterpBuilder {
         bh.op_rvmprof_code = self.op_rvmprof_code;
         //   self.op_live = builder.op_live
         bh.op_live = self.op_live;
+        // RPython blackhole.py:287: self.dispatch_loop = builder.dispatch_loop
+        bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
         bh
     }
 
@@ -5003,6 +5075,74 @@ fn handler_abort_result_marker_i(
 ) -> Result<usize, DispatchError> {
     Ok(position + 1)
 }
+
+// pyre-only: `state_field` family. RPython has no counterpart — these are
+// emitted by `#[jit_interp]`'s `jitcode_lower` macro to express loads/stores
+// against a Rust-port `state_fields` register file used during tracing.
+// Blackhole has nothing to do for them (the dispatch_one arm at
+// blackhole.rs:2505-2524 is also a no-op): the state-field semantics live
+// only in the trace path with a `JitCodeSym`. Handlers exist solely so the
+// dispatch_table entry is wired (not placeholder), keeping RPython
+// `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`'s
+// table-driven invariant.
+
+/// No-op handler for `load_state_field/di` / `store_state_field/di` —
+/// 2× u16 operands (4 bytes total).
+fn handler_state_field_noop_di(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 4)
+}
+
+/// No-op handler for `load_state_array/dii` / `store_state_array/dii` /
+/// `load_state_varray/dii` / `store_state_varray/dii` — 3× u16 operands
+/// (6 bytes total).
+fn handler_state_array_noop_dii(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 6)
+}
+
+/// Handler for `jit_merge_point/iIRFIRF` — `BC_JIT_MERGE_POINT`.
+/// Forwards to `bhimpl_jit_merge_point` which uses `self.position`-mutating
+/// helpers; `dispatch_step_with_fallback` already passes `self.position`
+/// as the `position` argument so the local copy stays in sync.
+fn handler_jit_merge_point_i(
+    bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _position: usize,
+) -> Result<usize, DispatchError> {
+    bh.bhimpl_jit_merge_point(jitcode::BC_JIT_MERGE_POINT)?;
+    Ok(bh.position)
+}
+
+/// Handler for `jit_merge_point/cIRFIRF` — `BC_JIT_MERGE_POINT_C`
+/// (assembler.py:312 `USE_C_FORM`: jdindex inlined as a signed byte).
+fn handler_jit_merge_point_c(
+    bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _position: usize,
+) -> Result<usize, DispatchError> {
+    bh.bhimpl_jit_merge_point(jitcode::BC_JIT_MERGE_POINT_C)?;
+    Ok(bh.position)
+}
+
+/// Handler for `abort_permanent/` — pyre-only fail-path opcode that
+/// forwards a TLS-stashed exception or aborts the frame. Carries no
+/// operand bytes.
+fn handler_abort_permanent(
+    bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    _position: usize,
+) -> Result<usize, DispatchError> {
+    bh.bhimpl_abort_permanent()?;
+    Ok(bh.position)
+}
+
 /// Handler for pyre-only `abort/>r` — counterpart of
 /// `abort/>i` with a Ref-classified result register.  Emerges when
 /// pyre's rtyper routes an untranslatable op's result through the
@@ -5096,6 +5236,11 @@ fn handler_int_return(
     let a = bh.registers_i[code[position] as usize];
     bh.tmpreg_i = a;
     bh.return_type = BhReturnType::Int;
+    // RPython blackhole.py:169 `_get_method` stores the decoded position
+    // back into `self.position` before invoking the bhimpl_*; this is
+    // visible after a LeaveFrame since the frame teardown reads the
+    // post-operand position.
+    bh.position = position + 1;
     Err(DispatchError::LeaveFrame)
 }
 
@@ -5108,6 +5253,7 @@ fn handler_ref_return(
     let a = bh.registers_r[code[position] as usize];
     bh.tmpreg_r = a;
     bh.return_type = BhReturnType::Ref;
+    bh.position = position + 1; // blackhole.py:169 parity (see int_return).
     Err(DispatchError::LeaveFrame)
 }
 
@@ -5331,6 +5477,7 @@ fn handler_float_return(
 ) -> Result<usize, DispatchError> {
     bh.tmpreg_f = bh.registers_f[code[position] as usize];
     bh.return_type = BhReturnType::Float;
+    bh.position = position + 1; // blackhole.py:169 parity (see int_return).
     Err(DispatchError::LeaveFrame)
 }
 
@@ -6421,6 +6568,27 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_sub_assign/ii>i", handler_int_sub_assign_pyre);
     builder.wire_handler("int_deref/i>i", handler_int_deref_pyre);
     builder.wire_handler("abort/", handler_abort_marker_pyre);
+
+    // pyre-only state_field family (no RPython counterpart). Blackhole
+    // treats these as no-ops; handlers exist only to advance position past
+    // the operand bytes so dispatch_table[opcode] is wired (not placeholder)
+    // and `dispatch_step_with_fallback` no longer routes through dispatch_one
+    // for them.
+    builder.wire_handler("load_state_field/di", handler_state_field_noop_di);
+    builder.wire_handler("store_state_field/di", handler_state_field_noop_di);
+    builder.wire_handler("load_state_array/dii", handler_state_array_noop_dii);
+    builder.wire_handler("store_state_array/dii", handler_state_array_noop_dii);
+    builder.wire_handler("load_state_varray/dii", handler_state_array_noop_dii);
+    builder.wire_handler("store_state_varray/dii", handler_state_array_noop_dii);
+
+    // jit_merge_point + abort_permanent — bodies live on
+    // `BlackholeInterpreter::bhimpl_jit_merge_point` / `bhimpl_abort_permanent`
+    // and are shared with the legacy dispatch_one arms so test fixtures that
+    // bypass `acquire_interp` continue to work.
+    builder.wire_handler("jit_merge_point/iIRFIRF", handler_jit_merge_point_i);
+    builder.wire_handler("jit_merge_point/cIRFIRF", handler_jit_merge_point_c);
+    builder.wire_handler("abort_permanent/", handler_abort_permanent);
+
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
     builder.wire_handler("int_div/ii>i", handler_int_floordiv);
     builder.wire_handler("int_floordiv/ii>i", handler_int_floordiv);
@@ -7143,9 +7311,16 @@ fn handler_raise(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    Err(DispatchError::RaiseException(
-        bh.registers_r[code[p] as usize],
-    ))
+    let exc = bh.registers_r[code[p] as usize];
+    // RPython blackhole.py:169 `_get_method` stores the decoded position
+    // back to `self.position` before invoking the bhimpl_*. Required here
+    // because `run_inner`'s RaiseException arm calls
+    // `handle_exception_in_frame`, which reads `self.position` to find
+    // the immediately-following `catch_exception/L` (blackhole.py:396).
+    // Without this update the search would start one byte short of the
+    // post-operand position.
+    bh.position = p + 1;
+    Err(DispatchError::RaiseException(exc))
 }
 fn handler_reraise(
     bh: &mut BlackholeInterpreter,

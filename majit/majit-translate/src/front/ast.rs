@@ -167,46 +167,52 @@ impl StructFieldRegistry {
     ///
     /// **Structural adaptation (parity rule §1):** RPython compares
     /// `lltype.Ptr(GcStruct)` objects directly; field/method lookups
-    /// resolve by structural type identity, not name.  Pyre's
-    /// analyser carries types as strings (the only stable handle on
-    /// `syn::Type`), so identity is recovered by string match.  A
-    /// receiver may surface as a fully-qualified path that adds
-    /// crate-level segments the analyser's `module_prefix` did not
-    /// contain at registration time (e.g. `obj as *mut
-    /// pyre_object::rangeobject::W_RangeIterator` while
-    /// `collect_fields_and_returns` registered the struct under the
-    /// shorter analyser-relative path).  Walk the trailing segments
-    /// until a registered key matches.
-    ///
-    /// **Limitation:** the suffix walk does not disambiguate two
-    /// structs that share a leaf name in different modules of the
-    /// same parsed crate.  `collect_fields_and_returns` registers
-    /// the bare name via `entry().or_insert`, so the first struct
-    /// with a given leaf wins the bare-key slot and a suffix walk
-    /// bottoming out there returns its fields regardless of which
-    /// qualified owner the caller asked about.  The parsed-
-    /// interpreter crate has no leaf-name collisions today; a future
-    /// collision is a structural-correctness concern that must be
-    /// re-evaluated rather than papered over.
+    /// resolve by structural type identity. Pyre's analyser carries
+    /// type identity as strings, so exact registered keys are the
+    /// normal path. A receiver can still surface with an unavoidable
+    /// Rust crate prefix that was not present at registration time
+    /// (for example `pyre_object::rangeobject::W_RangeIterator` vs
+    /// `rangeobject::W_RangeIterator`). In that case, accept a suffix
+    /// recovery only when it is unique. Ambiguous leaf-name matches
+    /// return `None` instead of picking the first registered struct.
     pub fn field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
-        if let Some(fields) = self.fields.get(owner) {
-            return fields
-                .iter()
-                .find(|(name, _)| name == field_name)
-                .map(|(_, ty)| ty.as_str());
-        }
-        let mut tail = owner;
-        while let Some(rest) = tail.split_once("::").map(|(_, rest)| rest) {
-            if let Some(fields) = self.fields.get(rest) {
-                return fields
-                    .iter()
-                    .find(|(name, _)| name == field_name)
-                    .map(|(_, ty)| ty.as_str());
-            }
-            tail = rest;
-        }
-        None
+        self.lookup_fields(owner)?
+            .iter()
+            .find(|(name, _)| name == field_name)
+            .map(|(_, ty)| ty.as_str())
     }
+
+    fn lookup_fields(&self, owner: &str) -> Option<&[(String, String)]> {
+        if let Some(fields) = self.fields.get(owner) {
+            return Some(fields.as_slice());
+        }
+        let key = self.unique_suffix_owner_key(owner)?;
+        self.fields.get(key).map(Vec::as_slice)
+    }
+
+    fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
+        let mut found: Option<&str> = None;
+        for key in self.fields.keys() {
+            let matches =
+                is_path_suffix(owner, key.as_str()) || is_path_suffix(key.as_str(), owner);
+            if !matches {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(key.as_str());
+        }
+        found
+    }
+}
+
+fn is_path_suffix(longer: &str, shorter: &str) -> bool {
+    if longer.len() <= shorter.len() || !longer.ends_with(shorter) {
+        return false;
+    }
+    let prefix_len = longer.len() - shorter.len();
+    longer[..prefix_len].ends_with("::")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -450,8 +456,7 @@ fn collect_fields_and_returns(
                     struct_fields.fields.insert(bare_name, fields);
                 } else {
                     let qualified = format!("{}::{}", prefix, bare_name);
-                    struct_fields.fields.insert(qualified, fields.clone());
-                    struct_fields.fields.entry(bare_name).or_insert(fields);
+                    struct_fields.fields.insert(qualified, fields);
                 }
             }
             Item::Fn(func) => {
@@ -531,15 +536,10 @@ fn collect_fields_and_returns(
                 // module prefix), but both forms collided across
                 // unrelated enums with the same variant name (e.g.
                 // `a::Foo::Empty` vs `b::Foo::Empty`, or
-                // `Foo::Empty` vs `Bar::Empty`) — `field_type`'s suffix
-                // walk would then bind the wrong field set.  Register
-                // only the fully-qualified key.  The walk still
-                // resolves shorter callers like
-                // `majit_ir::RdVirtualInfo::VirtualInfo` →
-                // `RdVirtualInfo::VirtualInfo` because the strip
-                // happens left-to-right on the caller's owner string,
-                // and the registered fully-qualified key is matched
-                // when the caller's tail equals it.  Tuple/unit
+                // `Foo::Empty` vs `Bar::Empty`). Register only the
+                // fully-qualified key. `field_type` accepts a shorter
+                // registered key for callers with extra crate prefixes
+                // only when that suffix match is unique. Tuple/unit
                 // variants carry no named fields and need no entry.
                 let bare_enum = e.ident.to_string();
                 let qualified_enum = if prefix.is_empty() {
@@ -3905,10 +3905,12 @@ fn bind_pattern_locals(
             // `Enum::Variant { f, .. }` resolves each field's concretetype
             // through the per-class field table (see Item::Enum branch of
             // `collect_fields_and_returns`).  Pyre's
-            // `StructFieldRegistry::field_type` runs a suffix walk on the
-            // owner key, so both fully-qualified
-            // (`majit_ir::RdVirtualInfo::VirtualInfo`) and bare
-            // (`VirtualInfo`) destructure paths land on the same field set.
+            // `StructFieldRegistry::field_type` resolves exact owner keys and
+            // accepts crate-prefix suffix recovery only when it is unique, so
+            // fully-qualified destructures such as
+            // `majit_ir::RdVirtualInfo::VirtualInfo` can still resolve to the
+            // registered `RdVirtualInfo::VirtualInfo` identity without
+            // first-wins collisions across unrelated variants.
             let owner: String = pat_struct
                 .path
                 .segments
@@ -3916,6 +3918,7 @@ fn bind_pattern_locals(
                 .map(|seg| seg.ident.to_string())
                 .collect::<Vec<_>>()
                 .join("::");
+            let matched_owner = matched_type.and_then(type_root_from_type_string);
             for field_pat in &pat_struct.fields {
                 let field_name = match &field_pat.member {
                     syn::Member::Named(ident) => ident.to_string(),
@@ -3924,6 +3927,11 @@ fn bind_pattern_locals(
                 let field_type = ctx
                     .struct_fields
                     .field_type(&owner, &field_name)
+                    .or_else(|| {
+                        matched_owner
+                            .as_deref()
+                            .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
+                    })
                     .map(|s| s.to_string());
                 bind_pattern_locals(&field_pat.pat, field_type.as_deref(), ctx);
             }
@@ -5048,6 +5056,92 @@ mod tests {
             )),
             "expected FieldRead for 'x', got {:?}",
             ops
+        );
+    }
+
+    #[test]
+    fn struct_field_registry_does_not_fall_back_to_ambiguous_leaf_names() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            mod a {
+                pub struct Foo { pub x: i64 }
+                pub fn read(foo: Foo) -> i64 { foo.x }
+                pub fn destructure(foo: Foo) -> i64 {
+                    let Foo { x } = foo;
+                    x
+                }
+            }
+            mod b {
+                pub struct Foo { pub x: f64 }
+                pub fn read(foo: Foo) -> f64 { foo.x }
+                pub fn destructure(foo: Foo) -> f64 {
+                    let Foo { x } = foo;
+                    x
+                }
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+
+        assert_eq!(program.struct_fields.field_type("a::Foo", "x"), Some("i64"));
+        assert_eq!(program.struct_fields.field_type("b::Foo", "x"), Some("f64"));
+        assert_eq!(
+            program.struct_fields.field_type("Foo", "x"),
+            None,
+            "bare Foo is ambiguous and must not pick the first registered module"
+        );
+
+        let field_read = |func_name: &str| {
+            let graph = &program
+                .functions
+                .iter()
+                .find(|func| func.name == func_name)
+                .unwrap_or_else(|| panic!("{func_name} graph"))
+                .graph;
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, ty, .. } if field.name == "x" => {
+                        Some((field.owner_root.clone(), ty.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{func_name} FieldRead"))
+        };
+
+        assert_eq!(
+            field_read("a::read"),
+            (Some("a::Foo".to_string()), ValueType::Int)
+        );
+        assert_eq!(
+            field_read("b::read"),
+            (Some("b::Foo".to_string()), ValueType::Float)
+        );
+
+        let destructured_input_ty = |func_name: &str| {
+            let graph = &program
+                .functions
+                .iter()
+                .find(|func| func.name == func_name)
+                .unwrap_or_else(|| panic!("{func_name} graph"))
+                .graph;
+            graph.blocks.iter().find_map(|block| {
+                block.operations.iter().find_map(|op| match &op.kind {
+                    OpKind::Input { name, ty } if name == "x" => Some(ty.clone()),
+                    _ => None,
+                })
+            })
+        };
+
+        assert_eq!(
+            destructured_input_ty("a::destructure"),
+            Some(ValueType::Int)
+        );
+        assert_eq!(
+            destructured_input_ty("b::destructure"),
+            Some(ValueType::Float)
         );
     }
 

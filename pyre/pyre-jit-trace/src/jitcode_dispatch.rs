@@ -83,10 +83,13 @@
 //!       `direct_assembler_call` specialization (`pyjitpl.py:1908-1990,
 //!       2057-2068`) — needs descr-type discrimination + dedicated emit
 //!       paths.
-//!    e. `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION num_live=0` is a known
-//!       under-approx — parity is `capture_resumedata(orgpc,
-//!       after_residual_call=True)` which needs the symbolic frame state
-//!       (`pyjitpl.py:2082-2086`).
+//!    e. Guard recording uses plain `ctx.trace_ctx.record_guard(..., 0)`
+//!       without a paired `capture_resumedata`. Full parity is still
+//!       `capture_resumedata(orgpc, after_residual_call=True)` with exact
+//!       MIFrame liveness and pending-result state (`pyjitpl.py:2082-2086`);
+//!       the walker has no liveness / framestack infrastructure to do
+//!       that without producing a wrong-layout snapshot, so guards stay
+//!       at `rd_resume_position=-1` until that infrastructure lands.
 //!    Multi-session epic; the IR-emission slice landed and is no longer
 //!    blocking opname coverage. (Item f from the earlier audit —
 //!    `_build_allboxes` ABI re-ordering — landed in slice 4.x: see
@@ -759,6 +762,24 @@ fn concrete_int_for_switch(
     }
 }
 
+// PRE-EXISTING-ADAPTATION (deferred port): the standalone walker emits
+// guards via plain `ctx.trace_ctx.record_guard(..., 0)` without the
+// paired `capture_resumedata` call.  RPython
+// `pyjitpl.py:2558-2602 generate_guard` always pairs every guard with
+// `capture_resumedata(resumepc=orgpc)`, walking `metainterp.framestack`
+// and consulting per-opcode liveness (`pyjitpl.py:177
+// get_list_of_active_boxes`) to encode the live `i`/`r`/`f` registers
+// in i→r→f order plus virtualizable / vref boxes.  The walker carries
+// only the typed register banks and has no per-opcode `live` byte
+// reader, so any snapshot constructed here would be a layout
+// approximation (wrong order, all-typed-registers vs liveness-filtered)
+// — strictly worse than no resume because the optimizer's
+// `store_final_boxes_in_guard` would consume it as truth.  The
+// production tracing path (`MIFrame::execute_opcode_step` in
+// `trace_opcode.rs`) already produces an RPython-orthodox snapshot;
+// once the walker grows MIFrame integration the placeholder helper
+// returns.
+
 /// Read a Ref-bank variadic operand list (`R` argcode): 1 length byte
 /// followed by `len` register bytes. Returns the resolved [`OpRef`]s
 /// in jitcode order plus the total operand byte width (so callers can
@@ -893,17 +914,14 @@ fn binop_int_record(
 /// * on miss, emit `INT_EQ(valuebox, ConstInt(key))` plus `GUARD_FALSE`
 ///   for every `switchdict.const_keys_in_order`, then fall through
 ///
-/// PRE-EXISTING-ADAPTATION: the `record_guard(..., 0)` calls below pass a
-/// stub `num_live = 0`, sharing the broader `capture_resumedata` gap
-/// documented at `dispatch_residual_call_iRd_kind` (search for
-/// "num_live-aware capture_resumedata" in this file).  The hit-side
-/// `GUARD_VALUE` and the miss-side `GUARD_FALSE` chain emit empty
-/// resume data here; a real bailout against either would observe an
-/// under-populated frame.  Convergence requires the
-/// `capture_resumedata(after_residual_call=True)` wire-up epic
-/// (pyjitpl.py:2078-2082) which is the same prerequisite the residual-
-/// call dispatchers are waiting on, so it lands in one slice across
-/// every guard-emitting site rather than one-by-one.
+/// PRE-EXISTING-ADAPTATION: guards below record with empty resume data
+/// (`record_guard(..., 0)`).  RPython `pyjitpl.py:600 opimpl_switch`
+/// pairs every `GUARD_VALUE` / `GUARD_FALSE` with `generate_guard(...,
+/// resumepc=orgpc) → capture_resumedata(orgpc)` walking the framestack
+/// with liveness.  The standalone walker has no MIFrame liveness /
+/// framestack infrastructure, so attaching a snapshot here would
+/// approximate it (wrong layout, all-typed-registers vs liveness-
+/// filtered) and downstream layout matching consumes it as truth.
 fn dispatch_switch_id(
     code: &[u8],
     op: &DecodedOp,
@@ -1983,8 +2001,10 @@ fn direct_call_release_gil(
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     // pyjitpl.py:2082 handle_possible_exception — emits
     // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.
-    // `num_live=0` is the same under-approx the rest of this
-    // dispatcher uses (capture_resumedata not yet wired).
+    // PRE-EXISTING-ADAPTATION: walker has no MIFrame liveness /
+    // framestack to feed `capture_resumedata(after_residual_call=True)`
+    // (pyjitpl.py:2082 → 2586), so the guard records with
+    // `rd_resume_position=-1` — matching shape without resume data.
     if ei.check_can_raise(false) {
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     }
@@ -2056,14 +2076,10 @@ fn direct_call_release_gil(
 ///   - `direct_libffi_call` / `direct_assembler_call` specialization
 ///     (`pyjitpl.py:1908-1990`).
 ///   - KEEPALIVE for vablebox (`pyjitpl.py:2080-2081`).
-///   - `num_live`-aware `capture_resumedata(after_residual_call=True)`
-///     on the guards (`pyjitpl.py:2078-2082 → capture_resumedata`).
-///     `record_guard(..., 0)` passes a stub `num_live = 0`; the
-///     guard's resume data is therefore empty and a real bailout
-///     would observe an under-populated frame.  Affects every
-///     guard-emitting site in this file, not just the residual-call
-///     dispatchers; convergence is the broader `capture_resumedata`
-///     wire-up epic.
+///   - Full `capture_resumedata(after_residual_call=True)` liveness on the
+///     guards (`pyjitpl.py:2078-2082 → capture_resumedata`). Walker guards
+///     stay at `rd_resume_position=-1`; without the MIFrame liveness /
+///     framestack walk the only honest snapshot is none.
 ///
 /// All of the above need MIFrame state pyre-jit-trace doesn't yet
 /// expose.
@@ -2156,8 +2172,9 @@ fn dispatch_residual_call_iRd_kind(
             }
             // pyjitpl.py:2082 `metainterp.handle_possible_exception()` emits
             // `GUARD_NO_EXCEPTION` whenever the EffectInfo can raise.
-            // `num_live=0` is a known under-approx
-            // (`capture_resumedata` not yet wired).
+            // Walker has no MIFrame liveness/framestack to feed
+            // `capture_resumedata(after_residual_call=True)` so the guard
+            // records with `rd_resume_position=-1`.
             if can_raise {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             }
@@ -6096,6 +6113,16 @@ mod tests {
         assert!(
             guard_op.args.is_empty(),
             "GuardNoException takes no operand args",
+        );
+        // PRE-EXISTING-ADAPTATION: standalone walker has no MIFrame
+        // liveness / framestack to feed `capture_resumedata(orgpc,
+        // after_residual_call=True)` (`pyjitpl.py:2082-2086`).  Until
+        // that infrastructure lands, walker guards record with empty
+        // resume data — better than a wrong-layout snapshot the
+        // optimizer would consume as truth.
+        assert_eq!(
+            guard_op.rd_resume_position, -1,
+            "walker guards stay at rd_resume_position=-1 until liveness/framestack lands",
         );
     }
 

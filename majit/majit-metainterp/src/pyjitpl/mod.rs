@@ -17358,7 +17358,7 @@ mod tests {
         let (item, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
         if let Some(ctx) = meta.trace_ctx() {
             let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
-            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)]);
+            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)], 0, 0);
             ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         }
         meta.compile_loop(&[OpRef(0), OpRef(1), OpRef(2)], ());
@@ -17469,7 +17469,7 @@ mod tests {
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[sum]);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
         meta.compile_loop(&[OpRef(0)], ());
@@ -17565,7 +17565,7 @@ mod tests {
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[sum]);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
         meta.compile_loop(&[OpRef(0)], ());
@@ -17604,7 +17604,7 @@ mod tests {
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
                 let sum2 = ctx.record_op(OpCode::IntAdd, &[sum, const_one]);
                 let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-                ctx.capture_snapshot_for_last_guard(&[sum2, i1]);
+                ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }
             meta.compile_loop(&[OpRef(0), OpRef(1)], ());

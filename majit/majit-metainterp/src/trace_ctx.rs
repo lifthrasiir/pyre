@@ -883,22 +883,25 @@ impl TraceCtx {
         self.recorder.set_last_op_resume_position(snapshot_id);
     }
 
-    /// PRE-EXISTING-ADAPTATION: low-level / test snapshot helper used by
-    /// callers that record guards without an MIFrame to walk.
+    /// PRE-EXISTING-ADAPTATION: low-level / single-frame snapshot helper
+    /// used by callers that record guards without a populated framestack
+    /// to walk.
     ///
     /// RPython's `pyjitpl.py:2586 capture_resumedata` walks the
-    /// `framestack`, encoding one `SnapshotFrame` per `MIFrame` (with the
-    /// real `jitcode_index`, `pc`, plus `virtualizable_boxes` and
+    /// `framestack`, encoding one `SnapshotFrame` per `MIFrame` (with
+    /// the real `jitcode_index`, `pc`, plus `virtualizable_boxes` and
     /// `virtualref_boxes` when configured).  Pyre's segmented low-level
-    /// driver (`jitdriver.rs::force_finish_trace`) and the
-    /// recorder-level unit tests in `jitdriver.rs::tests` /
+    /// driver (`jitdriver.rs::force_finish_trace`), the standalone
+    /// walker (`jitcode_dispatch.rs::record_guard_with_current_snapshot`),
+    /// and the recorder-level unit tests in `jitdriver.rs::tests` /
     /// `pyjitpl::tests` don't have a populated MIFrame at the guard
-    /// point — they only know the live `OpRef` set.  This helper builds
-    /// a single placeholder `SnapshotFrame { jitcode_index: 0, pc: 0,
-    /// boxes }` so the optimizer's `store_final_boxes_in_guard` has the
-    /// snapshot it requires (`resume.py:397`).  `vable_boxes` and
-    /// `vref_boxes` are empty: callers using this path don't manage
-    /// virtualizables or virtual refs.
+    /// point — they only know the live `OpRef` set.  Caller supplies the
+    /// `jitcode_index` and `pc` of the frame the guard belongs to so
+    /// downstream layout matching (`jit_state.rs::*` keys on these
+    /// fields) sees real coordinates rather than the previous
+    /// `0/0` placeholder.  `vable_boxes` and `vref_boxes` are empty:
+    /// callers using this path don't manage virtualizables or virtual
+    /// refs.
     ///
     /// Convergence (Task #89): once `S::Sym` is lifted into
     /// `MIFrame::populate_for_guard`, both call sites can route through
@@ -909,7 +912,12 @@ impl TraceCtx {
     /// resolve to a known `Box.type`; constants must have a recorded
     /// value.  Misses are bookkeeping bugs and panic, not silent
     /// fallbacks.
-    pub fn capture_snapshot_for_last_guard(&mut self, active_boxes: &[OpRef]) {
+    pub fn capture_snapshot_for_last_guard(
+        &mut self,
+        active_boxes: &[OpRef],
+        jitcode_index: u32,
+        pc: u32,
+    ) {
         let boxes: Vec<crate::recorder::SnapshotTagged> = active_boxes
             .iter()
             .map(|opref| {
@@ -928,8 +936,8 @@ impl TraceCtx {
             .collect();
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
             frames: vec![crate::recorder::SnapshotFrame {
-                jitcode_index: 0,
-                pc: 0,
+                jitcode_index,
+                pc,
                 boxes,
             }],
             vable_boxes: Vec::new(),

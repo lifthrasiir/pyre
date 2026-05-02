@@ -1034,6 +1034,17 @@ impl<S: JitState> JitDriver<S> {
                     .as_ref()
                     .map(|sym| S::collect_jump_args(sym))
                     .unwrap_or_default();
+                // RPython `pyjitpl.py:2586 capture_resumedata` reads
+                // `frame.jitcode.index` from the live framestack.  Pull
+                // the same value here so the placeholder snapshot
+                // captures real coordinates instead of `0`.
+                let frame_jitcode_index = self
+                    .meta
+                    .framestack
+                    .frames
+                    .last()
+                    .map(|f| f.jitcode.index() as u32)
+                    .unwrap_or(0);
                 if let Some(ctx) = self.meta.trace_ctx() {
                     // pyjitpl.py:2594: use last_traced_pc
                     // (= frame.pc at the guard point), not header_pc.
@@ -1060,7 +1071,12 @@ impl<S: JitState> JitDriver<S> {
                         // capture the active low-level boxes via the
                         // segmented-driver placeholder helper instead
                         // of inventing a fail_args-only fallback.
-                        ctx.capture_snapshot_for_last_guard(&current_live);
+                        let frame_pc = ctx.last_traced_pc as u32;
+                        ctx.capture_snapshot_for_last_guard(
+                            &current_live,
+                            frame_jitcode_index,
+                            frame_pc,
+                        );
                         ctx.set_fail_args(guard_opref, &current_live);
                     }
                     let dummy = ctx.const_int(0);
@@ -3797,7 +3813,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0); // input arg
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[i0]);
+            ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         };
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -3851,7 +3867,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)]);
+            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)], 0, 0);
             ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         };
         driver
@@ -3903,7 +3919,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)]);
+            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)], 0, 0);
             ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         };
         driver
@@ -4005,7 +4021,7 @@ mod tests {
             let i0 = OpRef(0);
             ctx.const_int(42);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[i0]);
+            ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -4122,7 +4138,7 @@ mod tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[sum]);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
         };
@@ -4163,7 +4179,7 @@ mod tests {
                 let c1 = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
                 let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-                ctx.capture_snapshot_for_last_guard(&[sum]);
+                ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
             driver.meta.compile_loop(&[OpRef(0)], ());
@@ -4204,7 +4220,7 @@ mod tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[sum]);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
         };
@@ -4269,7 +4285,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[]);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(g, &[]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -4360,7 +4376,7 @@ mod tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[sum]);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             sum
         };
