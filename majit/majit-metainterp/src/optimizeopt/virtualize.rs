@@ -2184,9 +2184,7 @@ mod tests {
 
     use super::super::seed_guard_snapshots_with;
 
-    fn seed_virtualize_guard_snapshots(
-        ops: &[Op],
-    ) -> (Vec<Op>, std::collections::HashMap<i32, Vec<OpRef>>) {
+    fn seed_virtualize_guard_snapshots(ops: &[Op]) -> (Vec<Op>, crate::optimizeopt::SnapshotBoxes) {
         // These direct optimizer tests do not build MIFrame objects.  Their
         // guard bracket list is the explicit active-box snapshot input that
         // RPython would get from capture_resumedata(); store_final_boxes then

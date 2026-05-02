@@ -15,6 +15,7 @@ use crate::optimizeopt::{
 use majit_ir::{Const, DescrRef, GcRef, Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
+use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 
 /// bridgeopt.py:124 parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
@@ -157,14 +158,14 @@ pub struct Optimizer {
     /// resume.py parity: per-guard snapshots from tracing time.
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
     /// Propagated to OptContext for store_final_boxes_in_guard.
-    pub snapshot_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
+    pub snapshot_boxes: SnapshotBoxes,
     /// Per-frame box counts for multi-frame snapshots.
     /// Propagated to OptContext for store_final_boxes_in_guard multi-frame encoding.
-    pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
+    pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
-    pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<OpRef>>,
+    pub snapshot_vable_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
-    pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
+    pub snapshot_frame_pcs: SnapshotFramePcs,
     /// Phase 1 emit ops carried into Phase 2's lookup surface (Slice 0.6).
     ///
     /// Mirror of `OptContext.phase1_emit_ops`; populated at the end of
@@ -174,24 +175,6 @@ pub struct Optimizer {
     /// directly — single source of truth for cross-phase Box.type
     /// (history.py:220 parity).
     pub phase1_emit_ops: Vec<majit_ir::Op>,
-    /// Phase 1 `value_types` carried into Phase 2's lookup surface.
-    ///
-    /// RPython Box objects keep their `box.type` regardless of whether
-    /// the box ever made it into `loop.operations`; pyre's flat
-    /// `OpRef(u32)` namespace cannot rely on Python identity, so the
-    /// `register_value_type` writes from Phase 1 (virtual heads, alias
-    /// seeds, propagate refresh, short-preamble) need to flow into
-    /// Phase 2 to keep cross-phase OpRefs typed when neither
-    /// `phase1_emit_ops` nor `original_trace_op_types` covers them.
-    /// Populated at the end of `optimize_with_constants_and_inputs_at`
-    /// from `ctx.value_types`, then drained into `OptContext.value_types`
-    /// at Phase 2 `setup_optimizations` start.
-    pub prev_phase_value_types: std::collections::HashMap<u32, majit_ir::Type>,
-    /// RPython Box type parity: position→type for ALL original trace ops.
-    /// snapshot_boxes reference original trace positions, but the optimizer
-    /// receives transformed ops (after fold_box/elide). This map covers
-    /// positions that were removed during trace transformation.
-    pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// jitprof.Counters.OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED accumulators.
     ///
     /// RPython optimizer.py:626/629/673 calls
@@ -1080,13 +1063,11 @@ impl Optimizer {
             string_constant_alloc: None,
             callinfocollection: None,
             resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
-            snapshot_boxes: std::collections::HashMap::new(),
-            snapshot_frame_sizes: std::collections::HashMap::new(),
-            snapshot_vable_boxes: std::collections::HashMap::new(),
-            snapshot_frame_pcs: std::collections::HashMap::new(),
+            snapshot_boxes: Vec::new(),
+            snapshot_frame_sizes: Vec::new(),
+            snapshot_vable_boxes: Vec::new(),
+            snapshot_frame_pcs: Vec::new(),
             phase1_emit_ops: Vec::new(),
-            prev_phase_value_types: std::collections::HashMap::new(),
-            original_trace_op_types: std::collections::HashMap::new(),
             opt_ops_emitted: 0,
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
@@ -1811,26 +1792,12 @@ impl Optimizer {
 
         // RPython Box type parity: in RPython each Box carries its type
         // intrinsically (InputArgInt, InputArgRef, etc.). In majit, OpRef
-        // is an untyped u32. Carry recorder-side positions on a dedicated
-        // ctx field (rather than fanning them into value_types) so the
-        // `opref_type` chain reads them at a fixed priority below the
-        // pass-local `value_types` writers.
-        //
-        // Skip Void entries: a reserve_pos that later hands out a Void
-        // slot for a new typed op would otherwise fire the Box.type
-        // retype invariant once the same OpRef is queried via this map.
-        // 1. Original trace ops (pre-transformation positions for snapshots
-        //    and retrace) — surfaced through ctx.original_trace_op_types.
-        ctx.original_trace_op_types = self
-            .original_trace_op_types
-            .iter()
-            .filter(|&(_, v)| *v != majit_ir::Type::Void)
-            .map(|(&k, &v)| (k, v))
-            .collect();
-        // 2. Phase 1 → Phase 2 carry: `phase1_emit_ops` below; `op_at`
+        // is an untyped u32, so the cross-phase carries below thread the
+        // Phase 1-side type information into Phase 2's `opref_type` chain.
+        // 1. Phase 1 → Phase 2 carry: `phase1_emit_ops` below; `op_at`
         //    resolves cross-phase OpRefs through `op.type_` directly
         //    (history.py:220 box.type parity).
-        // 3. Inputarg types (from recorder — RPython InputArgInt/Ref/Float).
+        // 2. Inputarg types (from recorder — RPython InputArgInt/Ref/Float).
         //    Slice 0.5: inputarg slot lookups live on the dedicated
         //    `ctx.inputarg_types` Vec exclusively, mirroring RPython's
         //    `InputArg{Int,Ref,Float}.type` (history.py:220 parity).
@@ -1838,16 +1805,7 @@ impl Optimizer {
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
-        // Phase 1 → Phase 2 carry of `value_types` entries that are not
-        // covered by `phase1_emit_ops` (virtual heads, alias seeds, refresh
-        // writes, short-preamble PreambleOp tombstones).  RPython Box objects
-        // keep `box.type` regardless of whether they were emitted, so the
-        // pyre flat-OpRef equivalent must persist these types into Phase 2's
-        // `value_types` to keep cross-phase OpRef typing intact.
-        for (k, v) in self.prev_phase_value_types.drain() {
-            ctx.value_types.entry(k).or_insert(v);
-        }
-        // 4. (removed) Slice 0.5: transformed trace ops carry `op.type_`
+        // 3. (removed) Slice 0.5: transformed trace ops carry `op.type_`
         //    intrinsically (resoperation.py:1693 parity); the pipeline
         //    emits each op into `new_operations` before moving to the
         //    next, so `OptContext::op_at` resolves the type of any
@@ -1860,28 +1818,29 @@ impl Optimizer {
         //
         // `reserve_pos` only skips over `constants`. Phase 2 / retrace
         // contexts inherit Phase 1's positions through
-        // `original_trace_op_types` (raw recorder positions) and the
         // input `ops` slice (post-fold transformed positions); the
         // emit-side high water can sit above the caller-provided
         // `start_next_pos` whenever the transformed `ops` slice ends
         // below that mark. Without this bump, a later `get_or_make_const`
         // / `emit` would hand out an already-seeded position and fire
         // the Box.type retype invariant.
-        let max_orig = self
-            .original_trace_op_types
-            .iter()
-            .filter(|&(_, v)| *v != majit_ir::Type::Void)
-            .map(|(k, _)| *k)
-            .max()
-            .unwrap_or(0);
         let max_input = ops
             .iter()
             .filter(|op| !op.pos.is_none() && op.result_type() != majit_ir::Type::Void)
             .map(|op| op.pos.0)
             .max()
             .unwrap_or(0);
-        let max_typed_pos = max_orig.max(max_input);
-        let next_after = max_typed_pos.saturating_add(1);
+        let max_snapshot = self
+            .snapshot_boxes
+            .iter()
+            .chain(self.snapshot_vable_boxes.iter())
+            .flatten()
+            .flat_map(|boxes| boxes.iter().map(|boxref| boxref.opref))
+            .filter(|opref| !opref.is_none() && !opref.is_constant())
+            .map(|opref| opref.0)
+            .max()
+            .unwrap_or(0);
+        let next_after = max_input.max(max_snapshot).saturating_add(1);
         ctx.next_pos = ctx.next_pos.max(next_after);
 
         // optimizer.py:293 patchguardop parity: propagate to Phase 2
@@ -2167,11 +2126,11 @@ impl Optimizer {
                 let resolved = ctx.get_box_replacement(*arg);
                 let expected_ref =
                     i < inputarg_types.len() && inputarg_types[i] == majit_ir::Type::Ref;
-                // setup_optimizations seeds trace_inputarg_types into
-                // ctx.value_types (this fn, lines 1816-1818), so opref_type
-                // covers both the per-op result and the inputarg slot.
-                // PtrInfo presence is an additional Ref-only side channel
-                // for inputargs that are not in `new_operations`.
+                // setup_optimizations seeds `trace_inputarg_types` into
+                // ctx.inputarg_types (this fn, line 1837), and `opref_type`
+                // consults it via the inputarg-slot fallback after the
+                // op/value_types chain. PtrInfo presence is an additional
+                // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_is_ref = ctx.opref_type(resolved) == Some(majit_ir::Type::Ref)
                     || ctx.get_ptr_info(resolved).is_some();
                 if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
@@ -2220,21 +2179,15 @@ impl Optimizer {
         // Phase 1 emit ops carry their own `op.type_`; Phase 1 inputarg slot
         // OpRefs are resolved through `OptContext::inputarg_type` (which
         // falls back to the shared `inputarg_types` Vec for low OpRefs in
-        // `[0, num_inputs)`). The slice carry covers emit ops via `op_at` →
-        // `op.type_`; the `value_types` carry below covers everything that
-        // Box-identity would have kept alive in RPython but flat-OpRef
-        // would otherwise lose at the phase boundary.
+        // `[0, num_inputs)`). ExportedState carries boundary input types
+        // explicitly, matching RPython's typed Box objects without a
+        // phase-wide OpRef→Type side table.
         self.phase1_emit_ops.clear();
         for op in &ctx.new_operations {
             if !op.pos.is_none() && op.type_ != majit_ir::Type::Void {
                 self.phase1_emit_ops.push(op.clone());
             }
         }
-        // Capture Phase 1 `value_types` entries for Phase 2 setup_optimizations
-        // to seed back into the next ctx.  Mirrors RPython's persistent
-        // `box.type` attribute across the export/import boundary.
-        self.prev_phase_value_types = ctx.value_types.clone();
-
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
         self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);
@@ -5047,8 +5000,6 @@ mod tests {
         // Vec, so they are NOT carried here.
         let mut opt = Optimizer::new();
         opt.trace_inputarg_types = vec![Type::Void, Type::Int, Type::Ref];
-        opt.original_trace_op_types.insert(40, Type::Void);
-        opt.original_trace_op_types.insert(41, Type::Int);
         opt.phase1_emit_ops
             .push(majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef(50)]));
 

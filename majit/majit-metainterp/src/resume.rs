@@ -204,11 +204,49 @@ impl NumberingState {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Virtualizable field boxes (resume.py:234-241).
-    pub vable_array: Vec<majit_ir::OpRef>,
+    pub vable_array: Vec<SnapshotBox>,
     /// Virtualref pairs (resume.py:243-247). Length must be even.
-    pub vref_array: Vec<majit_ir::OpRef>,
+    pub vref_array: Vec<SnapshotBox>,
     /// Frame chain (resume.py:249-253). Multiple frames for inlined calls.
     pub framestack: Vec<SnapshotFrame>,
+}
+
+/// A snapshot entry corresponding to one RPython Box.
+///
+/// RPython carries `box.type` on the Box object itself.  Majit's `OpRef`
+/// is only an integer identity, so typed recorder snapshots preserve the
+/// `SnapshotTagged::Box(_, Type)` payload here instead of recovering it
+/// later from an OpRef-keyed side table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotBox {
+    pub opref: majit_ir::OpRef,
+    pub tp: Option<majit_ir::Type>,
+}
+
+impl SnapshotBox {
+    pub fn untyped(opref: majit_ir::OpRef) -> Self {
+        SnapshotBox { opref, tp: None }
+    }
+
+    pub fn typed(opref: majit_ir::OpRef, tp: majit_ir::Type) -> Self {
+        SnapshotBox {
+            opref,
+            tp: Some(tp),
+        }
+    }
+
+    pub fn map_opref(self, f: impl FnOnce(majit_ir::OpRef) -> majit_ir::OpRef) -> Self {
+        SnapshotBox {
+            opref: f(self.opref),
+            tp: self.tp,
+        }
+    }
+}
+
+impl From<majit_ir::OpRef> for SnapshotBox {
+    fn from(opref: majit_ir::OpRef) -> Self {
+        SnapshotBox::untyped(opref)
+    }
 }
 
 /// One frame in a snapshot's frame chain.
@@ -219,7 +257,7 @@ pub struct SnapshotFrame {
     /// Bytecode program counter (resume.py:250 pc).
     pub pc: i32,
     /// Live boxes for this frame's registers (resume.py:253).
-    pub boxes: Vec<majit_ir::OpRef>,
+    pub boxes: Vec<SnapshotBox>,
 }
 
 impl Snapshot {
@@ -231,6 +269,14 @@ impl Snapshot {
     /// frame's liveness in the correct jitcode instead of silently
     /// falling through the pc-out-of-range LiveVars path on `jitcodes[0]`.
     pub fn single_frame(jitcode_index: i32, pc: i32, boxes: Vec<majit_ir::OpRef>) -> Self {
+        Self::single_frame_boxes(
+            jitcode_index,
+            pc,
+            boxes.into_iter().map(SnapshotBox::from).collect(),
+        )
+    }
+
+    pub fn single_frame_boxes(jitcode_index: i32, pc: i32, boxes: Vec<SnapshotBox>) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
@@ -251,6 +297,21 @@ impl Snapshot {
     /// jc_index=4 at `framestack[1]`). Input tuples for this factory
     /// follow the same caller-first order.
     pub fn multi_frame(frames: Vec<(i32, i32, Vec<majit_ir::OpRef>)>) -> Self {
+        Self::multi_frame_boxes(
+            frames
+                .into_iter()
+                .map(|(jitcode_index, pc, boxes)| {
+                    (
+                        jitcode_index,
+                        pc,
+                        boxes.into_iter().map(SnapshotBox::from).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub fn multi_frame_boxes(frames: Vec<(i32, i32, Vec<SnapshotBox>)>) -> Self {
         Snapshot {
             vable_array: Vec::new(),
             vref_array: Vec::new(),
@@ -3683,11 +3744,12 @@ impl ResumeDataLoopMemo {
     /// resume.py:192-226 `_number_boxes` — tag each box in a snapshot section.
     pub fn _number_boxes(
         &mut self,
-        boxes: &[majit_ir::OpRef],
+        boxes: &[SnapshotBox],
         numb_state: &mut NumberingState,
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
-        for &raw_opref in boxes {
+        for &snapshot_box in boxes {
+            let raw_opref = snapshot_box.opref;
             if raw_opref.is_none() {
                 numb_state.append_short(NULLREF);
                 continue;
@@ -3709,7 +3771,7 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(tagged);
                 continue;
             }
-            let box_type = env.get_type(opref);
+            let box_type = snapshot_box.tp.unwrap_or_else(|| env.get_type(opref));
             let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),

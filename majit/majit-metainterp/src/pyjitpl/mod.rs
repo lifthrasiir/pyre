@@ -42,9 +42,12 @@ pub use crate::compile::{
 };
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
+use crate::optimizeopt::{
+    SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_get, snapshot_insert,
+};
 use crate::resume::{
     EncodedResumeData, MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite,
-    ResumeData, ResumeDataLoopMemo, ResumeLayoutSummary, ResumeStorage,
+    ResumeData, ResumeDataLoopMemo, ResumeLayoutSummary, ResumeStorage, SnapshotBox,
 };
 use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
@@ -248,15 +251,15 @@ fn snapshot_map_from_trace_snapshots(
     constants: &mut std::collections::HashMap<u32, i64>,
     constant_types: &mut std::collections::HashMap<u32, majit_ir::Type>,
 ) -> (
-    std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
-    std::collections::HashMap<i32, Vec<usize>>,
-    std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
-    std::collections::HashMap<i32, Vec<(i32, i32)>>,
+    SnapshotBoxes,
+    SnapshotFrameSizes,
+    SnapshotBoxes,
+    SnapshotFramePcs,
 ) {
-    let mut box_map = std::collections::HashMap::new();
-    let mut size_map = std::collections::HashMap::new();
-    let mut vable_map = std::collections::HashMap::new();
-    let mut pc_map = std::collections::HashMap::new();
+    let mut box_map = Vec::new();
+    let mut size_map = Vec::new();
+    let mut vable_map = Vec::new();
+    let mut pc_map = Vec::new();
     let mut next_const_idx = constants
         .keys()
         .filter(|k| majit_ir::OpRef(**k).is_constant())
@@ -264,11 +267,18 @@ fn snapshot_map_from_trace_snapshots(
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
-    // opencoder.py:603 _encode: Box/Virtual → OpRef, Const → pool OpRef.
-    let mut tagged_to_opref = |t: &crate::recorder::SnapshotTagged| -> majit_ir::OpRef {
+    // opencoder.py:603 _encode: Box/Virtual → Box identity, Const → pool
+    // OpRef. RPython keeps `box.type` on the Box object; preserve the
+    // recorder's SnapshotTagged type on the snapshot entry instead of
+    // recovering it later from an OpRef-keyed side table.
+    let mut tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
         match t {
-            crate::recorder::SnapshotTagged::Box(n, _tp) => majit_ir::OpRef(*n),
-            crate::recorder::SnapshotTagged::Virtual(n) => majit_ir::OpRef(*n),
+            crate::recorder::SnapshotTagged::Box(n, tp) => {
+                SnapshotBox::typed(majit_ir::OpRef(*n), *tp)
+            }
+            crate::recorder::SnapshotTagged::Virtual(n) => {
+                SnapshotBox::typed(majit_ir::OpRef(*n), majit_ir::Type::Ref)
+            }
             crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
                 // Register in pool so is_const → true, get_const → (0, Ref),
@@ -292,30 +302,30 @@ fn snapshot_map_from_trace_snapshots(
                     constant_types.insert(opref.0, *tp);
                     opref.0
                 });
-                majit_ir::OpRef(key)
+                SnapshotBox::typed(majit_ir::OpRef(key), *tp)
             }
         }
     };
     for (id, snap) in trace_snapshots.iter().enumerate() {
-        let boxes: Vec<majit_ir::OpRef> = snap
+        let boxes: Vec<SnapshotBox> = snap
             .frames
             .iter()
             .flat_map(|f| f.boxes.iter())
-            .map(&mut tagged_to_opref)
+            .map(&mut tagged_to_box)
             .collect();
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
-        let vable_boxes: Vec<majit_ir::OpRef> =
-            snap.vable_boxes.iter().map(&mut tagged_to_opref).collect();
+        let vable_boxes: Vec<SnapshotBox> =
+            snap.vable_boxes.iter().map(&mut tagged_to_box).collect();
         let frame_pcs: Vec<(i32, i32)> = snap
             .frames
             .iter()
             .map(|f| (f.jitcode_index as i32, f.pc as i32))
             .collect();
         let id = id as i32;
-        box_map.insert(id, boxes);
-        size_map.insert(id, frame_sizes);
-        vable_map.insert(id, vable_boxes);
-        pc_map.insert(id, frame_pcs);
+        snapshot_insert(&mut box_map, id, boxes);
+        snapshot_insert(&mut size_map, id, frame_sizes);
+        snapshot_insert(&mut vable_map, id, vable_boxes);
+        snapshot_insert(&mut pc_map, id, frame_pcs);
     }
     (box_map, size_map, vable_map, pc_map)
 }
@@ -324,10 +334,10 @@ fn snapshot_map_from_trace_snapshots(
 struct PreparedBridgeTrace {
     ops: Vec<Op>,
     inputargs: Vec<InputArg>,
-    snapshot_boxes: HashMap<i32, Vec<OpRef>>,
-    snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
-    snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
-    snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    snapshot_boxes: SnapshotBoxes,
+    snapshot_frame_sizes: SnapshotFrameSizes,
+    snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
 }
 
@@ -345,12 +355,12 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
 
 #[allow(dead_code)]
 fn translate_trace_iter_box_map(
-    mut box_map: HashMap<i32, Vec<OpRef>>,
+    mut box_map: SnapshotBoxes,
     cache: &[Option<OpRef>],
-) -> HashMap<i32, Vec<OpRef>> {
-    for boxes in box_map.values_mut() {
-        for opref in boxes.iter_mut() {
-            *opref = translate_trace_iter_opref(*opref, cache);
+) -> SnapshotBoxes {
+    for boxes in box_map.iter_mut().flatten() {
+        for boxref in boxes.iter_mut() {
+            *boxref = boxref.map_opref(|opref| translate_trace_iter_opref(opref, cache));
         }
     }
     box_map
@@ -379,10 +389,10 @@ fn translate_trace_iter_box_map(
 fn prepare_bridge_trace_for_optimizer(
     bridge_ops: &[Op],
     bridge_inputargs: &[InputArg],
-    snapshot_boxes: HashMap<i32, Vec<OpRef>>,
-    snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
-    snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
-    snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    snapshot_boxes: SnapshotBoxes,
+    snapshot_frame_sizes: SnapshotFrameSizes,
+    snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
@@ -3529,20 +3539,6 @@ impl<M: Clone> MetaInterp<M> {
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
 
-        // RPython Box type parity: build type index from the FULL uncut
-        // trace. snapshot_boxes reference positions from the original trace;
-        // cut_trace_from removes early ops. Must capture types before cut.
-        // RPython Box type parity: every recorded op (including guards)
-        // has a position and a type. Include Void ops (guards) so that
-        // snapshot references to guard positions are covered.
-        let pre_cut_trace_op_types: std::collections::HashMap<u32, majit_ir::Type> = trace
-            .ops
-            .iter()
-            .filter(|op| !op.pos.is_none())
-            .map(|op| (op.pos.0, op.result_type()))
-            .collect();
-        let pre_cut_trace_op_types_for_retry = pre_cut_trace_op_types.clone();
-
         // compile.py:269-270: cut trace at cross-loop merge point.
         // When the trace was retargeted to a different loop header, record
         // the new header PC so meta can be updated after insert.
@@ -3621,11 +3617,6 @@ impl<M: Clone> MetaInterp<M> {
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
         unroll_opt.trace_inputarg_types = trace.inputargs.iter().map(|ia| ia.tp).collect();
-        // RPython Box type parity: snapshot_boxes reference positions from
-        // the original uncut trace. The optimizer sees transformed+cut ops.
-        // Use the pre-cut type index to cover all referenced positions.
-        unroll_opt.original_trace_op_types = pre_cut_trace_op_types;
-
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -3696,8 +3687,6 @@ impl<M: Clone> MetaInterp<M> {
                         for (i, &tp) in inputarg_types.iter().enumerate() {
                             simple_opt.constant_types.insert(i as u32, tp);
                         }
-                        simple_opt.original_trace_op_types =
-                            pre_cut_trace_op_types_for_retry.clone();
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
@@ -5094,15 +5083,6 @@ impl<M: Clone> MetaInterp<M> {
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
         let trace_snapshots = trace.snapshots.clone();
 
-        // RPython Box type parity: build type index from the trace ops.
-        // snapshot_boxes reference positions from the original trace.
-        let pre_cut_trace_op_types: std::collections::HashMap<u32, majit_ir::Type> = trace
-            .ops
-            .iter()
-            .filter(|op| !op.pos.is_none())
-            .map(|op| (op.pos.0, op.result_type()))
-            .collect();
-
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
@@ -5125,8 +5105,6 @@ impl<M: Clone> MetaInterp<M> {
         for (i, &tp) in inputarg_types.iter().enumerate() {
             optimizer.constant_types.insert(i as u32, tp);
         }
-        optimizer.original_trace_op_types = pre_cut_trace_op_types;
-
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -7671,10 +7649,10 @@ impl<M: Clone> MetaInterp<M> {
         bridge_inputargs: &[majit_ir::InputArg],
         constants: HashMap<u32, i64>,
         mut constant_types: HashMap<u32, Type>,
-        snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
-        snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
-        snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
-        snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+        snapshot_boxes: SnapshotBoxes,
+        snapshot_frame_sizes: SnapshotFrameSizes,
+        snapshot_vable_boxes: SnapshotBoxes,
+        snapshot_frame_pcs: SnapshotFramePcs,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -7973,10 +7951,10 @@ impl<M: Clone> MetaInterp<M> {
         bridge_inputargs: &[majit_ir::InputArg],
         constants: HashMap<u32, i64>,
         mut constant_types: HashMap<u32, Type>,
-        snapshot_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
-        snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
-        snapshot_vable_boxes: HashMap<i32, Vec<majit_ir::OpRef>>,
-        snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+        snapshot_boxes: SnapshotBoxes,
+        snapshot_frame_sizes: SnapshotFrameSizes,
+        snapshot_vable_boxes: SnapshotBoxes,
+        snapshot_frame_pcs: SnapshotFramePcs,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -16170,10 +16148,18 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(0)], 3),
             mk_op(OpCode::Jump, &[OpRef(2), OpRef(3)], OpRef::NONE.0),
         ];
-        let mut snapshot_boxes = HashMap::new();
-        snapshot_boxes.insert(0, vec![OpRef(0), OpRef(2), OpRef(3)]);
-        let mut snapshot_vable_boxes = HashMap::new();
-        snapshot_vable_boxes.insert(0, vec![OpRef(1), OpRef(2)]);
+        let mut snapshot_boxes = Vec::new();
+        snapshot_insert(
+            &mut snapshot_boxes,
+            0,
+            vec![OpRef(0).into(), OpRef(2).into(), OpRef(3).into()],
+        );
+        let mut snapshot_vable_boxes = Vec::new();
+        snapshot_insert(
+            &mut snapshot_vable_boxes,
+            0,
+            vec![OpRef(1).into(), OpRef(2).into()],
+        );
         let pending_bridge_rd = PendingBridgeRd {
             storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
             frontend_boxes: vec![11, 22],
@@ -16187,9 +16173,9 @@ mod tests {
             &bridge_ops,
             &bridge_inputargs,
             snapshot_boxes,
-            HashMap::new(),
+            Vec::new(),
             snapshot_vable_boxes,
-            HashMap::new(),
+            Vec::new(),
             Some(pending_bridge_rd),
             10,
         );
@@ -16208,11 +16194,19 @@ mod tests {
         assert_eq!(prepared.ops[1].args.to_vec(), vec![OpRef(10), OpRef(10)]);
         assert_eq!(prepared.ops[2].args.to_vec(), vec![OpRef(12), OpRef(13)]);
         assert_eq!(
-            prepared.snapshot_boxes.get(&0).cloned().unwrap(),
+            snapshot_get(&prepared.snapshot_boxes, 0)
+                .unwrap()
+                .iter()
+                .map(|boxref| boxref.opref)
+                .collect::<Vec<_>>(),
             vec![OpRef(10), OpRef(12), OpRef(13)]
         );
         assert_eq!(
-            prepared.snapshot_vable_boxes.get(&0).cloned().unwrap(),
+            snapshot_get(&prepared.snapshot_vable_boxes, 0)
+                .unwrap()
+                .iter()
+                .map(|boxref| boxref.opref)
+                .collect::<Vec<_>>(),
             vec![OpRef(11), OpRef(12)]
         );
         assert_eq!(

@@ -33,9 +33,38 @@ pub mod vstring;
 use std::collections::{HashMap, HashSet};
 
 use crate::optimizeopt::intutils::IntBound;
+use crate::resume::SnapshotBox;
 use info::{EnsuredPtrInfo, PtrInfo};
 use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type, Value};
 use std::collections::VecDeque;
+
+pub type SnapshotBoxes = Vec<Option<Vec<SnapshotBox>>>;
+pub type SnapshotFrameSizes = Vec<Option<Vec<usize>>>;
+pub type SnapshotFramePcs = Vec<Option<Vec<(i32, i32)>>>;
+
+pub(crate) fn snapshot_get<T>(store: &[Option<T>], pos: i32) -> Option<&T> {
+    if pos < 0 {
+        return None;
+    }
+    store.get(pos as usize).and_then(Option::as_ref)
+}
+
+pub(crate) fn snapshot_contains<T>(store: &[Option<T>], pos: i32) -> bool {
+    snapshot_get(store, pos).is_some()
+}
+
+pub(crate) fn snapshot_insert<T>(store: &mut Vec<Option<T>>, pos: i32, value: T) {
+    assert!(pos >= 0, "snapshot position must be non-negative");
+    let idx = pos as usize;
+    if store.len() <= idx {
+        store.resize_with(idx + 1, || None);
+    }
+    store[idx] = Some(value);
+}
+
+pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
+    store.len() as i32
+}
 
 pub(crate) fn majit_log_enabled() -> bool {
     std::env::var_os("MAJIT_LOG").is_some()
@@ -359,15 +388,15 @@ pub struct OptContext {
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
-    pub snapshot_boxes: HashMap<i32, Vec<OpRef>>,
+    pub snapshot_boxes: SnapshotBoxes,
     /// Per-frame box counts for multi-frame snapshots.
     /// opencoder.py:819 capture_resumedata encodes multiple frames;
     /// this tracks the boundary between callee and caller sections.
-    pub snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
+    pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
-    pub snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
+    pub snapshot_vable_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
-    pub snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    pub snapshot_frame_pcs: SnapshotFramePcs,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
     pub constant_types_for_numbering: HashMap<u32, majit_ir::Type>,
     /// compile.rs value_types parity: OpRef → Type for all defined values
@@ -391,18 +420,8 @@ pub struct OptContext {
     /// `imported_label_args`, fail-arg sources, and `record_same_as` source
     /// arguments inside Phase 2, but never inside Phase 2's own `new_operations`.
     /// `op_at` falls back to this slice so `op.type_` stays the single source
-    /// of truth for Phase 1 emit OpRef types — closing the
-    /// `prev_phase_value_types` HashMap fan-in (Slice 0.6).
+    /// of truth for Phase 1 emit OpRef types.
     pub phase1_emit_ops: Vec<Op>,
-    /// Pre-fold recorder positions that no longer have a producing Op
-    /// in `new_operations` (constant-folded, elided, or replaced by a
-    /// fresh OpRef). Cloned from `Optimizer.original_trace_op_types` in
-    /// `setup_optimizations`. Read by `opref_type` after `value_types`
-    /// and before `inputarg_type` so retrace and snapshot consumers
-    /// resolve the recorder's original `box.type` (history.py:220
-    /// parity) — closing the recorder fan-in into `value_types`
-    /// (Slice 0.5).
-    pub original_trace_op_types: HashMap<u32, majit_ir::Type>,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -1163,16 +1182,15 @@ impl OptContext {
             string_content_resolver: None,
             string_constant_alloc: None,
             quasi_immutable_deps: HashSet::new(),
-            snapshot_boxes: HashMap::new(),
-            snapshot_frame_sizes: HashMap::new(),
-            snapshot_vable_boxes: HashMap::new(),
-            snapshot_frame_pcs: HashMap::new(),
+            snapshot_boxes: Vec::new(),
+            snapshot_frame_sizes: Vec::new(),
+            snapshot_vable_boxes: Vec::new(),
+            snapshot_frame_pcs: Vec::new(),
 
             constant_types_for_numbering: HashMap::new(),
             value_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
-            original_trace_op_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
         }
@@ -1245,16 +1263,15 @@ impl OptContext {
             string_content_resolver: None,
             string_constant_alloc: None,
             quasi_immutable_deps: HashSet::new(),
-            snapshot_boxes: HashMap::new(),
-            snapshot_frame_sizes: HashMap::new(),
-            snapshot_vable_boxes: HashMap::new(),
-            snapshot_frame_pcs: HashMap::new(),
+            snapshot_boxes: Vec::new(),
+            snapshot_frame_sizes: Vec::new(),
+            snapshot_vable_boxes: Vec::new(),
+            snapshot_frame_pcs: Vec::new(),
 
             constant_types_for_numbering: HashMap::new(),
             value_types: HashMap::new(),
             inputarg_types: Vec::new(),
             phase1_emit_ops: Vec::new(),
-            original_trace_op_types: HashMap::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
         }
@@ -3382,7 +3399,7 @@ impl OptContext {
         // (unroll.py:336/409). No fallback — the position is always set
         // before store_final_boxes_in_guard runs.
         let resume_pos = op.rd_resume_position;
-        let has_snapshot = resume_pos >= 0 && self.snapshot_boxes.contains_key(&resume_pos);
+        let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
         // resume.py:396-397: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
         // store_final_boxes_in_guard. Every guard from the production
@@ -3405,7 +3422,7 @@ impl OptContext {
                 .patchguardop
                 .as_ref()
                 .map(|p| p.rd_resume_position)
-                .filter(|&p| p >= 0 && self.snapshot_boxes.contains_key(&p));
+                .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
             if let Some(fb_pos) = fallback_pos {
                 op.rd_resume_position = fb_pos;
                 // resume.py:570 _add_optimizer_sections: forward knowledge
@@ -3435,15 +3452,13 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        let snapshot_boxes = self.snapshot_boxes[&op.rd_resume_position].clone();
-        let vable_oprefs = self
-            .snapshot_vable_boxes
-            .get(&op.rd_resume_position)
+        let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position)
             .cloned()
             .unwrap_or_default();
-        let frame_pcs = self
-            .snapshot_frame_pcs
-            .get(&op.rd_resume_position)
+        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position)
+            .cloned()
+            .unwrap_or_default();
+        let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position)
             .cloned()
             .unwrap_or_default();
 
@@ -3451,22 +3466,22 @@ impl OptContext {
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes = self.snapshot_frame_sizes.get(&op.rd_resume_position);
+        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position);
         let mut snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
             // Multi-frame: split snapshot_boxes into per-frame chunks.
             let mut frames = Vec::new();
             let mut offset = 0;
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
-                let frame_boxes: Vec<OpRef> = snapshot_boxes[offset..end].to_vec();
+                let frame_boxes: Vec<SnapshotBox> = snapshot_boxes[offset..end].to_vec();
                 let (jitcode_index, pc) = frame_pcs.get(i).copied().unwrap_or((0, 0));
                 frames.push((jitcode_index, pc, frame_boxes));
                 offset = end;
             }
-            Snapshot::multi_frame(frames)
+            Snapshot::multi_frame_boxes(frames)
         } else {
             let (jitcode_index, pc) = frame_pcs.first().copied().unwrap_or((0, 0));
-            Snapshot::single_frame(jitcode_index, pc, snapshot_boxes.clone())
+            Snapshot::single_frame_boxes(jitcode_index, pc, snapshot_boxes.clone())
         };
         // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
         // ni/vsd are constants (TAGINT/TAGCONST) so they don't affect
@@ -3480,6 +3495,7 @@ impl OptContext {
                 .iter()
                 .copied()
                 .map(|boxref| {
+                    let boxref = boxref.opref;
                     let resolved = self.get_box_replacement(boxref);
                     let is_virtual = self
                         .get_ptr_info(resolved)
@@ -3493,6 +3509,7 @@ impl OptContext {
                 .iter()
                 .copied()
                 .map(|boxref| {
+                    let boxref = boxref.opref;
                     let resolved = self.get_box_replacement(boxref);
                     let is_virtual = self
                         .get_ptr_info(resolved)
@@ -3944,21 +3961,11 @@ impl OptContext {
         //    producing Op yet (e.g. registered via `register_value_type`
         //    by passes that synthesize an aliased OpRef). Removed in
         //    Slice 0.5 once all writers route through Op intrinsics or
-        //    the dedicated `inputarg_types` / `original_trace_op_types`
-        //    sources below.
+        //    the dedicated `inputarg_types` source below.
         if let Some(&tp) = self.value_types.get(&resolved.0) {
             return Some(tp);
         }
-        // 4. Pre-fold recorder positions (history.py:220 `box.type` for
-        //    raw recorder OpRefs that the optimizer transformed away).
-        //    Phase 2 / retrace paths inherit these via
-        //    `setup_optimizations` cloning `Optimizer.original_trace_op_types`.
-        //    Void slots are dropped at clone time so a stale entry never
-        //    overrides a fresh non-Void op result.
-        if let Some(&tp) = self.original_trace_op_types.get(&resolved.0) {
-            return Some(tp);
-        }
-        // 5. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
+        // 4. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
         //    history.py:220 parity). Slice 0.5 prep — placed last so
         //    legacy `value_types` writers keep priority during the
         //    transition; once Slice 0.5 drops the inputarg fan-in this
@@ -3986,8 +3993,8 @@ impl OptContext {
     /// `Optimizer.trace_inputarg_types` is identical between phases (single
     /// recorder source — see `unroll.rs:313` and `unroll.rs:510`). Indexing
     /// the same `inputarg_types` Vec by raw position recovers Phase 1
-    /// slot types from Phase 2 without a separate side-table — closing the
-    /// `prev_phase_value_types` inputarg fan-in (history.py:220 parity).
+    /// slot types from Phase 2 without a separate side-table
+    /// (history.py:220 parity).
     ///
     /// Note: `inputarg_types` may be over-allocated (auto-seeded
     /// `vec![Ref; 1024]` test stubs from optimizer.rs:1751); the
@@ -5054,28 +5061,33 @@ pub trait Optimization {
 pub(crate) fn seed_guard_snapshots_with<F>(
     ops: &[Op],
     mut snapshot_for_guard: F,
-) -> (Vec<Op>, HashMap<i32, Vec<OpRef>>)
+) -> (Vec<Op>, SnapshotBoxes)
 where
     F: FnMut(&Op) -> Vec<OpRef>,
 {
     let mut seeded = ops.to_vec();
-    let mut snapshots: HashMap<i32, Vec<OpRef>> = HashMap::new();
+    let mut snapshots: SnapshotBoxes = Vec::new();
     let mut next_resume_pos = 0i32;
     for op in seeded.iter_mut().filter(|op| op.opcode.is_guard()) {
         let snapshot_boxes = snapshot_for_guard(op);
-        let resume_pos =
-            if op.rd_resume_position >= 0 && !snapshots.contains_key(&op.rd_resume_position) {
-                op.rd_resume_position
-            } else {
-                while snapshots.contains_key(&next_resume_pos) {
-                    next_resume_pos += 1;
-                }
-                let resume_pos = next_resume_pos;
+        let resume_pos = if op.rd_resume_position >= 0
+            && !snapshot_contains(&snapshots, op.rd_resume_position)
+        {
+            op.rd_resume_position
+        } else {
+            while snapshot_contains(&snapshots, next_resume_pos) {
                 next_resume_pos += 1;
-                resume_pos
-            };
+            }
+            let resume_pos = next_resume_pos;
+            next_resume_pos += 1;
+            resume_pos
+        };
         op.rd_resume_position = resume_pos;
-        snapshots.insert(resume_pos, snapshot_boxes);
+        snapshot_insert(
+            &mut snapshots,
+            resume_pos,
+            snapshot_boxes.into_iter().map(SnapshotBox::from).collect(),
+        );
     }
     (seeded, snapshots)
 }
@@ -5086,7 +5098,7 @@ where
 /// models an empty active frame snapshot rather than deriving anything from
 /// `guard.fail_args`.
 #[cfg(test)]
-pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, HashMap<i32, Vec<OpRef>>) {
+pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, SnapshotBoxes) {
     seed_guard_snapshots_with(ops, |_| Vec::new())
 }
 

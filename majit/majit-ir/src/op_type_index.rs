@@ -83,9 +83,9 @@ impl<'a> OpTypeIndex<'a> {
     /// RPython Box identity gives a one-to-one map from a Box object to
     /// its producing ResOperation; collapsing two Box-bearing ops onto
     /// the same `OpRef(u32)` would silently keep the later op only and
-    /// rewrite Box.type for any earlier reader. Assert the invariant on
-    /// build so a violation surfaces here instead of as a wrong-type
-    /// guard fail much further along.
+    /// rewrite Box.type for any earlier reader. Hard-panic on collision
+    /// (release as well as debug) so a violation surfaces here instead
+    /// of as a wrong-type guard fail much further along.
     pub fn build_op_index(ops: &[Op]) -> HashMap<u32, usize> {
         let mut map: HashMap<u32, usize> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
@@ -93,8 +93,7 @@ impl<'a> OpTypeIndex<'a> {
                 continue;
             }
             if let Some(&prev_idx) = map.get(&op.pos.0) {
-                debug_assert!(
-                    false,
+                panic!(
                     "OpTypeIndex: OpRef({}) bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
                     op.pos.0, prev_idx, ops[prev_idx].opcode, idx, op.opcode,
                 );
@@ -149,6 +148,14 @@ impl<'a> OpTypeIndex<'a> {
             // statically-most-common Const flavour — so the helper still
             // satisfies the "Const always has a type" invariant rather
             // than returning None and diverging from PyPy.
+            //
+            // PRE-EXISTING-ADAPTATION: cranelift backend has callsites
+            // that build `OpTypeIndex` with a partial `constant_types`
+            // snapshot, so a strict miss-panic here triggers caught
+            // unwinds that silently mis-execute (`fib_recursive`,
+            // `nested_loop`, `fannkuch` regress on cranelift).  Closing
+            // this requires each cranelift caller to seed the full pool
+            // — multi-session work, see audit "Section 2.1".
             return Some(
                 self.constant_types
                     .get(&opref.0)

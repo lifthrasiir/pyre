@@ -22,7 +22,11 @@ use std::sync::{Arc, Mutex};
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
 
-use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+use crate::optimizeopt::{
+    OptContext, Optimization, OptimizationResult, SnapshotBoxes, SnapshotFramePcs,
+    SnapshotFrameSizes, next_snapshot_pos, snapshot_get, snapshot_insert,
+};
+use crate::resume::SnapshotBox;
 
 fn is_trace_constant_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
     !opref.is_none() && constants.contains_key(&opref.0)
@@ -74,13 +78,13 @@ pub struct UnrollOptimizer {
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Passed through to Phase 1 and Phase 2 optimizers for
     /// store_final_boxes_in_guard snapshot-based fail_args rebuild.
-    pub snapshot_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
+    pub snapshot_boxes: SnapshotBoxes,
     /// Per-frame box counts for multi-frame snapshots.
-    pub snapshot_frame_sizes: std::collections::HashMap<i32, Vec<usize>>,
+    pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
-    pub snapshot_vable_boxes: std::collections::HashMap<i32, Vec<majit_ir::OpRef>>,
+    pub snapshot_vable_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
-    pub snapshot_frame_pcs: std::collections::HashMap<i32, Vec<(i32, i32)>>,
+    pub snapshot_frame_pcs: SnapshotFramePcs,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: Vec<majit_ir::descr::DescrRef>,
@@ -91,21 +95,10 @@ pub struct UnrollOptimizer {
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputarg_types
     /// so value_types covers inputarg OpRefs.
     pub trace_inputarg_types: Vec<majit_ir::Type>,
-    /// RPython Box type parity: position→type for ALL original trace ops.
-    /// snapshot_boxes reference original trace positions, but the optimizer
-    /// receives transformed ops (fold_box/elide). This map covers the gap.
-    pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
     /// directly via `op.type_` (history.py:220 box.type parity).
     phase1_emit_ops: Vec<majit_ir::Op>,
-    /// Phase 1 `value_types` (full snapshot of `OptContext.value_types` at
-    /// end-of-phase) carried alongside `phase1_emit_ops` so the Phase 2
-    /// `OptContext.value_types` can be re-seeded with cross-phase types
-    /// that no Phase 1 emit op covers (alias seeds, virtual heads,
-    /// short-preamble PreambleOp tombstones).  Mirrors RPython's
-    /// persistent `box.type` attribute across the export/import boundary.
-    phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,
@@ -142,15 +135,13 @@ impl UnrollOptimizer {
             max_retrace_guards: 15,
             imported_state: None,
             final_exported_state: None,
-            snapshot_boxes: std::collections::HashMap::new(),
-            snapshot_frame_sizes: std::collections::HashMap::new(),
-            snapshot_vable_boxes: std::collections::HashMap::new(),
-            snapshot_frame_pcs: std::collections::HashMap::new(),
+            snapshot_boxes: Vec::new(),
+            snapshot_frame_sizes: Vec::new(),
+            snapshot_vable_boxes: Vec::new(),
+            snapshot_frame_pcs: Vec::new(),
             all_descrs: Vec::new(),
             trace_inputarg_types: Vec::new(),
-            original_trace_op_types: std::collections::HashMap::new(),
             phase1_emit_ops: Vec::new(),
-            phase1_value_types: std::collections::HashMap::new(),
             phase1_patchguardop: None,
             next_global_opref: 0,
             callinfocollection: None,
@@ -319,7 +310,6 @@ impl UnrollOptimizer {
             opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.numbering_type_overrides = self.numbering_type_overrides.clone();
             opt_p1.trace_inputarg_types = self.trace_inputarg_types.clone();
-            opt_p1.original_trace_op_types = self.original_trace_op_types.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
@@ -411,7 +401,7 @@ impl UnrollOptimizer {
                     // with `p1_iter_fresh_hw` keeps Phase 2's inputarg base
                     // strictly above every OpRef Phase 1 ever allocated,
                     // so Phase 2's own fresh OpRefs cannot collide with
-                    // positions in `phase1_emit_ops` / `original_trace_op_types`.
+                    // positions in `phase1_emit_ops` / typed snapshots.
                     self.next_global_opref = opt_p1
                         .final_ctx
                         .as_ref()
@@ -425,7 +415,6 @@ impl UnrollOptimizer {
                     // imported_label_args / fail_args / record_same_as
                     // sources (history.py:220 parity).
                     self.phase1_emit_ops = std::mem::take(&mut opt_p1.phase1_emit_ops);
-                    self.phase1_value_types = std::mem::take(&mut opt_p1.prev_phase_value_types);
                     // RPython: same Optimizer instance keeps patchguardop.
                     if self.phase1_patchguardop.is_none() {
                         self.phase1_patchguardop = opt_p1.patchguardop.clone();
@@ -518,9 +507,7 @@ impl UnrollOptimizer {
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.numbering_type_overrides = self.numbering_type_overrides.clone();
         opt_p2.trace_inputarg_types = self.trace_inputarg_types.clone();
-        opt_p2.original_trace_op_types = self.original_trace_op_types.clone();
         opt_p2.phase1_emit_ops = self.phase1_emit_ops.clone();
-        opt_p2.prev_phase_value_types = self.phase1_value_types.clone();
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
@@ -641,23 +628,16 @@ impl UnrollOptimizer {
                 .flatten()
                 .unwrap_or(opref)
         };
-        for boxes in opt_p2.snapshot_boxes.values_mut() {
+        for boxes in opt_p2.snapshot_boxes.iter_mut().flatten() {
             for r in boxes.iter_mut() {
-                *r = translate_opref(*r);
+                *r = r.map_opref(translate_opref);
             }
         }
-        for boxes in opt_p2.snapshot_vable_boxes.values_mut() {
+        for boxes in opt_p2.snapshot_vable_boxes.iter_mut().flatten() {
             for r in boxes.iter_mut() {
-                *r = translate_opref(*r);
+                *r = r.map_opref(translate_opref);
             }
         }
-        // KEY translation: rebuild HashMap with translated keys.
-        let translated_op_types: HashMap<u32, Type> = opt_p2
-            .original_trace_op_types
-            .iter()
-            .map(|(&k, &v)| (translate_opref(OpRef(k)).0, v))
-            .collect();
-        opt_p2.original_trace_op_types = translated_op_types;
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the
@@ -4971,23 +4951,16 @@ impl OptUnroll {
 }
 
 fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
-    let mut key = ctx
-        .snapshot_boxes
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(-1)
-        .saturating_add(1);
-    while ctx.snapshot_boxes.contains_key(&key) {
-        key = key.saturating_add(1);
-    }
-    key
+    next_snapshot_pos(&ctx.snapshot_boxes)
 }
 
-fn remap_snapshot_boxes(boxes: &[OpRef], ref_map: &HashMap<OpRef, OpRef>) -> Vec<OpRef> {
+fn remap_snapshot_boxes(
+    boxes: &[SnapshotBox],
+    ref_map: &HashMap<OpRef, OpRef>,
+) -> Vec<SnapshotBox> {
     boxes
         .iter()
-        .map(|&opref| ref_map.get(&opref).copied().unwrap_or(opref))
+        .map(|&boxref| boxref.map_opref(|opref| ref_map.get(&opref).copied().unwrap_or(opref)))
         .collect()
 }
 
@@ -5000,7 +4973,7 @@ fn clone_guard_snapshot_remapped(
     if old_pos < 0 {
         return;
     }
-    let Some(snapshot_boxes) = ctx.snapshot_boxes.get(&old_pos).cloned() else {
+    let Some(snapshot_boxes) = snapshot_get(&ctx.snapshot_boxes, old_pos).cloned() else {
         return;
     };
 
@@ -5009,17 +4982,23 @@ fn clone_guard_snapshot_remapped(
     // so cloned guards need a cloned snapshot table entry with the same
     // raw-box -> cloned-box mapping used for op args.
     let new_pos = fresh_snapshot_key(ctx);
-    ctx.snapshot_boxes
-        .insert(new_pos, remap_snapshot_boxes(&snapshot_boxes, ref_map));
-    if let Some(vable_boxes) = ctx.snapshot_vable_boxes.get(&old_pos).cloned() {
-        ctx.snapshot_vable_boxes
-            .insert(new_pos, remap_snapshot_boxes(&vable_boxes, ref_map));
+    snapshot_insert(
+        &mut ctx.snapshot_boxes,
+        new_pos,
+        remap_snapshot_boxes(&snapshot_boxes, ref_map),
+    );
+    if let Some(vable_boxes) = snapshot_get(&ctx.snapshot_vable_boxes, old_pos).cloned() {
+        snapshot_insert(
+            &mut ctx.snapshot_vable_boxes,
+            new_pos,
+            remap_snapshot_boxes(&vable_boxes, ref_map),
+        );
     }
-    if let Some(frame_pcs) = ctx.snapshot_frame_pcs.get(&old_pos).cloned() {
-        ctx.snapshot_frame_pcs.insert(new_pos, frame_pcs);
+    if let Some(frame_pcs) = snapshot_get(&ctx.snapshot_frame_pcs, old_pos).cloned() {
+        snapshot_insert(&mut ctx.snapshot_frame_pcs, new_pos, frame_pcs);
     }
-    if let Some(frame_sizes) = ctx.snapshot_frame_sizes.get(&old_pos).cloned() {
-        ctx.snapshot_frame_sizes.insert(new_pos, frame_sizes);
+    if let Some(frame_sizes) = snapshot_get(&ctx.snapshot_frame_sizes, old_pos).cloned() {
+        snapshot_insert(&mut ctx.snapshot_frame_sizes, new_pos, frame_sizes);
     }
     guard.rd_resume_position = new_pos;
 }
