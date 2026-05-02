@@ -7747,22 +7747,14 @@ mod tests {
         let mut miframe = MIFrame {
             ctx: &mut tc,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let ret_byte = *insns_opname_to_byte()
@@ -7826,22 +7818,14 @@ mod tests {
         let mut miframe = MIFrame {
             ctx: &mut tc,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let raise_byte = *insns_opname_to_byte()
@@ -7904,22 +7888,14 @@ mod tests {
         let mut miframe = MIFrame {
             ctx: &mut tc,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
         let ret_byte = *insns_opname_to_byte()
             .get("ref_return/r")

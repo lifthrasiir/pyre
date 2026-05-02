@@ -10,13 +10,54 @@ use pyre_interpreter::CodeObject;
 use pyre_interpreter::bytecode::Instruction;
 
 use super::state::{
-    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, materialize_pending_inline_result,
-    pending_inline_result_from_concrete,
+    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState,
+    materialize_pending_inline_result, pending_inline_result_from_concrete,
 };
+
+/// RPython MIFrame (pyjitpl.py:65) — per-frame tracing state.
+pub struct MetaInterpFrame {
+    pub sym: *mut PyreSym,
+    pub owned_sym: Option<Box<PyreSym>>,
+    pub jitcode: *const (),
+    pub pc: usize,
+    /// Raw `(code_ptr, target_pc)` greenkey components. Used for
+    /// element-wise recursion-depth comparison in
+    /// `step_root_frame` — see the filter at the
+    /// `max_unroll_recursion` check. This is `Option<(usize, usize)>`
+    /// rather than `Option<u64>` so the comparison cannot be fooled
+    /// by hash collisions, matching
+    /// rpython/jit/metainterp/pyjitpl.py:1396-1401 element-wise
+    /// `same_constant` iteration.
+    pub greenkey: Option<(usize, usize)>,
+    pub concrete_frame: usize,
+    /// Box for heap stability across Vec reallocs.
+    pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
+    /// opencoder.py:819-834: accumulated parent frame chain.
+    pub parent_frames: Vec<ResumeFrameState>,
+    pub drop_frame_opref: Option<OpRef>,
+    pub caller_result_stack_idx: Option<usize>,
+    pub caller_result_type: Option<Type>,
+    pub arg_state: pyre_interpreter::bytecode::OpArgState,
+}
+
+impl MetaInterpFrame {
+    /// Root frame borrows sym from caller; inline frame owns its sym.
+    fn is_inline(&self) -> bool {
+        self.owned_sym.is_some()
+    }
+
+    fn concrete_frame_addr(&self) -> usize {
+        if let Some(ref cf) = self.owned_concrete_frame {
+            &**cf as *const pyre_interpreter::pyframe::PyFrame as usize
+        } else {
+            self.concrete_frame
+        }
+    }
+}
 
 /// RPython MetaInterp (pyjitpl.py:2371).
 pub struct PyreMetaInterp {
-    pub framestack: Vec<MIFrame>,
+    pub framestack: Vec<MetaInterpFrame>,
     pub portal_call_depth: i32,
     pub jitcode: *const (),
     pub namespace: *mut pyre_interpreter::DictStorage,
@@ -116,34 +157,19 @@ impl PyreMetaInterp {
     // ── Root frame step ──────────────────────────────────────────
 
     fn step_root_frame(&mut self, ctx: &mut TraceCtx, pc: usize) -> LoopAction {
-        // pyjitpl.py:74 `self.metainterp` back-pointer — capture the
-        // raw pointer before reborrowing through `self.framestack`
-        // so MIFrame's recursion-depth walk can reach the same
-        // framestack RPython's `_opimpl_recursive_call` consults.
-        let meta_ptr = self as *mut Self;
         let top = self.framestack.last_mut().unwrap();
         let code = unsafe {
             &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject)
         };
-        let cf_addr = top.live_concrete_frame_addr();
+        let sym = unsafe { &mut *top.sym };
+        let cf_addr = top.concrete_frame_addr();
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
 
-        // pyjitpl.py:65-100 MIFrame.run_one_step: per-instruction state
-        // lives on the same MIFrame instance as the persistent fields.
-        // Rebind the per-step pointers / pcs in place rather than spinning
-        // up a fresh `from_sym` view.
-        top.ctx = ctx;
-        top.meta = meta_ptr;
-        top.fallthrough_pc = fallthrough_pc;
-        top.concrete_frame_addr = cf_addr;
-        top.orgpc = pc;
-        top.pre_opcode_registers_r = None;
-        top.pending_result_stack_idx = None;
-        top.pending_inline_frame = None;
-
-        let action = top.trace_code_step(code, pc);
-        let pending = top.pending_inline_frame.take();
+        let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc, pc);
+        let action = fs.trace_code_step(code, pc);
+        let pending = fs.pending_inline_frame.take();
+        drop(fs);
 
         if let Some(pending) = pending {
             // pyjitpl.py:1415 `self.metainterp.perform_call(portal_code,
@@ -200,7 +226,7 @@ impl PyreMetaInterp {
                 if let Some(ref has_compiled) = ctx.has_compiled_targets_fn {
                     // pyjitpl.py:2979: ptoken = self.get_procedure_token(greenboxes)
                     // greenboxes = (code, pc) for the CURRENT frame's loop header.
-                    let top_frame = self.framestack.last().unwrap();
+                    let w_code = self.framestack.last().unwrap().jitcode;
                     let target_pc = match &action {
                         TraceAction::CloseLoopWithArgs {
                             loop_header_pc: Some(tp),
@@ -208,9 +234,7 @@ impl PyreMetaInterp {
                         } => *tp,
                         _ => pc,
                     };
-                    let Some(gk) = top_frame.green_key_hash_for_pc(target_pc) else {
-                        return LoopAction::Continue;
-                    };
+                    let gk = crate::driver::make_green_key(w_code, target_pc);
                     if !has_compiled(gk) {
                         // No compiled targets for this loop — continue tracing.
                         // RPython: reached_loop_header returns without closing.
@@ -229,30 +253,22 @@ impl PyreMetaInterp {
     // ── Inline frame step ────────────────────────────────────────
 
     fn step_inline_frame(&mut self, ctx: &mut TraceCtx, pc: usize) -> LoopAction {
-        // pyjitpl.py:74 metainterp back-pointer (see step_root_frame).
-        let meta_ptr = self as *mut Self;
         let top = self.framestack.last_mut().unwrap();
         let code = unsafe {
             &*(pyre_interpreter::w_code_get_ptr(top.jitcode as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject)
         };
-        let cf_addr = top.live_concrete_frame_addr();
+        let sym = unsafe { &mut *top.sym };
+        let cf_addr = top.concrete_frame_addr();
+        let parent_frames = top.parent_frames.clone();
         let fallthrough_pc = semantic_fallthrough_pc(code, pc);
 
         let inline_action = {
-            top.ctx = ctx;
-            top.meta = meta_ptr;
-            top.fallthrough_pc = fallthrough_pc;
-            top.concrete_frame_addr = cf_addr;
-            top.orgpc = pc;
-            top.pre_opcode_registers_r = None;
-            top.pending_result_stack_idx = None;
-            top.pending_inline_frame = None;
-            // `parent_frames` already lives on the persistent frame; no
-            // per-step clone needed — `trace_code_step_inline` reads it
-            // directly from `self.parent_frames`.
-            let result = top.trace_code_step_inline(code, pc);
-            let pending = top.pending_inline_frame.take();
+            let mut fs = MIFrame::from_sym(ctx, sym, cf_addr, fallthrough_pc, pc);
+            fs.parent_frames = parent_frames;
+            let result = fs.trace_code_step_inline(code, pc);
+            let pending = fs.pending_inline_frame.take();
+            drop(fs);
 
             if let Some(pending) = pending {
                 let top = self.framestack.last_mut().unwrap();
@@ -368,14 +384,17 @@ impl PyreMetaInterp {
         mut pending: PendingInlineFrame,
         caller_result_idx: Option<usize>,
     ) {
-        // pyjitpl.py:1418-1420 perform_call → newframe: the inline-depth
-        // counter and the recursion-walk both read `MetaInterp.framestack`
-        // directly, so the legacy `TraceCtx::inline_frames` side table is
-        // no longer fed from the pyre-tracer push site.
+        let (driver, _) = crate::driver::driver_pair();
+        driver.enter_inline_frame(pending.green_key_raw);
         ctx.push_inline_trace_position(pending.green_key);
 
+        // `pyjitpl.py:181-193` analogue: tag the most recent parent frame
+        // (the caller that just traced this call instruction) with the
+        // stack slot where the result will land, so a guard captured
+        // inside the callee can clear that slot before snapshotting.
         if let Some(parent) = pending.parent_frames.first_mut() {
             parent.pending_result_stack_idx = caller_result_idx;
+            parent.pending_result_type = pending.caller_result_type;
         }
 
         let callee_code = pending.concrete_frame.pycode;
@@ -392,27 +411,19 @@ impl PyreMetaInterp {
             }
         }
 
-        let frame = MIFrame {
-            // Persistent fields (pyjitpl.py:65-100, perform_call).
+        let frame = MetaInterpFrame {
             sym: sym_ptr,
             owned_sym: Some(owned_sym),
             jitcode: callee_code,
             pc: 0,
-            greenkey: Some(pending.greenkey),
+            greenkey: Some(pending.green_key_raw),
+            concrete_frame: cf_addr,
             owned_concrete_frame: Some(owned_cf),
             parent_frames: pending.parent_frames,
             drop_frame_opref: pending.drop_frame_opref,
             caller_result_stack_idx: caller_result_idx,
+            caller_result_type: pending.caller_result_type,
             arg_state: pyre_interpreter::bytecode::OpArgState::default(),
-            // Per-instruction fields default-init; populated each step.
-            ctx: std::ptr::null_mut(),
-            meta: std::ptr::null_mut(),
-            fallthrough_pc: 0,
-            concrete_frame_addr: cf_addr,
-            orgpc: 0,
-            pre_opcode_registers_r: None,
-            pending_result_stack_idx: None,
-            pending_inline_frame: None,
         };
 
         self.portal_call_depth += 1;
@@ -453,9 +464,8 @@ impl PyreMetaInterp {
             );
         }
 
-        // pyjitpl.py:2462-2477 popframe: the framestack pop above is the
-        // single source of truth for the inline-depth counter; no
-        // matching `TraceCtx::inline_frames` pop is needed.
+        let (driver, _) = crate::driver::driver_pair();
+        driver.leave_inline_frame();
 
         if self.framestack.is_empty() {
             return; // shouldn't happen: root never produces Finish
@@ -592,21 +602,10 @@ impl PyreMetaInterp {
             None
         };
         if let Some(tp) = target_pc {
-            // interp_jit.py:118 reads `frame.is_being_profiled` live at
-            // every backedge; fall back to the root frame's live state
-            // rather than hardcoding `false` so the resulting JitCell
-            // matches the eval-side `make_green_key_for_frame` key.
-            let key = self
-                .framestack
-                .last()
-                .and_then(|frame| frame.green_key_hash_for_pc(tp))
-                .or_else(|| {
-                    self.framestack
-                        .first()
-                        .and_then(|f| f.green_key_hash_for_pc(tp))
-                })
-                .unwrap_or_else(|| crate::driver::make_green_key(w_code, tp, false));
-            ctx.set_green_key(key, (w_code as usize, tp));
+            ctx.set_green_key(
+                crate::driver::make_green_key(w_code, tp),
+                (w_code as usize, tp),
+            );
         }
     }
 
@@ -618,8 +617,6 @@ impl PyreMetaInterp {
     ///
     /// Returns Some(LoopAction) if handled, None if all frames exhausted.
     fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
-        // pyjitpl.py:74 metainterp back-pointer (see step_root_frame).
-        let meta_ptr = self as *mut Self;
         // RPython pyjitpl.py:2506: while self.framestack:
         while let Some(top) = self.framestack.last() {
             let code = unsafe {
@@ -725,9 +722,8 @@ impl PyreMetaInterp {
                         &[frame_opref],
                     );
                 }
-                // pyjitpl.py:2506 finishframe_exception: framestack pop
-                // above is sufficient — no `inline_frames` side-table
-                // pop required (see push_inline_frame for why).
+                let (driver, _) = crate::driver::driver_pair();
+                driver.leave_inline_frame();
 
                 // Propagate exception state to parent sym
                 if let Some(parent) = self.framestack.last() {
@@ -757,8 +753,7 @@ impl PyreMetaInterp {
                 let sym_mut = unsafe { &mut *top.sym };
                 let concrete_frame = sym_mut.concrete_vable_ptr as usize;
                 let pc = sym_mut.pending_next_instr.unwrap_or(0);
-                let mut mi =
-                    super::state::MIFrame::from_sym(ctx, sym_mut, meta_ptr, concrete_frame, pc, pc);
+                let mut mi = super::state::MIFrame::from_sym(ctx, sym_mut, concrete_frame, pc, pc);
                 mi.store_token_in_vable(ctx);
             }
             return Some(LoopAction::Return(TraceAction::Finish {

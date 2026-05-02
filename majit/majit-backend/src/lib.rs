@@ -987,8 +987,21 @@ pub struct JitCellToken {
     pub version_info: Option<LoopVersionInfo>,
     /// history.py:449: _keepalive_jitcell_tokens — set of other tokens
     /// that this loop can jump to (via CALL_ASSEMBLER or JUMP).
-    /// Prevents the target from being evicted while this loop is alive.
-    pub keepalive_tokens: Vec<u64>,
+    /// Upstream prevents the target from being evicted while this loop
+    /// is alive by holding the actual `JitCellToken` object reference
+    /// (`history.py:441 _keepalive_jitcell_tokens = {}` keyed on the
+    /// token object itself, with `:451 record_jump_to` writing
+    /// `self._keepalive_jitcell_tokens[target] = None`).  Pyre keeps the
+    /// same shape: an `Arc<JitCellToken>` set keyed on token number.
+    ///
+    /// Wrapped in `Mutex` so `record_jump_to` can push through
+    /// `&JitCellToken` once the token has been shared via
+    /// `Arc<JitCellToken>` (Slice 5.1 lifted `CompiledEntry::token` to
+    /// `Arc<JitCellToken>` so the same object is reachable from
+    /// `record_loop_or_bridge`'s descr walk).  The Mutex is the
+    /// Rust-side equivalent of RPython's implicit dict-mutation interior
+    /// mutability under the single-threaded JIT scheduler invariant.
+    pub keepalive_tokens: parking_lot::Mutex<Vec<Arc<JitCellToken>>>,
     /// `rpython/jit/backend/model.py:292` `CompiledLoopToken` parity.
     ///
     /// Carries per-compilation metadata: `asmmemmgr_blocks` (owned bridge
@@ -1007,6 +1020,22 @@ pub struct JitCellToken {
     /// address of the compiled loop entry. 0 until `compile_loop`
     /// assigns it.
     pub _ll_function_addr: usize,
+    /// `memmgr.py:59-60` `looptoken.generation`. Updated by
+    /// `MemoryManager.keep_loop_alive` and read by
+    /// `_kill_old_loops_now`. Default `0` means "not yet seen by
+    /// memmgr"; the eviction predicate at `memmgr.py:71` requires
+    /// `0 <= gen < max_generation`, so default-0 tokens are
+    /// candidates for eviction immediately — matching RPython where
+    /// `__init__` does not initialize `generation`. In practice
+    /// `compile.py:1149` calls `keep_loop_alive` before any
+    /// `_kill_old_loops_now` could see the token. RPython's
+    /// `r_int64` is signed 64-bit; pyre uses `i64` to preserve the
+    /// wraparound math at `memmgr.py:38` (5e9 years given 1000
+    /// loops/sec). Interior mutability via `Cell<i64>` mirrors the
+    /// RPython attribute write through `&JitCellToken`. Sync is
+    /// covered by the existing `unsafe impl Sync for JitCellToken`
+    /// at line 1130 — single-threaded JIT scheduler invariant.
+    pub generation: Cell<i64>,
 }
 
 impl JitCellToken {
@@ -1021,13 +1050,15 @@ impl JitCellToken {
             compiled: None,
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
-            keepalive_tokens: Vec::new(),
+            keepalive_tokens: parking_lot::Mutex::new(Vec::new()),
             // `rpython/jit/backend/x86/assembler.py:514` creates the
             // `compiled_loop_token` at the start of `assemble_loop` —
             // i.e., lazily when the backend compiles the token. pyre
             // initializes it eagerly here so the field is always present.
             compiled_loop_token: Some(Arc::new(CompiledLoopToken::new(number))),
             _ll_function_addr: 0,
+            // memmgr.py:38 default; first keep_loop_alive overwrites this.
+            generation: Cell::new(0),
         }
     }
 
@@ -1050,10 +1081,30 @@ impl JitCellToken {
 
     /// history.py:451-453: record_jump_to — record that this loop can
     /// jump to another JitCellToken (via CALL_ASSEMBLER or JUMP).
-    /// Prevents the MemoryManager from evicting the target.
-    pub fn record_jump_to(&mut self, target_number: u64) {
-        if !self.keepalive_tokens.contains(&target_number) {
-            self.keepalive_tokens.push(target_number);
+    ///
+    /// ```python
+    /// def record_jump_to(self, target_token):
+    ///     assert isinstance(target_token, JitCellToken)
+    ///     self._keepalive_jitcell_tokens[target_token] = None
+    /// ```
+    ///
+    /// Pyre stores the target's `Arc<JitCellToken>`, the direct Rust
+    /// analog of PyPy's Python-object dict-key keepalive.  The
+    /// `target.number == self.number` short-circuit matches PyPy's
+    /// `if target_token is self: return` (implicit because the dict
+    /// would just no-op); the explicit guard avoids the Mutex lock for
+    /// the self-jump case.
+    pub fn record_jump_to(&self, target: Arc<JitCellToken>) {
+        if target.number == self.number {
+            return;
+        }
+        let target_number = target.number;
+        let mut guard = self.keepalive_tokens.lock();
+        if !guard
+            .iter()
+            .any(|existing| existing.number == target_number)
+        {
+            guard.push(target);
         }
     }
 
@@ -1301,16 +1352,6 @@ pub trait Backend: Send {
     /// (`x86/assembler.py:870`, `aarch64/assembler.py:566-572`).
     fn set_propagate_exception_descr(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `llsupport/gc.py:115-126 getframedescrs(cpu)` — JitFrame field
-    /// descriptors consumed by the GC rewriter's `handle_call_assembler`
-    /// pass (`rewrite.py:613-695`).  RPython attaches these per-instance
-    /// via `cpu.gc_ll_descr.getframedescrs(cpu)`; majit threads them in
-    /// from the interpreter crate (`pyre-jit`) once the JitDriver has
-    /// constructed its backend.  Backends that don't lower
-    /// CALL_ASSEMBLER (wasm, no-op test backends) leave this as the
-    /// default no-op.
-    fn set_jitframe_layout(&mut self, _descrs: Option<majit_gc::rewrite::JitFrameDescrs>) {}
-
     /// Register a placeholder for a pending token (RPython compile_tmp_callback).
     /// The placeholder has null code_ptr; call_assembler_fast_path detects this
     /// and falls back to force_fn. Replaced by the real target on compile_loop.
@@ -1339,7 +1380,7 @@ pub trait Backend: Send {
         inputargs: &[InputArg],
         ops: &[Op],
         original_token: &JitCellToken,
-        previous_tokens: &[JitCellToken],
+        previous_tokens: &[std::sync::Arc<JitCellToken>],
     ) -> Result<AsmInfo, BackendError>;
 
     /// Compile all registered loop versions as bridges.
@@ -2423,6 +2464,27 @@ mod tests {
 
         assert!(token.version_info.is_some());
         assert_eq!(token.version_info.as_ref().unwrap().versions.len(), 1);
+    }
+
+    #[test]
+    fn jit_cell_token_keepalive_holds_jit_cell_token() {
+        let token = JitCellToken::new(1);
+        let target = Arc::new(JitCellToken::new(2));
+
+        token.record_jump_to(Arc::clone(&target));
+        token.record_jump_to(Arc::clone(&target));
+
+        let guard = token.keepalive_tokens.lock();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].number, 2);
+        assert!(Arc::ptr_eq(&guard[0], &target));
+    }
+
+    #[test]
+    fn jit_cell_token_keepalive_skips_self() {
+        let token = Arc::new(JitCellToken::new(1));
+        token.record_jump_to(Arc::clone(&token));
+        assert!(token.keepalive_tokens.lock().is_empty());
     }
 
     #[test]

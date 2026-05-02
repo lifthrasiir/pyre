@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
-use majit_ir::{GreenKey, Type, Value};
+use majit_ir::{Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
@@ -144,15 +144,7 @@ thread_local! {
     static JIT_DRIVER: UnsafeCell<JitDriverPair> = UnsafeCell::new({
         let info = build_pyframe_virtualizable_info();
         let mut d = JitDriver::new(JIT_THRESHOLD);
-        // llsupport/gc.py:115-126 getframedescrs(cpu) parity — attach the
-        // JitFrame field descriptors to the backend instance owned by
-        // this driver, so the GC rewriter's `handle_call_assembler`
-        // pass can emit `gen_malloc_frame` against a known layout.
-        d.set_jitframe_layout(Some(crate::call_jit::arena_jitframe_descrs()));
         d.set_virtualizable_info(info.clone());
-        d.meta_interp_mut()
-            .warm_state_mut()
-            .set_get_unique_id_fn(pypyjitdriver_unique_id_from_greenkey);
         d.meta_interp_mut().num_scalar_inputargs =
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — install pyre's
@@ -1404,22 +1396,14 @@ pub fn _call_not_in_trace(
 }
 
 #[inline]
-fn green_key_from_pycode(
-    next_instr: usize,
-    is_being_profiled: bool,
-    w_pycode: pyre_object::PyObjectRef,
-) -> Option<u64> {
+fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) -> Option<u64> {
     // Safety: this follows existing wrappers that treat `W_CodeObject`
     // as an owned pointer to a `CodeObject`.
     let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
     if code_ptr.is_null() {
         return None;
     }
-    Some(make_green_key(
-        w_pycode as *const (),
-        next_instr,
-        is_being_profiled,
-    ))
+    Some(make_green_key(code_ptr, next_instr))
 }
 
 /// RPython interp_jit.py helper: get_printable_location.
@@ -1527,10 +1511,10 @@ pub fn should_unroll_one_iteration(
 pub fn get_jitcell_at_key(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    is_being_profiled: bool,
+    _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    let key = green_key_from_pycode(next_instr, is_being_profiled, w_pycode);
+    let key = green_key_from_pycode(next_instr, w_pycode);
     let (driver, _) = driver_pair();
     w_bool_from(key.is_some_and(|green_key| {
         driver
@@ -1546,10 +1530,10 @@ pub fn get_jitcell_at_key(
 pub fn dont_trace_here(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    is_being_profiled: bool,
+    _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
-    let Some(green_key) = green_key_from_pycode(next_instr, is_being_profiled, w_pycode) else {
+    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
         return;
     };
     let (driver, _) = driver_pair();
@@ -1564,10 +1548,10 @@ pub fn dont_trace_here(
 pub fn mark_as_being_traced(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    is_being_profiled: bool,
+    _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
-    let Some(green_key) = green_key_from_pycode(next_instr, is_being_profiled, w_pycode) else {
+    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
         return;
     };
     let (driver, _) = driver_pair();
@@ -1582,10 +1566,10 @@ pub fn mark_as_being_traced(
 pub fn trace_next_iteration(
     _space: pyre_object::PyObjectRef,
     next_instr: usize,
-    is_being_profiled: bool,
+    _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
-    let Some(green_key) = green_key_from_pycode(next_instr, is_being_profiled, w_pycode) else {
+    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
         return;
     };
     let (driver, _) = driver_pair();
@@ -1829,52 +1813,11 @@ pub(crate) fn call_depth() -> u32 {
     pyre_interpreter::call::call_depth()
 }
 
-/// pypy/module/pypyjit/interp_jit.py:67-70:
-/// `greens = ['next_instr', 'is_being_profiled', 'pycode']`.
+/// RPython green_key = (pycode, next_instr).
+/// Each (code, pc) pair has independent warmup counter and compiled loop.
 #[inline(always)]
-pub fn pypyjit_greenkey(
-    next_instr: usize,
-    is_being_profiled: bool,
-    w_pycode: pyre_object::PyObjectRef,
-) -> GreenKey {
-    GreenKey::with_types(
-        vec![
-            next_instr as i64,
-            if is_being_profiled { 1 } else { 0 },
-            w_pycode as i64,
-        ],
-        vec![Type::Int, Type::Int, Type::Ref],
-    )
-}
-
-/// Hash bucket for PyPyJitDriver's full typed green tuple.
-///
-/// This is the `JitCell.get_uhash(*greenargs)` equivalent; callers must
-/// not collapse the key to `(pycode, next_instr)` because PyPy includes
-/// `is_being_profiled` in the green tuple.
-#[inline(always)]
-pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
-    pypyjit_greenkey(pc, is_being_profiled, code_ptr as pyre_object::PyObjectRef).hash_u64()
-}
-
-#[inline(always)]
-fn make_green_key_for_frame(frame: &PyFrame, pc: usize) -> u64 {
-    make_green_key(frame.pycode, pc, frame.get_is_being_profiled())
-}
-
-/// warmstate.py:807 `get_unique_id(greenkey)` for PyPyJitDriver.
-///
-/// interp_jit.py:44 ignores the first two greens and returns the pycode's
-/// rvmprof id. Pyre's process-local equivalent is `get_unique_id`.
-fn pypyjitdriver_unique_id_from_greenkey(greenkey: &GreenKey) -> i64 {
-    let next_instr = greenkey.values.first().copied().unwrap_or(0).max(0) as usize;
-    let is_being_profiled = greenkey.values.get(1).copied().unwrap_or(0) != 0;
-    let w_pycode =
-        greenkey.values.get(2).copied().unwrap_or(0) as usize as pyre_object::PyObjectRef;
-    match pypyjitdriver.get_unique_id {
-        Some(f) => f(next_instr, is_being_profiled, w_pycode) as i64,
-        None => 0,
-    }
+pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
+    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
 // JIT_CALL_DEPTH removed — pyre-interpreter::call::CALL_DEPTH is the single
@@ -2256,7 +2199,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) if is_portal => {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
-                let green_key = make_green_key_for_frame(frame, loop_header_pc);
+                let green_key = make_green_key(frame.pycode, loop_header_pc);
                 if let Some(loop_result) =
                     maybe_compile_and_run(frame, green_key, loop_header_pc, driver, info, &env)
                 {
@@ -2341,13 +2284,28 @@ fn jit_merge_point_hook(
     env: &PyreEnv,
 ) -> Option<LoopResult> {
     let concrete_frame = frame as *mut PyFrame as usize;
-    let green_key = make_green_key_for_frame(frame, pc);
+    let green_key = make_green_key(frame.pycode, pc);
 
     // S2.5 (wiggly-barto plan, Stage 2 — dual verification mode).
     //
-    // TODO: delete after the typed-key path has enough soak time.
-    // Production already uses PyPyJitDriver's full typed green tuple;
-    // this block now only probes the chain lookup for parity diagnostics.
+    // TODO(delete in S3.2): the env var and this whole soak block ship
+    // out alongside the direct-hook deletion. Upstream has no eval-side
+    // marker gate (rlib/jit.py:881-1006 + warmspot.py:874-1075 run
+    // unconditionally). The gate exists only as scaffolding for the
+    // S3.1 cutover so we can bring up the marker/static-data path
+    // alongside the legacy `make_green_key` hash flow without flipping
+    // production default in one commit.
+    //
+    // While `PYRE_JIT_MARKER_PARITY_SOAK=1` is set, this block runs
+    // shadow-style next to the production decision: it constructs the
+    // typed `GreenKey` mirroring `pypyjitdriver.greens` (rlib/jit.py:649,
+    // interp_jit.py:69 — `[next_instr, is_being_profiled, pycode]`) and
+    // exercises `WarmEnterState::lookup_chain_with_key` so the typed-key
+    // surface stays warm for the cutover; the result is intentionally
+    // discarded so the legacy hash-only flow below still owns the
+    // decision (see also Pre-S3.1 Task #17 — incremental hash unification
+    // is blocked by a fannkuch perf regression, so the soak gate is the
+    // S3.1 prereq instead).
     static PYRE_JIT_MARKER_PARITY_SOAK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_MARKER_PARITY_SOAK
         .get_or_init(|| std::env::var_os("PYRE_JIT_MARKER_PARITY_SOAK").is_some())
@@ -2502,7 +2460,10 @@ fn maybe_compile_and_run(
         .counter
         .tick(green_key)
     {
-        if driver.meta_interp().is_tracing_key(green_key) {
+        if driver
+            .meta_interp()
+            .is_tracing_key((frame.pycode as usize, loop_header_pc))
+        {
             return None;
         }
         return bound_reached(frame, green_key, loop_header_pc, driver, info, env);
@@ -2921,7 +2882,10 @@ fn bound_reached(
     frame.set_last_instr_from_next_instr(loop_header_pc);
     let mut jit_state = build_jit_state(frame, info);
     // warmstate.py:473-477 JC_TRACING
-    if driver.meta_interp().is_tracing_key(green_key) {
+    if driver
+        .meta_interp()
+        .is_tracing_key((frame.pycode as usize, loop_header_pc))
+    {
         return None;
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
@@ -3117,7 +3081,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let green_key = make_green_key_for_frame(frame, frame.next_instr());
+    let green_key = make_green_key(frame.pycode, frame.next_instr());
     let (driver, info) = driver_pair();
 
     // RPython warmstate.py maybe_compile_and_run fast path:
@@ -3133,7 +3097,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
 
     // RPython warmstate.py:473-477: per-cell JC_TRACING.
-    if driver.meta_interp().is_tracing_key(green_key) {
+    if driver
+        .meta_interp()
+        .is_tracing_key((frame.pycode as usize, frame.next_instr()))
+    {
         return None;
     }
     if driver.has_compiled_loop(green_key) {
@@ -5962,14 +5929,7 @@ mod tests {
         });
         let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
         sym.set_test_execution_context(ec_ref);
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let fail_args = state.capture_current_fail_args();
 
@@ -6057,14 +6017,7 @@ mod tests {
             resume_pc as i32,
             &[(0, stack0), (1, stack1)],
         );
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let fail_args = state.capture_current_fail_args();
 
@@ -6155,14 +6108,7 @@ mod tests {
                 vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
                 vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
             });
-            let mut state = MIFrame::from_sym(
-                &mut ctx,
-                &mut sym,
-                std::ptr::null_mut(),
-                frame_ptr,
-                resume_pc,
-                resume_pc,
-            );
+            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
             let loaded =
                 <MIFrame as LocalOpcodeHandler>::load_local_checked_value(&mut state, 0, name)
@@ -6242,14 +6188,7 @@ mod tests {
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         state.capture_guard_class(obj, &INT_TYPE as *const _);
 
@@ -6316,14 +6255,7 @@ mod tests {
             vable_lastblock: ctx.const_ref(0),
             vable_w_globals: ctx.const_ref(0),
         });
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let _ = state.capture_trace_guarded_int_payload(int_obj);
 
@@ -6421,14 +6353,7 @@ mod tests {
                 resume_pc as i32,
                 &[(0, lower_stack), (1, truth)],
             );
-            let mut state = MIFrame::from_sym(
-                &mut ctx,
-                &mut sym,
-                std::ptr::null_mut(),
-                frame_ptr,
-                resume_pc,
-                resume_pc,
-            );
+            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
             if record_branch_guard {
                 state.capture_record_branch_guard(OpRef::NONE, truth, true, resume_pc);
             } else {
@@ -6572,14 +6497,7 @@ mod tests {
             resume_pc as i32,
             &[(0, lower_stack), (1, truth)],
         );
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
         assert_eq!(
@@ -6688,14 +6606,7 @@ mod tests {
             vable_lastblock: ctx.const_ref(frame.lastblock as usize as i64),
             vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
         });
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            target_pc,
-            target_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
 
         let jump_args = state.capture_close_loop_args_at(Some(target_pc));
 
@@ -6740,14 +6651,7 @@ mod tests {
             Type::Int,
             key,
         ));
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let raw_index = state.capture_trace_dynamic_list_index(key, len, 2);
         assert_eq!(raw_index, key);
@@ -6806,14 +6710,7 @@ mod tests {
             Type::Ref,
             value,
         ));
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let len = state
             .capture_direct_len_value(callable, value, list)
@@ -6885,14 +6782,7 @@ mod tests {
             Type::Ref,
             list,
         ));
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let result = state.capture_generated_list_getitem_by_strategy(list, key, 2, 2);
         assert_eq!(state.capture_value_type(result), Type::Float);
@@ -6955,14 +6845,7 @@ mod tests {
                 Type::Ref,
                 list,
             ));
-            let mut state = MIFrame::from_sym(
-                &mut ctx,
-                &mut sym,
-                std::ptr::null_mut(),
-                frame_ptr,
-                resume_pc,
-                resume_pc,
-            );
+            let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
             state
                 .capture_list_append_value(list, value, concrete_list, concrete_value)
@@ -7069,14 +6952,7 @@ mod tests {
             Type::Ref,
             iter,
         ));
-        let mut state = MIFrame::from_sym(
-            &mut ctx,
-            &mut sym,
-            std::ptr::null_mut(),
-            frame_ptr,
-            resume_pc,
-            resume_pc,
-        );
+        let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
 
         let next = state
             .capture_iter_next_value(iter, range_iter)

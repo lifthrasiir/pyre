@@ -9,4 +9,3 @@
 pub mod counter;
 pub mod heapcache;
 pub mod logger;
-pub mod memmgr;

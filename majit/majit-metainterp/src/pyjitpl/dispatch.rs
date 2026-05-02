@@ -5,7 +5,6 @@ use std::mem::{MaybeUninit, size_of};
 use std::ptr;
 use std::sync::Arc;
 
-use majit_backend::JitCellToken;
 use majit_ir::{OpCode, OpRef, Value};
 
 use super::{MIFrame, MIFrameStack};
@@ -777,11 +776,12 @@ where
         }
     }
 
-    fn pop_exception_frame(&mut self, _ctx: &mut TraceCtx) {
-        // pyjitpl.py:2462-2477 popframe: framestack pop is the single
-        // bookkeeping point now that the BC_INLINE_CALL synthetic push
-        // is gone (α.4b).
-        let _ = self.frames.pop();
+    fn pop_exception_frame(&mut self, ctx: &mut TraceCtx) {
+        if let Some(frame) = self.frames.pop() {
+            if frame.inline_frame {
+                ctx.pop_inline_frame();
+            }
+        }
     }
 
     fn unwind_to_exception_handler(&mut self, ctx: &mut TraceCtx) -> TraceAction {
@@ -943,9 +943,9 @@ where
         };
         if finished {
             let finished_frame = self.frames.pop().expect("finished frame stack was empty");
-            // pyjitpl.py:2462-2477 popframe: framestack pop is the
-            // single bookkeeping point now that the BC_INLINE_CALL
-            // synthetic push is gone (α.4b).
+            if finished_frame.inline_frame {
+                ctx.pop_inline_frame();
+            }
             if let Some(parent) = self.frames.frames.last_mut() {
                 if let Some((return_kind, callee_src)) =
                     finished_frame.jitcode.trailing_return_info()
@@ -1653,34 +1653,12 @@ where
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
                     })
                     .clone();
-                // pyjitpl.py:1265-1276 `_opimpl_inline_call*` →
-                // pyjitpl.py:2421 `perform_call(jitcode, allboxes,
-                // greenkey=None)` → pyjitpl.py:2432 `newframe(jitcode,
-                // None)`.  With `greenkey=None`, `enter_portal_frame`
-                // is *not* recorded (gated on `greenkey is not None`),
-                // and the `portal_call_depth` / `call_ids` /
-                // `current_call_id` bookkeeping fires only when
-                // `jitcode.jitdriver_sd is not None`.
-                //
-                // BC_INLINE_CALL targets sub-jitcode helpers — by
-                // construction these have `jitdriver_sd = None`
-                // (portal jitcodes are entered via `do_recursive_call`
-                // → CALL_ASSEMBLER, not inlined here).  The newframe
-                // bookkeeping therefore reduces to the `MIFrame::setup
-                // + framestack.push` pair below, which is exactly the
-                // RPython no-`jitdriver_sd` newframe tail.  The
-                // assertion makes the assumption fail loud if a portal
-                // jitcode ever reaches this site — at which point
-                // routing through `MetaInterp::newframe` (Gap A
-                // `g.4.5.6.A` follow-up) becomes load-bearing.
-                debug_assert!(
-                    sub_jitcode.jitdriver_sd().is_none(),
-                    "BC_INLINE_CALL into portal jitcode (jitdriver_sd={:?}) requires \
-                     MetaInterp::newframe routing — pyjitpl.py:2433 portal_call_depth \
-                     bookkeeping is currently bypassed.  See Gap A `g.4.5.6.A`.",
-                    sub_jitcode.jitdriver_sd(),
-                );
                 let mut sub_frame = MIFrame::setup(sub_jitcode, pc, None, Some(ctx));
+                // dispatch.rs sub-jitcode inline frame (RPython pyjitpl
+                // perform_call for non-portal jitcodes). The structured
+                // greenkey has no pc-component meaning here — use
+                // `(sub_idx, pc)` which still preserves identity.
+                ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;
                 // State-field-JIT multi-frame snapshot wiring: remember
                 // which descrs slot of the *parent* frame's jitcode
@@ -1745,8 +1723,7 @@ where
                         .current_mut()
                         .jitcode
                         .call_assembler_target(fn_ptr_idx);
-                    let token = JitCellToken::new(token_number);
-                    ctx.call_assembler_void_typed(&token, &args, &arg_types);
+                    ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types);
                     call_void_function(concrete_ptr, &concrete_args);
                 } else {
                     let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
@@ -1973,8 +1950,8 @@ where
                         .current_mut()
                         .jitcode
                         .call_assembler_target(fn_ptr_idx);
-                    let token = JitCellToken::new(token_number);
-                    let traced = ctx.call_assembler_int_typed(&token, &args, &arg_types);
+                    let traced =
+                        ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types);
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                 } else {
@@ -2093,8 +2070,8 @@ where
                         .current_mut()
                         .jitcode
                         .call_assembler_target(fn_ptr_idx);
-                    let token = JitCellToken::new(token_number);
-                    let traced = ctx.call_assembler_ref_typed(&token, &args, &arg_types);
+                    let traced =
+                        ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types);
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                 } else {
@@ -2211,8 +2188,8 @@ where
                         .current_mut()
                         .jitcode
                         .call_assembler_target(fn_ptr_idx);
-                    let token = JitCellToken::new(token_number);
-                    let traced = ctx.call_assembler_float_typed(&token, &args, &arg_types);
+                    let traced =
+                        ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types);
                     let concrete = call_int_function(concrete_ptr, &concrete_args);
                     self.set_float_reg(dst, Some(traced), Some(concrete));
                 } else {

@@ -532,12 +532,27 @@ pub trait LoopTargetDescr: Descr {
     fn set_ll_loop_code(&self, loop_code: usize);
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
+
+    /// `history.py:493 self.original_jitcell_token = original_jitcell_token`.
+    /// The owning JitCellToken's `number` for this TargetToken — set by
+    /// `compile.py:237` / `compile.py:289` once the freshly-made JitCellToken
+    /// is bound to the loop. Returns `None` for a TargetToken constructed
+    /// before the owner exists (the preamble sentinel at
+    /// `unroll.rs:196 TargetToken::new_preamble(0)`); `record_loop_or_bridge`
+    /// (`compile.py:197-199`) must then leave this JUMP branch unhandled.
+    fn original_jitcell_token_number(&self) -> Option<u64> {
+        None
+    }
+    fn set_original_jitcell_token_number(&self, _num: u64) {}
 }
 
 #[derive(Debug, Default)]
 struct BasicLoopTargetDescrState {
     ll_loop_code: usize,
     target_arglocs: Vec<TargetArgLoc>,
+    /// `history.py:493 self.original_jitcell_token`. Backfilled at
+    /// compile-time once the owning JitCellToken is created.
+    original_jitcell_token_number: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -598,6 +613,14 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
 
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>) {
         self.state.lock().unwrap().target_arglocs = arglocs;
+    }
+
+    fn original_jitcell_token_number(&self) -> Option<u64> {
+        self.state.lock().unwrap().original_jitcell_token_number
+    }
+
+    fn set_original_jitcell_token_number(&self, num: u64) {
+        self.state.lock().unwrap().original_jitcell_token_number = Some(num);
     }
 }
 
@@ -1608,6 +1631,23 @@ pub trait LoopTokenDescr: Descr {
     fn call_virtualizable_index(&self) -> Option<usize> {
         None
     }
+
+    /// `compile.py:187 original.record_jump_to(descr)` parity hook.
+    ///
+    /// Upstream `op.getdescr()` IS a `JitCellToken` object — `record_jump_to`
+    /// receives it directly without any number-to-object lookup. majit's
+    /// `LoopTokenDescr` trait lives in `majit-ir`, which cannot reference the
+    /// `JitCellToken` type defined in `majit-backend`. Implementations that
+    /// own an `Arc<JitCellToken>` expose it here as a `&dyn Any` so consumers
+    /// in `majit-metainterp` can downcast to recover the owning Arc — matching
+    /// upstream's "descr IS the loop token" identity contract without forcing
+    /// the trait into a backend dependency cycle.
+    ///
+    /// Default `None` — only `MetaCallAssemblerDescr` and other production
+    /// descriptors that carry a real compiled-loop token override.
+    fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// rewrite.py:665-695 handle_call_assembler expansion recipe.
@@ -2570,6 +2610,7 @@ pub struct SimpleCallDescr {
     descr_index: AtomicI32,
     arg_types: Vec<Type>,
     result_type: Type,
+    result_class: char,
     result_size: usize,
     /// descr.py:453: CallDescr.result_flag — computed from result_type +
     /// result_signed in __init__ (descr.py:478-493).
@@ -2584,6 +2625,7 @@ impl Clone for SimpleCallDescr {
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             arg_types: self.arg_types.clone(),
             result_type: self.result_type,
+            result_class: self.result_class,
             result_size: self.result_size,
             result_flag: self.result_flag,
             effect: self.effect.clone(),
@@ -2599,6 +2641,32 @@ impl SimpleCallDescr {
         index: u32,
         arg_types: Vec<Type>,
         result_type: Type,
+        result_signed: bool,
+        result_size: usize,
+        effect: EffectInfo,
+    ) -> Self {
+        let result_class = match result_type {
+            Type::Int => 'i',
+            Type::Ref => 'r',
+            Type::Float => 'f',
+            Type::Void => 'v',
+        };
+        Self::new_with_result_class(
+            index,
+            arg_types,
+            result_type,
+            result_class,
+            result_signed,
+            result_size,
+            effect,
+        )
+    }
+
+    pub fn new_with_result_class(
+        index: u32,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_class: char,
         result_signed: bool,
         result_size: usize,
         effect: EffectInfo,
@@ -2621,6 +2689,7 @@ impl SimpleCallDescr {
             descr_index: AtomicI32::new(-1),
             arg_types,
             result_type,
+            result_class,
             result_size,
             result_flag,
             effect,
@@ -2649,6 +2718,9 @@ impl CallDescr for SimpleCallDescr {
     }
     fn result_type(&self) -> Type {
         self.result_type
+    }
+    fn result_class(&self) -> char {
+        self.result_class
     }
     /// descr.py:537-538: is_result_signed() → result_flag == FLAG_SIGNED
     fn is_result_signed(&self) -> bool {
@@ -3564,6 +3636,31 @@ pub fn make_call_descr_full(
         index,
         arg_types,
         result_type,
+        result_signed,
+        result_size,
+        effect,
+    ))
+}
+
+/// Create a call descriptor with explicit index and RPython result class.
+///
+/// `result_type` stays in pyre's coarse IR alphabet (`Int/Ref/Float/Void`);
+/// `result_class` preserves the codewriter/backend char alphabet
+/// (`i/r/f/L/S/v`) used by RPython `CallDescr.result_type`.
+pub fn make_call_descr_full_with_result_class(
+    index: u32,
+    arg_types: Vec<Type>,
+    result_type: Type,
+    result_class: char,
+    result_signed: bool,
+    result_size: usize,
+    effect: EffectInfo,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleCallDescr::new_with_result_class(
+        index,
+        arg_types,
+        result_type,
+        result_class,
         result_signed,
         result_size,
         effect,

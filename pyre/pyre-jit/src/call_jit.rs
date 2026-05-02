@@ -139,7 +139,7 @@ static mut ARENA_BUF_BASE: *mut u8 = std::ptr::null_mut();
 static mut ARENA_TOP: usize = 0;
 static mut ARENA_INITIALIZED: usize = 0;
 
-pub(crate) fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
+fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
     use majit_metainterp::jitframe::*;
     majit_gc::rewrite::JitFrameDescrs {
         jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
@@ -170,6 +170,20 @@ mod tests {
         let descrs = arena_jitframe_descrs();
         assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
         assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
+    }
+}
+
+#[cfg(feature = "cranelift")]
+pub fn arena_global_info() -> majit_backend_cranelift::JitFrameLayoutInfo {
+    majit_backend_cranelift::JitFrameLayoutInfo {
+        jitframe_descrs: Some(arena_jitframe_descrs()),
+    }
+}
+
+#[cfg(feature = "dynasm")]
+pub fn arena_global_info_dynasm() -> majit_backend_dynasm::JitFrameLayoutInfo {
+    majit_backend_dynasm::JitFrameLayoutInfo {
+        jitframe_descrs: Some(arena_jitframe_descrs()),
     }
 }
 
@@ -1426,7 +1440,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     }
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let w_code = caller.pycode;
-    let green_key = crate::eval::make_green_key(w_code, 0, caller.get_is_being_profiled());
+    let green_key = crate::eval::make_green_key(w_code, 0);
     let _token_num = self_recursive_dispatch(green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
@@ -1587,6 +1601,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
             );
+            majit_backend_cranelift::register_jitframe_layout(arena_global_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
             // resume.py:763-870 VStr/VUni.allocate parity — Cranelift
             // backend's materialize_virtual_recursive invokes these
@@ -1621,6 +1636,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
             );
+            majit_backend_dynasm::register_jitframe_layout(arena_global_info_dynasm());
             majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
             // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
             // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
@@ -1679,7 +1695,7 @@ fn jit_blackhole_resume_from_guard(
         let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
         if !frame_ptr.is_null() {
             let code = unsafe { (*frame_ptr).pycode };
-            crate::eval::make_green_key(code, 0, unsafe { (*frame_ptr).get_is_being_profiled() })
+            crate::eval::make_green_key(code, 0)
         } else {
             green_key
         }

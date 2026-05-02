@@ -858,21 +858,28 @@ pub struct BhCallDescr {
 impl BhCallDescr {
     pub fn from_call_descr(cd: &dyn majit_ir::descr::CallDescr) -> Self {
         // RPython `descr.py:456 CallDescr.result_type` is the char
-        // 'i'/'r'/'f'/'L'/'S'/'v' itself; carry it through `result_class()`
-        // so subclass overrides (longlong 'L', singlefloat 'S') survive
-        // the trip through `BhCallDescr` instead of being collapsed by
-        // `Type` (which only knows Int/Ref/Float/Void).
-        let result_type = cd.result_type();
+        // 'i'/'r'/'f'/'L'/'S'/'v' itself.  `cd.result_type()` is pyre's
+        // coarser IR type, so derive the backend layout from
+        // `result_class()` first; SimpleCallDescr preserves specialised
+        // 'L'/'S' classes there even though their IR type is Float/Int.
+        let result_class = cd.result_class();
+        let (_, _, result_erased) = result_type_char_layout_key(result_class);
+        let result_signed = cd.is_result_signed();
+        let result_size = cd.result_size();
         Self {
             arg_classes: cd.arg_classes(),
-            result_type: cd.result_class(),
-            result_signed: cd.is_result_signed(),
-            result_size: cd.result_size(),
-            result_erased: CallResultErasedKey::from_ir_layout(
-                result_type,
-                cd.is_result_signed(),
-                cd.result_size(),
-            ),
+            result_type: result_class,
+            result_signed,
+            result_size,
+            result_erased: if result_class == 'i' || result_class == 'r' || result_class == 'f' {
+                CallResultErasedKey::from_ir_layout(cd.result_type(), result_signed, result_size)
+            } else {
+                // Preserve RPython's RESULT_ERASED key for 'S'/'L'/'v'.
+                // Keep `result_signed`/`result_size` from the concrete
+                // CallDescr above; the layout tuple only supplies the
+                // char-specific erased key.
+                result_erased
+            },
             extra_info: cd.get_extra_info().clone(),
         }
     }

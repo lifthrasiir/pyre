@@ -5,7 +5,7 @@
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
 use majit_backend::Backend;
-use majit_ir::{DescrRef, GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
     JitDriverStaticData, JitState, ResidualVirtualizableSync, TraceAction, TraceCtx,
@@ -1588,17 +1588,6 @@ pub struct TestSymState {
 pub struct MIFrame {
     pub(crate) ctx: *mut TraceCtx,
     pub(crate) sym: *mut PyreSym,
-    /// pyjitpl.py:74 `MIFrame.metainterp` — back-pointer to the owning
-    /// `MetaInterp`.  RPython's `_opimpl_recursive_call`
-    /// (pyjitpl.py:1389-1402) walks `self.metainterp.framestack`
-    /// element-wise; pyre threads `*mut PyreMetaInterp` here so the
-    /// same walk is reachable from `with_ctx` closures without a
-    /// parallel `TraceCtx::inline_frames` side table.  Mirrors the
-    /// existing `*mut TraceCtx` / `*mut PyreSym` raw-pointer back-
-    /// pointer pattern used to satisfy the borrow checker without
-    /// adding a NEW deviation.  May be `null_mut()` in test fixtures
-    /// that do not exercise the recursion-depth walk.
-    pub(crate) meta: *mut crate::metainterp::PyreMetaInterp,
     pub(crate) fallthrough_pc: usize,
     /// Concrete PyFrame address for exception table lookup.
     pub(crate) concrete_frame_addr: usize,
@@ -1622,42 +1611,11 @@ pub struct MIFrame {
     pub parent_frames: Vec<ResumeFrameState>,
     /// `pyjitpl.py:181-193` `_result_argcode` analogue for non-top-frame
     /// snapshotting. When present, `get_list_of_active_boxes(in_a_call=True)`
-    /// overwrites this caller stack slot with a null placeholder before
+    /// overwrites this caller stack slot with a zero/null placeholder before
     /// liveness encoding.
     pub pending_result_stack_idx: Option<usize>,
+    pub pending_result_type: Option<Type>,
     pub pending_inline_frame: Option<PendingInlineFrame>,
-    /// pyjitpl.py:65-100 persistent MIFrame fields.  Populated by the
-    /// framestack push site (`trace.rs` for the root frame,
-    /// `MetaInterp::push_inline_frame` for inline frames); the
-    /// per-instruction fields above default-initialise and are rebound
-    /// by `step_root_frame` / `step_inline_frame` on each step.
-    pub owned_sym: Option<Box<PyreSym>>,
-    pub jitcode: *const (),
-    pub pc: usize,
-    /// pyjitpl.py:65 `MIFrame.greenkey`: typed greenboxes used by
-    /// `_opimpl_recursive_call`'s framestack walk (pyjitpl.py:1389-1402).
-    pub greenkey: Option<GreenKey>,
-    /// Concrete `PyFrame` owned by this MIFrame.  PRE-EXISTING-ADAPTATION:
-    /// the dual-execution side channel that pairs every symbolic
-    /// trace step with a parallel `pyre-interpreter` execution (via
-    /// `metainterp.rs` `concrete_execute_step` / `concrete_execute_return`).
-    /// Has no PyPy counterpart — PyPy MIFrame holds only symbolic
-    /// boxes (`registers_i/r/f`).
-    ///
-    /// Gap B (`g.4.5.6.D` audit, frame-shape memo): if pyre-jit-trace
-    /// ever adopts a TCO-style `framestack.remove(caller_idx)`
-    /// optimization analogous to majit's `_try_tco`
-    /// (`pyjitpl.py:1306-1307 del framestack[-2]`), the caller's
-    /// `owned_concrete_frame` would need an explicit "concrete-frame
-    /// pop hook" so the heap-slot ↔ frame mapping the
-    /// `concrete_execute_*` path consults stays in sync.  Today no
-    /// such optimization exists in pyre-jit-trace and the field is
-    /// dropped only via normal `framestack.pop()` — keep it that way
-    /// (or land Gap B fix + dual-execution Phase B' first).
-    pub owned_concrete_frame: Option<Box<pyre_interpreter::pyframe::PyFrame>>,
-    pub drop_frame_opref: Option<OpRef>,
-    pub caller_result_stack_idx: Option<usize>,
-    pub arg_state: pyre_interpreter::bytecode::OpArgState,
 }
 
 pub(crate) fn code_has_backward_jump(code: &CodeObject) -> bool {
@@ -2835,7 +2793,7 @@ impl PyreSym {
     }
 
     /// Initialize symbolic tracking state. Called once when the owning
-    /// MIFrame is pushed (trace.rs for root frame). Callee (inline)
+    /// MetaInterpFrame is pushed (trace.rs for root frame). Callee (inline)
     /// frames set symbolic state manually in perform_call
     /// (trace_opcode.rs:3323-3424) and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
@@ -5071,8 +5029,8 @@ impl JitState for PyreJitState {
         if frame_ptr.is_null() {
             return None;
         }
-        let frame = unsafe { &*frame_ptr };
-        Some(crate::driver::make_green_key_for_frame(frame, pc))
+        let code = unsafe { (*frame_ptr).pycode };
+        Some(crate::driver::make_green_key(code, pc))
     }
 
     fn code_ptr(&self) -> usize {
@@ -6286,22 +6244,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state).expect_err("reraise should raise");
@@ -6321,22 +6271,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let err =
@@ -6355,22 +6297,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6397,22 +6331,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6450,22 +6376,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6503,22 +6421,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6547,22 +6457,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6597,22 +6499,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6705,22 +6599,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6760,22 +6646,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         frame.push(caught_exc);
@@ -7033,22 +6911,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         state.with_ctx(|this, ctx| {
@@ -7078,22 +6948,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
@@ -7132,22 +6994,14 @@ mod tests {
             let mut state = MIFrame {
                 ctx: &mut ctx,
                 sym: &mut sym,
-                meta: std::ptr::null_mut(),
                 fallthrough_pc: 0,
                 parent_frames: Vec::new(),
                 pending_result_stack_idx: None,
+                pending_result_type: None,
                 pending_inline_frame: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
-                owned_sym: None,
-                jitcode: std::ptr::null(),
-                pc: 0,
-                greenkey: None,
-                owned_concrete_frame: None,
-                drop_frame_opref: None,
-                caller_result_stack_idx: None,
-                arg_state: pyre_interpreter::bytecode::OpArgState::default(),
             };
             trace_unbox_int_with_resume(
                 &mut state,
@@ -7196,22 +7050,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let instance_ref = ctx.const_ref(instance as i64);
@@ -7577,22 +7423,14 @@ mod tests {
             let mut state = MIFrame {
                 ctx: &mut ctx,
                 sym: &mut sym,
-                meta: std::ptr::null_mut(),
                 fallthrough_pc: 0,
                 parent_frames: Vec::new(),
                 pending_result_stack_idx: None,
+                pending_result_type: None,
                 pending_inline_frame: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
-                owned_sym: None,
-                jitcode: std::ptr::null(),
-                pc: 0,
-                greenkey: None,
-                owned_concrete_frame: None,
-                drop_frame_opref: None,
-                caller_result_stack_idx: None,
-                arg_state: pyre_interpreter::bytecode::OpArgState::default(),
             };
 
             let loaded =
@@ -7636,22 +7474,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         state
@@ -7678,22 +7508,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
@@ -7727,22 +7549,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let _ = state
@@ -7797,22 +7611,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: branch_pc,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let concrete_lhs = w_int_new(10);
@@ -7887,22 +7693,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let concrete_lhs = w_int_new(10);
@@ -7989,22 +7787,14 @@ mod tests {
         let state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: compare_pc + 1,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         assert!(
@@ -8326,22 +8116,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
@@ -8403,22 +8185,14 @@ mod tests {
         let mut state = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
-            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
+            pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
             concrete_frame_addr: frame_ptr,
             pre_opcode_registers_r: None,
-            owned_sym: None,
-            jitcode: std::ptr::null(),
-            pc: 0,
-            greenkey: None,
-            owned_concrete_frame: None,
-            drop_frame_opref: None,
-            caller_result_stack_idx: None,
-            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
@@ -8456,21 +8230,26 @@ mod tests {
 /// and pushes the callee `MIFrame` directly inside `perform_call`; pyre
 /// returns this struct from the trace step so the framestack mutation
 /// happens in `MetaInterpreter::push_inline_frame` after the trace
-/// handler releases its borrow on the framestack top `MIFrame`.  No
-/// upstream counterpart.
+/// handler releases its borrow on `MetaInterpFrame`.  No upstream
+/// counterpart.
 pub struct PendingInlineFrame {
     pub sym: PyreSym,
     pub concrete_frame: pyre_interpreter::pyframe::PyFrame,
     pub drop_frame_opref: Option<OpRef>,
     pub green_key: u64,
-    /// pyjitpl.py:1415 `perform_call(..., greenkey=greenboxes)`.
-    /// Typed PyPyJitDriver greens in declaration order, used by the
-    /// framestack recursion walk.
-    pub greenkey: GreenKey,
+    /// Raw `(code_ptr, target_pc)` greenkey components for element-
+    /// wise recursion-depth comparison. `green_key` above is the u64
+    /// hash derived from this pair and stays the identity key for
+    /// HashMap lookups; `green_key_raw` element-wise equality matches
+    /// rpython/jit/metainterp/pyjitpl.py:1396-1401 `for i in
+    /// range(len(gk)): if not gk[i].same_constant(greenboxes[i])`
+    /// without the hash-collision risk a u64-only comparison carries.
+    pub green_key_raw: (usize, usize),
     /// opencoder.py:819-834: accumulated parent frame chain.
     pub parent_frames: Vec<ResumeFrameState>,
     pub nargs: usize,
     pub caller_result_stack_idx: Option<usize>,
+    pub caller_result_type: Option<Type>,
 }
 
 pub enum InlineTraceStepAction {
@@ -8678,6 +8457,7 @@ pub struct ResumeFrameState {
     /// snapshotting liveness so the undefined call result does not leak
     /// stale boxes into guard fail_args.
     pub pending_result_stack_idx: Option<usize>,
+    pub pending_result_type: Option<Type>,
 }
 
 #[cfg(test)]

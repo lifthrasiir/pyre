@@ -1483,6 +1483,7 @@ mod tests {
 
         assert_eq!(call.arg_types(), &[Type::Int]);
         assert_eq!(call.result_type(), Type::Int);
+        assert_eq!(call.result_class(), 'S');
         assert_eq!(call.result_size(), 4);
         assert!(!call.is_result_signed());
     }
@@ -2170,10 +2171,11 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
     // call.py:320 effectinfo_from_writeanalyze parity: the descr consumed
     // by pyjitpl/residual-call recording must expose the same EffectInfo
     // that the codewriter classified for this call site.
-    majit_ir::descr::make_call_descr_full(
+    majit_ir::descr::make_call_descr_full_with_result_class(
         u32::MAX,
         arg_types,
         result_type,
+        bh.result_type,
         bh.result_signed,
         bh.result_size,
         bh.extra_info.clone(),

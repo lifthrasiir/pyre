@@ -105,7 +105,7 @@ pub struct UnrollOptimizer {
     /// that no Phase 1 emit op covers (alias seeds, virtual heads,
     /// short-preamble PreambleOp tombstones).  Mirrors RPython's
     /// persistent `box.type` attribute across the export/import boundary.
-    pub phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
+    phase1_value_types: std::collections::HashMap<u32, majit_ir::Type>,
     /// RPython: same Optimizer instance across phases keeps patchguardop.
     /// In majit, separate instances — forward explicitly.
     phase1_patchguardop: Option<majit_ir::Op>,
@@ -1790,12 +1790,11 @@ impl ExportedState {
     /// share one VirtualStateInfo" invariant. Rust's `Rc<...>` is immutable
     /// after construction, so each per-slot GcRef refresh would otherwise
     /// allocate an independent new `Rc` for every shared slot, breaking
-    /// the shared-substate dedup the position-based walker
-    /// (`enum_forced_boxes_for_entry` virtualstate.py:196 / 274 / 352)
-    /// depends on. Snapshot the original `Rc::as_ptr` per slot, group
-    /// slots that originally shared an `Rc`, and after the GcRef updates
-    /// re-clone a single canonical `Rc` into every slot of each group so
-    /// the post-refresh tree preserves the pre-GC aliasing.
+    /// the `Rc::as_ptr` dedup that `build_sequential_slot_schedule` relies
+    /// on. Snapshot the original `Rc::as_ptr` per slot, group slots that
+    /// originally shared an `Rc`, and after the GcRef updates re-clone a
+    /// single canonical `Rc` into every slot of each group so the
+    /// post-refresh tree preserves the pre-GC aliasing.
     pub fn refresh_from_gc(&mut self) {
         use crate::optimizeopt::info::PtrInfo;
         use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
@@ -1886,12 +1885,9 @@ impl ExportedState {
                     self.virtual_state.state[slot_idx] = Rc::clone(entry);
                 }
             }
-            // Rc identities have shifted, so position cells (which are
-            // assigned in DFS order over the live `state` graph) need to
-            // be re-derived. virtualstate.py:628-634 `VirtualState.__init__`
-            // re-runs `enum` over fresh subclass instances; pyre mirrors
-            // that by re-running `enum_top_level` over the rebuilt Rc set.
-            self.virtual_state.enum_top_level();
+            // Rc identities have shifted, so the dedup walkers'
+            // numnotvirtuals / slot_schedule need to be recomputed.
+            self.virtual_state.rebuild_slot_schedule();
         }
     }
 
@@ -2112,12 +2108,27 @@ impl TargetToken {
     pub fn as_jump_target_descr(&self) -> majit_ir::DescrRef {
         self.jump_target_descr.clone()
     }
+
+    /// `compile.py:237` / `compile.py:289` — bind the freshly-made
+    /// JitCellToken's `number` to this TargetToken's `original_jitcell_token`.
+    /// Walker (`record_loop_or_bridge`, `compile.py:197-199`) reads this to
+    /// determine whether a JUMP crosses to a different loop.
+    pub fn set_original_jitcell_token_number(&self, num: u64) {
+        majit_ir::LoopTargetDescr::set_original_jitcell_token_number(
+            self.jump_target_descr.as_ref(),
+            num,
+        );
+    }
 }
 
 #[derive(Debug, Default)]
 struct LoopTargetDescrState {
     ll_loop_code: usize,
     target_arglocs: Vec<majit_ir::TargetArgLoc>,
+    /// `history.py:493 self.original_jitcell_token`. Backfilled once the
+    /// owning JitCellToken is created (`pyjitpl/mod.rs:3853` etc., the
+    /// counterpart to `compile.py:237` / `compile.py:289`).
+    original_jitcell_token_number: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -2178,6 +2189,14 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
 
     fn set_target_arglocs(&self, arglocs: Vec<majit_ir::TargetArgLoc>) {
         self.state.lock().unwrap().target_arglocs = arglocs;
+    }
+
+    fn original_jitcell_token_number(&self) -> Option<u64> {
+        self.state.lock().unwrap().original_jitcell_token_number
+    }
+
+    fn set_original_jitcell_token_number(&self, num: u64) {
+        self.state.lock().unwrap().original_jitcell_token_number = Some(num);
     }
 }
 

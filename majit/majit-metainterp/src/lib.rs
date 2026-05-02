@@ -30,6 +30,7 @@ mod jitdriver;
 pub mod jitexc;
 pub mod jitframe;
 pub mod jitprof;
+pub mod memmgr;
 pub mod opencoder;
 pub mod optimize;
 pub mod optimizeopt;
@@ -46,8 +47,9 @@ pub mod walkvirtual;
 pub mod warmstate;
 
 pub use call_descr::{
-    make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
-    make_call_descr_with_effect,
+    make_call_assembler_descr, make_call_assembler_descr_by_number,
+    make_call_assembler_descr_with_vable, make_call_assembler_descr_with_vable_by_number,
+    make_call_descr, make_call_descr_with_effect,
 };
 pub use compile::{make_fail_descr, make_fail_descr_typed};
 pub use constant_pool::ConstantPool;

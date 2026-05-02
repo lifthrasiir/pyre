@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use majit_backend::JitCellToken;
 use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Type, VableExpansion};
 
 /// Generic CallDescr for function call operations.
@@ -13,15 +14,23 @@ struct MetaCallDescr {
     effect_info: EffectInfo,
 }
 
+/// `compile.py:187 isinstance(descr, JitCellToken)` parity.
+///
+/// RPython's `op.getdescr()` for a `CALL_ASSEMBLER_*` op IS a `JitCellToken`
+/// — `record_loop_or_bridge` reads `descr.number` directly and calls
+/// `original.record_jump_to(descr)` without any indirection. majit cannot
+/// inherit-from the trait, but it preserves the *identity* contract by
+/// owning an `Arc<JitCellToken>` here. Callers (`direct_assembler_call`,
+/// `compile_tmp_callback`) clone the same Arc that the warm cell /
+/// `CompiledEntry::token` /` MemoryManager.alive_loops` already hold, so the
+/// keepalive walker's downcast recovers the production token's strong
+/// reference rather than a number-recovered side-table lookup.
 #[derive(Debug)]
 struct MetaCallAssemblerDescr {
     arg_types: Vec<Type>,
     result_type: Type,
-    target_token: u64,
+    target_token: Arc<JitCellToken>,
     vable_expansion: Option<VableExpansion>,
-    /// rewrite.py:684 `jd.index_of_virtualizable`: index of the
-    /// virtualizable argument inside the callee's red-arg list.
-    virtualizable_arg_index: Option<usize>,
 }
 
 impl majit_ir::Descr for MetaCallDescr {
@@ -71,10 +80,10 @@ impl CallDescr for MetaCallAssemblerDescr {
         8
     }
     fn call_target_token(&self) -> Option<u64> {
-        Some(self.target_token)
+        Some(self.target_token.number)
     }
     fn call_virtualizable_index(&self) -> Option<usize> {
-        self.virtualizable_arg_index
+        self.target_token.virtualizable_arg_index
     }
     fn get_extra_info(&self) -> &EffectInfo {
         static INFO: EffectInfo = EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None);
@@ -87,11 +96,15 @@ impl CallDescr for MetaCallAssemblerDescr {
 
 impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
     fn loop_token_number(&self) -> u64 {
-        self.target_token
+        self.target_token.number
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {
-        self.virtualizable_arg_index
+        self.target_token.virtualizable_arg_index
+    }
+
+    fn token_handle_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.target_token)
     }
 }
 
@@ -259,27 +272,54 @@ pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> Descr
     })
 }
 
-/// Create a CallDescr for `CALL_ASSEMBLER_*` with the given target token.
+/// `compile.py:187 isinstance(descr, JitCellToken)` parity factory.
+///
+/// Create a `CALL_ASSEMBLER_*` descr that owns the same `Arc<JitCellToken>`
+/// as the production warm cell / `CompiledEntry::token` / `alive_loops`.
+/// `direct_assembler_call` (`pyjitpl.py:3589-3609`) is the canonical caller —
+/// it threads the cell's compiled token through, so `record_loop_or_bridge`'s
+/// keepalive walker downcasts the descr and pushes that same Arc into
+/// `original.keepalive_tokens`, matching `compile.py:187 record_jump_to(descr)`.
 pub fn make_call_assembler_descr(
-    target_token: u64,
+    target_token: Arc<JitCellToken>,
     arg_types: &[Type],
     result_type: Type,
-    virtualizable_arg_index: Option<usize>,
 ) -> DescrRef {
     Arc::new(MetaCallAssemblerDescr {
         arg_types: arg_types.to_vec(),
         result_type,
         target_token,
         vable_expansion: None,
-        virtualizable_arg_index,
     })
+}
+
+/// Number-only factory for callers that have not yet been threaded an
+/// `Arc<JitCellToken>` (jitcode dispatch in `dispatch.rs`, test fixtures).
+///
+/// Synthesises a fresh stand-alone `Arc<JitCellToken>` with the requested
+/// `target_number` so the descr keeps the same shape as the identity-preserving
+/// path. Identity is **not** preserved — the keepalive walker recovers the
+/// real Arc via `jitcell_token_by_number(target_number)` for these descrs
+/// (`pyjitpl/mod.rs:record_loop_or_bridge` Arc-fallback inside the
+/// CALL_ASSEMBLER branch). Sites transitioning to
+/// `make_call_assembler_descr` once the Arc is available upstream remove
+/// the lookup.
+pub fn make_call_assembler_descr_by_number(
+    target_number: u64,
+    arg_types: &[Type],
+    result_type: Type,
+    virtualizable_arg_index: Option<usize>,
+) -> DescrRef {
+    let mut tok = JitCellToken::new(target_number);
+    tok.virtualizable_arg_index = virtualizable_arg_index;
+    make_call_assembler_descr(Arc::new(tok), arg_types, result_type)
 }
 
 /// rewrite.py:665-695 handle_call_assembler: create a CallDescr that carries
 /// virtualizable expansion info. The backend reads fields from the frame
 /// reference to populate the callee's full inputarg jitframe layout.
 pub fn make_call_assembler_descr_with_vable(
-    target_token: u64,
+    target_token: Arc<JitCellToken>,
     arg_types: &[Type],
     result_type: Type,
     expansion: VableExpansion,
@@ -289,6 +329,17 @@ pub fn make_call_assembler_descr_with_vable(
         result_type,
         target_token,
         vable_expansion: Some(expansion),
-        virtualizable_arg_index: None,
     })
+}
+
+/// Number-only sibling of `make_call_assembler_descr_with_vable` for transitional
+/// callers (jitcode dispatch). See `make_call_assembler_descr_by_number`.
+pub fn make_call_assembler_descr_with_vable_by_number(
+    target_number: u64,
+    arg_types: &[Type],
+    result_type: Type,
+    expansion: VableExpansion,
+) -> DescrRef {
+    let tok = Arc::new(JitCellToken::new(target_number));
+    make_call_assembler_descr_with_vable(tok, arg_types, result_type, expansion)
 }

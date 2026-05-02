@@ -8,8 +8,8 @@
 use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 
-use crate::metainterp::PyreMetaInterp;
-use crate::state::{MIFrame, PyreSym};
+use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
+use crate::state::PyreSym;
 
 /// Trace an entire loop body starting at `start_pc`.
 ///
@@ -35,27 +35,19 @@ pub fn trace_bytecode(
     // (trace_opcode.rs:3323-3424) and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
-    let frame = MIFrame {
-        // Persistent fields (pyjitpl.py:65-100).
+    let frame = MetaInterpFrame {
         sym: sym as *mut PyreSym,
         owned_sym: None,
         jitcode: w_code,
         pc: start_pc,
         greenkey: None,
+        concrete_frame: cf_addr,
         owned_concrete_frame: Some(concrete_frame),
         parent_frames: Vec::new(),
         drop_frame_opref: None,
         caller_result_stack_idx: None,
+        caller_result_type: None,
         arg_state: pyre_interpreter::bytecode::OpArgState::default(),
-        // Per-instruction fields default-init; populated each step.
-        ctx: std::ptr::null_mut(),
-        meta: std::ptr::null_mut(),
-        fallthrough_pc: 0,
-        concrete_frame_addr: cf_addr,
-        orgpc: start_pc,
-        pre_opcode_registers_r: None,
-        pending_result_stack_idx: None,
-        pending_inline_frame: None,
     };
 
     let mut metainterp = PyreMetaInterp::new(w_code, std::ptr::null_mut());
@@ -64,17 +56,7 @@ pub fn trace_bytecode(
     // pyjitpl.py:2971-2973: register the initial merge point so
     // reached_loop_header recognizes the trace start backedge and closes
     // the loop instead of unrolling it as a first-visit inner loop.
-    //
-    // interp_jit.py:118 reads `frame.is_being_profiled` live at every
-    // backedge, so derive the start key from the live concrete frame
-    // rather than caching it across the trace.
-    let root_frame_ref = metainterp
-        .framestack
-        .first()
-        .expect("trace_bytecode root frame must be live before interpret()");
-    let start_key = root_frame_ref
-        .green_key_hash_for_pc(start_pc)
-        .expect("trace_bytecode root frame must hold a concrete PyFrame");
+    let start_key = crate::driver::make_green_key(w_code, start_pc);
     {
         let input_args: Vec<majit_ir::OpRef> = (0..ctx.num_inputs())
             .map(|i| majit_ir::OpRef(i as u32))
@@ -85,45 +67,33 @@ pub fn trace_bytecode(
 
     let action = metainterp.interpret(ctx);
 
-    // pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
-    // original_boxes comes from the merge point where the loop closes
-    // (pyjitpl.py:2995), which may differ from start_pc when
-    // cut_trace_from retargets to an inner loop.
-    //
-    // Compute the close-loop key BEFORE popping the root frame so the
-    // live `is_being_profiled` is observed (interp_jit.py:118), instead
-    // of the trace-start snapshot.
-    match &action {
-        TraceAction::CloseLoopWithArgs {
-            loop_header_pc: Some(target_pc),
-            ..
-        } if *target_pc != start_pc => {
-            let target_key = metainterp
-                .framestack
-                .last()
-                .and_then(|frame| frame.green_key_hash_for_pc(*target_pc))
-                .unwrap_or(start_key);
-            ctx.set_green_key(target_key, (w_code as usize, *target_pc));
-            ctx.header_pc = *target_pc;
-            ctx.cut_inner_green_key = Some(target_key);
-        }
-        TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-            let key = metainterp
-                .framestack
-                .first()
-                .and_then(|frame| frame.green_key_hash_for_pc(start_pc))
-                .unwrap_or(start_key);
-            ctx.set_green_key(key, (w_code as usize, start_pc));
-            ctx.header_pc = start_pc;
-        }
-        _ => {}
-    }
-
     // Recover the root frame's owned_concrete_frame for writeback.
     let executed_frame = metainterp
         .framestack
         .pop()
         .and_then(|f| f.owned_concrete_frame);
+
+    // pyjitpl.py:3160: greenkey = original_boxes[:num_green_args]
+    // original_boxes comes from the merge point where the loop closes
+    // (pyjitpl.py:2995), which may differ from start_pc when
+    // cut_trace_from retargets to an inner loop.
+    match &action {
+        TraceAction::CloseLoopWithArgs {
+            loop_header_pc: Some(target_pc),
+            ..
+        } if *target_pc != start_pc => {
+            let target_key = crate::driver::make_green_key(w_code, *target_pc);
+            ctx.set_green_key(target_key, (w_code as usize, *target_pc));
+            ctx.header_pc = *target_pc;
+            ctx.cut_inner_green_key = Some(target_key);
+        }
+        TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
+            let key = crate::driver::make_green_key(w_code, start_pc);
+            ctx.set_green_key(key, (w_code as usize, start_pc));
+            ctx.header_pc = start_pc;
+        }
+        _ => {}
+    }
 
     // On abort, root frame may still be on the stack.
     let root_frame = if let Some(frame) = executed_frame {

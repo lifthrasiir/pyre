@@ -221,7 +221,7 @@ pub enum CellJitState {
     Compiled(Arc<JitCellToken>),
 }
 
-pub use majit_trace::memmgr::LoopAging;
+pub use crate::memmgr::MemoryManager;
 
 /// Warm state manager — the orchestrator of the JIT lifecycle.
 ///
@@ -337,7 +337,7 @@ pub struct WarmEnterState {
     // warmstate.py:299-320 — retrace_limit / max_retrace_guards /
     // max_unroll_loops / max_unroll_recursion live on
     // warmrunnerdesc.memory_manager, not on WarmEnterState itself. See
-    // `LoopAging` in memmgr.rs.
+    // `MemoryManager` in memmgr.rs.
     /// jit.py:581,602: vec — enable vectorization optimization.
     vectorize: bool,
     /// jit.py:585,603: vec_all — vectorize loops outside numpypy library.
@@ -356,15 +356,7 @@ pub struct WarmEnterState {
     pureop_historylength: u32,
     /// warmspot.py:110: memory_manager — generation-based loop aging.
     /// pyjitpl.py:2348: try_to_free_some_loops calls next_generation().
-    pub memory_manager: majit_trace::memmgr::LoopAging,
-    /// warmstate.py make_unique_id_fn: per-`JitDriver` resolver for
-    /// `enter_portal_frame`'s `unique_id` operand (pyjitpl.py:2438-2441).
-    /// Default returns 0 — matches the RPython default when a driver
-    /// does not register `get_unique_id_default`.  PyPyJitDriver
-    /// (`pypy/module/pypyjit/interp_jit.py:44`) installs a resolver
-    /// that returns the pycode's rvmprof unique id; pyre wires that up
-    /// at the JitDriver registration site once available.
-    get_unique_id_fn: Option<fn(&GreenKey) -> i64>,
+    pub memory_manager: crate::memmgr::MemoryManager,
 }
 
 /// Result of checking whether a green key is hot.
@@ -443,7 +435,7 @@ impl WarmEnterState {
             disable_unrolling_threshold: DEFAULT_DISABLE_UNROLLING,
             pureop_historylength: 16,
             memory_manager: {
-                let mut m = majit_trace::memmgr::LoopAging::new(0);
+                let mut m = crate::memmgr::MemoryManager::new(0);
                 // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
                 // PARAMETERS is 0, applied in production via set_user_param).
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
@@ -453,7 +445,6 @@ impl WarmEnterState {
                 m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
-            get_unique_id_fn: None,
         }
     }
 
@@ -481,7 +472,7 @@ impl WarmEnterState {
             disable_unrolling_threshold: DEFAULT_DISABLE_UNROLLING,
             pureop_historylength: 16,
             memory_manager: {
-                let mut m = majit_trace::memmgr::LoopAging::new(0);
+                let mut m = crate::memmgr::MemoryManager::new(0);
                 // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
                 // PARAMETERS is 0, applied in production via set_user_param).
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
@@ -491,26 +482,6 @@ impl WarmEnterState {
                 m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
-            get_unique_id_fn: None,
-        }
-    }
-
-    /// Install a per-driver `get_unique_id` resolver — pyjitpl.py:2438
-    /// `jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`.  Invoked
-    /// once at JitDriver registration; `None` (default) means RPython's
-    /// `get_unique_id_default` returning `0`.
-    pub fn set_get_unique_id_fn(&mut self, fn_: fn(&GreenKey) -> i64) {
-        self.get_unique_id_fn = Some(fn_);
-    }
-
-    /// pyjitpl.py:2436-2441 `unique_id = jitcode.jitdriver_sd.warmstate.
-    /// get_unique_id(greenkey)`.  Returns `0` when no resolver is
-    /// installed (RPython `get_unique_id_default`); PyPyJitDriver
-    /// installs a resolver that returns the pycode rvmprof id.
-    pub fn get_unique_id(&self, greenkey: &GreenKey) -> i64 {
-        match self.get_unique_id_fn {
-            Some(f) => f(greenkey),
-            None => 0,
         }
     }
 
@@ -919,6 +890,26 @@ impl WarmEnterState {
         self.cells.get(&green_key_hash)
     }
 
+    /// PRE-EXISTING-ADAPTATION: walk the warmstate cells to find a
+    /// `JitCellToken` by number. Used by `MetaInterp::record_loop_or_bridge`
+    /// to widen the CALL_ASSEMBLER keepalive search to cover targets
+    /// that live only on a `BaseJitCell.loop_token` (most importantly
+    /// tmp-callback installs at `attach_tmp_callback_to_interp`) and
+    /// are not yet — or never — registered in `MetaInterp::compiled_loops`.
+    ///
+    /// RPython equivalent does not exist because upstream descrs hold
+    /// the `JitCellToken` object directly (`compile.py:187 isinstance(descr,
+    /// JitCellToken)`) — no number→token resolution is needed.  This
+    /// helper is removed by Slice X-D once `CallAssemblerDescr` /
+    /// `LoopTargetDescr` carry the owning `Arc<JitCellToken>`.
+    pub fn find_token_by_number(&self, token_number: u64) -> Option<&Arc<JitCellToken>> {
+        self.cells.values().find_map(|cell| {
+            cell.loop_token
+                .as_ref()
+                .filter(|tok| tok.number == token_number)
+        })
+    }
+
     /// `rpython/jit/metainterp/warmstate.py:714-723` `get_assembler_token`.
     ///
     /// Returns the cell's existing procedure token, or — if none exists —
@@ -1149,7 +1140,8 @@ impl WarmEnterState {
     /// warmstate.py:293-297 set_param_loop_longevity — delegates to the
     /// memory manager's max_age.
     pub fn set_param_loop_longevity(&mut self, value: u32) {
-        self.memory_manager.set_max_age(value as u64);
+        // memmgr.py:42 default check_frequency=0 → derives sqrt(max_age).
+        self.memory_manager.set_max_age(value as i64, 0);
     }
 
     /// RPython-compatible wrapper: set_param_pureop_historylength.
@@ -1228,7 +1220,7 @@ impl WarmEnterState {
         self.memory_manager.max_unroll_loops = 0;
         self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT;
         self.memory_manager.max_unroll_recursion = DEFAULT_MAX_UNROLL_RECURSION;
-        self.memory_manager.set_max_age(1000);
+        self.memory_manager.set_max_age(1000, 0);
         self.vec_cost = 0;
         self.vectorize = false;
         self.set_param_enable_opts("all");
@@ -1455,7 +1447,7 @@ impl WarmEnterState {
             "max_retrace_guards" => self.memory_manager.max_retrace_guards = as_u32,
             "max_unroll_loops" => self.memory_manager.max_unroll_loops = as_u32,
             "max_unroll_recursion" => self.memory_manager.max_unroll_recursion = as_u32,
-            "loop_longevity" => self.memory_manager.set_max_age(as_u32 as u64),
+            "loop_longevity" => self.memory_manager.set_max_age(as_u32 as i64, 0),
             // warmstate.py:322-329 — vec, vec_all, vec_cost are separate fields
             "vec" | "vectorize" => self.vectorize = value != 0,
             "vec_all" => self.vec_all = value != 0,
@@ -1523,7 +1515,7 @@ impl WarmEnterState {
             "max_retrace_guards" => Some(self.memory_manager.max_retrace_guards as i64),
             "max_unroll_loops" => Some(self.memory_manager.max_unroll_loops as i64),
             "max_unroll_recursion" => Some(self.memory_manager.max_unroll_recursion as i64),
-            "loop_longevity" => Some(self.memory_manager.max_age() as i64),
+            "loop_longevity" => Some(self.memory_manager.loop_longevity_param()),
             "vectorize" => Some(if self.vectorize { 1 } else { 0 }),
             "vec_cost" => Some(self.vec_cost as i64),
             "inlining" => Some(if self.inlining { 1 } else { 0 }),
@@ -1554,7 +1546,7 @@ impl WarmEnterState {
             "max_unroll_recursion" => {
                 self.memory_manager.max_unroll_recursion = DEFAULT_MAX_INLINE_DEPTH;
             }
-            "loop_longevity" => self.memory_manager.set_max_age(1000),
+            "loop_longevity" => self.memory_manager.set_max_age(1000, 0),
             "vectorize" => self.vectorize = false,
             "vec_cost" => self.vec_cost = 0,
             // rlib/jit.py:588 PARAMETERS default decay=40.
@@ -2287,276 +2279,261 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    // ── Loop aging (memmgr parity) tests ──
+    // ── MemoryManager (memmgr.py parity) tests ──
     //
-    // Ported from rpython/jit/metainterp/test/test_memmgr.py.
+    // Ported from rpython/jit/metainterp/test/test_memmgr.py.  Each
+    // test creates real `Arc<JitCellToken>` instances since
+    // `MemoryManager.alive_loops` keys on token identity per
+    // memmgr.py:9-12 (the looptoken Python object is the dict key
+    // upstream).
+
+    fn make_token(number: u64) -> Arc<JitCellToken> {
+        Arc::new(JitCellToken::new(number))
+    }
 
     #[test]
     fn test_loop_aging_basic() {
-        // Loops not accessed for max_age generations are evicted.
-        let mut aging = LoopAging::new(3);
+        // memmgr.py:_kill_old_loops_now predicate:
+        //   0 <= looptoken.generation < current_generation - (max_age - 1)
+        // With max_age=3 and a token kept alive at current_generation=1:
+        //   after 2 next_generation: cg=3, max_gen=3-2=1, 1<1=false → keep
+        //   after 3 next_generation: cg=4, max_gen=4-2=2, 1<2=true  → evict
+        let mut mgr = MemoryManager::new(3);
+        let t1 = make_token(1);
+        let t2 = make_token(2);
 
-        aging.register_loop(1);
-        aging.register_loop(2);
-        assert_eq!(aging.alive_count(), 2);
+        mgr.keep_loop_alive(&t1);
+        mgr.keep_loop_alive(&t2);
+        assert_eq!(mgr.alive_count(), 2);
 
-        // Advance 3 generations without refreshing.
-        let evicted = aging.next_generation(); // gen 1
-        assert!(evicted.is_empty());
-        let evicted = aging.next_generation(); // gen 2
-        assert!(evicted.is_empty());
-        let evicted = aging.next_generation(); // gen 3
-        assert!(evicted.is_empty());
+        mgr.next_generation();
+        mgr.next_generation();
+        assert_eq!(mgr.alive_count(), 2);
 
-        // gen 4: loops registered at gen 0, threshold = 4-3 = 1, 0 < 1 → evict
-        let evicted = aging.next_generation();
-        assert_eq!(evicted.len(), 2);
-        assert_eq!(aging.alive_count(), 0);
+        mgr.next_generation();
+        assert_eq!(mgr.alive_count(), 0);
     }
 
     #[test]
     fn test_loop_aging_disabled() {
-        // max_age=0 disables eviction entirely.
-        let mut aging = LoopAging::new(0);
+        // memmgr.py:43-44: max_age <= 0 disables eviction.
+        let mut mgr = MemoryManager::new(0);
+        let t1 = make_token(1);
+        let t2 = make_token(2);
 
-        aging.register_loop(1);
-        aging.register_loop(2);
+        mgr.keep_loop_alive(&t1);
+        mgr.keep_loop_alive(&t2);
 
         for _ in 0..100 {
-            let evicted = aging.next_generation();
-            assert!(evicted.is_empty());
+            mgr.next_generation();
         }
-        assert_eq!(aging.alive_count(), 2);
+        assert_eq!(mgr.alive_count(), 2);
     }
 
     #[test]
     fn test_loop_aging_refresh() {
-        // Accessing a loop resets its age.
-        let mut aging = LoopAging::new(3);
+        // keep_loop_alive resets `looptoken.generation` to
+        // `current_generation`, postponing eviction.
+        let mut mgr = MemoryManager::new(3);
+        let t1 = make_token(1);
+        let t2 = make_token(2);
 
-        aging.register_loop(1);
-        aging.register_loop(2);
+        mgr.keep_loop_alive(&t1);
+        mgr.keep_loop_alive(&t2);
 
-        // Advance 2 generations, refreshing loop 1 each time.
-        aging.next_generation(); // gen 1
-        aging.keep_loop_alive(1);
-        aging.next_generation(); // gen 2
-        aging.keep_loop_alive(1);
-        aging.next_generation(); // gen 3
+        // Refresh t1 each generation; t2 ages out.
+        mgr.next_generation();
+        mgr.keep_loop_alive(&t1);
+        mgr.next_generation();
+        mgr.keep_loop_alive(&t1);
+        mgr.next_generation();
+        // cg=4, max_gen=2; t1.gen=3 (refreshed), 3<2=false → keep;
+        //                  t2.gen=1, 1<2=true → evict.
+        assert_eq!(mgr.alive_count(), 1);
+        assert!(mgr.contains(&t1));
+        assert!(!mgr.contains(&t2));
 
-        // gen 4: loop 2 was registered at gen 0, threshold = 4-3=1, 0 < 1 → evict
-        // loop 1 was refreshed at gen 2, 2 >= 1 → alive
-        let evicted = aging.next_generation();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], 2);
-        assert_eq!(aging.alive_count(), 1);
-
-        // Keep refreshing loop 1 — it should never be evicted.
-        aging.keep_loop_alive(1);
+        // Refreshing t1 each generation keeps it indefinitely.
         for _ in 0..10 {
-            let evicted = aging.next_generation();
-            assert!(evicted.is_empty());
-            aging.keep_loop_alive(1);
+            mgr.keep_loop_alive(&t1);
+            mgr.next_generation();
         }
-        assert_eq!(aging.alive_count(), 1);
+        assert!(mgr.contains(&t1));
     }
 
     #[test]
     fn test_loop_aging_mixed() {
-        // Mix of registering at different generations.
-        let mut aging = LoopAging::new(2);
+        // Tokens kept alive at different generations age independently.
+        let mut mgr = MemoryManager::new(2);
+        let t1 = make_token(1);
+        let t2 = make_token(2);
 
-        aging.register_loop(1); // registered at gen 0
-        aging.next_generation(); // gen 1
-        aging.register_loop(2); // registered at gen 1
+        mgr.keep_loop_alive(&t1); // t1.gen=1
+        mgr.next_generation(); // cg=2, max_gen=2-1=1, t1.gen=1, 1<1=false → keep
+        mgr.keep_loop_alive(&t2); // t2.gen=2
 
-        // gen 2: threshold = 2-2=0, loop 1 at gen 0: 0 >= 0 → alive,
-        //        loop 2 at gen 1: 1 >= 0 → alive
-        let evicted = aging.next_generation();
-        assert!(evicted.is_empty());
-
-        // gen 3: threshold = 3-2=1, loop 1 at gen 0: 0 < 1 → evict,
-        //        loop 2 at gen 1: 1 >= 1 → alive
-        let evicted = aging.next_generation();
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], 1);
-        assert_eq!(aging.alive_count(), 1);
+        mgr.next_generation(); // cg=3, max_gen=2, t1.gen=1<2=true → evict, t2.gen=2<2=false → keep
+        assert_eq!(mgr.alive_count(), 1);
+        assert!(!mgr.contains(&t1));
+        assert!(mgr.contains(&t2));
     }
 
     // ── Memmgr deeper coverage (RPython: test_memmgr.py parity) ──
 
     #[test]
     fn test_evicted_loops_can_be_recompiled() {
-        // After a loop is evicted by loop aging, it can be re-registered
-        // (recompiled) and tracked again.
-        let mut aging = LoopAging::new(2);
+        // After eviction the same JitCellToken can be re-inserted by a
+        // fresh keep_loop_alive (or a freshly compiled token can take
+        // its place — RPython gets a brand-new LoopToken object).
+        let mut mgr = MemoryManager::new(2);
+        let t1 = make_token(1);
 
-        aging.register_loop(1); // gen 0
-        // Advance until eviction
-        aging.next_generation(); // gen 1
-        aging.next_generation(); // gen 2
-        let evicted = aging.next_generation(); // gen 3: threshold=1, 0 < 1 → evict
-        assert!(evicted.contains(&1));
-        assert_eq!(aging.alive_count(), 0);
+        mgr.keep_loop_alive(&t1); // t1.gen=1
+        mgr.next_generation(); // cg=2, max_gen=2-1=1, 1<1=false → keep
+        mgr.next_generation(); // cg=3, max_gen=2, 1<2=true → evict
+        assert_eq!(mgr.alive_count(), 0);
 
-        // Re-register the same loop (recompiled)
-        aging.register_loop(1); // now at gen 3
-        assert_eq!(aging.alive_count(), 1);
+        // Re-register the same token (or a fresh one).
+        mgr.keep_loop_alive(&t1); // t1.gen=3
+        assert_eq!(mgr.alive_count(), 1);
 
-        // Should stay alive for max_age generations
-        let evicted = aging.next_generation(); // gen 4: threshold=2, 3 >= 2 → alive
-        assert!(evicted.is_empty());
-        let evicted = aging.next_generation(); // gen 5: threshold=3, 3 >= 3 → alive
-        assert!(evicted.is_empty());
-        let evicted = aging.next_generation(); // gen 6: threshold=4, 3 < 4 → evict
-        assert!(evicted.contains(&1));
+        mgr.next_generation(); // cg=4, max_gen=3, 3<3=false → keep
+        assert!(mgr.contains(&t1));
+        mgr.next_generation(); // cg=5, max_gen=4, 3<4=true → evict
+        assert!(!mgr.contains(&t1));
     }
 
     #[test]
-    fn test_generation_overflow_saturating() {
-        // Verify that generation counter uses saturating subtraction
-        // and doesn't panic or wrap on extreme values.
-        let mut aging = LoopAging::new(3);
+    fn test_generation_does_not_panic_at_high_values() {
+        // Verify that generation arithmetic survives many advances.
+        // RPython uses r_int64; Rust uses i64 with the same wraparound
+        // semantics.
+        let mut mgr = MemoryManager::new(3);
 
-        // Advance many generations to get a high generation number
         for _ in 0..1000 {
-            aging.next_generation();
+            mgr.next_generation();
         }
-        assert_eq!(aging.generation(), 1000);
+        assert_eq!(mgr.current_generation(), 1001);
 
-        // Register a loop at the high generation
-        aging.register_loop(42);
-        assert_eq!(aging.alive_count(), 1);
+        let t = make_token(42);
+        mgr.keep_loop_alive(&t);
+        assert_eq!(mgr.alive_count(), 1);
 
-        // Should still evict correctly after max_age more generations
-        aging.next_generation(); // gen 1001
-        aging.next_generation(); // gen 1002
-        aging.next_generation(); // gen 1003
-        let evicted = aging.next_generation(); // gen 1004: threshold=1001, 1000 < 1001 → evict
-        assert!(evicted.contains(&42));
+        mgr.next_generation();
+        mgr.next_generation();
+        assert!(mgr.contains(&t));
+        mgr.next_generation();
+        assert!(!mgr.contains(&t));
     }
 
     #[test]
     fn test_loop_aging_with_warm_state_integration() {
-        // Simulate the interaction between loop aging and WarmEnterState:
-        // - WarmEnterState compiles a loop and registers it with LoopAging.
-        // - LoopAging evicts the loop.
-        // - WarmEnterState removes the compiled loop and allows recompilation.
+        // memmgr cooperates with WarmEnterState: attach a token via
+        // `attach_procedure_to_interp` (warmstate.py:340-341 parity)
+        // then mirror it into MemoryManager via keep_loop_alive.
         let mut ws = WarmEnterState::new(2);
-        let mut aging = LoopAging::new(2);
+        let mut mgr = MemoryManager::new(2);
         let key = 0xF00D;
 
-        // Step 1: compile a loop
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         match ws.maybe_compile(key) {
             HotResult::StartTracing => {}
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_token_number());
-        ws.attach_procedure_to_interp(key, token);
-        aging.register_loop(key);
+        let token = make_token(ws.alloc_token_number());
+        ws.attach_procedure_to_interp(key, Arc::clone(&token));
+        mgr.keep_loop_alive(&token);
 
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
-        assert_eq!(aging.alive_count(), 1);
+        assert_eq!(mgr.alive_count(), 1);
 
-        // Step 2: advance past max_age without refreshing
-        aging.next_generation();
-        aging.next_generation();
-        let evicted = aging.next_generation();
-        assert!(evicted.contains(&key));
+        mgr.next_generation();
+        mgr.next_generation();
+        assert!(!mgr.contains(&token));
 
-        // In a real system, eviction would cause the WarmEnterState to reset
-        // the cell so the loop can be recompiled. Simulate by checking
-        // that we can re-install.
-        let token2 = JitCellToken::new(ws.alloc_token_number());
-        ws.attach_procedure_to_interp(key, token2);
-        aging.register_loop(key);
+        // Re-install: a fresh compile produces a fresh token; the
+        // warmstate cell records the new procedure token, MemoryManager
+        // tracks it under its own pointer identity.
+        let token2 = make_token(ws.alloc_token_number());
+        ws.attach_procedure_to_interp(key, Arc::clone(&token2));
+        mgr.keep_loop_alive(&token2);
 
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
-        assert_eq!(aging.alive_count(), 1);
+        assert_eq!(mgr.alive_count(), 1);
     }
 
     #[test]
     fn test_loop_aging_does_not_affect_active_loops() {
-        // Loops that are kept alive each generation should never be evicted,
-        // even as other loops are evicted around them.
-        // This simulates "currently-executing" loops being refreshed.
-        let mut aging = LoopAging::new(2);
+        // A loop continually kept alive is never evicted, even while
+        // peers are aged out.
+        let mut mgr = MemoryManager::new(2);
+        let t_active = make_token(1);
+        let t_idle_a = make_token(2);
+        let t_idle_b = make_token(3);
 
-        aging.register_loop(1); // "active" loop
-        aging.register_loop(2); // "inactive" loop
-        aging.register_loop(3); // "inactive" loop
+        mgr.keep_loop_alive(&t_active);
+        mgr.keep_loop_alive(&t_idle_a);
+        mgr.keep_loop_alive(&t_idle_b);
 
         for _ in 0..20 {
-            aging.keep_loop_alive(1); // keep loop 1 active
-            let evicted = aging.next_generation();
-
-            // Loop 1 should never be evicted
-            assert!(!evicted.contains(&1), "active loop should never be evicted");
+            mgr.keep_loop_alive(&t_active);
+            mgr.next_generation();
+            assert!(mgr.contains(&t_active));
         }
 
-        // Loop 1 should still be alive
-        assert!(aging.alive_count() >= 1);
-        // Loop 2 and 3 should have been evicted long ago
-        // (registered at gen 0, threshold grows each generation)
+        // Idle loops were aged out long ago.
+        assert!(!mgr.contains(&t_idle_a));
+        assert!(!mgr.contains(&t_idle_b));
     }
 
     #[test]
     fn test_loop_aging_set_max_age_dynamic() {
-        // max_age can be changed dynamically. Changing it affects future
-        // eviction decisions but doesn't retroactively evict.
-        let mut aging = LoopAging::new(10);
+        // memmgr.py:42 set_max_age — shrinking max_age accelerates
+        // eviction of older loops.
+        let mut mgr = MemoryManager::new(10);
+        let t = make_token(1);
 
-        aging.register_loop(1); // gen 0
-        aging.next_generation(); // gen 1
+        mgr.keep_loop_alive(&t); // t.gen=1
+        mgr.next_generation(); // cg=2, max_gen=2-9=-7 → keep
 
-        // Reduce max_age to 1 — loop 1 at gen 0, threshold = 2 - 1 = 1
-        // 0 < 1 → should be evicted next generation
-        aging.set_max_age(1);
-        let evicted = aging.next_generation(); // gen 2
-        assert!(
-            evicted.contains(&1),
-            "reducing max_age should cause earlier eviction"
-        );
+        // Shrink max_age — next sweep evicts t.
+        mgr.set_max_age(1, 0);
+        mgr.next_generation(); // cg=3, max_gen=3-0=3, 1<3 → evict
+        assert!(!mgr.contains(&t));
     }
 
     #[test]
     fn test_loop_aging_interleaved_register_and_evict() {
-        // Mirrors RPython's test_basic_3: register loops at different
-        // generations, keep some alive on even indices.
-        let mut aging = LoopAging::new(4);
+        // Mirrors RPython's test_basic_3: tokens registered at different
+        // generations, even-indexed kept alive each step.  After the
+        // loop, even-indexed tokens are alive; old odd-indexed ones
+        // (registered ≥ max_age generations ago and never refreshed)
+        // are evicted.
+        let mut mgr = MemoryManager::new(4);
+        let mut tokens: Vec<Arc<JitCellToken>> = Vec::new();
 
-        let mut keys: Vec<u64> = Vec::new();
         for i in 0..10u64 {
-            keys.push(i);
-            aging.register_loop(i);
-            aging.next_generation();
+            let t = make_token(i);
+            mgr.keep_loop_alive(&t);
+            tokens.push(t);
+            mgr.next_generation();
 
-            // Keep even-indexed loops alive
+            // Refresh even-indexed tokens.
             for j in (0..=i).step_by(2) {
-                aging.keep_loop_alive(j);
+                mgr.keep_loop_alive(&tokens[j as usize]);
             }
         }
 
-        // After 10 generations with max_age=4:
-        // Even-indexed loops should still be alive (refreshed each gen).
-        // Odd-indexed loops registered at gen i should be evicted
-        // when generation > i + 4.
-        for i in 0..10u64 {
-            let is_alive = aging.contains_loop(i);
+        for (i, t) in tokens.iter().enumerate() {
+            let is_alive = mgr.contains(t);
             if i % 2 == 0 {
-                assert!(is_alive, "even-indexed loop {} should be alive", i);
-            }
-            // Odd loops registered early enough will have been evicted.
-            // Loop i (odd) registered at gen i. After gen 10, threshold = 10 - 4 = 6.
-            // Evicted if i < 6.
-            if i % 2 != 0 && i < 6 {
-                assert!(
-                    !is_alive,
-                    "odd loop {} registered at gen {} should be evicted by gen 10",
-                    i, i
-                );
+                assert!(is_alive, "even-indexed token {} should be alive", i);
+            } else if i < 6 {
+                // Odd tokens registered early enough are evicted.
+                // Token i registered at cg=i+1; cg now ~11; max_gen=11-3=8.
+                // For i < 6: t.gen=i+1 < 8 → evict.
+                assert!(!is_alive, "odd token {} should be evicted", i);
             }
         }
     }

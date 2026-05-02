@@ -5,31 +5,20 @@
 
 use crate::callbacks;
 use crate::state::PyreJitState;
-use majit_ir::{GreenKey, Type};
 
-/// pypy/module/pypyjit/interp_jit.py:67-70:
-/// `greens = ['next_instr', 'is_being_profiled', 'pycode']`.
+/// RPython green_key = (pycode, next_instr).
+/// Each (code, pc) pair has independent warmup counter and compiled loop.
+///
+/// PRE-EXISTING-ADAPTATION: pyre's green-key is fixed `(W_CodeObject*, pc)`
+/// and reduced to a single `u64` identityhash + Signed cast over the
+/// two-tuple. RPython's `hash_whatever(TYPE, x)` (`warmstate.py:115`)
+/// hashes individual primitives from a structural tuple of green boxes
+/// keyed by tuple identity in the JitCell dict. Pyre's two-component
+/// hash is a faithful Rust simplification — pyre's portal greens are
+/// always exactly `(W_CodeObject, next_instr)`.
 #[inline(always)]
-pub fn pypyjit_greenkey(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> GreenKey {
-    GreenKey::with_types(
-        vec![
-            pc as i64,
-            if is_being_profiled { 1 } else { 0 },
-            code_ptr as i64,
-        ],
-        vec![Type::Int, Type::Int, Type::Ref],
-    )
-}
-
-/// Hash bucket for PyPyJitDriver's full typed green tuple.
-#[inline(always)]
-pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
-    pypyjit_greenkey(code_ptr, pc, is_being_profiled).hash_u64()
-}
-
-#[inline(always)]
-pub fn make_green_key_for_frame(frame: &pyre_interpreter::pyframe::PyFrame, pc: usize) -> u64 {
-    make_green_key(frame.pycode, pc, frame.get_is_being_profiled())
+pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
+    (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
 /// Type alias for the JIT driver pair. Must match pyre-jit/eval.rs JitDriverPair.

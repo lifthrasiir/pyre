@@ -31,10 +31,11 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, GreenKey, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
+use crate::compile::make_jitcell_token;
 pub use crate::compile::{
     CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
     DeadFrameArtifacts, RawCompileResult,
@@ -471,7 +472,14 @@ fn normalize_root_loop_entry_contract(
 }
 
 pub(crate) struct CompiledEntry<M> {
-    pub(crate) token: JitCellToken,
+    /// `Arc<JitCellToken>` so the same Python-style object identity can
+    /// flow through `compile_loop` → `attach_procedure_to_interp` →
+    /// `MemoryManager.keep_loop_alive` per `compile.py:266` /
+    /// `:1019` / `:567` / `:1149`.  Slice 5.1 lifts this from the
+    /// previous by-value `JitCellToken`; Slice 5.3 will route the
+    /// same Arc to `attach_procedure_to_interp` (currently still on
+    /// the install_token PRE-EXISTING-ADAPTATION).
+    pub(crate) token: std::sync::Arc<JitCellToken>,
     pub(crate) num_inputs: usize,
     pub(crate) meta: M,
     /// Front-end loop-version state, mirroring RPython's
@@ -488,8 +496,9 @@ pub(crate) struct CompiledEntry<M> {
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
     /// previous functions are kept here so external target_token JUMPs
-    /// can redirect to them via runtime trampoline.
-    pub(crate) previous_tokens: Vec<JitCellToken>,
+    /// can redirect to them via runtime trampoline.  Stored as
+    /// `Arc<JitCellToken>` for Slice 5.1 token-identity lift.
+    pub(crate) previous_tokens: Vec<std::sync::Arc<JitCellToken>>,
     /// Box identity plan Phase E: high-water OpRef at which a bridge
     /// compilation starts allocating fresh boxes.
     ///
@@ -504,19 +513,6 @@ pub(crate) struct CompiledEntry<M> {
     /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
     /// in `compile_bridge` below).
     pub(crate) next_global_opref: u32,
-    /// Box identity plan Phase E.2b: parent loop's `value_types` snapshot.
-    ///
-    /// RPython bridges share the parent's `Optimizer` instance, so the
-    /// per-Box `_forwarded` chain naturally provides typing info for any
-    /// parent OpRef the bridge references via fail_args / JUMP / snapshot.
-    /// In pyre's per-phase `OptContext` model the bridge's `value_types`
-    /// is fresh, so parent OpRefs (e.g. inputargs at `[0..parent_num_inputs)`
-    /// referenced through fail_args after `bridge_inputarg_base` shift)
-    /// would have no type entry without this carry. Seeded from
-    /// `unroll_opt.phase1_value_types` at compile_loop completion;
-    /// consumed by `compile_bridge` / `start_retrace_from_guard` via
-    /// `optimizer.prev_phase_value_types` before `optimize_bridge`.
-    pub(crate) phase1_value_types: HashMap<u32, majit_ir::Type>,
 }
 
 /// compile.py compile_trace return parity.
@@ -765,12 +761,13 @@ pub struct MetaInterp<M: Clone> {
     /// longest-traced inlined function for abort reporting; the reset
     /// to `None` at pyjitpl.py:2795 signals that the trace aborted.
     ///
-    /// Pyre's trace-side `TraceCtx::inline_trace_positions` mirrors the
-    /// same enter/exit shape without `jd_sd` because it has a single
-    /// PyPyJitDriver. This field keeps the full RPython shape for the
-    /// majit metainterpreter path.
-    pub portal_trace_positions:
-        Option<Vec<(usize, Option<GreenKey>, crate::recorder::TracePosition)>>,
+    /// pyre's existing `find_biggest_function` (trace_ctx.rs:625) uses
+    /// `TraceCtx::inline_trace_positions` — a narrower subset that only
+    /// tracks active inlined callees.  Keeping this field here mirrors
+    /// RPython's shape so a future port of `find_biggest_function` can
+    /// line-by-line read the start/end stack; callers that merely want
+    /// the active-frame list should keep using `inline_trace_positions`.
+    pub portal_trace_positions: Option<Vec<(usize, Option<u64>, crate::recorder::TracePosition)>>,
 
     /// pyjitpl.py:2401 `self.current_call_id = 0`.
     ///
@@ -1170,7 +1167,7 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.fail_index == fail_index)
                 })
         };
-        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(lookup))
+        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(|t| lookup(t)))
     }
 
     fn terminal_exit_layout_from_trace(
@@ -1208,7 +1205,7 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.op_index == op_index)
                 })
         };
-        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(lookup))
+        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(|t| lookup(t)))
     }
 
     fn compiled_exit_layout_from_backend(
@@ -3122,16 +3119,15 @@ impl<M: Clone> MetaInterp<M> {
     /// this specific green key. Returns false for different green keys,
     /// matching RPython's per-cell JC_TRACING flag.
     ///
-    /// `target` is the full `JitCell` hash u64 (warmstate.py:459
-    /// `JitCell.get_uhash(*greenargs)`), so callers must hash the
-    /// complete typed greenkey including `is_being_profiled` before
-    /// calling — the (pycode, pc) projection alone collapses
-    /// profiled / unprofiled cells.
+    /// `target_raw` is the structured `(code_ptr, pc)` greenkey;
+    /// comparison routes through `TraceCtx::is_tracing_key` which walks
+    /// `green_key_raw` + `inline_frames` element-wise (pyjitpl.py:1396-
+    /// 1401 parity).
     #[inline]
-    pub fn is_tracing_key(&self, target: u64) -> bool {
+    pub fn is_tracing_key(&self, target_raw: (usize, usize)) -> bool {
         self.tracing
             .as_ref()
-            .is_some_and(|ctx| ctx.is_tracing_key(target))
+            .is_some_and(|ctx| ctx.is_tracing_key(target_raw))
     }
 
     /// Finish the current active trace without optimizing or compiling it.
@@ -3288,11 +3284,16 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         driver_descriptor: Option<&JitDriverStaticData>,
     ) {
+        // `compile.py:168 jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
+        // is already set by `make_jitcell_token` at the call site; this
+        // helper only fills the pyre-specific fields (`green_key`,
+        // `num_scalar_inputargs`, `virtualizable_arg_index`) used by
+        // warmstate cell lookup and the backend's
+        // `handle_call_assembler` rewrite.
         token.green_key = green_key;
         token.num_scalar_inputargs = self.num_scalar_inputargs;
         token.virtualizable_arg_index =
             driver_descriptor.and_then(JitDriverStaticData::virtualizable_arg_index);
-        token.outermost_jitdriver_index = driver_descriptor.and_then(|driver| driver.index);
     }
 
     /// Close the current trace, optimize, and compile.
@@ -3849,7 +3850,9 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             self.warm_state.alloc_token_number()
         };
-        let mut token = JitCellToken::new(token_num);
+        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
+        let mut token =
+            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
@@ -3886,6 +3889,14 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             unroll_opt.target_tokens.clone()
         };
+        // `compile.py:237` / `compile.py:289`
+        // `target_token.original_jitcell_token = jitcell_token`. Backfill the
+        // owning JitCellToken.number on every TargetToken now that the token
+        // exists, so `record_loop_or_bridge`'s JUMP branch
+        // (`compile.py:197-199`) can read it.
+        for target_token in &front_target_tokens {
+            target_token.set_original_jitcell_token_number(token_num);
+        }
 
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
         // field reload for every loop. Mirrors the FINISH-path call in
@@ -3963,7 +3974,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(&token);
                 // compile.py:213 record_loop_or_bridge — record this loop's
                 // CALL_ASSEMBLER / JUMP keepalive targets.
-                Self::record_loop_or_bridge(&mut token, &compiled_ops);
+                self.record_loop_or_bridge(&token, &compiled_ops);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -4045,7 +4056,7 @@ impl<M: Clone> MetaInterp<M> {
 
                 // RPython parity: keep previous compiled tokens alive so
                 // external target_token JUMPs can redirect to them.
-                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
@@ -4067,7 +4078,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
-                        token,
+                        token: std::sync::Arc::new(token),
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens,
@@ -4082,13 +4093,10 @@ impl<M: Clone> MetaInterp<M> {
                         // TraceIterator (opencoder.py:249-273); pyre flat u32
                         // OpRefs need this explicit baseline.
                         next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
-                        // Box Identity Phase E.2b: snapshot the parent loop's
-                        // value_types so bridges can seed their own ctx with
-                        // typing info for parent OpRefs they inherit via
-                        // fail_args / JUMP / snapshot_boxes.
-                        phase1_value_types: unroll_opt.phase1_value_types.clone(),
                     },
                 );
+                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
+                self.register_compiled_token_for_keepalive(green_key);
                 // PRE-EXISTING-ADAPTATION: pass a freshly-allocated
                 // uncompiled `JitCellToken` to `attach_procedure_to_interp`
                 // instead of the actual compiled `CompiledEntry::token`.
@@ -4099,26 +4107,22 @@ impl<M: Clone> MetaInterp<M> {
                 // `pyjitpl.py:3171-3174` (compile_loop) all pass the
                 // actual compiled jitcell_token, so `cell.loop_token`
                 // shares object identity with the compiled procedure
-                // token. Pyre cannot do the same here:
-                // `CompiledEntry::token` is a plain `JitCellToken` (not
-                // Arc) and `JitCellToken` owns a `Box<dyn Any + Send>`
-                // of compiled code that is not `Clone`, so the
-                // compiled token cannot be shared with
-                // `BaseJitCell::loop_token`.
+                // token.
                 //
-                // Convergence requires re-introducing
-                // `Arc<JitCellToken>` for `CompiledEntry::token` so
-                // the procedure token can be `Arc::clone`d into
-                // `cell.loop_token`. The atomic-fix attempt at all 5
-                // attach sites empirically produces wrong nbody output
-                // on dynasm even when `redirect_call_assembler` does
-                // not fire, so convergence also requires investigating
-                // the dynasm-side observability of `cell.loop_token`
-                // Arc identity.
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = JitCellToken::new(install_num);
-                self.warm_state
-                    .attach_procedure_to_interp(green_key, install_token);
+                // Slice 5.1 (commit `a84a7a5ef91`) already lifted
+                // `CompiledEntry::token` to `Arc<JitCellToken>`, so the
+                // mechanical Arc::clone that was previously blocked is
+                // now structurally feasible — `make_attach_token_for_probe`
+                // performs exactly that clone.  Convergence is no
+                // longer blocked on the type, only on the empirical
+                // failure described in the PROBE doc below.
+                //
+                // Task #195 Slice 5.2 PROBE: under
+                // MAJIT_PROBE_REDIRECT_IDENTITY=1, route the actual
+                // compiled Arc<JitCellToken> here.  See
+                // `make_attach_token_for_probe` doc.
+                let attach_token = self.make_attach_token_for_probe(green_key);
+                self.attach_procedure_with_redirect(green_key, attach_token);
 
                 self.stats.loops_compiled += 1;
 
@@ -4749,7 +4753,9 @@ impl<M: Clone> MetaInterp<M> {
             .set_callinfocollection(self.callinfocollection.clone());
 
         let token_num = self.warm_state.alloc_token_number();
-        let mut token = JitCellToken::new(token_num);
+        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
+        let mut token =
+            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
@@ -4772,8 +4778,27 @@ impl<M: Clone> MetaInterp<M> {
         match compile_result {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
+                // `compile.py:237` / `compile.py:289` — every TargetToken
+                // whose LABEL or JUMP appears in `combined_ops` carries
+                // `original_jitcell_token = jitcell_token`.  In the retrace
+                // path, `combined_ops = old_front + new_body`, so the old
+                // front's TargetTokens (created under the previous
+                // jitcell_token) still point at the old number.  RPython
+                // avoids this entirely by reusing the same
+                // `loop_jitcell_token` for retrace (`compile.py:356`); pyre
+                // allocates a new `token_num` for cranelift bridge
+                // migration, so we rebind the prior tokens to the new
+                // number here.  Without this, `record_loop_or_bridge`'s
+                // JUMP arm sees `target_owner_num == old_num !=
+                // new_token.number` and records a false self-loop keepalive.
+                for target_token in &prior_front_target_tokens {
+                    target_token.set_original_jitcell_token_number(token_num);
+                }
+                for target_token in &unroll_opt.target_tokens {
+                    target_token.set_original_jitcell_token_number(token_num);
+                }
                 // compile.py:213 record_loop_or_bridge.
-                Self::record_loop_or_bridge(&mut token, &combined_ops);
+                self.record_loop_or_bridge(&token, &combined_ops);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -4845,7 +4870,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
@@ -4863,7 +4888,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
-                        token,
+                        token: std::sync::Arc::new(token),
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens: if unroll_opt.target_tokens.is_empty() {
@@ -4877,17 +4902,16 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens,
                         // Box Identity Phase E Step 1: see main compile site.
                         next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
-                        // Box Identity Phase E.2b: see main compile site.
-                        phase1_value_types: unroll_opt.phase1_value_types.clone(),
                     },
                 );
+                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
+                self.register_compiled_token_for_keepalive(green_key);
                 // PRE-EXISTING-ADAPTATION: see compile_loop site for the
                 // RPython citation and convergence path. Retrace path
                 // mirrors `pyjitpl.py:3171-3174 attach_procedure_to_interp`.
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = JitCellToken::new(install_num);
-                self.warm_state
-                    .attach_procedure_to_interp(green_key, install_token);
+                // Slice 5.2 PROBE: see make_attach_token_for_probe doc.
+                let attach_token = self.make_attach_token_for_probe(green_key);
+                self.attach_procedure_with_redirect(green_key, attach_token);
                 self.stats.loops_compiled += 1;
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -5188,7 +5212,9 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             self.warm_state.alloc_token_number()
         };
-        let mut token = JitCellToken::new(token_num);
+        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
+        let mut token =
+            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
@@ -5259,7 +5285,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
                 // compile.py:213 record_loop_or_bridge.
-                Self::record_loop_or_bridge(&mut token, &optimized_ops);
+                self.record_loop_or_bridge(&token, &optimized_ops);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -5324,7 +5350,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
                 {
-                    let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                    let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                     let ft = self
                         .compiled_loops
                         .get(&green_key)
@@ -5346,7 +5372,7 @@ impl<M: Clone> MetaInterp<M> {
                     self.compiled_loops.insert(
                         green_key,
                         CompiledEntry {
-                            token,
+                            token: std::sync::Arc::new(token),
                             num_inputs: inputargs.len(),
                             meta,
                             front_target_tokens: ft,
@@ -5355,17 +5381,17 @@ impl<M: Clone> MetaInterp<M> {
                             traces,
                             previous_tokens,
                             next_global_opref: 0,
-                            phase1_value_types: HashMap::new(),
                         },
                     );
+                    // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
+                    self.register_compiled_token_for_keepalive(green_key);
                 }
                 // PRE-EXISTING-ADAPTATION: see compile_loop site for the
                 // RPython citation and convergence path. finish_and_compile
                 // mirrors `pyjitpl.py:3171-3174 attach_procedure_to_interp`.
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = JitCellToken::new(install_num);
-                self.warm_state
-                    .attach_procedure_to_interp(green_key, install_token);
+                // Slice 5.2 PROBE: see make_attach_token_for_probe doc.
+                let attach_token = self.make_attach_token_for_probe(green_key);
+                self.attach_procedure_with_redirect(green_key, attach_token);
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -5519,7 +5545,9 @@ impl<M: Clone> MetaInterp<M> {
 
         // Allocate token and compile.
         let token_num = self.warm_state.alloc_token_number();
-        let mut token = JitCellToken::new(token_num);
+        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
+        let mut token =
+            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
@@ -5532,6 +5560,8 @@ impl<M: Clone> MetaInterp<M> {
         // TargetToken, prepends LABEL(descr=target_token), and patches the
         // closing JUMP to the same token.
         let target_token = crate::optimizeopt::unroll::TargetToken::new_loop(token_num);
+        // `compile.py:237 target_token.original_jitcell_token = jitcell_token`.
+        target_token.set_original_jitcell_token_number(token_num);
         let mut compiled_ops = optimized_ops.clone();
         if let Some(jump_op) = compiled_ops
             .last_mut()
@@ -5581,7 +5611,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
                 // compile.py:213 record_loop_or_bridge.
-                Self::record_loop_or_bridge(&mut token, &compiled_ops);
+                self.record_loop_or_bridge(&token, &compiled_ops);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -5645,7 +5675,7 @@ impl<M: Clone> MetaInterp<M> {
                         jitcode: None,
                     },
                 );
-                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     previous_tokens.push(old_entry.token);
                     previous_tokens.extend(old_entry.previous_tokens);
@@ -5656,7 +5686,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
-                        token,
+                        token: std::sync::Arc::new(token),
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens: vec![target_token],
@@ -5665,9 +5695,10 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref: 0,
-                        phase1_value_types: HashMap::new(),
                     },
                 );
+                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
+                self.register_compiled_token_for_keepalive(green_key);
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -6526,15 +6557,77 @@ impl<M: Clone> MetaInterp<M> {
         crate::stack_almost_full()
     }
 
+    /// `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`
+    /// — register the freshly-compiled token with the memory manager
+    /// so its `generation` is current and the Arc is held by
+    /// `alive_loops`.
+    ///
+    /// RPython runs this at the tail of `send_loop_to_backend`, which
+    /// happens before `record_loop_or_bridge` and gives that walker
+    /// the `compile.py:178-179 generation > 0` invariant.  Pyre stores
+    /// the token Arc in `compiled_loops[green_key]` first and walks
+    /// `record_loop_or_bridge` BEFORE `compiled_loops.insert` (using
+    /// the still-mutable `&JitCellToken`), so the registration is
+    /// done here right after the insert.  The `generation > 0`
+    /// invariant therefore holds for the *next* compile's walker run
+    /// and for runtime keep-alive ticks, but not yet at the
+    /// just-finished compile's walker — see the docstring at
+    /// `record_loop_or_bridge` for the convergence path (Slice X-F).
+    fn register_compiled_token_for_keepalive(&mut self, green_key: u64) {
+        let token_arc = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|e| std::sync::Arc::clone(&e.token));
+        if let Some(arc) = token_arc {
+            self.warm_state.memory_manager.keep_loop_alive(&arc);
+        }
+    }
+
     /// pyjitpl.py:2345-2348: try_to_free_some_loops — advance the
-    /// memory manager's generation counter. Old loops not accessed
-    /// for max_age generations are candidates for eviction.
+    /// memory manager's generation counter.  Old loops not accessed
+    /// for max_age generations are removed from `alive_loops`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre also drops the matching
+    /// `compiled_loops` entry.  RPython's `try_to_free_some_loops` is
+    /// one line — `next_generation()` alone — because dropping the
+    /// only `alive_loops` strong owner triggers `LoopToken.__del__`
+    /// (`memmgr.py:13`).  Pyre's `compiled_loops` is still a second
+    /// strong owner, so without explicit removal here the backend
+    /// resources stay pinned forever.  Slice X-G (memmgr Slice 3.6)
+    /// downgrades `compiled_loops` to `Weak`, after which this branch
+    /// is removed and the function reverts to the upstream one-liner
+    /// shape.
+    ///
+    /// The eviction dispatch matches by **token-object identity**
+    /// (`Arc::ptr_eq`) — mirroring `memmgr.py:73`'s `del
+    /// self.alive_loops[looptoken]` which keys on the looptoken
+    /// itself.  This protects the recompile case: when fn B was
+    /// recompiled, `compiled_loops[gk].token` is the new token while
+    /// the old token is in `previous_tokens`; if alive_loops evicts
+    /// the old token, only the `previous_tokens` slot is dropped —
+    /// the current entry stays.  Conversely, when the current token
+    /// itself ages out, the whole `compiled_loops` entry is dropped
+    /// (RPython's `LoopToken.__del__` analog).
     pub fn try_to_free_some_loops(&mut self) {
         let evicted = self.warm_state.memory_manager.next_generation();
-        for key in evicted {
-            self.compiled_loops.remove(&key);
-            if crate::majit_log_enabled() {
-                eprintln!("[jit][memmgr] evicted loop key={}", key);
+        for token in evicted {
+            let gk = token.green_key;
+            let Some(entry) = self.compiled_loops.get_mut(&gk) else {
+                continue;
+            };
+            if std::sync::Arc::ptr_eq(&entry.token, &token) {
+                self.compiled_loops.remove(&gk);
+                if crate::majit_log_enabled() {
+                    eprintln!("[jit][memmgr] evicted current loop key={}", gk);
+                }
+            } else {
+                let before = entry.previous_tokens.len();
+                entry
+                    .previous_tokens
+                    .retain(|t| !std::sync::Arc::ptr_eq(t, &token));
+                if crate::majit_log_enabled() && entry.previous_tokens.len() < before {
+                    eprintln!("[jit][memmgr] evicted previous token at key={}", gk);
+                }
             }
         }
     }
@@ -6550,6 +6643,102 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0)
     }
 
+    /// Task #195 Slice 5.2 PROBE.
+    ///
+    /// Under `MAJIT_PROBE_REDIRECT_IDENTITY=1` returns the actual
+    /// compiled `Arc<JitCellToken>` already in `compiled_loops` so
+    /// `attach_procedure_to_interp` can route the same object that
+    /// `compile_loop` produced — RPython parity per
+    /// `warmstate.py:339-348` + `compile.py:266` / `:1019`.  The
+    /// resulting `cell.loop_token` then shares Arc identity with
+    /// `compiled_loops[green_key].token`, which is the upstream
+    /// invariant that drives `redirect_call_assembler` /
+    /// `record_jump_to` correctness.
+    ///
+    /// Default (PROBE off) returns a fresh `Arc<JitCellToken>`
+    /// wrapping an uncompiled install_token — the pre-Slice-5.3
+    /// PRE-EXISTING-ADAPTATION (see commit a2b3cd36b9f and the
+    /// PRE-EXISTING-ADAPTATION comments at the four attach sites).
+    /// Slice 5.3 will flip the default ON after the PROBE regression
+    /// is root-caused.
+    ///
+    /// Empirical PROBE state (re-measured 2026-05-01 against eval2-on-main
+    /// HEAD `26606bef27b`):  with PROBE on, `nbody` produces *wrong
+    /// output* on **both** backends (dynasm + cranelift), while the
+    /// other 13 check.py benchmarks pass.  Cranelift's
+    /// `redirect_call_assembler_target` is a thread-cache invalidate +
+    /// target lookup with no byte-patch surface, so the asymmetry
+    /// between the install-token sentinel `JitCellToken.number` and
+    /// the compiled token's number must be load-bearing in a layer
+    /// above the dynasm fast-path.  Convergence therefore requires
+    /// auditing every consumer of `cell.loop_token.number` /
+    /// `JitCellToken.number` (warmstate dispatch, blackhole exit,
+    /// `compiled_fail_descr_layouts` indexing, runtime descr
+    /// classifier) for a hidden assumption that those numbers are
+    /// distinct, then either fixing or removing the assumption.
+    /// Task #213 covers the audit.
+    fn make_attach_token_for_probe(&mut self, green_key: u64) -> std::sync::Arc<JitCellToken> {
+        if std::env::var_os("MAJIT_PROBE_REDIRECT_IDENTITY").is_some() {
+            if let Some(c) = self.compiled_loops.get(&green_key) {
+                return std::sync::Arc::clone(&c.token);
+            }
+        }
+        let install_num = self.warm_state.alloc_token_number();
+        std::sync::Arc::new(JitCellToken::new(install_num))
+    }
+
+    /// `warmstate.py:339-348 attach_procedure_to_interp` parity.
+    ///
+    /// ```python
+    /// def attach_procedure_to_interp(self, greenkey, procedure_token):
+    ///     cell = self.JitCell.ensure_jit_cell_at_key(greenkey)
+    ///     old_token = cell.get_procedure_token()
+    ///     cell.set_procedure_token(procedure_token)
+    ///     if old_token is not None:
+    ///         self.cpu.redirect_call_assembler(old_token, procedure_token)
+    ///         old_token.record_jump_to(procedure_token)
+    /// ```
+    ///
+    /// Caller-side helper because pyre's `WarmEnterState` does not
+    /// hold a `&mut Backend` (the upstream `self.cpu` lives on the
+    /// driver) — the `redirect_call_assembler` + `record_jump_to`
+    /// chain runs here, where `MetaInterp` owns both the warm-state
+    /// cell map and the backend.
+    ///
+    /// PRE-EXISTING-ADAPTATION: under the install-token sentinel
+    /// model (`make_attach_token_for_probe` PROBE off default),
+    /// both `old_token` and the new `attach_token` carry
+    /// `compiled = None`, so the redirect is a no-op on every
+    /// backend.  The `compiled.is_some()` guard skips the chain in
+    /// that case, since neither `redirect_call_assembler` nor
+    /// `record_jump_to` is meaningful for sentinel Arcs.  When
+    /// Slice X-F (Task #211) lands the actual compiled Arc into
+    /// every attach site, the guard becomes a no-op and the chain
+    /// fires per upstream.
+    pub fn attach_procedure_with_redirect(
+        &mut self,
+        green_key: u64,
+        attach_token: std::sync::Arc<JitCellToken>,
+    ) {
+        let old_token = self
+            .warm_state
+            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token));
+        if let Some(old_token) = old_token {
+            // `warmstate.py:343 if old_token is not None:` — both
+            // tokens must own real compiled code for the redirect
+            // chain to mean anything.  See PRE-EXISTING-ADAPTATION
+            // note in the doc above.
+            if old_token.compiled.is_some() && attach_token.compiled.is_some() {
+                // `warmstate.py:344` `cpu.redirect_call_assembler(old, new)`.
+                let _ = self
+                    .backend
+                    .redirect_call_assembler(&old_token, &attach_token);
+                // `warmstate.py:347` `old_token.record_jump_to(procedure_token)`.
+                old_token.record_jump_to(attach_token);
+            }
+        }
+    }
+
     // ── Call Assembler Support ──────────────────────────────────
 
     /// Get the JitCellToken for a compiled loop (for CALL_ASSEMBLER).
@@ -6558,6 +6747,18 @@ impl<M: Clone> MetaInterp<M> {
     /// to directly call JIT code for another function. The caller needs
     /// the target's JitCellToken to set up the call.
     pub fn get_loop_token(&self, green_key: u64) -> Option<&JitCellToken> {
+        self.compiled_loops
+            .get(&green_key)
+            .map(|c| c.token.as_ref())
+    }
+
+    /// Return the owning `Arc<JitCellToken>` for the compiled loop at
+    /// `green_key`, matching `compile.py:187 isinstance(descr, JitCellToken)`
+    /// identity. Used by `direct_assembler_call` to thread the same Arc
+    /// through `make_call_assembler_descr` so the keepalive walker
+    /// (`record_loop_or_bridge`) recovers the production token directly
+    /// from the descr without a side-table lookup.
+    pub fn get_loop_token_arc(&self, green_key: u64) -> Option<&std::sync::Arc<JitCellToken>> {
         self.compiled_loops.get(&green_key).map(|c| &c.token)
     }
 
@@ -6632,63 +6833,217 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// PARTIAL PORT of `compile.py:172-211 record_loop_or_bridge` — only
-    /// the CALL_ASSEMBLER keepalive walker is implemented here. For each
-    /// freshly compiled CALL_ASSEMBLER op
-    /// (`compile.py:187 isinstance(descr, JitCellToken)`), if the descr's
-    /// `loop_token_number()` (`history.py:443 JitCellToken.number`)
-    /// differs from `original.number`, call `original.record_jump_to(target)`
-    /// so the target is held in `_keepalive_jitcell_tokens`
-    /// (`history.py:451`) while this loop is alive.
-    ///
-    /// JUMP branch is NOT ported. Upstream (`compile.py:192 isinstance(descr,
-    /// TargetToken)`, `:198 record_jump_to(descr.original_jitcell_token)`)
-    /// keepalives the *owning* `JitCellToken` of the target `TargetToken`,
-    /// but pyre's `LoopTargetDescr.token_id()` is the in-list identity
-    /// (preamble=0, peeled-body=`target_tokens.len()` at finalize time —
-    /// see `optimizeopt/unroll.rs:894`), not a `JitCellToken.number`.
-    /// Recording it here would inject list-indexes (0, 1, …) into
-    /// `_keepalive_jitcell_tokens`, which collide with real
-    /// `JitCellToken.number` values. Re-enabling JUMP keepalive requires
-    /// `LoopTargetDescr` to carry the owning JitCellToken number
-    /// separately (Task #146).
-    ///
-    /// NOT PORTED (handled elsewhere or pending):
-    ///   * `compile.py:180-181 clt.loop_token_wref = weakref` — pyre has no
-    ///     weakref-keyed memmgr generation tracking yet.
-    ///   * `compile.py:185-186 descr.rd_loop_token = clt` — pyre's resume
-    ///     descrs reach the source compiled-loop-token through the runtime
-    ///     descr classifier instead of a direct field link.
-    ///   * `compile.py:189/197 op.cleardescr()` — Rust `Op` keeps the descr
-    ///     reference; the Python tests this serves (`history.Stats`
-    ///     liveness) have no pyre counterpart.
-    ///   * `compile.py:204-207 quasi_immutable_deps.register_loop_token` —
-    ///     pyre's QuasiImmut tracking is still TODO.
-    ///   * `compile.py:210 loop.original_jitcell_token = None` — pyre's
-    ///     `Loop` value is dropped at end-of-compile, so the explicit
-    ///     break-cycle is implicit.
-    ///
-    /// PRE-EXISTING-ADAPTATION: target identity is stored as `u64`
-    /// rather than the upstream token-object reference because
-    /// `CompiledEntry::token` is a non-`Clone` plain `JitCellToken`
-    /// and pyre cannot share Arc identity with the warm cell. The
-    /// number-keyed adaptation tracks the same membership relation at
-    /// coarser granularity.
-    fn record_loop_or_bridge(original: &mut JitCellToken, ops: &[majit_ir::Op]) {
-        let original_number = original.number;
-        for op in ops {
-            let Some(descr) = op.descr.as_ref() else {
-                continue;
-            };
-            if op.opcode.is_call_assembler() {
-                if let Some(loop_descr) = descr.as_loop_token_descr() {
-                    let target = loop_descr.loop_token_number();
-                    if target != original_number {
-                        original.record_jump_to(target);
-                    }
+    fn jitcell_token_by_number(&self, token_number: u64) -> Option<std::sync::Arc<JitCellToken>> {
+        for compiled in self.compiled_loops.values() {
+            if compiled.token.number == token_number {
+                return Some(std::sync::Arc::clone(&compiled.token));
+            }
+            for previous in &compiled.previous_tokens {
+                if previous.number == token_number {
+                    return Some(std::sync::Arc::clone(previous));
                 }
             }
         }
+        // PRE-EXISTING-ADAPTATION: pyre-only fallback to cover targets
+        // whose `JitCellToken` lives only on `BaseJitCell.loop_token`
+        // (tmp-callback installs via `attach_tmp_callback_to_interp` —
+        // `warmstate.py:716-723`). Without this, `compile.py:187`
+        // `original.record_jump_to(descr)` keepalive narrows to
+        // already-compiled targets and silently drops tmp-callback ones,
+        // regressing main behavior. Removed by Slice X-D when
+        // `CallAssemblerDescr` carries the owning `Arc<JitCellToken>`
+        // directly (Codex parity recommendation #4).
+        self.warm_state
+            .find_token_by_number(token_number)
+            .map(std::sync::Arc::clone)
+    }
+
+    /// Port of `rpython/jit/metainterp/compile.py:171-211
+    /// record_loop_or_bridge`. Walks `ops` (the freshly compiled
+    /// `loop.operations` from `compile.py:183`) and triages each op's
+    /// descr by upstream type:
+    ///
+    /// 1. `compile.py:185-186 ResumeDescr` — store back-pointer to the
+    ///    owning `CompiledLoopToken`.
+    /// 2. `compile.py:187-191 JitCellToken` (CALL_ASSEMBLER) — record
+    ///    keepalive on `original` and clear the descr reference.
+    /// 3. `compile.py:192-203 TargetToken` (JUMP) — walk to the target's
+    ///    owning JitCellToken, record keepalive, clear the descr.
+    ///
+    /// Each branch below cites its upstream line and, where pyre cannot
+    /// yet match RPython 1:1, names a PRE-EXISTING-ADAPTATION with the
+    /// blocker that gates convergence.
+    fn record_loop_or_bridge(&self, original: &JitCellToken, ops: &[majit_ir::Op]) {
+        // `compile.py:178-179` `assert original_jitcell_token.generation > 0`.
+        //
+        // PRE-EXISTING-ADAPTATION: pyre calls `MemoryManager.keep_loop_alive`
+        // at *runtime* (`jitdriver.rs:2657`, after a compiled loop finishes
+        // executing), not at compile time inside `send_loop_to_backend`
+        // (`compile.py:567`). The token's `generation` is therefore still 0
+        // when this walker runs. Convergence requires moving
+        // `keep_loop_alive` to the compile-time path, which is part of
+        // Slice X-F (Task #211) — the `attach_procedure_to_interp` rewrite.
+        //
+        // `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
+        // clt.loop_token_wref = wref`.
+        //
+        // PRE-EXISTING-ADAPTATION: requires `Arc<JitCellToken>` (so we can
+        // `Arc::downgrade`) at every call site; the loop-compile sites
+        // (3961 etc.) currently pass a bare `&JitCellToken` from a local
+        // `JitCellToken::new(...)` that is wrapped in `Arc::new` only
+        // afterwards (line 4059). Lifting the wrap earlier requires Slice
+        // X-F (Task #211) which routes the production Arc through
+        // `attach_procedure_to_interp` from creation. The two consumers
+        // (`compile.py:726` bridge force-segmenting flag check,
+        // `pyjitpl.py:2897` `resumekey_original_loop_token` graceful
+        // give-up) also need separate ports.
+        //
+        // `compile.py:183` `for op in loop.operations`.
+        for op in ops {
+            let Some(descr) = op.descr.as_ref() else {
+                // `compile.py:184 descr = op.getdescr()` returns `None`
+                // for ops without a descr; the subsequent `isinstance`
+                // checks all fail.
+                continue;
+            };
+
+            // `compile.py:185-186` `if isinstance(descr, ResumeDescr):
+            // descr.rd_loop_token = clt`.
+            //
+            // PRE-EXISTING-ADAPTATION: pyre's `ResumeGuardDescr.rd_loop_token`
+            // is `u64` (the green key) assigned at descr construction
+            // (`compile.rs:1372`), not a `Weak<CompiledLoopToken>` patched
+            // here. Convergence requires lifting `rd_loop_token` to a
+            // weak handle on the owning `CompiledLoopToken`, with the
+            // resume readers (`resume.rs`, blackhole resume,
+            // `pyjitpl.py:2897` reader) updated to dereference the weak
+            // ref (the consumer of `loop_token_wref` above).
+
+            // `compile.py:187-191` `if isinstance(descr, JitCellToken)`.
+            //
+            // pyre exposes the owning `Arc<JitCellToken>` carried by
+            // `MetaCallAssemblerDescr` through
+            // `LoopTokenDescr::token_handle_any` (Slice X-D). All
+            // production CALL_ASSEMBLER descrs are constructed via
+            // `make_call_assembler_descr` with the real Arc; jitcode
+            // dispatch sites (`trace_ctx.rs`) and tests use
+            // `make_call_assembler_descr_by_number`, which builds a synth
+            // Arc with `compiled.is_none()` — those fall back to the
+            // number-keyed lookup via `jitcell_token_by_number`.
+            //
+            // The `is_call_assembler()` opcode test mirrors RPython's
+            // `isinstance(descr, JitCellToken)`: in upstream, the
+            // `JitCellToken` descr type is exclusively attached to
+            // CALL_ASSEMBLER ops; the opcode test is the structural
+            // equivalent in pyre, where the trait `LoopTokenDescr` is
+            // implemented only by CALL_ASSEMBLER descrs.
+            if op.opcode.is_call_assembler() {
+                if let Some(loop_descr) = descr.as_loop_token_descr() {
+                    let target_number = loop_descr.loop_token_number();
+                    // `compile.py:189` `if descr is not original_jitcell_token`.
+                    if target_number != original.number {
+                        // `compile.py:190` `original_jitcell_token.record_jump_to(descr)`.
+                        // RPython's `descr` IS the `JitCellToken` object,
+                        // so the call is unconditional.  Pyre's descr
+                        // carries the real owning `Arc<JitCellToken>` for
+                        // production CALL_ASSEMBLER paths (`make_call_assembler_descr`,
+                        // Slice X-D); the by-number factory
+                        // (`make_call_assembler_descr_by_number`) used by
+                        // jitcode dispatch and tests builds a synth Arc
+                        // with `compiled.is_none()` and falls back to
+                        // `jitcell_token_by_number`. Empirical probe
+                        // `MAJIT_PROBE_CA_TARGET_MISS` against full
+                        // pyre/check.py + cargo test recorded zero misses,
+                        // matching `compile.py:187`'s no-fallback shape.
+                        // Promote to `expect` so any future regression
+                        // surfaces fail-loud rather than silently dropping
+                        // a `record_jump_to`.
+                        let direct_arc = loop_descr
+                            .token_handle_any()
+                            .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
+                            .filter(|arc| arc.compiled.is_some());
+                        let target = match direct_arc {
+                            Some(real_arc) => std::sync::Arc::clone(real_arc),
+                            None => self.jitcell_token_by_number(target_number).expect(
+                                "compile.py:187 — CALL_ASSEMBLER descr's \
+                                 JitCellToken must be reachable through \
+                                 compiled_loops or warmstate cells",
+                            ),
+                        };
+                        original.record_jump_to(target);
+                    }
+                    // `compile.py:191` `op.cleardescr()`.
+                    //
+                    // PARITY BY CONSTRUCTION: pyre's `Loop` value drops at
+                    // end-of-compile, releasing every descr it held.
+                    // Upstream `cleardescr` exists primarily to keep
+                    // `history.Stats` from holding the loop alive across
+                    // tests; pyre has no equivalent test infrastructure.
+                    continue;
+                }
+            }
+
+            // `compile.py:192-203` `elif isinstance(descr, TargetToken)`
+            // (JUMP target).
+            //
+            // `compile.py:197 if descr.original_jitcell_token is not
+            //                  original_jitcell_token`. pyre stores the
+            // owner's `number` in `LoopTargetDescr.original_jitcell_token_number`
+            // (set by `compile.py:237` / `compile.py:289` counterparts at
+            // `pyjitpl/mod.rs:3886`/`5518`).  Empirically (probe
+            // `MAJIT_PROBE_TARGETTOKEN_NONE` against the full pyre/check.py
+            // suite, dynasm 14/14) every JUMP TargetToken reaching the
+            // walker has the owner number backfilled, so the
+            // `assert descr.original_jitcell_token is not None`
+            // (`compile.py:198`) form below is a structural invariant
+            // rather than a sentinel skip.
+            if op.opcode == majit_ir::OpCode::Jump {
+                if let Some(target_descr) = descr.as_loop_target_descr() {
+                    let target_owner_num = target_descr.original_jitcell_token_number();
+                    // `compile.py:197` `if descr.original_jitcell_token
+                    // is not original_jitcell_token`.
+                    if target_owner_num != Some(original.number) {
+                        // `compile.py:198` `assert descr.original_jitcell_token
+                        // is not None`.
+                        let target_owner_num = target_owner_num.expect(
+                            "compile.py:198 — JUMP TargetToken must carry an owning \
+                             JitCellToken.number by record_loop_or_bridge time",
+                        );
+                        // `compile.py:199` `original_jitcell_token
+                        // .record_jump_to(descr.original_jitcell_token)` — the
+                        // upstream call is unconditional (the descr already
+                        // carries the owning JitCellToken object).  Empirically
+                        // (probe `MAJIT_PROBE_JUMP_TARGET_MISS` against full
+                        // pyre/check.py + cargo test, dynasm 14/14 +
+                        // metainterp 1321/0/2) the number→Arc resolve through
+                        // `jitcell_token_by_number` always succeeds, so the
+                        // unwrap mirrors RPython's no-fallback shape.
+                        let target = self.jitcell_token_by_number(target_owner_num).expect(
+                            "compile.py:199 — JUMP TargetToken's owning \
+                             JitCellToken must be reachable through compiled_loops \
+                             or warmstate cells",
+                        );
+                        original.record_jump_to(target);
+                    }
+                    // `compile.py:200-202` `op._descr_wref =
+                    // weakref.ref(op._descr); op.cleardescr()` — PARITY
+                    // BY CONSTRUCTION (Loop value drops at end-of-compile,
+                    // releasing the descr without explicit cleardescr).
+                }
+            }
+        }
+
+        // `compile.py:204-207` quasi-immutable_deps register_loop_token.
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's QuasiImmut tracking is not yet
+        // ported, and the wref-keyed registration depends on
+        // `loop_token_wref` (above) also being available.
+
+        // `compile.py:210` `loop.original_jitcell_token = None`.
+        //
+        // PARITY BY CONSTRUCTION: pyre's `Loop` value drops at the end of
+        // each `compile_loop` / `compile_bridge` body, breaking the cycle
+        // implicitly without an explicit assignment.
     }
 
     /// Check whether a compiled loop exists for a given green key.
@@ -6871,8 +7226,27 @@ impl<M: Clone> MetaInterp<M> {
 
     /// memmgr.py:58-61: keep_loop_alive(looptoken).
     /// warmstate.py:402: warmrunnerdesc.memory_manager.keep_loop_alive(loop_token)
+    ///
+    /// The Arc source is the freshly-executed compiled `JitCellToken`
+    /// from `compiled_loops[green_key].token` (`warmstate.py:398` —
+    /// `loop_token` is the token that just ran).  Reading
+    /// `cell.loop_token` instead would currently observe the
+    /// install-token sentinel produced by `make_attach_token_for_probe`
+    /// (PROBE off default), whose `green_key` is 0 and whose
+    /// `compiled` is None — that breaks both `next_generation`
+    /// eviction (`memmgr.rs:228 evict by token.green_key` →
+    /// `compiled_loops.remove(&0)` is a no-op) and
+    /// `compile.py:567 send_loop_to_backend` keepalive semantics.
+    /// Cells with no compiled entry (key not yet compiled, or
+    /// already evicted) silently no-op — RPython's
+    /// `keep_loop_alive` is likewise gated by
+    /// `if loop_token is not None` callers (`compile.py:1149`).
     pub fn keep_loop_alive(&mut self, green_key: u64) {
-        self.warm_state.memory_manager.keep_loop_alive(green_key);
+        let Some(entry) = self.compiled_loops.get(&green_key) else {
+            return;
+        };
+        let token = std::sync::Arc::clone(&entry.token);
+        self.warm_state.memory_manager.keep_loop_alive(&token);
     }
 
     /// compile.py:826-830 store_hash: assign jitcounter hashes to guards
@@ -7304,12 +7678,6 @@ impl<M: Clone> MetaInterp<M> {
         // decode (resume.py:1245-1282).
         let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
-            // Box Identity Phase E.2b: seed parent loop's value_types so the
-            // bridge's optimizer can resolve types for parent OpRefs the bridge
-            // inherits via fail_args / JUMP / snapshot_boxes after the
-            // bridge_inputarg_base shift moves bridge inputargs out of the
-            // legacy [0..num_inputs) aliasing range.
-            optimizer.prev_phase_value_types = compiled.phase1_value_types.clone();
             (
                 compiled.retraced_count,
                 compiled.num_inputs,
@@ -7439,7 +7807,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
                 // compile.py:213 record_loop_or_bridge.
-                Self::record_loop_or_bridge(&mut token, &optimized_ops);
+                self.record_loop_or_bridge(&token, &optimized_ops);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         bridge_inputargs,
@@ -7523,7 +7891,7 @@ impl<M: Clone> MetaInterp<M> {
                     .get(&original_green_key)
                     .map(|c| c.retraced_count)
                     .unwrap_or(0);
-                let mut previous_tokens: Vec<JitCellToken> = Vec::new();
+                let mut previous_tokens: Vec<std::sync::Arc<JitCellToken>> = Vec::new();
                 if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
                     self.backend.migrate_bridges(&old_entry.token, &token);
                     previous_tokens.push(old_entry.token);
@@ -7535,7 +7903,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops.insert(
                     original_green_key,
                     CompiledEntry {
-                        token,
+                        token: std::sync::Arc::new(token),
                         num_inputs: bridge_inputargs.len(),
                         meta,
                         front_target_tokens,
@@ -7544,17 +7912,17 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref: 0,
-                        phase1_value_types: HashMap::new(),
                     },
                 );
+                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
+                self.register_compiled_token_for_keepalive(original_green_key);
                 // PRE-EXISTING-ADAPTATION: see compile_loop site for the
                 // RPython citation and convergence path. Entry-bridge
                 // mirrors `compile.py:1019 ResumeFromInterpDescr.
                 // compile_and_attach`.
-                let install_num = self.warm_state.alloc_token_number();
-                let install_token = JitCellToken::new(install_num);
-                self.warm_state
-                    .attach_procedure_to_interp(original_green_key, install_token);
+                // Slice 5.2 PROBE: see make_attach_token_for_probe doc.
+                let attach_token = self.make_attach_token_for_probe(original_green_key);
+                self.attach_procedure_with_redirect(original_green_key, attach_token);
                 self.stats.loops_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(original_green_key, bridge_ops.len(), num_optimized_ops);
@@ -7699,12 +8067,6 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_inputarg_base = compiled
             .next_global_opref
             .max(bridge_inputargs.len() as u32);
-        // Box Identity Phase E.2b: seed parent loop's value_types so the
-        // bridge's optimizer can resolve types for parent OpRefs the bridge
-        // inherits via fail_args / JUMP / snapshot_boxes after the
-        // bridge_inputarg_base shift moves bridge inputargs out of the
-        // legacy [0..num_inputs) aliasing range.
-        optimizer.prev_phase_value_types = compiled.phase1_value_types.clone();
         if crate::majit_log_enabled() {
             eprintln!(
                 "--- bridge trace (before opt) ninputs={} ---",
@@ -7886,6 +8248,19 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 };
                 self.assign_bridge_guard_hashes(green_key, source_trace_id, fail_index);
+                // compile.py:213 record_loop_or_bridge — bridges share
+                // their original loop's token, so we record onto
+                // `compiled.token` rather than a fresh one. The walk needs
+                // `&self` (for `jitcell_token_by_number` fallback), so we
+                // clone the owning Arc here and run the walk *before* the
+                // following `get_mut` borrow scope.
+                if let Some(original_arc) = self
+                    .compiled_loops
+                    .get(&green_key)
+                    .map(|compiled| std::sync::Arc::clone(&compiled.token))
+                {
+                    self.record_loop_or_bridge(&original_arc, &optimized_ops);
+                }
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     let source_trace_id = {
@@ -7896,10 +8271,6 @@ impl<M: Clone> MetaInterp<M> {
                             trace_id
                         }
                     };
-                    // compile.py:213 record_loop_or_bridge — bridges share
-                    // their original loop's token, so we record onto
-                    // `compiled.token` rather than a fresh one.
-                    Self::record_loop_or_bridge(&mut compiled.token, &optimized_ops);
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(
                             bridge_inputargs,
@@ -9077,66 +9448,30 @@ impl<M: Clone> MetaInterp<M> {
     /// 4. Otherwise → inline (`perform_call`).
     ///
     /// `recursive_depth` mirrors the RPython framestack walk at
-    /// Pyre split-metainterp adapter: the caller has already performed
-    /// pyjitpl.py:1389-1402's framestack walk over its active frame stack.
-    ///
-    /// The earlier `should_inline` / `should_inline_with_ctx`
-    /// surfaces re-derived `inline_depth` from `TraceCtx`, but α.4b
-    /// removed the parallel `inline_frames` side table that those
-    /// readers depended on, leaving the cap stub-zero.  Until a
-    /// non-pyre consumer plumbs a real framestack accessor into
-    /// `MetaInterp`, this is the only inline-decision entry point.
-    pub fn should_inline_with_depth(
-        &mut self,
-        callee_key: u64,
-        inline_depth: usize,
-        recursive_depth: usize,
-    ) -> InlineDecision {
-        self.should_inline_core(callee_key, Some((inline_depth, recursive_depth)))
+    /// pyjitpl.py:1389-1402 which skips frames with `greenkey is None`
+    /// (the root frame created by `initialize_state_from_start` /
+    /// `newframe(mainjitcode)` at pyjitpl.py:3270 — always greenkey-None).
+    /// Pyre's `has_inline_frame_for` therefore walks `inline_frames`
+    /// only, which counts the same population: already-inlined portal
+    /// frames.
+    pub fn should_inline(&mut self, callee_key: u64, callee_raw: (usize, usize)) -> InlineDecision {
+        // Extract inline-relevant info from ctx before calling impl
+        // (avoids borrow conflict between self.tracing and &mut self).
+        let ctx_info = self
+            .tracing
+            .as_ref()
+            .map(|ctx| (ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
+        self.should_inline_core(callee_key, ctx_info)
     }
 
-    /// pyjitpl.py:1389-1402 `_opimpl_recursive_call` recursion count.
-    ///
-    /// RPython walks `self.metainterp.framestack`, skips non-portal
-    /// frames and frames whose `greenkey is None`, then compares every
-    /// green Const with `same_constant` (history.py:207/285/331 —
-    /// integer ==, float bit ==, pointer ==).  Pyre uses
-    /// [`GreenKey::same_constant`] which mirrors that exactly; do
-    /// **not** route through `PartialEq::eq`, which goes through
-    /// `equal_whatever` and may resolve `Str`/`Unicode` content
-    /// equality (warmstate JitCell key semantics, not Const identity).
-    pub fn recursive_depth_for_greenkey(&self, jdindex: usize, target: &GreenKey) -> usize {
-        // pyjitpl.py:1388-1402 reads `portal_code = targetjitdriver_sd
-        // .mainjitcode` and skips frames whose `f.jitcode is not
-        // portal_code`. The caller supplies the `jdindex` from
-        // `_opimpl_recursive_call`; using that slot's `mainjitcode`
-        // identity (`Arc::ptr_eq`) matches RPython's `is`-comparison
-        // exactly, instead of the broader `jitdriver_sd().is_some()`
-        // proxy that overcounts under transitional Some(0) jdindex
-        // impersonation.
-        let portal_code = self
-            .staticdata
-            .jitdrivers_sd
-            .get(jdindex)
-            .and_then(|jd| jd.mainjitcode.as_ref());
-        self.framestack
-            .frames
-            .iter()
-            .filter(|frame| {
-                let portal_match = match portal_code {
-                    Some(pc) => std::sync::Arc::ptr_eq(&frame.jitcode, pc),
-                    // Transitional fallback for tests/hosts that have not
-                    // populated `mainjitcode` yet. RPython warmspot always
-                    // does, so production parity is the Arc identity branch.
-                    None => frame.jitcode.jitdriver_sd() == Some(jdindex),
-                };
-                portal_match
-                    && frame
-                        .greenkey
-                        .as_ref()
-                        .is_some_and(|gk| gk.same_constant(target))
-            })
-            .count()
+    pub fn should_inline_with_ctx(
+        &mut self,
+        callee_key: u64,
+        callee_raw: (usize, usize),
+        ctx: &crate::trace_ctx::TraceCtx,
+    ) -> InlineDecision {
+        let ctx_info = Some((ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
+        self.should_inline_core(callee_key, ctx_info)
     }
 
     /// Core inline decision logic — RPython `_opimpl_recursive_call`
@@ -9227,6 +9562,45 @@ impl<M: Clone> MetaInterp<M> {
         InlineDecision::Inline
     }
 
+    /// Begin inlining a function call during tracing.
+    ///
+    /// Pushes an inline frame so tracing can continue through the callee body.
+    /// We intentionally avoid recording ENTER_PORTAL_FRAME markers for inline
+    /// calls: unlike a real portal transition, they do not carry runtime
+    /// semantics and only bloat the trace.
+    ///
+    /// Returns `true` if inlining started, `false` if not tracing or depth exceeded.
+    pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return false,
+        };
+        if ctx.inline_depth() >= MAX_INLINE_DEPTH {
+            return false;
+        }
+
+        ctx.push_inline_frame(callee_raw, MAX_INLINE_DEPTH as u32);
+        true
+    }
+
+    /// Leave an inlined function call during tracing.
+    ///
+    /// Pops the inline frame. See `enter_inline_frame()` for why we do not
+    /// record LEAVE_PORTAL_FRAME for inline calls.
+    pub fn leave_inline_frame(&mut self) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.pop_inline_frame();
+        }
+    }
+
+    /// Get the current inlining depth.
+    pub fn inline_depth(&self) -> usize {
+        self.tracing
+            .as_ref()
+            .map(|ctx| ctx.inline_depth())
+            .unwrap_or(0)
+    }
+
     // ────────────────────────────────────────────────────────────────
     // Frame-management surface mirroring pyjitpl.py:2421-2477.
     //
@@ -9269,7 +9643,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
         argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        greenkey: Option<GreenKey>,
+        greenkey: Option<u64>,
     ) -> Result<(), ChangeFrame> {
         // pyjitpl.py:2423: f = self.newframe(jitcode, greenkey)
         let _ = self.newframe(jitcode, greenkey);
@@ -10065,29 +10439,16 @@ impl<M: Clone> MetaInterp<M> {
     pub fn newframe(
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        greenkey: Option<GreenKey>,
+        greenkey: Option<u64>,
     ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
         if let Some(jd_no) = jitcode.jitdriver_sd() {
             self.portal_call_depth += 1;
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
-            // pyjitpl.py:2436-2441
-            //   unique_id = -1
-            //   if greenkey is not None:
-            //       unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)
-            //       self.enter_portal_frame(jd_no, unique_id)
-            //
-            // RPython routes `unique_id` through the per-driver
-            // `warmstate.get_unique_id` resolver — for PyPyJitDriver this
-            // returns the pycode rvmprof id (interp_jit.py:44), default
-            // returns 0 (warmstate.py make_unique_id_fn).  The previous
-            // pyre port used `greenkey.hash_u64()` (the JitCell
-            // bucketing hash), which is a distinct quantity and a
-            // structural divergence — fixed here.
-            if let Some(ref greenkey) = greenkey {
-                let unique_id = self.warm_state.get_unique_id(greenkey);
-                self.enter_portal_frame(jd_no, unique_id as u64);
+            // pyjitpl.py:2440-2441: enter_portal_frame(jitdriver_sd.index, unique_id)
+            if let Some(unique_id) = greenkey {
+                self.enter_portal_frame(jd_no, unique_id);
             }
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
@@ -10095,15 +10456,25 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2443-2445: `if greenkey is not None and
         // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
         //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
-        if let (Some(gk), Some(jd_no)) = (greenkey.as_ref(), jitcode.jitdriver_sd()) {
+        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd()) {
             if self.is_main_jitcode(&jitcode) {
                 if let (Some(positions), Some(ctx)) =
                     (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
                 {
-                    positions.push((jd_no, Some(gk.clone()), ctx.get_trace_position()));
+                    positions.push((jd_no, Some(gk), ctx.get_trace_position()));
                 }
             }
         }
+        // Bump the existing TraceCtx inline-depth counter so trace
+        // recorder bookkeeping (already wired through pyre's tracer)
+        // stays in sync; the canonical frame storage is `framestack`.
+        // The `newframe` path predates the raw (code_ptr, pc) greenkey
+        // and operates on sub-jitcodes rather than portal frames, so
+        // project the u64 greenkey into the raw slot verbatim —
+        // pyjitpl.py:1396-1401 element-wise parity still holds because
+        // this caller doesn't feed the recursion-depth walk.
+        let raw = (greenkey.unwrap_or_default() as usize, 0);
+        let _ = self.enter_inline_frame(raw);
         // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
         let frame = crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut());
         self.framestack.push(frame);
@@ -10168,7 +10539,7 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2470-2472: `if frame.greenkey is not None and
             // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
             //     (jitcode.jitdriver_sd, None, self.history.get_trace_position()))`.
-            if let (true, Some(jd_no)) = (frame.greenkey.is_some(), frame.jitcode.jitdriver_sd()) {
+            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd()) {
                 if self.is_main_jitcode(&frame.jitcode) {
                     if let (Some(positions), Some(ctx)) =
                         (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
@@ -10183,6 +10554,9 @@ impl<M: Clone> MetaInterp<M> {
             // an RPython memory-reuse optimization; pyre relies on the
             // Rust drop to release register banks.
         }
+        // Mirror the TraceCtx inline-depth counter so trace recorder
+        // bookkeeping stays balanced with the framestack pop.
+        self.leave_inline_frame();
     }
 
     /// pyjitpl.py:2479-2503 `MetaInterp.finishframe(resultbox, leave_portal_frame=True)`.
@@ -10751,68 +11125,7 @@ impl<M: Clone> MetaInterp<M> {
             return;
         }
         let caller_idx = self.framestack.frames.len() - 2;
-        let removed = self.framestack.frames.remove(caller_idx);
-        // pyjitpl.py:1306-1307 `del framestack[-2]` bypasses
-        // `popframe` — the removed frame's portal bookkeeping
-        // (`portal_call_depth`, `call_ids`) is NOT undone.  Upstream
-        // accepts this leak because the typical TCO caller is a
-        // sub-jitcode helper (`jitdriver_sd is None`); a portal-
-        // driver caller would underflow `portal_call_depth` on the
-        // matching popframe later.  Make the assumption fail loud so
-        // we catch any unanticipated portal-driver caller here.
-        debug_assert!(
-            removed.jitcode.jitdriver_sd().is_none(),
-            "_try_tco removed portal-driver caller (jitdriver_sd={:?}) — \
-             pyjitpl.py:1306-1307 `del framestack[-2]` would leak \
-             portal_call_depth / call_ids.  Pair the removal with \
-             popframe's portal-bookkeeping decrement (Gap C `g.4.5.6.B` \
-             follow-up).",
-            removed.jitcode.jitdriver_sd(),
-        );
-        // pyjitpl.py:1301-1302 already guarantees `target_index ==
-        // bytecode[next_pc + 1]` (callee's `*_return` operand matches
-        // the caller's pending result slot).  PyPy reads the return
-        // slot dynamically each time `*_return` fires, so the slot
-        // index is naturally re-resolved against whichever frame
-        // currently sits at framestack[-2].  Pyre caches the slot on
-        // `MIFrame.return_i/r/f` (`frame.rs:75-77`) populated from the
-        // BC_INLINE_CALL payload, so after `framestack.remove` the
-        // cached index must still be a legal slot in the
-        // grandcaller's register file.  Verify here so the violation
-        // surfaces at the TCO site instead of as an OOB write later.
-        if target_index >= 0 {
-            let callee =
-                self.framestack.frames.last().expect(
-                    "_try_tco: callee frame must remain on framestack after caller removal",
-                );
-            let cached_slot = match argcode {
-                b'i' => callee.return_i,
-                b'r' => callee.return_r,
-                b'f' => callee.return_f,
-                _ => None,
-            };
-            if let Some(slot) = cached_slot {
-                let grandcaller = self.framestack.frames.get(self.framestack.frames.len() - 2);
-                if let Some(grand) = grandcaller {
-                    let bank_len = match argcode {
-                        b'i' => grand.int_regs.len(),
-                        b'r' => grand.ref_regs.len(),
-                        b'f' => grand.float_regs.len(),
-                        _ => usize::MAX,
-                    };
-                    debug_assert!(
-                        slot < bank_len,
-                        "_try_tco: cached return slot {slot} (kind={:?}) out of bounds \
-                         in grandcaller's register file (len={bank_len}). Pyre's
-                         `MIFrame.return_{{i,r,f}}` cache (frame.rs:75-77) was \
-                         populated against the now-removed caller's register layout; \
-                         a remap to the grandcaller's slot is required (Gap D \
-                         `g.4.5.6.C` follow-up).",
-                        argcode as char,
-                    );
-                }
-            }
-        }
+        let _removed = self.framestack.frames.remove(caller_idx);
         // pyjitpl.py:1308-1321: trace_length_at_last_tco bookkeeping.
         let tracelength = self
             .tracing
@@ -11048,8 +11361,14 @@ impl<M: Clone> MetaInterp<M> {
         );
         let green_values: Vec<i64> = greenargs.iter().map(|(_, _, value)| *value).collect();
         let green_key = crate::green_key_hash(&green_values);
-        let (target_token, vable_index) = if let Some(token) = self.get_loop_token(green_key) {
-            (token.number, token.virtualizable_arg_index)
+        // `compile.py:187` parity: `op.getdescr()` IS a `JitCellToken`.  Carry
+        // the *same* Arc that `compiled_loops` / warm cell own through to the
+        // descr so `record_loop_or_bridge` can downcast and push it directly,
+        // skipping the number-keyed `jitcell_token_by_number` recovery.
+        let target_token: std::sync::Arc<JitCellToken> = if let Some(arc) =
+            self.get_loop_token_arc(green_key)
+        {
+            std::sync::Arc::clone(arc)
         } else {
             // warmstate.py:714-723 — cell has no procedure_token yet, so
             // synthesise one via `compile_tmp_callback`.  Reuses the
@@ -11068,31 +11387,29 @@ impl<M: Clone> MetaInterp<M> {
             let token_number = self
                 .get_pending_token_number(green_key)
                 .unwrap_or_else(|| self.warm_state.alloc_token_number());
-            let token = {
-                let backend = &mut self.backend;
-                match self.warm_state.get_assembler_token(green_key, || {
-                    compile::compile_tmp_callback(
-                        backend,
-                        &target_sd,
-                        token_number,
-                        green_key,
-                        &greenboxes,
-                        &arg_types,
-                    )
-                }) {
-                    Ok(token) => token,
-                    Err(err) => {
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[jit][call_assembler] compile_tmp_callback failed for key={green_key}: {err:?}"
-                            );
-                        }
-                        return (None, None);
+            let backend = &mut self.backend;
+            match self.warm_state.get_assembler_token(green_key, || {
+                compile::compile_tmp_callback(
+                    backend,
+                    &target_sd,
+                    token_number,
+                    green_key,
+                    &greenboxes,
+                    &arg_types,
+                )
+            }) {
+                Ok(token) => token,
+                Err(err) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][call_assembler] compile_tmp_callback failed for key={green_key}: {err:?}"
+                        );
                     }
+                    return (None, None);
                 }
-            };
-            (token.number, token.virtualizable_arg_index)
+            }
         };
+        let vable_index = target_token.virtualizable_arg_index;
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {
             majit_ir::Type::Int => OpCode::CallAssemblerI,
@@ -11108,10 +11425,9 @@ impl<M: Clone> MetaInterp<M> {
                 None => return (None, None),
             };
             let descr = crate::make_call_assembler_descr(
-                target_token,
+                std::sync::Arc::clone(&target_token),
                 &arg_types,
                 descr_view.result_type(),
-                vable_index,
             );
             ctx.record_op_with_descr(opnum, &opref_args, descr)
         };
@@ -15237,66 +15553,6 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn recursive_depth_walks_miframe_greenkeys() {
-        use crate::jitcode::JitCodeBuilder;
-
-        let mut meta = MetaInterp::<()>::new(0);
-        let mut portal = JitCodeBuilder::new().finish();
-        portal.replace_jitdriver_sd(Some(0));
-        let portal = std::sync::Arc::new(portal);
-        let target = GreenKey::new(vec![0xabc, 0]);
-
-        meta.perform_call(portal.clone(), &[], None).unwrap_err();
-        meta.perform_call(portal.clone(), &[], Some(target.clone()))
-            .unwrap_err();
-        meta.perform_call(portal, &[], Some(target.clone()))
-            .unwrap_err();
-        let non_portal = std::sync::Arc::new(JitCodeBuilder::new().finish());
-        meta.perform_call(non_portal, &[], Some(target.clone()))
-            .unwrap_err();
-
-        assert_eq!(meta.recursive_depth_for_greenkey(0, &target), 2);
-        assert_eq!(
-            meta.recursive_depth_for_greenkey(0, &GreenKey::new(vec![0xdef, 0])),
-            0
-        );
-    }
-
-    #[test]
-    fn recursive_depth_filters_by_target_portal_code_identity() {
-        use crate::jitcode::JitCodeBuilder;
-
-        let mut meta = MetaInterp::<()>::new(0);
-
-        let mut portal0 = JitCodeBuilder::new().finish();
-        portal0.replace_jitdriver_sd(Some(0));
-        let portal0 = std::sync::Arc::new(portal0);
-
-        let mut portal1 = JitCodeBuilder::new().finish();
-        portal1.replace_jitdriver_sd(Some(1));
-        let portal1 = std::sync::Arc::new(portal1);
-
-        let mut jd0 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
-        jd0.index = Some(0);
-        jd0.mainjitcode = Some(portal0.clone());
-        let mut jd1 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
-        jd1.index = Some(1);
-        jd1.mainjitcode = Some(portal1.clone());
-        std::sync::Arc::get_mut(&mut meta.staticdata)
-            .unwrap()
-            .jitdrivers_sd = vec![jd0, jd1];
-
-        let target = GreenKey::single(0xabc);
-        meta.perform_call(portal0, &[], Some(target.clone()))
-            .unwrap_err();
-        meta.perform_call(portal1, &[], Some(target.clone()))
-            .unwrap_err();
-
-        assert_eq!(meta.recursive_depth_for_greenkey(0, &target), 1);
-        assert_eq!(meta.recursive_depth_for_greenkey(1, &target), 1);
-    }
-
-    #[test]
     fn initialize_state_from_start_seeds_portal_call_depth_to_zero() {
         // pyjitpl.py:3268-3272 — set portal_call_depth = -1, push the
         // portal mainjitcode (which bumps it to 0), then assert == 0.
@@ -15427,7 +15683,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(5));
         let jc = std::sync::Arc::new(jc);
 
-        meta.newframe(jc, Some(GreenKey::single(0xfeed)));
+        meta.newframe(jc, Some(0xfeed));
         meta.popframe(true);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
@@ -15448,13 +15704,9 @@ mod metainterp_static_data_tests {
             ctx.constants_get_value(enter.args[0]),
             Some(majit_ir::Value::Int(5))
         );
-        // pyjitpl.py:2438 unique_id = warmstate.get_unique_id(greenkey).
-        // Default resolver (no `set_get_unique_id_fn`) returns 0 per
-        // RPython `get_unique_id_default`; PyPyJitDriver installs its
-        // own resolver that returns the pycode rvmprof id.
         assert_eq!(
             ctx.constants_get_value(enter.args[1]),
-            Some(majit_ir::Value::Int(0))
+            Some(majit_ir::Value::Int(0xfeed))
         );
         assert_eq!(
             ctx.constants_get_value(leave.args[0]),
@@ -15491,9 +15743,7 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        let greenkey = GreenKey::single(0xcafe);
-        meta.perform_call(jc, &[], Some(greenkey.clone()))
-            .unwrap_err();
+        meta.perform_call(jc, &[], Some(0xcafe)).unwrap_err();
         assert_eq!(
             meta.portal_trace_positions
                 .as_ref()
@@ -15503,7 +15753,7 @@ mod metainterp_static_data_tests {
         );
         let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
         assert_eq!(entry.0, idx);
-        assert_eq!(entry.1, Some(greenkey));
+        assert_eq!(entry.1, Some(0xcafe));
 
         meta.popframe(true);
         let positions = meta
@@ -15543,8 +15793,7 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(GreenKey::single(0xbabe)))
-            .unwrap_err();
+        meta.perform_call(jc, &[], Some(0xbabe)).unwrap_err();
         assert!(
             meta.portal_trace_positions
                 .as_ref()
@@ -15962,7 +16211,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 7;
         let trace_id = 11;
-        let token = JitCellToken::new(3);
+        let token = std::sync::Arc::new(JitCellToken::new(3));
         let start_token = crate::optimizeopt::unroll::TargetToken::new_preamble(0);
         let start_descr = start_token.as_jump_target_descr();
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
@@ -16007,7 +16256,6 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
-                phase1_value_types: HashMap::new(),
             },
         );
 
@@ -16178,7 +16426,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token: JitCellToken::new(3),
+                token: std::sync::Arc::new(JitCellToken::new(3)),
                 num_inputs: 0,
                 meta: (),
                 front_target_tokens: Vec::new(),
@@ -16187,7 +16435,6 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
-                phase1_value_types: HashMap::new(),
             },
         );
 
@@ -16278,7 +16525,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token: JitCellToken::new(3),
+                token: std::sync::Arc::new(JitCellToken::new(3)),
                 num_inputs: 0,
                 meta: (),
                 front_target_tokens: Vec::new(),
@@ -16287,7 +16534,6 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
-                phase1_value_types: HashMap::new(),
             },
         );
 
@@ -16308,11 +16554,17 @@ mod tests {
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
     fn patch_dynasm_fail_descr_resume_data(
-        token: &mut JitCellToken,
+        token: &std::sync::Arc<JitCellToken>,
         fail_index: u32,
         rd_numb: Vec<u8>,
         rd_consts: Vec<majit_ir::Const>,
     ) {
+        // Test-only: same single-threaded JIT scheduler invariant the
+        // sibling `descr` cast below relies on — bypass `Arc::get_mut`
+        // because the runtime keeps a second strong ref via the warm
+        // cell / memmgr / `compiled_loops`.
+        let token: &mut JitCellToken =
+            unsafe { &mut *(std::sync::Arc::as_ptr(token) as *mut JitCellToken) };
         let compiled = token
             .compiled
             .as_mut()
@@ -16340,10 +16592,12 @@ mod tests {
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
     fn patch_dynasm_fail_descr_types(
-        token: &mut JitCellToken,
+        token: &std::sync::Arc<JitCellToken>,
         fail_index: u32,
         fail_arg_types: Vec<Type>,
     ) {
+        let token: &mut JitCellToken =
+            unsafe { &mut *(std::sync::Arc::as_ptr(token) as *mut JitCellToken) };
         let compiled = token
             .compiled
             .as_mut()
@@ -16406,10 +16660,10 @@ mod tests {
                 .compiled_loops
                 .get_mut(&green_key)
                 .expect("compiled entry");
-            patch_dynasm_fail_descr_resume_data(&mut entry.token, fail_index, rd_numb, vec![]);
+            patch_dynasm_fail_descr_resume_data(&entry.token, fail_index, rd_numb, vec![]);
             let mut fresh_token = JitCellToken::new(9003);
             fresh_token.green_key = green_key;
-            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
             entry.previous_tokens.push(old_token);
             entry
                 .traces
@@ -16573,7 +16827,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token,
+                token: std::sync::Arc::new(token),
                 num_inputs: inputargs.len(),
                 meta: (),
                 front_target_tokens: Vec::new(),
@@ -16582,7 +16836,6 @@ mod tests {
                 traces,
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
-                phase1_value_types: HashMap::new(),
             },
         );
     }
@@ -16620,7 +16873,7 @@ mod tests {
                 .expect("compiled entry");
             let mut fresh_token = JitCellToken::new(9001);
             fresh_token.green_key = green_key;
-            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
             entry.previous_tokens.push(old_token);
             entry
                 .traces
@@ -16687,7 +16940,7 @@ mod tests {
                 .compiled_loops
                 .get_mut(&green_key)
                 .expect("compiled entry");
-            patch_dynasm_fail_descr_types(&mut entry.token, fail_index, vec![]);
+            patch_dynasm_fail_descr_types(&entry.token, fail_index, vec![]);
         }
 
         assert_eq!(meta.fail_arg_count_for(green_key, trace_id, fail_index), 1);
@@ -16743,7 +16996,7 @@ mod tests {
                 .expect("compiled entry");
             let mut fresh_token = JitCellToken::new(9002);
             fresh_token.green_key = green_key;
-            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
             entry.previous_tokens.push(old_token);
             entry
                 .traces
@@ -16828,7 +17081,7 @@ mod tests {
             );
             let mut fresh_token = JitCellToken::new(9004);
             fresh_token.green_key = green_key;
-            let old_token = std::mem::replace(&mut entry.token, fresh_token);
+            let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
             entry.previous_tokens.push(old_token);
             entry
                 .traces
@@ -17335,7 +17588,7 @@ mod tests {
         meta.compiled_loops.insert(
             green_key,
             CompiledEntry {
-                token,
+                token: std::sync::Arc::new(token),
                 num_inputs: 1,
                 meta: (),
                 front_target_tokens: Vec::new(),
@@ -17344,7 +17597,6 @@ mod tests {
                 traces: HashMap::new(),
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
-                phase1_value_types: HashMap::new(),
             },
         );
         let action = meta.force_start_tracing(777, (0, 0), None, &[]);

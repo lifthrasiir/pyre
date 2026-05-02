@@ -1,4 +1,4 @@
-use majit_backend::{Backend, ExitValueSourceLayout};
+use majit_backend::ExitValueSourceLayout;
 
 /// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
 fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
@@ -579,17 +579,6 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    /// `llsupport/gc.py:115-126 getframedescrs(cpu)` parity — install the
-    /// JitFrame field descriptors on this driver's backend.  RPython
-    /// attaches them via `cpu.gc_ll_descr.getframedescrs(cpu)`; majit
-    /// threads them in from the interpreter crate (`pyre-jit`) once the
-    /// JitDriver has constructed its backend so the GC rewriter's
-    /// `handle_call_assembler` pass can emit `gen_malloc_frame` against
-    /// a known layout.
-    pub fn set_jitframe_layout(&mut self, descrs: Option<majit_gc::rewrite::JitFrameDescrs>) {
-        self.meta.backend.set_jitframe_layout(descrs);
-    }
-
     /// Install the state-field JIT canonical liveness payload before
     /// any tracing path runs.  Mirrors RPython `warmspot.py:281-289`'s
     /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
@@ -859,11 +848,11 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// RPython JC_TRACING parity: true only when tracing this specific
-    /// key.  `target` is the full `JitCell` hash u64 — see
-    /// `MetaInterp::is_tracing_key`.
+    /// key. `target_raw` is the structured `(code_ptr, pc)` greenkey
+    /// matching pyjitpl.py:1396-1401's element-wise comparison.
     #[inline]
-    pub fn is_tracing_key(&self, target: u64) -> bool {
-        self.meta.is_tracing_key(target)
+    pub fn is_tracing_key(&self, target_raw: (usize, usize)) -> bool {
+        self.meta.is_tracing_key(target_raw)
     }
 
     /// Whether the driver is currently tracing a bridge.
@@ -1389,10 +1378,14 @@ impl<S: JitState> JitDriver<S> {
                     // site for the RPython citation and convergence path.
                     // Segmented loop mirrors `pyjitpl.py:1662-1663`.
                     let install_num = self.meta.warm_state.alloc_token_number();
-                    let install_token = majit_backend::JitCellToken::new(install_num);
+                    let install_token =
+                        std::sync::Arc::new(majit_backend::JitCellToken::new(install_num));
+                    // `warmstate.py:339-348` redirect+record_jump_to chain
+                    // routed through MetaInterp's caller-side helper so the
+                    // backend `redirect_call_assembler` is reachable when
+                    // both old/new tokens carry compiled code.
                     self.meta
-                        .warm_state
-                        .attach_procedure_to_interp(green_key, install_token);
+                        .attach_procedure_with_redirect(green_key, install_token);
                 }
                 // Blackhole transition: clear all driver tracing state.
                 self.sym = None;
@@ -2861,6 +2854,13 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.compiled_loops.len()
             );
         }
+        // `memmgr.py:85-89 release_all_loops` — the upstream entry
+        // point for `jit_hooks.releaseall` (`rlib/jit_hooks.py:131`)
+        // calls `memory_manager.alive_loops.clear()`.  Slice 3.3
+        // (`memmgr.rs alive_loops` Arc owner) made `alive_loops`
+        // a strong owner of every running loop, so releasing here
+        // is the only path that drops those Arcs.
+        self.meta.warm_state.memory_manager.release_all_loops();
         self.meta.compiled_loops.clear();
     }
 
@@ -2907,26 +2907,40 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Returns `Inline` if the callee should be traced through,
     /// `CallAssembler` if it already has compiled code, or
-    /// Inline decision when an adapter metainterp has already performed
-    /// pyjitpl.py:1389-1402's framestack walk over its active frame stack.
-    ///
-    /// Pyre's split tracer is the only surface that consults the
-    /// `MAX_INLINE_DEPTH` cap; both `inline_depth` and `recursive_depth`
-    /// are derived by the caller from its concrete framestack and the
-    /// portal `mainjitcode` identity.  The legacy `should_inline` /
-    /// `should_inline_with_ctx` variants that re-derived
-    /// `inline_depth` from `TraceCtx` were stub-zero after the α.4b
-    /// drop of the parallel `inline_frames` side table and have been
-    /// removed; revive them by plumbing a real framestack accessor
-    /// into `MetaInterp` if a non-pyre consumer ever needs them.
-    pub fn should_inline_with_depth(
+    /// `ResidualCall` if it should be left as an opaque call.
+    pub fn should_inline(&mut self, callee_key: u64, callee_raw: (usize, usize)) -> InlineDecision {
+        self.meta.should_inline(callee_key, callee_raw)
+    }
+
+    /// Inline decision with externally-held ctx (merge_point callback).
+    pub fn should_inline_with_ctx(
         &mut self,
         callee_key: u64,
-        inline_depth: usize,
-        recursive_depth: usize,
+        callee_raw: (usize, usize),
+        ctx: &crate::trace_ctx::TraceCtx,
     ) -> InlineDecision {
         self.meta
-            .should_inline_with_depth(callee_key, inline_depth, recursive_depth)
+            .should_inline_with_ctx(callee_key, callee_raw, ctx)
+    }
+
+    /// Begin inlining a function call during tracing.
+    ///
+    /// Records EnterPortalFrame and pushes an inline frame.
+    /// Returns `true` if inlining started successfully.
+    pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
+        self.meta.enter_inline_frame(callee_raw)
+    }
+
+    /// End an inlined function call during tracing.
+    ///
+    /// Records LeavePortalFrame and pops the inline frame.
+    pub fn leave_inline_frame(&mut self) {
+        self.meta.leave_inline_frame()
+    }
+
+    /// Get the current inlining depth.
+    pub fn inline_depth(&self) -> usize {
+        self.meta.inline_depth()
     }
 
     /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`

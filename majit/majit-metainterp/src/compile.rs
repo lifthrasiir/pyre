@@ -36,6 +36,39 @@ use crate::resume::{
     ResumeLayoutSummary, ResumeValueSource,
 };
 
+/// `compile.py:166-169` `make_jitcell_token(jitdriver_sd)`.
+///
+/// ```python
+/// def make_jitcell_token(jitdriver_sd):
+///     jitcell_token = JitCellToken()
+///     jitcell_token.outermost_jitdriver_sd = jitdriver_sd
+///     return jitcell_token
+/// ```
+///
+/// Pyre takes `number` separately because `JitCellToken::new(number)`
+/// requires a unique number allocated up-front (RPython relies on
+/// `__init__` increment of `_GLOBAL_NUMBER_OF_TOKENS`; pyre uses
+/// `WarmEnterState::alloc_token_number` for the same purpose).  The
+/// `outermost_jitdriver_index: Option<usize>` is the pyre analog of
+/// RPython's `outermost_jitdriver_sd` attribute (pyre stores a slot
+/// index into `metainterp_sd.jitdrivers_sd` instead of a direct
+/// reference, since the descriptor lives in another crate).
+///
+/// Returns a bare `JitCellToken` so the caller can apply pyre-specific
+/// fields (`green_key`, `num_scalar_inputargs`,
+/// `virtualizable_arg_index` via `MetaInterp::configure_loop_token_for_driver`)
+/// while the token is still solely owned, then wrap it in
+/// `Arc::new(token)` once it is fully populated.  The Arc is the
+/// canonical handle thereafter, mirroring the single-object identity
+/// that flows through `compile_loop` (`compile.py:266`) →
+/// `attach_procedure_to_interp` (`compile.py:1019`) →
+/// `MemoryManager.keep_loop_alive` (`compile.py:567`/`:1149`).
+pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> JitCellToken {
+    let mut token = JitCellToken::new(number);
+    token.outermost_jitdriver_index = jd_index;
+    token
+}
+
 /// Resolve the type of an OpRef in guard fail_args.
 /// OpRef::NONE is a virtual slot placeholder (null GC ref).
 /// RPython resume.py:389-452 parity: guard metadata sees only the
@@ -2427,11 +2460,12 @@ pub fn compile_tmp_callback(
     // on later CALL_ASSEMBLER) and `virtualizable_arg_index` (cached from
     // `jitdriver_sd.index_of_virtualizable`, matching the fields populated
     // on real-loop tokens at `compile_loop`).
-    let mut jitcell_token = JitCellToken::new(token_number);
+    //
+    // `compile.py:168` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
+    // is set inside `make_jitcell_token`.
+    let mut jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
     jitcell_token.green_key = green_key;
     jitcell_token.virtualizable_arg_index = jitdriver_sd.virtualizable_arg_index();
-    // `compile.py:168` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`.
-    jitcell_token.outermost_jitdriver_index = jitdriver_sd.index;
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  PRE-EXISTING-ADAPTATION: `rpython/rlib/jit.py`'s `jl`

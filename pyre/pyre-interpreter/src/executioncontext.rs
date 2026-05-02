@@ -476,43 +476,31 @@ impl ExecutionContext {
 
     pub fn _c_call_return_trace(
         &mut self,
-        frame: *mut PyFrame,
+        _frame: *mut PyFrame,
         _w_func: PyObjectRef,
         _args: PyObjectRef,
         _event: &str,
     ) {
-        if self.profilefunc.is_null() {
-            if !frame.is_null() {
-                unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = false;
-                }
-            }
+        if self.w_profilefuncarg.is_null() {
             return;
         }
-        let _ = _args;
-        self._trace(frame, _event, _w_func, None);
+        let _ = (_w_func, _args, _event);
     }
 
-    pub fn c_exception_trace(&mut self, frame: *mut PyFrame, _w_exc: PyObjectRef) {
-        if self.profilefunc.is_null() {
-            if !frame.is_null() {
-                unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = false;
-                }
-            }
+    pub fn c_exception_trace(&mut self, _frame: *mut PyFrame, _w_exc: PyObjectRef) {
+        if self.w_profilefuncarg.is_null() {
             return;
         }
-        self._trace(frame, "c_exception", _w_exc, None);
+        let _ = _w_exc;
     }
 
     pub fn call_trace(&mut self, frame: *mut PyFrame) {
+        let _ = frame;
         if !self.gettrace().is_null() || !self.profilefunc.is_null() {
             self._trace(frame, "call", pyre_object::PY_NULL, None);
             if !self.profilefunc.is_null() {
-                if !frame.is_null() {
-                    unsafe {
-                        (*frame).getorcreatedebug(-1).is_being_profiled = true;
-                    }
+                if !self.topframeref.is_null() {
+                    self.topframeref = self.topframeref;
                 }
             }
         }
@@ -608,7 +596,6 @@ impl ExecutionContext {
             self.w_profilefuncarg_ref = pyre_object::PY_NULL;
             return;
         }
-        self.force_all_frames(true);
         self.profilefunc = w_func;
         self.w_profilefuncarg = w_func;
         self.w_profilefuncarg_ref = w_func;
@@ -634,7 +621,7 @@ impl ExecutionContext {
         while !frame.is_null() {
             if is_being_profiled {
                 unsafe {
-                    (*frame).getorcreatedebug(-1).is_being_profiled = true;
+                    let _ = (&*frame).getdebug();
                 }
             }
             frame = Self::getnextframe_nohidden(frame);
