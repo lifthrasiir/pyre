@@ -894,10 +894,32 @@ fn dispatch_op(
                 .vable_getfield_float_with_base(dst, vable_reg, field_idx);
         }
         "setfield_vable_i" => {
-            let (vable_reg, value_reg, field_idx) = expect_vable_field_write_args(args, Kind::Int);
-            state
-                .builder
-                .vable_setfield_int_with_base(vable_reg, field_idx, value_reg);
+            // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` is generic
+            // across i/r/f — `valuebox` may be a ConstInt after optimizer
+            // folding.  Mirror the `setfield_vable_r` ConstRef branch.
+            assert_eq!(
+                args.len(),
+                3,
+                "setfield_vable_i expects [vable, value, fielddescr]"
+            );
+            let vable_reg = expect_reg(&args[0], Kind::Ref);
+            let field_idx = expect_descr_vable_static_field(&args[2]);
+            match &args[1] {
+                Operand::Register(r) if r.kind == Kind::Int => {
+                    state
+                        .builder
+                        .vable_setfield_int_with_base(vable_reg, field_idx, r.index);
+                }
+                Operand::ConstInt(value) => {
+                    state
+                        .builder
+                        .vable_setfield_int_const_value_with_base(vable_reg, field_idx, *value);
+                }
+                other => panic!(
+                    "setfield_vable_i expects Register(Int) or ConstInt, got {:?}",
+                    other,
+                ),
+            }
         }
         "setfield_vable_r" => {
             assert_eq!(
@@ -925,11 +947,31 @@ fn dispatch_op(
             }
         }
         "setfield_vable_f" => {
-            let (vable_reg, value_reg, field_idx) =
-                expect_vable_field_write_args(args, Kind::Float);
-            state
-                .builder
-                .vable_setfield_float_with_base(vable_reg, field_idx, value_reg);
+            // pyjitpl.py:1188-1199 — float counterpart to setfield_vable_i
+            // ConstInt branch.
+            assert_eq!(
+                args.len(),
+                3,
+                "setfield_vable_f expects [vable, value, fielddescr]"
+            );
+            let vable_reg = expect_reg(&args[0], Kind::Ref);
+            let field_idx = expect_descr_vable_static_field(&args[2]);
+            match &args[1] {
+                Operand::Register(r) if r.kind == Kind::Float => {
+                    state
+                        .builder
+                        .vable_setfield_float_with_base(vable_reg, field_idx, r.index);
+                }
+                Operand::ConstFloat(value) => {
+                    state
+                        .builder
+                        .vable_setfield_float_const_value_with_base(vable_reg, field_idx, *value);
+                }
+                other => panic!(
+                    "setfield_vable_f expects Register(Float) or ConstFloat, got {:?}",
+                    other,
+                ),
+            }
         }
         "getarrayitem_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
@@ -953,11 +995,24 @@ fn dispatch_op(
                 .vable_getarrayitem_float_with_base(dst, vable_reg, array_idx, index_reg);
         }
         "setarrayitem_vable_i" => {
+            // pyjitpl.py:1236-1247 — see setfield_vable_i ConstInt rationale.
             let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
-            let value_reg = expect_reg(&args[2], Kind::Int);
-            state
-                .builder
-                .vable_setarrayitem_int_with_base(vable_reg, array_idx, index_reg, value_reg);
+            match &args[2] {
+                Operand::Register(r) if r.kind == Kind::Int => {
+                    state
+                        .builder
+                        .vable_setarrayitem_int_with_base(vable_reg, array_idx, index_reg, r.index);
+                }
+                Operand::ConstInt(value) => {
+                    state.builder.vable_setarrayitem_int_const_value_with_base(
+                        vable_reg, array_idx, index_reg, *value,
+                    );
+                }
+                other => panic!(
+                    "setarrayitem_vable_i expects Register(Int) or ConstInt, got {:?}",
+                    other,
+                ),
+            }
         }
         "setarrayitem_vable_r" => {
             let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
@@ -979,11 +1034,26 @@ fn dispatch_op(
             }
         }
         "setarrayitem_vable_f" => {
+            // pyjitpl.py:1236-1247 — see setfield_vable_i ConstInt rationale.
             let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
-            let value_reg = expect_reg(&args[2], Kind::Float);
-            state
-                .builder
-                .vable_setarrayitem_float_with_base(vable_reg, array_idx, index_reg, value_reg);
+            match &args[2] {
+                Operand::Register(r) if r.kind == Kind::Float => {
+                    state.builder.vable_setarrayitem_float_with_base(
+                        vable_reg, array_idx, index_reg, r.index,
+                    );
+                }
+                Operand::ConstFloat(value) => {
+                    state
+                        .builder
+                        .vable_setarrayitem_float_const_value_with_base(
+                            vable_reg, array_idx, index_reg, *value,
+                        );
+                }
+                other => panic!(
+                    "setarrayitem_vable_f expects Register(Float) or ConstFloat, got {:?}",
+                    other,
+                ),
+            }
         }
         "arraylen_vable" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);

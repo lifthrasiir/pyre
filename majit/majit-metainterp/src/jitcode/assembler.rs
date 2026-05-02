@@ -425,6 +425,49 @@ impl JitCodeBuilder {
         self.push_u16(field_descr);
     }
 
+    /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` accepts any box for
+    /// `valuebox` (i/r/f variants share the same generic body). The
+    /// optimizer may fold a register source down to `ConstInt`; the
+    /// assembler must accept that as a constant-pool patch matching
+    /// the `_r` variant's pattern.
+    pub fn vable_setfield_int_const_value_with_base(
+        &mut self,
+        vable_reg: u16,
+        field_idx: u16,
+        value: i64,
+    ) {
+        let const_idx = self.add_const_i(value);
+        self.touch_ref_reg(vable_reg);
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("setfield_vable_i/rid");
+        self.push_reg_u8(vable_reg, "setfield_vable_i base");
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Int, const_idx));
+        self.push_u16(field_descr);
+    }
+
+    /// pyjitpl.py:1188-1199 — float counterpart to
+    /// `vable_setfield_int_const_value_with_base`.
+    pub fn vable_setfield_float_const_value_with_base(
+        &mut self,
+        vable_reg: u16,
+        field_idx: u16,
+        value: i64,
+    ) {
+        let const_idx = self.add_const_f(value);
+        self.touch_ref_reg(vable_reg);
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("setfield_vable_f/rfd");
+        self.push_reg_u8(vable_reg, "setfield_vable_f base");
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Float, const_idx));
+        self.push_u16(field_descr);
+    }
+
     pub fn vable_setfield_float_with_base(&mut self, vable_reg: u16, field_idx: u16, src: u16) {
         self.touch_ref_reg(vable_reg);
         self.touch_float_reg(src);
@@ -554,6 +597,58 @@ impl JitCodeBuilder {
         self.push_u8(0);
         self.const_patches_u8
             .push((src_offset, ConstKind::Ref, const_idx));
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+    }
+
+    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` accepts any
+    /// box for `valuebox`; the optimizer may fold the source down to
+    /// `ConstInt`.  See `vable_setfield_int_const_value_with_base`
+    /// for the parity rationale.
+    pub fn vable_setarrayitem_int_const_value_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+        value: i64,
+    ) {
+        let const_idx = self.add_const_i(value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(index_reg);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Int, true);
+        self.write_insn("setarrayitem_vable_i/riidd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_i base");
+        self.push_reg_u8(index_reg, "setarrayitem_vable_i index");
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Int, const_idx));
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+    }
+
+    /// pyjitpl.py:1236-1247 — float counterpart to
+    /// `vable_setarrayitem_int_const_value_with_base`.
+    pub fn vable_setarrayitem_float_const_value_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+        value: i64,
+    ) {
+        let const_idx = self.add_const_f(value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(index_reg);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Float, false);
+        self.write_insn("setarrayitem_vable_f/rifdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_f base");
+        self.push_reg_u8(index_reg, "setarrayitem_vable_f index");
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Float, const_idx));
         self.push_u16(field_descr);
         self.push_u16(array_descr);
     }
