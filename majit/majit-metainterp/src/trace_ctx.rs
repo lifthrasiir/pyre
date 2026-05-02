@@ -2528,12 +2528,6 @@ impl TraceCtx {
         (op, Value::Void)
     }
 
-    /// Record a virtualizable array item read (GETARRAYITEM_GC_I).
-    pub fn vable_getarrayitem_int(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
-        let zero = self.const_int(0); // descr placeholder
-        self.record_op(OpCode::GetarrayitemGcI, &[array_opref, index, zero])
-    }
-
     /// Standard virtualizable array item read (int).
     /// `array_field_offset` identifies which array field, `item_index` is the element index.
     /// If standard boxes are active, reads from the flat box array directly.
@@ -2856,12 +2850,6 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetarrayitemGcI, &[array_opref, index], descr)
     }
 
-    /// Record a virtualizable array item read (GETARRAYITEM_GC_R).
-    pub fn vable_getarrayitem_ref(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
-        let zero = self.const_int(0); // descr placeholder
-        self.record_op(OpCode::GetarrayitemGcR, &[array_opref, index, zero])
-    }
-
     /// Record a virtualizable array item read with an explicit array descriptor.
     pub fn vable_getarrayitem_ref_descr(
         &mut self,
@@ -2872,12 +2860,6 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetarrayitemGcR, &[array_opref, index], descr)
     }
 
-    /// Record a virtualizable array item read (GETARRAYITEM_GC_F).
-    pub fn vable_getarrayitem_float(&mut self, array_opref: OpRef, index: OpRef) -> OpRef {
-        let zero = self.const_int(0); // descr placeholder
-        self.record_op(OpCode::GetarrayitemGcF, &[array_opref, index, zero])
-    }
-
     /// Record a virtualizable array item read with an explicit array descriptor.
     pub fn vable_getarrayitem_float_descr(
         &mut self,
@@ -2886,12 +2868,6 @@ impl TraceCtx {
         descr: DescrRef,
     ) -> OpRef {
         self.record_op_with_descr(OpCode::GetarrayitemGcF, &[array_opref, index], descr)
-    }
-
-    /// Record a virtualizable array item write (SETARRAYITEM_GC).
-    pub fn vable_setarrayitem(&mut self, array_opref: OpRef, index: OpRef, value: OpRef) {
-        let zero = self.const_int(0); // descr placeholder
-        self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
     }
 
     /// Record a virtualizable array item write with an explicit array descriptor.
