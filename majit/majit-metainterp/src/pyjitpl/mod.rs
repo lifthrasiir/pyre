@@ -2871,11 +2871,12 @@ impl<M: Clone> MetaInterp<M> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
+        adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_int requires active tracing")
-            .vable_getarrayitem_int_indexed(vable_opref, index, index_runtime_value, fdescr)
+            .vable_getarrayitem_int_indexed(vable_opref, index, index_runtime_value, fdescr, adescr)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
@@ -2885,11 +2886,12 @@ impl<M: Clone> MetaInterp<M> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
+        adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_ref requires active tracing")
-            .vable_getarrayitem_ref_indexed(vable_opref, index, index_runtime_value, fdescr)
+            .vable_getarrayitem_ref_indexed(vable_opref, index, index_runtime_value, fdescr, adescr)
     }
 
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
@@ -2899,11 +2901,18 @@ impl<M: Clone> MetaInterp<M> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
+        adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.tracing
             .as_mut()
             .expect("opimpl_getarrayitem_vable_float requires active tracing")
-            .vable_getarrayitem_float_indexed(vable_opref, index, index_runtime_value, fdescr)
+            .vable_getarrayitem_float_indexed(
+                vable_opref,
+                index,
+                index_runtime_value,
+                fdescr,
+                adescr,
+            )
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable` — int variant.
@@ -2915,6 +2924,7 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
         fdescr: DescrRef,
+        adescr: DescrRef,
     ) {
         self.tracing
             .as_mut()
@@ -2924,6 +2934,7 @@ impl<M: Clone> MetaInterp<M> {
                 index,
                 index_runtime_value,
                 fdescr,
+                adescr,
                 value,
                 concrete,
             );
@@ -2938,6 +2949,7 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
         fdescr: DescrRef,
+        adescr: DescrRef,
     ) {
         self.tracing
             .as_mut()
@@ -2947,6 +2959,7 @@ impl<M: Clone> MetaInterp<M> {
                 index,
                 index_runtime_value,
                 fdescr,
+                adescr,
                 value,
                 concrete,
             );
@@ -2961,6 +2974,7 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
         fdescr: DescrRef,
+        adescr: DescrRef,
     ) {
         self.tracing
             .as_mut()
@@ -2970,17 +2984,23 @@ impl<M: Clone> MetaInterp<M> {
                 index,
                 index_runtime_value,
                 fdescr,
+                adescr,
                 value,
                 concrete,
             );
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
-    pub fn opimpl_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
+    pub fn opimpl_arraylen_vable(
+        &mut self,
+        vable_opref: OpRef,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+    ) -> OpRef {
         self.tracing
             .as_mut()
             .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(vable_opref, fdescr)
+            .vable_arraylen_vable(vable_opref, fdescr, adescr)
     }
 
     /// pyjitpl.py:1064-1073 `opimpl_hint_force_virtualizable(box)`.
@@ -17366,6 +17386,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
         start_tracing_with_virtualizable(
             &mut meta,
             info,
@@ -17377,7 +17398,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let (result, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
+        let (result, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24, adesc);
         assert_eq!(result, OpRef(2));
 
         let ctx = meta.trace_ctx().unwrap();
@@ -17389,6 +17410,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
         start_tracing_with_virtualizable(
             &mut meta,
             info,
@@ -17396,7 +17418,7 @@ mod tests {
             vec![2],
         );
 
-        let len_ref = meta.opimpl_arraylen_vable(OpRef(0), fd24);
+        let len_ref = meta.opimpl_arraylen_vable(OpRef(0), fd24, adesc);
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
         assert_eq!(ctx.num_ops(), 0);
@@ -17454,7 +17476,8 @@ mod tests {
         };
         let fd24 =
             majit_ir::descr::make_field_descr(24, 8, Type::Int, majit_ir::descr::ArrayFlag::Signed);
-        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 1, fd24);
+        let adesc = majit_ir::make_array_descr(0, 8, Type::Int);
+        let _result = meta.opimpl_getarrayitem_vable_int(nonstandard_vable, index, 1, fd24, adesc);
 
         // pyjitpl.py:1219-1230 _opimpl_getarrayitem_vable falls back to
         // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when
@@ -17778,6 +17801,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
         // live_values[0] is the vable identity — must be Ref-typed per
         // virtualstate.py:417 NotVirtualStateInfoPtr contract. A bare
         // Value::Int here makes `enum_forced_boxes_for_entry` reject the
@@ -17797,7 +17821,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let (item, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
+        let (item, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24, adesc);
         if let Some(ctx) = meta.trace_ctx() {
             let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
             ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)], 0, 0);

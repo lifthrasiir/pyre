@@ -372,6 +372,24 @@ impl JitCodeBuilder {
         self.push_u16(field_descr);
     }
 
+    pub fn vable_setfield_ref_const_value_with_base(
+        &mut self,
+        vable_reg: u16,
+        field_idx: u16,
+        value: i64,
+    ) {
+        let const_idx = self.add_const_r(value);
+        self.touch_ref_reg(vable_reg);
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("setfield_vable_r/rrd");
+        self.push_reg_u8(vable_reg, "setfield_vable_r base");
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Ref, const_idx));
+        self.push_u16(field_descr);
+    }
+
     pub fn vable_setfield_float_with_base(&mut self, vable_reg: u16, field_idx: u16, src: u16) {
         self.touch_ref_reg(vable_reg);
         self.touch_float_reg(src);

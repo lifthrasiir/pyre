@@ -760,20 +760,21 @@ where
         Some((vable_opref, descr))
     }
 
-    /// pyjitpl.py: vable array-field descriptor lookup.  Converts a
-    /// bytecode `array_idx` to the cached `DescrRef` from
-    /// `VirtualizableInfo` and pairs it with the box operand resolved
-    /// by [`resolve_vable_box`].
-    fn vable_array_field_descr(
+    /// pyjitpl.py: vable array descriptor lookup.  Converts a bytecode
+    /// array index to the cached `(arrayfielddescr, arraydescr)` pair
+    /// from `VirtualizableInfo` and pairs it with the box operand
+    /// resolved by [`resolve_vable_box`].
+    fn vable_array_descrs(
         &mut self,
         ctx: &TraceCtx,
         vable_reg: usize,
         array_idx: usize,
-    ) -> Option<(OpRef, majit_ir::DescrRef)> {
+    ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
         let info = ctx.virtualizable_info()?;
-        let descr = info.array_field_descrs().get(array_idx)?.clone();
-        Some((vable_opref, descr))
+        let fdescr = info.array_field_descrs().get(array_idx)?.clone();
+        let adescr = info.array_descrs.get(array_idx)?.clone();
+        Some((vable_opref, fdescr, adescr))
     }
 
     /// Construct a `JitCodeMachine` over an existing framestack borrow.
@@ -1148,47 +1149,62 @@ where
             jitcode::BC_GETARRAYITEM_VABLE_I => {
                 let (vable_reg, array_idx, index_reg, dest) =
                     self.frames.current_mut().read_vable_getarrayitem();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (opref, value) =
-                    ctx.vable_getarrayitem_int_indexed(vable_opref, index, index_value, fdescr);
+                let (opref, value) = ctx.vable_getarrayitem_int_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    adescr,
+                );
                 self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_R => {
                 let (vable_reg, array_idx, index_reg, dest) =
                     self.frames.current_mut().read_vable_getarrayitem();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (opref, value) =
-                    ctx.vable_getarrayitem_ref_indexed(vable_opref, index, index_value, fdescr);
+                let (opref, value) = ctx.vable_getarrayitem_ref_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    adescr,
+                );
                 self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let (vable_reg, array_idx, index_reg, dest) =
                     self.frames.current_mut().read_vable_getarrayitem();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
-                let (opref, value) =
-                    ctx.vable_getarrayitem_float_indexed(vable_opref, index, index_value, fdescr);
+                let (opref, value) = ctx.vable_getarrayitem_float_indexed(
+                    vable_opref,
+                    index,
+                    index_value,
+                    fdescr,
+                    adescr,
+                );
                 self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::BC_SETARRAYITEM_VABLE_I => {
                 let (vable_reg, array_idx, index_reg, src) =
                     self.frames.current_mut().read_vable_setarrayitem();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1199,6 +1215,7 @@ where
                     index,
                     index_value,
                     fdescr,
+                    adescr,
                     value,
                     Value::Int(concrete),
                 );
@@ -1206,8 +1223,8 @@ where
             jitcode::BC_SETARRAYITEM_VABLE_R => {
                 let (vable_reg, array_idx, index_reg, src) =
                     self.frames.current_mut().read_vable_setarrayitem();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1218,6 +1235,7 @@ where
                     index,
                     index_value,
                     fdescr,
+                    adescr,
                     value,
                     Value::Ref(majit_ir::GcRef(concrete as usize)),
                 );
@@ -1225,8 +1243,8 @@ where
             jitcode::BC_SETARRAYITEM_VABLE_F => {
                 let (vable_reg, array_idx, index_reg, src) =
                     self.frames.current_mut().read_vable_setarrayitem();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1237,18 +1255,19 @@ where
                     index,
                     index_value,
                     fdescr,
+                    adescr,
                     value,
                     Value::Float(f64::from_bits(concrete as u64)),
                 );
             }
             jitcode::BC_ARRAYLEN_VABLE => {
                 let (vable_reg, array_idx, dest) = self.frames.current_mut().read_vable_arraylen();
-                let Some((vable_opref, fdescr)) =
-                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
+                let Some((vable_opref, fdescr, adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_arraylen_vable(vable_opref, fdescr);
+                let result = ctx.vable_arraylen_vable(vable_opref, fdescr, adescr);
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {

@@ -881,10 +881,29 @@ fn dispatch_op(
                 .vable_setfield_int_with_base(vable_reg, field_idx, value_reg);
         }
         "setfield_vable_r" => {
-            let (vable_reg, value_reg, field_idx) = expect_vable_field_write_args(args, Kind::Ref);
-            state
-                .builder
-                .vable_setfield_ref_with_base(vable_reg, field_idx, value_reg);
+            assert_eq!(
+                args.len(),
+                3,
+                "setfield_vable_r expects [vable, value, fielddescr]"
+            );
+            let vable_reg = expect_reg(&args[0], Kind::Ref);
+            let field_idx = expect_descr_vable_static_field(&args[2]);
+            match &args[1] {
+                Operand::Register(r) if r.kind == Kind::Ref => {
+                    state
+                        .builder
+                        .vable_setfield_ref_with_base(vable_reg, field_idx, r.index);
+                }
+                Operand::ConstRef(value) => {
+                    state
+                        .builder
+                        .vable_setfield_ref_const_value_with_base(vable_reg, field_idx, *value);
+                }
+                other => panic!(
+                    "setfield_vable_r expects Register(Ref) or ConstRef, got {:?}",
+                    other,
+                ),
+            }
         }
         "setfield_vable_f" => {
             let (vable_reg, value_reg, field_idx) =
@@ -2088,6 +2107,40 @@ mod tests {
         assert_eq!(jitcode.code[0], copy_opcode);
         assert_eq!(u16::from_le_bytes([jitcode.code[1], jitcode.code[2]]), 1);
         assert_eq!(u16::from_le_bytes([jitcode.code[3], jitcode.code[4]]), 0);
+    }
+
+    #[test]
+    fn assemble_setfield_vable_r_accepts_const_ref_source() {
+        let mut ssarepr = SSARepr::new("vable_setfield_const_ref");
+        ssarepr.insns.push(Insn::op(
+            "setfield_vable_r",
+            vec![
+                Operand::Register(r(Kind::Ref, 0)),
+                Operand::ConstRef(0),
+                Operand::descr_vable_static_field(3),
+            ],
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("setfield_vable_r/rrd")
+            .expect("setfield_vable_r must be registered in wellknown insns");
+        assert_eq!(jitcode.code, vec![opcode, 0, 1, 0, 0]);
+        assert_eq!(jitcode.constants_r, vec![0]);
+        assert!(matches!(
+            &jitcode.exec.descrs[0],
+            majit_metainterp::jitcode::RuntimeBhDescr::Descr(
+                majit_metainterp::blackhole::BhDescr::VableField { index: 3 }
+            )
+        ));
     }
 
     #[test]
