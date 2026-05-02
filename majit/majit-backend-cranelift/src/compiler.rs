@@ -1352,10 +1352,11 @@ fn rebuild_state_after_failure(
 
             // Step 2: rebuild ALL frames' slots, concatenated in
             // callee-first order. ExitRecoveryLayout stores frames
-            // outermost-first (caller, callee), but the blackhole
-            // consumer parse_fail_arg_sections at call_jit.rs:1075
-            // expects [[callee], [caller]] and iterates .rev() to
-            // build the chain innermost-first.
+            // outermost-first (caller, callee) per the
+            // `opencoder.py:217` `framestack.reverse()` parity, while
+            // the deadframe layout that downstream consumers
+            // (`restore_guard_failure_values`) read expects innermost-
+            // first concatenation, so reverse on read.
             let mut rebuilt = Vec::new();
             for frame_layout in recovery.frames.iter().rev() {
                 for slot in &frame_layout.slots {
@@ -12504,12 +12505,13 @@ fn collect_guards(
                 frame.slot_types = Some(new_slot_types);
                 // resume.py:250 jitcode_index parity: overwrite the
                 // identity layout's default 0 with the innermost frame's
-                // jitcode_index from rd_numb. rd_numb encodes frames in
-                // [callee(top), caller(parent)] order (see compile.rs:281-284),
-                // so `frames[0]` is the innermost — the same frame the
-                // identity layout represents.
-                if let Some(topmost) = frames.first() {
-                    frame.jitcode_index = topmost.jitcode_index;
+                // jitcode_index from rd_numb. After `opencoder.py:217`
+                // `framestack.reverse()` parity rd_numb encodes frames
+                // outermost-first (caller before callee), so the
+                // innermost frame — the one the identity layout
+                // represents — is `frames.last()`.
+                if let Some(innermost) = frames.last() {
+                    frame.jitcode_index = innermost.jitcode_index;
                 }
             }
 

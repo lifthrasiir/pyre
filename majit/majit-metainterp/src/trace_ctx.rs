@@ -3166,6 +3166,68 @@ impl TraceCtx {
         self.call_typed(OpCode::CallPureF, func_ptr, args, arg_types, Type::Float)
     }
 
+    /// Shared body for typed-helper Plain / MayForce / Pure / LoopInvariant
+    /// / ReleaseGil call families.  Records `[func_ref] + args`, matching
+    /// `pyjitpl.py:1995-2002 _build_allboxes(funcbox, argboxes, descr)`'s
+    /// `[funcbox] + reordered_argboxes` shape (here `args` already excludes
+    /// the funcbox — `func_ptr` is passed separately and prepended once).
+    ///
+    /// PRE-EXISTING-ADAPTATION (CALL_RELEASE_GIL_*):
+    /// `pyjitpl.py:3671-3681 direct_call_release_gil` records a *different*
+    /// shape for release-gil callees:
+    ///
+    /// ```text
+    ///     realfuncaddr, saveerr = effectinfo.call_release_gil_target
+    ///     funcbox = ConstInt(adr2int(realfuncaddr))
+    ///     savebox = ConstInt(saveerr)
+    ///     opnum   = rop.call_release_gil_for_descr(calldescr)
+    ///     return self.history.record_nospec(
+    ///         opnum, [savebox, funcbox] + argboxes[1:], ..., calldescr)
+    /// ```
+    ///
+    /// i.e. `[savebox, funcbox_real] + argboxes[1:]` with `funcbox_real`
+    /// resolved from `effectinfo.call_release_gil_target` (the *real* C
+    /// function address, distinct from the wrapper at `argboxes[0]`).
+    /// Pyre's typed-helper API exposes neither field:
+    /// 1. The `#[jit_interp]` macro `release_gil_*` policy
+    ///    (`majit-macros/src/jit_interp/mod.rs:219-243`) takes only the
+    ///    bare callee — no `saveerr` attribute, no wrapper indirection.
+    ///    `func_ptr` here *is* the real C address, so the upstream
+    ///    `(realfuncaddr, saveerr)` distinction is intrinsically absent
+    ///    at this layer.
+    /// 2. `make_call_may_force_descr` does not populate the descr's
+    ///    `effect_info.call_release_gil_target` — there is no
+    ///    `(realfuncaddr, saveerr)` pair to thread.
+    ///
+    /// Consequence: this function records `[func_ptr] + args` for the
+    /// release-gil family too, conflating the upstream wrapper-vs-real
+    /// distinction.  Today this is observationally equivalent because
+    /// pyre's release-gil callees are direct C calls (no Python-side
+    /// wrapper), `saveerr == 0` is implied (no errno save/restore around
+    /// the call), and the `pyre-jit` codewriter never emits
+    /// `emit_residual_call(_, CallFlavor::ReleaseGil, _)` at all
+    /// (`flatten.rs:486` docstring).  The single production ReleaseGil
+    /// producer is the macro layer
+    /// (`majit-macros/src/jit_interp/jitcode_lower.rs:950+ / 2291+`)
+    /// emitting `BC_CALL_RELEASE_GIL_*` walked at runtime by
+    /// `majit-metainterp/src/pyjitpl/dispatch.rs:1640/1898/2124` →
+    /// `ctx.call_release_gil_*_typed` → here.
+    ///
+    /// Convergence (deferred — multi-session epic):
+    /// - Add `saveerr` attribute to the `#[jit_interp]` `release_gil_*`
+    ///   policy declarations in `majit-macros/src/jit_interp/mod.rs`.
+    /// - Plumb `(real_addr, saveerr)` into `make_call_*_descr` so the
+    ///   descr's `EffectInfo::call_release_gil_target` is populated.
+    /// - Branch in `call_release_gil_*_typed` to emit
+    ///   `[savebox, funcbox_real] + args[1:]` instead of routing through
+    ///   this shared `call_family_typed`.
+    /// - Update `dispatch.rs` BH walker to mirror the upstream
+    ///   `direct_call_release_gil` argbox reshape on replay.
+    ///
+    /// Until then: a future caller that introduces a release-gil callee
+    /// requiring `saveerr` semantics (errno save / save-and-restore
+    /// across the GIL release) will silently lose that semantic at this
+    /// site.  The convergence work above is mandatory before that lands.
     fn call_family_typed(
         &mut self,
         opcode: OpCode,
@@ -3366,6 +3428,22 @@ impl TraceCtx {
 
     /// pyjitpl.py:2081-2104: loop-invariant call with heapcache caching.
     /// Pure-like: does NOT invalidate caches. Result cached by (descr, arg0).
+    ///
+    /// Cache key parity: `heapcache.py:629-634
+    /// call_loopinvariant_known_result` matches by descr identity AND
+    /// `allboxes[0].getint()`.  In `pyjitpl.py:2002 _build_allboxes(funcbox,
+    /// argboxes, descr)` the slot 0 of `allboxes` is the funcbox, so
+    /// `allboxes[0].getint() == funcbox.getint()` — the function
+    /// pointer's raw integer address.  In our typed-helper world
+    /// `func_ptr` *is* the funcbox's int counterpart (no Python wrapper
+    /// indirection), so `arg0_int = func_ptr as i64` is the upstream
+    /// equivalent.  `descr_index = func_ref.0` substitutes for descr
+    /// identity: `ConstantPool::get_or_insert` interns by value so
+    /// `func_ref.0` is stable per-callee within the trace, matching the
+    /// "same callee → same descr identity" precondition that holds at
+    /// every typed-helper call site (each `BC_CALL_LOOPINVARIANT_*` site
+    /// emits one `func_ptr` constant + one `make_call_descr_for_opcode`
+    /// fresh descr per call signature).
     fn call_loopinvariant_impl(
         &mut self,
         func_ptr: *const (),
@@ -3375,7 +3453,7 @@ impl TraceCtx {
     ) -> OpRef {
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
         let descr_index = func_ref.0;
-        let arg0_int = args.first().map(|a| a.0 as i64).unwrap_or(0);
+        let arg0_int = func_ptr as usize as i64;
         // heapcache: check loop-invariant cache
         if let Some((cached, _resvalue)) = self
             .heap_cache

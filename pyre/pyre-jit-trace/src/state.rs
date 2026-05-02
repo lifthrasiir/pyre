@@ -1697,12 +1697,19 @@ pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
 /// Environment context — currently unused.
 pub struct PyreEnv;
 
-/// Descriptor for raw `PyObjectRef` item pointers — i.e. the Rust
-/// `PyObjectArray.ptr` field (`pyre-object/src/object_array.rs:28`) and
-/// `W_ListObject.items.ptr` / tuple backing storage / dict raw values.
-/// These pointers already address `items[0]`, so
-/// `GETARRAYITEM_GC_R(ptr, i)` must land on `ptr + i * item_size`
-/// without an extra length-prefix skip.
+/// Descriptor for raw `PyObjectRef` item pointers that already address
+/// `items[0]` (no length prefix to skip). Used after an explicit
+/// `IntAdd(block, ITEMS_BLOCK_ITEMS_OFFSET)` converts a
+/// `*mut ItemsBlock` block-base pointer into the items-base pointer —
+/// see `load_namespace_value` in `trace_opcode.rs` for the canonical
+/// pattern. `GETARRAYITEM_GC_R(ptr, i)` lands on `ptr + i * item_size`.
+///
+/// For callers that hold the block-base pointer directly (i.e.
+/// `*mut ItemsBlock` for `W_ListObject.items` / tuple backing storage,
+/// or `*mut FixedObjectArray` for `PyFrame.locals_cells_stack_w`), use
+/// [`pyobject_gcarray_descr`] instead — its
+/// `base_size = FIXED_ARRAY_ITEMS_OFFSET` makes the descriptor itself
+/// skip the length prefix.
 pub(crate) fn pyobject_array_descr() -> DescrRef {
     make_array_descr(0, 8, Type::Ref, false)
 }
@@ -2136,11 +2143,18 @@ pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -
     )
 }
 
-/// Read from frame's locals_cells_stack_w array.
-/// Uses GcR (Ref-typed) to match RPython's GETARRAYITEM_GC_R,
-/// ensuring the optimizer knows these are boxed pointers.
+/// Read from frame's `locals_cells_stack_w` array. Caller passes the
+/// `*mut FixedObjectArray` block-base pointer (output of
+/// `frame_locals_cells_stack_array`); the
+/// [`pyobject_gcarray_descr`] sets
+/// `base_size = FIXED_ARRAY_ITEMS_OFFSET` so the descriptor skips the
+/// length prefix and `GETARRAYITEM_GC_R(array, i)` lands on
+/// `items[i]`.
+///
+/// Uses GcR (Ref-typed) to match RPython's GETARRAYITEM_GC_R, ensuring
+/// the optimizer knows these are boxed pointers.
 pub(crate) fn trace_array_getitem_value(ctx: &mut TraceCtx, array: OpRef, index: OpRef) -> OpRef {
-    let descr = pyobject_array_descr();
+    let descr = pyobject_gcarray_descr();
     let descr_idx = descr.index();
     if let Some(cached) = ctx.heap_cache().getarrayitem_cache(array, index, descr_idx) {
         return cached;

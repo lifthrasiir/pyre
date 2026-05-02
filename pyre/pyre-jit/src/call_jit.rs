@@ -719,9 +719,12 @@ pub fn resume_in_blackhole(
     };
 
     // resume.py:1333-1343 blackhole_from_resumedata:
-    // Build chain bottom-up. Process in reverse so the LAST acquired
-    // interp is the innermost (callee), with nextblackholeinterp
-    // pointing to the caller.
+    // RPython iterates the resume reader in stream order. After
+    // `opencoder.py:217` `framestack.reverse()` parity the rd_numb
+    // stream is outermost-first, so feeding `frames` forward produces
+    // exactly the upstream chain — each new bh's `nextblackholeinterp`
+    // points to the previously-built (more outer) caller, and the
+    // final `prev_bh` is the innermost frame the runner executes.
     let mut prev_bh: Option<majit_metainterp::blackhole::BlackholeInterpreter> = None;
 
     // pyjitpl.py:2264: metainterp_sd.liveness_info — one shared pool for
@@ -754,7 +757,7 @@ pub fn resume_in_blackhole(
         "ResumedFrame.frame_ptr must be identical across sections (chain virtualizable)"
     );
 
-    for (sec_idx, section) in frames.iter().enumerate().rev() {
+    for (sec_idx, section) in frames.iter().enumerate() {
         if section.code.is_null() {
             if nbody_debug {
                 eprintln!(

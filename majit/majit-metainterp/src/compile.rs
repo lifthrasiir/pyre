@@ -380,13 +380,14 @@ pub(crate) fn build_guard_metadata(
                             }
                         }
                     };
-                // rd_numb encodes [callee(top), caller(parent)] order.
-                // resume_layout expects [outer, ..., innermost] order.
+                // After `opencoder.py:217` `framestack.reverse()` parity,
+                // both rd_numb and `ResumeData.frames` agree on outermost-
+                // first ordering, so push frames in stream order.
                 //
                 // RPython resume.py keeps vable_array/vref_array/framestack
                 // as separate sections. Do not merge vable_array entries into
                 // the innermost frame slots here.
-                for frame in frames.iter().rev() {
+                for frame in frames.iter() {
                     builder.push_frame(frame.jitcode_index, frame.pc as u64);
                     let mut slot_idx = 0usize;
                     for val in &frame.values {
@@ -479,9 +480,7 @@ pub(crate) fn build_guard_metadata(
                         vref_values.iter().map(to_exit_source).collect::<Vec<_>>(),
                         frames
                             .iter()
-                            .enumerate()
-                            .rev()
-                            .map(|(_orig_idx, frame)| {
+                            .map(|frame| {
                                 let mut slots = Vec::new();
                                 slots.extend(frame.values.iter().map(to_exit_source));
                                 let slot_types = derive_slot_types(&slots, &exit_types);

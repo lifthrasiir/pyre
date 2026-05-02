@@ -1140,8 +1140,10 @@ impl MIFrame {
 
     /// RPython Box.type parity: build fail_arg_types matching compact
     /// active_boxes length. Each box carries its own immutable type.
-    /// header = [frame, last_instr, pycode, valuestackdepth, debugdata,
-    ///           lastblock, w_globals].
+    /// header layout matches `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`:
+    /// `[frame:Ref, last_instr:Int, pycode:Ref, valuestackdepth:Int,
+    ///   debugdata:Ref, lastblock:Ref, w_globals:Ref]` — line-by-line PyPy
+    /// parity with `interp_jit.py:25-31`.
     fn build_fail_arg_types_for_active_boxes(&self, active_boxes: &[OpRef]) -> Vec<Type> {
         let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         for &opref in active_boxes {
@@ -2702,13 +2704,17 @@ impl MIFrame {
     }
 
     /// pyjitpl.py:2586 capture_resumedata: build fail_args for CURRENT
-    /// top frame. Returns [frame, (ec)?, ni, code, vsd, debugdata, lastblock,
-    /// ns, active_boxes...]. Layout matches the inputarg stream produced by
-    /// `extract_live_values` — `NUM_EXTRA_REDS` controls whether the ec slot
-    /// (interp_jit.py:67 `reds = ['frame', 'ec']`) is present between frame
-    /// and the vable static fields. Dormant under NUM_EXTRA_REDS=0 (skips
-    /// ec push, preserves pre-ec 7-scalar layout).
-    /// virtualizable.py:86 read_boxes: all static fields in order.
+    /// top frame. Returns the scalar header plus active_boxes —
+    /// `[frame, (ec)?, last_instr, pycode, valuestackdepth, debugdata,
+    /// lastblock, w_globals, active_boxes...]` — matching
+    /// `interp_jit.py:25-31 PyFrame._virtualizable_` /
+    /// `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` line-by-line.
+    /// `NUM_EXTRA_REDS` controls whether the ec slot
+    /// (interp_jit.py:67 `reds = ['frame', 'ec']`) is present between
+    /// frame and the vable static fields. Dormant under
+    /// NUM_EXTRA_REDS=0 (skips ec push, preserves pre-ec 7-scalar
+    /// layout). virtualizable.py:86 read_boxes: all static fields in
+    /// order.
     pub(crate) fn current_fail_args(&mut self, ctx: &mut TraceCtx) -> Vec<OpRef> {
         self.flush_to_frame_for_guard(ctx);
         let active_boxes = self.get_list_of_active_boxes(ctx, false, false);
@@ -3043,6 +3049,17 @@ impl MIFrame {
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
+        // opencoder.py:217 `SnapshotIterator.__init__` calls
+        // `self.framestack.reverse()` so the numbering loop at
+        // `resume.py:249-253` iterates outermost-first.  Pyre's
+        // encoder builds `frames` innermost-first
+        // (`[top, immediate_caller, ..., outermost]`); reverse here
+        // so `Snapshot.frames[0]` is outermost-first, matching the
+        // documented contract on `recorder.rs:54` "Frames in the
+        // snapshot, outermost first" and `resume.rs:252`
+        // "Input tuples for this factory follow the same caller-first
+        // order".
+        frames.reverse();
         let vable_boxes = self.list_of_boxes_virtualizable(ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         // PHASE 1.4 candidate D probe: detect snapshot-time divergence
@@ -3218,7 +3235,7 @@ impl MIFrame {
     /// or trace-time SameAs emission for fresh vable OpRefs.
     fn list_of_boxes_virtualizable(
         &self,
-        ctx: &majit_metainterp::TraceCtx,
+        ctx: &mut majit_metainterp::TraceCtx,
     ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
         let sym = self.sym();
         // opencoder.py:718-726 _list_of_boxes_virtualizable parity:
@@ -3243,83 +3260,102 @@ impl MIFrame {
         // `FIELDTYPE`; pyre mirrors that by consulting
         // `VirtualizableInfo::static_fields[i].field_type`.
         //
-        // PRE-EXISTING-ADAPTATION (split-brain reader) — Task #117.
-        // Upstream `opencoder.py:718-726
-        // _list_of_boxes_virtualizable` reads from
-        // `metainterp.virtualizable_boxes` exclusively.  Pyre reads
-        // `sym.vable_field_oprefs()` because that store carries the
-        // pre-opcode override that `flush_to_frame_for_guard` writes
-        // for the snapshot reader's `last_instr` / `valuestackdepth`
-        // (see `mirror_vable_static_to_boxes` doc).  The shared
-        // `ctx.virtualizable_boxes` is the JUMP/JIT-time view:
-        // continuously mirrored by push/pop and setfield_vable, but
-        // never carries the orgpc-1 / pre-opcode vsd override, so its
-        // slot 2 lies post-push at guard time.  Both stores carry the
-        // same trace-start inputarg OpRefs for the four invariant
-        // scalars (`pycode`, `debugdata`, `lastblock`, `w_globals`)
-        // because their mutators are unreachable under CPython 3.14
-        // bytecode.
+        // opencoder.py:718-726 `_list_of_boxes_virtualizable(boxes)`
+        // parity: read from `ctx.virtualizable_boxes` (the canonical
+        // analog of RPython's `metainterp.virtualizable_boxes`) for
+        // the four invariant scalars (`pycode`, `debugdata`,
+        // `lastblock`, `w_globals`), and recompute the two
+        // per-opcode-advancing scalars (`last_instr`, `valuestackdepth`)
+        // from `self.orgpc` / `pre_opcode_registers_r` /
+        // `portal_bridge_vable_vsd(orgpc)` so the snapshot encodes
+        // the pre-opcode state at `resume_pc` (the PROBE-VABLE-DIV
+        // diagnostic on 2026-04-30 confirmed slot 0 / slot 2 are the
+        // only divergence sources between the shared shadow and
+        // `s.vable_*` — slots 1/3/4/5 always agree because their
+        // mutators are unreachable under CPython 3.14 bytecode).
         //
-        // Per-slot freshness today (layout per
-        // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`):
-        //   slot 0 (last_instr): `publish_last_instr_to_vable`
-        //     mirrors `pc - 1` into both stores at every opcode; a
-        //     switch would be safe for this slot in isolation.
-        //   slot 1 (pycode): JIT-scope invariant — set only by
-        //     `pyframe.rs::frame_reinit` outside any trace; both
-        //     stores carry the trace-start inputarg OpRef.
-        //   slot 2 (valuestackdepth): push/pop mirror the post-state
-        //     into both stores; only `s.vable_valuestackdepth`
-        //     carries the flush-time pre-opcode override.  A switch
-        //     needs a symmetric save/restore around the snapshot
-        //     build (the same pattern `record_branch_guard` uses for
-        //     `s.vable_*` would need to be pushed onto
-        //     `ctx.virtualizable_boxes`).
-        //   slot 3 (debugdata): mutated lazily by
-        //     `pyframe.rs::getorcreate_debug_data` on debug paths the
-        //     tracer never enters; both stores carry the trace-start
-        //     inputarg OpRef.
-        //   slot 4 (lastblock): mutated only by
-        //     `pyopcode.py:1268 SETUP_*/POP_BLOCK` which CPython 3.14
-        //     no longer emits (the legacy interpreter path
-        //     `pyre-interpreter/src/eval.rs:306-308` still mutates
-        //     the heap field but the tracer never enters those
-        //     handlers); both stores carry the trace-start inputarg
-        //     OpRef.
-        //   slot 5 (w_globals): JIT-scope invariant — set only by
-        //     `pyframe.rs::frame_reinit`; same trajectory as slot 1.
+        // The slot-0 inline override re-derives `resume_pc - 1`
+        // because `flush_to_frame_for_guard` swaps `self.orgpc` to
+        // `resume_pc` (capture_resumedata at line 2773), and writes
+        // `s.vable_last_instr = const_int(resume_pc - 1)` without
+        // mirroring to `ctx.virtualizable_boxes[0]`.  Reading
+        // `ctx.virtualizable_boxes[0]` directly would pick up the
+        // value `publish_last_instr_to_vable` wrote at the original
+        // (pre-swap) orgpc, which is one off when `resume_pc !=
+        // orgpc` (most branch guards).  The read-time recompute
+        // matches `flush_to_frame_for_guard` so the snapshot stays
+        // self-consistent.
         //
-        // Net: a unified reader on `ctx.virtualizable_boxes` is the
-        // RPython-orthodox direction but is empirically blocked.  An
-        // attempted switch on 2026-04-30 — read all six static slots
-        // from `ctx.virtualizable_boxes` and recompute slot 2 inline
-        // from `pre_opcode_registers_r` / `portal_bridge_vable_vsd`
-        // so no save/restore on the shared shadow was needed —
-        // regressed `fib_recursive` to a >5s timeout on both dynasm
-        // and cranelift backends and slowed `nested_loop` by 2-3x.
-        // The on-the-fly slot-2 override matches the value
-        // `flush_to_frame_for_guard` writes into `s.vable_
-        // valuestackdepth`, so the regression points at a deeper
-        // reader-side mismatch (likely bridge-import shadow seeding
-        // or parent-frame snapshot capture order) rather than at
-        // slot freshness alone.  Until that root cause is isolated,
-        // the snapshot reader stays on `sym.vable_field_oprefs()`
-        // and the convergence path is "diagnose + close the
-        // bridge/parent-frame mismatch first, then switch the
-        // reader" — multi-session.  No additional `_opimpl_setfield_
-        // vable` emission would be needed for slots 3/4 today
-        // because their mutators are unreachable; that requirement
-        // only resurfaces if pyre re-introduces SETUP_*/POP_BLOCK
-        // or debug-mode tracing.
-        let vable_static_types: Vec<majit_ir::Type> = ctx
-            .virtualizable_info()
-            .map(|info| info.static_fields.iter().map(|f| f.field_type).collect())
-            .unwrap_or_default();
-        for (idx, opref) in sym.vable_field_oprefs().iter().enumerate() {
-            let declared = vable_static_types.get(idx).copied();
-            boxes.push(Self::opref_to_snapshot_tagged_for_slot(
-                *opref, ctx, declared,
-            ));
+        // The slot-2 inline override re-derives the pre-opcode
+        // valuestackdepth via `portal_bridge_vable_vsd(resume_pc)
+        // .unwrap_or(pre_opcode_registers_r.len() / s.valuestackdepth)`
+        // — same source `flush_to_frame_for_guard` uses to set
+        // `s.vable_valuestackdepth`.
+        //
+        // Test-fixture fallback: `TraceCtx::for_test_types` callers
+        // construct a ctx without registering `VirtualizableInfo` and
+        // without seeding `ctx.virtualizable_boxes`.  In that mode
+        // the `_with_compiled_trace_jitcode` fixtures expect
+        // `sym.vable_field_oprefs()` to drive the snapshot — fall
+        // back when the shared shadow is unseeded.
+        let (vable_static_types, vsd_field_index, ni_field_index, num_static): (
+            Vec<majit_ir::Type>,
+            Option<usize>,
+            Option<usize>,
+            usize,
+        ) = match ctx.virtualizable_info() {
+            Some(info) => (
+                info.static_fields.iter().map(|f| f.field_type).collect(),
+                info.static_field_index_by_name("valuestackdepth"),
+                info.static_field_index_by_name("last_instr"),
+                info.num_static_extra_boxes,
+            ),
+            None => (Vec::new(), None, None, 0),
+        };
+        let pre_opcode_vsd: Option<i64> = if vsd_field_index.is_some() {
+            let resume_pc = self.orgpc;
+            Some(self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
+                let s = self.sym();
+                self.pre_opcode_registers_r
+                    .as_ref()
+                    .map(|pre_r| pre_r.len())
+                    .unwrap_or(s.valuestackdepth) as i64
+            }))
+        } else {
+            None
+        };
+        let pre_opcode_last_instr: Option<i64> = ni_field_index.map(|_| self.orgpc as i64 - 1);
+        if num_static > 0 && ctx.has_virtualizable_boxes() {
+            for idx in 0..num_static {
+                let declared = vable_static_types.get(idx).copied();
+                let opref = if Some(idx) == ni_field_index {
+                    let li = pre_opcode_last_instr
+                        .expect("pre_opcode_last_instr seeded when ni_field_index is Some");
+                    ctx.const_int(li)
+                } else if Some(idx) == vsd_field_index {
+                    let vsd =
+                        pre_opcode_vsd.expect("pre_opcode_vsd seeded when vsd_field_index is Some");
+                    ctx.const_int(vsd)
+                } else {
+                    ctx.virtualizable_box_at(idx).unwrap_or(OpRef::NONE)
+                };
+                boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+                    opref, ctx, declared,
+                ));
+            }
+        } else {
+            // Test fallback: ctx has no vinfo and no seeded shadow.
+            let fallback_types: Vec<majit_ir::Type> = if !vable_static_types.is_empty() {
+                vable_static_types.clone()
+            } else {
+                vec![majit_ir::Type::Ref; sym.vable_field_oprefs().len()]
+            };
+            for (idx, opref) in sym.vable_field_oprefs().iter().enumerate() {
+                let declared = fallback_types.get(idx).copied();
+                boxes.push(Self::opref_to_snapshot_tagged_for_slot(
+                    *opref, ctx, declared,
+                ));
+            }
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let _ = stack_only;

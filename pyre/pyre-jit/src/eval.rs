@@ -4545,12 +4545,16 @@ fn rebuild_typed_from_rd_numb(
     };
 
     // resume.py:1049-1056: rebuild_from_resumedata iterates all frames
-    // via newframe()+consume_boxes(). For guard-failure restore into JIT
-    // state (restore_guard_failure_values), only the outermost frame's
-    // values matter — inner frames are handled by build_resumed_frames →
-    // resume_in_blackhole. rd_numb frames are innermost-first; last = outermost.
+    // via newframe()+consume_boxes(). For guard-failure restore into the
+    // outer pyre interpreter state (restore_guard_failure_values), only
+    // the JIT-entry frame's values are needed — inner-frame state lives
+    // in the build_resumed_frames chain consumed by resume_in_blackhole.
+    // After `opencoder.py:217` `framestack.reverse()` parity (encoder at
+    // `trace_opcode.rs::build_framestack_snapshot`) `frames[0]` is the
+    // outermost (caller / JIT-driver) frame, so `frames.first()` is the
+    // restoration target for both single- and multi-frame guards.
     let mut typed = header;
-    if let Some(outermost) = frames.last() {
+    if let Some(outermost) = frames.first() {
         _prepare_next_section(
             outermost,
             &dead_frame_typed,
@@ -4570,7 +4574,9 @@ fn rebuild_typed_from_rd_numb(
 
     // resume.py:1383 parity: liveness PC = frame.pc from rd_numb
     // (the same PC used by get_list_of_active_boxes during encoding).
-    let rd_numb_pc = frames.last().map(|f| f.pc as usize);
+    // The outer pyre interpreter resumes at the JIT-entry frame's PC,
+    // which after `framestack.reverse()` parity is `frames[0]`.
+    let rd_numb_pc = frames.first().map(|f| f.pc as usize);
     (typed, rd_numb_pc, virtuals_cache)
 }
 
@@ -5004,9 +5010,13 @@ fn build_resumed_frames(
             vable_ni
         };
         // resume.py:1339 jitcodes[jitcode_pos]:
-        // Outermost frame (last): code from vable resume data.
+        // Outermost frame: code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).
-        let is_outermost = frames.len() == 1 || idx == frames.len() - 1;
+        // After `opencoder.py:217` `framestack.reverse()` parity (encoder at
+        // `trace_opcode.rs::build_framestack_snapshot`), `frames[0]` is the
+        // outermost (caller / JIT-driver) frame and the last entry is the
+        // innermost (deepest callee).
+        let is_outermost = idx == 0;
         let w_code = if is_outermost {
             // virtualizable.py:86-99: code from resume data, not heap.
             if !vable_pycode.is_null() {
@@ -5045,7 +5055,7 @@ fn build_resumed_frames(
         }
         // Per-frame VSD: outermost uses vable_vsd, inner frames derive
         // from their code's nlocals + snapshot stack depth.
-        let vsd = if frames.len() == 1 || idx == frames.len() - 1 {
+        let vsd = if is_outermost {
             // resume.py:1399 parity: outermost frame's vsd comes directly
             // from the virtualizable. RPython does not sentinel-check 0.
             vable_vsd
