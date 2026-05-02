@@ -1306,7 +1306,9 @@ unsafe fn read_all_virtualizable_boxes(
     obj_ptr: *const u8,
     array_lengths: &[usize],
 ) -> (Vec<i64>, Vec<Vec<i64>>) {
-    info.read_all_boxes(obj_ptr, array_lengths)
+    // SAFETY: forwarded from this function's caller via the doc-comment
+    // contract — `obj_ptr` valid + array lengths match storage.
+    unsafe { info.read_all_boxes(obj_ptr, array_lengths) }
 }
 
 /// Write all virtualizable state back to the heap.
@@ -1320,7 +1322,10 @@ unsafe fn write_all_virtualizable_boxes(
     static_boxes: &[i64],
     array_boxes: &[Vec<i64>],
 ) {
-    info.write_all_boxes(obj_ptr, static_boxes, array_boxes);
+    // SAFETY: per the function-level Safety contract, callers guarantee
+    // `obj_ptr` is valid and the arrays have sufficient space; that
+    // forwards directly to `write_all_boxes`'s same precondition.
+    unsafe { info.write_all_boxes(obj_ptr, static_boxes, array_boxes) };
 }
 
 /// Generate accessor functions for virtualizable field access from JIT code.

@@ -1483,6 +1483,14 @@ mod tests {
 
         assert_eq!(call.arg_types(), &[Type::Int]);
         assert_eq!(call.result_type(), Type::Int);
+        // descr.py:524-526 `get_result_type()` parity — the raw 'S' char
+        // must survive the BhCallDescr -> CallDescr conversion, so
+        // downstream consumers can distinguish singlefloat from a real
+        // int result.  pyre's `result_class()` returns the raw char
+        // (matches `descr.py:526 get_result_type()`); the normalized
+        // form per descr.py:527-532 (collapsing 'S' → 'i') is not yet
+        // exposed as a separate method but the underlying `result_type`
+        // is already `Type::Int`, which is the normalized view.
         assert_eq!(call.result_class(), 'S');
         assert_eq!(call.result_size(), 4);
         assert!(!call.is_result_signed());
@@ -2171,6 +2179,12 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
     // call.py:320 effectinfo_from_writeanalyze parity: the descr consumed
     // by pyjitpl/residual-call recording must expose the same EffectInfo
     // that the codewriter classified for this call site.
+    //
+    // descr.py:524-526 `get_result_type()` parity — preserve the raw
+    // `bh.result_type` char ('i'/'r'/'f'/'v'/'S'/'L') so downstream
+    // consumers (`bhimpl_call_*` dispatch, `is_result_signed`) can
+    // recover the original singlefloat/longlong classification that the
+    // normalized `Type` collapses.
     majit_ir::descr::make_call_descr_full_with_result_class(
         u32::MAX,
         arg_types,
