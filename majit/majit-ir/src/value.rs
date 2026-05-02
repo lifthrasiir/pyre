@@ -504,6 +504,42 @@ impl GreenKey {
     pub fn hash_u64(&self) -> u64 {
         self.get_uhash()
     }
+
+    /// rpython/jit/metainterp/pyjitpl.py:1399 element-wise
+    /// `gk[i].same_constant(greenboxes[i])` for the
+    /// `_opimpl_recursive_call` framestack walk.
+    ///
+    /// Distinct from [`PartialEq::eq`] which routes through
+    /// `equal_whatever` (warmstate JitCell key equality, possibly
+    /// with `Str`/`Unicode` content comparison).  `same_constant` is
+    /// strict per-`Const` subtype identity:
+    ///
+    /// * `ConstInt.same_constant` — `self.value == other.value`
+    ///   (history.py:207).
+    /// * `ConstFloat.same_constant` — raw bit comparison
+    ///   (`longlong.extract_bits`, history.py:285).
+    /// * `ConstPtr.same_constant` — pointer `==`, no content compare
+    ///   (history.py:331).  This means a `Str`/`Unicode` greenkey
+    ///   stored as a `Ref` GC pointer compares by identity, *not* by
+    ///   string content — matching RPython exactly.
+    pub fn same_constant(&self, other: &GreenKey) -> bool {
+        if self.values.len() != other.values.len() {
+            return false;
+        }
+        if self.types != other.types {
+            return false;
+        }
+        for i in 0..self.values.len() {
+            // For Int / Float (raw bits) / Ref (pointer) / Str+Unicode
+            // (pointer per ConstPtr.same_constant) / Void: degenerates
+            // to raw `i64` equality, which is exactly what the four
+            // RPython `same_constant` overrides compute.
+            if self.values[i] != other.values[i] {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]

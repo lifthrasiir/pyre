@@ -5,7 +5,7 @@
 /// the call stack of nested inline calls.
 use std::sync::Arc;
 
-use majit_ir::{OpRef, Type};
+use majit_ir::{GreenKey, OpRef, Type};
 
 use crate::constant_pool::ConstantPool;
 use crate::jitcode::{JitArgKind, JitCode, read_u8, read_u16};
@@ -78,7 +78,13 @@ pub struct MIFrame {
     pub return_f: Option<usize>,
     /// pyjitpl.py `MIFrame.greenkey` — set when this frame is a
     /// recursive portal call (pyjitpl.py:80).
-    pub greenkey: Option<u64>,
+    ///
+    /// RPython stores the actual list of green `Const` boxes here, not
+    /// a hash and not a parallel raw side table.  `GreenKey` is the
+    /// Rust representation of that same value list plus its per-entry
+    /// `_green_args_spec` types; derived `u64` keys are computed from
+    /// this value only when warmstate / compiled-loop maps need them.
+    pub greenkey: Option<GreenKey>,
     /// pyjitpl.py:91 `self._result_argcode = 'v'`.
     ///
     /// Single-byte argcode of the *previous* opimpl's result type
@@ -189,7 +195,7 @@ impl MIFrame {
     pub fn setup(
         jitcode: Arc<JitCode>,
         pc: usize,
-        greenkey: Option<u64>,
+        greenkey: Option<GreenKey>,
         ctx: Option<&mut crate::trace_ctx::TraceCtx>,
     ) -> Self {
         let mut frame = Self::new(jitcode, pc);
@@ -1432,10 +1438,11 @@ mod tests {
         let _ = recorder.record_input_arg(Type::Int);
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, 0, sd);
 
-        let frame = MIFrame::setup(jitcode, 7, Some(0xfeed), Some(&mut ctx));
+        let greenkey = GreenKey::single(0xfeed);
+        let frame = MIFrame::setup(jitcode, 7, Some(greenkey.clone()), Some(&mut ctx));
 
         assert_eq!(frame.pc, 7);
-        assert_eq!(frame.greenkey, Some(0xfeed));
+        assert_eq!(frame.greenkey, Some(greenkey));
         assert_eq!(frame._result_argcode, b'v');
         assert_eq!(frame.parent_snapshot, -1);
         assert_eq!(frame.unroll_iterations, 1);

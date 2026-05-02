@@ -31,7 +31,7 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, FailDescr, GcRef, GreenKey, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;
@@ -765,13 +765,12 @@ pub struct MetaInterp<M: Clone> {
     /// longest-traced inlined function for abort reporting; the reset
     /// to `None` at pyjitpl.py:2795 signals that the trace aborted.
     ///
-    /// pyre's existing `find_biggest_function` (trace_ctx.rs:625) uses
-    /// `TraceCtx::inline_trace_positions` — a narrower subset that only
-    /// tracks active inlined callees.  Keeping this field here mirrors
-    /// RPython's shape so a future port of `find_biggest_function` can
-    /// line-by-line read the start/end stack; callers that merely want
-    /// the active-frame list should keep using `inline_trace_positions`.
-    pub portal_trace_positions: Option<Vec<(usize, Option<u64>, crate::recorder::TracePosition)>>,
+    /// Pyre's trace-side `TraceCtx::inline_trace_positions` mirrors the
+    /// same enter/exit shape without `jd_sd` because it has a single
+    /// PyPyJitDriver. This field keeps the full RPython shape for the
+    /// majit metainterpreter path.
+    pub portal_trace_positions:
+        Option<Vec<(usize, Option<GreenKey>, crate::recorder::TracePosition)>>,
 
     /// pyjitpl.py:2401 `self.current_call_id = 0`.
     ///
@@ -3123,15 +3122,16 @@ impl<M: Clone> MetaInterp<M> {
     /// this specific green key. Returns false for different green keys,
     /// matching RPython's per-cell JC_TRACING flag.
     ///
-    /// `target_raw` is the structured `(code_ptr, pc)` greenkey;
-    /// comparison routes through `TraceCtx::is_tracing_key` which walks
-    /// `green_key_raw` + `inline_frames` element-wise (pyjitpl.py:1396-
-    /// 1401 parity).
+    /// `target` is the full `JitCell` hash u64 (warmstate.py:459
+    /// `JitCell.get_uhash(*greenargs)`), so callers must hash the
+    /// complete typed greenkey including `is_being_profiled` before
+    /// calling — the (pycode, pc) projection alone collapses
+    /// profiled / unprofiled cells.
     #[inline]
-    pub fn is_tracing_key(&self, target_raw: (usize, usize)) -> bool {
+    pub fn is_tracing_key(&self, target: u64) -> bool {
         self.tracing
             .as_ref()
-            .is_some_and(|ctx| ctx.is_tracing_key(target_raw))
+            .is_some_and(|ctx| ctx.is_tracing_key(target))
     }
 
     /// Finish the current active trace without optimizing or compiling it.
@@ -9077,30 +9077,66 @@ impl<M: Clone> MetaInterp<M> {
     /// 4. Otherwise → inline (`perform_call`).
     ///
     /// `recursive_depth` mirrors the RPython framestack walk at
-    /// pyjitpl.py:1389-1402 which skips frames with `greenkey is None`
-    /// (the root frame created by `initialize_state_from_start` /
-    /// `newframe(mainjitcode)` at pyjitpl.py:3270 — always greenkey-None).
-    /// Pyre's `has_inline_frame_for` therefore walks `inline_frames`
-    /// only, which counts the same population: already-inlined portal
-    /// frames.
-    pub fn should_inline(&mut self, callee_key: u64, callee_raw: (usize, usize)) -> InlineDecision {
-        // Extract inline-relevant info from ctx before calling impl
-        // (avoids borrow conflict between self.tracing and &mut self).
-        let ctx_info = self
-            .tracing
-            .as_ref()
-            .map(|ctx| (ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
-        self.should_inline_core(callee_key, ctx_info)
-    }
-
-    pub fn should_inline_with_ctx(
+    /// Pyre split-metainterp adapter: the caller has already performed
+    /// pyjitpl.py:1389-1402's framestack walk over its active frame stack.
+    ///
+    /// The earlier `should_inline` / `should_inline_with_ctx`
+    /// surfaces re-derived `inline_depth` from `TraceCtx`, but α.4b
+    /// removed the parallel `inline_frames` side table that those
+    /// readers depended on, leaving the cap stub-zero.  Until a
+    /// non-pyre consumer plumbs a real framestack accessor into
+    /// `MetaInterp`, this is the only inline-decision entry point.
+    pub fn should_inline_with_depth(
         &mut self,
         callee_key: u64,
-        callee_raw: (usize, usize),
-        ctx: &crate::trace_ctx::TraceCtx,
+        inline_depth: usize,
+        recursive_depth: usize,
     ) -> InlineDecision {
-        let ctx_info = Some((ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
-        self.should_inline_core(callee_key, ctx_info)
+        self.should_inline_core(callee_key, Some((inline_depth, recursive_depth)))
+    }
+
+    /// pyjitpl.py:1389-1402 `_opimpl_recursive_call` recursion count.
+    ///
+    /// RPython walks `self.metainterp.framestack`, skips non-portal
+    /// frames and frames whose `greenkey is None`, then compares every
+    /// green Const with `same_constant` (history.py:207/285/331 —
+    /// integer ==, float bit ==, pointer ==).  Pyre uses
+    /// [`GreenKey::same_constant`] which mirrors that exactly; do
+    /// **not** route through `PartialEq::eq`, which goes through
+    /// `equal_whatever` and may resolve `Str`/`Unicode` content
+    /// equality (warmstate JitCell key semantics, not Const identity).
+    pub fn recursive_depth_for_greenkey(&self, jdindex: usize, target: &GreenKey) -> usize {
+        // pyjitpl.py:1388-1402 reads `portal_code = targetjitdriver_sd
+        // .mainjitcode` and skips frames whose `f.jitcode is not
+        // portal_code`. The caller supplies the `jdindex` from
+        // `_opimpl_recursive_call`; using that slot's `mainjitcode`
+        // identity (`Arc::ptr_eq`) matches RPython's `is`-comparison
+        // exactly, instead of the broader `jitdriver_sd().is_some()`
+        // proxy that overcounts under transitional Some(0) jdindex
+        // impersonation.
+        let portal_code = self
+            .staticdata
+            .jitdrivers_sd
+            .get(jdindex)
+            .and_then(|jd| jd.mainjitcode.as_ref());
+        self.framestack
+            .frames
+            .iter()
+            .filter(|frame| {
+                let portal_match = match portal_code {
+                    Some(pc) => std::sync::Arc::ptr_eq(&frame.jitcode, pc),
+                    // Transitional fallback for tests/hosts that have not
+                    // populated `mainjitcode` yet. RPython warmspot always
+                    // does, so production parity is the Arc identity branch.
+                    None => frame.jitcode.jitdriver_sd() == Some(jdindex),
+                };
+                portal_match
+                    && frame
+                        .greenkey
+                        .as_ref()
+                        .is_some_and(|gk| gk.same_constant(target))
+            })
+            .count()
     }
 
     /// Core inline decision logic — RPython `_opimpl_recursive_call`
@@ -9191,45 +9227,6 @@ impl<M: Clone> MetaInterp<M> {
         InlineDecision::Inline
     }
 
-    /// Begin inlining a function call during tracing.
-    ///
-    /// Pushes an inline frame so tracing can continue through the callee body.
-    /// We intentionally avoid recording ENTER_PORTAL_FRAME markers for inline
-    /// calls: unlike a real portal transition, they do not carry runtime
-    /// semantics and only bloat the trace.
-    ///
-    /// Returns `true` if inlining started, `false` if not tracing or depth exceeded.
-    pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => return false,
-        };
-        if ctx.inline_depth() >= MAX_INLINE_DEPTH {
-            return false;
-        }
-
-        ctx.push_inline_frame(callee_raw, MAX_INLINE_DEPTH as u32);
-        true
-    }
-
-    /// Leave an inlined function call during tracing.
-    ///
-    /// Pops the inline frame. See `enter_inline_frame()` for why we do not
-    /// record LEAVE_PORTAL_FRAME for inline calls.
-    pub fn leave_inline_frame(&mut self) {
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.pop_inline_frame();
-        }
-    }
-
-    /// Get the current inlining depth.
-    pub fn inline_depth(&self) -> usize {
-        self.tracing
-            .as_ref()
-            .map(|ctx| ctx.inline_depth())
-            .unwrap_or(0)
-    }
-
     // ────────────────────────────────────────────────────────────────
     // Frame-management surface mirroring pyjitpl.py:2421-2477.
     //
@@ -9272,7 +9269,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
         argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        greenkey: Option<u64>,
+        greenkey: Option<GreenKey>,
     ) -> Result<(), ChangeFrame> {
         // pyjitpl.py:2423: f = self.newframe(jitcode, greenkey)
         let _ = self.newframe(jitcode, greenkey);
@@ -10068,16 +10065,29 @@ impl<M: Clone> MetaInterp<M> {
     pub fn newframe(
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        greenkey: Option<u64>,
+        greenkey: Option<GreenKey>,
     ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
         if let Some(jd_no) = jitcode.jitdriver_sd() {
             self.portal_call_depth += 1;
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
-            // pyjitpl.py:2440-2441: enter_portal_frame(jitdriver_sd.index, unique_id)
-            if let Some(unique_id) = greenkey {
-                self.enter_portal_frame(jd_no, unique_id);
+            // pyjitpl.py:2436-2441
+            //   unique_id = -1
+            //   if greenkey is not None:
+            //       unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)
+            //       self.enter_portal_frame(jd_no, unique_id)
+            //
+            // RPython routes `unique_id` through the per-driver
+            // `warmstate.get_unique_id` resolver — for PyPyJitDriver this
+            // returns the pycode rvmprof id (interp_jit.py:44), default
+            // returns 0 (warmstate.py make_unique_id_fn).  The previous
+            // pyre port used `greenkey.hash_u64()` (the JitCell
+            // bucketing hash), which is a distinct quantity and a
+            // structural divergence — fixed here.
+            if let Some(ref greenkey) = greenkey {
+                let unique_id = self.warm_state.get_unique_id(greenkey);
+                self.enter_portal_frame(jd_no, unique_id as u64);
             }
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
@@ -10085,25 +10095,15 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2443-2445: `if greenkey is not None and
         // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
         //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
-        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd()) {
+        if let (Some(gk), Some(jd_no)) = (greenkey.as_ref(), jitcode.jitdriver_sd()) {
             if self.is_main_jitcode(&jitcode) {
                 if let (Some(positions), Some(ctx)) =
                     (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
                 {
-                    positions.push((jd_no, Some(gk), ctx.get_trace_position()));
+                    positions.push((jd_no, Some(gk.clone()), ctx.get_trace_position()));
                 }
             }
         }
-        // Bump the existing TraceCtx inline-depth counter so trace
-        // recorder bookkeeping (already wired through pyre's tracer)
-        // stays in sync; the canonical frame storage is `framestack`.
-        // The `newframe` path predates the raw (code_ptr, pc) greenkey
-        // and operates on sub-jitcodes rather than portal frames, so
-        // project the u64 greenkey into the raw slot verbatim —
-        // pyjitpl.py:1396-1401 element-wise parity still holds because
-        // this caller doesn't feed the recursion-depth walk.
-        let raw = (greenkey.unwrap_or_default() as usize, 0);
-        let _ = self.enter_inline_frame(raw);
         // pyjitpl.py:2446-2451: reuse / allocate MIFrame, push onto framestack.
         let frame = crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut());
         self.framestack.push(frame);
@@ -10168,7 +10168,7 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2470-2472: `if frame.greenkey is not None and
             // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
             //     (jitcode.jitdriver_sd, None, self.history.get_trace_position()))`.
-            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd()) {
+            if let (true, Some(jd_no)) = (frame.greenkey.is_some(), frame.jitcode.jitdriver_sd()) {
                 if self.is_main_jitcode(&frame.jitcode) {
                     if let (Some(positions), Some(ctx)) =
                         (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
@@ -10183,9 +10183,6 @@ impl<M: Clone> MetaInterp<M> {
             // an RPython memory-reuse optimization; pyre relies on the
             // Rust drop to release register banks.
         }
-        // Mirror the TraceCtx inline-depth counter so trace recorder
-        // bookkeeping stays balanced with the framestack pop.
-        self.leave_inline_frame();
     }
 
     /// pyjitpl.py:2479-2503 `MetaInterp.finishframe(resultbox, leave_portal_frame=True)`.
@@ -10754,7 +10751,68 @@ impl<M: Clone> MetaInterp<M> {
             return;
         }
         let caller_idx = self.framestack.frames.len() - 2;
-        let _removed = self.framestack.frames.remove(caller_idx);
+        let removed = self.framestack.frames.remove(caller_idx);
+        // pyjitpl.py:1306-1307 `del framestack[-2]` bypasses
+        // `popframe` — the removed frame's portal bookkeeping
+        // (`portal_call_depth`, `call_ids`) is NOT undone.  Upstream
+        // accepts this leak because the typical TCO caller is a
+        // sub-jitcode helper (`jitdriver_sd is None`); a portal-
+        // driver caller would underflow `portal_call_depth` on the
+        // matching popframe later.  Make the assumption fail loud so
+        // we catch any unanticipated portal-driver caller here.
+        debug_assert!(
+            removed.jitcode.jitdriver_sd().is_none(),
+            "_try_tco removed portal-driver caller (jitdriver_sd={:?}) — \
+             pyjitpl.py:1306-1307 `del framestack[-2]` would leak \
+             portal_call_depth / call_ids.  Pair the removal with \
+             popframe's portal-bookkeeping decrement (Gap C `g.4.5.6.B` \
+             follow-up).",
+            removed.jitcode.jitdriver_sd(),
+        );
+        // pyjitpl.py:1301-1302 already guarantees `target_index ==
+        // bytecode[next_pc + 1]` (callee's `*_return` operand matches
+        // the caller's pending result slot).  PyPy reads the return
+        // slot dynamically each time `*_return` fires, so the slot
+        // index is naturally re-resolved against whichever frame
+        // currently sits at framestack[-2].  Pyre caches the slot on
+        // `MIFrame.return_i/r/f` (`frame.rs:75-77`) populated from the
+        // BC_INLINE_CALL payload, so after `framestack.remove` the
+        // cached index must still be a legal slot in the
+        // grandcaller's register file.  Verify here so the violation
+        // surfaces at the TCO site instead of as an OOB write later.
+        if target_index >= 0 {
+            let callee =
+                self.framestack.frames.last().expect(
+                    "_try_tco: callee frame must remain on framestack after caller removal",
+                );
+            let cached_slot = match argcode {
+                b'i' => callee.return_i,
+                b'r' => callee.return_r,
+                b'f' => callee.return_f,
+                _ => None,
+            };
+            if let Some(slot) = cached_slot {
+                let grandcaller = self.framestack.frames.get(self.framestack.frames.len() - 2);
+                if let Some(grand) = grandcaller {
+                    let bank_len = match argcode {
+                        b'i' => grand.int_regs.len(),
+                        b'r' => grand.ref_regs.len(),
+                        b'f' => grand.float_regs.len(),
+                        _ => usize::MAX,
+                    };
+                    debug_assert!(
+                        slot < bank_len,
+                        "_try_tco: cached return slot {slot} (kind={:?}) out of bounds \
+                         in grandcaller's register file (len={bank_len}). Pyre's
+                         `MIFrame.return_{{i,r,f}}` cache (frame.rs:75-77) was \
+                         populated against the now-removed caller's register layout; \
+                         a remap to the grandcaller's slot is required (Gap D \
+                         `g.4.5.6.C` follow-up).",
+                        argcode as char,
+                    );
+                }
+            }
+        }
         // pyjitpl.py:1308-1321: trace_length_at_last_tco bookkeeping.
         let tracelength = self
             .tracing
@@ -15179,6 +15237,66 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn recursive_depth_walks_miframe_greenkeys() {
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut portal = JitCodeBuilder::new().finish();
+        portal.replace_jitdriver_sd(Some(0));
+        let portal = std::sync::Arc::new(portal);
+        let target = GreenKey::new(vec![0xabc, 0]);
+
+        meta.perform_call(portal.clone(), &[], None).unwrap_err();
+        meta.perform_call(portal.clone(), &[], Some(target.clone()))
+            .unwrap_err();
+        meta.perform_call(portal, &[], Some(target.clone()))
+            .unwrap_err();
+        let non_portal = std::sync::Arc::new(JitCodeBuilder::new().finish());
+        meta.perform_call(non_portal, &[], Some(target.clone()))
+            .unwrap_err();
+
+        assert_eq!(meta.recursive_depth_for_greenkey(0, &target), 2);
+        assert_eq!(
+            meta.recursive_depth_for_greenkey(0, &GreenKey::new(vec![0xdef, 0])),
+            0
+        );
+    }
+
+    #[test]
+    fn recursive_depth_filters_by_target_portal_code_identity() {
+        use crate::jitcode::JitCodeBuilder;
+
+        let mut meta = MetaInterp::<()>::new(0);
+
+        let mut portal0 = JitCodeBuilder::new().finish();
+        portal0.replace_jitdriver_sd(Some(0));
+        let portal0 = std::sync::Arc::new(portal0);
+
+        let mut portal1 = JitCodeBuilder::new().finish();
+        portal1.replace_jitdriver_sd(Some(1));
+        let portal1 = std::sync::Arc::new(portal1);
+
+        let mut jd0 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd0.index = Some(0);
+        jd0.mainjitcode = Some(portal0.clone());
+        let mut jd1 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd1.index = Some(1);
+        jd1.mainjitcode = Some(portal1.clone());
+        std::sync::Arc::get_mut(&mut meta.staticdata)
+            .unwrap()
+            .jitdrivers_sd = vec![jd0, jd1];
+
+        let target = GreenKey::single(0xabc);
+        meta.perform_call(portal0, &[], Some(target.clone()))
+            .unwrap_err();
+        meta.perform_call(portal1, &[], Some(target.clone()))
+            .unwrap_err();
+
+        assert_eq!(meta.recursive_depth_for_greenkey(0, &target), 1);
+        assert_eq!(meta.recursive_depth_for_greenkey(1, &target), 1);
+    }
+
+    #[test]
     fn initialize_state_from_start_seeds_portal_call_depth_to_zero() {
         // pyjitpl.py:3268-3272 — set portal_call_depth = -1, push the
         // portal mainjitcode (which bumps it to 0), then assert == 0.
@@ -15309,7 +15427,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(5));
         let jc = std::sync::Arc::new(jc);
 
-        meta.newframe(jc, Some(0xfeed));
+        meta.newframe(jc, Some(GreenKey::single(0xfeed)));
         meta.popframe(true);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
@@ -15330,9 +15448,13 @@ mod metainterp_static_data_tests {
             ctx.constants_get_value(enter.args[0]),
             Some(majit_ir::Value::Int(5))
         );
+        // pyjitpl.py:2438 unique_id = warmstate.get_unique_id(greenkey).
+        // Default resolver (no `set_get_unique_id_fn`) returns 0 per
+        // RPython `get_unique_id_default`; PyPyJitDriver installs its
+        // own resolver that returns the pycode rvmprof id.
         assert_eq!(
             ctx.constants_get_value(enter.args[1]),
-            Some(majit_ir::Value::Int(0xfeed))
+            Some(majit_ir::Value::Int(0))
         );
         assert_eq!(
             ctx.constants_get_value(leave.args[0]),
@@ -15369,7 +15491,9 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(0xcafe)).unwrap_err();
+        let greenkey = GreenKey::single(0xcafe);
+        meta.perform_call(jc, &[], Some(greenkey.clone()))
+            .unwrap_err();
         assert_eq!(
             meta.portal_trace_positions
                 .as_ref()
@@ -15379,7 +15503,7 @@ mod metainterp_static_data_tests {
         );
         let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
         assert_eq!(entry.0, idx);
-        assert_eq!(entry.1, Some(0xcafe));
+        assert_eq!(entry.1, Some(greenkey));
 
         meta.popframe(true);
         let positions = meta
@@ -15419,7 +15543,8 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(0xbabe)).unwrap_err();
+        meta.perform_call(jc, &[], Some(GreenKey::single(0xbabe)))
+            .unwrap_err();
         assert!(
             meta.portal_trace_positions
                 .as_ref()

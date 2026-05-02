@@ -109,8 +109,9 @@ pub struct JitDriverStaticData {
     /// `BC_JIT_MERGE_POINT` payload (mirroring upstream `pyjitpl.py:
     /// 1536-1538` `orgpc` operand) and the JitCode PC ↔ Python PC map
     /// is the single source of truth. Until then this slot keeps the
-    /// existing trace-side `make_green_key(code, pc)` lookup keyed on
-    /// the same merge-point PC the runtime registered — see plan
+    /// existing trace-side PyPyJitDriver green tuple lookup
+    /// `(next_instr, is_being_profiled, pycode)` keyed on the same
+    /// merge-point PC the runtime registered — see plan
     /// "Risk Assessment" row 3.
     pub merge_point_pc: Option<usize>,
     /// RPython: `JitDriverStaticData.mainjitcode`

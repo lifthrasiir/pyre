@@ -859,11 +859,11 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// RPython JC_TRACING parity: true only when tracing this specific
-    /// key. `target_raw` is the structured `(code_ptr, pc)` greenkey
-    /// matching pyjitpl.py:1396-1401's element-wise comparison.
+    /// key.  `target` is the full `JitCell` hash u64 — see
+    /// `MetaInterp::is_tracing_key`.
     #[inline]
-    pub fn is_tracing_key(&self, target_raw: (usize, usize)) -> bool {
-        self.meta.is_tracing_key(target_raw)
+    pub fn is_tracing_key(&self, target: u64) -> bool {
+        self.meta.is_tracing_key(target)
     }
 
     /// Whether the driver is currently tracing a bridge.
@@ -2907,40 +2907,26 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Returns `Inline` if the callee should be traced through,
     /// `CallAssembler` if it already has compiled code, or
-    /// `ResidualCall` if it should be left as an opaque call.
-    pub fn should_inline(&mut self, callee_key: u64, callee_raw: (usize, usize)) -> InlineDecision {
-        self.meta.should_inline(callee_key, callee_raw)
-    }
-
-    /// Inline decision with externally-held ctx (merge_point callback).
-    pub fn should_inline_with_ctx(
+    /// Inline decision when an adapter metainterp has already performed
+    /// pyjitpl.py:1389-1402's framestack walk over its active frame stack.
+    ///
+    /// Pyre's split tracer is the only surface that consults the
+    /// `MAX_INLINE_DEPTH` cap; both `inline_depth` and `recursive_depth`
+    /// are derived by the caller from its concrete framestack and the
+    /// portal `mainjitcode` identity.  The legacy `should_inline` /
+    /// `should_inline_with_ctx` variants that re-derived
+    /// `inline_depth` from `TraceCtx` were stub-zero after the α.4b
+    /// drop of the parallel `inline_frames` side table and have been
+    /// removed; revive them by plumbing a real framestack accessor
+    /// into `MetaInterp` if a non-pyre consumer ever needs them.
+    pub fn should_inline_with_depth(
         &mut self,
         callee_key: u64,
-        callee_raw: (usize, usize),
-        ctx: &crate::trace_ctx::TraceCtx,
+        inline_depth: usize,
+        recursive_depth: usize,
     ) -> InlineDecision {
         self.meta
-            .should_inline_with_ctx(callee_key, callee_raw, ctx)
-    }
-
-    /// Begin inlining a function call during tracing.
-    ///
-    /// Records EnterPortalFrame and pushes an inline frame.
-    /// Returns `true` if inlining started successfully.
-    pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
-        self.meta.enter_inline_frame(callee_raw)
-    }
-
-    /// End an inlined function call during tracing.
-    ///
-    /// Records LeavePortalFrame and pops the inline frame.
-    pub fn leave_inline_frame(&mut self) {
-        self.meta.leave_inline_frame()
-    }
-
-    /// Get the current inlining depth.
-    pub fn inline_depth(&self) -> usize {
-        self.meta.inline_depth()
+            .should_inline_with_depth(callee_key, inline_depth, recursive_depth)
     }
 
     /// RPython equivalent: `opimpl_hint_force_virtualizable(box)`

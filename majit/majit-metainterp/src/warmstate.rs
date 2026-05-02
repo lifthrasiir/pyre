@@ -357,6 +357,14 @@ pub struct WarmEnterState {
     /// warmspot.py:110: memory_manager — generation-based loop aging.
     /// pyjitpl.py:2348: try_to_free_some_loops calls next_generation().
     pub memory_manager: majit_trace::memmgr::LoopAging,
+    /// warmstate.py make_unique_id_fn: per-`JitDriver` resolver for
+    /// `enter_portal_frame`'s `unique_id` operand (pyjitpl.py:2438-2441).
+    /// Default returns 0 — matches the RPython default when a driver
+    /// does not register `get_unique_id_default`.  PyPyJitDriver
+    /// (`pypy/module/pypyjit/interp_jit.py:44`) installs a resolver
+    /// that returns the pycode's rvmprof unique id; pyre wires that up
+    /// at the JitDriver registration site once available.
+    get_unique_id_fn: Option<fn(&GreenKey) -> i64>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -445,6 +453,7 @@ impl WarmEnterState {
                 m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
+            get_unique_id_fn: None,
         }
     }
 
@@ -482,6 +491,26 @@ impl WarmEnterState {
                 m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
+            get_unique_id_fn: None,
+        }
+    }
+
+    /// Install a per-driver `get_unique_id` resolver — pyjitpl.py:2438
+    /// `jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`.  Invoked
+    /// once at JitDriver registration; `None` (default) means RPython's
+    /// `get_unique_id_default` returning `0`.
+    pub fn set_get_unique_id_fn(&mut self, fn_: fn(&GreenKey) -> i64) {
+        self.get_unique_id_fn = Some(fn_);
+    }
+
+    /// pyjitpl.py:2436-2441 `unique_id = jitcode.jitdriver_sd.warmstate.
+    /// get_unique_id(greenkey)`.  Returns `0` when no resolver is
+    /// installed (RPython `get_unique_id_default`); PyPyJitDriver
+    /// installs a resolver that returns the pycode rvmprof id.
+    pub fn get_unique_id(&self, greenkey: &GreenKey) -> i64 {
+        match self.get_unique_id_fn {
+            Some(f) => f(greenkey),
+            None => 0,
         }
     }
 

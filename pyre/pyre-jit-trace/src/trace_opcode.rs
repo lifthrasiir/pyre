@@ -5,7 +5,7 @@
 
 use crate::state::*;
 
-use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
@@ -370,6 +370,41 @@ fn mirror_vable_static_to_boxes(
 }
 
 impl MIFrame {
+    /// pyjitpl.py:65 framestack frame discriminator: root frame borrows
+    /// its `PyreSym` from the caller (`owned_sym = None`); inline frames
+    /// own the `Box<PyreSym>` they were pushed with.
+    pub fn is_inline(&self) -> bool {
+        self.owned_sym.is_some()
+    }
+
+    /// Resolve the live concrete `PyFrame` address — prefer the owned
+    /// `Box<PyFrame>` when present (inline frames), fall back to the
+    /// cached `concrete_frame_addr` snapshot (root frame, no owned box).
+    pub fn live_concrete_frame_addr(&self) -> usize {
+        if let Some(ref cf) = self.owned_concrete_frame {
+            &**cf as *const pyre_interpreter::pyframe::PyFrame as usize
+        } else {
+            self.concrete_frame_addr
+        }
+    }
+
+    pub(crate) fn pypyjit_greenkey_for_pc(&self, pc: usize) -> Option<GreenKey> {
+        let frame_addr = self.live_concrete_frame_addr();
+        if frame_addr == 0 {
+            return None;
+        }
+        let frame = unsafe { &*(frame_addr as *const pyre_interpreter::pyframe::PyFrame) };
+        Some(crate::driver::pypyjit_greenkey(
+            frame.pycode,
+            pc,
+            frame.get_is_being_profiled(),
+        ))
+    }
+
+    pub(crate) fn green_key_hash_for_pc(&self, pc: usize) -> Option<u64> {
+        self.pypyjit_greenkey_for_pc(pc).map(|key| key.hash_u64())
+    }
+
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         let exec_ctx = self.sym().concrete_execution_context;
         if !exec_ctx.is_null() {
@@ -420,18 +455,20 @@ impl MIFrame {
     pub fn from_sym(
         ctx: &mut TraceCtx,
         sym: &mut PyreSym,
+        meta: *mut crate::metainterp::PyreMetaInterp,
         concrete_frame: usize,
         fallthrough_pc: usize,
         opcode_start_pc: usize,
     ) -> Self {
-        // sym was initialized when its owning MetaInterpFrame was pushed
-        // (trace.rs root push / metainterp.rs perform_call). MIFrame is a
-        // borrowed per-instruction view; no re-initialization here.
+        // sym was initialized when the owning framestack `MIFrame` was
+        // pushed (trace.rs root push / metainterp.rs perform_call); this
+        // is a transient snapshot/parent-flush view, no re-init.
         // RPython pyjitpl.py: orgpc = opcode start PC passed to each handler.
         let orgpc = opcode_start_pc;
         Self {
             ctx,
             sym,
+            meta,
             fallthrough_pc,
             concrete_frame_addr: concrete_frame,
             orgpc,
@@ -439,6 +476,14 @@ impl MIFrame {
             parent_frames: Vec::new(),
             pending_inline_frame: None,
             pending_result_stack_idx: None,
+            owned_sym: None,
+            jitcode: std::ptr::null(),
+            pc: opcode_start_pc,
+            greenkey: None,
+            owned_concrete_frame: None,
+            drop_frame_opref: None,
+            caller_result_stack_idx: None,
+            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         }
     }
 
@@ -3147,6 +3192,7 @@ impl MIFrame {
         let mut parent_frame = MIFrame::from_sym(
             ctx,
             parent_sym,
+            self.meta,
             parent.concrete_frame_addr,
             parent.resume_pc,
             parent.resume_pc,
@@ -4435,11 +4481,6 @@ impl MIFrame {
             }
             if is_function(concrete_callable) {
                 let w_callee_code = pyre_interpreter::getcode(concrete_callable);
-                let callee_key = crate::driver::make_green_key(w_callee_code, 0);
-                // pyjitpl.py:1396-1401 element-wise greenkey: pyre's
-                // tuple is `(code_ptr, pc)` so structural equality cannot
-                // be fooled by hash collisions the way the derived u64
-                // `callee_key` can (driver.rs:12 make_green_key).
                 let callee_raw: (usize, usize) = (w_callee_code as usize, 0);
                 let caller_raw: (usize, usize) = ((*self.sym().jitcode).code as usize, 0);
                 let callee_code =
@@ -4456,7 +4497,27 @@ impl MIFrame {
                 // trace through it directly instead of waiting for
                 // should_inline() to bless a helper-boundary inline.
                 let is_self_recursive = callee_raw == caller_raw;
-                let inline_decision = driver.should_inline(callee_key, callee_raw);
+                // pypy/module/pypyjit/interp_jit.py:67 PyPyJitDriver
+                // greens = ["next_instr", "is_being_profiled", "pycode"]
+                // with types [Int, Int, Ref]; line-by-line per Codex
+                // parity guidance, the recursion-depth surface MUST
+                // accept the typed greenboxes list, not a (code_ptr, pc)
+                // raw pair.  The raw pair below is retained as a Pyre
+                // adapter for compiled-loop / inline-frame side tables
+                // only.
+                //
+                // pypy/module/pypyjit/interp_jit.py:82-94 dispatch()
+                // reads `self.get_is_being_profiled()` on the callee
+                // frame. A newly-created callee frame becomes profiled
+                // during ExecutionContext.call_trace() when a profile
+                // function is active, so mirror that initial state here.
+                let callee_is_being_profiled = {
+                    let ec = self.active_execution_context();
+                    !ec.is_null() && !(*ec).profilefunc.is_null()
+                };
+                let callee_greenkey =
+                    crate::driver::pypyjit_greenkey(w_callee_code, 0, callee_is_being_profiled);
+                let callee_key = callee_greenkey.hash_u64();
                 let inline_framestack_active = !self.parent_frames.is_empty();
                 let callee_inline_eligible = driver
                     .meta_interp()
@@ -4464,30 +4525,56 @@ impl MIFrame {
                     .can_inline_callable(callee_key);
                 let max_unroll_recursion =
                     driver.meta_interp().warm_state_ref().max_unroll_recursion() as usize;
-                let recursive_depth = self.with_ctx(|_, ctx| ctx.recursive_depth(callee_raw));
+                // pyjitpl.py:1418-1420 newframe-driven inline depth: count
+                // frames on `MetaInterp.framestack` excluding the root.
+                // After the α.4 split this is the single source of truth
+                // for the MAX_INLINE_DEPTH cap on the pyre-tracer side;
+                // `TraceCtx::inline_frames` no longer reflects pyre pushes.
+                let inline_depth = if self.meta.is_null() {
+                    0
+                } else {
+                    unsafe { (*self.meta).framestack.len().saturating_sub(1) }
+                };
+                // pyjitpl.py:1389-1402 `_opimpl_recursive_call` walk:
+                //
+                //   for f in self.metainterp.framestack:
+                //       if f.jitcode is not portal_code: continue
+                //       gk = f.greenkey
+                //       if gk is None: continue
+                //       ... element-wise same_constant ...
+                //
+                // PyreMetaInterp.framestack is the active framestack for
+                // the split Pyre tracer. Each inline `MIFrame.greenkey`
+                // is populated from `PendingInlineFrame.greenkey`, which
+                // carries the typed PyPyJitDriver greens `[next_instr,
+                // is_being_profiled, pycode]`.  The single PyPyJitDriver
+                // setup means every inline frame here is a portal frame,
+                // so the upstream `f.jitcode is not portal_code` filter
+                // is satisfied by construction.  Comparison uses
+                // [`GreenKey::same_constant`] (history.py:207/285/331
+                // raw bit / pointer ==), *not* `PartialEq::eq` which
+                // routes `Str`/`Unicode` greens through warmstate's
+                // `equal_whatever` content-comparison resolver.
+                let recursive_depth = if self.meta.is_null() {
+                    0
+                } else {
+                    (&*self.meta)
+                        .framestack
+                        .iter()
+                        .filter(|f| {
+                            f.greenkey
+                                .as_ref()
+                                .is_some_and(|gk| gk.same_constant(&callee_greenkey))
+                        })
+                        .count()
+                };
+                let inline_decision =
+                    driver.should_inline_with_depth(callee_key, inline_depth, recursive_depth);
                 let concrete_arg0 = if nargs == 1 {
                     concrete_args.first().copied()
                 } else {
                     None
                 };
-                // pyjitpl.py:1388-1402 element-wise greenkey walk:
-                //   count = 0
-                //   for f in self.metainterp.framestack:
-                //       if f.jitcode is not portal_code: continue
-                //       gk = f.greenkey
-                //       if gk is None: continue
-                //       for i in range(len(gk)):
-                //           if not gk[i].same_constant(greenboxes[i]): break
-                //       else: count += 1
-                //
-                // Pyre's greenkey is `(code_ptr, target_pc)`; matching the
-                // tuple implies `f.jitcode is portal_code`. With
-                // `is_recursive=True` on the single PyPyJitDriver every
-                // framestack entry is a portal frame, so the upstream
-                // filter is automatically satisfied and the count equals
-                // `ctx.recursive_depth(callee_key)`: only already-inlined
-                // portal frames count, matching PyPy's root frame whose
-                // `greenkey` is None.
                 let recursive_count = recursive_depth;
                 let recursion_exceeded =
                     callee_inline_eligible && recursive_count >= max_unroll_recursion;
@@ -4558,6 +4645,7 @@ impl MIFrame {
                         args,
                         concrete_callable,
                         callee_key,
+                        callee_greenkey.clone(),
                         concrete_args,
                     ) {
                         Ok(pending) => {
@@ -4700,6 +4788,7 @@ impl MIFrame {
                                 args,
                                 concrete_callable,
                                 callee_key,
+                                callee_greenkey.clone(),
                                 concrete_args,
                             ) {
                                 Ok(pending) => {
@@ -4846,6 +4935,7 @@ impl MIFrame {
         args: &[OpRef],
         concrete_callable: PyObjectRef,
         callee_key: u64,
+        callee_greenkey: GreenKey,
         passed_concrete_args: &[PyObjectRef],
     ) -> Result<PendingInlineFrame, PyError> {
         use pyre_interpreter::pyframe::PyFrame;
@@ -4873,8 +4963,8 @@ impl MIFrame {
         };
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
-        // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
-        // tuple equality is lossless vs the derived u64 hash.
+        // Pyre adapter self-recursion test for helper selection. The
+        // RPython semantic recursion count uses `callee_greenkey`.
         let is_self_recursive = caller_code as usize == w_code as usize;
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             w_code,
@@ -4883,6 +4973,9 @@ impl MIFrame {
             caller_exec_ctx,
             closure,
         );
+        if !caller_exec_ctx.is_null() && unsafe { !(*caller_exec_ctx).profilefunc.is_null() } {
+            callee_frame.getorcreatedebug(-1).is_being_profiled = true;
+        }
         callee_frame.fix_array_ptrs();
 
         let callee_code = unsafe { &*pyre_interpreter::pyframe_get_pycode(&callee_frame) };
@@ -5070,12 +5163,7 @@ impl MIFrame {
             concrete_frame: callee_frame,
             drop_frame_opref,
             green_key: callee_key,
-            // Raw greenkey pair for element-wise recursion comparison
-            // (pyjitpl.py:1396-1401). target_pc is 0 for function
-            // entries — matches `make_green_key(w_code, 0)`. `w_code`
-            // and `callee_key` are the same greenkey inputs that built
-            // `callee_key` near the top of this function.
-            green_key_raw: (w_code as usize, 0),
+            greenkey: callee_greenkey,
             parent_frames,
             nargs: args.len(),
             caller_result_stack_idx: None,
@@ -5112,7 +5200,8 @@ impl MIFrame {
             if args.len() == 1 {
                 let result = if matches!(concrete_arg0, Some(arg) if unsafe { is_int(arg) }) {
                     let raw_arg = this.trace_guarded_int_payload(ctx, args[0]);
-                    // pyjitpl.py:1396-1401 element-wise greenkey.
+                    // Pyre adapter self-recursion test for the
+                    // helper-boundary residual call path.
                     let _ = callee_key;
                     let caller_raw: (usize, usize) =
                         (unsafe { (*this.sym().jitcode).code } as usize, 0);
@@ -6873,6 +6962,7 @@ mod tests {
         let mut frame = MIFrame {
             ctx: &mut ctx,
             sym: &mut sym,
+            meta: std::ptr::null_mut(),
             fallthrough_pc: 0,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
@@ -6880,6 +6970,14 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            owned_sym: None,
+            jitcode: std::ptr::null(),
+            pc: 0,
+            greenkey: None,
+            owned_concrete_frame: None,
+            drop_frame_opref: None,
+            caller_result_stack_idx: None,
+            arg_state: pyre_interpreter::bytecode::OpArgState::default(),
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);

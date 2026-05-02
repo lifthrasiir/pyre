@@ -16,9 +16,13 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
         target: usize,
     ) -> Result<Option<Vec<Self::Value>>, pyre_interpreter::PyError> {
         self.with_ctx(|this, ctx| {
-            // pyjitpl.py:2950-3036 reached_loop_header
-            let code_ptr = unsafe { (*this.sym().jitcode).code };
-            let back_edge_key = crate::driver::make_green_key(code_ptr, target);
+            // pyjitpl.py:2950-3036 reached_loop_header.
+            // interp_jit.py:118 always reads `frame.is_being_profiled`
+            // live at the backedge; the live frame must be present when
+            // close_loop_args runs.
+            let back_edge_key = this
+                .green_key_hash_for_pc(target)
+                .expect("close_loop_args: live concrete frame must be set");
             // pyjitpl.py:2951 self.heapcache.reset()
             ctx.heap_cache_mut().reset();
             // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.

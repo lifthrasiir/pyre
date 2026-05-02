@@ -12,8 +12,7 @@
 //! * **Compile role** (`compile.py compile_loop` / `compile_bridge`
 //!   merge-point bookkeeping).  `MergePoint`, `add_merge_point`,
 //!   `clear_merge_points`, `get_merge_point*`, `has_merge_point*`,
-//!   inline-trace tracking (`push/pop_inline_trace_position`,
-//!   `recursive_depth`).
+//!   inline-trace tracking (`push/pop_inline_trace_position`).
 //!
 //! * **Trace bytestream role** (`opencoder.py Trace` —
 //!   `cut_point()` snapshot tuples, encoded operation buffer).
@@ -103,19 +102,12 @@ pub struct TraceCtx {
     pub(crate) green_key_raw: (usize, usize),
     root_green_key_raw: (usize, usize),
     pub(crate) constants: ConstantPool,
-    /// Stack of inlined function frames (callee green keys as raw
-    /// `(code_ptr, pc)` pairs). rpython/jit/metainterp/pyjitpl.py:1390
-    /// walks `self.metainterp.framestack` element-wise; pyre mirrors
-    /// that by storing the structured greenkey per inline frame and
-    /// doing tuple-equality comparisons in [`recursive_depth`] and
-    /// [`is_tracing_key`].
-    inline_frames: Vec<(usize, usize)>,
-    /// Start positions for currently active inlined trace-through frames.
+    /// PyPy `portal_trace_positions` event stream for inlined portal frames.
     ///
-    /// This mirrors the subset of PyPy's `portal_trace_positions` that we
-    /// need for `find_biggest_function()`: active inlined callees and the
-    /// trace length at which each one started tracing.
-    inline_trace_positions: Vec<(u64, usize)>,
+    /// RPython stores `(jitdriver_sd, greenkey_or_None, trace_position)`;
+    /// Pyre has a single PyPyJitDriver here, so `Some(green_key)` marks an
+    /// enter event and `None` marks the matching exit event.
+    inline_trace_positions: Vec<(Option<u64>, usize)>,
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
@@ -472,7 +464,6 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             constants: ConstantPool::new(),
-            inline_frames: Vec::new(),
             inline_trace_positions: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
@@ -526,7 +517,6 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             constants: ConstantPool::new(),
-            inline_frames: Vec::new(),
             inline_trace_positions: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
@@ -558,11 +548,6 @@ impl TraceCtx {
         }
     }
 
-    /// Get the current inlining depth.
-    pub fn inline_depth(&self) -> usize {
-        self.inline_frames.len()
-    }
-
     pub fn inline_trace_depth(&self) -> usize {
         self.inline_trace_positions.len()
     }
@@ -586,43 +571,13 @@ impl TraceCtx {
         self.root_green_key_raw = raw;
     }
 
-    /// pyjitpl.py:1396-1401 element-wise greenkey comparison against
-    /// the current trace's greenkey and each inline-frame greenkey.
-    pub fn is_tracing_key(&self, target: (usize, usize)) -> bool {
-        self.green_key_raw == target
-            || self.root_green_key_raw == target
-            || self.inline_frames.contains(&target)
-    }
-
-    /// pyjitpl.py:1390-1402 recursion counting only walks portal
-    /// frames already pushed on `framestack`; the root trace entry is
-    /// not counted unless it has become an actual inline frame.
-    pub fn has_inline_frame_for(&self, target: (usize, usize)) -> bool {
-        self.inline_frames.contains(&target)
-    }
-
-    /// pyjitpl.py:1389-1402 `_opimpl_recursive_call` element-wise walk:
-    ///
-    /// ```python
-    /// count = 0
-    /// for f in self.metainterp.framestack:
-    ///     if f.jitcode is not portal_code: continue
-    ///     gk = f.greenkey
-    ///     for i in range(len(gk)):
-    ///         if not gk[i].same_constant(greenboxes[i]): break
-    ///     else: count += 1
-    /// ```
-    ///
-    /// Pyre's greenkey is `(code_ptr, pc)` — a fixed-arity pair — so
-    /// tuple equality reproduces the element-wise `same_constant`
-    /// result without an intermediate hash that could falsely collide.
-    ///
-    /// Only inlined portal frames count here. The root frame is
-    /// created without a `greenkey` in upstream `initialize_state_from_start`
-    /// / `newframe(mainjitcode)`, so counting `root_green_key_raw` would
-    /// make self-recursion hit `max_unroll_recursion` one level early.
-    pub fn recursive_depth(&self, target: (usize, usize)) -> usize {
-        self.inline_frames.iter().filter(|&&k| k == target).count()
+    /// warmstate.py:458,473 — JC_TRACING is keyed on the full greenargs
+    /// tuple (next_instr, is_being_profiled, pycode for PyPyJitDriver),
+    /// not on (pycode, pc) alone.  Compare the precomputed `JitCell`
+    /// hash so profiled and unprofiled frames stay in distinct cells
+    /// like RPython.
+    pub fn is_tracing_key(&self, target: u64) -> bool {
+        self.green_key == target || self.root_green_key == target
     }
 
     /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)` —
@@ -668,31 +623,14 @@ impl TraceCtx {
         self.heap_cache.replace_box(oldbox, newbox);
     }
 
-    /// Push an inline frame (entering a callee).
-    /// Returns false if the max inline depth has been exceeded.
-    /// `callee_raw` is the structured `(code_ptr, pc)` greenkey, stored
-    /// in `inline_frames` so `recursive_depth` / `is_tracing_key` can
-    /// walk it element-wise (pyjitpl.py:1396-1401 parity).
-    pub(crate) fn push_inline_frame(&mut self, callee_raw: (usize, usize), max_depth: u32) -> bool {
-        if (self.inline_frames.len() as u32) >= max_depth {
-            return false;
-        }
-        self.inline_frames.push(callee_raw);
-        true
-    }
-
-    /// Pop an inline frame (returning from a callee).
-    pub(crate) fn pop_inline_frame(&mut self) {
-        self.inline_frames.pop();
-    }
-
     pub fn push_inline_trace_position(&mut self, green_key: u64) {
         self.inline_trace_positions
-            .push((green_key, self.recorder.num_ops()));
+            .push((Some(green_key), self.recorder.num_ops()));
     }
 
     pub fn pop_inline_trace_position(&mut self) {
-        self.inline_trace_positions.pop();
+        self.inline_trace_positions
+            .push((None, self.recorder.num_ops()));
     }
 
     pub fn truncate_inline_trace_positions(&mut self, depth: usize) {
@@ -702,11 +640,27 @@ impl TraceCtx {
     /// pyjitpl.py:3514 find_biggest_function
     pub fn find_biggest_function(&self) -> Option<u64> {
         let current_pos = self.recorder.num_ops();
-        self.inline_trace_positions
-            .iter()
-            .map(|&(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
-            .max_by_key(|&(_, size)| size)
-            .map(|(green_key, _)| green_key)
+        let mut start_stack: Vec<(u64, usize)> = Vec::new();
+        let mut max_size = 0usize;
+        let mut max_key = None;
+        for &(green_key, pos) in &self.inline_trace_positions {
+            if let Some(green_key) = green_key {
+                start_stack.push((green_key, pos));
+            } else if let Some((green_key, start_pos)) = start_stack.pop() {
+                let size = pos.saturating_sub(start_pos);
+                if size > max_size {
+                    max_size = size;
+                    max_key = Some(green_key);
+                }
+            }
+        }
+        if let Some(&(green_key, start_pos)) = start_stack.first() {
+            let size = current_pos.saturating_sub(start_pos);
+            if size > max_size {
+                max_key = Some(green_key);
+            }
+        }
+        max_key
     }
 
     /// Get or create a constant OpRef for a given i64 value.
@@ -3875,6 +3829,24 @@ mod tests {
         // mark_type → numbering_type_overrides takes priority over the
         // intrinsic Int; this is the raw-pointer-ConstInt retag path.
         assert_eq!(ctx.const_type(c), Some(Type::Ref));
+    }
+
+    #[test]
+    fn find_biggest_function_uses_portal_enter_exit_stack() {
+        let mut ctx = TraceCtx::for_test(0);
+        let c = ctx.const_int(1);
+        ctx.push_inline_trace_position(10);
+        ctx.record_op(OpCode::IntAdd, &[c, c]);
+        ctx.record_op(OpCode::IntAdd, &[c, c]);
+        ctx.push_inline_trace_position(20);
+        ctx.record_op(OpCode::IntAdd, &[c, c]);
+        ctx.pop_inline_trace_position();
+        ctx.record_op(OpCode::IntAdd, &[c, c]);
+        ctx.record_op(OpCode::IntAdd, &[c, c]);
+        ctx.record_op(OpCode::IntAdd, &[c, c]);
+        ctx.pop_inline_trace_position();
+
+        assert_eq!(ctx.find_biggest_function(), Some(10));
     }
 
     // ── M1 · opref_to_box bridge tests ─────────────────────────────────
