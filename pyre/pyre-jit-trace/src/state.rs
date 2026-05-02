@@ -1598,21 +1598,6 @@ pub struct MIFrame {
     pub pending_inline_frame: Option<PendingInlineFrame>,
 }
 
-pub(crate) fn code_has_backward_jump(code: &CodeObject) -> bool {
-    for pc in 0..code.instructions.len() {
-        let Some((instruction, _)) = decode_instruction_at(code, pc) else {
-            continue;
-        };
-        if matches!(
-            instruction,
-            Instruction::JumpBackward { .. } | Instruction::JumpBackwardNoInterrupt { .. }
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
 pub(crate) fn instruction_consumes_comparison_truth(instruction: Instruction) -> bool {
     matches!(
         instruction,

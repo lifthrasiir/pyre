@@ -4489,7 +4489,6 @@ impl MIFrame {
                 let callee_code =
                     &*(pyre_interpreter::w_code_get_ptr(w_callee_code as pyre_object::PyObjectRef)
                         as *const CodeObject);
-                let callee_has_loop = code_has_backward_jump(callee_code);
                 let (driver, _) = crate::driver::driver_pair();
                 let nargs = args.len();
 
@@ -4577,9 +4576,11 @@ impl MIFrame {
                 // perform_call when callee is inlinable and the recursion
                 // count is below `max_unroll_recursion`.  PyPy does not
                 // special-case self-recursive calls here; the framestack
-                // depth check is the gate.
-                let can_trace_through =
-                    callee_inline_eligible && nargs <= 4 && !callee_has_loop && !recursion_exceeded;
+                // depth check is the gate.  RPython places no `nargs` or
+                // callee-loop constraint on the inline decision; the
+                // resulting trace length is bounded by `trace_limit`
+                // (rlib/jit.py:592) and `max_unroll_recursion`.
+                let can_trace_through = callee_inline_eligible && !recursion_exceeded;
 
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
@@ -4734,11 +4735,11 @@ impl MIFrame {
                     majit_metainterp::InlineDecision::CallAssembler => {
                         // Trace-through: inline callee body instead of CallAssembler.
                         // Guards use parent_frames to avoid OpRef::NONE in fail_args.
-                        if callee_inline_eligible
-                            && !is_self_recursive
-                            && nargs <= 4
-                            && !callee_has_loop
-                        {
+                        // RPython's _opimpl_recursive_call (pyjitpl.py:1376-
+                        // 1423) does not apply `nargs` or callee-loop gates
+                        // here; the assembler-call fall-through gates only
+                        // on `can_inline_callable` + recursion count.
+                        if callee_inline_eligible && !is_self_recursive {
                             match self.build_pending_inline_frame(
                                 callable,
                                 args,
