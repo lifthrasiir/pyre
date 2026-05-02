@@ -212,6 +212,132 @@ impl MIFrame {
         read_u16(&self.jitcode.code, &mut self.code_cursor)
     }
 
+    /// Peek a u16 at absolute position `pos` without advancing the
+    /// cursor.  Mirrors the canonical decode helper on
+    /// `BlackholeInterpreter::peek_u16_at` so trace dispatch can do the
+    /// same dual-encoding auto-detect for vable opcodes.
+    pub fn peek_u16_at(&self, pos: usize) -> Option<u16> {
+        let code = &self.jitcode.code;
+        if pos + 1 >= code.len() {
+            return None;
+        }
+        Some((code[pos] as u16) | ((code[pos + 1] as u16) << 8))
+    }
+
+    /// Resolve a `d`-argcode descr index against the per-jitcode
+    /// runtime descr pool (`exec.descrs`), returning the canonical
+    /// `BhDescr` if present.  Trace dispatch uses this to detect when a
+    /// vable opcode was emitted in canonical form (descr lives in the
+    /// pool) versus pyre's pre-orthodox legacy form (descr operand is
+    /// the field index inline).
+    pub fn runtime_bh_descr(&self, descr_idx: usize) -> Option<&crate::blackhole::BhDescr> {
+        self.jitcode
+            .exec
+            .descrs
+            .get(descr_idx)
+            .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
+    }
+
+    /// Read the static-field index from a canonical `VableField` descr
+    /// pool entry at `pos`. Stage 3c-3 dropped the dual-mode
+    /// auto-detect, so the bytes must already be canonical
+    /// (`assembler.py:165-167` + `:197-207`).
+    pub fn vable_field_index_at(&self, pos: usize) -> usize {
+        let idx = self
+            .peek_u16_at(pos)
+            .expect("vable_field_index_at: descr operand out of bounds");
+        match self.runtime_bh_descr(idx as usize) {
+            Some(crate::blackhole::BhDescr::VableField { index }) => *index,
+            other => {
+                panic!("vable_field_index_at: expected VableField at descr {idx}, got {other:?}")
+            }
+        }
+    }
+
+    /// Read the array-field index from a canonical
+    /// (`VableArray`, `Array`) descr pool pair.
+    pub fn vable_array_index_pair_at(&self, field_pos: usize, array_pos: usize) -> usize {
+        let field_idx = self
+            .peek_u16_at(field_pos)
+            .expect("vable_array_index_pair_at: field descr out of bounds");
+        let array_idx = self
+            .peek_u16_at(array_pos)
+            .expect("vable_array_index_pair_at: array descr out of bounds");
+        let field_descr = self.runtime_bh_descr(field_idx as usize);
+        let array_descr = self.runtime_bh_descr(array_idx as usize);
+        match (field_descr, array_descr) {
+            (
+                Some(crate::blackhole::BhDescr::VableArray { index }),
+                Some(crate::blackhole::BhDescr::Array { .. }),
+            ) => *index,
+            other => panic!(
+                "vable_array_index_pair_at: expected (VableArray, Array) at descrs ({field_idx}, {array_idx}), got {other:?}"
+            ),
+        }
+    }
+
+    /// Decode a `getfield_vable_<kind>/rd>X` operand triple, returning
+    /// `(vable_reg, field_idx, dest_reg)` per `assembler.py:165-167` +
+    /// `:197-207`. Canonical layout: 1B vable_reg + 2B descr_pool_idx
+    /// + 1B dest_reg. The leading `r` operand carries the live struct
+    /// register consumed as the `struct` argument by RPython
+    /// `pyjitpl.py:1166 _opimpl_setfield_vable_*`.
+    pub fn read_vable_getfield(&mut self) -> (usize, usize, usize) {
+        let field_idx = self.vable_field_index_at(self.code_cursor + 1);
+        let base = self.next_u8() as usize;
+        self.code_cursor += 2;
+        let dst = self.next_u8() as usize;
+        (base, field_idx, dst)
+    }
+
+    /// Decode a `setfield_vable_<kind>/rXd` operand triple, returning
+    /// `(vable_reg, field_idx, value_reg)`. Canonical layout: 1B
+    /// vable_reg + 1B value_reg + 2B descr_pool_idx.
+    pub fn read_vable_setfield(&mut self) -> (usize, usize, usize) {
+        let field_idx = self.vable_field_index_at(self.code_cursor + 2);
+        let base = self.next_u8() as usize;
+        let src = self.next_u8() as usize;
+        self.code_cursor += 2;
+        (base, field_idx, src)
+    }
+
+    /// Decode a `getarrayitem_vable_<kind>/ridd>X` operand quintuple,
+    /// returning `(vable_reg, array_idx, index_reg, dest_reg)`.
+    /// Canonical layout: 1B vable_reg + 1B index_reg + 2B fdescr + 2B
+    /// adescr + 1B dest.
+    pub fn read_vable_getarrayitem(&mut self) -> (usize, usize, usize, usize) {
+        let array_idx = self.vable_array_index_pair_at(self.code_cursor + 2, self.code_cursor + 4);
+        let base = self.next_u8() as usize;
+        let index_reg = self.next_u8() as usize;
+        self.code_cursor += 4;
+        let dst = self.next_u8() as usize;
+        (base, array_idx, index_reg, dst)
+    }
+
+    /// Decode a `setarrayitem_vable_<kind>/riXdd` operand quintuple,
+    /// returning `(vable_reg, array_idx, index_reg, value_reg)`.
+    /// Canonical layout: 1B vable_reg + 1B index_reg + 1B value_reg +
+    /// 2B fdescr + 2B adescr.
+    pub fn read_vable_setarrayitem(&mut self) -> (usize, usize, usize, usize) {
+        let array_idx = self.vable_array_index_pair_at(self.code_cursor + 3, self.code_cursor + 5);
+        let base = self.next_u8() as usize;
+        let index_reg = self.next_u8() as usize;
+        let src = self.next_u8() as usize;
+        self.code_cursor += 4;
+        (base, array_idx, index_reg, src)
+    }
+
+    /// Decode an `arraylen_vable/rdd>i` operand triple, returning
+    /// `(vable_reg, array_idx, dest_reg)`. Canonical layout: 1B
+    /// vable_reg + 2B fdescr + 2B adescr + 1B dest.
+    pub fn read_vable_arraylen(&mut self) -> (usize, usize, usize) {
+        let array_idx = self.vable_array_index_pair_at(self.code_cursor + 1, self.code_cursor + 3);
+        let base = self.next_u8() as usize;
+        self.code_cursor += 4;
+        let dst = self.next_u8() as usize;
+        (base, array_idx, dst)
+    }
+
     /// pyjitpl.py:1530-1535 `MIFrame.verify_green_args(jitdriver_sd, varargs)`.
     ///
     /// ```python

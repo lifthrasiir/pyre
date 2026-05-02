@@ -1082,15 +1082,17 @@ impl<'a> Transformer<'a> {
                 });
                 self.vable_rewrites += 1;
                 if let Some(arg) = args.first().copied() {
+                    let base = resolve_alias(arg, &self.aliases);
                     if let Some(result) = op.result {
-                        self.aliases
-                            .insert(result, resolve_alias(arg, &self.aliases));
+                        self.aliases.insert(result, base);
                     }
+                    RewriteResult::Replace(vec![SpaceOperation {
+                        result: None,
+                        kind: OpKind::VableForce { base },
+                    }])
+                } else {
+                    RewriteResult::Keep
                 }
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: None,
-                    kind: OpKind::VableForce,
-                }])
             }
         }
     }
@@ -2852,13 +2854,15 @@ fn remap_op(
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFloat(_)
-        | OpKind::VableForce
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::GuardValue { .. }
         | OpKind::VtableMethodPtr { .. }
         | OpKind::Abort { .. } => op.kind.clone(),
+        OpKind::VableForce { base } => OpKind::VableForce {
+            base: remap_value(*base, aliases),
+        },
         OpKind::JitMergePoint {
             jitdriver_index,
             greens_i,
@@ -4207,7 +4211,10 @@ mod tests {
         );
 
         let ops = &result.graph.block(graph.startblock).operations;
-        assert!(matches!(ops[0].kind, OpKind::VableForce));
+        assert!(matches!(
+            ops[0].kind,
+            OpKind::VableForce { base } if base == frame
+        ));
         assert!(matches!(
             ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }

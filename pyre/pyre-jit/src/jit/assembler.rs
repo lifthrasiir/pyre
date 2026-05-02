@@ -855,125 +855,84 @@ fn dispatch_op(
         // them (codewriter.rs `emit_vable_*` macros use the short form).
         "getfield_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            let (vable_reg, field_idx) = expect_vable_field_read_args(args);
             state
                 .builder
-                .vable_getfield_int(dst, expect_small_u16(&args[0]));
+                .vable_getfield_int_with_base(dst, vable_reg, field_idx);
         }
         "getfield_vable_r" => {
-            // 2-arg shape mirroring `jtransform.py:846-847` getfield:
-            // `[v_inst, descr]` with a Ref result.  `args[0]` is the
-            // `v_inst` sentinel (`ConstRef(0)`) — pyre's single-frame
-            // model leaves the frame implicit at `state.frame`.
-            // `field_idx` derives from the trailing
-            // `VableStaticField` descr.
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-            let _v_inst = &args[0];
-            let field_idx = expect_descr_vable_static_field(&args[1]);
-            state.builder.vable_getfield_ref(dst, field_idx);
+            let (vable_reg, field_idx) = expect_vable_field_read_args(args);
+            state
+                .builder
+                .vable_getfield_ref_with_base(dst, vable_reg, field_idx);
         }
         "getfield_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
+            let (vable_reg, field_idx) = expect_vable_field_read_args(args);
             state
                 .builder
-                .vable_getfield_float(dst, expect_small_u16(&args[0]));
+                .vable_getfield_float_with_base(dst, vable_reg, field_idx);
         }
         "setfield_vable_i" => {
-            // 3-arg shape mirroring `jtransform.py:927-928` setfield:
-            // `[v_inst, v_value, descr]`.  `args[0]` is the `v_inst`
-            // sentinel; see `getfield_vable_r` for rationale.
-            // `field_idx` derives from the trailing
-            // `VableStaticField` descr.
-            let _v_inst = &args[0];
-            let value_reg = expect_reg(&args[1], Kind::Int);
-            let field_idx = expect_descr_vable_static_field(&args[2]);
-            state.builder.vable_setfield_int(field_idx, value_reg);
-        }
-        "setfield_vable_r" => state
-            .builder
-            .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
-        "setfield_vable_f" => state.builder.vable_setfield_float(
-            expect_small_u16(&args[0]),
-            expect_reg(&args[1], Kind::Float),
-        ),
-        "getarrayitem_vable_i" => {
-            let dst = expect_result_or_first_reg(args, result, Kind::Int);
-            state.builder.vable_getarrayitem_int(
-                dst,
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-            );
-        }
-        "getarrayitem_vable_r" => {
-            // 4-arg shape mirroring `jtransform.py:1882-1885
-            // do_fixed_list_getitem` (vable branch): `[v_base,
-            // v_index, arrayfielddescr, arraydescr]` with a Ref
-            // result.  See `setarrayitem_vable_r` arm for the
-            // descr-pair extraction + lowering rationale.
-            let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-            let _v_base = &args[0];
-            let index_reg = expect_reg(&args[1], Kind::Int);
-            let array_idx = expect_descr_vable_array_field(&args[2]);
-            let array_descr_idx = expect_descr_vable_array(&args[3]);
-            assert_eq!(
-                array_idx, array_descr_idx,
-                "getarrayitem_vable_r: VableArrayField({}) and VableArray({}) descrs \
-                 must reference the same array field",
-                array_idx, array_descr_idx,
-            );
+            let (vable_reg, value_reg, field_idx) = expect_vable_field_write_args(args, Kind::Int);
             state
                 .builder
-                .vable_getarrayitem_ref(dst, array_idx, index_reg);
+                .vable_setfield_int_with_base(vable_reg, field_idx, value_reg);
+        }
+        "setfield_vable_r" => {
+            let (vable_reg, value_reg, field_idx) = expect_vable_field_write_args(args, Kind::Ref);
+            state
+                .builder
+                .vable_setfield_ref_with_base(vable_reg, field_idx, value_reg);
+        }
+        "setfield_vable_f" => {
+            let (vable_reg, value_reg, field_idx) =
+                expect_vable_field_write_args(args, Kind::Float);
+            state
+                .builder
+                .vable_setfield_float_with_base(vable_reg, field_idx, value_reg);
+        }
+        "getarrayitem_vable_i" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
+            state
+                .builder
+                .vable_getarrayitem_int_with_base(dst, vable_reg, array_idx, index_reg);
+        }
+        "getarrayitem_vable_r" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Ref);
+            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
+            state
+                .builder
+                .vable_getarrayitem_ref_with_base(dst, vable_reg, array_idx, index_reg);
         }
         "getarrayitem_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
-            state.builder.vable_getarrayitem_float(
-                dst,
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-            );
+            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
+            state
+                .builder
+                .vable_getarrayitem_float_with_base(dst, vable_reg, array_idx, index_reg);
         }
-        "setarrayitem_vable_i" => state.builder.vable_setarrayitem_int(
-            expect_small_u16(&args[0]),
-            expect_reg(&args[1], Kind::Int),
-            expect_reg(&args[2], Kind::Int),
-        ),
+        "setarrayitem_vable_i" => {
+            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
+            let value_reg = expect_reg(&args[2], Kind::Int);
+            state
+                .builder
+                .vable_setarrayitem_int_with_base(vable_reg, array_idx, index_reg, value_reg);
+        }
         "setarrayitem_vable_r" => {
-            // 5-arg shape mirroring `jtransform.py:1898-1906
-            // do_fixed_list_setitem` (vable branch): `[v_base,
-            // v_index, v_value, arrayfielddescr, arraydescr]`.
-            // `args[0]` is the `v_base` sentinel (`ConstRef(0)`) —
-            // pyre's single-frame model leaves the frame implicit at
-            // `state.frame`; the operand exists for shape parity.
-            // `array_idx` derives from the trailing `VableArrayField`
-            // descr; `VableArray` is sanity-checked to match.
-            // Mirroring `assembler.py:80-138 emit_const`'s role of
-            // compressing descr operands into bytecode bytes.
-            let _v_base = &args[0];
-            let index_reg = expect_reg(&args[1], Kind::Int);
-            let array_idx = expect_descr_vable_array_field(&args[3]);
-            let array_descr_idx = expect_descr_vable_array(&args[4]);
-            assert_eq!(
-                array_idx, array_descr_idx,
-                "setarrayitem_vable_r: VableArrayField({}) and VableArray({}) descrs \
-                 must reference the same array field",
-                array_idx, array_descr_idx,
-            );
+            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
             match &args[2] {
                 Operand::Register(r) if r.kind == Kind::Ref => {
                     state
                         .builder
-                        .vable_setarrayitem_ref(array_idx, index_reg, r.index);
+                        .vable_setarrayitem_ref_with_base(vable_reg, array_idx, index_reg, r.index);
                 }
-                // `setarrayitem_vable_r(vable, idx, ConstPtr(value))` —
-                // jtransform.py:1898 lowers ConstPtr value operands as
-                // SSA constants. The builder side reuses the same
-                // BC_SETARRAYITEM_VABLE_R bytecode and points its src
-                // u16 at the constants suffix of the unified register
-                // space (matching upstream `assembler.py:80-138 emit_const`).
                 Operand::ConstRef(value) => {
-                    state
-                        .builder
-                        .vable_setarrayitem_ref_const_value(array_idx, index_reg, *value);
+                    state.builder.vable_setarrayitem_ref_const_value_with_base(
+                        vable_reg, array_idx, index_reg, *value,
+                    );
                 }
                 other => panic!(
                     "setarrayitem_vable_r expects Register(Ref) or ConstRef, got {:?}",
@@ -981,18 +940,25 @@ fn dispatch_op(
                 ),
             }
         }
-        "setarrayitem_vable_f" => state.builder.vable_setarrayitem_float(
-            expect_small_u16(&args[0]),
-            expect_reg(&args[1], Kind::Int),
-            expect_reg(&args[2], Kind::Float),
-        ),
-        "arraylen_vable" => {
-            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+        "setarrayitem_vable_f" => {
+            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
+            let value_reg = expect_reg(&args[2], Kind::Float);
             state
                 .builder
-                .vable_arraylen(dst, expect_small_u16(&args[0]));
+                .vable_setarrayitem_float_with_base(vable_reg, array_idx, index_reg, value_reg);
         }
-        "hint_force_virtualizable" => state.builder.vable_force(),
+        "arraylen_vable" => {
+            let dst = expect_result_or_first_reg(args, result, Kind::Int);
+            let (vable_reg, array_idx) = expect_vable_arraylen_args(args);
+            state
+                .builder
+                .vable_arraylen_with_base(dst, vable_reg, array_idx);
+        }
+        "hint_force_virtualizable" => {
+            assert_eq!(args.len(), 1, "hint_force_virtualizable expects [vable]");
+            let vable_reg = expect_reg(&args[0], Kind::Ref);
+            state.builder.vable_force_with_base(vable_reg);
+        }
         // Per-OpCode opname dispatch for integer / float primitives —
         // RPython `rpython/jit/metainterp/blackhole.py:459-723` defines
         // one `bhimpl_*` per opname; `assembler.py:162-222` routes each
@@ -1608,8 +1574,8 @@ fn expect_small_u16(op: &Operand) -> u16 {
 /// `Operand::Descr(DescrOperand::VableArrayField(i))` operand at the
 /// trailing position of `getarrayitem_vable_X` / `setarrayitem_vable_X`
 /// / `arraylen_vable` SSA ops (`jtransform.py:1880-1906`,
-/// `:1865-1873`). Used by the assembler dispatch to recover the
-/// `array_idx:u16` that the existing `vable_*` builder API expects.
+/// `:1865-1873`). Used by the assembler dispatch to populate the
+/// canonical `BhDescr::VableArray` descriptor.
 fn expect_descr_vable_array_field(op: &Operand) -> u16 {
     match op {
         Operand::Descr(rc) => match &**rc {
@@ -1640,8 +1606,7 @@ fn expect_descr_vable_array(op: &Operand) -> u16 {
 /// `Operand::Descr(DescrOperand::VableStaticField(i))` operand at the
 /// trailing position of `getfield_vable_<kind>` / `setfield_vable_<kind>`
 /// SSA ops (`jtransform.py:846-927`).  Used by the assembler dispatch
-/// to recover the `field_idx:u16` that the existing `vable_getfield_*`
-/// / `vable_setfield_*` builder API expects.
+/// to populate the canonical `BhDescr::VableField` descriptor.
 fn expect_descr_vable_static_field(op: &Operand) -> u16 {
     match op {
         Operand::Descr(rc) => match &**rc {
@@ -1650,6 +1615,75 @@ fn expect_descr_vable_static_field(op: &Operand) -> u16 {
         },
         _ => panic!("expected Operand::Descr(VableStaticField), got {:?}", op),
     }
+}
+
+fn expect_vable_field_read_args(args: &[Operand]) -> (u16, u16) {
+    assert_eq!(
+        args.len(),
+        2,
+        "getfield_vable_* expects [vable, fielddescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let field_idx = expect_descr_vable_static_field(&args[1]);
+    (vable_reg, field_idx)
+}
+
+fn expect_vable_field_write_args(args: &[Operand], value_kind: Kind) -> (u16, u16, u16) {
+    assert_eq!(
+        args.len(),
+        3,
+        "setfield_vable_* expects [vable, value, fielddescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let value_reg = expect_reg(&args[1], value_kind);
+    let field_idx = expect_descr_vable_static_field(&args[2]);
+    (vable_reg, value_reg, field_idx)
+}
+
+fn expect_matching_vable_array_descrs(field: &Operand, array: &Operand, opname: &str) -> u16 {
+    let array_idx = expect_descr_vable_array_field(field);
+    let array_descr_idx = expect_descr_vable_array(array);
+    assert_eq!(
+        array_idx, array_descr_idx,
+        "{opname}: VableArrayField({array_idx}) and VableArray({array_descr_idx}) \
+         descrs must reference the same array field",
+    );
+    array_idx
+}
+
+fn expect_vable_array_read_args(args: &[Operand]) -> (u16, u16, u16) {
+    assert_eq!(
+        args.len(),
+        4,
+        "getarrayitem_vable_* expects [vable, index, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let index_reg = expect_reg(&args[1], Kind::Int);
+    let array_idx = expect_matching_vable_array_descrs(&args[2], &args[3], "getarrayitem_vable_*");
+    (vable_reg, index_reg, array_idx)
+}
+
+fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
+    assert_eq!(
+        args.len(),
+        5,
+        "setarrayitem_vable_* expects [vable, index, value, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let index_reg = expect_reg(&args[1], Kind::Int);
+    let array_idx = expect_matching_vable_array_descrs(&args[3], &args[4], "setarrayitem_vable_*");
+    (vable_reg, index_reg, array_idx)
+}
+
+fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {
+    assert_eq!(
+        args.len(),
+        3,
+        "arraylen_vable expects [vable, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let array_idx = expect_matching_vable_array_descrs(&args[1], &args[2], "arraylen_vable");
+    (vable_reg, array_idx)
 }
 
 fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {

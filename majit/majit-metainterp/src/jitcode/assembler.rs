@@ -11,7 +11,8 @@ use majit_ir::OpCode;
 use crate::jitcode;
 
 use super::{
-    JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode, RuntimeBhDescr,
+    CanonicalBhDescr, JitArgKind, JitCallArg, JitCallAssemblerTarget, JitCallTarget, JitCode,
+    RuntimeBhDescr,
 };
 
 #[derive(Default)]
@@ -272,11 +273,13 @@ impl JitCodeBuilder {
     // ── State field access (register/tape machines) ──
 
     /// Load a scalar state field value into an int register.
+    /// `assembler.py:165-167` `i` argcode emits 1-byte register index;
+    /// `assembler.py:197-207` `d` argcode emits 2-byte descr index.
     pub fn load_state_field(&mut self, field_idx: u16, dest: u16) {
         self.touch_reg(dest);
         self.write_insn("load_state_field/di");
         self.push_u16(field_idx);
-        self.push_u16(dest);
+        self.push_u8(dest as u8);
     }
 
     /// Store an int register value into a scalar state field.
@@ -284,7 +287,7 @@ impl JitCodeBuilder {
         self.touch_reg(src);
         self.write_insn("store_state_field/di");
         self.push_u16(field_idx);
-        self.push_u16(src);
+        self.push_u8(src as u8);
     }
 
     /// Load an array state field element into an int register.
@@ -294,8 +297,8 @@ impl JitCodeBuilder {
         self.touch_reg(dest);
         self.write_insn("load_state_array/dii");
         self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(dest);
+        self.push_u8(index_reg as u8);
+        self.push_u8(dest as u8);
     }
 
     /// Store an int register value into an array state field element.
@@ -305,153 +308,239 @@ impl JitCodeBuilder {
         self.touch_reg(src);
         self.write_insn("store_state_array/dii");
         self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(src);
+        self.push_u8(index_reg as u8);
+        self.push_u8(src as u8);
     }
 
     // ── First-class virtualizable access (getfield_vable_*) ──
+    //
+    // Canonical-only API: every emit threads a `vable_reg` operand for
+    // the live struct pointer (`pyjitpl.py:1166 _opimpl_setfield_vable_*`
+    // `r` argcode), and the descr operand resolves through the runtime
+    // descr pool (`assembler.py:165-167` + `:197-207`). The pre-orthodox
+    // helper-style legacy methods that omitted `vable_reg` and inlined
+    // the field index were retired in Stage 3c-2 once `jit_interp` DSL
+    // and pyre-jit both committed to the canonical encoding.
 
-    pub fn vable_getfield_int(&mut self, dest: u16, field_idx: u16) {
+    pub fn vable_getfield_int_with_base(&mut self, dest: u16, vable_reg: u16, field_idx: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(dest);
-        self.start_instr(jitcode::BC_GETFIELD_VABLE_I);
-        self.push_u16(field_idx);
-        self.push_u16(dest);
-        self.record_resulttype('i');
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("getfield_vable_i/rd>i");
+        self.push_reg_u8(vable_reg, "getfield_vable_i base");
+        self.push_u16(field_descr);
+        self.push_reg_u8(dest, "getfield_vable_i result");
     }
 
-    pub fn vable_getfield_ref(&mut self, dest: u16, field_idx: u16) {
+    pub fn vable_getfield_ref_with_base(&mut self, dest: u16, vable_reg: u16, field_idx: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_ref_reg(dest);
-        self.start_instr(jitcode::BC_GETFIELD_VABLE_R);
-        self.push_u16(field_idx);
-        self.push_u16(dest);
-        self.record_resulttype('r');
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("getfield_vable_r/rd>r");
+        self.push_reg_u8(vable_reg, "getfield_vable_r base");
+        self.push_u16(field_descr);
+        self.push_reg_u8(dest, "getfield_vable_r result");
     }
 
-    pub fn vable_getfield_float(&mut self, dest: u16, field_idx: u16) {
+    pub fn vable_getfield_float_with_base(&mut self, dest: u16, vable_reg: u16, field_idx: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_float_reg(dest);
-        self.start_instr(jitcode::BC_GETFIELD_VABLE_F);
-        self.push_u16(field_idx);
-        self.push_u16(dest);
-        self.record_resulttype('f');
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("getfield_vable_f/rd>f");
+        self.push_reg_u8(vable_reg, "getfield_vable_f base");
+        self.push_u16(field_descr);
+        self.push_reg_u8(dest, "getfield_vable_f result");
     }
 
-    pub fn vable_setfield_int(&mut self, field_idx: u16, src: u16) {
+    pub fn vable_setfield_int_with_base(&mut self, vable_reg: u16, field_idx: u16, src: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(src);
-        self.start_instr(jitcode::BC_SETFIELD_VABLE_I);
-        self.push_u16(field_idx);
-        self.push_u16(src);
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("setfield_vable_i/rid");
+        self.push_reg_u8(vable_reg, "setfield_vable_i base");
+        self.push_reg_u8(src, "setfield_vable_i value");
+        self.push_u16(field_descr);
     }
 
-    pub fn vable_setfield_ref(&mut self, field_idx: u16, src: u16) {
+    pub fn vable_setfield_ref_with_base(&mut self, vable_reg: u16, field_idx: u16, src: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_ref_reg(src);
-        self.start_instr(jitcode::BC_SETFIELD_VABLE_R);
-        self.push_u16(field_idx);
-        self.push_u16(src);
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("setfield_vable_r/rrd");
+        self.push_reg_u8(vable_reg, "setfield_vable_r base");
+        self.push_reg_u8(src, "setfield_vable_r value");
+        self.push_u16(field_descr);
     }
 
-    pub fn vable_setfield_float(&mut self, field_idx: u16, src: u16) {
+    pub fn vable_setfield_float_with_base(&mut self, vable_reg: u16, field_idx: u16, src: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_float_reg(src);
-        self.start_instr(jitcode::BC_SETFIELD_VABLE_F);
-        self.push_u16(field_idx);
-        self.push_u16(src);
+        let field_descr = self.add_vable_field_descr(field_idx);
+        self.write_insn("setfield_vable_f/rfd");
+        self.push_reg_u8(vable_reg, "setfield_vable_f base");
+        self.push_reg_u8(src, "setfield_vable_f value");
+        self.push_u16(field_descr);
     }
 
-    pub fn vable_getarrayitem_int(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
+    pub fn vable_getarrayitem_int_with_base(
+        &mut self,
+        dest: u16,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+    ) {
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(index_reg);
         self.touch_reg(dest);
-        self.touch_reg(index_reg);
-        self.start_instr(jitcode::BC_GETARRAYITEM_VABLE_I);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(dest);
-        self.record_resulttype('i');
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Int, true);
+        self.write_insn("getarrayitem_vable_i/ridd>i");
+        self.push_reg_u8(vable_reg, "getarrayitem_vable_i base");
+        self.push_reg_u8(index_reg, "getarrayitem_vable_i index");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "getarrayitem_vable_i result");
     }
 
-    pub fn vable_getarrayitem_ref(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
+    pub fn vable_getarrayitem_ref_with_base(
+        &mut self,
+        dest: u16,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+    ) {
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(index_reg);
         self.touch_ref_reg(dest);
-        self.touch_reg(index_reg);
-        self.start_instr(jitcode::BC_GETARRAYITEM_VABLE_R);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(dest);
-        self.record_resulttype('r');
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("getarrayitem_vable_r/ridd>r");
+        self.push_reg_u8(vable_reg, "getarrayitem_vable_r base");
+        self.push_reg_u8(index_reg, "getarrayitem_vable_r index");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "getarrayitem_vable_r result");
     }
 
-    pub fn vable_getarrayitem_float(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
+    pub fn vable_getarrayitem_float_with_base(
+        &mut self,
+        dest: u16,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+    ) {
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(index_reg);
         self.touch_float_reg(dest);
-        self.touch_reg(index_reg);
-        self.start_instr(jitcode::BC_GETARRAYITEM_VABLE_F);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(dest);
-        self.record_resulttype('f');
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Float, false);
+        self.write_insn("getarrayitem_vable_f/ridd>f");
+        self.push_reg_u8(vable_reg, "getarrayitem_vable_f base");
+        self.push_reg_u8(index_reg, "getarrayitem_vable_f index");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "getarrayitem_vable_f result");
     }
 
-    pub fn vable_setarrayitem_int(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+    pub fn vable_setarrayitem_int_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+        src: u16,
+    ) {
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_I);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(src);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Int, true);
+        self.write_insn("setarrayitem_vable_i/riidd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_i base");
+        self.push_reg_u8(index_reg, "setarrayitem_vable_i index");
+        self.push_reg_u8(src, "setarrayitem_vable_i value");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
     }
 
-    pub fn vable_setarrayitem_ref(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+    pub fn vable_setarrayitem_ref_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+        src: u16,
+    ) {
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(index_reg);
         self.touch_ref_reg(src);
-        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_R);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(src);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("setarrayitem_vable_r/rirdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_r base");
+        self.push_reg_u8(index_reg, "setarrayitem_vable_r index");
+        self.push_reg_u8(src, "setarrayitem_vable_r value");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
     }
 
-    /// Const-source variant of `vable_setarrayitem_ref`. Lowers a
-    /// `setarrayitem_vable_r(vable, idx, ConstPtr(value))` SSA op
-    /// (jtransform.py:1898 produces this when the value operand is a
-    /// `Const`) by reusing the same `BC_SETARRAYITEM_VABLE_R` opcode
-    /// with the src u16 deferred to the const-patch table — at finish
-    /// time it is patched to `num_regs_r + const_idx`, addressing into
-    /// the constants suffix of the unified register space (see
-    /// `Frame::copy_constants` and `init_register_file_from_i64s`,
-    /// matching upstream `assembler.py:80-138 emit_const` register-
-    /// space convention). No new bytecode is required: blackhole
-    /// (`registers_r[src]`) and tracer (`read_ref_reg(src)`) both read
-    /// the pre-populated constant slot.
-    pub fn vable_setarrayitem_ref_const_value(
+    pub fn vable_setarrayitem_ref_const_value_with_base(
         &mut self,
+        vable_reg: u16,
         array_idx: u16,
         index_reg: u16,
         value: i64,
     ) {
         let const_idx = self.add_const_r(value);
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(index_reg);
-        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_R);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("setarrayitem_vable_r/rirdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_r base");
+        self.push_reg_u8(index_reg, "setarrayitem_vable_r index");
         let src_offset = self.code.len();
-        self.push_u16(0);
-        self.const_patches
+        self.push_u8(0);
+        self.const_patches_u8
             .push((src_offset, ConstKind::Ref, const_idx));
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
     }
 
-    pub fn vable_setarrayitem_float(&mut self, array_idx: u16, index_reg: u16, src: u16) {
+    pub fn vable_setarrayitem_float_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_reg: u16,
+        src: u16,
+    ) {
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(index_reg);
         self.touch_float_reg(src);
-        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_F);
-        self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(src);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Float, false);
+        self.write_insn("setarrayitem_vable_f/rifdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_f base");
+        self.push_reg_u8(index_reg, "setarrayitem_vable_f index");
+        self.push_reg_u8(src, "setarrayitem_vable_f value");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
     }
 
-    pub fn vable_arraylen(&mut self, dest: u16, array_idx: u16) {
+    pub fn vable_arraylen_with_base(&mut self, dest: u16, vable_reg: u16, array_idx: u16) {
+        self.touch_ref_reg(vable_reg);
         self.touch_reg(dest);
-        self.start_instr(jitcode::BC_ARRAYLEN_VABLE);
-        self.push_u16(array_idx);
-        self.push_u16(dest);
-        self.record_resulttype('i');
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("arraylen_vable/rdd>i");
+        self.push_reg_u8(vable_reg, "arraylen_vable base");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "arraylen_vable result");
     }
 
-    pub fn vable_force(&mut self) {
-        self.start_instr(jitcode::BC_HINT_FORCE_VIRTUALIZABLE);
+    pub fn vable_force_with_base(&mut self, vable_reg: u16) {
+        self.touch_ref_reg(vable_reg);
+        self.write_insn("hint_force_virtualizable/r");
+        self.push_reg_u8(vable_reg, "hint_force_virtualizable base");
     }
 
     /// Load from a virtualizable state array: emit GETARRAYITEM_RAW_I.
@@ -461,8 +550,8 @@ impl JitCodeBuilder {
         self.touch_reg(dest);
         self.write_insn("load_state_varray/dii");
         self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(dest);
+        self.push_u8(index_reg as u8);
+        self.push_u8(dest as u8);
     }
 
     /// Store to a virtualizable state array: emit SETARRAYITEM_RAW.
@@ -472,8 +561,8 @@ impl JitCodeBuilder {
         self.touch_reg(src);
         self.write_insn("store_state_varray/dii");
         self.push_u16(array_idx);
-        self.push_u16(index_reg);
-        self.push_u16(src);
+        self.push_u8(index_reg as u8);
+        self.push_u8(src as u8);
     }
 
     /// RPython `blackhole.py:459-521` `bhimpl_int_*` per-opname handlers:
@@ -1832,6 +1921,48 @@ impl JitCodeBuilder {
         self.add_call_assembler_target_number(target.number, concrete_ptr)
     }
 
+    fn add_vable_field_descr(&mut self, field_idx: u16) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::VableField {
+            index: field_idx as usize,
+        })
+    }
+
+    fn add_vable_array_field_descr(&mut self, array_idx: u16) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::VableArray {
+            index: array_idx as usize,
+        })
+    }
+
+    fn add_vable_array_descr(
+        &mut self,
+        item_type: majit_ir::value::Type,
+        is_item_signed: bool,
+    ) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::Array {
+            base_size: std::mem::size_of::<usize>(),
+            itemsize: 8,
+            type_id: 0,
+            item_type,
+            is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
+            is_array_of_structs: false,
+            is_item_signed,
+            interior_fields: Vec::new(),
+        })
+    }
+
+    fn add_bh_descr(&mut self, descr: CanonicalBhDescr) -> u16 {
+        for (idx, entry) in self.descrs.iter().enumerate() {
+            if let RuntimeBhDescr::Descr(existing) = entry {
+                if canonical_bh_descr_eq(existing, &descr) {
+                    return idx as u16;
+                }
+            }
+        }
+        let idx = self.descrs.len() as u16;
+        self.descrs.push(RuntimeBhDescr::Descr(descr));
+        idx
+    }
+
     pub fn finish(mut self) -> JitCode {
         self.flush_pending_resulttype();
         self.patch_labels();
@@ -1860,6 +1991,59 @@ impl JitCodeBuilder {
         // off to `JitCodeBody::resulttypes` is therefore keyed by
         // every typed-result instruction's end-of-instruction PC.
         let resulttypes = Some(self.resulttypes);
+        // Stage 1 audit (bytecode encoding unification —
+        // .claude/plans/TODO-bytecode-encoding-unification.md):
+        // RPython enforces two distinct ceilings:
+        //   * `jitcode.py:36 assert num_regs_i < 256 and ...` — the
+        //     stored `c_num_regs_*` is a single char.
+        //   * `assembler.py:132-133 val = count_regs[kind] +
+        //     len(constants) - 1; assert 0 <= val < 256` — the last
+        //     constant-slot index in the unified register-plus-const
+        //     namespace must fit in one byte, so the total count
+        //     `num_regs + len(constants) <= 256` (last index 255).
+        // pyre legacy assembler still emits u16 operands, so this hook
+        // gates the migration: if any production trace exceeds the
+        // canonical ceiling per kind, the migration plan must grow a
+        // spill mechanism before continuing.
+        let total_i = self.num_regs_i as usize + self.constants_i.len();
+        let total_r = self.num_regs_r as usize + self.constants_r.len();
+        let total_f = self.num_regs_f as usize + self.constants_f.len();
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[bcenc-audit] {:?} regs i={} r={} f={} consts i={} r={} f={} total i={} r={} f={}",
+                self.name,
+                self.num_regs_i,
+                self.num_regs_r,
+                self.num_regs_f,
+                self.constants_i.len(),
+                self.constants_r.len(),
+                self.constants_f.len(),
+                total_i,
+                total_r,
+                total_f,
+            );
+        }
+        // RPython `jitcode.py:36` ceiling: `num_regs_X < 256` per kind.
+        assert!(
+            (self.num_regs_i as usize) < 256
+                && (self.num_regs_r as usize) < 256
+                && (self.num_regs_f as usize) < 256,
+            "jitcode {:?} exceeds RPython jitcode.py:36 num_regs ceiling \
+             (num_regs i={} r={} f={})",
+            self.name,
+            self.num_regs_i,
+            self.num_regs_r,
+            self.num_regs_f,
+        );
+        // RPython `assembler.py:132-133` ceiling: last unified slot
+        // index `num_regs + len(consts) - 1 < 256`, i.e. `total <= 256`.
+        assert!(
+            total_i <= 256 && total_r <= 256 && total_f <= 256,
+            "jitcode {:?} exceeds canonical 1-byte register pool \
+             (i_total={total_i} r_total={total_r} f_total={total_f}); \
+             see TODO-bytecode-encoding-unification.md Stage 1.3",
+            self.name,
+        );
         let body = majit_translate::jitcode::JitCodeBody {
             // RPython `jitcode.py:17 self.calldescr = calldescr` — the
             // value was stored on the builder via `set_calldescr` (the
@@ -1908,6 +2092,14 @@ impl JitCodeBuilder {
 
     fn push_u8(&mut self, value: u8) {
         self.code.push(value);
+    }
+
+    fn push_reg_u8(&mut self, reg: u16, context: &'static str) {
+        assert!(
+            reg <= u8::MAX as u16,
+            "{context}: register {reg} does not fit canonical u8 operand"
+        );
+        self.push_u8(reg as u8);
     }
 
     fn push_u16(&mut self, value: u16) {
@@ -2193,6 +2385,51 @@ impl JitCodeBuilder {
     }
 }
 
+fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool {
+    match (lhs, rhs) {
+        (
+            CanonicalBhDescr::VableField { index: lhs },
+            CanonicalBhDescr::VableField { index: rhs },
+        ) => lhs == rhs,
+        (
+            CanonicalBhDescr::VableArray { index: lhs },
+            CanonicalBhDescr::VableArray { index: rhs },
+        ) => lhs == rhs,
+        (
+            CanonicalBhDescr::Array {
+                base_size: lhs_base_size,
+                itemsize: lhs_itemsize,
+                type_id: lhs_type_id,
+                item_type: lhs_item_type,
+                is_array_of_pointers: lhs_is_array_of_pointers,
+                is_array_of_structs: lhs_is_array_of_structs,
+                is_item_signed: lhs_is_item_signed,
+                interior_fields: lhs_interior_fields,
+            },
+            CanonicalBhDescr::Array {
+                base_size: rhs_base_size,
+                itemsize: rhs_itemsize,
+                type_id: rhs_type_id,
+                item_type: rhs_item_type,
+                is_array_of_pointers: rhs_is_array_of_pointers,
+                is_array_of_structs: rhs_is_array_of_structs,
+                is_item_signed: rhs_is_item_signed,
+                interior_fields: rhs_interior_fields,
+            },
+        ) => {
+            lhs_base_size == rhs_base_size
+                && lhs_itemsize == rhs_itemsize
+                && lhs_type_id == rhs_type_id
+                && lhs_item_type == rhs_item_type
+                && lhs_is_array_of_pointers == rhs_is_array_of_pointers
+                && lhs_is_array_of_structs == rhs_is_array_of_structs
+                && lhs_is_item_signed == rhs_is_item_signed
+                && lhs_interior_fields == rhs_interior_fields
+        }
+        _ => false,
+    }
+}
+
 /// RPython `assembler.py:218-231 get_liveness_info(insn, kind)` adapted
 /// for the flat-state JIT: every state_field slot is permanently live,
 /// so the canonical `(live_i, live_r, live_f)` triple just enumerates
@@ -2268,13 +2505,55 @@ mod tests {
         // `len(code)` after all operands are emitted. These helper-side
         // adapters are not canonical argcode layouts, but their result
         // byte is still the last operand consumed by make_result_of_lastop.
-        assert_resulttype_after(|b| b.vable_getfield_int(0, 1), 'i');
-        assert_resulttype_after(|b| b.vable_getfield_ref(0, 1), 'r');
-        assert_resulttype_after(|b| b.vable_getfield_float(0, 1), 'f');
-        assert_resulttype_after(|b| b.vable_getarrayitem_int(0, 1, 2), 'i');
-        assert_resulttype_after(|b| b.vable_getarrayitem_ref(0, 1, 2), 'r');
-        assert_resulttype_after(|b| b.vable_getarrayitem_float(0, 1, 2), 'f');
-        assert_resulttype_after(|b| b.vable_arraylen(0, 1), 'i');
+        let vr = 0;
+        assert_resulttype_after(|b| b.vable_getfield_int_with_base(0, vr, 1), 'i');
+        assert_resulttype_after(|b| b.vable_getfield_ref_with_base(0, vr, 1), 'r');
+        assert_resulttype_after(|b| b.vable_getfield_float_with_base(0, vr, 1), 'f');
+        assert_resulttype_after(|b| b.vable_getarrayitem_int_with_base(0, vr, 1, 2), 'i');
+        assert_resulttype_after(|b| b.vable_getarrayitem_ref_with_base(0, vr, 1, 2), 'r');
+        assert_resulttype_after(|b| b.vable_getarrayitem_float_with_base(0, vr, 1, 2), 'f');
+        assert_resulttype_after(|b| b.vable_arraylen_with_base(0, vr, 1), 'i');
+    }
+
+    #[test]
+    fn canonical_vable_field_emit_uses_base_reg_and_descr_pool() {
+        let mut builder = JitCodeBuilder::new();
+        builder.vable_getfield_ref_with_base(2, 1, 3);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("getfield_vable_r/rd>r");
+        assert_eq!(jitcode.code, vec![opcode, 1, 0, 0, 2]);
+        assert!(matches!(
+            &jitcode.exec.descrs[0],
+            RuntimeBhDescr::Descr(CanonicalBhDescr::VableField { index: 3 })
+        ));
+        assert_eq!(
+            jitcode
+                .body()
+                .resulttypes
+                .as_ref()
+                .and_then(|resulttypes| resulttypes.get(&5).copied()),
+            Some('r')
+        );
+    }
+
+    #[test]
+    fn canonical_vable_array_emit_uses_two_descrs() {
+        let mut builder = JitCodeBuilder::new();
+        builder.vable_getarrayitem_ref_with_base(4, 1, 7, 2);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("getarrayitem_vable_r/ridd>r");
+        assert_eq!(jitcode.code, vec![opcode, 1, 2, 0, 0, 1, 0, 4]);
+        assert!(matches!(
+            &jitcode.exec.descrs[0],
+            RuntimeBhDescr::Descr(CanonicalBhDescr::VableArray { index: 7 })
+        ));
+        assert!(matches!(
+            &jitcode.exec.descrs[1],
+            RuntimeBhDescr::Descr(CanonicalBhDescr::Array {
+                item_type: majit_ir::value::Type::Ref,
+                ..
+            })
+        ));
     }
 
     #[test]

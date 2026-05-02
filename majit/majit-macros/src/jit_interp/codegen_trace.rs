@@ -41,6 +41,32 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &promote_preamble));
 
     let label_closure = quote! { |_unused_pc| 0usize };
+    let trace_jitcode_call = if config.virtualizable_decl.is_some() {
+        quote! {
+            let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
+                return TraceAction::Abort;
+            };
+            let __jitcode_args = [__vable_argbox];
+            let __result = majit_metainterp::trace_jitcode_observer_with_args(
+                __ctx,
+                __sym,
+                &__jitcode,
+                pc,
+                #label_closure,
+                &__jitcode_args,
+            );
+        }
+    } else {
+        quote! {
+            let __result = majit_metainterp::trace_jitcode_observer(
+                __ctx,
+                __sym,
+                &__jitcode,
+                pc,
+                #label_closure,
+            );
+        }
+    };
 
     let _ = has_pre_dispatch_promote;
     let trace_fn_body = quote! {
@@ -82,13 +108,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             // second time. The IR call op recorded above runs at compiled-
             // trace runtime; the outer/metainterp pair stays single-execution
             // per recording iter.
-            let __result = majit_metainterp::trace_jitcode_observer(
-                __ctx,
-                __sym,
-                &__jitcode,
-                pc,
-                #label_closure,
-            );
+            #trace_jitcode_call
             if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
                 eprintln!(
                     "[jit] trace action at pc={} op={} -> {:?}",

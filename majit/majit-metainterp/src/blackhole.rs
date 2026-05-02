@@ -1490,6 +1490,59 @@ impl BlackholeInterpreter {
         jitcode::read_u16(&self.jitcode.code, &mut self.position)
     }
 
+    fn peek_u16_at(&self, pos: usize) -> Option<u16> {
+        let code = &self.jitcode.code;
+        if pos + 1 >= code.len() {
+            return None;
+        }
+        Some((code[pos] as u16) | ((code[pos + 1] as u16) << 8))
+    }
+
+    fn runtime_bh_descr(&self, descr_idx: usize) -> Option<&BhDescr> {
+        if let Some(entry) = self.jitcode.exec.descrs.get(descr_idx) {
+            return entry.as_bh_descr();
+        }
+        self.descrs.get(descr_idx)
+    }
+
+    /// Read the static-field index from a canonical `VableField` descr
+    /// pool entry at `pos`. Panics if the bytes do not point at a
+    /// `BhDescr::VableField` — Stage 3c-3 collapses the dual-mode
+    /// auto-detect, so callers must already be on the canonical layout
+    /// (`assembler.py:165-167` + `:197-207`).
+    fn vable_field_index_at(&self, pos: usize) -> usize {
+        let idx = self
+            .peek_u16_at(pos)
+            .expect("vable_field_index_at: descr operand out of bounds");
+        match self.runtime_bh_descr(idx as usize) {
+            Some(BhDescr::VableField { index }) => *index,
+            other => {
+                panic!("vable_field_index_at: expected VableField at descr {idx}, got {other:?}")
+            }
+        }
+    }
+
+    /// Read the array-field index from a canonical
+    /// (`VableArray`, `Array`) descr pool pair at `field_pos` /
+    /// `array_pos`. Panics if either entry is missing or the wrong
+    /// variant — see [`Self::vable_field_index_at`].
+    fn vable_array_index_pair_at(&self, field_pos: usize, array_pos: usize) -> usize {
+        let field_idx = self
+            .peek_u16_at(field_pos)
+            .expect("vable_array_index_pair_at: field descr out of bounds");
+        let array_idx = self
+            .peek_u16_at(array_pos)
+            .expect("vable_array_index_pair_at: array descr out of bounds");
+        let field_descr = self.runtime_bh_descr(field_idx as usize);
+        let array_descr = self.runtime_bh_descr(array_idx as usize);
+        match (field_descr, array_descr) {
+            (Some(BhDescr::VableArray { index }), Some(BhDescr::Array { .. })) => *index,
+            other => panic!(
+                "vable_array_index_pair_at: expected (VableArray, Array) at descrs ({field_idx}, {array_idx}), got {other:?}"
+            ),
+        }
+    }
+
     fn bh_binop_i(&mut self, opcode: OpCode) {
         let dst = self.next_u16() as usize;
         let lhs_idx = self.next_u16() as usize;
@@ -2507,35 +2560,41 @@ impl BlackholeInterpreter {
                 }
             }
             // -- State field access --
-            jitcode::BC_LOAD_STATE_FIELD | jitcode::BC_LOAD_STATE_VARRAY => {
+            // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
+            // `i` = u8 register index (`assembler.py:165-167`).
+            jitcode::BC_LOAD_STATE_FIELD => {
+                // /di : u16 descr + u8 dst = 3 bytes
                 let _field_idx = self.next_u16();
-                let _dst = self.next_u16();
+                let _dst = self.next_u8();
                 // No-op in blackhole: state fields are only meaningful
                 // during tracing with a JitCodeSym.
             }
-            jitcode::BC_STORE_STATE_FIELD | jitcode::BC_STORE_STATE_VARRAY => {
+            jitcode::BC_STORE_STATE_FIELD => {
                 let _field_idx = self.next_u16();
-                let _src = self.next_u16();
+                let _src = self.next_u8();
             }
-            jitcode::BC_LOAD_STATE_ARRAY => {
+            jitcode::BC_LOAD_STATE_ARRAY | jitcode::BC_LOAD_STATE_VARRAY => {
+                // /dii : u16 descr + u8 index + u8 dst = 4 bytes
                 let _array_idx = self.next_u16();
-                let _elem_idx = self.next_u16();
-                let _dst = self.next_u16();
+                let _elem_idx = self.next_u8();
+                let _dst = self.next_u8();
             }
-            jitcode::BC_STORE_STATE_ARRAY => {
+            jitcode::BC_STORE_STATE_ARRAY | jitcode::BC_STORE_STATE_VARRAY => {
                 let _array_idx = self.next_u16();
-                let _elem_idx = self.next_u16();
-                let _src = self.next_u16();
+                let _elem_idx = self.next_u8();
+                let _src = self.next_u8();
             }
             // -- Virtualizable field/array access --
             // blackhole.py:1446-1458 bhimpl_getfield_vable_i/r/f:
             //   fielddescr.get_vinfo().clear_vable_token(struct)
             //   return cpu.bh_getfield_gc_i/r/f(struct, fielddescr)
             jitcode::BC_GETFIELD_VABLE_I => {
-                let field_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
+                let field_idx = self.vable_field_index_at(self.position + 1);
+                let base = self.next_u8() as usize;
+                self.position += 2;
+                let dst = self.next_u8() as usize;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 // virtualizable.py:218-222 clear_vable_token
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let offset = vinfo.static_fields[field_idx].offset;
@@ -2543,20 +2602,24 @@ impl BlackholeInterpreter {
                 self.registers_i[dst] = value;
             }
             jitcode::BC_GETFIELD_VABLE_R => {
-                let field_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
+                let field_idx = self.vable_field_index_at(self.position + 1);
+                let base = self.next_u8() as usize;
+                self.position += 2;
+                let dst = self.next_u8() as usize;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let offset = vinfo.static_fields[field_idx].offset;
                 let value = unsafe { *(ptr.add(offset) as *const i64) };
                 self.registers_r[dst] = value;
             }
             jitcode::BC_GETFIELD_VABLE_F => {
-                let field_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
+                let field_idx = self.vable_field_index_at(self.position + 1);
+                let base = self.next_u8() as usize;
+                self.position += 2;
+                let dst = self.next_u8() as usize;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let offset = vinfo.static_fields[field_idx].offset;
                 let value = unsafe { *(ptr.add(offset) as *const i64) };
@@ -2564,30 +2627,36 @@ impl BlackholeInterpreter {
             }
             // blackhole.py:1485-1495 bhimpl_setfield_vable_i/r/f
             jitcode::BC_SETFIELD_VABLE_I => {
-                let field_idx = self.next_u16() as usize;
-                let src = self.next_u16() as usize;
+                let field_idx = self.vable_field_index_at(self.position + 2);
+                let base = self.next_u8() as usize;
+                let src = self.next_u8() as usize;
+                self.position += 2;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let offset = vinfo.static_fields[field_idx].offset;
                 let value = self.registers_i[src];
                 unsafe { *(ptr.add(offset) as *mut i64) = value };
             }
             jitcode::BC_SETFIELD_VABLE_R => {
-                let field_idx = self.next_u16() as usize;
-                let src = self.next_u16() as usize;
+                let field_idx = self.vable_field_index_at(self.position + 2);
+                let base = self.next_u8() as usize;
+                let src = self.next_u8() as usize;
+                self.position += 2;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let offset = vinfo.static_fields[field_idx].offset;
                 let value = self.registers_r[src];
                 unsafe { *(ptr.add(offset) as *mut i64) = value };
             }
             jitcode::BC_SETFIELD_VABLE_F => {
-                let field_idx = self.next_u16() as usize;
-                let src = self.next_u16() as usize;
+                let field_idx = self.vable_field_index_at(self.position + 2);
+                let base = self.next_u8() as usize;
+                let src = self.next_u8() as usize;
+                self.position += 2;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let offset = vinfo.static_fields[field_idx].offset;
                 let value = self.registers_f[src];
@@ -2601,11 +2670,14 @@ impl BlackholeInterpreter {
             | jitcode::BC_GETARRAYITEM_VABLE_R
             | jitcode::BC_GETARRAYITEM_VABLE_F => {
                 let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
-                let array_idx = self.next_u16() as usize;
-                let index_reg = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
+                let array_idx =
+                    self.vable_array_index_pair_at(self.position + 2, self.position + 4);
+                let base = self.next_u8() as usize;
+                let index_reg = self.next_u8() as usize;
+                self.position += 4;
+                let dst = self.next_u8() as usize;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let ainfo = &vinfo.array_fields[array_idx];
                 let index = self.registers_i[index_reg] as usize;
@@ -2629,11 +2701,14 @@ impl BlackholeInterpreter {
             | jitcode::BC_SETARRAYITEM_VABLE_R
             | jitcode::BC_SETARRAYITEM_VABLE_F => {
                 let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
-                let array_idx = self.next_u16() as usize;
-                let index_reg = self.next_u16() as usize;
-                let src = self.next_u16() as usize;
+                let array_idx =
+                    self.vable_array_index_pair_at(self.position + 3, self.position + 5);
+                let base = self.next_u8() as usize;
+                let index_reg = self.next_u8() as usize;
+                let src = self.next_u8() as usize;
+                self.position += 4;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let ainfo = &vinfo.array_fields[array_idx];
                 let index = self.registers_i[index_reg] as usize;
@@ -2654,10 +2729,13 @@ impl BlackholeInterpreter {
             }
             // blackhole.py:1406-1409 bhimpl_arraylen_vable
             jitcode::BC_ARRAYLEN_VABLE => {
-                let array_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
+                let array_idx =
+                    self.vable_array_index_pair_at(self.position + 1, self.position + 3);
+                let base = self.next_u8() as usize;
+                self.position += 4;
+                let dst = self.next_u8() as usize;
+                let ptr = self.registers_r[base] as *mut u8;
                 let vinfo = unsafe { &*self.virtualizable_info };
-                let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let ainfo = &vinfo.array_fields[array_idx];
                 let len =
@@ -2665,6 +2743,7 @@ impl BlackholeInterpreter {
                 self.registers_i[dst] = len as i64;
             }
             jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
+                let _vable_reg = self.next_u8();
                 // No-op in blackhole
             }
             other => {
@@ -5087,24 +5166,25 @@ fn handler_abort_result_marker_i(
 // table-driven invariant.
 
 /// No-op handler for `load_state_field/di` / `store_state_field/di` —
-/// 2× u16 operands (4 bytes total).
+/// canonical encoding per `assembler.py`: 1× u16 descr + 1× u8 register
+/// = 3 bytes total.
 fn handler_state_field_noop_di(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position + 4)
+    Ok(position + 3)
 }
 
 /// No-op handler for `load_state_array/dii` / `store_state_array/dii` /
-/// `load_state_varray/dii` / `store_state_varray/dii` — 3× u16 operands
-/// (6 bytes total).
+/// `load_state_varray/dii` / `store_state_varray/dii` — canonical
+/// encoding: 1× u16 descr + 2× u8 register = 4 bytes total.
 fn handler_state_array_noop_dii(
     _bh: &mut BlackholeInterpreter,
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position + 6)
+    Ok(position + 4)
 }
 
 /// Handler for `jit_merge_point/iIRFIRF` — `BC_JIT_MERGE_POINT`.
@@ -5772,6 +5852,12 @@ fn handler_unreachable(
 #[inline]
 fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a BhDescr, usize) {
     let descr_idx = (code[pos] as usize) | ((code[pos + 1] as usize) << 8);
+    if let Some(entry) = bh.jitcode.exec.descrs.get(descr_idx) {
+        let descr = entry.as_bh_descr().unwrap_or_else(|| {
+            panic!("d-arg descrs[{descr_idx}] is not a BhDescr entry: {entry:?}")
+        });
+        return (descr, pos + 2);
+    }
     let descr = &bh.descrs[descr_idx]; // RPython: no fallback, index must be valid
     (descr, pos + 2)
 }

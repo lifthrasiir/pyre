@@ -6,7 +6,7 @@ pub use dispatch::{
     ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack,
     consume_observed_float_call, consume_observed_int_call, consume_observed_ref_call,
     consume_observed_void_call, observer_arg_to_i64, observer_i64_to_value, trace_jitcode,
-    trace_jitcode_observer,
+    trace_jitcode_observer, trace_jitcode_observer_with_args, trace_jitcode_with_args,
 };
 pub(crate) use dispatch::{
     call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i,

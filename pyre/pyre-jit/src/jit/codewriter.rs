@@ -1253,10 +1253,10 @@ fn record_graph_op(
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py:1898-1906 do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
-/// arraydescr]`. `v_base` is the single-frame sentinel
-/// `Constant::none()` (lowers to `Operand::ConstRef(0)` via
-/// `flatten_constant_operand` per `assembler.py:109` null Ref
-/// handling); the trailing two operands are the
+/// arraydescr]`. `v_base` is the portal frame Variable produced by
+/// `portal_graph_inputvars(code).0` — matching jtransform.py:840 where
+/// the JIT driver's red `frame` arg is threaded into every vable op
+/// from the start. The trailing two operands are the
 /// `vable_array_field_descr` / `vable_array_descr` singletons from
 /// `majit_ir::descr` (matching `virtualizable.py:73,58` 1:1 — Arc
 /// identity is preserved across calls so `flatten_descr_by_ptr`
@@ -1267,11 +1267,12 @@ fn record_graph_op(
 /// today; the type signature is shaped to allow multi-array
 /// virtualizables.
 fn vable_setarrayitem_ref_graph_args(
+    v_base: super::flow::SpaceOperationArg,
     v_idx: super::flow::SpaceOperationArg,
     v_value: super::flow::SpaceOperationArg,
 ) -> Vec<super::flow::SpaceOperationArg> {
     vec![
-        super::flow::Constant::none().into(),
+        v_base,
         v_idx,
         v_value,
         majit_ir::descr::vable_array_field_descr(0).into(),
@@ -1284,12 +1285,14 @@ fn vable_setarrayitem_ref_graph_args(
 /// (vable branch): `[v_base, v_index, arrayfielddescr, arraydescr]`.
 /// Counterpart of `vable_setarrayitem_ref_graph_args` for the read
 /// side; the result Variable is supplied by the caller to
-/// `emit_graph_op_with_result`.
+/// `emit_graph_op_with_result`. `v_base` is the portal frame Variable
+/// from `portal_graph_inputvars(code).0` per jtransform.py:840.
 fn vable_getarrayitem_ref_graph_args(
+    v_base: super::flow::SpaceOperationArg,
     v_idx: super::flow::SpaceOperationArg,
 ) -> Vec<super::flow::SpaceOperationArg> {
     vec![
-        super::flow::Constant::none().into(),
+        v_base,
         v_idx,
         majit_ir::descr::vable_array_field_descr(0).into(),
         majit_ir::descr::vable_array_descr(0).into(),
@@ -1298,16 +1301,18 @@ fn vable_getarrayitem_ref_graph_args(
 
 /// Build the 3-arg `setfield_vable_i` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py:927-928` setfield (vable
-/// branch): `[v_inst, v_value, descr]`.  `Constant::none()` stands in
-/// for the implicit single-frame `v_inst`; the trailing
-/// `vable_static_field_descr(idx)` singleton mirrors
-/// `virtualizable.py:71 static_field_descrs[idx]`.
+/// branch): `[v_inst, v_value, descr]`.  `v_inst` is the portal frame
+/// Variable from `portal_graph_inputvars(code).0` per
+/// jtransform.py:840 (the JIT driver's red `frame` arg threaded into
+/// every vable op). The trailing `vable_static_field_descr(idx)`
+/// singleton mirrors `virtualizable.py:71 static_field_descrs[idx]`.
 fn vable_setfield_int_graph_args(
+    v_inst: super::flow::SpaceOperationArg,
     v_value: super::flow::SpaceOperationArg,
     field_idx: u16,
 ) -> Vec<super::flow::SpaceOperationArg> {
     vec![
-        super::flow::Constant::none().into(),
+        v_inst,
         v_value,
         majit_ir::descr::vable_static_field_descr(field_idx).into(),
     ]
@@ -2806,6 +2811,12 @@ impl CodeWriter {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) -> PyJitCode {
+        // jtransform.py:840 — the portal `frame` (and `ec`) red args are
+        // threaded into every vable op from the start. Compute the graph
+        // Variables once at function entry so all vable graph-shadow
+        // emit sites can reference the same `frame_var`/`ec_var` pair
+        // (instead of substituting a `Constant::none()` sentinel).
+        let (frame_var, ec_var) = portal_graph_inputvars(code);
         // RPython codewriter.py:46-48 `regallocs[kind] = perform_register_allocation(graph, kind)`.
         // pyre's regalloc is trivial — fast locals occupy the bottom of
         // the ref register file and the operand stack stacks above
@@ -3133,6 +3144,7 @@ impl CodeWriter {
                         &current_block.block(),
                         "setfield_vable_i",
                         vable_setfield_int_graph_args(
+                            frame_var.into(),
                             v_depth.into(),
                             VABLE_VALUESTACKDEPTH_FIELD_IDX,
                         ),
@@ -3143,6 +3155,7 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, scratch_depth, depth_value);
                     emit_vable_setfield_int!(
                         ssarepr,
+                        portal_frame_reg,
                         VABLE_VALUESTACKDEPTH_FIELD_IDX,
                         scratch_depth
                     );
@@ -3676,31 +3689,27 @@ impl CodeWriter {
         // `jtransform.py:846-847` emits `getfield_vable_<kind>` with
         // **2 args + result**: `[v_inst, descr]` → `op.result`;
         // `jtransform.py:927-928` emits `setfield_vable_<kind>` with
-        // **3 args**: `[v_inst, v_value, descr]`. Pyre matches the
-        // upstream shape end-to-end:
+        // **3 args**: `[v_inst, v_value, descr]`. Pyre matches that shape
+        // end-to-end across all three layers:
         //
-        // - **GRAPH layer** (`record_graph_op("setfield_vable_i", …)` —
-        //   Slice 3): `vable_setfield_int_graph_args(v_value, idx)`
-        //   builds `[Constant::none(), v_value,
-        //   vable_static_field_descr(idx).into()]`. The trailing descr
-        //   is a singleton `Arc<dyn Descr>` in `majit_ir::descr`
-        //   mirroring `rpython/jit/metainterp/virtualizable.py:71`.
+        // - **GRAPH layer** (`record_graph_op("setfield_vable_i", …)`):
+        //   `vable_setfield_int_graph_args(v_inst, v_value, idx)` carries
+        //   the portal frame Variable (`portal_graph_inputvars(code).0`,
+        //   per `jtransform.py:840`) as `v_inst`, threaded by the call
+        //   sites via `frame_var.into()` (Stage 3 Issue 2.3 —
+        //   graph-shadow `v_inst/v_base` parity landed).
         // - **SSARepr layer** (`emit_vable_setfield_int!` /
-        //   `emit_vable_getfield_ref!`): setfield = `[Operand::ConstRef(0),
+        //   `emit_vable_getfield_ref!`): setfield = `[reg(Ref, frame),
         //   reg(Int, src), descr_vable_static_field(idx)]`; getfield =
-        //   `[Operand::ConstRef(0), descr_vable_static_field(idx)]`
-        //   with a Ref result.  `flatten_arg` lowers graph-side
+        //   `[reg(Ref, frame), descr_vable_static_field(idx)]` with a
+        //   Ref result.  `flatten_arg` lowers graph-side
         //   `SpaceOperationArg::Descr` to the matching `Operand::Descr`
         //   via `flatten_descr_by_ptr` (Arc::ptr_eq against the
         //   singleton) — same shape end-to-end.
-        // - **Assembler dispatch** at `assembler.rs:875`
-        //   (`getfield_vable_r`) and `:887` (`setfield_vable_i`):
-        //   extracts `field_idx` from the trailing
-        //   `VableStaticField` descr, ignores `v_base` (single-frame
-        //   implicit `state.frame`), and lowers to the existing
-        //   `vable_getfield_*` / `vable_setfield_*` builder API.
-        //   Mirrors `assembler.py:80-138 emit_const`'s role of
-        //   compressing descr operands into bytecode bytes.
+        // - **Assembler dispatch** lowers that exact `[r, d]` / `[r, X, d]`
+        //   shape to the canonical `JitCodeBuilder::*_with_base` emitters:
+        //   one-byte vable/value registers plus a two-byte descriptor-pool
+        //   index, matching `assembler.py:80-138`.
         //
         // Graph-side shadow for `getfield_vable_r` intentionally
         // absent: jtransform.py:919-922 `do_fixed_list_getitem`
@@ -3714,22 +3723,23 @@ impl CodeWriter {
         //
         // The remaining vable scalar variants (`getfield_vable_i/f`,
         // `setfield_vable_r/f`) have assembler dispatch arms but no
-        // production emit site today.  The dispatch arms keep their
-        // pre-orthodox 2-arg shape (`[ConstInt(field_idx), reg(...)]`)
-        // until an emit site lands; per `/parity` rule "don't add
-        // speculatively without consumer".
+        // production emit site today; those arms already require the same
+        // canonical `[v_inst, ... descr]` operand shape.
         macro_rules! emit_vable_getfield_ref {
-            ($ssarepr:expr, $dst:expr, $field_idx:expr) => {{
+            ($ssarepr:expr, $vable_reg:expr, $dst:expr, $field_idx:expr) => {{
+                let vable_reg: u16 = $vable_reg;
                 let dst = $dst;
                 let field_idx: u16 = $field_idx;
                 // `jtransform.py:846-847` getfield: `[v_inst, descr]` → result.
-                // `Operand::ConstRef(0)` is the v_inst sentinel — pyre's
-                // single-frame model leaves the frame implicit at
-                // `state.frame`; the operand exists for shape parity.
+                // `args[0]` is the vable register holding the live frame
+                // pointer — `portal_frame_reg` is filled by
+                // `BlackholeInterpreter::fill_portal_registers` at portal
+                // entry and encoded by the assembler as the canonical
+                // leading `r` operand.
                 let insn = Insn::op_with_result(
                     "getfield_vable_r",
                     vec![
-                        Operand::ConstRef(0),
+                        Operand::reg(Kind::Ref, vable_reg),
                         Operand::descr_vable_static_field(field_idx),
                     ],
                     Register::new(Kind::Ref, dst),
@@ -3738,16 +3748,17 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_vable_setfield_int {
-            ($ssarepr:expr, $field_idx:expr, $src:expr) => {{
+            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $src:expr) => {{
+                let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let src = $src;
                 // `jtransform.py:927-928` setfield: `[v_inst, v_value, descr]`.
-                // `Operand::ConstRef(0)` is the v_inst sentinel — see
+                // `args[0]` is the vable register — see
                 // `emit_vable_getfield_ref!` for rationale.
                 let insn = Insn::op(
                     "setfield_vable_i",
                     vec![
-                        Operand::ConstRef(0),
+                        Operand::reg(Kind::Ref, vable_reg),
                         Operand::reg(Kind::Int, src),
                         Operand::descr_vable_static_field(field_idx),
                     ],
@@ -3763,55 +3774,57 @@ impl CodeWriter {
         // arrayfielddescr, arraydescr]`; `jtransform.py:1898-1906
         // do_fixed_list_setitem` emits `setarrayitem_vable_X` with
         // **5 args**: `[v_base, v_index, v_value, arrayfielddescr,
-        // arraydescr]`.  Pyre matches the upstream shape end-to-end:
+        // arraydescr]`.  Pyre matches that shape end-to-end across all
+        // three layers:
         //
         // - **GRAPH layer** (`record_graph_op("setarrayitem_vable_r",
-        //   …)`): `vable_setarrayitem_ref_graph_args(v_idx, v_value)`
-        //   builds `[Constant::none(), v_idx, v_value,
-        //   SpaceOperationArg::Descr(vable_array_field_descr(0)),
-        //   SpaceOperationArg::Descr(vable_array_descr(0))]`.  The
-        //   two trailing descrs are singleton `Arc<dyn Descr>`s in
-        //   `majit_ir::descr` mirroring
-        //   `rpython/jit/metainterp/virtualizable.py:73,58`.
+        //   …)`): `vable_setarrayitem_ref_graph_args(v_base, v_idx,
+        //   v_value)` carries the portal frame Variable
+        //   (`portal_graph_inputvars(code).0`, per `jtransform.py:840`)
+        //   as `v_base`, threaded by the call sites via
+        //   `frame_var.into()` (Stage 3 Issue 2.3 — graph-shadow
+        //   `v_base/v_inst` parity landed).  When the value being stored
+        //   is a true `ConstPtr` lifted to the bytecode const-pool,
+        //   `v_value` is recorded as a `Constant::none()` placeholder
+        //   (the live SSA register is patched at bytecode-finish time
+        //   via `vable_setarrayitem_ref_const_value_with_base`); the
+        //   bytecode shape stays identical.  The two trailing descrs
+        //   are singleton `Arc<dyn Descr>`s in `majit_ir::descr`
+        //   mirroring `rpython/jit/metainterp/virtualizable.py:73,58`.
         // - **SSARepr layer** (`emit_vable_setarrayitem_ref!` /
         //   `emit_vable_setarrayitem_ref_const!`):
-        //   `[Operand::ConstRef(0), reg(Int, idx), reg(Ref, src) |
+        //   `[reg(Ref, frame), reg(Int, idx), reg(Ref, src) |
         //   ConstRef(value), descr_vable_array_field(idx),
         //   descr_vable_array(idx)]`.  `flatten_arg` lowers
         //   graph-side `SpaceOperationArg::Descr` to the matching
         //   `Operand::Descr` via `flatten_descr_by_ptr` (Arc::ptr_eq
         //   against the singletons) — same shape end-to-end.
-        // - **Assembler dispatch** at `assembler.rs:905`
-        //   (`getarrayitem_vable_r`) and `:926`
-        //   (`setarrayitem_vable_r`): extracts `array_idx` from the
-        //   trailing `VableArrayField` descr (sanity-checks
-        //   `VableArray` matches), ignores `v_base` (single-frame
-        //   implicit `state.frame`), and lowers to the existing
-        //   3-arg builder API.  Mirrors `assembler.py:80-138
-        //   emit_const`'s role of compressing descr operands into
-        //   bytecode bytes.
+        // - **Assembler dispatch** extracts and validates the two trailing
+        //   descrs, then emits canonical `[r, i, d, d, >r]` /
+        //   `[r, i, r, d, d]` bytecode through `JitCodeBuilder::*_with_base`.
         //
         // The remaining vable op family variants
         // (`getarrayitem_vable_i/f`, `setarrayitem_vable_i/f`,
         // `arraylen_vable`) have assembler dispatch arms but no
         // production emit site today (pyre's `PyFrame
         // .locals_cells_stack_w` carries Ref items only and its
-        // length is constant).  The arms become Slice 5+ work if
-        // and when those emit sites appear.
+        // length is constant).  The arms already require the canonical
+        // `[v_base, ... arrayfielddescr, arraydescr]` operand shape.
         macro_rules! emit_vable_getarrayitem_ref {
-            ($ssarepr:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
+            ($ssarepr:expr, $vable_reg:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
+                let vable_reg: u16 = $vable_reg;
                 let dst = $dst;
                 let field_idx: u16 = $field_idx;
                 let index = $index;
                 // `jtransform.py:1882-1885 do_fixed_list_getitem` (vable
                 // branch): `[v_base, v_index, arrayfielddescr,
                 // arraydescr]` with a Ref result.  See
-                // `emit_vable_setarrayitem_ref!` for v_base sentinel
+                // `emit_vable_setarrayitem_ref!` for v_base register
                 // rationale and the descr-pair parity citations.
                 let insn = Insn::op_with_result(
                     "getarrayitem_vable_r",
                     vec![
-                        Operand::ConstRef(0),
+                        Operand::reg(Kind::Ref, vable_reg),
                         Operand::reg(Kind::Int, index),
                         Operand::descr_vable_array_field(field_idx),
                         Operand::descr_vable_array(field_idx),
@@ -3822,23 +3835,22 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_vable_setarrayitem_ref {
-            ($ssarepr:expr, $field_idx:expr, $index:expr, $src:expr) => {{
+            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index:expr, $src:expr) => {{
+                let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let index = $index;
                 let src = $src;
                 // `jtransform.py:1898-1906 do_fixed_list_setitem` (vable
                 // branch): `[v_base, v_index, v_value, arrayfielddescr,
-                // arraydescr]`. `Operand::ConstRef(0)` is the v_base
-                // sentinel for pyre's single-frame model — `state.frame`
-                // is implicit, the operand exists for shape parity and
-                // the multi-frame flip. Trailing two descrs are
-                // `array_field_descrs[i]` /
-                // `array_descrs[i]` per
+                // arraydescr]`. `args[0]` is the vable register holding
+                // the live frame pointer (`portal_frame_reg` filled by
+                // `fill_portal_registers`).  Trailing two descrs are
+                // `array_field_descrs[i]` / `array_descrs[i]` per
                 // `rpython/jit/metainterp/virtualizable.py:73,58`.
                 let insn = Insn::op(
                     "setarrayitem_vable_r",
                     vec![
-                        Operand::ConstRef(0),
+                        Operand::reg(Kind::Ref, vable_reg),
                         Operand::reg(Kind::Int, index),
                         Operand::reg(Kind::Ref, src),
                         Operand::descr_vable_array_field(field_idx),
@@ -3853,12 +3865,13 @@ impl CodeWriter {
         // ConstPtr-source variant produced by jtransform.py:1898 when
         // the value operand is a Const. Carries `Operand::ConstRef`
         // through to the assembler dispatch, which routes it to
-        // `JitCodeBuilder::vable_setarrayitem_ref_const_value`. No
-        // separate bytecode: the existing `BC_SETARRAYITEM_VABLE_R`
-        // already supports unified-register-space const sources via
-        // the `const_patches` / `init_register_file_from_i64s` path.
+        // `JitCodeBuilder::vable_setarrayitem_ref_const_value_with_base`.
+        // No separate bytecode: the canonical `setarrayitem_vable_r/rirdd`
+        // form can address const sources through the unified ref register
+        // space after `const_patches_u8` resolution.
         macro_rules! emit_vable_setarrayitem_ref_const {
-            ($ssarepr:expr, $field_idx:expr, $index:expr, $value:expr) => {{
+            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index:expr, $value:expr) => {{
+                let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let index = $index;
                 let value: i64 = $value;
@@ -3869,7 +3882,7 @@ impl CodeWriter {
                 let insn = Insn::op(
                     "setarrayitem_vable_r",
                     vec![
-                        Operand::ConstRef(0),
+                        Operand::reg(Kind::Ref, vable_reg),
                         Operand::reg(Kind::Int, index),
                         Operand::ConstRef(value),
                         Operand::descr_vable_array_field(field_idx),
@@ -3952,13 +3965,23 @@ impl CodeWriter {
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
-                        vable_setarrayitem_ref_graph_args(v_idx.into(), src_value.into()),
+                        vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
+                            v_idx.into(),
+                            src_value.into(),
+                        ),
                         None,
                         -1,
                     );
                     let scratch_depth = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                     emit_load_const_i!($ssarepr, scratch_depth, depth_value);
-                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, scratch_depth, src_reg);
+                    emit_vable_setarrayitem_ref!(
+                        $ssarepr,
+                        portal_frame_reg,
+                        0_u16,
+                        scratch_depth,
+                        src_reg
+                    );
                 }
                 $depth += 1;
                 emit_vsd!($depth);
@@ -4005,6 +4028,7 @@ impl CodeWriter {
                         &current_block.block(),
                         "setarrayitem_vable_r",
                         vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
                             v_idx.into(),
                             super::flow::Constant::none().into(),
                         ),
@@ -4013,7 +4037,13 @@ impl CodeWriter {
                     );
                     let scratch_depth = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                     emit_load_const_i!($ssarepr, scratch_depth, depth_value);
-                    emit_vable_setarrayitem_ref_const!($ssarepr, 0_u16, scratch_depth, value);
+                    emit_vable_setarrayitem_ref_const!(
+                        $ssarepr,
+                        portal_frame_reg,
+                        0_u16,
+                        scratch_depth,
+                        value
+                    );
                 }
                 $depth += 1;
                 emit_vsd!($depth);
@@ -4054,6 +4084,7 @@ impl CodeWriter {
                         &current_block.block(),
                         "setarrayitem_vable_r",
                         vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
                             v_idx.into(),
                             super::flow::Constant::none().into(),
                         ),
@@ -4064,6 +4095,7 @@ impl CodeWriter {
                     emit_load_const_i!($ssarepr, scratch_depth, depth_value);
                     emit_vable_setarrayitem_ref_const!(
                         $ssarepr,
+                        portal_frame_reg,
                         0_u16,
                         scratch_depth,
                         pyre_object::PY_NULL as i64
@@ -4091,6 +4123,7 @@ impl CodeWriter {
                     emit_load_const_i!($ssarepr, scratch_local_idx, local_slot);
                     emit_vable_getarrayitem_ref!(
                         $ssarepr,
+                        portal_frame_reg,
                         stack_base + $depth,
                         0_u16,
                         scratch_local_idx
@@ -4131,7 +4164,7 @@ impl CodeWriter {
                         &mut graph,
                         &current_block.block(),
                         "getarrayitem_vable_r",
-                        vable_getarrayitem_ref_graph_args(v_local_idx.into()),
+                        vable_getarrayitem_ref_graph_args(frame_var.into(), v_local_idx.into()),
                         Kind::Ref,
                         -1,
                     );
@@ -4148,6 +4181,7 @@ impl CodeWriter {
                         &current_block.block(),
                         "setarrayitem_vable_r",
                         vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
                             v_stack_idx.into(),
                             loaded.clone().into(),
                         ),
@@ -4158,6 +4192,7 @@ impl CodeWriter {
                     emit_load_const_i!($ssarepr, scratch_stack_idx, stack_slot);
                     emit_vable_setarrayitem_ref!(
                         $ssarepr,
+                        portal_frame_reg,
                         0_u16,
                         scratch_stack_idx,
                         stack_base + $depth
@@ -4199,7 +4234,13 @@ impl CodeWriter {
                         scratch_local_idx,
                         local_to_vable_slot(reg as usize) as i64
                     );
-                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, scratch_local_idx, stored_reg);
+                    emit_vable_setarrayitem_ref!(
+                        $ssarepr,
+                        portal_frame_reg,
+                        0_u16,
+                        scratch_local_idx,
+                        stored_reg
+                    );
                 }
                 emit_ref_copy!($ssarepr, reg, stored_reg);
             }};
@@ -4303,7 +4344,6 @@ impl CodeWriter {
                         let jdindex = portal_jd_index
                             .expect("portal jit_merge_point requires a registered jitdriver");
                         let w_code_i64 = w_code as i64;
-                        let (frame_var, ec_var) = portal_graph_inputvars(code);
                         let graph_args = portal_jit_merge_point_graph_args(
                             &graph,
                             py_pc,
@@ -4453,6 +4493,7 @@ impl CodeWriter {
                                 &current_block.block(),
                                 "setarrayitem_vable_r",
                                 vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
                                     v_idx.into(),
                                     stored.clone().into(),
                                 ),
@@ -4520,7 +4561,12 @@ impl CodeWriter {
                         // Portal vable sync at this slot relies on the next
                         // opcode's pushvalue (LoadConst's existing A-slice 2
                         // elision documented at LoadGlobal's caveat).
-                        emit_vable_getfield_ref!(ssarepr, dst_slot, VABLE_CODE_FIELD_IDX);
+                        emit_vable_getfield_ref!(
+                            ssarepr,
+                            portal_frame_reg,
+                            dst_slot,
+                            VABLE_CODE_FIELD_IDX
+                        );
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::Plain,
@@ -4645,6 +4691,7 @@ impl CodeWriter {
                                 &current_block.block(),
                                 "setarrayitem_vable_r",
                                 vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
                                     v_store_idx.into(),
                                     stored.clone().into(),
                                 ),
@@ -4669,6 +4716,7 @@ impl CodeWriter {
                             emit_load_const_i!(ssarepr, scratch_local_idx, load_slot);
                             emit_vable_getarrayitem_ref!(
                                 ssarepr,
+                                portal_frame_reg,
                                 stack_base + current_depth,
                                 0_u16,
                                 scratch_local_idx
@@ -4721,7 +4769,10 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 "getarrayitem_vable_r",
-                                vable_getarrayitem_ref_graph_args(v_load_idx.into()),
+                                vable_getarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_load_idx.into(),
+                                ),
                                 Kind::Ref,
                                 -1,
                             );
@@ -4738,6 +4789,7 @@ impl CodeWriter {
                                 &current_block.block(),
                                 "setarrayitem_vable_r",
                                 vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
                                     v_stack_idx.into(),
                                     loaded.clone().into(),
                                 ),
@@ -4748,6 +4800,7 @@ impl CodeWriter {
                             emit_load_const_i!(ssarepr, scratch_depth, stack_slot);
                             emit_vable_setarrayitem_ref!(
                                 ssarepr,
+                                portal_frame_reg,
                                 0_u16,
                                 scratch_depth,
                                 stack_base + current_depth
@@ -5110,8 +5163,18 @@ impl CodeWriter {
                         let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         // jtransform.py: getfield_vable_r for w_globals (field 3)
                         // and pycode (field 1) — namespace for lookup, code for names.
-                        emit_vable_getfield_ref!(ssarepr, scratch_ns, VABLE_NAMESPACE_FIELD_IDX);
-                        emit_vable_getfield_ref!(ssarepr, scratch_code, VABLE_CODE_FIELD_IDX);
+                        emit_vable_getfield_ref!(
+                            ssarepr,
+                            portal_frame_reg,
+                            scratch_ns,
+                            VABLE_NAMESPACE_FIELD_IDX
+                        );
+                        emit_vable_getfield_ref!(
+                            ssarepr,
+                            portal_frame_reg,
+                            scratch_code,
+                            VABLE_CODE_FIELD_IDX
+                        );
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::MayForce,
@@ -5730,6 +5793,7 @@ impl CodeWriter {
                                     &current_block.block(),
                                     "setarrayitem_vable_r",
                                     vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
                                         v_idx.into(),
                                         stored.clone().into(),
                                     ),
@@ -5918,6 +5982,7 @@ impl CodeWriter {
                         &current_block.block(),
                         "setarrayitem_vable_r",
                         vable_setarrayitem_ref_graph_args(
+                            frame_var.into(),
                             v_idx.into(),
                             super::flow::Constant::none().into(),
                         ),
@@ -5928,6 +5993,7 @@ impl CodeWriter {
                     emit_load_const_i!(ssarepr, scratch_unwind_depth, depth_value);
                     emit_vable_setarrayitem_ref_const!(
                         ssarepr,
+                        portal_frame_reg,
                         0_u16,
                         scratch_unwind_depth,
                         pyre_object::PY_NULL as i64
@@ -5963,7 +6029,13 @@ impl CodeWriter {
                         scratch_lasti_depth,
                         (stack_base_absolute + depth as usize) as i64,
                     );
-                    emit_vable_setarrayitem_ref!(ssarepr, 0_u16, scratch_lasti_depth, exc_slot);
+                    emit_vable_setarrayitem_ref!(
+                        ssarepr,
+                        portal_frame_reg,
+                        0_u16,
+                        scratch_lasti_depth,
+                        exc_slot
+                    );
                 }
                 depth += 1;
                 emit_vsd!(depth);
@@ -5988,13 +6060,23 @@ impl CodeWriter {
                 record_graph_op(
                     &current_block.block(),
                     "setarrayitem_vable_r",
-                    vable_setarrayitem_ref_graph_args(v_idx.into(), exc_value.clone().into()),
+                    vable_setarrayitem_ref_graph_args(
+                        frame_var.into(),
+                        v_idx.into(),
+                        exc_value.clone().into(),
+                    ),
                     None,
                     -1,
                 );
                 let scratch_exc_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                 emit_load_const_i!(ssarepr, scratch_exc_depth, depth_value);
-                emit_vable_setarrayitem_ref!(ssarepr, 0_u16, scratch_exc_depth, exc_slot);
+                emit_vable_setarrayitem_ref!(
+                    ssarepr,
+                    portal_frame_reg,
+                    0_u16,
+                    scratch_exc_depth,
+                    exc_slot
+                );
             }
             // CATCH-LANDING dual-write follow-up (Task #227).
             // RPython parity: `pypy/interpreter/pyopcode.py` exception

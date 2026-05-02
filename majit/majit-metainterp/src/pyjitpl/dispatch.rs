@@ -733,25 +733,44 @@ where
         majit_ir::descr::make_array_descr(0, 8, majit_ir::Type::Int)
     }
 
-    /// pyjitpl.py: standard virtualizable → (vable_box, fielddescr).
-    /// Converts a bytecode field_idx to the cached DescrRef from VirtualizableInfo.
-    fn standard_vable_field_descr(
+    /// Resolve the box operand for a vable opcode. The canonical
+    /// bytecode (Stage 3a-3c) carries the live struct register as the
+    /// leading `r` operand — pyjitpl.py:1166-1170
+    /// `_opimpl_setfield_vable_*(struct, ...)` consumes it as the
+    /// `struct` argument.
+    fn resolve_vable_box(&mut self, vable_reg: usize) -> OpRef {
+        self.read_ref_reg(vable_reg).0
+    }
+
+    /// pyjitpl.py: vable field descriptor lookup.  Converts a bytecode
+    /// `field_idx` to the cached `DescrRef` from `VirtualizableInfo`
+    /// and pairs it with the box operand resolved by
+    /// [`resolve_vable_box`].  Mirrors the upstream
+    /// `(struct, fielddescr)` argument tuple of
+    /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
+    fn vable_field_descr(
+        &mut self,
         ctx: &TraceCtx,
+        vable_reg: usize,
         field_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
-        let vable_opref = ctx.standard_virtualizable_box()?;
+        let vable_opref = self.resolve_vable_box(vable_reg);
         let info = ctx.virtualizable_info()?;
         let descr = info.static_field_descrs().get(field_idx)?.clone();
         Some((vable_opref, descr))
     }
 
-    /// pyjitpl.py: standard virtualizable → (vable_box, array_field_descr).
-    /// Converts a bytecode array_idx to the cached array field DescrRef.
-    fn standard_vable_array_field_descr(
+    /// pyjitpl.py: vable array-field descriptor lookup.  Converts a
+    /// bytecode `array_idx` to the cached `DescrRef` from
+    /// `VirtualizableInfo` and pairs it with the box operand resolved
+    /// by [`resolve_vable_box`].
+    fn vable_array_field_descr(
+        &mut self,
         ctx: &TraceCtx,
+        vable_reg: usize,
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
-        let vable_opref = ctx.standard_virtualizable_box()?;
+        let vable_opref = self.resolve_vable_box(vable_reg);
         let info = ctx.virtualizable_info()?;
         let descr = info.array_field_descrs().get(array_idx)?.clone();
         Some((vable_opref, descr))
@@ -997,9 +1016,11 @@ where
                 let _liveness_offset = self.frames.current_mut().next_u16();
             }
             // -- State field access (register/tape machines) --
+            // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
+            // `i` = u8 register index (`assembler.py:165-167`).
             jitcode::BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let dest = self.frames.current_mut().next_u8() as usize;
                 let opref = sym
                     .state_field_ref(field_idx)
                     .expect("state field not initialized");
@@ -1010,15 +1031,15 @@ where
             }
             jitcode::BC_STORE_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (opref, value) = self.read_int_reg(src);
                 sym.set_state_field_ref(field_idx, opref);
                 sym.set_state_field_value(field_idx, value);
             }
             jitcode::BC_LOAD_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u8() as usize;
+                let dest = self.frames.current_mut().next_u8() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
                 let opref = sym.state_array_ref(array_idx, elem_idx);
@@ -1035,8 +1056,8 @@ where
             }
             jitcode::BC_STORE_STATE_ARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (_, index_concrete) = self.read_int_reg(index_reg);
                 let elem_idx = index_concrete as usize;
                 let (opref, value) = self.read_int_reg(src);
@@ -1055,10 +1076,9 @@ where
             // the live frame here — stale/shadow divergence caused the
             // issue #1 from 2026-04-18.
             jitcode::BC_GETFIELD_VABLE_I => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, field_idx, dest) = self.frames.current_mut().read_vable_getfield();
                 let Some((vable_opref, fielddescr)) =
-                    Self::standard_vable_field_descr(ctx, field_idx)
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1066,10 +1086,9 @@ where
                 self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::BC_GETFIELD_VABLE_R => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, field_idx, dest) = self.frames.current_mut().read_vable_getfield();
                 let Some((vable_opref, fielddescr)) =
-                    Self::standard_vable_field_descr(ctx, field_idx)
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1077,10 +1096,9 @@ where
                 self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::BC_GETFIELD_VABLE_F => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, field_idx, dest) = self.frames.current_mut().read_vable_getfield();
                 let Some((vable_opref, fielddescr)) =
-                    Self::standard_vable_field_descr(ctx, field_idx)
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1088,10 +1106,9 @@ where
                 self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::BC_SETFIELD_VABLE_I => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, field_idx, src) = self.frames.current_mut().read_vable_setfield();
                 let Some((vable_opref, fielddescr)) =
-                    Self::standard_vable_field_descr(ctx, field_idx)
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1099,10 +1116,9 @@ where
                 ctx.vable_setfield(vable_opref, fielddescr, value, Value::Int(concrete));
             }
             jitcode::BC_SETFIELD_VABLE_R => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, field_idx, src) = self.frames.current_mut().read_vable_setfield();
                 let Some((vable_opref, fielddescr)) =
-                    Self::standard_vable_field_descr(ctx, field_idx)
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1115,10 +1131,9 @@ where
                 );
             }
             jitcode::BC_SETFIELD_VABLE_F => {
-                let field_idx = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, field_idx, src) = self.frames.current_mut().read_vable_setfield();
                 let Some((vable_opref, fielddescr)) =
-                    Self::standard_vable_field_descr(ctx, field_idx)
+                    self.vable_field_descr(ctx, vable_reg, field_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1131,11 +1146,10 @@ where
                 );
             }
             jitcode::BC_GETARRAYITEM_VABLE_I => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, index_reg, dest) =
+                    self.frames.current_mut().read_vable_getarrayitem();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1145,11 +1159,10 @@ where
                 self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_R => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, index_reg, dest) =
+                    self.frames.current_mut().read_vable_getarrayitem();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1159,11 +1172,10 @@ where
                 self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::BC_GETARRAYITEM_VABLE_F => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, index_reg, dest) =
+                    self.frames.current_mut().read_vable_getarrayitem();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1173,11 +1185,10 @@ where
                 self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::BC_SETARRAYITEM_VABLE_I => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, index_reg, src) =
+                    self.frames.current_mut().read_vable_setarrayitem();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1193,11 +1204,10 @@ where
                 );
             }
             jitcode::BC_SETARRAYITEM_VABLE_R => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, index_reg, src) =
+                    self.frames.current_mut().read_vable_setarrayitem();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1213,11 +1223,10 @@ where
                 );
             }
             jitcode::BC_SETARRAYITEM_VABLE_F => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, index_reg, src) =
+                    self.frames.current_mut().read_vable_setarrayitem();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1233,10 +1242,9 @@ where
                 );
             }
             jitcode::BC_ARRAYLEN_VABLE => {
-                let array_idx = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let (vable_reg, array_idx, dest) = self.frames.current_mut().read_vable_arraylen();
                 let Some((vable_opref, fdescr)) =
-                    Self::standard_vable_array_field_descr(ctx, array_idx)
+                    self.vable_array_field_descr(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
@@ -1244,18 +1252,19 @@ where
                 self.set_int_reg(dest, Some(result), Some(0));
             }
             jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
-                let Some(vable_opref) = ctx.standard_virtualizable_box() else {
-                    return TraceAction::Abort;
-                };
+                let vable_reg = self.frames.current_mut().next_u8() as usize;
+                let vable_opref = self.resolve_vable_box(vable_reg);
                 ctx.gen_store_back_in_vable(vable_opref);
             }
 
             // -- Virtualizable state array access --
+            // Argcodes: `d` = u16 descr, `i` = u8 register
+            // (`assembler.py:165-167,197-207`).
             // Array stays on heap; emit raw memory load/store IR ops.
             jitcode::BC_LOAD_STATE_VARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let dest = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u8() as usize;
+                let dest = self.frames.current_mut().next_u8() as usize;
                 let (index_opref, _) = self.read_int_reg(index_reg);
                 let array_ptr = sym
                     .state_varray_ptr(array_idx)
@@ -1269,8 +1278,8 @@ where
             }
             jitcode::BC_STORE_STATE_VARRAY => {
                 let array_idx = self.frames.current_mut().next_u16() as usize;
-                let index_reg = self.frames.current_mut().next_u16() as usize;
-                let src = self.frames.current_mut().next_u16() as usize;
+                let index_reg = self.frames.current_mut().next_u8() as usize;
+                let src = self.frames.current_mut().next_u8() as usize;
                 let (index_opref, _) = self.read_int_reg(index_reg);
                 let (value_opref, _) = self.read_int_reg(src);
                 let array_ptr = sym
@@ -2501,10 +2510,28 @@ where
     S: JitCodeSym,
     FLabel: Fn(usize) -> usize,
 {
+    trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, &[])
+}
+
+/// RPython `MIFrame.setup_call(original_boxes)` entry variant for callers
+/// that have explicit JitCode argument boxes.
+pub fn trace_jitcode_with_args<S, FLabel>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    label_at: FLabel,
+    argboxes: &[(JitArgKind, OpRef, i64)],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    FLabel: Fn(usize) -> usize,
+{
     let runtime = ClosureRuntime::new(label_at);
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
-    let frame = MIFrame::setup(jitcode_arc, pc, None, Some(ctx));
+    let mut frame = MIFrame::setup(jitcode_arc, pc, None, Some(ctx));
+    frame.setup_call(argboxes);
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.run_to_end(ctx, sym, &runtime)
@@ -2538,8 +2565,24 @@ where
     S: JitCodeSym,
     FLabel: Fn(usize) -> usize,
 {
+    trace_jitcode_observer_with_args(ctx, sym, jitcode, pc, label_at, &[])
+}
+
+/// Observer-mode variant of [`trace_jitcode_with_args`].
+pub fn trace_jitcode_observer_with_args<S, FLabel>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    pc: usize,
+    label_at: FLabel,
+    argboxes: &[(JitArgKind, OpRef, i64)],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    FLabel: Fn(usize) -> usize,
+{
     let _observer_guard = ObserverGuard::enter();
-    trace_jitcode(ctx, sym, jitcode, pc, label_at)
+    trace_jitcode_with_args(ctx, sym, jitcode, pc, label_at, argboxes)
 }
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —
@@ -3216,17 +3259,23 @@ mod tests {
     #[test]
     fn jitcode_vable_reads_use_standard_boxes_without_heap_ops() {
         let mut builder = JitCodeBuilder::new();
+        let vr = 0;
+        // Canonical vable encoding (Stage 3c) reads the live struct pointer
+        // from `registers_r[vable_reg]`; pre-seed it with the standard
+        // virtualizable identity so the trace path constant-folds the
+        // reads against `standard_virtualizable_box()`.
+        builder.load_const_r_value(vr, 999);
         builder.load_const_i_value(0, 0);
-        builder.vable_getfield_int(1, 0);
-        builder.vable_getarrayitem_int(2, 0, 0);
-        builder.vable_arraylen(3, 0);
+        builder.vable_getfield_int_with_base(1, vr, 0);
+        builder.vable_getarrayitem_int_with_base(2, vr, 0, 0);
+        builder.vable_arraylen_with_base(3, vr, 0);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
         let info = make_test_vable_info();
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
-        let vable_ref = ctx.const_int(999);
+        let vable_ref = ctx.const_ref(999);
         ctx.init_virtualizable_boxes(
             &info,
             vable_ref,

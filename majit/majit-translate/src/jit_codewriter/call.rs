@@ -2352,7 +2352,7 @@ impl CallControl {
             for op in &block.operations {
                 match &op.kind {
                     // RPython: jit_force_virtualizable / jit_force_virtual
-                    OpKind::VableForce => return true,
+                    OpKind::VableForce { .. } => return true,
                     OpKind::Call { target, .. } => {
                         let callee_path = match self.target_to_path(target) {
                             Some(p) => p,
@@ -3989,7 +3989,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // ── Known raising ops ─────────────────────────────────────
         // RPython LL: jit_force_virtualizable has `canrun=True`, not
         // `canraise`; effect classification handles its special meaning.
-        OpKind::VableForce => RaiseClass::No,
+        OpKind::VableForce { .. } => RaiseClass::No,
         // RPython LL: int_floordiv, int_mod → canraise = (ZeroDivisionError,)
         OpKind::BinOp { .. } => RaiseClass::Yes, // div/mod/rem/ovf (others matched above)
         // RPython LL: int_neg_ovf → canraise = (OverflowError,)
@@ -4800,7 +4800,9 @@ mod tests {
         // A function with VableForce → ForcesVirtualOrVirtualizable.
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("forcer");
-        graph.push_op(graph.startblock, OpKind::VableForce, false);
+        let frame = graph.alloc_value();
+        graph.block_mut(graph.startblock).inputargs.push(frame);
+        graph.push_op(graph.startblock, OpKind::VableForce { base: frame }, false);
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["forcer"]);
         cc.register_function_graph(path, graph);
@@ -4810,7 +4812,7 @@ mod tests {
         let mut cache = AnalysisCache::default();
         let descriptor = cc.getcalldescr(
             &direct_call_op(target.clone()),
-            Vec::new(),
+            vec![Type::Ref],
             Type::Void,
             OopSpecIndex::None,
             None,

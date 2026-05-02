@@ -539,7 +539,7 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             operand: remap(operand),
             result_ty: result_ty.clone(),
         },
-        OpKind::VableForce => OpKind::VableForce,
+        OpKind::VableForce { base } => OpKind::VableForce { base: remap(base) },
         OpKind::JitDebug { args } => OpKind::JitDebug {
             args: args.iter().map(remap).collect(),
         },
@@ -715,13 +715,13 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFloat(_)
-        | OpKind::VableForce
         | OpKind::CurrentTraceLength
         | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. } => {
             vec![]
         }
+        OpKind::VableForce { base } => vec![*base],
         OpKind::JitMergePoint {
             greens_i,
             greens_r,

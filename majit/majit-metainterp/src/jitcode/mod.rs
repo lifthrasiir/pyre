@@ -292,6 +292,26 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("load_state_varray/dii", BC_LOAD_STATE_VARRAY);
     m.insert("store_state_varray/dii", BC_STORE_STATE_VARRAY);
 
+    // Virtualizable operations — RPython canonical argcode shapes from
+    // blackhole.py:1374-1409 and :1446-1495.  The legacy helper-side
+    // `JitCodeBuilder::vable_*` methods still emit their old compact
+    // payloads for the state-field macro path; Pyre's SSA assembler uses
+    // the `*_with_base` methods that match these keys byte-for-byte.
+    m.insert("getfield_vable_i/rd>i", BC_GETFIELD_VABLE_I);
+    m.insert("getfield_vable_r/rd>r", BC_GETFIELD_VABLE_R);
+    m.insert("getfield_vable_f/rd>f", BC_GETFIELD_VABLE_F);
+    m.insert("setfield_vable_i/rid", BC_SETFIELD_VABLE_I);
+    m.insert("setfield_vable_r/rrd", BC_SETFIELD_VABLE_R);
+    m.insert("setfield_vable_f/rfd", BC_SETFIELD_VABLE_F);
+    m.insert("getarrayitem_vable_i/ridd>i", BC_GETARRAYITEM_VABLE_I);
+    m.insert("getarrayitem_vable_r/ridd>r", BC_GETARRAYITEM_VABLE_R);
+    m.insert("getarrayitem_vable_f/ridd>f", BC_GETARRAYITEM_VABLE_F);
+    m.insert("setarrayitem_vable_i/riidd", BC_SETARRAYITEM_VABLE_I);
+    m.insert("setarrayitem_vable_r/rirdd", BC_SETARRAYITEM_VABLE_R);
+    m.insert("setarrayitem_vable_f/rifdd", BC_SETARRAYITEM_VABLE_F);
+    m.insert("arraylen_vable/rdd>i", BC_ARRAYLEN_VABLE);
+    m.insert("hint_force_virtualizable/r", BC_HINT_FORCE_VIRTUALIZABLE);
+
     // Control flow / structural markers that actually emit.
     // pyjitpl.py:2237 `op_goto = insns.get('goto/L', -1)` and
     // blackhole.py:950 `bhimpl_goto(target): return target` — the
@@ -614,6 +634,11 @@ impl JitCallArg {
 /// runtime; pyre encodes the same discrimination in the enum tag.
 #[derive(Clone, Debug)]
 pub enum RuntimeBhDescr {
+    /// Ordinary blackhole descriptor for a `d` argcode (`FieldDescr`,
+    /// `ArrayDescr`, virtualizable descriptors, ...).  RPython keeps all
+    /// of these in `BlackholeInterpBuilder.descrs`; pyre's runtime
+    /// `JitCodeBuilder` uses the per-JitCode pool described below.
+    Descr(CanonicalBhDescr),
     /// Target JitCode for a `j` argcode (`BC_INLINE_CALL`).  RPython:
     /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
     /// `isinstance(value, JitCode)`.
@@ -636,6 +661,14 @@ pub enum RuntimeBhDescr {
 }
 
 impl RuntimeBhDescr {
+    /// Extract an ordinary blackhole descriptor for `d` argcodes.
+    pub fn as_bh_descr(&self) -> Option<&CanonicalBhDescr> {
+        match self {
+            Self::Descr(descr) => Some(descr),
+            _ => None,
+        }
+    }
+
     /// RPython parity: `isinstance(value, JitCode)` assertion at
     /// `blackhole.py:156`.  Returns the callee JitCode for `BC_INLINE_CALL`.
     pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
@@ -919,73 +952,58 @@ mod tests {
             "helper-side BC_INLINE_CALL adapter must not masquerade as \
              canonical inline_call_irf_f/dIRF>f",
         );
-        // blackhole.py:1446,1485 `bhimpl_{get,set}field_vable_*` expect
-        // the canonical key shape `{get,set}field_vable_x/{rd,rxd}`
-        // with an explicit vable register in the leading `r` argcode.
-        // pyre's helper-side `BC_*FIELD_VABLE_*` adapters emit the
-        // descr + typed value operand only (the vable pointer is kept
-        // in the `BH_VABLE_PTR` thread-local), so they cannot be wired
-        // to the canonical bhimpl without first growing the vable
-        // register argcode.
-        assert!(
-            !insns.contains_key("getfield_vable_i/rd>i"),
-            "helper-side BC_GETFIELD_VABLE_I must not masquerade as \
-             canonical getfield_vable_i/rd>i",
+        assert_eq!(
+            insns.get("getfield_vable_i/rd>i"),
+            Some(&BC_GETFIELD_VABLE_I)
         );
-        assert!(
-            !insns.contains_key("getfield_vable_r/rd>r"),
-            "helper-side BC_GETFIELD_VABLE_R must not masquerade as \
-             canonical getfield_vable_r/rd>r",
+        assert_eq!(
+            insns.get("getfield_vable_r/rd>r"),
+            Some(&BC_GETFIELD_VABLE_R)
         );
-        assert!(
-            !insns.contains_key("getfield_vable_f/rd>f"),
-            "helper-side BC_GETFIELD_VABLE_F must not masquerade as \
-             canonical getfield_vable_f/rd>f",
+        assert_eq!(
+            insns.get("getfield_vable_f/rd>f"),
+            Some(&BC_GETFIELD_VABLE_F)
         );
-        assert!(
-            !insns.contains_key("setfield_vable_i/rid"),
-            "helper-side BC_SETFIELD_VABLE_I must not masquerade as \
-             canonical setfield_vable_i/rid",
+        assert_eq!(
+            insns.get("setfield_vable_i/rid"),
+            Some(&BC_SETFIELD_VABLE_I)
         );
-        assert!(
-            !insns.contains_key("setfield_vable_r/rrd"),
-            "helper-side BC_SETFIELD_VABLE_R must not masquerade as \
-             canonical setfield_vable_r/rrd",
+        assert_eq!(
+            insns.get("setfield_vable_r/rrd"),
+            Some(&BC_SETFIELD_VABLE_R)
         );
-        assert!(
-            !insns.contains_key("setfield_vable_f/rfd"),
-            "helper-side BC_SETFIELD_VABLE_F must not masquerade as \
-             canonical setfield_vable_f/rfd",
+        assert_eq!(
+            insns.get("setfield_vable_f/rfd"),
+            Some(&BC_SETFIELD_VABLE_F)
         );
-        // blackhole.py:1374,1390 `bhimpl_{get,set}arrayitem_vable_*`
-        // canonical keys are `{get,set}arrayitem_vable_x/{ridd>x,rixdd}`
-        // — vable register + index + (optional value) + fielddescr + arraydescr.
-        // pyre's helper-side adapters fuse fielddescr+arraydescr into a
-        // single `array_idx` descr and drop the vable register.
-        assert!(
-            !insns.contains_key("getarrayitem_vable_i/ridd>i"),
-            "helper-side BC_GETARRAYITEM_VABLE_I must not masquerade as \
-             canonical getarrayitem_vable_i/ridd>i",
+        assert_eq!(
+            insns.get("getarrayitem_vable_i/ridd>i"),
+            Some(&BC_GETARRAYITEM_VABLE_I)
         );
-        assert!(
-            !insns.contains_key("setarrayitem_vable_i/riidd"),
-            "helper-side BC_SETARRAYITEM_VABLE_I must not masquerade as \
-             canonical setarrayitem_vable_i/riidd",
+        assert_eq!(
+            insns.get("getarrayitem_vable_r/ridd>r"),
+            Some(&BC_GETARRAYITEM_VABLE_R)
         );
-        // blackhole.py:1406 `bhimpl_arraylen_vable` canonical key
-        // `arraylen_vable/rdd>i`; pyre fuses descrs and drops vable reg.
-        assert!(
-            !insns.contains_key("arraylen_vable/rdd>i"),
-            "helper-side BC_ARRAYLEN_VABLE must not masquerade as \
-             canonical arraylen_vable/rdd>i",
+        assert_eq!(
+            insns.get("getarrayitem_vable_f/ridd>f"),
+            Some(&BC_GETARRAYITEM_VABLE_F)
         );
-        // blackhole.py:1547 `bhimpl_hint_force_virtualizable(r)`
-        // canonical key `hint_force_virtualizable/r`. pyre's adapter
-        // reads the vable from `BH_VABLE_PTR` instead.
-        assert!(
-            !insns.contains_key("hint_force_virtualizable/r"),
-            "helper-side BC_HINT_FORCE_VIRTUALIZABLE must not masquerade \
-             as canonical hint_force_virtualizable/r",
+        assert_eq!(
+            insns.get("setarrayitem_vable_i/riidd"),
+            Some(&BC_SETARRAYITEM_VABLE_I)
+        );
+        assert_eq!(
+            insns.get("setarrayitem_vable_r/rirdd"),
+            Some(&BC_SETARRAYITEM_VABLE_R)
+        );
+        assert_eq!(
+            insns.get("setarrayitem_vable_f/rifdd"),
+            Some(&BC_SETARRAYITEM_VABLE_F)
+        );
+        assert_eq!(insns.get("arraylen_vable/rdd>i"), Some(&BC_ARRAYLEN_VABLE));
+        assert_eq!(
+            insns.get("hint_force_virtualizable/r"),
+            Some(&BC_HINT_FORCE_VIRTUALIZABLE)
         );
     }
 

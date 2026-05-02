@@ -36,6 +36,7 @@ use majit_backend::JitCellToken;
 
 use crate::call_descr::{make_call_descr, make_call_may_force_descr};
 use crate::constant_pool::ConstantPool;
+use crate::jitcode::JitArgKind;
 // `make_resume_guard_descr*` is no longer needed at the tracer side —
 // guards record `descr=None` and the optimizer's
 // `store_final_boxes_in_guard` mints the descr (codex #3 / pyjitpl.py:2548
@@ -1153,6 +1154,57 @@ impl TraceCtx {
     /// `Trace.num_inputargs` name parity in external call sites.
     pub fn num_inputargs(&self) -> usize {
         self.recorder.num_inputargs()
+    }
+
+    /// RPython `original_boxes[index]` lookup for the currently active trace.
+    ///
+    /// `MetaInterp.setup_tracing` snapshots each trace-entry concrete value in
+    /// `initial_inputarg_consts`; the inputarg Box identity itself is still the
+    /// ordinary `OpRef(index)`, matching RPython's `original_boxes` list.
+    pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
+        let tp = self.recorder.inputarg_types().get(index).copied()?;
+        let const_ref = self.initial_inputarg_consts.get(index).copied()?;
+        let value = self.constants.get_value(const_ref)?;
+        let bits = match value {
+            Value::Int(v) => v,
+            Value::Ref(r) => r.as_usize() as i64,
+            Value::Float(v) => v.to_bits() as i64,
+            Value::Void => 0,
+        };
+        let kind = match tp {
+            Type::Int => JitArgKind::Int,
+            Type::Ref => JitArgKind::Ref,
+            Type::Float => JitArgKind::Float,
+            Type::Void => return None,
+        };
+        Some((kind, OpRef(index as u32), bits))
+    }
+
+    /// JitCode setup argbox for the standard virtualizable.
+    ///
+    /// This is the observer-mode counterpart of
+    /// `pyjitpl.py:3271 f.setup_call(original_boxes)`: prefer the exact
+    /// trace-entry red inputarg named by `jd.index_of_virtualizable`, and
+    /// fall back to `virtualizable_boxes[-1]` only for legacy pyre traces that
+    /// initialized the standard virtualizable before descriptor metadata was
+    /// threaded through.
+    pub fn standard_virtualizable_jitcode_argbox(&self) -> Option<(JitArgKind, OpRef, i64)> {
+        if let Some(argbox) = self
+            .driver_descriptor()
+            .and_then(|driver| driver.virtualizable_arg_index())
+            .and_then(|index| self.initial_inputarg_argbox(index))
+        {
+            return Some(argbox);
+        }
+
+        let opref = self.standard_virtualizable_box()?;
+        let concrete = match self.standard_virtualizable_concrete()? {
+            Value::Ref(r) => r.as_usize() as i64,
+            Value::Int(v) => v,
+            Value::Float(v) => v.to_bits() as i64,
+            Value::Void => return None,
+        };
+        Some((JitArgKind::Ref, opref, concrete))
     }
 
     fn infer_arg_types(&self, args: &[OpRef]) -> Vec<Type> {

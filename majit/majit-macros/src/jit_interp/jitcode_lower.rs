@@ -49,6 +49,13 @@ pub struct LowererConfig {
     /// RPython jtransform.py: `is_virtualizable_getset()` uses this to check
     /// if a field access target is the virtualizable variable.
     vable_var: Option<String>,
+    /// Ref-register assigned to the virtualizable input variable.
+    ///
+    /// RPython `MIFrame.setup_call(original_boxes)` distributes portal args
+    /// by kind before opimpls consume `v_inst` / `v_base`.  The generated
+    /// observer JitCode fragment receives the virtualizable as its first Ref
+    /// input, so the line-by-line graph variable is `registers_r[0]`.
+    vable_input_ref_reg: Option<u16>,
     /// Field name → (field_index, field_type).
     /// RPython: `vinfo.static_field_to_extra_box[fieldname]` → index.
     vable_fields: HashMap<String, (usize, ValueKind)>,
@@ -139,29 +146,30 @@ impl LowererConfig {
                 (canonical_path_segments(&entry.path), spec)
             })
             .collect();
-        let (vable_var, vable_fields, vable_arrays) = if let Some(decl) = vable_decl {
-            let var = Some(decl.var_name.to_string());
-            let fields = decl
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    (
-                        f.name.to_string(),
-                        (i, ValueKind::from_ident(&f.field_type)),
-                    )
-                })
-                .collect();
-            let arrays = decl
-                .arrays
-                .iter()
-                .enumerate()
-                .map(|(i, a)| (a.name.to_string(), (i, ValueKind::from_ident(&a.item_type))))
-                .collect();
-            (var, fields, arrays)
-        } else {
-            (None, HashMap::new(), HashMap::new())
-        };
+        let (vable_var, vable_input_ref_reg, vable_fields, vable_arrays) =
+            if let Some(decl) = vable_decl {
+                let var = Some(decl.var_name.to_string());
+                let fields = decl
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        (
+                            f.name.to_string(),
+                            (i, ValueKind::from_ident(&f.field_type)),
+                        )
+                    })
+                    .collect();
+                let arrays = decl
+                    .arrays
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (a.name.to_string(), (i, ValueKind::from_ident(&a.item_type))))
+                    .collect();
+                (var, Some(0), fields, arrays)
+            } else {
+                (None, None, HashMap::new(), HashMap::new())
+            };
         let (state_scalars, state_arrays, state_virt_arrays) = if let Some(sf) = state_fields_cfg {
             use crate::jit_interp::StateFieldKind;
             let mut scalars = HashMap::new();
@@ -198,6 +206,7 @@ impl LowererConfig {
             calls,
             auto_calls,
             vable_var,
+            vable_input_ref_reg,
             vable_fields,
             vable_arrays,
             state_scalars,
@@ -264,7 +273,7 @@ fn named_member(member: &syn::Member) -> Option<String> {
 
 // ── Lowerer ──────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum BindingKind {
     Int,
     Ref,
@@ -608,7 +617,7 @@ impl<'c> Lowerer<'c> {
         call_policies: Vec<(Vec<String>, CallPolicySpec)>,
         inference_failure_mode: InferenceFailureMode,
     ) -> Self {
-        Self {
+        let mut this = Self {
             bindings: HashMap::new(),
             statements: Vec::new(),
             op_metadata: Vec::new(),
@@ -618,6 +627,38 @@ impl<'c> Lowerer<'c> {
             call_policies,
             inference_failure_mode,
             auto_calls: config.map(|cfg| cfg.auto_calls).unwrap_or(false),
+        };
+        this.install_vable_input_binding();
+        this
+    }
+
+    fn install_vable_input_binding(&mut self) {
+        let Some(config) = self.config else {
+            return;
+        };
+        let (Some(vable_var), Some(vable_reg)) =
+            (config.vable_var.as_ref(), config.vable_input_ref_reg)
+        else {
+            return;
+        };
+        self.bindings.insert(
+            vable_var.clone(),
+            Binding {
+                reg: vable_reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+            },
+        );
+        self.next_reg = self.next_reg.max(vable_reg.saturating_add(1));
+    }
+
+    fn vable_base_reg(&self) -> Option<u16> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+        let binding = self.bindings.get(vable_var)?;
+        match binding.kind {
+            BindingKind::Ref => Some(binding.reg),
+            _ => None,
         }
     }
 
@@ -789,21 +830,22 @@ impl<'c> Lowerer<'c> {
         }
         let member_name = named_member(&field.member)?;
         let &(field_index, field_type) = config.vable_fields.get(&member_name)?;
+        let vable_reg = self.vable_base_reg()?;
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
         match field_type {
             ValueKind::Ref => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![src], vec![]),
-                quote! { __builder.vable_setfield_ref(#fi, #src); },
+                OpMeta::linear(OpKind::Vable, vec![vable_reg, src], vec![]),
+                quote! { __builder.vable_setfield_ref_with_base(#vable_reg, #fi, #src); },
             ),
             ValueKind::Float => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![src], vec![]),
-                quote! { __builder.vable_setfield_float(#fi, #src); },
+                OpMeta::linear(OpKind::Vable, vec![vable_reg, src], vec![]),
+                quote! { __builder.vable_setfield_float_with_base(#vable_reg, #fi, #src); },
             ),
             ValueKind::Int => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![src], vec![]),
-                quote! { __builder.vable_setfield_int(#fi, #src); },
+                OpMeta::linear(OpKind::Vable, vec![vable_reg, src], vec![]),
+                quote! { __builder.vable_setfield_int_with_base(#vable_reg, #fi, #src); },
             ),
         }
         Some(())
@@ -834,6 +876,7 @@ impl<'c> Lowerer<'c> {
         }
         let member_name = named_member(&field.member)?;
         let &(array_index, item_type) = config.vable_arrays.get(&member_name)?;
+        let vable_reg = self.vable_base_reg()?;
         let ai = array_index as u16;
 
         // Lower index and value
@@ -844,16 +887,16 @@ impl<'c> Lowerer<'c> {
 
         match item_type {
             ValueKind::Ref => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![idx_reg, val_reg], vec![]),
-                quote! { __builder.vable_setarrayitem_ref(#ai, #idx_reg, #val_reg); },
+                OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg, val_reg], vec![]),
+                quote! { __builder.vable_setarrayitem_ref_with_base(#vable_reg, #ai, #idx_reg, #val_reg); },
             ),
             ValueKind::Float => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![idx_reg, val_reg], vec![]),
-                quote! { __builder.vable_setarrayitem_float(#ai, #idx_reg, #val_reg); },
+                OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg, val_reg], vec![]),
+                quote! { __builder.vable_setarrayitem_float_with_base(#vable_reg, #ai, #idx_reg, #val_reg); },
             ),
             ValueKind::Int => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![idx_reg, val_reg], vec![]),
-                quote! { __builder.vable_setarrayitem_int(#ai, #idx_reg, #val_reg); },
+                OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg, val_reg], vec![]),
+                quote! { __builder.vable_setarrayitem_int_with_base(#vable_reg, #ai, #idx_reg, #val_reg); },
             ),
         }
         Some(())
@@ -945,9 +988,12 @@ impl<'c> Lowerer<'c> {
         if hint != VirtualizableHintKind::ForceVirtualizable {
             return None;
         }
+        let arg: Expr = syn::parse2(mac.mac.tokens.clone()).ok()?;
+        let binding = self.lower_value_expr(&arg)?;
+        let vable_reg = binding.reg;
         self.emit_op(
-            OpMeta::linear(OpKind::Vable, vec![], vec![]),
-            quote! { __builder.vable_force(); },
+            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![]),
+            quote! { __builder.vable_force_with_base(#vable_reg); },
         );
         Some(())
     }
@@ -2429,27 +2475,28 @@ impl<'c> Lowerer<'c> {
             let member_name = named_member(&field.member)?;
 
             if let Some(&(field_index, field_type)) = config.vable_fields.get(&member_name) {
+                let vable_reg = self.vable_base_reg()?;
                 let reg = self.alloc_reg();
                 let fi = field_index as u16;
                 let kind = match field_type {
                     ValueKind::Ref => {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
-                            quote! { __builder.vable_getfield_ref(#reg, #fi); },
+                            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+                            quote! { __builder.vable_getfield_ref_with_base(#reg, #vable_reg, #fi); },
                         );
                         BindingKind::Ref
                     }
                     ValueKind::Float => {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
-                            quote! { __builder.vable_getfield_float(#reg, #fi); },
+                            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+                            quote! { __builder.vable_getfield_float_with_base(#reg, #vable_reg, #fi); },
                         );
                         BindingKind::Float
                     }
                     ValueKind::Int => {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
-                            quote! { __builder.vable_getfield_int(#reg, #fi); },
+                            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+                            quote! { __builder.vable_getfield_int_with_base(#reg, #vable_reg, #fi); },
                         );
                         BindingKind::Int
                     }
@@ -2486,6 +2533,7 @@ impl<'c> Lowerer<'c> {
         }
         let member_name = named_member(&field.member)?;
         let &(array_index, item_type) = config.vable_arrays.get(&member_name)?;
+        let vable_reg = self.vable_base_reg()?;
 
         // Lower the index expression to a register
         let idx_binding = self.lower_value_expr(&index_expr.index)?;
@@ -2496,22 +2544,22 @@ impl<'c> Lowerer<'c> {
         let kind = match item_type {
             ValueKind::Ref => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::Vable, vec![idx_reg], vec![reg]),
-                    quote! { __builder.vable_getarrayitem_ref(#reg, #ai, #idx_reg); },
+                    OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg], vec![reg]),
+                    quote! { __builder.vable_getarrayitem_ref_with_base(#reg, #vable_reg, #ai, #idx_reg); },
                 );
                 BindingKind::Ref
             }
             ValueKind::Float => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::Vable, vec![idx_reg], vec![reg]),
-                    quote! { __builder.vable_getarrayitem_float(#reg, #ai, #idx_reg); },
+                    OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg], vec![reg]),
+                    quote! { __builder.vable_getarrayitem_float_with_base(#reg, #vable_reg, #ai, #idx_reg); },
                 );
                 BindingKind::Float
             }
             ValueKind::Int => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::Vable, vec![idx_reg], vec![reg]),
-                    quote! { __builder.vable_getarrayitem_int(#reg, #ai, #idx_reg); },
+                    OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg], vec![reg]),
+                    quote! { __builder.vable_getarrayitem_int_with_base(#reg, #vable_reg, #ai, #idx_reg); },
                 );
                 BindingKind::Int
             }
@@ -2545,11 +2593,12 @@ impl<'c> Lowerer<'c> {
         }
         let member_name = named_member(&field.member)?;
         let &array_index = config.vable_arrays.get(&member_name).map(|(idx, _)| idx)?;
+        let vable_reg = self.vable_base_reg()?;
         let reg = self.alloc_reg();
         let ai = array_index as u16;
         self.emit_op(
-            OpMeta::linear(OpKind::Vable, vec![], vec![reg]),
-            quote! { __builder.vable_arraylen(#reg, #ai); },
+            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+            quote! { __builder.vable_arraylen_with_base(#reg, #vable_reg, #ai); },
         );
         Some(Binding {
             reg,

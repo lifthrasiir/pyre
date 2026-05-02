@@ -354,22 +354,18 @@ pub enum DescrOperand {
     /// `jtransform.py:1882-1885 do_fixed_list_getitem` and `:1898-1906
     /// do_fixed_list_setitem` emit it as the second-to-last operand of
     /// `getarrayitem_vable_X` / `setarrayitem_vable_X` and as one of two
-    /// trailing descrs on `arraylen_vable`.  pyre stores only the
-    /// per-array index (today always 0 — pyre's `PyFrame` has a single
-    /// virtualizable array, `locals_cells_stack_w`) because the
-    /// assembler dispatch lowers to the existing `vable_setarrayitem_*`
-    /// / `vable_getarrayitem_*` / `vable_arraylen` builder API where
-    /// `array_idx:u16` already encodes both `array_field_descr` and
-    /// `array_descr` jointly.
+    /// trailing descrs on `arraylen_vable`.  pyre stores the per-array
+    /// index (today always 0 — pyre's `PyFrame` has a single virtualizable
+    /// array, `locals_cells_stack_w`); assembler dispatch turns it into
+    /// a canonical `BhDescr::VableArray` descriptor.
     VableArrayField(u16),
     /// `rpython/jit/metainterp/virtualizable.py:58` `VirtualizableInfo
     /// .array_descrs[i]` — the `ArrayDescr` for the GcArray that the
     /// `array_field_descr` field points at.  Always paired with a
     /// `VableArrayField(i)` operand at `i+1` in upstream's argv;
     /// `assembler.py:80-138 emit_const` uses both to encode the per-op
-    /// bytecode.  pyre's bytecode jointly encodes the pair as
-    /// `array_idx:u16`, so this variant is carried at SSARepr level for
-    /// shape parity but absorbed by the assembler dispatch.
+    /// bytecode.  pyre carries it as a distinct SSARepr descriptor and the
+    /// assembler emits a second `d` operand for the array descriptor.
     VableArray(u16),
     /// `rpython/jit/metainterp/virtualizable.py:71` `VirtualizableInfo
     /// .static_field_descrs[i]` — the `FieldDescr` for the i-th scalar
@@ -377,10 +373,8 @@ pub enum DescrOperand {
     /// `jtransform.py:846` (getfield) emits it as the trailing descr
     /// operand of `getfield_vable_<kind>` after `v_inst`;
     /// `jtransform.py:927` (setfield) emits it after `v_inst, v_value`
-    /// on `setfield_vable_<kind>`. pyre stores only the per-field
-    /// index because the assembler dispatch lowers to the existing
-    /// `vable_setfield_*` / `vable_getfield_*` builder API which
-    /// already encodes the field as a single `u16`.
+    /// on `setfield_vable_<kind>`. pyre stores the per-field index and the
+    /// assembler turns it into a canonical `BhDescr::VableField` descriptor.
     VableStaticField(u16),
 }
 

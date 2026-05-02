@@ -245,7 +245,7 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
                 ValueType::Int // Arithmetic defaults to Int
             }
         }
-        OpKind::VableForce
+        OpKind::VableForce { .. }
         | OpKind::Live
         | OpKind::GuardValue { .. }
         | OpKind::JitDebug { .. }

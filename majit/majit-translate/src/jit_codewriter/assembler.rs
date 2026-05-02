@@ -1368,6 +1368,14 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::VableForce { base } => {
+                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                assert_eq!(kc, 'r', "hint_force_virtualizable expects a Ref base");
+                state.code.push(reg);
+                argcodes.push(kc);
+                let opnum = self.get_opnum("hint_force_virtualizable/r");
+                state.code[startposition] = opnum;
+            }
 
             // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header
             // emits `SpaceOperation('loop_header', [c_index], None)`; upstream
@@ -1694,7 +1702,7 @@ impl Assembler {
                 OpKind::VableArrayWrite { .. } => "VableArrayWrite",
                 OpKind::BinOp { .. } => "BinOp",
                 OpKind::UnaryOp { .. } => "UnaryOp",
-                OpKind::VableForce => "VableForce",
+                OpKind::VableForce { .. } => "VableForce",
                 OpKind::CallElidable { .. } => "CallElidable",
                 OpKind::CallResidual { .. } => "CallResidual",
                 OpKind::CallMayForce { .. } => "CallMayForce",
@@ -2609,7 +2617,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             s if s.starts_with("float_") || s.starts_with("cast_") => op.clone(),
             _ => format!("int_{op}"),
         },
-        OpKind::VableForce => "hint_force_virtualizable".into(),
+        OpKind::VableForce { .. } => "hint_force_virtualizable".into(),
         // jtransform.py:1731-1743 — jit.* builtin ops
         OpKind::JitDebug { .. } => "jit_debug".into(),
         OpKind::AssertGreen { kind_char, .. } => format!("{kind_char}_assert_green"),
