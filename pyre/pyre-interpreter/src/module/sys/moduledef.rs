@@ -38,8 +38,15 @@ fn make_sys_namespace_instance() -> PyObjectRef {
     w_instance_new(sys_namespace_type())
 }
 
+/// `pypy/module/sys/vm.py:217 space.getexecutioncontext()` access for
+/// `sys.gettrace`/`settrace`/`getprofile`/`setprofile`.
+///
+/// Pyre's `crate::call::getexecutioncontext` returns the TLS-cached
+/// active context (set on eval-loop entry); see the helper's doc for
+/// the staleness gap relative to PyPy's `space.getexecutioncontext()`
+/// which always queries the thread state.
 fn current_execution_context() -> *mut crate::PyExecutionContext {
-    crate::call::take_last_exec_ctx() as *mut crate::PyExecutionContext
+    crate::call::getexecutioncontext() as *mut crate::PyExecutionContext
 }
 
 fn sys_gettrace_impl(_args: &[PyObjectRef]) -> crate::PyResult {
@@ -77,7 +84,9 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
     let ec = current_execution_context();
     if !ec.is_null() {
         let w_func = args.first().copied().unwrap_or_else(w_none);
-        unsafe { (*ec).setprofile(w_func) };
+        // executioncontext.py:317-318 ValueError("Cannot call setllprofile
+        // with real None") propagates via setprofile -> setllprofile.
+        unsafe { (*ec).setprofile(w_func)? };
     }
     Ok(w_none())
 }

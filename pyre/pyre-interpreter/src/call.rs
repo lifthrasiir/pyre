@@ -107,6 +107,22 @@ pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
     LAST_EXEC_CTX.with(|c| c.get())
 }
 
+/// `pypy/objspace/std/objspace.py space.getexecutioncontext()` analogue.
+///
+/// PyPy walks thread state and returns the live `ExecutionContext`,
+/// creating one on demand.  Pyre stores the active context in a TLS
+/// slot updated at eval-loop entry/exit, so this helper returns the
+/// `LAST_EXEC_CTX` snapshot — equivalent for the steady state but
+/// observably different when the slot is stale (no eval entered yet,
+/// or after a callback unwinds while the eval loop is between
+/// frames).  Documented surface for `sys.gettrace`/`settrace`/
+/// `getprofile`/`setprofile` and other `space.getexecutioncontext()`
+/// call sites; tightening to a true space-level lookup is a separate
+/// follow-up tied to the `ExecutionContext` ownership refactor.
+pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
+    take_last_exec_ctx()
+}
+
 /// Guard that temporarily forces all nested calls to use the plain
 /// interpreter, bypassing eval_with_jit. Used by force_fn to avoid
 /// re-entering compiled code from blackhole execution.
