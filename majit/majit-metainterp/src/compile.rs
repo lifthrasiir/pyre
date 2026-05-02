@@ -2648,17 +2648,17 @@ mod tests {
 
         let snapshot = Snapshot {
             vable_array: vec![
-                OpRef(0),
-                OpRef::from_const(1),
-                OpRef::from_const(2),
-                OpRef::from_const(3),
-                OpRef::from_const(4),
+                OpRef(0).into(),
+                OpRef::from_const(1).into(),
+                OpRef::from_const(2).into(),
+                OpRef::from_const(3).into(),
+                OpRef::from_const(4).into(),
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                boxes: vec![OpRef(1)],
+                boxes: vec![OpRef(1).into()],
             }],
         };
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();

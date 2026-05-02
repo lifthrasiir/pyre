@@ -4676,12 +4676,12 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef(1), OpRef::from_const(0)],
+                    boxes: vec![OpRef(1).into(), OpRef::from_const(0).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
                     pc: 20,
-                    boxes: vec![OpRef(2), OpRef(3)],
+                    boxes: vec![OpRef(2).into(), OpRef(3).into()],
                 },
             ],
         };
@@ -4783,12 +4783,12 @@ mod tests {
         let snapshot = Snapshot {
             // pyjitpl.py:3302-3306 parity: payload slots first,
             // virtualizable identity (`virtualizable_boxes[-1]`) last.
-            vable_array: vec![OpRef(1), OpRef(7)],
+            vable_array: vec![OpRef(1).into(), OpRef(7).into()],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                boxes: vec![OpRef(1)],
+                boxes: vec![OpRef(1).into()],
             }],
         };
 
