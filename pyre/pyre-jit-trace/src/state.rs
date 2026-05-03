@@ -2101,6 +2101,21 @@ pub(crate) unsafe fn objspace_compare_floats(
     }
 }
 
+/// virtualizable.py:94 `getattr(virtualizable, fieldname)` parity for
+/// the `locals_cells_stack_w` array field. Materialises the array
+/// pointer that step 2 (`lst[i]` → `GETARRAYITEM_GC_R`) indexes.
+///
+/// PRE-EXISTING-ADAPTATION: the upstream-orthodox emission is
+/// `OpCode::GetfieldGcR` because `pyframe_locals_cells_stack_descr`
+/// is field 0 of `PYFRAME_DESCR_GROUP` with `field_type = Type::Ref`
+/// on a `PYFRAME_GC_TYPE_ID`-typed PyFrame, so the read goes through
+/// the GC barrier in RPython's `rclass.py` getfield emission. Pyre's
+/// cranelift backend has incomplete GC-barrier coverage for the
+/// PYFRAME_DESCR_GROUP read path — a direct swap to `GetfieldGcR`
+/// SIGABRTs in fib_recursive — so the emission stays `GetfieldRawI`
+/// pending a cranelift barrier port (separate parity epic). The
+/// runtime descr's `field_type = Type::Ref` is preserved so the
+/// optimizer's view of the field as a boxed pointer is correct.
 pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(
         OpCode::GetfieldRawI,
