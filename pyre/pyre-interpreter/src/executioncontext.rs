@@ -76,8 +76,18 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
         let w_globals = frame_ref.get_w_globals();
         let w_locals = frame_ref.get_w_locals();
         let w_trace = frame_ref.get_w_f_trace();
+        // pypy/interpreter/pyframe.py:154 fget_f_back walks the
+        // f_backref vref to materialise the parent frame.  Pyre's
+        // wrapper has to do the same eagerly because the wrapper is a
+        // plain pyre_object instance (no `__getattr__` slot wired to
+        // the live struct yet — Task #224).  Recursion depth tracks
+        // the live stack depth, which is bounded by Python's
+        // recursion limit; the wrappers are short-lived (allocated
+        // per callback invocation) so the per-trace overhead scales
+        // with stack depth rather than total executed bytecodes.
+        let f_back_obj = wrap_trace_frame(frame_ref.get_f_back());
         let _ = crate::baseobjspace::setattr(w_frame, "f_code", frame_ref.pycode as PyObjectRef);
-        let _ = crate::baseobjspace::setattr(w_frame, "f_back", pyre_object::w_none());
+        let _ = crate::baseobjspace::setattr(w_frame, "f_back", f_back_obj);
         let _ = crate::baseobjspace::setattr(w_frame, "f_builtins", frame_ref.get_builtin());
         let _ = crate::baseobjspace::setattr(
             w_frame,
