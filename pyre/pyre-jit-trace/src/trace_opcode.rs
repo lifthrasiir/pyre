@@ -4740,9 +4740,23 @@ impl MIFrame {
         if unsafe { is_method(concrete_callable) } {
             let inner_func = unsafe { w_method_get_func(concrete_callable) };
             let inner_self = unsafe { w_method_get_self(concrete_callable) };
+            // `is_builtin_code` gate: a list subclass overriding `append`
+            // or `pop` with a Python `def` would still produce
+            // `is_function(inner_func) == true` and a matching `func_name`,
+            // which would silently rewire the call to builtin list IR.
+            // PyPy's `_Method` dispatch (`baseobjspace.py:1252` →
+            // `function.py:566`) just unwraps and calls `w_function`
+            // generically, so the user override runs. Restrict the spec
+            // arm to builtin-coded functions; Python overrides fall
+            // through to `trace_call_callable` below.
             if !inner_func.is_null()
                 && !inner_self.is_null()
                 && unsafe { is_function(inner_func) }
+                && unsafe {
+                    is_builtin_code(
+                        pyre_interpreter::getcode(inner_func) as pyre_object::PyObjectRef
+                    )
+                }
                 && unsafe { is_list(inner_self) }
             {
                 let func_name = unsafe { pyre_interpreter::function_get_name(inner_func) };
