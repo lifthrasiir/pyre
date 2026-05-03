@@ -4866,14 +4866,19 @@ pub fn call_args_and_c_profile(
     let w_res = call_function(callable, args);
     if w_res == pyre_object::PY_NULL {
         if !ec.is_null() {
-            // baseobjspace.py:1275-1276 — fire c_exception_trace then
-            // re-raise the original OperationError. The TLS stash already
-            // holds the user error; if c_exception_trace raises, that
-            // newer error replaces it (matches the bare `raise` after
-            // the except-block — Python's exception chaining keeps the
-            // newer one as the active exception).
-            let _ =
-                unsafe { (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable) };
+            // baseobjspace.py:1274-1276 — `except OperationError:
+            // ec.c_exception_trace(frame, w_func); raise`. The bare
+            // `raise` re-raises the active exception, but Python
+            // semantics are that an exception raised from inside an
+            // `except` block replaces the in-flight one. Pyre's call
+            // stash already holds the original OperationError; if
+            // c_exception_trace raises, overwrite the stash so the
+            // tracer error is what propagates.
+            if let Err(trace_err) =
+                unsafe { (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable) }
+            {
+                crate::call::set_call_error(trace_err);
+            }
         }
         return pyre_object::PY_NULL;
     }

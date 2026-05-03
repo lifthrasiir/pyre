@@ -403,7 +403,12 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
 ///
 /// Returns `true` if a handler was found (resume PC updated to handler),
 /// `false` if the exception should propagate to the caller.
-pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usize) -> bool {
+///
+/// `err` is taken by `&mut` so the bytecode_trace_after_exception /
+/// exception_trace plumbing can replace it with a tracer exception
+/// (pyopcode.py:144-145 `except OperationError as e: operr = e`); the
+/// caller's `Err(err)` propagation then surfaces the replacement.
+pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut usize) -> bool {
     // Internal control-flow / corruption markers are not real Python
     // exceptions and must never be dispatched via bytecode handlers.
     if err.kind == crate::PyErrorKind::GeneratorReturn
@@ -428,11 +433,11 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usi
     //
     // Gated on a live tracefunc so the no-tracer hot path skips both
     // the f_trace save/restore dance and the `to_exc_object` alloc.
-    // A trace-callback exception replaces the in-flight one through
-    // the TLS `set_call_error` slot; pyre keeps `err` unchanged for
-    // handler dispatch (so the resume PC and pushed exception still
-    // reflect the original raise) — the take_call_error checkpoints
-    // downstream surface the tracer error after this frame unwinds.
+    // bytecode_trace_after_exception's exception is caught by the
+    // surrounding `except OperationError` and replaces operr;
+    // exception_trace's exception is NOT caught (line 148 stands
+    // outside the except), so it short-circuits the unrollstack search
+    // — pyre signals that by returning `false` after replacing `err`.
     let ec = frame.execution_context as *mut crate::PyExecutionContext;
     if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
         let saved_trace = frame.get_w_f_trace();
@@ -445,7 +450,8 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usi
             frame.getorcreatedebug(-1).w_f_trace = saved_trace;
         }
         if let Err(trace_err) = after_exc_result {
-            crate::call::set_call_error(trace_err);
+            // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
+            *err = trace_err;
         }
         let exc_obj = err.to_exc_object();
         if let Err(trace_err) = unsafe {
@@ -456,7 +462,13 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usi
                 pyre_object::PY_NULL,
             )
         } {
-            crate::call::set_call_error(trace_err);
+            // pyopcode.py:148 `ec.exception_trace(self, operr)` is
+            // outside the except-block; a raise here propagates past
+            // unrollstack. Replace err and return `false` so the
+            // caller's `return Err(err)` surfaces the tracer error
+            // without searching for a handler for the original.
+            *err = trace_err;
+            return false;
         }
     }
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
@@ -503,9 +515,9 @@ pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
 pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
-        if let Some(err) = operr {
+        if let Some(mut err) = operr {
             let mut next_instr = frame.next_instr();
-            if !handle_exception(frame, &err, &mut next_instr) {
+            if !handle_exception(frame, &mut err, &mut next_instr) {
                 return Err(err);
             }
             frame.last_instr = next_instr as isize - 1;
@@ -537,9 +549,9 @@ pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) 
     let outer_result = (|| -> PyResult {
         execution_context.call_trace(frame as *mut PyFrame)?;
         let inner_result = (|| -> PyResult {
-            if let Some(err) = operr {
+            if let Some(mut err) = operr {
                 let mut next_instr = frame.next_instr();
-                if !handle_exception(frame, &err, &mut next_instr) {
+                if !handle_exception(frame, &mut err, &mut next_instr) {
                     return Err(err);
                 }
                 frame.last_instr = next_instr as isize - 1;
@@ -621,13 +633,13 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
             }
             Ok(StepResult::Return(result)) => return Ok(result),
             Ok(StepResult::Yield(result)) => return Ok(result),
-            Err(err) => {
+            Err(mut err) => {
                 // GeneratorReturn: RETURN_GENERATOR unwind → return generator object
                 if err.kind == crate::PyErrorKind::GeneratorReturn {
                     let gen_ptr = err.message.parse::<usize>().unwrap_or(0);
                     return Ok(gen_ptr as pyre_object::PyObjectRef);
                 }
-                if handle_exception(frame, &err, &mut next_instr) {
+                if handle_exception(frame, &mut err, &mut next_instr) {
                     continue;
                 }
                 return Err(err);

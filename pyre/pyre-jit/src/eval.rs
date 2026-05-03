@@ -2239,9 +2239,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // hot benchmarks 28-29% because the function-call boundary
         // hides the no-tracer fast path from the optimizer. Inline
         // the gate here — read `ec.w_tracefunc` directly and skip
-        // the whole call when null. Matches the structure of
-        // executioncontext.py:181-183 `bytecode_only_trace` gate
-        // where `ec.gettrace() is not None` short-circuits.
+        // the trace-only slow path when null. The ticker decrement
+        // (executioncontext.py:163-165) runs unconditionally so
+        // signal handlers / async actions fire periodically (matches
+        // PyPy's `actionflag.decrement_ticker(decr_by)` invariant);
+        // the `action_dispatcher` slow path itself is still a stub
+        // pending the actionflag port.
         let ec_ptr = frame.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
@@ -2254,15 +2257,18 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 } {
                     return LoopResult::Done(Err(err));
                 }
+            } else {
+                // executioncontext.py:163-164 — `actionflag.
+                // decrement_ticker(decr_by)` runs every bytecode.
+                // bytecode_trace already includes this when called
+                // above; the no-tracer fast path inlines the dec
+                // directly.
+                let _ = unsafe {
+                    (*ec_ptr).actionflag.decrement_ticker(
+                        pyre_interpreter::executioncontext::TICK_COUNTER_STEP as isize,
+                    )
+                };
             }
-            // PRE-EXISTING-ADAPTATION: PyPy unconditionally decrements
-            // the ticker (executioncontext.py:163-164) so signal
-            // handlers and async actions fire periodically.  pyre's
-            // actionflag.action_dispatcher slow path is not yet wired
-            // (executioncontext.py:165 only stubs the dec); skip the
-            // decrement on the fast path until that lands so this
-            // gate stays a single null check.  Tracked alongside
-            // Task #224 follow-up.
         }
         let mut next_instr = frame.next_instr();
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
@@ -2284,8 +2290,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::CloseLoop { .. }) => {}
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
-            Err(err) => {
-                if pyre_interpreter::eval::handle_exception(frame, &err, &mut next_instr) {
+            Err(mut err) => {
+                if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut next_instr) {
                     frame.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
@@ -2335,9 +2341,9 @@ pub(crate) fn eval_loop_jit_bridge(frame: &mut PyFrame) -> LoopResult {
             Ok(StepResult::CloseLoop { .. }) => {}
             Ok(StepResult::Return(result)) => return LoopResult::Done(Ok(result)),
             Ok(StepResult::Yield(result)) => return LoopResult::Done(Ok(result)),
-            Err(err) => {
+            Err(mut err) => {
                 let mut next_instr = frame.next_instr();
-                if pyre_interpreter::eval::handle_exception(frame, &err, &mut next_instr) {
+                if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut next_instr) {
                     frame.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
