@@ -138,14 +138,17 @@ pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
 ///
 /// PyPy walks thread state and returns the live `ExecutionContext`,
 /// creating one on demand.  Pyre stores the active context in a TLS
-/// slot updated at eval-loop entry/exit, so this helper returns the
-/// `LAST_EXEC_CTX` snapshot — equivalent for the steady state but
-/// observably different when the slot is stale (no eval entered yet,
-/// or after a callback unwinds while the eval loop is between
-/// frames).  Documented surface for `sys.gettrace`/`settrace`/
-/// `getprofile`/`setprofile` and other `space.getexecutioncontext()`
-/// call sites; tightening to a true space-level lookup is a separate
-/// follow-up tied to the `ExecutionContext` ownership refactor.
+/// slot seeded at process boot by pyrex (`pyrex/src/lib.rs:185
+/// set_last_exec_ctx(Rc::as_ptr(&execution_context))`) and
+/// re-stamped on every `eval_frame_plain` entry.  The slot stays
+/// pointing at the root EC for the lifetime of the process, so
+/// `sys.gettrace`/`settrace`/`getprofile`/`setprofile` and other
+/// `space.getexecutioncontext()` callers see the live EC even when
+/// no eval frame is currently on the stack.
+///
+/// PRE-EXISTING-ADAPTATION: pyre is single-threaded today so the TLS
+/// slot is effectively a global.  PyPy's per-thread `threadlocals`
+/// dispatch lands when pyre adds its own thread state container.
 pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
     take_last_exec_ctx()
 }

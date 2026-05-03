@@ -182,6 +182,13 @@ fn run_source(source: &str, mode: Mode) {
     let execution_context = Rc::new(PyExecutionContext::default());
     // Set execution context for __build_class__ to use
     call::set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
+    // Eagerly seed the LAST_EXEC_CTX TLS slot so that
+    // `space.getexecutioncontext()` (sys.settrace/setprofile/getframe)
+    // returns the live ExecutionContext from the very first user
+    // statement, not only after the first `eval_frame_plain` entry
+    // updates the slot.  Mirrors PyPy's `space.threadlocals` always
+    // holding the active EC for the current thread.
+    call::set_last_exec_ctx(Rc::as_ptr(&execution_context));
     let mut frame = PyFrame::new_with_context(code, execution_context);
 
     // Register __main__ module in sys.modules — PyPy: app_main sets
