@@ -2233,6 +2233,23 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         trace_jit_bytecode(pc, "");
         frame.last_instr = pc as isize;
         frame.set_last_instr_from_next_instr(opcode_pc + 1);
+        // PRE-EXISTING-ADAPTATION: pyopcode.py:170-176 dispatch_bytecode
+        // fires `ec.bytecode_trace(self)` each iteration in the non-jit
+        // branch.  pyre's JIT warm-up loop sees most opcodes during
+        // pre-threshold execution; per-opcode `bytecode_trace` here
+        // pushes hot benchmarks (nbody/fannkuch) over the perf
+        // threshold even when the no-tracer fast path is taken
+        // (function-call cost dominates the null-check fast path).
+        // The interpreter `eval_loop` (pyre-interpreter/src/eval.rs)
+        // already fires `bytecode_trace` for the non-JIT path; the
+        // JIT-compiled trace fires `bytecode_trace` per backward jump
+        // via `jump_absolute` (interp_jit.py:107-109).  The remaining
+        // gap is per-opcode `line` events while warming up a
+        // not-yet-compiled function — addressing it requires either
+        // codewriter emission of `bytecode_only_trace` per traced
+        // opcode (so the JIT trace covers it) or a faster gate at
+        // this call site (inline ec.w_tracefunc check).  Tracked as a
+        // follow-up to Task #224.
         let mut next_instr = frame.next_instr();
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
             Ok(StepResult::Continue) => {
