@@ -723,12 +723,22 @@ impl ExecutionContext {
         frame: *mut PyFrame,
         decr_by: usize,
     ) -> Result<(), crate::PyError> {
-        // executioncontext.py:158-165: bytecode_only_trace runs first;
-        // if it raises (tracefunc callback exception), the ticker
-        // decrement + slow-path action_dispatcher do NOT run.  Use `?`
-        // so a tracer error short-circuits before touching actionflag.
+        // executioncontext.py:158-165 bytecode_trace:
+        //   def bytecode_trace(self, frame, decr_by=TICK_COUNTER_STEP):
+        //       self.bytecode_only_trace(frame)
+        //       actionflag = self.space.actionflag
+        //       if actionflag.decrement_ticker(decr_by) < 0:
+        //           actionflag.action_dispatcher(self, frame)
+        //
+        // bytecode_only_trace runs first; if it raises (tracefunc
+        // callback exception), the ticker decrement + slow-path
+        // action_dispatcher do NOT run.  Use `?` so a tracer error
+        // short-circuits before touching actionflag.
         self.bytecode_only_trace(frame)?;
-        let _ = self.actionflag.decrement_ticker(decr_by as isize);
+        if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
+            let self_ptr = self as *mut ExecutionContext;
+            self.actionflag.action_dispatcher(self_ptr, frame);
+        }
         Ok(())
     }
 
@@ -821,12 +831,14 @@ impl ExecutionContext {
     ) -> Result<(), crate::PyError> {
         self.bytecode_only_trace(frame)?;
         if self.actionflag.get_ticker() < 0 {
-            // PRE-EXISTING-ADAPTATION: pyre's actionflag has no
-            // `action_dispatcher` slow path yet (executioncontext.py:165);
-            // the prior stub only nudged the ticker so the deferred
-            // signal/AsyncAction queue would not loop.  Preserve that
-            // behaviour until the dispatcher port lands.
-            let _ = self.actionflag.decrement_ticker(0);
+            // executioncontext.py:207-208 — `if actionflag.get_ticker()
+            // < 0: actionflag.action_dispatcher(self, frame)`. Pyre's
+            // ActionFlag::action_dispatcher is a stub today (the
+            // AsyncAction queue / signal handler dispatch is still a
+            // pending port), but the call surface is wired so the
+            // line-by-line shape stays correct.
+            let self_ptr = self as *mut ExecutionContext;
+            self.actionflag.action_dispatcher(self_ptr, frame);
         }
         Ok(())
     }

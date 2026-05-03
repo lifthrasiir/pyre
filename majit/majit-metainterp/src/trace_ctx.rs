@@ -287,9 +287,25 @@ impl TraceCtx {
     /// follow-up.  `live_args_len` is plumbed through so that
     /// follow-up doesn't need to re-touch the call sites.
     pub fn has_merge_point_with_shape_assert(&self, key: u64, _live_args_len: usize) -> bool {
-        // pyjitpl.py:2994-2997 reverse scan.  The shape assert is
-        // suppressed until the `current_merge_points` jitdriver
-        // isolation lands.
+        // pyjitpl.py:2994-2997 reverse scan:
+        //   for j in range(len(self.current_merge_points) - 1, -1, -1):
+        //       original_boxes, start = self.current_merge_points[j]
+        //       assert len(original_boxes) == len(live_arg_boxes)
+        //       if greenkey == ...:
+        //           ...
+        //
+        // PRE-EXISTING-ADAPTATION: the upstream assert holds because
+        // every entry in `current_merge_points` comes from the same
+        // jitdriver and so shares a single red-bank shape. Pyre's
+        // `add_merge_point` callers are not yet isolated by jitdriver:
+        // `nested_loop` mixes 4-arg and 14-arg merge points in the
+        // same vector, and enabling the assert here panics those
+        // traces. The convergence path is to partition
+        // `current_merge_points` per jitdriver (mirroring RPython's
+        // `metainterp_sd.jitdrivers_sd` indirection at the caller
+        // site of pyjitpl.py:2989) before reinstating the assert. Until
+        // that prerequisite lands, the live_args_len argument is
+        // accepted but unused so the call surface stays stable.
         self.current_merge_points
             .iter()
             .rev()
