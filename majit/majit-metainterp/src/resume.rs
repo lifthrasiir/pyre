@@ -14,7 +14,7 @@ use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
     ExitVirtualLayout,
 };
-use majit_ir::{Const, GcRef, Type};
+use majit_ir::{Const, GcRef, OpRef, Type};
 
 /// resume.py:656-670: element kind from arraydescr.
 /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
@@ -3166,8 +3166,8 @@ pub struct ResumeDataLoopMemo {
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
-    pub cached_boxes: HashMap<u32, i32>,
-    pub cached_virtuals: HashMap<u32, i32>,
+    pub cached_boxes: HashMap<OpRef, i32>,
+    pub cached_virtuals: HashMap<OpRef, i32>,
     /// resume.py:153-155 — statistics.
     pub nvirtuals: usize,
     pub nvholes: usize,
@@ -3347,17 +3347,17 @@ impl ResumeDataLoopMemo {
     /// RPython version mutates `boxes` list:
     /// - cached: `boxes[-num - 1] = box`
     /// - new: `boxes.append(box); num = -len(boxes)`
-    pub fn assign_number_to_box(&mut self, box_id: u32, boxes: &mut Vec<u32>) -> i32 {
+    pub fn assign_number_to_box(&mut self, box_id: OpRef, boxes: &mut Vec<u32>) -> i32 {
         if let Some(&num) = self.cached_boxes.get(&box_id) {
             // resume.py:268: boxes[-num - 1] = box
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
-                boxes[idx] = box_id;
+                boxes[idx] = box_id.0;
             }
             return num;
         }
         // resume.py:270-271: boxes.append(box); num = -len(boxes)
-        boxes.push(box_id);
+        boxes.push(box_id.0);
         let num = -(boxes.len() as i32);
         self.cached_boxes.insert(box_id, num);
         num
@@ -3365,22 +3365,22 @@ impl ResumeDataLoopMemo {
 
     /// resume.py:264-273 variant for `_number_virtuals`: boxes is `Vec<Option<u32>>`.
     /// RPython's `new_liveboxes = [None] * memo.num_cached_boxes()`.
-    pub fn assign_number_to_box_opt(&mut self, box_id: u32, boxes: &mut Vec<Option<u32>>) -> i32 {
+    pub fn assign_number_to_box_opt(&mut self, box_id: OpRef, boxes: &mut Vec<Option<u32>>) -> i32 {
         if let Some(&num) = self.cached_boxes.get(&box_id) {
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
-                boxes[idx] = Some(box_id);
+                boxes[idx] = Some(box_id.0);
             }
             return num;
         }
-        boxes.push(Some(box_id));
+        boxes.push(Some(box_id.0));
         let num = -(boxes.len() as i32);
         self.cached_boxes.insert(box_id, num);
         num
     }
 
     /// resume.py:278 assign_number_to_virtual — returns a negative number.
-    pub fn assign_number_to_virtual(&mut self, box_id: u32) -> i32 {
+    pub fn assign_number_to_virtual(&mut self, box_id: OpRef) -> i32 {
         if let Some(&num) = self.cached_virtuals.get(&box_id) {
             return num;
         }
@@ -3492,7 +3492,7 @@ impl ResumeDataLoopMemo {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
                 // resume.py:472-473: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
-                let index = self.assign_number_to_box_opt(opref_id, &mut new_boxes_list);
+                let index = self.assign_number_to_box_opt(OpRef(opref_id), &mut new_boxes_list);
                 if let Ok(t) = tag(index, TAGBOX) {
                     new_liveboxes.insert(opref_id, t);
                 }
@@ -3501,7 +3501,7 @@ impl ResumeDataLoopMemo {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
                     // resume.py:479-480: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
-                    let index = self.assign_number_to_virtual(opref_id);
+                    let index = self.assign_number_to_virtual(OpRef(opref_id));
                     if let Ok(t) = tag(index, TAGVIRTUAL) {
                         new_liveboxes.insert(opref_id, t);
                     }
@@ -3575,12 +3575,12 @@ impl ResumeDataLoopMemo {
                             }
                             if let Some(t) = new_liveboxes.get(opref.0) {
                                 if tagged_eq(t, UNASSIGNED) {
-                                    if let Some(&num) = self.cached_boxes.get(&opref.0) {
+                                    if let Some(&num) = self.cached_boxes.get(&opref) {
                                         return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                                     }
                                 }
                                 if tagged_eq(t, UNASSIGNEDVIRTUAL) {
-                                    if let Some(&num) = self.cached_virtuals.get(&opref.0) {
+                                    if let Some(&num) = self.cached_virtuals.get(&opref) {
                                         return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                                     }
                                 }
@@ -3718,12 +3718,12 @@ impl ResumeDataLoopMemo {
         if let Some(tagged) = new_liveboxes.get(opref.0) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED) {
-                if let Some(&num) = self.cached_boxes.get(&opref.0) {
+                if let Some(&num) = self.cached_boxes.get(&opref) {
                     return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                 }
             }
             if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                if let Some(&num) = self.cached_virtuals.get(&opref.0) {
+                if let Some(&num) = self.cached_virtuals.get(&opref) {
                     return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                 }
             }

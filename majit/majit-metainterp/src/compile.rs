@@ -1687,7 +1687,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 .chain(op.args.iter().copied())
                 .chain(op.fail_args.iter().flatten().copied())
         })
-        .chain(expanded_inputargs.iter().map(|ia| OpRef(ia.index)))
+        .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
         .filter(|opref| !opref.is_none() && !opref.is_constant())
         .map(|opref| opref.0)
         .max()

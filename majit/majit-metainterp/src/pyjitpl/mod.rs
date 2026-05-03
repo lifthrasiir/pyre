@@ -288,11 +288,14 @@ fn snapshot_map_from_trace_snapshots(
                     .iter()
                     .find(|(k, v)| {
                         **v == *val
-                            && constant_types
-                                .get(k)
-                                .copied()
-                                .unwrap_or(majit_ir::Type::Int)
-                                == *tp
+                            && constant_types.get(k).copied().unwrap_or_else(|| {
+                                panic!(
+                                    "constant_types missing entry for raw={} though \
+                                     constants has it: both maps are populated in \
+                                     lockstep at line ~302",
+                                    *k
+                                )
+                            }) == *tp
                     })
                     .map(|(k, _)| *k);
                 let key = existing.unwrap_or_else(|| {
@@ -3840,7 +3843,7 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::OpCode::Label,
                 &root_inputargs
                     .iter()
-                    .map(|ia| majit_ir::OpRef(ia.index))
+                    .map(|ia| ia.opref())
                     .collect::<Vec<_>>(),
             );
             label_op.pos = majit_ir::OpRef::NONE;
@@ -3935,10 +3938,7 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 let mut label_op = majit_ir::Op::new(
                     majit_ir::OpCode::Label,
-                    &inputargs
-                        .iter()
-                        .map(|ia| majit_ir::OpRef(ia.index))
-                        .collect::<Vec<_>>(),
+                    &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
                 );
                 label_op.pos = majit_ir::OpRef::NONE;
                 label_op.descr = Some(target_token.as_jump_target_descr());
@@ -5613,10 +5613,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         let mut label_op = majit_ir::Op::new(
             majit_ir::OpCode::Label,
-            &inputargs
-                .iter()
-                .map(|ia| majit_ir::OpRef(ia.index))
-                .collect::<Vec<_>>(),
+            &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
         );
         label_op.pos = majit_ir::OpRef::NONE;
         label_op.descr = Some(target_token.as_jump_target_descr());

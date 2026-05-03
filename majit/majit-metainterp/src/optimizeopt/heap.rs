@@ -704,12 +704,15 @@ pub struct OptHeap {
     seen_allocation: Vec<bool>,
     unescaped: Vec<bool>,
     known_nonnull: Vec<bool>,
-    /// heapcache.py: _heapc_deps — per-box dependency list.
+    /// heapcache.py:209/298-307/453-455 `box._heapc_deps` — per-Box
+    /// dependency list. RPython attaches `_heapc_deps: list | None`
+    /// as an attribute on the `RefFrontendOp` Box object itself;
+    /// pyre keeps a side-table keyed by OpRef for the same effect.
     /// When an unescaped value is stored into an unescaped container,
     /// the value is recorded as a dependency of the container instead
     /// of being immediately escaped. When the container escapes later,
     /// all its dependencies are transitively escaped.
-    heapc_deps: HashMap<u32, Vec<OpRef>>,
+    heapc_deps: HashMap<OpRef, Vec<OpRef>>,
 
     // heap.py:27 OptHeap inherits Optimization.last_emitted_operation,
     // which is set to REMOVED by `_optimize_CALL_DICT_LOOKUP`
@@ -798,23 +801,23 @@ impl OptHeap {
         descr.index()
     }
 
-    /// heapcache.py:295-309 _escape_box: escape a box and transitively
-    /// escape all its dependencies.
+    /// heapcache.py:295-309 `_escape_box`: escape a box and transitively
+    /// escape all its dependencies stored in `box._heapc_deps`.
     fn escape_box(&mut self, opref: OpRef) {
         vb_unset(&mut self.unescaped, opref.0);
-        if let Some(deps) = self.heapc_deps.remove(&opref.0) {
+        if let Some(deps) = self.heapc_deps.remove(&opref) {
             for dep in deps {
                 self.escape_box(dep);
             }
         }
     }
 
-    /// heapcache.py:224-230 _escape_from_write: when storing a value into
-    /// a container, record dependency if both are unescaped; otherwise
-    /// escape the value immediately.
+    /// heapcache.py:224-230 `_escape_from_write`: when storing a value
+    /// into a container, append to `_get_deps(box)` if both are
+    /// unescaped; otherwise escape the value immediately.
     fn escape_from_write(&mut self, container: OpRef, value: OpRef) {
         if vb_get(&self.unescaped, container.0) && vb_get(&self.unescaped, value.0) {
-            self.heapc_deps.entry(container.0).or_default().push(value);
+            self.heapc_deps.entry(container).or_default().push(value);
         } else if !value.is_none() {
             self.escape_box(value);
         }

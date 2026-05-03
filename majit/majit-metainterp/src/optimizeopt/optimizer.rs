@@ -61,8 +61,14 @@ pub struct Optimizer {
     /// the sharer, matching `compile.py:832
     /// ResumeGuardCopiedDescr(prev)` parity.
     last_guard_op_idx: Option<usize>,
-    /// optimizer.py: `replaces_guard` — maps guard op position to replacement.
-    replaces_guard: std::collections::HashMap<u32, Op>,
+    /// optimizer.py:241/304/632-634 `replaces_guard` — maps an emitted
+    /// guard op to its replacement. RPython keys this dict by the guard
+    /// `op` object itself (object identity); pyre keys by `op.pos:
+    /// OpRef`. The parity invariant is that `alloc_op_position` issues
+    /// a fresh OpRef per emitted guard so OpRef → Op is bijective on
+    /// the guard subspace, matching RPython's object-identity keying.
+    /// No site re-uses an OpRef across distinct guard ops.
+    replaces_guard: std::collections::HashMap<OpRef, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -248,6 +254,25 @@ pub(crate) fn sanitize_backend_constants_for_ops(
         .retain(|idx, _| (*idx as usize) >= live_positions.len() || !live_positions[*idx as usize]);
 }
 
+/// Export newly-discovered constants from `OptContext` into the
+/// backend's `constants: HashMap<u32, i64>` value pool.
+///
+/// PRE-EXISTING-ADAPTATION: RPython has no parallel "untyped backend
+/// constants" map — `box.type` is read directly from the Const Box at
+/// every consumption site (history.py:220, ConstInt/Float/Ptr have
+/// pinned types). pyre carries types via separate channels
+/// (`Op.type_`, `OpTypeIndex.constant_types`); this exporter therefore
+/// strips `Value` enum types into raw `i64` bits.
+///
+/// The lockstep panics in `ConstantPool::get_value` (constant_pool.rs)
+/// and the recorder dedup paths (`pyjitpl/mod.rs`, `trace_ctx.rs`) only
+/// guard the in-pool maps — backend consumers reach types via the
+/// separate `OpTypeIndex` channel, which itself documents a
+/// PRE-EXISTING-ADAPTATION (`majit-ir/src/op_type_index.rs:144-164`)
+/// for cranelift caller seeding gap. Convergence path: thread typed
+/// `Value` through the backend pool (`HashMap<u32, Value>` or parallel
+/// `constant_types: HashMap<u32, Type>`) so all consumers carry types
+/// in lockstep with values; closes the same blocker as op_type_index.
 pub(crate) fn merge_backend_constants_from_ctx(
     ctx: &OptContext,
     constants: &mut std::collections::HashMap<u32, i64>,
@@ -1128,13 +1153,13 @@ impl Optimizer {
     /// optimizer.py: notice_guard_future_condition(op)
     /// Record that a guard at the given position should be replaced
     /// with the given op when the future condition is realized.
-    pub fn notice_guard_future_condition(&mut self, guard_pos: u32, replacement: Op) {
+    pub fn notice_guard_future_condition(&mut self, guard_pos: OpRef, replacement: Op) {
         self.replaces_guard.insert(guard_pos, replacement);
     }
 
     /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
     /// Replace a previously emitted guard with a new one.
-    pub fn replace_guard_op(&mut self, old_pos: u32, new_guard: Op) {
+    pub fn replace_guard_op(&mut self, old_pos: OpRef, new_guard: Op) {
         self.replaces_guard.insert(old_pos, new_guard);
     }
 
@@ -3388,7 +3413,7 @@ impl Optimizer {
 
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
             if self.can_replace_guards {
-                if let Some(replacement) = self.replaces_guard.remove(&op.pos.0) {
+                if let Some(replacement) = self.replaces_guard.remove(&op.pos) {
                     let target_pos = replacement.pos.0 as usize;
                     if target_pos < ctx.new_operations.len() {
                         if std::env::var_os("MAJIT_LOG").is_some() {

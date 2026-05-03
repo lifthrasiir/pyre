@@ -162,11 +162,22 @@ impl ConstantPool {
     /// the OpRef is not a known constant.
     pub fn get_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
         let &raw = self.constants.get(&opref.0)?;
+        // history.py:220/261/307: ConstInt/Float/Ptr Box.type is pinned at
+        // construction. `get_or_insert*` always inserts into both
+        // `constants` and `constant_types`, so a constant present in
+        // `constants` MUST also be present in `constant_types`.
         let tp = self
             .constant_types
             .get(&opref.0)
             .copied()
-            .unwrap_or(Type::Int);
+            .unwrap_or_else(|| {
+                panic!(
+                    "constant_types missing entry for constant OpRef({}) (raw={}) \
+                 though `constants` has it: get_or_insert / get_or_insert_typed \
+                 must populate both maps in lockstep",
+                    opref.0, raw
+                )
+            });
         Some(match tp {
             Type::Int => majit_ir::Value::Int(raw),
             Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)),

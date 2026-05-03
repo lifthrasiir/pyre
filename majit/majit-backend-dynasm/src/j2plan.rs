@@ -191,10 +191,7 @@ impl TracePlan {
         let fallback_ops = 0;
 
         TracePlan {
-            inputargs: inputargs
-                .iter()
-                .map(|arg| OpRef(arg.index))
-                .collect::<Vec<_>>(),
+            inputargs: inputargs.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             lowered_ops: lowered.len() - fallback_ops,
             fallback_ops,
             ops: lowered,

@@ -1703,7 +1703,18 @@ impl TraceCtx {
     pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
         if opref.is_constant() {
             if let Some(raw) = self.constants.as_ref().get(&opref.0).copied() {
-                let tp = self.constants.constant_type(opref).unwrap_or(Type::Int);
+                // Constants always have their type pinned by the
+                // pool's `get_or_insert*` paths (constant_pool.rs:101 /
+                // 134); a constant present in the pool with no recorded
+                // type is a structural bug.
+                let tp = self.constants.constant_type(opref).unwrap_or_else(|| {
+                    panic!(
+                        "constant_pool.constant_type missing for constant OpRef({}) (raw={}): \
+                         constant_pool.get_or_insert / get_or_insert_typed must populate \
+                         constant_types in lockstep",
+                        opref.0, raw
+                    )
+                });
                 return match tp {
                     Type::Int => Value::Int(raw),
                     Type::Float => Value::Float(f64::from_bits(raw as u64)),

@@ -242,6 +242,17 @@ impl InputArg {
     pub fn from_type(tp: Type, index: u32) -> Self {
         InputArg { tp, index }
     }
+
+    /// Returns the OpRef referencing this input arg's slot.
+    ///
+    /// RPython's `InputArg*` Box object IS its own reference — there is
+    /// no separate handle/slot distinction. Pyre encodes the inputarg
+    /// position into the low bits of an `OpRef`; this helper centralises
+    /// that construction so call sites do not reach for the raw `.index`
+    /// field directly.
+    pub fn opref(&self) -> crate::resoperation::OpRef {
+        crate::resoperation::OpRef(self.index)
+    }
 }
 
 /// Limit on the number of fail arguments per guard.

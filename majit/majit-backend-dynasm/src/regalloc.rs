@@ -461,7 +461,7 @@ pub fn compute_vars_longevity(inputargs: &[InputArg], operations: &[Op]) -> Life
 
     // regalloc.py:1210-1213 input arguments
     for iarg in inputargs {
-        let opref = OpRef(iarg.index);
+        let opref = iarg.opref();
         if !longevity.contains(opref) {
             longevity.set(opref, Lifetime::new(-1, -1));
         }
@@ -1415,6 +1415,11 @@ impl RegisterManager {
         let items: Vec<(OpRef, RegLoc)> = self.reg_bindings_items();
         for (v, reg) in items {
             let max_age = longevity.get(v).unwrap().last_usage;
+            // PRE-EXISTING-ADAPTATION: the `unwrap_or(Type::Int)` mirrors
+            // the cranelift caller seeding gap documented at
+            // `majit-ir/src/op_type_index.rs:144-164`. RPython box.type
+            // is intrinsic on the Box object (history.py:220) and never
+            // requires a fallback.
             let v_type = if self.position >= 0 {
                 type_index
                     .opref_type_at(v, self.position as usize)
@@ -1755,7 +1760,7 @@ impl<'a> RegAlloc<'a> {
         // Free input variables that are dead at position 0
         for iarg in inputargs {
             let tp = iarg.tp;
-            let opref = OpRef(iarg.index);
+            let opref = iarg.opref();
             if tp == Type::Float {
                 self.xrm
                     .possibly_free_var(opref, &mut self.longevity, &mut self.fm, tp);
@@ -1850,7 +1855,7 @@ impl<'a> RegAlloc<'a> {
     /// regalloc.py:861 _set_initial_bindings — place all inputargs in frame slots.
     fn _set_initial_bindings(&mut self, inputargs: &[InputArg]) {
         for iarg in inputargs {
-            let opref = OpRef(iarg.index);
+            let opref = iarg.opref();
             let _loc = self.fm.get_new_loc(opref, iarg.tp, &mut self.longevity);
         }
     }
@@ -1861,7 +1866,7 @@ impl<'a> RegAlloc<'a> {
 
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
-            let v = OpRef(iarg.index);
+            let v = iarg.opref();
             let tp = iarg.tp;
             match loc {
                 Loc::Reg(reg) => {
@@ -1907,7 +1912,7 @@ impl<'a> RegAlloc<'a> {
 
         // x86/regalloc.py:321
         for iarg in inputargs {
-            let opref = OpRef(iarg.index);
+            let opref = iarg.opref();
             self.possibly_free_var(opref, iarg.tp);
         }
         // x86/regalloc.py:322
@@ -1959,7 +1964,10 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py:305 possibly_free_vars_for_op(op) — RPython reads
-    /// `arg.type` per box; pyre routes through `self.opref_type`.
+    /// `arg.type` per box; pyre routes through `self.opref_type`. The
+    /// `unwrap_or(Type::Int)` is a PRE-EXISTING-ADAPTATION; see `tp()`
+    /// docstring + `majit-ir/src/op_type_index.rs:144-164` for the
+    /// shared cranelift caller seeding gap rationale.
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
         for &arg in &op.args {
             if !arg.is_constant() && !arg.is_none() {
@@ -2285,7 +2293,13 @@ impl<'a> RegAlloc<'a> {
 
     // ── Type resolution ──
 
-    /// RPython reads `box.type` directly; pyre delegates to `OpTypeIndex`.
+    /// RPython reads `box.type` directly (history.py:220 ConstInt /
+    /// :261 ConstFloat / :307 ConstPtr pin `type` at construction);
+    /// pyre delegates to `OpTypeIndex`. The `unwrap_or(Type::Int)`
+    /// fallback is a PRE-EXISTING-ADAPTATION mirroring
+    /// `majit-ir/src/op_type_index.rs:144-164` — the same cranelift
+    /// caller seeding gap blocks fail-loud here. Convergence path
+    /// closes both layers together.
     fn tp(&self, v: OpRef) -> Type {
         self.opref_type(v).unwrap_or(Type::Int)
     }
@@ -2334,7 +2348,7 @@ impl<'a> RegAlloc<'a> {
 
         // x86/regalloc.py:400-401 free inputargs
         for iarg in inputargs {
-            let opref = OpRef(iarg.index);
+            let opref = iarg.opref();
             self.possibly_free_var(opref, iarg.tp);
         }
 
