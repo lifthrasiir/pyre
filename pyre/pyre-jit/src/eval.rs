@@ -2233,23 +2233,37 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         trace_jit_bytecode(pc, "");
         frame.last_instr = pc as isize;
         frame.set_last_instr_from_next_instr(opcode_pc + 1);
-        // PRE-EXISTING-ADAPTATION: pyopcode.py:170-176 dispatch_bytecode
-        // fires `ec.bytecode_trace(self)` each iteration in the non-jit
-        // branch.  pyre's JIT warm-up loop sees most opcodes during
-        // pre-threshold execution; per-opcode `bytecode_trace` here
-        // pushes hot benchmarks (nbody/fannkuch) over the perf
-        // threshold even when the no-tracer fast path is taken
-        // (function-call cost dominates the null-check fast path).
-        // The interpreter `eval_loop` (pyre-interpreter/src/eval.rs)
-        // already fires `bytecode_trace` for the non-JIT path; the
-        // JIT-compiled trace fires `bytecode_trace` per backward jump
-        // via `jump_absolute` (interp_jit.py:107-109).  The remaining
-        // gap is per-opcode `line` events while warming up a
-        // not-yet-compiled function — addressing it requires either
-        // codewriter emission of `bytecode_only_trace` per traced
-        // opcode (so the JIT trace covers it) or a faster gate at
-        // this call site (inline ec.w_tracefunc check).  Tracked as a
-        // follow-up to Task #224.
+        // pyopcode.py:170-176 dispatch_bytecode parity: fire
+        // `ec.bytecode_trace(self)` each opcode while warming up.
+        // The naive call (`(*ec).bytecode_trace(...)`) regresses
+        // hot benchmarks 28-29% because the function-call boundary
+        // hides the no-tracer fast path from the optimizer. Inline
+        // the gate here — read `ec.w_tracefunc` directly and skip
+        // the whole call when null. Matches the structure of
+        // executioncontext.py:181-183 `bytecode_only_trace` gate
+        // where `ec.gettrace() is not None` short-circuits.
+        let ec_ptr = frame.execution_context as *mut PyExecutionContext;
+        if !ec_ptr.is_null() {
+            let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
+            if needs_trace {
+                if let Err(err) = unsafe {
+                    (*ec_ptr).bytecode_trace(
+                        frame as *mut PyFrame,
+                        pyre_interpreter::executioncontext::TICK_COUNTER_STEP,
+                    )
+                } {
+                    return LoopResult::Done(Err(err));
+                }
+            }
+            // PRE-EXISTING-ADAPTATION: PyPy unconditionally decrements
+            // the ticker (executioncontext.py:163-164) so signal
+            // handlers and async actions fire periodically.  pyre's
+            // actionflag.action_dispatcher slow path is not yet wired
+            // (executioncontext.py:165 only stubs the dec); skip the
+            // decrement on the fast path until that lands so this
+            // gate stays a single null check.  Tracked alongside
+            // Task #224 follow-up.
+        }
         let mut next_instr = frame.next_instr();
         match execute_opcode_step(frame, code, instruction, op_arg, next_instr) {
             Ok(StepResult::Continue) => {
