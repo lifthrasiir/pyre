@@ -470,30 +470,55 @@ pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) 
     execution_context.enter(frame as *mut PyFrame);
     let mut got_exception = true;
     let mut w_exitvalue = pyre_object::w_none();
-    let result = (|| {
+    // pyframe.py:343-373 PyFrame.execute_frame parity:
+    //   try:
+    //     ec.call_trace(self)            # outside inner try
+    //     try:
+    //       ... eval ...
+    //     finally:
+    //       ec.return_trace(self, w_exitvalue)
+    //     got_exception = False
+    //   finally:
+    //     ec.leave(self, w_exitvalue, got_exception)
+    //
+    // call_trace lives in the outer try only — if it raises, neither the
+    // eval body nor return_trace runs, but leave still does (because
+    // enter() already executed).  Python finally semantics: a finally
+    // block that raises replaces the prior exception (return_trace
+    // overrides eval-body, leave overrides everything).
+    let outer_result = (|| -> PyResult {
         execution_context.call_trace(frame as *mut PyFrame)?;
-        if let Some(err) = operr {
-            let mut next_instr = frame.next_instr();
-            if !handle_exception(frame, &err, &mut next_instr) {
-                return Err(err);
+        let inner_result = (|| -> PyResult {
+            if let Some(err) = operr {
+                let mut next_instr = frame.next_instr();
+                if !handle_exception(frame, &err, &mut next_instr) {
+                    return Err(err);
+                }
+                frame.last_instr = next_instr as isize - 1;
             }
-            frame.last_instr = next_instr as isize - 1;
+            let result = eval_loop(frame)?;
+            w_exitvalue = result;
+            Ok(result)
+        })();
+        let return_trace_result =
+            execution_context.return_trace(frame as *mut PyFrame, w_exitvalue);
+        // Python finally: a finally-block exception replaces any
+        // pending exception from the try-body. Only the all-OK path
+        // advances to `got_exception = false`.
+        let combined = match return_trace_result {
+            Err(rt_err) => Err(rt_err),
+            Ok(()) => inner_result,
+        };
+        if combined.is_ok() {
+            got_exception = false;
         }
-        let result = eval_loop(frame)?;
-        w_exitvalue = result;
-        got_exception = false;
-        Ok(result)
+        combined
     })();
-    // executioncontext.py:91-103 — leave wraps `_trace('leaveframe', …)` in
-    // try/finally; the topframeref restore must run regardless of trace
-    // outcome.  Capture both trace results, run leave's cleanup, then
-    // funnel exceptions back into `result` (eval body errors win over
-    // late-trace errors, matching the upstream raise order).
-    let return_trace_result = execution_context.return_trace(frame as *mut PyFrame, w_exitvalue);
     let leave_result = execution_context.leave(frame as *mut PyFrame, w_exitvalue, got_exception);
-    result
-        .and_then(|v| return_trace_result.map(|()| v))
-        .and_then(|v| leave_result.map(|()| v))
+    match leave_result {
+        Err(leave_err) => Err(leave_err),
+        Ok(()) => outer_result,
+    }
 }
 
 /// Resume interpretation after compiled code guard failure.

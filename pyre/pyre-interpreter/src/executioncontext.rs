@@ -665,9 +665,13 @@ impl ExecutionContext {
         frame: *mut PyFrame,
         decr_by: usize,
     ) -> Result<(), crate::PyError> {
-        let trace_result = self.bytecode_only_trace(frame);
+        // executioncontext.py:158-165: bytecode_only_trace runs first;
+        // if it raises (tracefunc callback exception), the ticker
+        // decrement + slow-path action_dispatcher do NOT run.  Use `?`
+        // so a tracer error short-circuits before touching actionflag.
+        self.bytecode_only_trace(frame)?;
         let _ = self.actionflag.decrement_ticker(decr_by as isize);
-        trace_result
+        Ok(())
     }
 
     pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {

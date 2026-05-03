@@ -118,6 +118,11 @@ fn real_main(binary_name: &str) {
     pyre_interpreter::stack_check::set_recursion_limit(5000)
         .expect("startup recursion limit must be applicable");
 
+    // Eagerly install pyre-jit's hooks into pyre-interpreter so that
+    // sys.settrace / set_jit_param routing is live from the very first
+    // user statement, not only after the first JIT-traced bytecode.
+    pyre_jit::eval::init_jit_hooks();
+
     match mode {
         RunMode::Command(cmd) => {
             // Initialize sys.path with CWD for -c mode.

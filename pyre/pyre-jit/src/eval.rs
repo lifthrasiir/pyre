@@ -1882,6 +1882,21 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
         .set_param(name, value);
 }
 
+/// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
+/// like `sys.settrace` see the JIT side from the very first user call,
+/// not only after the first JIT-eligible eval.  Idempotent (the
+/// `OnceLock::set` semantics inside the registrars discard repeats).
+///
+/// `register_eval_override` and `register_set_jit_param_hook` are also
+/// invoked from `eval_with_jit_inner` as a lazy safety net — pyrex
+/// calls this once at boot so user code that touches `sys.settrace`
+/// before its first JIT-traced bytecode still routes through to the
+/// real `WarmState::set_param("trace_limit", 10000)`.
+pub fn init_jit_hooks() {
+    pyre_interpreter::call::register_eval_override(eval_with_jit);
+    pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
+}
+
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
