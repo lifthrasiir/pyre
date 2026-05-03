@@ -411,46 +411,37 @@ impl ExecutionContext {
     }
 
     pub fn enter(&mut self, frame: *mut PyFrame) {
+        // pypy/interpreter/executioncontext.py:85-89 enter parity.
         if !self.space.is_null() && self.is_tracing > 0 {
             self._revdb_enter(frame);
         }
         unsafe {
             (*frame).f_backref = self.topframeref;
         }
+        // `jit.virtual_ref(frame)` — vref allocation, no-op until
+        // jit.virtual_ref is ported.
         self.topframeref = frame;
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn leave(&mut self, frame: *mut PyFrame, w_exitvalue: PyObjectRef, got_exception: bool) {
         // pypy/interpreter/executioncontext.py:91-109 leave parity.
-        // The Python `try/finally` collapses into linear code here because
-        // `_trace` cannot raise — it's a no-op stub.
         if !self.profilefunc.is_null() {
             self._trace(frame, "leaveframe", w_exitvalue, None);
         }
-        // `frame_vref = self.topframeref` — vref currently a raw frame
-        // pointer; the `vref()` force at the bottom of the if-block is a
-        // no-op until `jit.virtual_ref` ports.
         let _frame_vref = self.topframeref;
         unsafe {
             self.topframeref = (*frame).f_backref;
-            // pypy/interpreter/executioncontext.py:98-106: if the frame
-            // escaped to applevel (or unwinding via exception), the back-
-            // chain must also be marked so consumers walking f_back stop
-            // treating it as "still on the JIT stack".
             if (*frame).escaped || got_exception {
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
                     (*f_back).mark_as_escaped();
                 }
-                // `frame_vref()` — vref force, no-op until `jit.virtual_ref`
-                // is ported.
+                // `frame_vref()` — vref force, no-op until jit.virtual_ref is ported.
             }
         }
         // `jit.virtual_ref_finish(frame_vref, frame)` — no-op until
-        // `jit.virtual_ref` is ported.
-        // PyPy gates this on `self.space.reverse_debugging`; pyre has no
-        // equivalent flag, so the (also no-op) call runs unconditionally.
+        // jit.virtual_ref is ported.
         self._revdb_leave(got_exception);
     }
 

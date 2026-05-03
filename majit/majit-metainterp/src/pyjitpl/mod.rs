@@ -4068,15 +4068,12 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_constant_types,
                 );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(
-                        &mut exit_layouts,
-                        backend_layouts.as_slice(),
-                    );
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        backend_layouts.as_slice(),
+                        &backend_layouts,
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -4882,15 +4879,12 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_constant_types,
                 );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(
-                        &mut exit_layouts,
-                        backend_layouts.as_slice(),
-                    );
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        backend_layouts.as_slice(),
+                        &backend_layouts,
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -5356,15 +5350,12 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_constant_types,
                 );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(
-                        &mut exit_layouts,
-                        backend_layouts.as_slice(),
-                    );
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        backend_layouts.as_slice(),
+                        &backend_layouts,
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -5687,15 +5678,12 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_constant_types,
                 );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(
-                        &mut exit_layouts,
-                        backend_layouts.as_slice(),
-                    );
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        backend_layouts.as_slice(),
+                        &backend_layouts,
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -7910,15 +7898,12 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_constant_types,
                 );
                 if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(
-                        &mut exit_layouts,
-                        backend_layouts.as_slice(),
-                    );
+                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                 }
                 if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
-                        backend_layouts.as_slice(),
+                        &backend_layouts,
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(&token, trace_id);
@@ -8412,10 +8397,7 @@ impl<M: Clone> MetaInterp<M> {
                         source_trace_id,
                         fail_index,
                     ) {
-                        compile::merge_backend_exit_layouts(
-                            &mut exit_layouts,
-                            backend_layouts.as_slice(),
-                        );
+                        compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
                     }
                     if let Some(backend_layouts) =
                         self.backend.compiled_bridge_terminal_exit_layouts(
@@ -8426,7 +8408,7 @@ impl<M: Clone> MetaInterp<M> {
                     {
                         compile::merge_backend_terminal_exit_layouts(
                             &mut terminal_exit_layouts,
-                            backend_layouts.as_slice(),
+                            &backend_layouts,
                         );
                     }
                     let bridge_trace_info = self
@@ -13919,26 +13901,53 @@ mod metainterp_static_data_tests {
     fn finishframe_writes_result_into_caller_then_change_frame() {
         // pyjitpl.py:2483-2486 — popframe + framestack[-1].make_result_of_lastop +
         // raise ChangeFrame.
+        //
+        // RPython parity (pyjitpl.py:258-265, 2479-2486): when
+        // `make_result_of_lastop` fires on the caller frame after the
+        // callee returns, it reads `_resulttypes[self.pc]` and asserts
+        // the recorded kind matches the runtime kind.  To exercise that
+        // assertion (which `MIFrame::make_result_of_lastop` mirrors as
+        // a `debug_assert`), the caller jitcode must contain a real
+        // typed-call bytecode whose end-of-instruction position is
+        // reflected in `caller.pc` at finishframe time.
         use crate::jitcode::{JitArgKind, JitCodeBuilder};
-        let callee = std::sync::Arc::new(JitCodeBuilder::new().finish());
         let mut builder_caller = JitCodeBuilder::new();
-        let callee_idx = builder_caller.add_sub_jitcode_arc(callee.clone());
-        builder_caller.inline_call_r_i(callee_idx, &[], Some(1));
+        builder_caller.load_const_i_value(0, 0);
+        builder_caller.load_const_i_value(1, 0);
+        // assembler.py:217-219 — `inline_call_irf_i` records
+        // `resulttypes[end_pc] = 'i'` so the post-call pc lookup
+        // succeeds at make_result_of_lastop.  The sub_jitcode index
+        // (0) is a placeholder — perform_call(callee) below pushes
+        // the actual callee onto the framestack regardless of the
+        // bytecode operand, since this test never runs the dispatch
+        // loop.
+        builder_caller.inline_call_irf_i(0, &[], &[], &[], Some(1));
+        let post_call_pc = builder_caller.current_pos();
         let caller = std::sync::Arc::new(builder_caller.finish());
-        let caller_return_pc = caller.body().code.len();
+        let builder_callee = JitCodeBuilder::new();
+        let callee = std::sync::Arc::new(builder_callee.finish());
 
         let mut meta = MetaInterp::<()>::new(0);
-        // Push caller, then callee.
+        // Push caller, then advance caller.pc to the post-call
+        // position the way the bytecode dispatch loop would (the
+        // opimpl reads operand bytes and bumps `pc` past the entire
+        // `inline_call_irf_i` instruction before raising ChangeFrame
+        // and yielding control to the callee — pyjitpl.py:2475-2479).
         meta.perform_call(caller, &[], None).unwrap_err();
-        meta.framestack.current_mut().pc = caller_return_pc;
+        meta.framestack.current_mut().pc = post_call_pc;
         meta.perform_call(callee, &[], None).unwrap_err();
         assert_eq!(meta.framestack.len(), 2);
 
         // Return from callee: write result into caller register 1.
+        // `make_result_of_lastop` (frame.rs) checks
+        // `caller.jitcode.body.resulttypes[caller.pc]` matches the
+        // runtime kind — both are 'i' here, so the debug_assert
+        // passes and the result is written.
         let result = meta.finishframe(Some((JitArgKind::Int, 1, OpRef(42), 4242)), true);
         assert!(matches!(result, Err(FinishFrameSignal::ChangeFrame)));
         assert_eq!(meta.framestack.len(), 1);
         let caller_frame = meta.framestack.current_mut();
+        assert_eq!(caller_frame.pc, post_call_pc);
         assert_eq!(caller_frame.int_regs[1], Some(OpRef(42)));
         assert_eq!(caller_frame.int_values[1], Some(4242));
     }
@@ -16921,12 +16930,12 @@ mod tests {
         let mut terminal_exit_layouts =
             compile::build_terminal_exit_layouts(inputargs, &ops, &HashMap::new());
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
-            compile::merge_backend_exit_layouts(&mut exit_layouts, backend_layouts.as_slice());
+            compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
         }
         if let Some(backend_layouts) = meta.backend.compiled_terminal_exit_layouts(&token) {
             compile::merge_backend_terminal_exit_layouts(
                 &mut terminal_exit_layouts,
-                backend_layouts.as_slice(),
+                &backend_layouts,
             );
         }
         let trace_info = meta.backend.compiled_trace_info(&token, trace_id);

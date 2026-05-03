@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use vecset::VecSet;
+
 use crate::call::CallControl;
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use crate::flowspace::model::ConstValue;
@@ -65,7 +67,7 @@ pub struct Assembler {
     pub all_liveness_length: usize,
     /// RPython: Assembler.all_liveness_positions — dedup cache.
     /// Maps (live_i set, live_r set, live_f set) → offset in all_liveness.
-    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), usize>,
+    all_liveness_positions: HashMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
     /// Name of the graph currently being assembled, threaded through so
@@ -307,12 +309,12 @@ impl Assembler {
             c_num_regs_i: num_regs_i as u16,
             c_num_regs_r: num_regs_r as u16,
             c_num_regs_f: num_regs_f as u16,
-            // RPython `assembler.py:271-281 make_jitcode(startpoints=
-            // self.startpoints, alllabels=self.alllabels, ...)` — the
-            // assembler always hands its set, never `None`. Wrap in
-            // `Some(...)` so the assembled jitcode parities the upstream
-            // shape (helper jitcodes that bypass the assembler keep the
-            // `None` default).
+            // self.startpoints, alllabels=self.alllabels,
+            // resulttypes=self.resulttypes, ...)` — assembled jitcodes
+            // always carry the recorded set, never `None`. Wrap in
+            // `Some(...)` so the upstream None sentinel is reserved
+            // for hand-built helper jitcodes that bypass the builder
+            // (jitcode.py:24 defaults).
             startpoints: Some(state.startpoints),
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
@@ -367,12 +369,10 @@ impl Assembler {
                         RegKind::Float => live_f.push(color),
                     }
                 }
-                // assembler.py:236 `key = (frozenset(live_i), …)` — pyre
-                // deduplicates with sorted `Vec<u8>` keys; sort each kind
-                // so equal sets compare equal under the `Vec<u8>` Eq impl.
-                live_i.sort();
-                live_r.sort();
-                live_f.sort();
+                // assembler.py:236 `key = (frozenset(live_i), …)` —
+                // `_encode_liveness` collects the inputs into `VecSet`
+                // for canonical ordering and dedup, so the caller emits
+                // raw push-order without an extra sort.
                 // assembler.py:148 `self.code.append(chr(self.insns['live/']))`
                 let opnum = self.get_opnum("live/");
                 state.code.push(opnum);
@@ -683,34 +683,30 @@ impl Assembler {
         code: &mut Vec<u8>,
     ) {
         // assembler.py:235 `key = (frozenset(live_i), frozenset(live_r),
-        // frozenset(live_f))`.  Pyre normalises by sort+dedup so the
-        // `Vec<u8>` cache key matches across equivalent sets.
-        let normalize = |slice: &[u8]| -> Vec<u8> {
-            let mut v = slice.to_vec();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
-        let live_i = normalize(live_i);
-        let live_r = normalize(live_r);
-        let live_f = normalize(live_f);
-        let key = (live_i.clone(), live_r.clone(), live_f.clone());
+        // frozenset(live_f))`.  `VecSet` is a Vec-backed sorted set, so
+        // collecting the input into one yields the same canonical form
+        // `frozenset` would have produced.
+        let key = (
+            live_i.iter().copied().collect::<VecSet<u8>>(),
+            live_r.iter().copied().collect::<VecSet<u8>>(),
+            live_f.iter().copied().collect::<VecSet<u8>>(),
+        );
         let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
             cached
         } else {
             let pos = self.all_liveness.len();
-            self.all_liveness_positions.insert(key, pos);
             // assembler.py:241 `chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))`
-            self.all_liveness.push(live_i.len() as u8);
-            self.all_liveness.push(live_r.len() as u8);
-            self.all_liveness.push(live_f.len() as u8);
+            self.all_liveness.push(key.0.len() as u8);
+            self.all_liveness.push(key.1.len() as u8);
+            self.all_liveness.push(key.2.len() as u8);
             // assembler.py:243-247 `for live in live_i, live_r, live_f:
             // liveness = encode_liveness(live); …`
-            for live in [live_i.as_slice(), live_r.as_slice(), live_f.as_slice()] {
+            for live in [key.0.as_slice(), key.1.as_slice(), key.2.as_slice()] {
                 let encoded = crate::jit_codewriter::liveness::encode_liveness(live);
                 self.all_liveness.extend_from_slice(&encoded);
             }
             self.all_liveness_length = self.all_liveness.len();
+            self.all_liveness_positions.insert(key, pos);
             pos
         };
         // assembler.py:248 `encode_offset(pos, self.code)`.
@@ -1405,17 +1401,13 @@ impl Assembler {
             // (`blackhole.py:1066 @arguments("self","i","I","R","F",
             // "I","R","F")`) reads jdindex + six typed register lists, each
             // encoded as `[len:u8][reg:u8 * N]` (assembler.py:181-196 ListOfKind).
-            // assembler.py:163 reads `allow_short = (insn[0] in USE_C_FORM)`
-            // and assembler.py:312 puts `jit_merge_point` in `USE_C_FORM`,
-            // so a jdindex in the signed-byte range is emitted inline as
-            // `'c'` (canonical key `jit_merge_point/cIRFIRF`); otherwise
-            // the value is constants-pool-promoted and emitted as `'i'`
-            // (canonical key `jit_merge_point/iIRFIRF`). Both keys are
-            // registered in `wellknown_bh_insns()` mapping to distinct
-            // opcodes (`BC_JIT_MERGE_POINT_C` vs `BC_JIT_MERGE_POINT`); the
-            // blackhole `@arguments("i", ...)` decoder
-            // (`blackhole.py:113-123`) interprets the byte per the runtime
-            // argcode.
+            // pyre's runtime (`blackhole.rs:2012-2029`) consumes exactly this
+            // six-list shape. The canonical runtime key is
+            // `jit_merge_point/cIRFIRF` for signed-byte jitdriver indices or
+            // `jit_merge_point/iIRFIRF` for constant-pool jitdriver indices.
+            // The generic fallback would flatten SSA register bytes without the
+            // length prefix and without the jdindex byte, corrupting the
+            // stream.
             OpKind::JitMergePoint {
                 jitdriver_index,
                 greens_i,
@@ -1427,7 +1419,7 @@ impl Assembler {
             } => {
                 let jdindex_value = *jitdriver_index as i64;
                 let jdindex_argcode = if (-128..=127).contains(&jdindex_value) {
-                    state.code.push(jdindex_value as u8);
+                    state.code.push(jdindex_value as i8 as u8);
                     'c'
                 } else {
                     let jdindex_byte = self.emit_const_i(jdindex_value, state);
@@ -3248,7 +3240,7 @@ mod tests {
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FunctionGraph, OpKind, ValueType};
         use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::{resolve_rewritten_types, resolve_types};
+        use crate::translate_legacy::rtyper::rtyper::resolve_types;
 
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("caller");
@@ -3280,12 +3272,7 @@ mod tests {
             .with_callcontrol(&mut cc)
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
-        let rewritten_types = resolve_rewritten_types(
-            &type_state,
-            &rewritten.graph,
-            &annotations,
-            &rewritten.synth_kinds,
-        );
+        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat =
@@ -3320,7 +3307,7 @@ mod tests {
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
         use crate::translate_legacy::annotator::annrpython::annotate;
-        use crate::translate_legacy::rtyper::rtyper::{resolve_rewritten_types, resolve_types};
+        use crate::translate_legacy::rtyper::rtyper::resolve_types;
         use crate::translator::rtyper::rpbc::lower_indirect_calls;
 
         fn build_run_impl(name: &str) -> FunctionGraph {
@@ -3378,12 +3365,7 @@ mod tests {
             .with_callcontrol(&mut cc)
             .with_type_state(&type_state);
         let rewritten = transformer.transform(&graph);
-        let rewritten_types = resolve_rewritten_types(
-            &type_state,
-            &rewritten.graph,
-            &annotations,
-            &rewritten.synth_kinds,
-        );
+        let rewritten_types = resolve_types(&rewritten.graph, &annotations);
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
         let mut flat =

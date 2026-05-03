@@ -12,7 +12,7 @@ use majit_metainterp::{
 };
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
-use pyre_interpreter::pyframe::{PendingInlineResult, PyFrame};
+use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
@@ -232,31 +232,11 @@ impl MetaInterpStaticData {
 
     /// codewriter.py:67-68 parity — stamp the SD-local `idx` onto the
     /// shared `Arc<majit_metainterp::jitcode::JitCode>` carried by the
-    /// payload.  RPython relies on the `metainterp_sd.jitcodes[i].index
-    /// == i` invariant (`codewriter.py:80`,
-    /// `warmspot.py:281-282`); a JitCode that lands at SD slot `i`
-    /// with a different stamped index would let
-    /// `frame.jitcode.index` and `metainterp_sd.jitcodes[frame_idx]`
-    /// disagree, breaking blackhole resume.
-    ///
-    /// Two paths reach here:
-    ///   * Build-time `make_jitcodes()` already called `set_index(i)`
-    ///     on every drained `Arc<JitCode>` (`codewriter.rs:279`); the
-    ///     SD list now publishes those same Arcs at the same offsets
-    ///     so a re-stamp with the same value is a no-op (the
-    ///     `OnceLock` accepts the equal-value second `set` —
-    ///     `jitcode.rs:333-348`).
-    ///   * Pyre-only fresh runtime jitcodes (skeletons, portal-bridge
-    ///     installs) reach here without a build-time stamp; the
-    ///     SD-local position is the only meaningful index they have
-    ///     and the first `set_index` succeeds.
-    ///
-    /// Both paths therefore funnel through `JitCode::set_index(idx)`
-    /// unconditionally — the canonical helper asserts `existing ==
-    /// idx` on a re-stamp and panics on a divergent one, which is
-    /// exactly the parity gate Codex flagged: a previously-stamped
-    /// payload merged into a different SD slot will trip the assert
-    /// instead of silently violating the upstream invariant.
+    /// payload.  Upstream RPython unconditionally writes
+    /// `jitcode.index = index`; a mismatch between an existing
+    /// canonical stamp and the SD-local slot is a parity violation, so
+    /// rely on `JitCode::set_index`'s own assert (same value: OK,
+    /// different value: panic) instead of silently skipping.
     fn stamp_payload_index(idx: i32, payload: &std::sync::Arc<crate::PyJitCode>) {
         payload.jitcode.set_index(idx as usize);
     }
@@ -612,12 +592,12 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
                 code
             )
         });
-        (callbacks.ensure_published_jitcode)(raw_code, code);
+        (callbacks.ensure_majit_jitcode)(raw_code, code);
         if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
             return existing;
         }
         panic!(
-            "ensure_published_jitcode did not install a populated JitCode for W_CodeObject {:p}",
+            "ensure_majit_jitcode did not install a populated JitCode for W_CodeObject {:p}",
             code
         );
     }
@@ -625,8 +605,8 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
 }
 
 /// Install one CodeWriter-owned PyJitCode payload into trace-side
-/// MetaInterpStaticData. Used by the CallControl.get_jitcode drain path to
-/// publish the same Arc that CallControl.jitcodes stores.
+/// MetaInterpStaticData. Used by the lazy CallControl.get_jitcode drain path
+/// to publish the same Arc that CallControl.jitcodes stores.
 pub fn install_jitcode_for(
     code: *const (),
     payload: std::sync::Arc<crate::PyJitCode>,
@@ -2491,27 +2471,6 @@ pub(crate) fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -
         Value::Float(v) => ctx.const_int(v.to_bits() as i64),
         Value::Ref(r) => ctx.const_ref(r.as_usize() as i64),
         Value::Void => ctx.const_ref(PY_NULL as i64),
-    }
-}
-
-pub fn pending_inline_result_from_concrete(
-    result_type: Type,
-    concrete_result: PyObjectRef,
-) -> PendingInlineResult {
-    match result_type {
-        Type::Int => PendingInlineResult::Int(unsafe { w_int_get_value(concrete_result) }),
-        Type::Float => PendingInlineResult::Float(unsafe {
-            pyre_object::floatobject::w_float_get_value(concrete_result)
-        }),
-        Type::Ref | Type::Void => PendingInlineResult::Ref(concrete_result),
-    }
-}
-
-pub fn materialize_pending_inline_result(result: PendingInlineResult) -> PyObjectRef {
-    match result {
-        PendingInlineResult::Ref(result) => result,
-        PendingInlineResult::Int(value) => w_int_new(value),
-        PendingInlineResult::Float(value) => pyre_object::floatobject::w_float_new(value),
     }
 }
 
@@ -5561,21 +5520,10 @@ impl JitState for PyreJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        // interp_jit.py:67 `reds = ['frame', 'ec']` — every JUMP threads ec.
-        // `pypyjit_create_sym` / `setup_bridge_sym` seed sym.execution_context
-        // before any trace emission, so this is unconditional.
-        debug_assert!(
-            !sym.execution_context.is_none(),
-            "sym.execution_context must be seeded before collect_jump_args"
-        );
         Self::pypyjit_collect_jump_args(sym)
     }
 
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        debug_assert!(
-            !sym.execution_context.is_none(),
-            "sym.execution_context must be seeded before collect_typed_jump_args"
-        );
         Self::pypyjit_collect_typed_jump_args(sym)
     }
 
@@ -5945,7 +5893,7 @@ mod tests {
                 jit_create_self_recursive_callee_frame_1: std::ptr::null(),
                 jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
                 driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
-                ensure_published_jitcode: |_, _| {},
+                ensure_majit_jitcode: |_, _| {},
             }));
             crate::callbacks::init(cb);
         });

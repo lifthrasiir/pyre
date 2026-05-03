@@ -5831,11 +5831,14 @@ mod tests {
         assert_eq!(get_count, 1, "byte-array read-after-read should be cached");
     }
 
+    /// `resoperation.py:1044` lists `ARRAYLEN_GC` inside the
+    /// `_ALWAYS_PURE_FIRST.._ALWAYS_PURE_LAST` band; CSE of always-pure
+    /// ops is `optimizeopt/pure.py:316`'s `_pure_operations[opnum]`
+    /// table, not heap.py.  This test wires `OptPure` to confirm the
+    /// dedup path; running with `OptHeap` alone would (correctly) leave
+    /// both reads in place — heap.py has no parallel cache.
     #[test]
-    fn test_arraylen_caching() {
-        // Two ARRAYLEN_GC on the same array → second eliminated by OptPure.
-        // resoperation.py:1044 marks ARRAYLEN_GC as ALWAYS_PURE; OptPure's
-        // _pure_operations CSE table handles dedup.
+    fn test_arraylen_caching_via_optpure() {
         let d = descr(42);
         let mut ops = vec![
             {
@@ -5862,7 +5865,10 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::ArraylenGc)
             .count();
-        assert_eq!(len_count, 1, "duplicate ARRAYLEN_GC should be cached");
+        assert_eq!(
+            len_count, 1,
+            "duplicate ARRAYLEN_GC should be cached by OptPure"
+        );
     }
 
     /// heap.py:278-298 ArrayCachedItem._cannot_alias_via_content — two

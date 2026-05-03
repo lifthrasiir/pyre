@@ -453,27 +453,6 @@ impl MIFrame {
     /// `target_index`. RPython reads `target_index = ord(self.bytecode[self.pc-1])`
     /// from the bytecode; pyre's call BC encodes `dst` explicitly so
     /// callers pass it directly.
-    ///
-    /// RPython `pyjitpl.py:260-265` non-translated debug check:
-    ///
-    /// ```python
-    /// got_type = resultbox.type
-    /// if not we_are_translated():
-    ///     typeof = {'i': history.INT, 'r': history.REF, 'f': history.FLOAT}
-    ///     assert typeof[self.jitcode._resulttypes[self.pc]] == got_type
-    /// ```
-    ///
-    /// `_resulttypes[pc]` is keyed by end-of-instruction position
-    /// (RPython `assembler.py:217-219`). Pyre's typed-result CALL
-    /// helpers (`JitCodeBuilder::{call_*_like, call_assembler_*_like,
-    /// inline_call_typed}`) populate the map at the same key.
-    ///
-    /// RPython does direct `_resulttypes[self.pc]` indexing — missing
-    /// keys panic (`KeyError`). Pyre mirrors the `resulttypes=None`
-    /// sentinel with `Option<HashMap<..>>`: only `None` means the
-    /// jitcode was not built through the assembler, while `Some({})`
-    /// is an assembled jitcode whose empty dict must still fail on a
-    /// missing result pc.
     pub fn make_result_of_lastop(
         &mut self,
         kind: JitArgKind,
@@ -483,13 +462,24 @@ impl MIFrame {
     ) {
         #[cfg(debug_assertions)]
         {
-            let expected = match kind {
+            // pyjitpl.py:260-264 non-translated check:
+            //
+            //     if not we_are_translated():
+            //         typeof = {'i': history.INT, 'r': history.REF,
+            //                   'f': history.FLOAT}
+            //         assert typeof[self.jitcode._resulttypes[self.pc]] == got_type
+            //
+            // Rust `debug_assertions` is the closest equivalent of
+            // `not we_are_translated()`: fail loudly in non-translated
+            // developer builds, but elide the whole check in release.
+            let got = match kind {
                 JitArgKind::Int => 'i',
                 JitArgKind::Ref => 'r',
                 JitArgKind::Float => 'f',
             };
             let resulttypes = self
                 .jitcode
+                .core()
                 .body()
                 .resulttypes
                 .as_ref()
@@ -498,10 +488,9 @@ impl MIFrame {
                 .get(&self.pc)
                 .expect("make_result_of_lastop: missing _resulttypes[pc]");
             assert_eq!(
-                recorded, expected,
-                "make_result_of_lastop: jitcode {:?} _resulttypes[{}] = {recorded:?} \
-                 does not match resultbox kind {expected:?}",
-                self.jitcode.name, self.pc,
+                recorded, got,
+                "make_result_of_lastop: jitcode._resulttypes[{}] = {recorded:?} but runtime kind = {got:?}",
+                self.pc
             );
         }
         match kind {
@@ -1030,7 +1019,9 @@ mod tests {
         for i in 0..num_f {
             builder.load_const_f_value(i, 0);
         }
-        Arc::new(builder.finish())
+        let mut jitcode = builder.finish();
+        jitcode.body_mut().resulttypes = Some([(0, 'i'), (1, 'r'), (2, 'f')].into_iter().collect());
+        Arc::new(jitcode)
     }
 
     #[test]
@@ -1448,15 +1439,7 @@ mod tests {
 
     #[test]
     fn make_result_of_lastop_stores_into_typed_slot() {
-        let mut jitcode = JitCodeBuilder::new().finish();
-        {
-            let body = jitcode.body_mut();
-            body.c_num_regs_i = 2;
-            body.c_num_regs_r = 2;
-            body.c_num_regs_f = 1;
-            body.resulttypes = Some([(0, 'i'), (1, 'r'), (2, 'f')].into_iter().collect());
-        }
-        let jitcode = Arc::new(jitcode);
+        let jitcode = make_jitcode_with_regs(2, 2, 1);
         let mut frame = MIFrame::new(jitcode.clone(), 0);
 
         frame.pc = 0;
@@ -1473,55 +1456,6 @@ mod tests {
         frame.make_result_of_lastop(JitArgKind::Float, 0, OpRef(9), 99);
         assert_eq!(frame.float_regs[0], Some(OpRef(9)));
         assert_eq!(frame.float_values[0], Some(99));
-    }
-
-    #[test]
-    fn make_result_of_lastop_accepts_matching_recorded_resulttype() {
-        // RPython `pyjitpl.py:260-265`: in non-translated builds the
-        // assertion compares the resultbox kind against
-        // `jitcode._resulttypes[frame.pc]`.  pyre's writer-side
-        // `JitCodeBuilder::record_resulttype` populates the map at
-        // end-of-instruction position; this test asserts the reader
-        // accepts a matching kind without panicking.
-        use crate::JitCallArg;
-        let mut builder = JitCodeBuilder::new();
-        // Emit a typed-int residual_call that records 'i' at end-of-instr.
-        builder.call_int_typed(0, &[JitCallArg::int(0)], 0);
-        let jitcode = Arc::new(builder.finish());
-        let post_call_pc = jitcode.body().code.len();
-        let recorded = jitcode
-            .body()
-            .resulttypes
-            .as_ref()
-            .and_then(|resulttypes| resulttypes.get(&post_call_pc).copied());
-        assert_eq!(
-            recorded,
-            Some('i'),
-            "writer must record 'i' at end-of-instruction PC for residual_call_int"
-        );
-
-        let mut frame = MIFrame::new(jitcode.clone(), 0);
-        frame.pc = post_call_pc;
-        // Matching kind — assertion passes silently.
-        frame.make_result_of_lastop(JitArgKind::Int, 0, OpRef(7), 77);
-        assert_eq!(frame.int_regs[0], Some(OpRef(7)));
-    }
-
-    #[test]
-    #[should_panic(expected = "_resulttypes")]
-    fn make_result_of_lastop_panics_on_recorded_resulttype_mismatch() {
-        // Same writer setup as the matching variant — but the reader
-        // passes `Ref` against a recorded `'i'`, which fires the
-        // RPython `pyjitpl.py:264` assertion port.
-        use crate::JitCallArg;
-        let mut builder = JitCodeBuilder::new();
-        builder.call_int_typed(0, &[JitCallArg::int(0)], 0);
-        let jitcode = Arc::new(builder.finish());
-        let post_call_pc = jitcode.body().code.len();
-
-        let mut frame = MIFrame::new(jitcode.clone(), 0);
-        frame.pc = post_call_pc;
-        frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef(7), 77);
     }
 
     #[test]

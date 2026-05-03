@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
+use vecset::VecSet;
 
 use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
 
@@ -53,7 +54,7 @@ pub struct Assembler {
     /// `assembler.py:30` `self.all_liveness_length = 0`.
     all_liveness_length: usize,
     /// `assembler.py:31` `self.all_liveness_positions = {}`.
-    all_liveness_positions: HashMap<(Vec<u8>, Vec<u8>, Vec<u8>), u16>,
+    all_liveness_positions: HashMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), u16>,
     /// `assembler.py:32` `self.num_liveness_ops = 0`.
     num_liveness_ops: usize,
     /// `assembler.py:24` `self.indirectcalltargets = set()    # set of JitCodes`.
@@ -340,10 +341,10 @@ impl Assembler {
     /// `assembler.py:234-248` `_encode_liveness(...)`.
     ///
     /// Line-by-line port of RPython's `_encode_liveness`:
-    ///   - Dedup key is `(live_i, live_r, live_f)` — pyre uses sorted-byte
-    ///     slices where RPython uses `frozenset`. Equivalent modulo the
-    ///     caller's responsibility to present sorted/dedup'd input, which
-    ///     is done by `get_liveness_info` before this call.
+    ///   - Dedup key is `(frozenset(live_i), frozenset(live_r),
+    ///     frozenset(live_f))`. Pyre carries each kind as a `VecSet<u8>`
+    ///     (Vec-backed sorted set), and the cache uses the same
+    ///     `(VecSet, VecSet, VecSet)` triple as its `HashMap` key.
     ///   - On miss: append the three u8 length bytes + the encoded
     ///     bitsets, and advance `all_liveness_length`.
     ///   - `num_liveness_ops` bumps once per `-live-` write regardless of
@@ -355,11 +356,16 @@ impl Assembler {
     /// the blackhole reader (a lower-crate consumer that cannot depend
     /// on `pyre_jit`) sees the same bytes. PRE-EXISTING-ADAPTATION for
     /// the crate layering, not a relocation of the RPython state.
-    fn encode_liveness_info(&mut self, live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> u16 {
+    fn encode_liveness_info(
+        &mut self,
+        live_i: &VecSet<u8>,
+        live_r: &VecSet<u8>,
+        live_f: &VecSet<u8>,
+    ) -> u16 {
         use majit_translate::liveness::encode_liveness;
 
         self.num_liveness_ops += 1;
-        let key = (live_i.to_vec(), live_r.to_vec(), live_f.to_vec());
+        let key = (live_i.clone(), live_r.clone(), live_f.clone());
         let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
             cached
         } else {
@@ -374,16 +380,16 @@ impl Assembler {
                 "too many live registers in one slot"
             );
             let pos = self.all_liveness_length as u16;
-            self.all_liveness_positions.insert(key, pos);
             self.all_liveness.push(live_i.len() as u8);
             self.all_liveness.push(live_r.len() as u8);
             self.all_liveness.push(live_f.len() as u8);
             self.all_liveness_length += 3;
-            for live in [live_i, live_r, live_f] {
+            for live in [live_i.as_slice(), live_r.as_slice(), live_f.as_slice()] {
                 let encoded = encode_liveness(live);
                 self.all_liveness.extend_from_slice(&encoded);
                 self.all_liveness_length += encoded.len();
             }
+            self.all_liveness_positions.insert(key, pos);
             pos
         };
         pyre_jit_trace::assembler::publish_state(
@@ -425,6 +431,19 @@ fn is_adapter_only_helper_call_family(opname: &str) -> bool {
 }
 
 fn insn_key(opname: &str, args: &[Operand], result: Option<&Register>) -> String {
+    if opname == "jit_merge_point" {
+        let jdindex_argcode = match args {
+            [Operand::ConstInt(value), ..] if (-128..=127).contains(value) => 'c',
+            [Operand::ConstInt(_), ..] => 'i',
+            _ => panic!(
+                "jit_merge_point: expected 7-arg shape with ConstInt jd_index at arg[0]; \
+                 jtransform.py:1690-1712 always emits the canonical \
+                 [jd_index, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f] form"
+            ),
+        };
+        return format!("jit_merge_point/{jdindex_argcode}IRFIRF");
+    }
+
     let mut argcodes = String::new();
     let allow_short = use_c_form(opname);
     for arg in args {
@@ -529,8 +548,8 @@ fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
     label
 }
 
-fn get_liveness_info(args: &[Operand], kind: Kind) -> Vec<u8> {
-    let mut lives = Vec::new();
+fn get_liveness_info(args: &[Operand], kind: Kind) -> VecSet<u8> {
+    let mut lives = VecSet::new();
     for arg in args {
         if let Operand::Register(Register {
             kind: reg_kind,
@@ -538,12 +557,10 @@ fn get_liveness_info(args: &[Operand], kind: Kind) -> Vec<u8> {
         }) = arg
         {
             if *reg_kind == kind {
-                lives.push(u8::try_from(*index).expect("liveness register index exceeds u8"));
+                lives.insert(u8::try_from(*index).expect("liveness register index exceeds u8"));
             }
         }
     }
-    lives.sort_unstable();
-    lives.dedup();
     lives
 }
 
@@ -693,10 +710,12 @@ fn dispatch_op(
             state.builder.goto_if_exception_mismatch(vtable, label_id);
         }
         "jit_merge_point" => {
-            // RPython jtransform.py:1690-1712 emits the upstream shape:
-            // `[jd_index_const, greens_i, greens_r, greens_f, reds_i,
-            // reds_r, reds_f]`. blackhole.py:1066
-            // `@arguments("self","i","I","R","F","I","R","F")` reads
+            // Upstream-orthodox 7-arg shape (jtransform.py:1690-1712 +
+            // jtransform.py:437-445 make_three_lists):
+            //   [jd_index_const, greens_i, greens_r, greens_f,
+            //    reds_i, reds_r, reds_f]
+            // Produced by `codewriter.rs::portal_jit_merge_point_graph_args`.
+            // The builder lowers to bytecode that carries
             // jdindex + the six typed register lists generally; the
             // helper writes the same byte stream regardless of which
             // lists are empty for the current jitdriver.
@@ -1780,13 +1799,15 @@ fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
 /// argcodes ('i'/'r'/'f' for Register, 'c' for Constant) and routing
 /// Constants through the per-kind constant table at write time.
 ///
-/// Pyre's portal `jit_merge_point` graph path produces the 7-arg
-/// upstream-orthodox shape via
+/// Pyre's production jit_merge_point historically emitted
+/// pre-pool-routed `Register` operands (via
+/// `ssa_emitter.rs::emit_portal_jit_merge_point`), so this function
+/// keeps that path working.  It also makes the 7-arg
+/// upstream-orthodox shape produced by
 /// `codewriter.rs::portal_jit_merge_point_graph_args` +
 /// `GraphFlattener` (which emits raw `ConstInt`/`ConstRef` inside
 /// `ListOfKind` because pyre's flow-graph constants are not
-/// pool-routed upstream), so this helper accepts both already-colored
-/// registers and constants inside those lists.
+/// pool-routed upstream) work end-to-end.
 fn expect_list_regs_or_pool(state: &mut AssemblyState, op: &Operand, expected: Kind) -> Vec<u8> {
     let ListOfKind { kind, content } = match op {
         Operand::ListOfKind(list) => list,
@@ -1969,6 +1990,10 @@ mod tests {
         let mut assembler = Assembler::new();
 
         let mut ssarepr = SSARepr::new("portal");
+        // jtransform.py:1704-1707 emits the canonical 7-arg shape
+        // `[Constant(jd.index), greens_i, greens_r, greens_f,
+        //   reds_i, reds_r, reds_f]`. A small ConstInt jd_index lowers
+        // to the `c` argcode (insn_key arg[0] match: -128..=127 → 'c').
         ssarepr.insns.push(Insn::op(
             "jit_merge_point",
             vec![
@@ -1996,6 +2021,18 @@ mod tests {
                 Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
             ],
         ));
+        ssarepr.insns.push(Insn::op(
+            "jit_merge_point",
+            vec![
+                Operand::ConstInt(200),
+                Operand::ListOfKind(ListOfKind::new(Kind::Int, Vec::new())),
+                Operand::ListOfKind(ListOfKind::new(Kind::Ref, Vec::new())),
+                Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
+                Operand::ListOfKind(ListOfKind::new(Kind::Int, Vec::new())),
+                Operand::ListOfKind(ListOfKind::new(Kind::Ref, Vec::new())),
+                Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
+            ],
+        ));
         ssarepr.insns.push(Insn::op_with_result(
             "last_exc_value",
             Vec::new(),
@@ -2013,13 +2050,13 @@ mod tests {
 
         let insns = assembler.insns_snapshot();
         let wellknown = majit_metainterp::jitcode::wellknown_bh_insns();
-        // The fixture above passes `ConstInt(0)` for jdindex which is in
-        // the signed-byte range, so `assembler.py:163,312 USE_C_FORM`
-        // selects the `'c'` argcode and the canonical key is
-        // `jit_merge_point/cIRFIRF`.
         assert_eq!(
             insns.get("jit_merge_point/cIRFIRF"),
             wellknown.get("jit_merge_point/cIRFIRF")
+        );
+        assert_eq!(
+            insns.get("jit_merge_point/iIRFIRF"),
+            wellknown.get("jit_merge_point/iIRFIRF")
         );
         assert_eq!(
             insns.get("last_exc_value/>r"),

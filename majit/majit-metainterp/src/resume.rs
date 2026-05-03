@@ -4840,10 +4840,7 @@ mod tests {
         // Hand-crafted body bypasses the builder's `start_instr` path,
         // so populate `startpoints` explicitly: BC_LIVE at 0,
         // BC_ABORT at 3.  RPython `jitcode.py:85-90` asserts
-        // `pc in self._startpoints`. `Some(set)` matches the
-        // assembler's `make_jitcode(startpoints=...)` shape — `None`
-        // would tell `dispatch_loop` (`blackhole.py:86-90`) to skip
-        // the assertion entirely.
+        // `pc in self._startpoints`.
         runtime.body_mut().startpoints = Some([0_usize, 3].into_iter().collect());
         let runtime = std::sync::Arc::new(runtime);
 

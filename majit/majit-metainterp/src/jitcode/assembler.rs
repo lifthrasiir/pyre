@@ -2381,7 +2381,7 @@ impl JitCodeBuilder {
     }
 
     /// 1-byte counterpart of `patch_const_refs`. `loop_header/i` and
-    /// `jit_merge_point/IRR` jdindex bytes (`@arguments("i")`,
+    /// `jit_merge_point/iIRFIRF` jdindex bytes (`@arguments("i")`,
     /// blackhole.py:1062,1066) carry a single register-index byte.
     /// Asserts the resolved slot fits in u8 — overflow means the portal
     /// has more than 255 int registers + constants combined, which

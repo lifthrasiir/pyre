@@ -18,13 +18,6 @@ const _: () = assert!(
         == std::mem::size_of::<Rc<PyExecutionContext>>()
 );
 
-#[derive(Debug, Clone, Copy)]
-pub enum PendingInlineResult {
-    Ref(PyObjectRef),
-    Int(i64),
-    Float(f64),
-}
-
 /// Execution frame for a single Python code block.
 ///
 /// Unified `locals_cells_stack_w` array layout:
@@ -59,25 +52,28 @@ pub struct PyFrame {
     /// Absolute index into `locals_cells_stack_w` marking the top of the
     /// operand stack. Starts at `nlocals + ncells` (empty stack), grows upward.
     pub valuestackdepth: usize,
-    /// `pyframe.py:72 last_instr` — index of the last executed instruction.
-    /// PyPy initializes to -1; `get_last_lineno` uses this for `offset2lineno`.
+    /// `pyframe.py:72 last_instr` — index of the currently-dispatching (or
+    /// just-dispatched) instruction. Initialized to `-1` (frame not yet
+    /// entered). `get_last_lineno` uses this for `offset2lineno`.
     ///
-    /// PRE-EXISTING-ADAPTATION (Stage 3 / Task #118): pyre stores the PC of
-    /// the last executed instruction here (matches CPython's `f_lasti`
-    /// semantic, returned directly by `fget_f_lasti`). RPython's runtime
-    /// stores `last_instr = next_instr` instead, set every dispatch by
-    /// `pypy/interpreter/pyopcode.py:172 self.last_instr = intmask(next_instr)`,
-    /// so RPython's `last_instr` is one ahead of pyre's. The two conventions
-    /// are equivalent modulo ±1; `next_instr()` below adds one to recover
-    /// PyPy's view, and JIT shadow code (`vable_last_instr`) is consistently
-    /// produced as `pc - 1` and consumed as such across both pyre-jit and
-    /// pyre-jit-trace. Flipping storage to RPython's convention is
-    /// achievable but requires an atomic 30+ site mechanical rewrite (every
-    /// `vable_last_instr = ctx.const_int(pc - 1)` producer plus the
-    /// downstream readers) with no observable behavior change. Until that is
-    /// done the divergence is documented but accepted; cited at
-    /// `pypy/interpreter/pyopcode.py:172` and
-    /// `pypy/module/pypyjit/interp_jit.py:25`.
+    /// Storage semantic matches RPython.  `pypy/interpreter/pyopcode.py:172
+    /// self.last_instr = intmask(next_instr)` writes the to-be-dispatched
+    /// byte-offset at the top of every dispatch iteration, and pyre's
+    /// `eval.rs::eval_loop` writes `frame.last_instr = pc` at the same
+    /// point.  At any inspection boundary (between opcodes, at a guard,
+    /// during a handler) both sides hold "current/just-completed opcode"
+    /// modulo bytes-vs-instruction units.
+    ///
+    /// PRE-EXISTING-ADAPTATION (pattern-level, not semantic): RPython's
+    /// dispatch carries the next-to-execute pc as a separate `next_instr`
+    /// local variable advanced by `next_instr += 2` after the opcode read.
+    /// pyre packs the same information into `last_instr` plus the
+    /// `next_instr()` accessor below, which returns `last_instr + 1`.
+    /// `set_last_instr_from_next_instr` is the inverse setter, and the
+    /// JIT vable shadow `vable_last_instr` mirrors the same field. The
+    /// `±1` arithmetic on either side of the accessor cancels — the
+    /// runtime never observes a divergence — so this remains a structural
+    /// adaptation, not a parity bug.
     pub last_instr: isize,
     /// pyframe.py:80 escaped — see mark_as_escaped()
     pub escaped: bool,

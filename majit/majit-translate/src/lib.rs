@@ -2169,11 +2169,6 @@ mod tests {
         let mut call_control = call::CallControl::new();
         let mut function_graphs = std::collections::HashMap::new();
         for parsed in &parsed_files {
-            // `collect_function_graphs` returns `Result<(), FlowingError>`
-            // precisely so unsupported constructs surface as hard
-            // failures (mirrors `flowspace/objspace.py:49 ctx.build_flow`
-            // re-raise semantics). Silently dropping the Result here
-            // would hide flow-build errors that upstream propagates.
             parse::collect_function_graphs(parsed, &mut function_graphs)
                 .expect("collect_function_graphs: FlowingError must propagate");
         }

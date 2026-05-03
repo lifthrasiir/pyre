@@ -1576,12 +1576,10 @@ where
                 // Payload shape mirrors upstream `@arguments("self", "i",
                 // "I", "R", "F", "I", "R", "F")` (blackhole.py:1066) and
                 // pyre's own `majit-metainterp/src/jitcode/assembler.rs:692`
-                // — 1-byte jdindex (assembler.py:312 `USE_C_FORM` membership
-                // selects between `'c'` raw signed byte and `'i'` register
-                // pool slot at compile time; both opcodes route here) + six
-                // typed register lists (`[len:u8][reg:u8 * N]`). Metainterp
-                // dispatch doesn't use jdindex yet (trace-level
-                // opimpl_jit_merge_point 는 pyjitpl.py:1538 참조), but the
+                // — 1-byte jdindex (either a registers_i pool slot for the
+                // `i` form or a raw signed byte for the `c` form) + six
+                // typed register lists (`[len:u8][reg:u8 * N]`).
+                // Metainterp dispatch doesn't use jdindex yet, but the
                 // cursor must advance past the operands so the following
                 // opcode byte is read at the correct offset.
                 let frame = self.frames.current_mut();

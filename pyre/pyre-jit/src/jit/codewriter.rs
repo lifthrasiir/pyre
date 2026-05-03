@@ -2068,30 +2068,16 @@ fn register_helper_fn_pointers(
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
 ///
-/// The Ref bank still carries the LV∩SSA `live_r.retain(...)` intersect
-/// as a PRE-EXISTING-ADAPTATION (Task #181 / parent #185 epic, blocked
-/// by Task #110 slice 3b + Task #158 graph regalloc). RPython's
-/// `liveness.py:19-76 compute_liveness` produces a single SSA-driven
-/// alive set as the sole authority. The encoder at
-/// `pyre-jit-trace/src/trace_opcode.rs:get_list_of_active_boxes` now
-/// reads `registers_r_bank[reg]` directly per `pyjitpl.py:218-225` (no
-/// semantic-prefix fallback) and the blackhole decoder
-/// (`call_jit.rs::resume_in_blackhole` / `consume_one_section`)
-/// restores only liveness-listed colors per `resume.py:1017-1026` (no
-/// heap-mirror fallback). RPython's flat `_registers_r` register file
-/// makes encoder and decoder indices agree by construction. Pyre's
-/// retain still compensates for chordal regalloc collapsing scratch
-/// colors onto pinned Python-frame colors: dropping the retain alone
-/// leaves the scratch value visible at the encoded color and the BH
-/// decoder writes it back as if it were the local/stack value
-/// (verified empirically — fannkuch(9) and nbody SIGSEGV on cranelift
-/// when the retain was removed in isolation at b72cf1d743d, nbody and
-/// fannkuch timeout under MAJIT_PHASE06_DROP_LV=1 once those crashes
-/// were closed). Convergence path: graph regalloc with separate
-/// scratch color space (Task #158 item 4) eliminates the conflation,
-/// after which the retain becomes provably dead.
+/// `live_i` and `live_f` are emitted line-by-line parity with
+/// upstream — RPython's `liveness.py:19-76 compute_liveness`
+/// produces one SSA-driven alive set as the sole authority, and
+/// `assembler.py:150-152` only splits that set by kind.
 ///
-/// Int/Float banks are emitted line-by-line parity with no filter.
+/// PRE-EXISTING-ADAPTATION: `live_r` carries an extra LV∩SSA
+/// `retain` step on top of the SSA bank — see the inline comment
+/// in the loop body below.  Removing it requires extending the
+/// encoder + symbolic-state pair to track scratch Ref colors,
+/// matching `pyjitpl.py:218-225` line by line.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
 /// `LiveVars` analysis. The direct-dispatch walker emits one
@@ -2171,14 +2157,13 @@ fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) 
 fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
-    nlocals: usize,
-    stack_slot_color_map: &[u16],
     depth_at_pc: &[u16],
-    collapsed_scratch_colors: &std::collections::HashSet<u16>,
+    stack_slot_color_map: &[u16],
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness(ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
+    let nlocals = code.varnames.len();
     let live_markers = live_marker_indices_by_pc(ssarepr, code.instructions.len());
     for (py_pc, insn_idx) in live_markers.into_iter().enumerate() {
         let existing = match ssarepr.insns.get_mut(insn_idx) {
@@ -2221,18 +2206,6 @@ fn filter_liveness_in_place(
         // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`. All three
         // banks mirror that shape — every alive Register of the kind is
         // pushed in encounter order with seen-set deduplication.
-        //
-        // The Ref bank previously carried an `(in_locals || in_stack)`
-        // pre-filter to keep portal/scratch indices out of `live_r`.
-        // After Phase 2.2 routed every scratch through
-        // `ssarepr.fresh_var(Kind::Ref, scratch_ref_base)` (placed
-        // above `portal_ec_reg + 1`) and the LV∩SSA retain below
-        // (`live_r.retain(|idx| lv_live.contains(idx))`) settled in
-        // as the authoritative narrowing step, the pre-filter became
-        // algebraically redundant: any index that would have been
-        // dropped by `(in_locals || in_stack)` is also missing from
-        // `lv_live = {LV-live-locals} ∪ live_stack_colors`, so the
-        // retain drops it on the next line. Task #158 retires it.
         for op in existing.iter() {
             let SsaOperand::Register(reg) = op else {
                 continue;
@@ -2255,14 +2228,26 @@ fn filter_liveness_in_place(
                 }
             }
         }
-        // The codewriter `live_r` mirrors RPython's `liveness.py:19-76`
-        // SSA-driven alive set — every alive Register pushed in encounter
-        // order with seen-set dedup, no pyre-only widening. The LV∩SSA
-        // `live_r.retain` below is a PRE-EXISTING-ADAPTATION that
-        // compensates for chordal regalloc collapsing scratch colors onto
-        // pinned Python-frame colors (file-top doc explains the failure
-        // mode); convergence path is graph regalloc with separate scratch
-        // color space (Task #158 item 4).
+        // PRE-EXISTING-ADAPTATION: LV∩SSA retain narrows the Ref bank
+        // to the post-rename colors that correspond to LV-live Python
+        // locals or live stack slots at this PC. The encoder
+        // (`get_list_of_active_boxes`) populates only those colors via
+        // `semantic_ref_slot_for_reg_color`; scratches are not yet
+        // tracked in `PyreSym.registers_r`, so leaving them in the
+        // encoded `-live-` section would surface as `OpRef::NONE` in
+        // guard fail_args and BH dispatch reads of stale registers.
+        // Removing this retain requires extending the
+        // encoder/symbolic-state pair to the full post-color bank,
+        // mirroring `pyjitpl.py:218-225` line by line.
+        //
+        // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
+        // RPython-orthodox SSA-only `live_r` so probe-A logs in
+        // `consume_one_section` (`call_jit.rs::resume_in_blackhole`)
+        // can capture what BH writes per color when the bank widens.
+        // Default off — bench / production keep the retain. Removed
+        // once Task #158 graph regalloc lands a separate scratch
+        // color space; until then this env-var is the only path back
+        // to RPython form.
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
@@ -2271,66 +2256,8 @@ fn filter_liveness_in_place(
             s.extend(live_stack_colors.iter().copied());
             s
         };
-        // Phase 0.4 probe (Task #181 follow-up). When
-        // MAJIT_PROBE_LIVENESS is set, dump the indices that the
-        // SSA-driven scan above pushed into `live_r` but the LV∩SSA
-        // retain (below) drops — these are the entries Phase 2.3
-        // would have widened live_r with. Post-Task #158 slice B the
-        // pyre-only force-add and historical index-range pre-filter
-        // are both gone, so `live_r_pre` already equals the SSA-alive
-        // Ref set; `lv_drops = live_r_pre ∖ lv_live`.
-        if std::env::var_os("MAJIT_PROBE_LIVENESS").is_some() {
-            let lv_drops: Vec<u16> = live_r
-                .iter()
-                .copied()
-                .filter(|idx| !lv_live.contains(idx))
-                .collect();
-            if !lv_drops.is_empty() {
-                eprintln!(
-                    "[probe-B][filter_liveness] code={} py_pc={} depth={} nlocals={} \
-                     stack_colors={:?} live_r_pre={:?} lv_drops={:?}",
-                    code.obj_name, py_pc, depth, nlocals, live_stack_colors, live_r, lv_drops,
-                );
-            }
-        }
-        // Task #110 slice 1 diagnostic: `MAJIT_PHASE06_DROP_LV=1` reproduces
-        // the (now panic-free, post-Phase 0.6) wrong-value behaviour so the
-        // probe-A logs in `consume_one_section` (call_jit.rs:909-965) capture
-        // what BH writes per color when live_r widens to the SSA-alive set.
-        // Default off — bench / production unchanged. Removed in Task #110
-        // slice 4 cleanup.
         if std::env::var_os("MAJIT_PHASE06_DROP_LV").is_none() {
             live_r.retain(|idx| lv_live.contains(idx));
-        }
-
-        // Task #158 item 4 prep probe (`MAJIT_PROBE_SCRATCH_COLLAPSE=1`):
-        // dump live_r entries at this py_pc whose post-rename color is
-        // BOTH (a) reached by some scratch pre-index (>= scratch_ref_base
-        // pre-rename, mapped down via `apply_rename`) AND (b) currently
-        // LV-live at this PC. These are the silent-corruption candidates
-        // — chordal coloring let a scratch land on a Python-frame color,
-        // and the LV∩SSA retain kept it because the same color is
-        // LV-live as a Python local/stack at this PC. The encoder /
-        // BH decoder will treat the scratch's value as the local /
-        // stack value, producing wrong-value bugs without crashing.
-        // Static dump fires once per (jitcode, color) pair via
-        // collapse-set construction; this per-PC dump pinpoints the
-        // PCs that surface the conflation as a corruption event.
-        if std::env::var_os("MAJIT_PROBE_SCRATCH_COLLAPSE").is_some()
-            && !collapsed_scratch_colors.is_empty()
-        {
-            let live_collapsed: Vec<u16> = live_r
-                .iter()
-                .copied()
-                .filter(|idx| collapsed_scratch_colors.contains(idx) && lv_live.contains(idx))
-                .collect();
-            if !live_collapsed.is_empty() {
-                eprintln!(
-                    "[probe-C][scratch_collapse_per_pc] code={} py_pc={} depth={} \
-                     nlocals={} live_collapsed={:?}",
-                    code.obj_name, py_pc, depth, nlocals, live_collapsed,
-                );
-            }
         }
 
         existing.clear();
@@ -2690,7 +2617,6 @@ impl CodeWriter {
     /// Phase A: the cpu helpers are fixed module-level functions in
     /// `crate::call_jit`; Phase D.2 wired `callcontrol` as a field so
     /// `writer.callcontrol()` matches `self.callcontrol` in upstream.
-    ///
     pub fn new() -> Self {
         // codewriter.py:21-23 `self.cpu = cpu; self.assembler = Assembler();
         //   self.callcontrol = CallControl(cpu, jitdrivers_sd)`.
@@ -2936,15 +2862,16 @@ impl CodeWriter {
         let (catch_for_pc, catch_sites, handler_depth_at) =
             decode_exception_catch_sites(&mut assembler, code, num_instrs);
 
-        // codewriter.py:37 `portal_jd =
-        // self.callcontrol.jitdriver_sd_from_portal_graph(graph)`.
-        // RPython treats `CallControl.jitdrivers_sd` as the single
-        // authoritative portal registry: a graph is a portal iff it was
-        // registered through `setup_jitdriver`. Merely existing in
-        // `CallControl.jitcodes` means only that `get_jitcode(graph)`
-        // queued it for assembly (call.py:155-172); callees assembled
-        // that way must remain non-portal and must not grow a
-        // `jit_merge_point`.
+        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
+        // — RPython looks up portal-ness in the registry that
+        // `setup_jitdriver` populates. pyre matches that: a code is a
+        // portal iff it is in `CallControl.jitdrivers_sd`. The portal
+        // path (`register_portal_jitdriver`) registers before the drain
+        // runs `transform_graph_to_jitcode`, so the lookup must happen
+        // before creating the shadow graph / entry FrameState below.
+        // `merge_point_pc` is only a pyre refinement hint; `None` still
+        // means "registered portal whose exact merge PC is not known yet",
+        // not "non-portal".
         let portal_jd_index = self
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
@@ -2959,7 +2886,7 @@ impl CodeWriter {
         // shadow graph now carries the same per-block `FrameState`
         // object instead of a topology-only `BlockRef`.
         //
-        // Portal graphs (those registered in `jitdrivers_sd`, per
+        // Portal graphs (registered in `jitdrivers_sd`, per
         // codewriter.py:37) carry two extra red inputs —
         // `(frame, ec)` — appended to both `startblock.inputargs` via
         // `graph_entry_inputargs(code, portal_inputs=true)` AND to
@@ -4330,17 +4257,21 @@ impl CodeWriter {
                         // Graph side: record the upstream-matched 7-arg
                         // SpaceOperation per
                         // `jtransform.py:1690-1712 handle_jit_marker__jit_merge_point`.
-                        // The graph layer carries the full `[jd_index, 3 green
-                        // ListOfKinds, 3 red ListOfKinds]` shape that
-                        // upstream regalloc + flatten consume.
+                        // The graph carries the full
+                        // `[jd_index, 3 green ListOfKinds, 3 red ListOfKinds]`
+                        // shape, and `GraphFlattener::emit_space_operation`
+                        // lowers that same shape into SSARepr — the byte
+                        // side is no longer pyre's old 3-list shorthand.
+                        // Assembler / blackhole / backend (`assembler.rs:712`)
+                        // assert the canonical 7-arg form on the way out.
                         //
-                        // PRE-EXISTING-ADAPTATION: pycode is carried as
-                        // an `Opaque(Ref)` Constant at the graph layer so
-                        // `Constant` Eq/Hash stays Clone + PartialEq-deriveable
-                        // (raw pointers cannot hash cleanly); the
-                        // `lower_constant` callback below recovers the
-                        // original `w_code` pointer from its closure capture
-                        // and routes it through the runtime constant pool.
+                        // pycode is carried as an `Opaque(Ref)` Constant at
+                        // the graph layer so `Constant` Eq/Hash stays Clone +
+                        // PartialEq-deriveable (raw pointers cannot hash
+                        // cleanly); the `lower_constant` callback below
+                        // recovers the original `w_code` pointer from its
+                        // closure capture and routes it through the runtime
+                        // constant pool.
                         let jdindex = portal_jd_index
                             .expect("portal jit_merge_point requires a registered jitdriver");
                         let w_code_i64 = w_code as i64;
@@ -4388,19 +4319,20 @@ impl CodeWriter {
                             },
                         )
                         .emit_space_operation(&graph_op);
-                    } else {
-                        if let Some(jdindex) = portal_jd_index {
-                            let loop_header_op = emit_graph_op_void(
-                                &current_block.block(),
-                                "loop_header",
-                                vec![super::flow::Constant::signed(jdindex as i64).into()],
-                                py_pc as i64,
-                            );
-                            GraphFlattener::new(&mut ssarepr, |_variable| {
-                                unreachable!("loop_header graph op does not carry Variables")
-                            })
-                            .emit_space_operation(&loop_header_op);
-                        }
+                    } else if let Some(jdindex) = portal_jd_index {
+                        // jtransform.py:1714 handle_jit_marker__loop_header
+                        // asserts `jd is not None` — only emit when this
+                        // compilation belongs to a registered jitdriver.
+                        let loop_header_op = emit_graph_op_void(
+                            &current_block.block(),
+                            "loop_header",
+                            vec![super::flow::Constant::signed(jdindex as i64).into()],
+                            py_pc as i64,
+                        );
+                        GraphFlattener::new(&mut ssarepr, |_variable| {
+                            unreachable!("loop_header graph op does not carry Variables")
+                        })
+                        .emit_space_operation(&loop_header_op);
                     }
                 }
 
@@ -4621,18 +4553,15 @@ impl CodeWriter {
                     // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
                     // LOAD_FAST reads. Portal parity with plain LoadFast would
                     // route both halves through vable_getarrayitem_ref, but
-                    // flipping this arm (attempted multiple times — most
-                    // recently 2026-04-27 alongside Phase 2.3 LV∩SSA drop)
-                    // reproduces the same `set_virtualizable_entry_at: index
-                    // X out of range for X slots` bridge re-trace panic, with
-                    // the same mechanism Phase 2.3 hit. The 2026-04-24 LFLF
+                    // flipping this arm (attempted multiple times, most
+                    // recently 2026-04-27) reproduces the same
+                    // `set_virtualizable_entry_at: index X out of range for
+                    // X slots` bridge re-trace panic. The 2026-04-24 LFLF
                     // flip (commit 776c763575) recovered correctness on
                     // top-level benches but was reverted at 2648598f9da
                     // because float-typed locals returned NaN — and even the
                     // 2026-04-27 retry on the post-Phase-2.2 base hits the
-                    // same bridge re-trace push_value overflow as Phase 2.3.
-                    // The shared root cause is the LV-driven tracer encoder
-                    // (Task #110, see filter_liveness_in_place docstring).
+                    // same bridge re-trace push_value overflow.
                     Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                     | Instruction::LoadFastLoadFast { var_nums } => {
                         let pair = var_nums.get(op_arg);
@@ -6848,72 +6777,12 @@ impl CodeWriter {
         // and chordal coloring guarantees uniqueness within any
         // simultaneously-live subset.
 
-        // Task #158 item 4 prep probe: identify which post-rename
-        // colors are reached by BOTH a Python-frame pre-rename Variable
-        // (locals 0..nlocals, stack stack_base..stack_base + max_stackdepth,
-        // portal red regs) AND a scratch pre-rename Variable
-        // (>= scratch_ref_base). These are the chordal-coloring
-        // namespace conflations that motivate the graph regalloc with
-        // separate scratch color space (Task #158 item 4 / option A).
-        // Computed once per jitcode; per-PC corruption events surface
-        // through `MAJIT_PROBE_SCRATCH_COLLAPSE` inside
-        // `filter_liveness_in_place`.
-        //
-        // The set is named "pinned" but `stack_slot_color_map` only
-        // forces identity over the live prefix (see the build site's
-        // PIN-vs-LENGTH split docstring above). Tail stack colors land
-        // identity by side effect, which means a scratch landing on a
-        // tail color is included here even though no PC would ever
-        // read that color from the heap mirror — a slight overcount.
-        // Acceptable for the audit; the per-PC dump in
-        // `filter_liveness_in_place` re-bounds via `lv_live` to the
-        // live prefix, so reported events stay precise.
-        let pinned_post_colors: std::collections::HashSet<u16> = {
-            let mut s = std::collections::HashSet::new();
-            s.extend(pyre_color_for_semantic_local.iter().copied());
-            s.extend(stack_slot_color_map.iter().copied());
-            s.insert(portal_frame_reg);
-            s.insert(portal_ec_reg);
-            s
-        };
-        let mut collapsed_scratch_colors: std::collections::HashSet<u16> =
-            std::collections::HashSet::new();
-        for ((kind, pre), &post) in alloc_result.rename.iter() {
-            if *kind == Kind::Ref && *pre >= scratch_ref_base && pinned_post_colors.contains(&post)
-            {
-                collapsed_scratch_colors.insert(post);
-            }
-        }
-        if std::env::var_os("MAJIT_PROBE_SCRATCH_COLLAPSE").is_some()
-            && !collapsed_scratch_colors.is_empty()
-        {
-            let mut sorted: Vec<u16> = collapsed_scratch_colors.iter().copied().collect();
-            sorted.sort();
-            eprintln!(
-                "[probe-C][scratch_collapse_static] code={} pinned_count={} \
-                 collapsed_count={} colors={:?}",
-                code.obj_name,
-                pinned_post_colors.len(),
-                collapsed_scratch_colors.len(),
-                sorted,
-            );
-        }
-
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
-        // them into live_i/live_r/live_f per assembler.py:150-152,
-        // with a PRE-EXISTING-ADAPTATION narrowing live_r to Python
-        // boxes (see that function's header comment).
-        filter_liveness_in_place(
-            &mut ssarepr,
-            code,
-            nlocals,
-            &stack_slot_color_map,
-            &depth_at_pc,
-            &collapsed_scratch_colors,
-        );
+        // them into live_i/live_r/live_f per assembler.py:150-152.
+        filter_liveness_in_place(&mut ssarepr, code, &depth_at_pc, &stack_slot_color_map);
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -7028,10 +6897,10 @@ impl CodeWriter {
         };
 
         // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
-        // only portal jitcodes reached through `grab_initial_jitcodes`;
-        // callees created by plain `get_jitcode(graph)` keep
-        // `jitdriver_sd=None`, which blackhole.py:1764 uses to walk back
-        // to the enclosing portal during exception handling.
+        // the shell returned by `grab_initial_jitcodes`; pyre still
+        // builds the populated `JitCode` as the final codewriter step, so
+        // stamp the exact jdindex while constructing that populated object.
+        // Non-portals keep the JitCode constructor default of `None`.
         if let Some(idx) = self
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject)
@@ -7177,16 +7046,11 @@ impl CodeWriter {
 
     /// call.py:147-148 follow-up after the drain. `grab_initial_jitcodes`
     /// already binds `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`;
-    /// the drain calls `publish_jitcode`, which mutates the inner
-    /// `Arc<JitCode>` allocation in place (`PyJitCode::replace_with`).
-    /// The inner `Arc<JitCode>` pointer therefore stays stable, so the
-    /// initial `mainjitcode` binding remains valid across the drain
-    /// without a rebind. This method exists for the
-    /// `reset_jitcode_skeleton` path (`merge_point_pc` refinement —
-    /// pyre-only adapter) which swaps the cached `Arc<PyJitCode>` for a
-    /// fresh one, in which case `mainjitcode` must be rebound to the
-    /// new inner `Arc<JitCode>`. `finalize_jitcode` stamps the exact
-    /// `jitdriver_sd` on the populated runtime `JitCode`.
+    /// the drain fills that same Arc in place, so this method only refreshes
+    /// each jd from `CallControl.jitcodes[portal_graph]`. `finalize_jitcode` stamps
+    /// the exact `jitdriver_sd` on the populated runtime `JitCode`; because
+    /// `publish_jitcode` replaces the payload in place, this no longer needs
+    /// to repair identity after the drain.
     fn assign_portal_jitdriver_indices(&self) {
         let cc = self.callcontrol();
         // Snapshot the (key, jdindex) pairs first so the borrow on
@@ -7198,12 +7062,9 @@ impl CodeWriter {
             .map(|(idx, jd)| (super::call::CallControl::jitcode_key(jd.portal_graph), idx))
             .collect();
         for (key, idx) in assignments {
-            let inner = cc
-                .jitcodes
-                .get(&key)
-                .map(|arc| std::sync::Arc::clone(&arc.jitcode));
-            if let Some(jitcode_arc) = inner {
-                cc.jitdrivers_sd[idx].mainjitcode = Some(jitcode_arc);
+            let arc_clone = cc.jitcodes.get(&key).map(std::sync::Arc::clone);
+            if let Some(clone) = arc_clone {
+                cc.jitdrivers_sd[idx].mainjitcode = Some(clone);
             }
         }
     }
@@ -7270,24 +7131,37 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 // `CallControl::get_jitcode` is the canonical entry point.
 // ---------------------------------------------------------------------------
 
-/// Register the lazily discovered portal before `make_jitcodes`.
+/// Portal entry path: `setup_jitdriver` followed by `make_jitcodes` —
+/// the warmspot order at codewriter.py:74-99. RPython runs this once
+/// per `@jit_callback` decoration; pyre's portal discovery is lazy,
+/// so this adapter fires per JIT entry. `setup_jitdriver` dedups by
+/// `portal_graph` so `jitdrivers_sd` stays bounded by the number of
+/// unique portals (see [`CodeWriter::setup_jitdriver`] for the
+/// PRE-EXISTING-ADAPTATION rationale).
 ///
-/// RPython warmspot calls `CodeWriter.setup_jitdriver(jd)` before
-/// `CodeWriter.make_jitcodes()`. Pyre discovers the portal CodeObject at
-/// runtime, but the CodeWriter/CallControl ordering stays the same:
-/// append the jd first, then let `grab_initial_jitcodes` seed the portal
-/// jitcode through `get_jitcode(jd.portal_graph)`.
+/// `make_jitcodes` is then the canonical RPython no-arg call: it
+/// pulls its seed list from `CallControl.jitdrivers_sd` and runs
+/// `grab_initial_jitcodes` → drain → `assembler.finished()` →
+/// `assign_portal_jitdriver_indices`. The resulting list is published
+/// whole to trace-side `MetaInterpStaticData`, matching
+/// `warmspot.py:281-282`. Runtime trace-side lookup must observe this
+/// installed result; it must not compile missing callees lazily.
 pub fn register_portal_jitdriver(
     code: &pyre_interpreter::CodeObject,
     w_code: *const (),
     merge_point_pc: Option<usize>,
 ) {
     let writer = CodeWriter::instance();
-    // codewriter.py:96-99 `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
+    // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
+    // portal so `grab_initial_jitcodes` finds it.
     writer.setup_jitdriver(super::call::JitDriverStaticData {
         portal_graph: code as *const pyre_interpreter::CodeObject,
         w_code,
         merge_point_pc,
+        // call.py:147 LHS — initial `None` matches RPython's
+        // `jd.mainjitcode = None` before `grab_initial_jitcodes`
+        // fires; `grab_initial_jitcodes` itself stores the
+        // `Arc<PyJitCode>` from `get_jitcode(jd.portal_graph)`.
         mainjitcode: None,
     });
     // codewriter.py:74 `make_jitcodes()` — drain everything pending.
@@ -7296,7 +7170,7 @@ pub fn register_portal_jitdriver(
     // `make_jitcodes()` result on MetaInterpStaticData before tracing
     // can observe it. Pyre keeps trace-side SD in a separate crate
     // keyed by W_CodeObject, so install the whole just-drained list at
-    // this codewriter boundary. A missing compiled entry after the drain
+    // this codewriter boundary. A missing portal entry after the drain
     // is an impossible postcondition and must fail loudly.
     if !jitcodes.is_empty() {
         pyre_jit_trace::state::install_jitcodes(jitcodes);
@@ -7335,40 +7209,36 @@ pub fn compile_jitcode_for_callee(
 /// This is the pyre boundary corresponding to RPython's setup-time
 /// `make_jitcodes()` handoff: the writer owns `CallControl.jitcodes`, and the
 /// trace-side staticdata stores the same populated JitCode objects.
-pub fn ensure_published_jitcode_for_w_code(
+///
+/// `call.py:155-172 CallControl.get_jitcode(graph)` keys its dictionary on
+/// graph identity; pyre's "graph identity" is the `*const CodeObject`
+/// pointer.  The trace recorder already has that pointer in hand when it
+/// calls into the writer, so consume it directly and assert it agrees with
+/// `w_code`'s embedded code pointer instead of re-deriving the pointer.
+pub fn ensure_trace_jitcode_for_w_code(
     raw_code: *const pyre_interpreter::CodeObject,
     w_code: *const (),
 ) -> Option<std::sync::Arc<PyJitCode>> {
-    let pyjit = compile_jitcode_via_w_code(raw_code, w_code)?;
+    let pyjit = compile_jitcode_via_raw_code(raw_code, w_code)?;
     pyre_jit_trace::state::install_jitcode_for(w_code, std::sync::Arc::clone(&pyjit));
     Some(pyjit)
 }
 
-fn compile_jitcode_via_w_code(
+fn compile_jitcode_via_raw_code(
     raw_code: *const pyre_interpreter::CodeObject,
     w_code: *const (),
 ) -> Option<std::sync::Arc<PyJitCode>> {
-    if w_code.is_null() {
+    if raw_code.is_null() || w_code.is_null() {
         return None;
     }
-    let canonical_raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    let raw_code = if raw_code.is_null() {
-        canonical_raw_code
-    } else {
-        if !canonical_raw_code.is_null() {
-            assert_eq!(
-                raw_code, canonical_raw_code,
-                "callback raw CodeObject must match the W_CodeObject payload"
-            );
-        }
-        raw_code
-    };
-    if raw_code.is_null() {
-        return None;
-    }
+    assert_eq!(
+        unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        },
+        raw_code,
+        "ensure_trace_jitcode_for_w_code: w_code's embedded code pointer must match raw_code",
+    );
     let code = unsafe { &*raw_code };
     if let Some(existing) = CodeWriter::instance()
         .callcontrol()
@@ -7396,8 +7266,8 @@ fn compile_jitcode_via_w_code(
 /// raw Python bytecode, so the equivalent scan looks for
 /// `JUMP_BACKWARD` instructions and resolves their target PCs.
 ///
-/// Used by `transform_graph_to_jitcode` to decide where `loop_header`
-/// bytecodes belong; portal classification itself comes from
+/// Used by `transform_graph_to_jitcode` to decide where loop markers
+/// belong. Portal classification itself comes from
 /// `CallControl.jitdrivers_sd`, matching codewriter.py:37.
 pub fn find_loop_header_pcs(
     code: &pyre_interpreter::CodeObject,
@@ -8344,6 +8214,57 @@ mod tests {
     }
 
     #[test]
+    fn filter_liveness_drops_non_lv_live_colors_from_live_r() {
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
+        let reachable_pc = (0..code.instructions.len())
+            .find(|&py_pc| live_vars.is_reachable(py_pc))
+            .expect("compiled code must have a reachable pc");
+
+        let mut ssarepr = SSARepr::new("t");
+        for py_pc in 0..code.instructions.len() {
+            ssarepr.insns.push(Insn::PcAnchor(py_pc));
+            ssarepr.insns.push(Insn::live(vec![
+                Operand::Register(Register::new(Kind::Ref, 0)),
+                Operand::Register(Register::new(Kind::Ref, 7)),
+                Operand::Register(Register::new(Kind::Int, 3)),
+            ]));
+        }
+
+        let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
+        let stack_slot_color_map: Vec<u16> = Vec::new();
+        filter_liveness_in_place(&mut ssarepr, &code, &depth_at_pc, &stack_slot_color_map);
+
+        let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
+        let live_args = ssarepr.insns[live_idx]
+            .live_args()
+            .expect("reachable pc must keep a -live- marker");
+        let refs: std::collections::BTreeSet<u16> = live_args
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Register(reg) if reg.kind == Kind::Ref => Some(reg.index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !refs.contains(&7),
+            "scratch-stand-in color 7 must be dropped by LV∩SSA retain",
+        );
+        let ints: std::collections::BTreeSet<u16> = live_args
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Register(reg) if reg.kind == Kind::Int => Some(reg.index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ints,
+            std::collections::BTreeSet::from([3]),
+            "Int bank must be untouched by the Ref-only filter",
+        );
+    }
+
+    #[test]
     fn publish_indirectcalltargets_updates_trace_staticdata() {
         let writer = CodeWriter::new();
         let j100 = make_runtime_jitcode_with_fnaddr(0x100);
@@ -8838,11 +8759,11 @@ mod tests {
             .as_ref()
             .expect("grab_initial_jitcodes must bind jd.mainjitcode");
         assert!(
-            Arc::ptr_eq(mainjitcode, &cached.jitcode),
-            "call.py:147 requires jd.mainjitcode to share the inner Arc<JitCode> of cc.jitcodes[graph]"
+            Arc::ptr_eq(mainjitcode, &cached),
+            "call.py:147 requires jd.mainjitcode to be the get_jitcode return object"
         );
         assert!(
-            cached.is_skeleton(),
+            mainjitcode.is_skeleton(),
             "call.py:147 binds the shell before codewriter.py:80 fills it"
         );
     }
@@ -8868,19 +8789,18 @@ mod tests {
             .as_ref()
             .expect("grab_initial_jitcodes must bind jd.mainjitcode")
             .clone();
-        let shell_inner_ptr = Arc::as_ptr(&shell);
+        let shell_ptr = Arc::as_ptr(&shell);
         let cached_shell = writer
             .callcontrol()
             .jitcodes
             .get(&(code_ptr as usize))
-            .expect("grab_initial_jitcodes must cache the same shell")
-            .clone();
+            .expect("grab_initial_jitcodes must cache the same shell");
         assert!(
-            Arc::ptr_eq(&shell, &cached_shell.jitcode),
-            "call.py:147-170 binds jd.mainjitcode to the inner Arc<JitCode> of self.jitcodes[portal_graph]"
+            Arc::ptr_eq(&shell, cached_shell),
+            "call.py:147-170 binds jd.mainjitcode to self.jitcodes[portal_graph]"
         );
         assert!(
-            cached_shell.is_skeleton(),
+            shell.is_skeleton(),
             "test must start from the call.py:147 shell"
         );
 
@@ -8896,18 +8816,52 @@ mod tests {
             .expect("make_jitcodes must leave jd.mainjitcode bound");
         assert_eq!(
             Arc::as_ptr(mainjitcode),
-            shell_inner_ptr,
-            "codewriter.py:80 must fill the call.py:147 shell in place (inner Arc<JitCode> stable)"
+            shell_ptr,
+            "codewriter.py:80 must fill the call.py:147 shell in place"
         );
         assert!(
-            Arc::ptr_eq(mainjitcode, &cached.jitcode),
-            "jd.mainjitcode and CallControl.jitcodes[portal_graph].jitcode must share the populated Arc"
+            Arc::ptr_eq(mainjitcode, &cached),
+            "jd.mainjitcode and CallControl.jitcodes[portal_graph] must share the populated Arc"
         );
         assert_eq!(
-            mainjitcode.jitdriver_sd(),
+            mainjitcode.jitcode.jitdriver_sd(),
             Some(0),
             "call.py:148 requires the portal jitcode to carry its jd index"
         );
+    }
+
+    #[test]
+    fn portal_without_merge_point_hint_still_allocates_portal_inputs() {
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\nwhile x:\n    x = 0\n")
+            .expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        assert_eq!(
+            entry_arg_slots(unsafe { &*code_ptr }),
+            0,
+            "regression fixture must expose missing portal frame/ec inputargs"
+        );
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            w_code: w_code as *const (),
+            merge_point_pc: None,
+            mainjitcode: None,
+        });
+
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("make_jitcodes must populate the registered portal");
+        assert!(
+            pyjit.merge_point_pc.is_some(),
+            "registered portal with no hint should infer its first loop header"
+        );
+        assert_eq!(pyjit.jitcode.jitdriver_sd(), Some(0));
     }
 
     #[test]
@@ -9201,8 +9155,6 @@ mod tests {
             mainjitcode: None,
         });
 
-        // The two `setup_jitdriver` calls above target the same canonical
-        // `raw_code` portal, so they collapse into one jd entry.
         let skeleton_ptr = {
             let cc = writer.callcontrol();
             assert_eq!(cc.jitdrivers_sd.len(), 1);
@@ -9220,11 +9172,11 @@ mod tests {
                 .as_ref()
                 .expect("call.py:147 binds jd.mainjitcode immediately");
             assert!(
-                std::sync::Arc::ptr_eq(&cached.jitcode, mainjitcode),
-                "jd.mainjitcode must share the inner Arc<JitCode> of CallControl.jitcodes"
+                std::sync::Arc::ptr_eq(cached, mainjitcode),
+                "jd.mainjitcode must share the same PyJitCode Arc as CallControl.jitcodes"
             );
             assert_eq!(
-                mainjitcode.jitdriver_sd(),
+                mainjitcode.jitcode.jitdriver_sd(),
                 Some(0),
                 "call.py:148 stamps jd.mainjitcode.jitdriver_sd immediately"
             );
@@ -9250,10 +9202,10 @@ mod tests {
             "portal skeleton Arc should be filled in place despite jd.mainjitcode"
         );
         assert!(
-            std::sync::Arc::ptr_eq(&cached.jitcode, mainjitcode),
-            "populated jd.mainjitcode must remain the same inner Arc<JitCode> as CallControl.jitcodes[graph].jitcode"
+            std::sync::Arc::ptr_eq(cached, mainjitcode),
+            "populated jd.mainjitcode must remain the same Arc as CallControl.jitcodes"
         );
-        assert!(cached.is_populated());
-        assert_eq!(mainjitcode.jitdriver_sd(), Some(0));
+        assert!(mainjitcode.is_populated());
+        assert_eq!(mainjitcode.jitcode.jitdriver_sd(), Some(0));
     }
 }

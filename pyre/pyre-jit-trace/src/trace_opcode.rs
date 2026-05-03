@@ -599,10 +599,8 @@ impl MIFrame {
 
     /// `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']` requires
     /// every CALL_ASSEMBLER red-args list and JUMP-args list to carry ec.
-    /// `init_symbolic` / `pypyjit_create_sym` / `setup_bridge_sym` all seed
-    /// `sym.execution_context` ahead of any trace emission, so this helper
-    /// is structurally just a getter — the recovery branch is defensive
-    /// against future paths that forget to seed it.
+    /// Normal trace setup seeds `sym.execution_context`; this recovery keeps
+    /// adapter paths from passing OpRef::NONE as the ec red.
     pub(crate) fn ensure_execution_context(&mut self, ctx: &mut TraceCtx) -> OpRef {
         let ec = self.sym().execution_context;
         if !ec.is_none() {
@@ -1154,10 +1152,12 @@ impl MIFrame {
 
     /// RPython Box.type parity: build fail_arg_types matching compact
     /// active_boxes length. Each box carries its own immutable type.
-    /// header layout matches `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`:
-    /// `[frame:Ref, last_instr:Int, pycode:Ref, valuestackdepth:Int,
-    ///   debugdata:Ref, lastblock:Ref, w_globals:Ref]` — line-by-line PyPy
-    /// parity with `interp_jit.py:25-31`.
+    /// Header layout matches `virtualizable_gen.rs:33-35` (frame +
+    /// `extra_reds` + `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`):
+    /// `[frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
+    ///   valuestackdepth:Int, debugdata:Ref, lastblock:Ref,
+    ///   w_globals:Ref]` — line-by-line PyPy parity with
+    /// `interp_jit.py:25-31` plus `interp_jit.py:67 reds = ['frame', 'ec']`.
     fn build_fail_arg_types_for_active_boxes(&self, active_boxes: &[OpRef]) -> Vec<Type> {
         let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         for &opref in active_boxes {
@@ -4803,7 +4803,6 @@ impl MIFrame {
 
                                 // pyjitpl.py:2017: do_residual_call step 1
                                 this.vable_and_vrefs_before_residual_call(ctx);
-                                // interp_jit.py:67 reds = ['frame', 'ec']
                                 let ec = this.ensure_execution_context(ctx);
                                 let ca_result = ctx.call_assembler_red_only_ref(
                                     token_number,
@@ -5192,7 +5191,6 @@ impl MIFrame {
                         )?;
                         // pyjitpl.py:2017: do_residual_call step 1
                         this.vable_and_vrefs_before_residual_call(ctx);
-                        // interp_jit.py:67 reds = ['frame', 'ec']
                         let ec = this.ensure_execution_context(ctx);
                         let ca_result = ctx.call_assembler_red_only_ref(
                             token_number,
@@ -6860,9 +6858,7 @@ mod tests {
                 c_num_regs_f: 4,
                 // RPython `jitcode.py:85-90` `assert pc in self._startpoints`:
                 // hand-crafted bodies must declare each opcode's offset.  The
-                // single BC_LIVE here sits at byte 0. `Some(set)` matches the
-                // assembler's `make_jitcode(startpoints=...)` shape (the
-                // upstream `None` default would skip the dispatch-loop assert).
+                // single BC_LIVE here sits at byte 0.
                 startpoints: Some([0_usize].into_iter().collect()),
                 ..Default::default()
             });
@@ -6884,15 +6880,13 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
         // `registers_r` is the unified abstract register file
-        // (locals[..nlocals] then stack[nlocals..nlocals+stack_only]).
-        // The lazy-load preamble translates Ref liveness colors through
-        // `semantic_ref_slot_for_reg_color`, then writes the completed
-        // OpRef back into the Ref bank at that same color. The snapshot
-        // loop itself stays RPython-shaped and reads `registers_r[color]`
-        // directly. Set nlocals=2 so encoded ref color 1 is also a valid
-        // local slot in this simple direct-bank fixture. Int and Float
-        // banks stay kind-specific, so their bank-indexed setup is
-        // unchanged.
+        // (locals[..nlocals] then stack[nlocals..nlocals+stack_only]); the
+        // snapshot read translates the Ref liveness color through
+        // `semantic_ref_slot_for_reg_color` to land at the same slot the
+        // lazy-load preamble populates. Set nlocals=2 so the encoded ref
+        // color 1 maps to semantic slot `locals[1]` via the in-range
+        // fallback. Int and Float banks stay kind-specific (no
+        // unification), so their bank-indexed setup is unchanged.
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
         sym.registers_i = vec![OpRef::NONE, OpRef::NONE, int_box];

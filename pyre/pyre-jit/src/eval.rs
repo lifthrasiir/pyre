@@ -1790,11 +1790,10 @@ fn init_callbacks() {
                 jit_create_self_recursive_callee_frame_1_raw_int:
                     crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
                 driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
-                ensure_published_jitcode: |code, w_code| {
+                ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        let _ = crate::jit::codewriter::ensure_published_jitcode_for_w_code(
-                            code, w_code,
-                        );
+                        let _ =
+                            crate::jit::codewriter::ensure_trace_jitcode_for_w_code(code, w_code);
                     }
                 },
             }));
@@ -4812,8 +4811,9 @@ fn build_resumed_frames(
     let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize - extra;
 
     // Resolve ALL vable fields from resume data.
-    // vable_values = [frame_ptr, last_instr, pycode, valuestackdepth,
-    //                  debugdata, lastblock, w_globals, array...]
+    // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
+    //                  valuestackdepth(3), debugdata(4),
+    //                  lastblock(5), w_globals(6), array...]
     // RPython reader.load_next_value_of_type reads ALL values sequentially.
     let resolved_vable: Vec<Value> = (0..vable_values.len())
         .map(|i| {
@@ -5572,6 +5572,7 @@ mod tests {
 
     fn ensure_test_jit_callbacks() {
         super::init_callbacks();
+        let _ = crate::jit::codewriter::CodeWriter::instance();
     }
 
     /// Drive the codewriter `register_portal_jitdriver` setup path so
@@ -5907,8 +5908,6 @@ mod tests {
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
-        let stack0 = ctx.const_ref(0xb0);
-        let stack1 = ctx.const_ref(0xb1);
         let mut sym = PyreSym::from_test_state(TestSymState {
             frame: frame_ref,
             jitcode: jitcode_ptr,
@@ -5917,7 +5916,7 @@ mod tests {
             locals_cells_stack_array_ref: locals_array,
             symbolic_local_types: vec![Type::Ref, Type::Int],
             symbolic_stack_types: vec![Type::Ref, Type::Int],
-            registers_r: vec![OpRef::NONE, OpRef::NONE, stack0, stack1],
+            registers_r: vec![OpRef::NONE; 4],
             concrete_stack: vec![],
             concrete_namespace: frame.w_globals,
             vable_last_instr: ctx.const_int(999),

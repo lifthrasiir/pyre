@@ -4589,20 +4589,12 @@ impl LowLevelOpList {
         })
     }
 
-    /// PyPy parity proxy for upstream's `llops.gendirectcall(ll_function,
-    /// *args)` shape. Upstream callers (e.g. `rstr.py:812,820 convert_from_to`)
-    /// hand `gendirectcall` a host Python helper function and let the
-    /// `LowLevelOpList` consult its own `self.rtyper` internally to
-    /// annotate and resolve the helper graph. Pyre cannot annotate Python
-    /// source at this stage of the port (the host helper objects do not
-    /// exist), so the helper graph is built explicitly through a
-    /// `builder` closure.
-    ///
-    /// Routing the build through `LowLevelOpList` instead of asking
-    /// callers to dance through `llops.require_rtyper(...)?
-    /// .lowlevel_helper_function_with_builder(...)` keeps the upstream
-    /// caller-side shape intact: `pair_*` conversions and other
-    /// `convert_from_to` ports never touch `llops.rtyper` directly.
+    /// PyPy `rstr.py:817-820 pair(StringRepr, CharRepr).convert_from_to`
+    /// builds the helper graph through `llops.gendirectcall(host_helper,
+    /// ...)` — the rtyper sits behind `llops` and never appears at the
+    /// caller. Pyre exposes the same indirection on `LowLevelOpList`
+    /// so `pair_*_convert_from_to` ports do not have to dance through
+    /// `llops.require_rtyper(...)?.lowlevel_helper_function_with_builder(...)`.
     pub fn lowlevel_helper_function_with_builder<F>(
         &self,
         name: impl Into<String>,

@@ -9,10 +9,7 @@ use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 use pyre_interpreter::bytecode::Instruction;
 
-use super::state::{
-    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState,
-    materialize_pending_inline_result, pending_inline_result_from_concrete,
-};
+use super::state::{ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState};
 
 /// RPython MIFrame (pyjitpl.py:65) — per-frame tracing state.
 pub struct MetaInterpFrame {
@@ -579,9 +576,7 @@ impl PyreMetaInterp {
         let next = cf.next_instr();
 
         match pyre_interpreter::execute_opcode_step(cf, code, instruction, op_arg, next) {
-            Ok(pyre_interpreter::StepResult::Return(value)) => materialize_pending_inline_result(
-                pending_inline_result_from_concrete(Type::Ref, value),
-            ),
+            Ok(pyre_interpreter::StepResult::Return(value)) => value,
             _ => pyre_object::PY_NULL,
         }
     }

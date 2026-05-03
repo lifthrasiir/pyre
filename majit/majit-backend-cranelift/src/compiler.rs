@@ -3773,9 +3773,19 @@ fn resolve_opref(
     constants: &HashMap<u32, i64>,
     opref: OpRef,
 ) -> CValue {
-    if opref.is_none() {
-        return builder.ins().iconst(cl_types::I64, 0);
-    }
+    // RPython parity (`llgraph/runner.py:1124, 1177`): both op args and
+    // failargs flow through `env[box]`, so a missing/none binding is an
+    // immediate invariant failure (KeyError) — never a silent zero
+    // substitution. `OpRef::NONE` reaching here means the optimizer
+    // emitted an op or failarg without a real binding; surface that
+    // at the producing site rather than masking it.
+    assert!(
+        !opref.is_none(),
+        "cranelift resolve_opref: OpRef::NONE reached arg-resolution — \
+         RPython env[box] would KeyError. The optimizer site that \
+         emitted this null OpRef must bind it (or rewrite the op) \
+         instead of relying on a zero-load fallback"
+    );
     // RPython boxes/inputargs are distinct from Consts even when pyre's
     // compact OpRef numbering collides with an entry in the constant pool.
     // Once an OpRef has a declared variable, the variable is authoritative.
@@ -13555,53 +13565,238 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        // Run the dispatch loop (handles bridge attachment and external-JUMP
-        // re-entry, llgraph/runner.py:1130-1140 closing_jump parity) and then
-        // marshall the resulting DeadFrame into RawExecResult.
-        let frame = Self::execute_with_inputs(compiled, args);
-        let descr = self.get_latest_descr(&frame);
-        let exit_layout = self.describe_deadframe(&frame);
-        let savedata = self.get_savedata_ref(&frame);
-        let exception_value = self.grab_exc_value(&frame);
-        let exit_arity = descr.fail_arg_types().len();
-        let mut result = Vec::with_capacity(exit_arity);
-        let mut typed_result = Vec::with_capacity(exit_arity);
-        for (i, &tp) in descr.fail_arg_types().iter().enumerate() {
-            match tp {
-                Type::Int => {
-                    let value = self.get_int_value(&frame, i);
-                    result.push(value);
-                    typed_result.push(Value::Int(value));
+        // PRE-EXISTING-ADAPTATION (parity exception): RPython
+        // `llgraph/runner.py:1120-1201` has only one `LLFrame.execute`
+        // path that produces an `LLDeadFrame`; the deadframe is
+        // decoded via the recovery layout (resume.py:1042
+        // `rebuild_state_after_failure`) on every read, materialising
+        // virtuals into concrete objects.  pyre's
+        // `execute_with_inputs` mirrors that path and feeds
+        // `MetaInterp.handle_*` callers that expect virtual rebuild.
+        //
+        // `RawExecResult` is the lightweight raw-output cousin used
+        // by [`crate::pyre`] entry points that need the encoded
+        // exit-slot bytes BEFORE virtual reconstruction (the
+        // resume-trace builder rebuilds virtuals from the
+        // `recovery_layout` itself).  Routing these consumers through
+        // `execute_with_inputs` collapses the two semantics and
+        // breaks fannkuch on cranelift (the recovery-layout decoder
+        // allocates fresh per-iteration virtual lists, defeating the
+        // raw resumetrace shortcut).  The dispatch loop below is kept
+        // structurally aligned with `execute_with_inputs` (same
+        // closing-jump / bridge-follow / FINISH branches) so a parity
+        // edit to one stays mechanically applicable to the other.
+        let mut cur_code_ptr = compiled.code_ptr;
+        let mut cur_fail_descrs: Box<[Arc<CraneliftFailDescr>]> = compiled.fail_descrs.clone();
+        let mut cur_num_ref_roots = compiled.num_ref_roots;
+        let mut cur_max_output_slots = compiled.max_output_slots;
+        let mut cur_inputs = args.to_vec();
+        let attachments_guard = compiled.cpu_attachments.read().unwrap();
+        let attachments: &CpuDescrAttachments = &*attachments_guard;
+
+        loop {
+            let exec = run_compiled_code(
+                cur_code_ptr,
+                &cur_fail_descrs,
+                cur_num_ref_roots,
+                cur_max_output_slots,
+                &cur_inputs,
+                attachments,
+            );
+            let fail_index = exec.fail_index;
+            let direct_descr = exec.direct_descr.clone();
+            let mut outputs = exec.extract_outputs(cur_max_output_slots.max(1));
+
+            // CALL_ASSEMBLER deadframe interception — exits raw dispatch.
+            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+                let frame = wrap_call_assembler_deadframe_with_caller_prefix(
+                    frame,
+                    compiled.trace_id,
+                    compiled.header_pc,
+                    None,
+                    &compiled.input_types,
+                    &cur_inputs,
+                    compiled.caller_prefix_layout.as_ref(),
+                );
+                let descr = self.get_latest_descr(&frame);
+                let exit_layout = self.describe_deadframe(&frame);
+                let savedata = self.get_savedata_ref(&frame);
+                let exception_value = self.grab_exc_value(&frame);
+                let exit_arity = descr.fail_arg_types().len();
+                let mut result = Vec::with_capacity(exit_arity);
+                let mut typed_result = Vec::with_capacity(exit_arity);
+                for (i, &tp) in descr.fail_arg_types().iter().enumerate() {
+                    match tp {
+                        Type::Int => {
+                            let value = self.get_int_value(&frame, i);
+                            result.push(value);
+                            typed_result.push(Value::Int(value));
+                        }
+                        Type::Ref => {
+                            let value = self.get_ref_value(&frame, i);
+                            result.push(value.as_usize() as i64);
+                            typed_result.push(Value::Ref(value));
+                        }
+                        Type::Float => {
+                            let value = self.get_float_value(&frame, i);
+                            result.push(value.to_bits() as i64);
+                            typed_result.push(Value::Float(value));
+                        }
+                        Type::Void => {
+                            result.push(0);
+                            typed_result.push(Value::Void);
+                        }
+                    }
                 }
-                Type::Ref => {
-                    let value = self.get_ref_value(&frame, i);
-                    result.push(value.as_usize() as i64);
-                    typed_result.push(Value::Ref(value));
+                return majit_backend::RawExecResult {
+                    outputs: result,
+                    typed_outputs: typed_result,
+                    exit_layout,
+                    force_token_slots: descr.force_token_slots().to_vec(),
+                    savedata,
+                    exception_value,
+                    fail_index: descr.fail_index(),
+                    trace_id: descr.trace_id(),
+                    is_finish: descr.is_finish(),
+                    is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
+                    status: descr.get_status(),
+                    descr_addr: descr as *const dyn FailDescr as *const () as usize,
+                };
+            }
+
+            // llmodel.py:412-420 get_latest_descr.
+            let fail_descr_arc = if let Some(descr) = direct_descr {
+                descr
+            } else if (fail_index as usize) < cur_fail_descrs.len() {
+                cur_fail_descrs[fail_index as usize].clone()
+            } else {
+                let found = compiled.fail_descrs.iter().find_map(|d| {
+                    let guard = d.bridge_ref();
+                    guard.as_ref().and_then(|b| {
+                        find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
+                    })
+                });
+                found.unwrap_or_else(|| {
+                    cur_fail_descrs
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| compiled.fail_descrs[0].clone())
+                })
+            };
+            let fail_descr = &fail_descr_arc;
+
+            // llgraph/runner.py:1130-1140 closing_jump: cross-loop JUMP
+            // re-enters the target loop trace identified by the
+            // TargetToken on the fail descriptor.
+            if fail_descr.is_external_jump {
+                let target_entry = fail_descr
+                    .target_descr
+                    .as_ref()
+                    .and_then(lookup_loop_target)
+                    .expect("external JUMP target must be a registered LoopTargetDescr");
+                cur_code_ptr = target_entry.code_ptr;
+                cur_fail_descrs = target_entry.fail_descrs;
+                cur_num_ref_roots = target_entry.num_ref_roots;
+                cur_max_output_slots = target_entry.max_output_slots;
+                cur_inputs = outputs;
+                continue;
+            }
+
+            // llgraph/runner.py:1200-1201 execute_finish.  Finish exits
+            // the dispatch loop with the trace's payload — the raw path
+            // reads outputs / savedata / exception directly from the
+            // jitframe and emits a `RawExecResult`.
+            if fail_descr.is_finish {
+                let savedata = {
+                    let raw =
+                        unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
+                    if raw != 0 { Some(GcRef(raw)) } else { None }
+                };
+                let exc_raw =
+                    unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
+                let exception = GcRef(exc_raw);
+
+                let exit_arity = fail_descr.fail_arg_types().len();
+                outputs.truncate(exit_arity);
+                let mut typed_outputs = Vec::with_capacity(exit_arity);
+                for (&raw, &tp) in outputs.iter().zip(fail_descr.fail_arg_types().iter()) {
+                    match tp {
+                        Type::Int => typed_outputs.push(Value::Int(raw)),
+                        Type::Ref => typed_outputs.push(Value::Ref(GcRef(raw as usize))),
+                        Type::Float => typed_outputs.push(Value::Float(f64::from_bits(raw as u64))),
+                        Type::Void => typed_outputs.push(Value::Void),
+                    }
                 }
-                Type::Float => {
-                    let value = self.get_float_value(&frame, i);
-                    result.push(value.to_bits() as i64);
-                    typed_result.push(Value::Float(value));
-                }
-                Type::Void => {
-                    result.push(0);
-                    typed_result.push(Value::Void);
+
+                return majit_backend::RawExecResult {
+                    outputs,
+                    typed_outputs,
+                    exit_layout: Some(fail_descr.layout()),
+                    force_token_slots: fail_descr.force_token_slots().to_vec(),
+                    savedata,
+                    exception_value: exception,
+                    fail_index,
+                    trace_id: fail_descr.trace_id(),
+                    is_finish: true,
+                    is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
+                    status: fail_descr.get_status(),
+                    descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
+                };
+            }
+
+            fail_descr.increment_fail_count();
+
+            // llgraph/runner.py:1184-1191 fail_guard with bridge.
+            let bridge_guard = fail_descr.bridge_ref();
+            if let Some(ref bridge) = *bridge_guard {
+                let n = bridge.num_inputs.min(outputs.len());
+                let bridge_inputs = outputs[..n].to_vec();
+                cur_code_ptr = bridge.code_ptr;
+                cur_fail_descrs = bridge.fail_descrs.clone();
+                cur_num_ref_roots = bridge.num_ref_roots;
+                cur_max_output_slots = bridge.max_output_slots;
+                cur_inputs = bridge_inputs;
+                continue;
+            }
+            let _ = bridge_guard;
+
+            // llgraph/runner.py:1192-1194 fail_guard without bridge —
+            // exit with the raw outputs.
+            let savedata = {
+                let raw =
+                    unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
+                if raw != 0 { Some(GcRef(raw)) } else { None }
+            };
+            let exc_raw =
+                unsafe { *((exec.jf_gcref.0 + JF_GUARD_EXC_OFS as usize) as *const usize) };
+            let exception = GcRef(exc_raw);
+
+            let exit_arity = fail_descr.fail_arg_types().len();
+            outputs.truncate(exit_arity);
+            let mut typed_outputs = Vec::with_capacity(exit_arity);
+            for (&raw, &tp) in outputs.iter().zip(fail_descr.fail_arg_types().iter()) {
+                match tp {
+                    Type::Int => typed_outputs.push(Value::Int(raw)),
+                    Type::Ref => typed_outputs.push(Value::Ref(GcRef(raw as usize))),
+                    Type::Float => typed_outputs.push(Value::Float(f64::from_bits(raw as u64))),
+                    Type::Void => typed_outputs.push(Value::Void),
                 }
             }
-        }
-        majit_backend::RawExecResult {
-            outputs: result,
-            typed_outputs: typed_result,
-            exit_layout,
-            force_token_slots: descr.force_token_slots().to_vec(),
-            savedata,
-            exception_value,
-            fail_index: descr.fail_index(),
-            trace_id: descr.trace_id(),
-            is_finish: descr.is_finish(),
-            is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
-            status: descr.get_status(),
-            descr_addr: descr as *const dyn FailDescr as *const () as usize,
+
+            return majit_backend::RawExecResult {
+                outputs,
+                typed_outputs,
+                exit_layout: Some(fail_descr.layout()),
+                force_token_slots: fail_descr.force_token_slots().to_vec(),
+                savedata,
+                exception_value: exception,
+                fail_index,
+                trace_id: fail_descr.trace_id(),
+                is_finish: false,
+                is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
+                status: fail_descr.get_status(),
+                descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
+            };
         }
     }
 

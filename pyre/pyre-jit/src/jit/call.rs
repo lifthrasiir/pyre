@@ -31,7 +31,6 @@
 
 use std::collections::HashMap;
 
-use majit_metainterp::jitcode::JitCode;
 use majit_translate::jitcode::BhCallDescr;
 use pyre_interpreter::CodeObject;
 use pyre_jit_trace::PyJitCode;
@@ -76,7 +75,7 @@ impl CallInfoCollection {
 /// statically known at flow-graph time).
 ///
 /// `Copy` was previously derived because every field was `Copy` /
-/// `Option<Copy>`; restoring `mainjitcode` (`Option<Arc<JitCode>>`
+/// `Option<Copy>`; restoring `mainjitcode` (`Option<Arc<PyJitCode>>`
 /// per `call.py:147`) takes that away. Only `Clone` remains —
 /// per-field reads inside `grab_initial_jitcodes` snapshot the
 /// `Copy` fields explicitly to keep the iteration cheap.
@@ -115,15 +114,38 @@ pub struct JitDriverStaticData {
     pub merge_point_pc: Option<usize>,
     /// RPython: `JitDriverStaticData.mainjitcode`
     /// (`call.py:147` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
-    /// left-hand side). Populated by [`CallControl::grab_initial_jitcodes`]
-    /// with the same `Arc<JitCode>` allocation that `CallControl.jitcodes
-    /// [graph].jitcode` holds — RPython's identity invariant
-    /// (`metainterp_sd.jitcodes[index] is jd.mainjitcode is
-    /// cc.jitcodes[graph]`) is bare-`JitCode`-keyed; pyre's `PyJitCode`
-    /// is a per-CodeObject side-table around the same shared
-    /// `Arc<JitCode>`. Stays `None` until `grab_initial_jitcodes` fires,
-    /// matching RPython's `jd.mainjitcode = None` before call.py:147.
-    pub mainjitcode: Option<std::sync::Arc<JitCode>>,
+    /// left-hand side, plus `call.py:148`
+    /// `jd.mainjitcode.jitdriver_sd = jd`).  Populated by
+    /// [`CallControl::grab_initial_jitcodes`] with the same Arc that
+    /// `CallControl.jitcodes[graph]` holds, mirroring RPython's
+    /// "same `JitCode` instance is shared between the cc.jitcodes dict
+    /// and jd.mainjitcode" identity.  Stays `None` until
+    /// `grab_initial_jitcodes` fires, matching RPython's
+    /// `jd.mainjitcode = None` before call.py:147.
+    ///
+    /// PRE-EXISTING-ADAPTATION (type-only): RPython types this as
+    /// `JitCode`; pyre stores `Arc<PyJitCode>`, where `PyJitCode` is a
+    /// thin wrapper around `Arc<RuntimeJitCode>` plus pyre-only
+    /// metadata (`PyJitCodeMetadata`, `code_ptr`, `w_code`, `has_abort`,
+    /// `merge_point_pc`).  The wrapper exists because pyre's codewriter
+    /// publication path needs interior mutability to fill an empty
+    /// skeleton in place (so that the same Arc identity sits in both
+    /// `cc.jitcodes[graph]` and `jd.mainjitcode` while the assembler
+    /// drains pending graphs into populated payloads).  The runtime
+    /// `JitCode` (`RuntimeJitCode`) is reachable via
+    /// `mainjitcode.jitcode` and is the object `jitdriver_sd` is
+    /// stamped onto, matching upstream's
+    /// `jd.mainjitcode.jitdriver_sd = jd` line-for-line.  Production
+    /// access drills explicitly through `.jitcode` rather than relying
+    /// on `Deref`, so the wrapper boundary stays visible at every site.
+    ///
+    /// **Deletion criterion**: removable once the codewriter publication
+    /// path is reworked so the runtime `JitCode` itself can be
+    /// late-stamped without an outer skeleton (the per-jitcode pyre-only
+    /// metadata moves to a side table keyed by `RuntimeJitCode` Arc
+    /// identity).  See `pyjitcode_wrapper_dissolution_slice_a_audit_*`
+    /// memos for the multi-session plan.
+    pub mainjitcode: Option<std::sync::Arc<PyJitCode>>,
 }
 
 impl JitDriverStaticData {
@@ -282,7 +304,7 @@ impl CallControl {
                 if pyjitcode.jitcode.jitdriver_sd().is_none() {
                     pyjitcode.jitcode.set_jitdriver_sd(i);
                 }
-                self.jitdrivers_sd[i].mainjitcode = Some(std::sync::Arc::clone(&slot.jitcode));
+                self.jitdrivers_sd[i].mainjitcode = Some(std::sync::Arc::clone(slot));
             }
         }
     }
@@ -300,11 +322,8 @@ impl CallControl {
     /// callback: returns the same `Arc<PyJitCode>` the SD will store,
     /// so both stores reference one allocation. RPython's
     /// `MetaInterpStaticData.jitcodes`, `CallControl.jitcodes`, and
-    /// `JitDriverStaticData.mainjitcode` all reference the same Python
-    /// `JitCode` object via refcount semantics; pyre keeps the per-graph
-    /// `PyJitCode` shared with `cc.jitcodes`, while `mainjitcode` (after
-    /// `grab_initial_jitcodes`) holds the inner `Arc<JitCode>` directly
-    /// — same underlying allocation, narrower view.
+    /// `JitDriverStaticData.mainjitcode` hold the same Python `JitCode`
+    /// objects via refcount semantics; this helper is the Rust analog.
     pub fn find_jitcode_arc(&self, code: *const CodeObject) -> Option<std::sync::Arc<PyJitCode>> {
         self.jitcodes
             .get(&(code as usize))
