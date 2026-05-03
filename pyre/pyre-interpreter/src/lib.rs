@@ -12,6 +12,7 @@ pub mod compile;
 pub use compile::*;
 
 // ── Core interpreter modules ──
+pub mod argument;
 pub mod baseobjspace;
 pub mod builtins;
 pub mod display;

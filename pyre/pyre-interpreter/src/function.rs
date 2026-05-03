@@ -250,6 +250,25 @@ pub unsafe fn is_function(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &FUNCTION_TYPE) || py_type_check(obj, &BUILTIN_FUNCTION_TYPE) }
 }
 
+/// `isinstance(obj, FunctionWithFixedCode)` parity.
+///
+/// function.py:783 — `class FunctionWithFixedCode(Function):
+///     can_change_code = False`.  Pyre encodes the `Function`
+/// vs `FunctionWithFixedCode` distinction through the
+/// `can_change_code` flag (true for user `def`s built via
+/// `function_new_with_closure`, false for gateway-built builtins
+/// via `function_new_with_fixed_code`).  `BuiltinFunction` has its
+/// own `BUILTIN_FUNCTION_TYPE`, so a strict `FUNCTION_TYPE` check
+/// excludes it (function.py:786 makes BuiltinFunction a sibling
+/// subclass of Function, not a subclass of FunctionWithFixedCode).
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_function_with_fixed_code(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &FUNCTION_TYPE) && !(*(obj as *const Function)).can_change_code }
+}
+
 /// function.py:78-83 — `getcode(self)`: three-way dispatch.
 ///   - JIT + immutable code → _get_immutable_code (elidable_promote)
 ///   - JIT + mutable code  → promote(self.code)

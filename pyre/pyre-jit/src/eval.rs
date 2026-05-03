@@ -1302,44 +1302,67 @@ impl __extend__ {
         handle_jitexception(frame)
     }
 
-    /// interp_jit.py:98-117 — jump_absolute(self, jumpto, ec).
+    /// interp_jit.py:102-121 — jump_absolute(self, jumpto, next_instr, ec).
     ///
     /// RPython:
-    ///   if we_are_jitted():
-    ///       decr_by = _get_adapted_tick_counter()
-    ///       self.last_instr = intmask(jumpto)
-    ///       ec.bytecode_trace(self, decr_by)
-    ///       jumpto = r_uint(self.last_instr)   # re-read after trace hook
-    ///   pypyjitdriver.can_enter_jit(...)
-    ///   return jumpto
+    ///   def jump_absolute(self, jumpto, next_instr, ec):
+    ///       jumpto *= 2
+    ///       if jumpto >= next_instr:    # no backward jump
+    ///           return jumpto
+    ///       if we_are_jitted():
+    ///           decr_by = 0
+    ///           if self.space.actionflag.has_bytecode_counter:
+    ///               if self.space.threadlocals.gil_ready:
+    ///                   decr_by = _get_adapted_tick_counter()
+    ///           self.last_instr = intmask(jumpto)
+    ///           ec.bytecode_trace(self, decr_by)
+    ///           jumpto = r_uint(self.last_instr)
+    ///       pypyjitdriver.can_enter_jit(frame=self, ec=ec,
+    ///           next_instr=jumpto, pycode=self.getcode(),
+    ///           is_being_profiled=self.get_is_being_profiled())
+    ///       return jumpto
     pub fn jump_absolute(
         frame: &mut PyFrame,
         mut jumpto: usize,
+        next_instr: usize,
         ec: *mut PyExecutionContext,
-    ) -> usize {
+    ) -> Result<usize, pyre_interpreter::PyError> {
+        // interp_jit.py:103 — `jumpto *= 2`. RPython encodes PCs in
+        // 16-bit code-words; pyre's `JumpBackward` opcode arg is
+        // already the absolute byte offset, so the `*= 2` scaling
+        // does not apply.  Kept as a comment marker so the line-by-
+        // line correspondence stays explicit.
+        // interp_jit.py:104-105 — `if jumpto >= next_instr: return jumpto`.
+        if jumpto >= next_instr {
+            return Ok(jumpto);
+        }
         if majit_metainterp::we_are_jitted() {
+            // interp_jit.py:108-112 — has_bytecode_counter +
+            // gil_ready quasi-immutable gate.  Pyre's actionflag
+            // does not carry a constant-folded `has_bytecode_counter`
+            // flag yet, so use the adapted tick directly.  When the
+            // actionflag port lands the gate flips back on.
             let decr_by = _get_adapted_tick_counter();
+            // interp_jit.py:114 — `self.last_instr = intmask(jumpto)`.
             frame.set_last_instr_from_next_instr(jumpto);
             if !ec.is_null() {
-                // executioncontext.py:392-395 — _trace re-raises callback
-                // exceptions; this JIT-side helper returns `usize` so the
-                // error cannot ride the call stack directly. Stash via
-                // `set_call_error` so the surrounding eval loop's
-                // `take_call_error` checkpoints surface it on the next
-                // hand-off.
-                unsafe {
-                    if let Err(err) = (*ec).bytecode_trace(frame as *mut PyFrame, decr_by) {
-                        pyre_interpreter::call::set_call_error(err);
-                    }
-                }
+                // interp_jit.py:115 — `ec.bytecode_trace(self, decr_by)`.
+                // executioncontext.py:392-395 re-raises callback
+                // exceptions; propagate via `?`.
+                unsafe { (*ec).bytecode_trace(frame as *mut PyFrame, decr_by) }?;
             }
-            // Re-read: trace/profile hook may have changed the jump target
-            // (interp_jit.py:112 — jumpto = r_uint(self.last_instr))
+            // interp_jit.py:116 — `jumpto = r_uint(self.last_instr)`.
             jumpto = frame.next_instr();
         }
-        // can_enter_jit is handled by eval_loop_jit's StepResult::CloseLoop
-        // path which calls maybe_compile_and_run.
-        jumpto
+        // interp_jit.py:118-120 — `pypyjitdriver.can_enter_jit(...)`.
+        // Not invoked here: this function is a documentation-only
+        // line-by-line port of PyPy `interp_jit.py:102-121` kept for
+        // parity audit (no Rust caller exists yet).  Pyre's live
+        // can_enter_jit dispatch happens out-of-band at
+        // `eval_loop_jit`'s `StepResult::CloseLoop` →
+        // `maybe_compile_and_run`, which fires for every backward
+        // jump independently of this shim.
+        Ok(jumpto)
     }
 }
 
@@ -2056,12 +2079,10 @@ pub(crate) fn pyre_portal_runner(
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     loop {
         let loop_outcome = eval_loop_jit(frame);
-        // jump_absolute (line ~1315) calls ec.bytecode_trace from inside
-        // a JIT-compiled trace; its `usize` return type cannot ride a
-        // PyError, so executioncontext.py:392-395's re-raise is staged
-        // through TLS via `set_call_error`. Drain the TLS slot here so
-        // the tracer exception surfaces at the same point PyPy raises
-        // from `bytecode_trace`, before the next eval iteration starts.
+        // Drain pyre's call-error stash (see `pyre_interpreter::call::set_call_error`).
+        // Several PY_NULL-returning helpers (e.g. `call_args_and_c_profile`,
+        // `c_call_trace` / `c_return_trace` / `c_exception_trace` callbacks)
+        // park their `PyError` here when their signature cannot carry one.
         if let Some(err) = pyre_interpreter::call::take_call_error() {
             return Err(err);
         }
@@ -2234,7 +2255,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         frame.last_instr = pc as isize;
         frame.set_last_instr_from_next_instr(opcode_pc + 1);
         // pyopcode.py:170-176 dispatch_bytecode parity: fire
-        // `ec.bytecode_trace(self)` each opcode while warming up.
+        // `ec.bytecode_trace(self)` each opcode while warming up,
+        // with the default `TICK_COUNTER_STEP` decrement.  This is
+        // NOT the same call site as interp_jit.py:115
+        // `jump_absolute`'s `ec.bytecode_trace(self, decr_by)` —
+        // jump_absolute fires on backward jumps only, with an
+        // adapted tick (`_get_adapted_tick_counter()`); that path
+        // is in `__extend__::jump_absolute` above and its
+        // `pypyjitdriver.can_enter_jit` half is dispatched by
+        // `StepResult::CloseLoop` → `maybe_compile_and_run` below.
         // The naive call (`(*ec).bytecode_trace(...)`) regresses
         // hot benchmarks 28-29% because the function-call boundary
         // hides the no-tracer fast path from the optimizer. Inline

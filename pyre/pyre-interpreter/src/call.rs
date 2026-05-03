@@ -384,13 +384,17 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     dispatch_callable(
         callable,
         |callable| {
-            // baseobjspace.py:1247-1267 _call_function_or_call_args_and_c_profile
-            // — when a profilefunc is installed, route the builtin
-            // call through `call_args_and_c_profile` so the
-            // `c_call`/`c_return`/`c_exception` events fire around
-            // the underlying `space.call_args(w_func, args)`.
-            let ec_ptr = getexecutioncontext() as *mut crate::PyExecutionContext;
-            let profile_active = !ec_ptr.is_null() && unsafe { (*ec_ptr).profilefunc.is_some() };
+            // baseobjspace.py:1243 — `if frame.get_is_being_profiled() and
+            // is_builtin_code(w_func): ... return self.call_args_and_c_profile(...)`
+            // The `is_builtin_code(w_func)` check is structurally implicit
+            // here: dispatch_callable already routed via the builtin arm
+            // (runtime_ops.rs:275 `if is_builtin_code(code) { on_builtin }`),
+            // so reaching this closure means the callable is a builtin.
+            // The remaining condition is the per-frame profile flag, set
+            // by `ec.call_trace` (executioncontext.py:150) on frame entry
+            // and cleared by `_c_call_return_trace` when profilefunc was
+            // turned off (executioncontext.py:122-123).
+            let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
             if profile_active {
                 let w_res = crate::baseobjspace::call_args_and_c_profile(
                     unsafe { &mut *frame_ptr },
@@ -683,7 +687,8 @@ pub(crate) fn resolve_kwargs(
 /// Call a user function with positional args + keyword args from a dict.
 ///
 /// PyPy: argument.py Arguments._match_signature with keyword handling.
-/// Used by CALL_FUNCTION_EX when kwargs dict is non-empty.
+/// Used by CALL_FUNCTION_KW / CALL_KW and CALL_FUNCTION_EX when kwargs
+/// are non-empty.
 pub fn call_with_kwargs(
     frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
@@ -706,17 +711,67 @@ pub fn call_with_kwargs(
 
     if unsafe { crate::is_function(callable) } {
         let code = unsafe { crate::getcode(callable) };
-        // For builtins: pack kwargs into a dict as last arg
+        // For builtins: pack kwargs into a dict as last arg.
+        //
+        // PyPy keeps keyword_names_w / keywords_w on the live Arguments object
+        // and gateway builtins parse that object.  Pyre's builtin ABI is still
+        // the older flat slice, so the dict tail is a structural adaptation.
+        // Keep the __pyre_kw__ marker here, in the one builtin kwargs packing
+        // site, so CALL_KW and CALL_FUNCTION_EX have the same shape.
         if unsafe { crate::is_builtin_code(code as pyre_object::PyObjectRef) } {
             let mut full_args = pos_args.to_vec();
             if !kwargs.is_empty() {
                 let kwargs_dict = pyre_object::w_dict_new();
+                unsafe {
+                    pyre_object::w_dict_store(
+                        kwargs_dict,
+                        pyre_object::w_str_new("__pyre_kw__"),
+                        pyre_object::w_bool_from(true),
+                    );
+                }
                 for (key, value) in kwargs {
                     unsafe {
                         pyre_object::w_dict_store(kwargs_dict, pyre_object::w_str_new(key), *value);
                     }
                 }
                 full_args.push(kwargs_dict);
+                // Step 2 of the Arguments port: when this is a profiled
+                // builtin call AND kwargs are present, route through
+                // `call_args_and_c_profile_args` with a structured
+                // `Arguments::with_kw(pos_args, keyword_names_w,
+                // keywords_w)`.  Otherwise `call_args_and_c_profile`
+                // (reached via `call_callable`'s on_builtin closure)
+                // would build `Arguments::positional_only(full_args)`
+                // and surface the trailing kwargs dict at index 0,
+                // breaking the FunctionWithFixedCode rebinding's
+                // firstarg() (`argument.py:164-168` returns `None`
+                // when positional count is zero, not the kwargs dict).
+                let frame_ptr = frame as *mut PyFrame;
+                let profile_active = unsafe { (*frame_ptr).get_is_being_profiled() };
+                if profile_active {
+                    let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
+                        .iter()
+                        .map(|(k, _)| pyre_object::w_str_new(k))
+                        .collect();
+                    let keywords_w: Vec<pyre_object::PyObjectRef> =
+                        kwargs.iter().map(|(_, v)| *v).collect();
+                    let arguments = crate::argument::Arguments::with_kw(
+                        pos_args,
+                        &keyword_names_w,
+                        &keywords_w,
+                    );
+                    let w_res = crate::baseobjspace::call_args_and_c_profile_args(
+                        unsafe { &mut *frame_ptr },
+                        callable,
+                        &arguments,
+                        &full_args,
+                    );
+                    if w_res == pyre_object::PY_NULL {
+                        return Err(take_call_error()
+                            .unwrap_or_else(|| crate::PyError::value_error("call failed")));
+                    }
+                    return Ok(w_res);
+                }
             }
             return call_callable(frame, callable, &full_args);
         }

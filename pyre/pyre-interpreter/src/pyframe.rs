@@ -1213,10 +1213,28 @@ impl PyFrame {
         crate::eval::eval_frame_plain_with_operr(self, operr)
     }
 
-    /// PyPy-compatible `hide`.
+    /// pyframe.py:521-522 `hide(self): return self.pycode.hidden_applevel`.
+    ///
+    /// PyPy creates a `PyFrame` for every callable that has a Code
+    /// object — including gateway builtins (`BuiltinCode`,
+    /// `gateway.py:743 hidden_applevel = True`) and the
+    /// `app_main.py`-style internal frames
+    /// (`pycompiler.compile(..., hidden_applevel=True)`).  The
+    /// `hide()` flag lets `_trace` skip those internal frames so
+    /// user-visible callbacks never see the gateway machinery.
+    ///
+    /// Pyre does not allocate a `PyFrame` for builtin calls — the
+    /// `dispatch_callable` builtin closure (`runtime_ops.rs:275`)
+    /// invokes the BuiltinCode function pointer directly, with no
+    /// frame attached, so the trace path never observes builtin
+    /// frames.  Hidden-applevel user frames (the `app_main.py`
+    /// case) are not reachable in pyre yet either — pyre has no
+    /// `pycompiler.compile(hidden_applevel=True)` call site.  The
+    /// field still lives on W_CodeObject, and this accessor mirrors
+    /// PyPy's object-field read.
     #[inline]
     pub fn hide(&self) -> bool {
-        false
+        unsafe { crate::w_code_hidden_applevel(self.pycode as PyObjectRef) }
     }
 
     /// pyframe.py:183 mark_as_escaped

@@ -4842,28 +4842,55 @@ pub fn call_valuestack(
 /// the c_call/c_return/c_exception events propagate via the same TLS
 /// stash so the JIT-side and interpreter-side error paths see them.
 ///
-/// PRE-EXISTING-ADAPTATION: PyPy passes the live `Arguments` object
-/// to the trace callback as the third positional, allowing the profile
-/// hook to introspect kw layout etc.  Pyre's call surface is a flat
-/// `&[PyObjectRef]`; until an `Arguments` wrapper exists we pass
-/// `None` so the callback sees a missing args parameter (the
-/// `c_call/c_return/c_exception` event itself still fires, which is
-/// the user-visible bit).
+/// This wrapper is for call sites that already have a positional-only
+/// slice.  Call sites that know keyword_names_w / keywords_w must call
+/// `call_args_and_c_profile_args` with `Arguments::with_kw`, mirroring
+/// pyopcode.py's `CALL_FUNCTION_KW` / `CALL_FUNCTION_EX` construction of
+/// a single `Arguments` object before the profiled-builtin branch.
 pub fn call_args_and_c_profile(
     frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
+    let arguments = crate::argument::Arguments::positional_only(args);
+    call_args_and_c_profile_args(frame, callable, &arguments, args)
+}
+
+/// `baseobjspace.py:1269-1278 call_args_and_c_profile` with a
+/// pre-built `Arguments` instance.
+///
+/// Step 2 of the Arguments port (continuation of `argument.rs`):
+/// callers that have positional and kwargs separated (currently
+/// `call::call_with_kwargs` for the builtin path) construct
+/// `Arguments::with_kw(pos_args, keyword_names_w, keywords_w)` and
+/// route through this helper, instead of wrapping the merged slice
+/// as positional-only.  This way `firstarg()` reads `pos_args[0]`
+/// rather than surfacing the trailing kwargs dict that pyre's flat
+/// call surface otherwise appends.
+///
+/// `flat_args` is the legacy flat slice (positional + trailing kwargs
+/// dict) that `call_function` still expects until the call surface
+/// itself learns about Arguments.
+pub fn call_args_and_c_profile_args(
+    frame: &mut crate::pyframe::PyFrame,
+    callable: PyObjectRef,
+    arguments: &crate::argument::Arguments<'_>,
+    flat_args: &[PyObjectRef],
+) -> PyObjectRef {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if !ec.is_null() {
-        if let Err(err) =
-            unsafe { (*ec).c_call_trace(frame as *mut crate::pyframe::PyFrame, callable, None) }
-        {
+        if let Err(err) = unsafe {
+            (*ec).c_call_trace(
+                frame as *mut crate::pyframe::PyFrame,
+                callable,
+                Some(arguments),
+            )
+        } {
             crate::call::set_call_error(err);
             return pyre_object::PY_NULL;
         }
     }
-    let w_res = call_function(callable, args);
+    let w_res = call_function(callable, flat_args);
     if w_res == pyre_object::PY_NULL {
         if !ec.is_null() {
             // baseobjspace.py:1274-1276 — `except OperationError:
@@ -4883,9 +4910,13 @@ pub fn call_args_and_c_profile(
         return pyre_object::PY_NULL;
     }
     if !ec.is_null() {
-        if let Err(err) =
-            unsafe { (*ec).c_return_trace(frame as *mut crate::pyframe::PyFrame, callable, None) }
-        {
+        if let Err(err) = unsafe {
+            (*ec).c_return_trace(
+                frame as *mut crate::pyframe::PyFrame,
+                callable,
+                Some(arguments),
+            )
+        } {
             crate::call::set_call_error(err);
             return pyre_object::PY_NULL;
         }

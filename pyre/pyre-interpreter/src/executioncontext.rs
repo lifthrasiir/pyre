@@ -44,15 +44,24 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
         Ok(v) => v,
         Err(_) => return,
     };
+    // pyframe.py:785-791 fset_f_trace:
+    //   if space.is_w(w_trace, space.w_None):
+    //       self.getorcreatedebug().w_f_trace = None
+    //   else:
+    //       d = self.getorcreatedebug()
+    //       d.w_f_trace = w_trace
+    //       d.f_lineno = self.get_last_lineno()
+    // The non-None branch also realigns f_lineno to the current
+    // bytecode line so trace events fire from the new tracer's
+    // perspective immediately.
     unsafe {
         let d = (*frame).getorcreatedebug(init_lineno);
-        let normalized = if new_f_trace.is_null() || new_f_trace == pyre_object::w_none() {
-            pyre_object::PY_NULL
-        } else {
-            new_f_trace
-        };
-        if normalized != d.w_f_trace {
-            d.w_f_trace = normalized;
+        let is_clear = new_f_trace.is_null() || new_f_trace == pyre_object::w_none();
+        if is_clear {
+            d.w_f_trace = pyre_object::PY_NULL;
+        } else if new_f_trace != d.w_f_trace {
+            d.w_f_trace = new_f_trace;
+            d.f_lineno = (*frame).get_last_lineno();
         }
     }
     if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr(w_frame, "f_lineno") {
@@ -72,6 +81,25 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
             unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
                 d.f_lineno = new_lineno as isize;
+            }
+        }
+    }
+    // pyframe.py:799-806 fset_f_trace_lines / fset_f_trace_opcodes.
+    // Both setters apply `space.is_true(w_trace)` to coerce arbitrary
+    // truthy values; pyre's `is_true` is the equivalent.
+    if let Ok(new_lines_obj) = crate::baseobjspace::getattr(w_frame, "f_trace_lines") {
+        if !new_lines_obj.is_null() {
+            let new_lines = unsafe { crate::baseobjspace::is_true(new_lines_obj) };
+            unsafe {
+                (*frame).getorcreatedebug(init_lineno).f_trace_lines = new_lines;
+            }
+        }
+    }
+    if let Ok(new_opcodes_obj) = crate::baseobjspace::getattr(w_frame, "f_trace_opcodes") {
+        if !new_opcodes_obj.is_null() {
+            let new_opcodes = unsafe { crate::baseobjspace::is_true(new_opcodes_obj) };
+            unsafe {
+                (*frame).getorcreatedebug(init_lineno).f_trace_opcodes = new_opcodes;
             }
         }
     }
@@ -136,6 +164,22 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
             } else {
                 w_trace
             },
+        );
+        // pyframe.py:796-806 fget_f_trace_lines / fget_f_trace_opcodes
+        // — exposed as bools.  PyPy stores the live values on the
+        // frame's debug data; pyre's wrapper mirrors them so the user
+        // callback can read or set them.  flush_trace_frame_writeback
+        // copies the wrapper's post-callback values back onto the
+        // live frame.
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_trace_lines",
+            pyre_object::w_bool_from(frame_ref.get_f_trace_lines()),
+        );
+        let _ = crate::baseobjspace::setattr(
+            w_frame,
+            "f_trace_opcodes",
+            pyre_object::w_bool_from(frame_ref.get_f_trace_opcodes()),
         );
     }
     w_frame
@@ -624,31 +668,32 @@ impl ExecutionContext {
         trace_result
     }
 
+    /// executioncontext.py:113-115 — `c_call_trace(self, frame, w_func, args=None)`.
     pub fn c_call_trace(
         &mut self,
         frame: *mut PyFrame,
         w_func: PyObjectRef,
-        args: Option<PyObjectRef>,
+        args: Option<&crate::argument::Arguments>,
     ) -> Result<(), crate::PyError> {
-        let args = args.unwrap_or(pyre_object::PY_NULL);
         self._c_call_return_trace(frame, w_func, args, "c_call")
     }
 
+    /// executioncontext.py:117-119 — `c_return_trace(self, frame, w_func, args=None)`.
     pub fn c_return_trace(
         &mut self,
         frame: *mut PyFrame,
         w_func: PyObjectRef,
-        args: Option<PyObjectRef>,
+        args: Option<&crate::argument::Arguments>,
     ) -> Result<(), crate::PyError> {
-        let args = args.unwrap_or(pyre_object::PY_NULL);
         self._c_call_return_trace(frame, w_func, args, "c_return")
     }
 
+    /// executioncontext.py:121-136 — `_c_call_return_trace`.
     pub fn _c_call_return_trace(
         &mut self,
         frame: *mut PyFrame,
         mut w_func: PyObjectRef,
-        args: PyObjectRef,
+        args: Option<&crate::argument::Arguments>,
         event: &str,
     ) -> Result<(), crate::PyError> {
         if self.profilefunc.is_none() {
@@ -659,27 +704,28 @@ impl ExecutionContext {
             }
             return Ok(());
         }
-        // executioncontext.py:125-134 FunctionWithFixedCode method-call
-        // rebinding. Pyre represents FunctionWithFixedCode and builtin
-        // functions as Function records; builtin-code functions are the
-        // fixed-code subset that can appear here.
-        unsafe {
-            if crate::is_function(w_func)
-                && crate::is_builtin_code(crate::function_get_code(w_func) as PyObjectRef)
-                && !args.is_null()
-            {
-                let w_firstarg = if pyre_object::is_tuple(args) {
-                    pyre_object::w_tuple_getitem(args, 0)
-                } else if pyre_object::is_list(args) {
-                    pyre_object::w_list_getitem(args, 0)
-                } else {
-                    None
-                };
-                if let Some(w_firstarg) = w_firstarg {
-                    if !w_firstarg.is_null() {
-                        let w_type =
-                            crate::typedef::r#type(w_firstarg).unwrap_or(pyre_object::PY_NULL);
-                        w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
+        // executioncontext.py:128-134 FunctionWithFixedCode method-call
+        // rebinding.  PyPy:
+        //   if isinstance(w_func, FunctionWithFixedCode) and args is not None:
+        //       w_firstarg = args.firstarg()
+        //       if w_firstarg is not None:
+        //           w_func = descr_function_get(self.space, w_func,
+        //                                       w_firstarg, self.space.type(w_firstarg))
+        // BuiltinFunction (function.py:786, the module-level
+        // builtin sibling) is intentionally excluded — function.py
+        // splits the two so that "builtin function binds
+        // differently" (no descriptor rebinding).  Pyre's
+        // `is_function_with_fixed_code` (FUNCTION_TYPE && !can_change_code)
+        // is the line-by-line port of the isinstance check.
+        if let Some(args) = args {
+            unsafe {
+                if crate::is_function_with_fixed_code(w_func) {
+                    if let Some(w_firstarg) = args.firstarg() {
+                        if !w_firstarg.is_null() {
+                            let w_type =
+                                crate::typedef::r#type(w_firstarg).unwrap_or(pyre_object::PY_NULL);
+                            w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
+                        }
                     }
                 }
             }
@@ -753,11 +799,32 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// pypy/interpreter/executioncontext.py:173-184 `bytecode_only_trace`.
+    ///
+    /// ```python
+    /// def bytecode_only_trace(self, frame):
+    ///     if self.space.reverse_debugging:
+    ///         self._revdb_potential_stop_point(frame)
+    ///     if (frame.get_w_f_trace() is None or self.is_tracing or
+    ///         self.gettrace() is None):
+    ///         return
+    ///     self.run_trace_func(frame)
+    /// ```
+    ///
+    /// reverse_debugging is not implemented in pyre, so the
+    /// `_revdb_potential_stop_point` arm reduces to a no-op.  All
+    /// three short-circuit conditions stay — including
+    /// `frame.get_w_f_trace() is None`, which avoids the trailing
+    /// `instr_prev_plus_one` write inside `run_trace_func` when the
+    /// per-frame trace is unset (so a later `frame.f_trace = cb`
+    /// observes the unmodified instr_prev_plus_one and can fire its
+    /// first `line` event correctly).
     pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
-        if self.space.is_null() || frame.is_null() || self.is_tracing != 0 {
+        if self.space.is_null() || frame.is_null() {
             return Ok(());
         }
-        if self.w_tracefunc.is_null() {
+        let f_trace_is_none = unsafe { (*frame).get_w_f_trace().is_null() };
+        if f_trace_is_none || self.is_tracing != 0 || self.w_tracefunc.is_null() {
             return Ok(());
         }
         self.run_trace_func(frame)
@@ -788,27 +855,37 @@ impl ExecutionContext {
         if self.space.is_null() || frame.is_null() {
             return Ok(());
         }
-        // executioncontext.py:188 — don't trace before the first
-        // executable instruction (SETUP_ANNOTATIONS at frame entry).
+        // executioncontext.py:189-192:
+        //   d = frame.getorcreatedebug()
+        //   lastline = d.f_lineno
+        //   lineno = frame.pycode._get_lineno_for_pc_tracing(frame.last_instr)
+        //   d.f_lineno = lineno
         let last_instr = unsafe { (*frame).last_instr };
-        if last_instr == -1 {
-            return Ok(());
-        }
         let lineno = unsafe { (*frame).get_last_lineno() };
-        let (line_event, opcode_event) = {
-            let d = unsafe { (*frame).getorcreatedebug(lineno) };
-            // executioncontext.py:191-197 — line event when
-            // is_in_line_tracing OR f_trace_lines, AND we crossed a
-            // line boundary OR jumped backwards.
-            let want_line = (d.is_in_line_tracing || d.f_trace_lines)
-                && (d.f_lineno != lineno || last_instr < d.instr_prev_plus_one);
+        let (lastline, want_line, want_opcode) = unsafe {
+            let d = (*frame).getorcreatedebug(lineno);
+            let lastline = d.f_lineno;
+            // executioncontext.py:192 d.f_lineno = lineno — PERSISTENT
+            // write so subsequent run_trace_func invocations see the
+            // current line (not the previous).
+            d.f_lineno = lineno;
+            // executioncontext.py:193-197:
+            //   if d.f_trace_lines and lineno != -1:
+            //       if lastline != lineno or frame.last_instr < d.instr_prev_plus_one:
+            //           self._trace(frame, 'line', self.space.w_None)
+            //   if d.f_trace_opcodes:
+            //       self._trace(frame, 'opcode', self.space.w_None)
+            let want_line = d.f_trace_lines
+                && lineno != -1
+                && (lastline != lineno || last_instr < d.instr_prev_plus_one);
             let want_opcode = d.f_trace_opcodes;
-            (want_line, want_opcode)
+            (lastline, want_line, want_opcode)
         };
-        if line_event {
+        let _ = lastline;
+        if want_line {
             self._trace(frame, "line", pyre_object::w_none(), None)?;
         }
-        if opcode_event {
+        if want_opcode {
             self._trace(frame, "opcode", pyre_object::w_none(), None)?;
         }
         // executioncontext.py:200 — record the next-PC sentinel so
@@ -1126,7 +1203,15 @@ impl ExecutionContext {
                 d.is_in_line_tracing = prev_line_tracing;
             }
             self.is_tracing -= 1;
-            if had_locals {
+            // executioncontext.py:401-402 reads `d.w_locals is not None`
+            // again inside finally — the callback may have installed or
+            // cleared w_locals.  Re-read here instead of caching
+            // `had_locals` from before the call.
+            let post_had_locals = unsafe {
+                let d = (*frame).getorcreatedebug(init_lineno);
+                !d.w_locals.is_null()
+            };
+            if post_had_locals {
                 unsafe { (*frame).locals2fast(false) };
             }
             // executioncontext.py:392-395 — re-raise the callback's
