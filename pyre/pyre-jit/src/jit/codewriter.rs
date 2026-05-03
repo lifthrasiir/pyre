@@ -4304,7 +4304,24 @@ impl CodeWriter {
                         // `interp_jit.py:25-31`).
                         let jdindex = portal_jd_index
                             .expect("portal jit_merge_point requires a registered jitdriver");
-                        let w_code_i64 = w_code as i64;
+                        // β.2.1 (plan inline-call-portal-migration.md): instead
+                        // of baking `w_code` into the runtime constants_r pool
+                        // via `Operand::ConstRef`, load `frame.pycode` at
+                        // runtime into a fresh scratch register and reference
+                        // that register from `jit_merge_point`'s pycode green
+                        // arg. RPython orthodox parity per
+                        // `pypyjit/interp_jit.py:67 reds=['frame','ec']` +
+                        // `interp_jit.py:25 _virtualizable_=['..., 'pycode',
+                        // ...]`: pycode is recovered from the live frame at
+                        // every merge point, so the trace key is the runtime
+                        // value rather than a build-time constant.
+                        let scratch_pycode_reg = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                        emit_vable_getfield_ref!(
+                            ssarepr,
+                            portal_frame_reg,
+                            scratch_pycode_reg,
+                            VABLE_CODE_FIELD_IDX
+                        );
                         let graph_args = portal_jit_merge_point_graph_args(
                             &graph,
                             py_pc,
@@ -4336,12 +4353,16 @@ impl CodeWriter {
                                     Operand::ConstInt(*value)
                                 }
                                 (super::flow::ConstantValue::Opaque(_), Some(Kind::Ref)) => {
-                                    // pycode ref — real pointer recovered
-                                    // from closure capture above.  The
-                                    // assembler's `expect_list_regs_or_pool`
-                                    // routes `Operand::ConstRef` through
-                                    // `builder.add_const_r`.
-                                    Operand::ConstRef(w_code_i64)
+                                    // β.2.1: pycode green arg references the
+                                    // scratch register pre-loaded with
+                                    // `frame.pycode` via `emit_vable_getfield_ref!`
+                                    // above. RPython orthodox parity
+                                    // (`pypyjit/interp_jit.py:67-78` PyPyJitDriver
+                                    // `greens=[..., 'pycode']`): pycode is read
+                                    // from the live frame at every merge point,
+                                    // not baked into the per-CodeObject
+                                    // constants_r pool.
+                                    Operand::reg(Kind::Ref, scratch_pycode_reg)
                                 }
                                 other => {
                                     panic!("portal jit_merge_point: unexpected Constant {other:?}")
