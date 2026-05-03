@@ -486,7 +486,24 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
         // EF_CAN_RAISE — default normal call (`effectinfo.py:22`).
-        CallFlavor::Plain => EffectInfo::default(),
+        // Mirror `majit-metainterp/src/call_descr.rs::DEFAULT_EFFECT_INFO`
+        // (the conservative "all read/write descrs touched" fallback used
+        // when the producer has no analyzer output).  `EffectInfo::default()`
+        // alone leaves the descr bitsets at zero, which makes
+        // `force_from_effectinfo` (`heap.py:540-560`) skip the cached
+        // lazy_set / field flush — a regression vs main's plain void
+        // residual call invalidation.  `call.py:296-326 getcalldescr` is
+        // the upstream constructor; the analyzer port is a separate epic.
+        CallFlavor::Plain => EffectInfo {
+            extraeffect: ExtraEffect::CanRaise,
+            readonly_descrs_fields: u64::MAX,
+            write_descrs_fields: u64::MAX,
+            readonly_descrs_arrays: u64::MAX,
+            write_descrs_arrays: u64::MAX,
+            readonly_descrs_interiorfields: u64::MAX,
+            write_descrs_interiorfields: u64::MAX,
+            ..EffectInfo::default()
+        },
         // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `effectinfo.py:23`.
         // `optimize_CALL_MAY_FORCE_*` branch.
         CallFlavor::MayForce => EffectInfo {
@@ -601,6 +618,15 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // arm which would otherwise return `MayForce`.
         CallFlavor::ReleaseGil => EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
+            // call.py:286 `can_invalidate = random_effects or
+            // self.quasiimmut_analyzer.analyze(op)` — `random_effects`
+            // implies `can_invalidate`.  Sibling producer
+            // `majit-metainterp/src/jitcode/assembler.rs:1821`
+            // already sets this to `true`; leaving it `false` here
+            // would let the heapcache `clear_caches_varargs` skip the
+            // arraycopy / arraymove fast-paths for traces whose
+            // release-gil descr came from this producer.
+            can_invalidate: true,
             call_release_gil_target: (1, 0),
             ..EffectInfo::default()
         },

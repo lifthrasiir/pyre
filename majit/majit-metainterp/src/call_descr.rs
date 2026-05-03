@@ -190,7 +190,7 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// blind spot upstream papered over with frozenset bitstrings before
 /// the bitstring rewrite. PRE-EXISTING-ADAPTATION: the bitset width
 /// upgrade is a separate slice from the EffectInfo port.
-const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
+pub(crate) const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::CanRaise,
     oopspecindex: OopSpecIndex::None,
     readonly_descrs_fields: u64::MAX,

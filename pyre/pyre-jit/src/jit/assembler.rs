@@ -1183,28 +1183,28 @@ fn dispatch_op(
             let call_args = expect_call_args(&args[1..]);
             state
                 .builder
-                .residual_call_void_typed_args(fn_idx, &call_args);
+                .residual_call_void_canonical_via_target(fn_idx, &call_args);
         }
         "call_may_force_void" => {
             let fn_idx = expect_small_u16(&args[0]);
             let call_args = expect_call_args(&args[1..]);
             state
                 .builder
-                .call_may_force_void_typed_args(fn_idx, &call_args);
+                .call_may_force_void_canonical_via_target(fn_idx, &call_args);
         }
         "call_release_gil_void" => {
             let fn_idx = expect_small_u16(&args[0]);
             let call_args = expect_call_args(&args[1..]);
             state
                 .builder
-                .call_release_gil_void_typed_args(fn_idx, &call_args);
+                .call_release_gil_void_canonical_via_target(fn_idx, &call_args);
         }
         "call_loopinvariant_void" => {
             let fn_idx = expect_small_u16(&args[0]);
             let call_args = expect_call_args(&args[1..]);
             state
                 .builder
-                .call_loopinvariant_void_typed_args(fn_idx, &call_args);
+                .call_loopinvariant_void_canonical_via_target(fn_idx, &call_args);
         }
         "call_assembler_void" => {
             let target_idx = expect_small_u16(&args[0]);
@@ -1486,6 +1486,20 @@ fn dispatch_residual_call(
     // codewriter branch resolves to the same builder method through the
     // predicates instead of a producer-side enum.
     let dispatch_kind = dispatch_kind_for_effect_info(&stub.effect_info);
+    if reskind == ResKind::Void {
+        if dispatch_kind == CallFlavor::Pure {
+            panic!("dispatch_residual_call: pure void call is not a valid rewrite_call shape");
+        }
+        state
+            .builder
+            .residual_call_void_canonical_via_target_with_effect_info(
+                fn_idx,
+                &call_args,
+                stub.effect_info.clone(),
+            );
+        return;
+    }
+
     match (dispatch_kind, reskind) {
         (CallFlavor::Plain, ResKind::Int) => {
             let dst = expect_result_reg(result, Kind::Int, "residual_call int needs result");
@@ -1494,11 +1508,6 @@ fn dispatch_residual_call(
         (CallFlavor::Plain, ResKind::Ref) => {
             let dst = expect_result_reg(result, Kind::Ref, "residual_call ref needs result");
             state.builder.call_ref_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Plain, ResKind::Void) => {
-            state
-                .builder
-                .residual_call_void_typed_args(fn_idx, &call_args);
         }
         (CallFlavor::MayForce, ResKind::Int) => {
             let dst = expect_result_reg(
@@ -1534,11 +1543,6 @@ fn dispatch_residual_call(
                 .builder
                 .call_may_force_float_typed(fn_idx, &call_args, dst);
         }
-        (CallFlavor::MayForce, ResKind::Void) => {
-            state
-                .builder
-                .call_may_force_void_typed_args(fn_idx, &call_args);
-        }
         (CallFlavor::Pure, ResKind::Int) => {
             let dst = expect_result_reg(result, Kind::Int, "residual_call pure int needs result");
             state.builder.call_pure_int_typed(fn_idx, &call_args, dst);
@@ -1551,9 +1555,6 @@ fn dispatch_residual_call(
             let dst =
                 expect_result_reg(result, Kind::Float, "residual_call pure float needs result");
             state.builder.call_pure_float_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Pure, ResKind::Void) => {
-            panic!("dispatch_residual_call: pure void call is not a valid rewrite_call shape");
         }
         (CallFlavor::ReleaseGil, ResKind::Int) => {
             let dst = expect_result_reg(
@@ -1597,11 +1598,6 @@ fn dispatch_residual_call(
                 .builder
                 .call_release_gil_float_typed(fn_idx, &call_args, dst);
         }
-        (CallFlavor::ReleaseGil, ResKind::Void) => {
-            state
-                .builder
-                .call_release_gil_void_typed_args(fn_idx, &call_args);
-        }
         (CallFlavor::LoopInvariant, ResKind::Int) => {
             let dst = expect_result_reg(
                 result,
@@ -1632,11 +1628,7 @@ fn dispatch_residual_call(
                 .builder
                 .call_loopinvariant_float_typed(fn_idx, &call_args, dst);
         }
-        (CallFlavor::LoopInvariant, ResKind::Void) => {
-            state
-                .builder
-                .call_loopinvariant_void_typed_args(fn_idx, &call_args);
-        }
+        (_, ResKind::Void) => unreachable!("void residual calls returned before policy dispatch"),
     }
 }
 
@@ -2557,8 +2549,17 @@ mod tests {
             }),
         );
 
-        // majit jitcode/mod.rs: `BC_CALL_RELEASE_GIL_VOID = 45`.
-        assert_eq!(jitcode.code[0], 45);
+        let expected = majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("residual_call_ir_v/iIRd")
+            .copied()
+            .unwrap();
+        assert_eq!(jitcode.code[0], expected);
+        let descr_idx = (jitcode.code[6] as u16) | ((jitcode.code[7] as u16) << 8);
+        let descr = jitcode.exec.descrs[descr_idx as usize]
+            .as_bh_descr()
+            .unwrap()
+            .as_calldescr();
+        assert!(descr.extra_info.is_call_release_gil());
     }
 
     /// `assembler.py:197-206` parity: a `Descr` operand attached to an op

@@ -1101,7 +1101,18 @@ impl HeapCache {
         argboxes: &[OpRef],
     ) {
         self.need_guard_not_invalidated = true;
-        if opnum.is_call()
+        // RPython `heapcache.py:341-345`:
+        //     if (OpHelpers.is_plain_call(opnum) or
+        //         OpHelpers.is_call_loopinvariant(opnum) or
+        //         OpHelpers.is_cond_call_value(opnum) or
+        //         opnum == rop.COND_CALL):
+        // `is_plain_call` matches `CALL_{I,R,F,N}` only — `CALL_PURE_*`,
+        // `CALL_MAY_FORCE_*`, `CALL_ASSEMBLER_*`, `CALL_RELEASE_GIL_*`
+        // all fall through to `reset_keep_likely_virtuals` (the
+        // aggressive arm).  Pyre's `is_call()` is the broader
+        // `_CALL_FIRST..=_CALL_LAST` range, so use the narrow
+        // `is_plain_call()` predicate to mirror upstream's enumeration.
+        if opnum.is_plain_call()
             || opnum.is_call_loopinvariant()
             || opnum.is_cond_call_value()
             || opnum == OpCode::CondCallN

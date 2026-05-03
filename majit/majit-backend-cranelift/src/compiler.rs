@@ -9804,15 +9804,32 @@ impl CraneliftBackend {
                     }
                     let sig_ref = builder.import_signature(sig);
 
-                    let func_ptr_raw = resolve_opref(&mut builder, &constants, op.arg(0));
+                    // pyjitpl.py:3679 direct_call_release_gil records
+                    // `[savebox, funcbox_real] + argboxes[1:]`, so for
+                    // CallReleaseGil{I,F,N} the function pointer lives
+                    // at `op.arg(1)` and the C arguments start at
+                    // `op.args[2..]`. The leading `op.arg(0)` (savebox)
+                    // is consumed by the GIL-release pre-hook in
+                    // RPython (`backend/x86/assembler.py:2242-2244
+                    // _genop_call_release_gil`'s `_store_force_index` /
+                    // `is_call_release_gil=True` offset). Pyre's
+                    // dynasm backend mirrors that with
+                    // `func_index = 3 + is_call_release_gil` at
+                    // `backend-dynasm/x86/assembler.rs:4804`.
+                    // PRE-EXISTING-ADAPTATION: pyre does not yet
+                    // forward `saveerr` to the GIL pre/post-hooks, so
+                    // `op.arg(0)` is still consumed as a const_int
+                    // operand at trace replay rather than threaded
+                    // into the backend hook signature.
+                    let func_ptr_raw = resolve_opref(&mut builder, &constants, op.arg(1));
                     let func_ptr_val = if ptr_type != cl_types::I64 {
                         builder.ins().ireduce(ptr_type, func_ptr_raw)
                     } else {
                         func_ptr_raw
                     };
 
-                    let mut args: Vec<CValue> = Vec::with_capacity(op.args.len() - 1);
-                    for (i, &arg_ref) in op.args[1..].iter().enumerate() {
+                    let mut args: Vec<CValue> = Vec::with_capacity(op.args.len() - 2);
+                    for (i, &arg_ref) in op.args[2..].iter().enumerate() {
                         let raw = resolve_opref(&mut builder, &constants, arg_ref);
                         if i < arg_types.len() && arg_types[i] == Type::Float {
                             args.push(builder.ins().bitcast(cl_types::F64, MemFlags::new(), raw));
@@ -14143,31 +14160,105 @@ impl majit_backend::Backend for CraneliftBackend {
         if func == 0 {
             return 0;
         }
-        // Separate integer (i+r) and float (f) args in arg_classes order.
-        let mut int_args: Vec<i64> = Vec::new();
-        let mut float_args: Vec<f64> = Vec::new();
-        let mut ii = 0usize;
-        let mut ri = 0usize;
-        let mut fi = 0usize;
-        for c in calldescr.arg_classes.chars() {
-            match c {
-                'i' => {
-                    int_args.push(args_i.and_then(|a| a.get(ii).copied()).unwrap_or(0));
-                    ii += 1;
-                }
-                'r' => {
-                    int_args.push(args_r.and_then(|a| a.get(ri).copied()).unwrap_or(0));
-                    ri += 1;
-                }
-                'f' => {
-                    let bits = args_f.and_then(|a| a.get(fi).copied()).unwrap_or(0);
-                    float_args.push(f64::from_bits(bits as u64));
-                    fi += 1;
-                }
-                _ => {}
-            }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
         }
-        unsafe { bh_call_i_dispatch(func as usize, &int_args, &float_args) }
+    }
+
+    /// llmodel.py:818 bh_call_r: GcRef-returning parallel of `bh_call_i`.
+    /// `lltype.Ptr(lltype.GcStruct, ...)` lowers to a host pointer that
+    /// matches `i64` on 64-bit; transmute via the shared int dispatcher
+    /// and wrap as `GcRef`. Without this override
+    /// `bhimpl_residual_call_*_r` would silently no-op via the default
+    /// trait impl at `majit-backend/lib.rs:1992`.
+    fn bh_call_r(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        if func == 0 {
+            return majit_ir::GcRef::NULL;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        let raw = unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
+        };
+        majit_ir::GcRef(raw as usize)
+    }
+
+    /// llmodel.py:825 bh_call_f / descr.py:590-602 create_call_stub
+    /// (`RESULT == lltype.Float`): route through the f64-typed
+    /// dispatcher so the result lands in xmm0 / d0 rather than rax /
+    /// x0. Without this override `bhimpl_residual_call_*_f` would
+    /// silently no-op via the default trait impl at
+    /// `majit-backend/lib.rs:2003`.
+    fn bh_call_f(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) -> f64 {
+        if func == 0 {
+            return 0.0;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        unsafe {
+            majit_backend::call_stub::bh_call_f_dispatch(func as usize, &int_args, &float_args)
+        }
+    }
+
+    /// llmodel.py:834 bh_call_v / descr.py:590-602 create_call_stub
+    /// (`RESULT == lltype.Void`): dispatch via the void-typed stub so
+    /// the funcptr is transmuted to `extern "C" fn(...) -> ()`. Without
+    /// this override the canonical `residual_call_*_v` walker would
+    /// silently no-op via the default trait impl
+    /// (`majit-backend/lib.rs:2013`).
+    fn bh_call_v(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) {
+        // llmodel.py:834 bh_call_v / descr.py:590-602 create_call_stub
+        // (`RESULT == lltype.Void`) parity: route through the void-typed
+        // dispatcher so genuinely void C callees use the right C-ABI
+        // signature instead of `extern "C" fn(...) -> i64` (which reads
+        // garbage from rax/x0).
+        if func == 0 {
+            return;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        unsafe {
+            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &int_args, &float_args);
+        }
     }
 
     /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
@@ -14232,155 +14323,9 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 }
 
-/// llmodel.py:816 call_stub_i: ABI-correct dispatch with separate int/float
-/// register files. On ARM64/x86-64, integer args go to x0-x7 / rdi,rsi,... and
-/// float args go to d0-d7 / xmm0-xmm7 independently.
-///
-/// Safety: func must be a valid function pointer matching the described ABI.
-unsafe fn bh_call_i_dispatch(func: usize, int_args: &[i64], float_args: &[f64]) -> i64 {
-    unsafe {
-        type I = i64;
-        type F = f64;
-        match (int_args.len(), float_args.len()) {
-            // No float args — integer-only calls.
-            (0, 0) => {
-                let f: unsafe extern "C" fn() -> I = std::mem::transmute(func);
-                f()
-            }
-            (1, 0) => {
-                let f: unsafe extern "C" fn(I) -> I = std::mem::transmute(func);
-                f(int_args[0])
-            }
-            (2, 0) => {
-                let f: unsafe extern "C" fn(I, I) -> I = std::mem::transmute(func);
-                f(int_args[0], int_args[1])
-            }
-            (3, 0) => {
-                let f: unsafe extern "C" fn(I, I, I) -> I = std::mem::transmute(func);
-                f(int_args[0], int_args[1], int_args[2])
-            }
-            (4, 0) => {
-                let f: unsafe extern "C" fn(I, I, I, I) -> I = std::mem::transmute(func);
-                f(int_args[0], int_args[1], int_args[2], int_args[3])
-            }
-            (5, 0) => {
-                let f: unsafe extern "C" fn(I, I, I, I, I) -> I = std::mem::transmute(func);
-                f(
-                    int_args[0],
-                    int_args[1],
-                    int_args[2],
-                    int_args[3],
-                    int_args[4],
-                )
-            }
-            (6, 0) => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I) -> I = std::mem::transmute(func);
-                f(
-                    int_args[0],
-                    int_args[1],
-                    int_args[2],
-                    int_args[3],
-                    int_args[4],
-                    int_args[5],
-                )
-            }
-            // Float-only calls.
-            (0, 1) => {
-                let f: unsafe extern "C" fn(F) -> I = std::mem::transmute(func);
-                f(float_args[0])
-            }
-            (0, 2) => {
-                let f: unsafe extern "C" fn(F, F) -> I = std::mem::transmute(func);
-                f(float_args[0], float_args[1])
-            }
-            // Mixed int + float calls.
-            (1, 1) => {
-                let f: unsafe extern "C" fn(I, F) -> I = std::mem::transmute(func);
-                f(int_args[0], float_args[0])
-            }
-            (2, 1) => {
-                let f: unsafe extern "C" fn(I, I, F) -> I = std::mem::transmute(func);
-                f(int_args[0], int_args[1], float_args[0])
-            }
-            (1, 2) => {
-                let f: unsafe extern "C" fn(I, F, F) -> I = std::mem::transmute(func);
-                f(int_args[0], float_args[0], float_args[1])
-            }
-            (2, 2) => {
-                let f: unsafe extern "C" fn(I, I, F, F) -> I = std::mem::transmute(func);
-                f(int_args[0], int_args[1], float_args[0], float_args[1])
-            }
-            (3, 1) => {
-                let f: unsafe extern "C" fn(I, I, I, F) -> I = std::mem::transmute(func);
-                f(int_args[0], int_args[1], int_args[2], float_args[0])
-            }
-            (4, 1) => {
-                let f: unsafe extern "C" fn(I, I, I, I, F) -> I = std::mem::transmute(func);
-                f(
-                    int_args[0],
-                    int_args[1],
-                    int_args[2],
-                    int_args[3],
-                    float_args[0],
-                )
-            }
-            (3, 2) => {
-                let f: unsafe extern "C" fn(I, I, I, F, F) -> I = std::mem::transmute(func);
-                f(
-                    int_args[0],
-                    int_args[1],
-                    int_args[2],
-                    float_args[0],
-                    float_args[1],
-                )
-            }
-            (0, 3) => {
-                let f: unsafe extern "C" fn(F, F, F) -> I = std::mem::transmute(func);
-                f(float_args[0], float_args[1], float_args[2])
-            }
-            (0, 4) => {
-                let f: unsafe extern "C" fn(F, F, F, F) -> I = std::mem::transmute(func);
-                f(float_args[0], float_args[1], float_args[2], float_args[3])
-            }
-            (1, 3) => {
-                let f: unsafe extern "C" fn(I, F, F, F) -> I = std::mem::transmute(func);
-                f(int_args[0], float_args[0], float_args[1], float_args[2])
-            }
-            (7, 0) => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> I = std::mem::transmute(func);
-                f(
-                    int_args[0],
-                    int_args[1],
-                    int_args[2],
-                    int_args[3],
-                    int_args[4],
-                    int_args[5],
-                    int_args[6],
-                )
-            }
-            (8, 0) => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> I =
-                    std::mem::transmute(func);
-                f(
-                    int_args[0],
-                    int_args[1],
-                    int_args[2],
-                    int_args[3],
-                    int_args[4],
-                    int_args[5],
-                    int_args[6],
-                    int_args[7],
-                )
-            }
-            (ni, nf) => {
-                panic!(
-                    "bh_call_i: unsupported arg combination ({ni} ints, {nf} floats); \
-                 needs libffi for general dispatch"
-                );
-            }
-        }
-    }
-}
+// `bh_call_i_dispatch` arity table moved to
+// `majit_backend::call_stub::bh_call_i_dispatch` (Slice 0d) so dynasm shares
+// the same dispatch.
 
 // Tests
 // ---------------------------------------------------------------------------

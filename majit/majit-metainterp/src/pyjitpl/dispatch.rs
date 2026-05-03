@@ -1268,7 +1268,19 @@ where
                     return TraceAction::Abort;
                 };
                 let result = ctx.vable_arraylen_vable(vable_opref, fdescr, adescr);
-                self.set_int_reg(dest, Some(result), Some(0));
+                // pyjitpl.py:1262-1263 `result =
+                // vinfo.get_array_length(virtualizable, arrayindex);
+                // return ConstInt(result)`.  RPython reads from the live
+                // struct; pyre's trace-side shadow is
+                // `virtualizable_array_lengths`, populated by
+                // `init_virtualizable_boxes` (resume.py:471-486 parity)
+                // before the trace runs, so it carries the same length
+                // RPython would dereference.
+                let len = ctx
+                    .virtualizable_array_lengths()
+                    .and_then(|lengths| lengths.get(array_idx).copied())
+                    .unwrap_or(0);
+                self.set_int_reg(dest, Some(result), Some(len as i64));
             }
             jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
                 let vable_reg = self.frames.current_mut().next_u8() as usize;
@@ -1717,11 +1729,247 @@ where
                 sub_frame.return_f = return_f;
                 self.frames.push(sub_frame);
             }
-            jitcode::BC_RESIDUAL_CALL_VOID
-            | jitcode::BC_CALL_MAY_FORCE_VOID
-            | jitcode::BC_CALL_RELEASE_GIL_VOID
-            | jitcode::BC_CALL_LOOPINVARIANT_VOID
-            | jitcode::BC_CALL_ASSEMBLER_VOID => {
+            // ── canonical *_v call family (Slices 1-2 of
+            // pyre-call-family-canonical-migration.md) ──
+            //
+            // Byte layout matches `blackhole.rs:6534, 6580, 6621`:
+            //   funcptr_reg:u8 + (countI:u8 + regI×N) + (countR:u8 +
+            //   regR×M) + (countF:u8 + regF×K, IRF only) + descr:u16.
+            //
+            // `funcptr_reg` is the post-regs constants-pool slot the
+            // emitter projected concrete_ptr into (RPython
+            // `assembler.py:127-138 emit_const`). The `d` operand carries
+            // the `BhCallDescr`; its `arg_classes` restores source
+            // argument order from the grouped I/R/F lists, matching
+            // `pyjitpl.py:_build_allboxes`.
+            jitcode::BC_RESIDUAL_CALL_R_V
+            | jitcode::BC_RESIDUAL_CALL_IR_V
+            | jitcode::BC_RESIDUAL_CALL_IRF_V => {
+                let has_int = matches!(
+                    bytecode,
+                    jitcode::BC_RESIDUAL_CALL_IR_V | jitcode::BC_RESIDUAL_CALL_IRF_V
+                );
+                let has_float = bytecode == jitcode::BC_RESIDUAL_CALL_IRF_V;
+
+                let (target, args_i, args_r, args_f, calldescr) = {
+                    let frame = self.frames.current_mut();
+                    let funcptr_reg = frame.next_u8() as u16;
+                    let mut args_i: Vec<JitCallArg> = Vec::new();
+                    if has_int {
+                        let count = frame.next_u8() as usize;
+                        for _ in 0..count {
+                            args_i.push(JitCallArg::int(frame.next_u8() as u16));
+                        }
+                    }
+                    let mut args_r: Vec<JitCallArg> = Vec::new();
+                    let count_r = frame.next_u8() as usize;
+                    for _ in 0..count_r {
+                        args_r.push(JitCallArg::reference(frame.next_u8() as u16));
+                    }
+                    let mut args_f: Vec<JitCallArg> = Vec::new();
+                    if has_float {
+                        let count = frame.next_u8() as usize;
+                        for _ in 0..count {
+                            args_f.push(JitCallArg::float(frame.next_u8() as u16));
+                        }
+                    }
+                    let calldescr_idx = frame.next_u16();
+                    let calldescr = frame.jitcode.exec.descrs[calldescr_idx as usize]
+                        .as_bh_descr()
+                        .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
+                        .as_calldescr()
+                        .clone();
+                    let target = frame
+                        .jitcode
+                        .exec
+                        .call_descr_to_call_target
+                        .get(&calldescr_idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let func =
+                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
+                                    panic!(
+                                        "BC_RESIDUAL_CALL_*_V: funcptr slot \
+                                     {funcptr_reg} is uninitialized"
+                                    )
+                                });
+                            let func = func as *const ();
+                            JitCallTarget::new(func, func)
+                        });
+                    (target, args_i, args_r, args_f, calldescr)
+                };
+
+                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) = self
+                    .read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &args_f);
+
+                let trace_ptr = if target.trace_ptr.is_null() {
+                    target.concrete_ptr
+                } else {
+                    target.trace_ptr
+                };
+                let concrete_ptr = if target.concrete_ptr.is_null() {
+                    trace_ptr
+                } else {
+                    target.concrete_ptr
+                };
+
+                let effectinfo = &calldescr.extra_info;
+
+                // pyjitpl.py:3683-3697 do_not_in_trace_call parity:
+                // `@not_in_trace`-decorated callees execute but are not
+                // recorded in the trace IR. For void result this means
+                // dispatch the C function and skip the
+                // `ctx.call_*_void_typed` recording + `may_force` vable
+                // bookkeeping (`forces` is incompatible with
+                // `NotInTrace`). If the call raises, abort the trace —
+                // PyPy raises `SwitchToBlackhole(ABORT_ESCAPE,
+                // raising_exception=True)` which `TraceAction::Abort`
+                // mirrors.
+                //
+                // `MetaInterp::do_not_in_trace_call` (`pyjitpl/mod.rs:10220`)
+                // is the same logic on the `MetaInterp` side; the
+                // `JitCodeMachine` walker does not currently hold a
+                // `MetaInterp` reference, so the clear / dispatch /
+                // exception-check sequence is replicated inline using
+                // the shared `BH_LAST_EXC_VALUE` TLS already used by
+                // other dispatch sites (e.g. `blackhole.rs:1715, 2412,
+                // 2448`).
+                if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
+                    crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+                    if !concrete_ptr.is_null() {
+                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+                            &calldescr.arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        );
+                        unsafe {
+                            majit_backend::call_stub::bh_call_v_dispatch(
+                                concrete_ptr as usize,
+                                &int_args,
+                                &float_args,
+                            );
+                        }
+                    }
+                    if in_observer_mode() {
+                        record_observed_void_call(concrete_ptr, &concrete_args);
+                    }
+                    // pyjitpl.py:3687-3692 if self.last_exc_value: raise
+                    // SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True).
+                    // The exception value stays on `BH_LAST_EXC_VALUE`
+                    // for the blackhole replay; do not clear it here.
+                    let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                    if exc != 0 {
+                        return TraceAction::Abort;
+                    }
+                } else {
+                    let is_release_gil = effectinfo.is_call_release_gil();
+                    let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
+                    let is_loopinvariant =
+                        effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
+
+                    let active_vable = if is_forces {
+                        self.prepare_standard_virtualizable_before_residual_call(ctx)
+                    } else {
+                        None
+                    };
+                    // pyjitpl.py:1995-2068 do_residual_call parity: thread
+                    // the original calldescr's `EffectInfo` (oopspec, read/
+                    // write descr sets, can_invalidate, can_collect,
+                    // call_release_gil_target) into the trace IR instead of
+                    // re-deriving the default for the opcode.
+                    //
+                    // PRE-EXISTING-ADAPTATION: pyjitpl.py:2057 also branches
+                    // on `oopspecindex == OS_LIBFFI_CALL` to call
+                    // `direct_libffi_call` for a special CALL_LIBFFI op
+                    // shape. Pyre's canonical void walker does not yet
+                    // mirror that branch — `direct_libffi_call` lives in
+                    // `pyjitpl/mod.rs:11910` for the legacy path. Latent
+                    // gap: in-tree producers do not currently emit a
+                    // BC_RESIDUAL_CALL_*_V whose calldescr carries
+                    // `OS_LIBFFI_CALL`, so the divergence is dormant.
+                    let effect_info = calldescr.extra_info.clone();
+                    if is_release_gil {
+                        ctx.call_release_gil_void_typed_with_effect(
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            effect_info,
+                        );
+                    } else if is_forces {
+                        ctx.call_may_force_void_typed_with_effect(
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            effect_info,
+                        );
+                    } else if is_loopinvariant {
+                        // pyjitpl.py:2087-2110 with tp == 'v':
+                        // _record_helper_varargs returns None for void,
+                        // so the loop-invariant cache always misses for
+                        // void calls — concrete C dispatch always runs.
+                        ctx.call_loopinvariant_void_typed_with_effect(
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            effect_info,
+                        );
+                    } else {
+                        ctx.call_void_typed_with_effect(trace_ptr, &args, &arg_types, effect_info);
+                    }
+                    if !concrete_ptr.is_null() {
+                        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+                            &calldescr.arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        );
+                        // llmodel.py:834 bh_call_v: a genuinely void C
+                        // callee returns nothing, so route through the
+                        // void-typed dispatcher instead of
+                        // `bh_call_i_dispatch` (which transmutes to
+                        // `extern "C" fn(...) -> i64` and reads garbage
+                        // from rax/x0).
+                        //
+                        // PRE-EXISTING-ADAPTATION: post-call exception
+                        // checking is not yet wired here. RPython
+                        // `pyjitpl.py:2019-2068 do_residual_call` calls
+                        // `execute_varargs(.., exc, pure)` which
+                        // transcribes `BH_LAST_EXC_VALUE` onto
+                        // `MetaInterp.last_exc_value`, then
+                        // `handle_possible_exception()` emits
+                        // `GUARD_NO_EXCEPTION` or routes the catch path.
+                        // main's legacy `call_void_function` had the
+                        // same gap; the canonical walker preserves the
+                        // shape pending a `handle_possible_exception()`
+                        // parity helper on `JitCodeMachine`.
+                        unsafe {
+                            majit_backend::call_stub::bh_call_v_dispatch(
+                                concrete_ptr as usize,
+                                &int_args,
+                                &float_args,
+                            );
+                        }
+                    }
+                    if in_observer_mode() {
+                        record_observed_void_call(concrete_ptr, &concrete_args);
+                    }
+                    if is_forces
+                        && matches!(
+                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable,),
+                            TraceAction::Abort
+                        )
+                    {
+                        return TraceAction::Abort;
+                    }
+                }
+            }
+            // BC_CALL_ASSEMBLER_VOID retains the legacy `(fn_ptr_idx:u16,
+            // num_args:u16, [(kind:u8, reg:u16)]...)` layout — the
+            // assembler-token path is not in the canonical *_v family
+            // and Slice 4 of pyre-call-family-canonical-migration.md
+            // owns its migration.
+            jitcode::BC_CALL_ASSEMBLER_VOID => {
                 let (fn_ptr_idx, arg_regs) = {
                     let frame = self.frames.current_mut();
                     let fn_ptr_idx = frame.next_u16() as usize;
@@ -1743,67 +1991,13 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if bytecode == jitcode::BC_CALL_ASSEMBLER_VOID {
-                    let (token_number, concrete_ptr) = self
-                        .frames
-                        .current_mut()
-                        .jitcode
-                        .call_assembler_target(fn_ptr_idx);
-                    ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types);
-                    call_void_function(concrete_ptr, &concrete_args);
-                } else {
-                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
-                    let trace_ptr = if target.trace_ptr.is_null() {
-                        target.concrete_ptr
-                    } else {
-                        target.trace_ptr
-                    };
-                    let concrete_ptr = if target.concrete_ptr.is_null() {
-                        trace_ptr
-                    } else {
-                        target.concrete_ptr
-                    };
-                    let active_vable = if bytecode == jitcode::BC_CALL_MAY_FORCE_VOID {
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    match bytecode {
-                        jitcode::BC_RESIDUAL_CALL_VOID => {
-                            ctx.call_void_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_MAY_FORCE_VOID => {
-                            ctx.call_may_force_void_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_RELEASE_GIL_VOID => {
-                            ctx.call_release_gil_void_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_LOOPINVARIANT_VOID => {
-                            ctx.call_loopinvariant_void_typed(trace_ptr, &args, &arg_types)
-                        }
-                        _ => unreachable!(),
-                    }
-                    call_void_function(concrete_ptr, &concrete_args);
-                    if in_observer_mode() {
-                        // Always record using `concrete_ptr`: for plain
-                        // policies it equals the helper symbol; for
-                        // `*_wrapped` it is the codewriter-generated
-                        // wrapper. The outer-side consume in
-                        // `observer_replay_for_call`
-                        // (`majit-macros/src/jit_interp/mod.rs`) recovers
-                        // the wrapper symbol via `helper_policy_path`
-                        // for wrapped variants so the queue keys match.
-                        record_observed_void_call(concrete_ptr, &concrete_args);
-                    }
-                    if bytecode == jitcode::BC_CALL_MAY_FORCE_VOID
-                        && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
-                    }
-                }
+                let (token_number, concrete_ptr) = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .call_assembler_target(fn_ptr_idx);
+                ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types);
+                call_void_function(concrete_ptr, &concrete_args);
             }
             // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
             jitcode::BC_COND_CALL_VOID
@@ -2413,6 +2607,113 @@ where
                 (opref, value, majit_ir::Type::Float)
             }
         }
+    }
+
+    fn read_canonical_call_args(
+        &mut self,
+        arg_classes: &str,
+        args_i: &[JitCallArg],
+        args_r: &[JitCallArg],
+        args_f: &[JitCallArg],
+    ) -> (
+        Vec<OpRef>,
+        Vec<i64>,
+        Vec<majit_ir::Type>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+    ) {
+        let mut values_i = Vec::with_capacity(args_i.len());
+        let mut raw_i = Vec::with_capacity(args_i.len());
+        for &arg in args_i {
+            let value = self.read_call_arg(arg);
+            raw_i.push(value.1);
+            values_i.push(value);
+        }
+
+        let mut values_r = Vec::with_capacity(args_r.len());
+        let mut raw_r = Vec::with_capacity(args_r.len());
+        for &arg in args_r {
+            let value = self.read_call_arg(arg);
+            raw_r.push(value.1);
+            values_r.push(value);
+        }
+
+        let mut values_f = Vec::with_capacity(args_f.len());
+        let mut raw_f = Vec::with_capacity(args_f.len());
+        for &arg in args_f {
+            let value = self.read_call_arg(arg);
+            raw_f.push(value.1);
+            values_f.push(value);
+        }
+
+        let mut next_i = 0usize;
+        let mut next_r = 0usize;
+        let mut next_f = 0usize;
+        let mut args = Vec::with_capacity(arg_classes.len());
+        let mut concrete_args = Vec::with_capacity(arg_classes.len());
+        let mut arg_types = Vec::with_capacity(arg_classes.len());
+        for class in arg_classes.chars() {
+            let (arg, concrete, arg_type) = match class {
+                'i' | 'S' => {
+                    let value = values_i.get(next_i).copied().unwrap_or_else(|| {
+                        panic!(
+                            "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
+                             expected int arg #{next_i}, only {} encoded",
+                            values_i.len()
+                        )
+                    });
+                    next_i += 1;
+                    value
+                }
+                'r' => {
+                    let value = values_r.get(next_r).copied().unwrap_or_else(|| {
+                        panic!(
+                            "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
+                             expected ref arg #{next_r}, only {} encoded",
+                            values_r.len()
+                        )
+                    });
+                    next_r += 1;
+                    value
+                }
+                'f' | 'L' => {
+                    let value = values_f.get(next_f).copied().unwrap_or_else(|| {
+                        panic!(
+                            "BC_RESIDUAL_CALL_*_V calldescr arg_classes \
+                             expected float arg #{next_f}, only {} encoded",
+                            values_f.len()
+                        )
+                    });
+                    next_f += 1;
+                    value
+                }
+                other => panic!(
+                    "BC_RESIDUAL_CALL_*_V calldescr has unsupported \
+                     arg class {other:?}"
+                ),
+            };
+            args.push(arg);
+            concrete_args.push(concrete);
+            arg_types.push(arg_type);
+        }
+
+        assert_eq!(
+            next_i,
+            values_i.len(),
+            "BC_RESIDUAL_CALL_*_V encoded extra int args not present in calldescr"
+        );
+        assert_eq!(
+            next_r,
+            values_r.len(),
+            "BC_RESIDUAL_CALL_*_V encoded extra ref args not present in calldescr"
+        );
+        assert_eq!(
+            next_f,
+            values_f.len(),
+            "BC_RESIDUAL_CALL_*_V encoded extra float args not present in calldescr"
+        );
+        (args, concrete_args, arg_types, raw_i, raw_r, raw_f)
     }
 
     fn trace_binop_i(&mut self, ctx: &mut TraceCtx, opcode: OpCode) {
@@ -3327,7 +3628,7 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_no_force as *const ());
-        builder.call_may_force_void_typed_args(fn_idx, &[JitCallArg::reference(0)]);
+        builder.call_may_force_void_canonical_via_target(fn_idx, &[JitCallArg::reference(0)]);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -3378,7 +3679,7 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_force as *const ());
-        builder.call_may_force_void_typed_args(fn_idx, &[JitCallArg::reference(0)]);
+        builder.call_may_force_void_canonical_via_target(fn_idx, &[JitCallArg::reference(0)]);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);

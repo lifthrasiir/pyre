@@ -3047,22 +3047,79 @@ impl TraceCtx {
         call_args.extend_from_slice(args);
         let result = self
             .recorder
-            .record_op_with_descr(opcode, &call_args, descr);
-        // heapcache.py: cache invalidation based on effect level.
-        // EF_ELIDABLE / EF_LOOPINVARIANT (CallPure*, CallLoopinvariant*):
-        //   no invalidation at all.
-        // EF_CAN_RAISE / EF_CANNOT_RAISE (Call*, CallMayForce*):
-        //   escape args + invalidate escaped caches.
-        // EF_RANDOM_EFFECTS: handled separately via invalidate_all_caches.
-        if !opcode.is_call_pure() && !opcode.is_call_loopinvariant() {
-            self.heap_cache._escape_argboxes(args);
-            self.heap_cache.invalidate_caches_for_escaped();
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2659 `_record_helper_varargs` parity: route every
+        // CALL family record through `heapcache.invalidate_caches_varargs`
+        // so the elidable / loopinvariant / arraycopy / arraymove
+        // fast-paths inside `clear_caches_varargs` (heapcache.py:341-376)
+        // run exactly once per call. The previous escape-only path
+        // (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
+        // those branches.
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
         }
         result
     }
 
     pub fn call_void_typed(&mut self, func_ptr: *const (), args: &[OpRef], arg_types: &[Type]) {
         let _ = self.call_typed(OpCode::CallN, func_ptr, args, arg_types, Type::Void);
+    }
+
+    /// `call_typed` variant that preserves the caller-supplied `EffectInfo`
+    /// instead of re-deriving the default for the opcode. Mirrors
+    /// `pyjitpl.py:1995-2068 do_residual_call` parity: PyPy passes the
+    /// original `calldescr` through `record_nospec` so the trace IR
+    /// retains `oopspec`, `read/write_descrs_*`, `can_invalidate`,
+    /// `can_collect`, and `call_release_gil_target` exactly as written
+    /// by the codewriter / write-analyzer.
+    pub fn call_typed_with_effect(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr =
+            crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2659 `_record_helper_varargs` parity (see
+        // `call_typed` for the full rationale).
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
+        result
+    }
+
+    pub fn call_void_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) {
+        let _ = self.call_typed_with_effect(
+            OpCode::CallN,
+            func_ptr,
+            args,
+            arg_types,
+            Type::Void,
+            effect_info,
+        );
     }
 
     /// pyjitpl.py:3553-3579: record_result_of_call_pure.
@@ -3360,12 +3417,19 @@ impl TraceCtx {
         call_args.extend_from_slice(args);
         let result = self
             .recorder
-            .record_op_with_descr(opcode, &call_args, descr);
-        // heapcache.py: may-force calls escape args and invalidate caches.
-        // (GuardNotForced after the call also invalidates, but we need
-        // the escape marking here for correctness.)
-        self.heap_cache._escape_argboxes(args);
-        self.heap_cache.invalidate_caches_for_escaped();
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2070-2072 `do_residual_call` may-force branch:
+        // `self.metainterp.heapcache.invalidate_caches_varargs(opnum1,
+        // descr, allboxes)` after recording the may-force op. The
+        // canonical helper marks args escaped and runs the heap-array
+        // invalidation arm in one pass (heapcache.py:341-376).
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
         result
     }
 
@@ -3382,6 +3446,213 @@ impl TraceCtx {
             arg_types,
             Type::Void,
         );
+    }
+
+    /// `call_family_typed` variant preserving the caller-supplied
+    /// `EffectInfo`. Mirrors `pyjitpl.py:1995-2068 do_residual_call`
+    /// parity (see `call_typed_with_effect` for the full rationale).
+    /// Routes through a fresh `MetaCallDescr` (`make_call_descr_with_effect`)
+    /// instead of the static-`EffectInfo` `MetaCallMayForceDescr`, so
+    /// `oopspecindex`, `read/write_descrs_*`, and
+    /// `call_release_gil_target` survive into the trace IR.
+    fn call_family_typed_with_effect(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr =
+            crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2070-2072 (see `call_family_typed` for rationale).
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
+        result
+    }
+
+    pub fn call_may_force_void_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) {
+        let _ = self.call_family_typed_with_effect(
+            OpCode::call_may_force_for_type(Type::Void),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Void,
+            effect_info,
+        );
+    }
+
+    /// pyjitpl.py:3671-3681 direct_call_release_gil parity. RPython:
+    /// ```python
+    /// realfuncaddr, saveerr = effectinfo.call_release_gil_target
+    /// funcbox = ConstInt(adr2int(realfuncaddr))
+    /// savebox = ConstInt(saveerr)
+    /// opnum   = rop.call_release_gil_for_descr(calldescr)
+    /// return self.history.record_nospec(opnum,
+    ///     [savebox, funcbox] + argboxes[1:], ..., calldescr)
+    /// ```
+    ///
+    /// Pyre's typed-helper API takes `args` *without* a leading funcbox
+    /// (the funcbox is the `func_ptr` parameter), so `args` is already
+    /// the upstream `argboxes[1:]` shape. The trace op shape becomes
+    /// `[savebox, realfuncaddr] + args`. When the
+    /// `call_release_gil_target` slot carries the sentinel `(1, 0)`
+    /// emitted by `assembler.rs::call_release_gil_void_canonical_via_target`
+    /// (pyre has no asm-helper wrapper, so there is no real helper
+    /// address to thread), reuse `func_ptr` as `realfuncaddr` —
+    /// pyre's release-gil callees ARE the C function the trace records.
+    ///
+    /// Routes heapcache invalidation through `invalidate_caches_varargs`
+    /// (heapcache.py:309-340) instead of the escape-only path used by
+    /// `call_family_typed_with_effect`. RPython
+    /// `heapcache.py:341-376 clear_caches_varargs` enumerates the
+    /// plain CALL_* / CALL_LOOPINVARIANT_* / COND_CALL_* opcodes and
+    /// EXCLUDES the `CALL_RELEASE_GIL_*` family — release-gil falls
+    /// through to `reset_keep_likely_virtuals` because the optimizer
+    /// cannot selectively invalidate across a GIL-release boundary.
+    /// Pyre's `clear_caches_varargs` (`heapcache.rs:1097`) mirrors
+    /// the upstream enumeration with an explicit
+    /// `!is_call_release_gil()` guard.
+    pub fn call_release_gil_void_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) {
+        let _ = self.record_release_gil_typed_with_effect(
+            OpCode::call_release_gil_for_type(Type::Void),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Void,
+            effect_info,
+        );
+    }
+
+    /// Shared release-gil recorder for the `i / r / f / v` typed
+    /// variants. Mirrors `pyjitpl.py:3671-3681 direct_call_release_gil`:
+    ///
+    /// ```python
+    /// realfuncaddr, saveerr = effectinfo.call_release_gil_target
+    /// funcbox = ConstInt(adr2int(realfuncaddr))
+    /// savebox = ConstInt(saveerr)
+    /// opnum   = rop.call_release_gil_for_descr(calldescr)
+    /// return self.history.record_nospec(opnum,
+    ///     [savebox, funcbox] + argboxes[1:], ..., calldescr)
+    /// ```
+    ///
+    /// Pyre's typed-helper API takes `args` *without* a leading funcbox
+    /// (the funcbox is the `func_ptr` parameter), so `args` is already
+    /// the upstream `argboxes[1:]` shape. The trace op shape becomes
+    /// `[savebox, realfuncaddr] + args`.
+    ///
+    /// The Cranelift / Dynasm consumers (`compiler.rs:9807` etc.)
+    /// require this shape uniformly; emitting the legacy `[func, args]`
+    /// shape for int/float typed release-gil silently mis-routes the
+    /// first real arg as the function pointer.
+    fn record_release_gil_typed_with_effect(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        let (realfuncaddr, saveerr) = effect_info.call_release_gil_target;
+        // Sentinel: emit-side stamps `(1, 0)` to flag is_call_release_gil()
+        // without a real asm-helper address. Treat any
+        // `realfuncaddr <= 1` slot as "use the caller's func_ptr".
+        let realfuncaddr_value = if realfuncaddr <= 1 {
+            func_ptr as usize as i64
+        } else {
+            realfuncaddr as i64
+        };
+        let savebox = self.constants.get_or_insert(saveerr as i64);
+        let funcbox = self.constants.get_or_insert(realfuncaddr_value);
+
+        let descr =
+            crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
+        let mut call_args = Vec::with_capacity(2 + args.len());
+        call_args.push(savebox);
+        call_args.push(funcbox);
+        call_args.extend_from_slice(args);
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // heapcache.py:341-376 clear_caches_varargs: release-gil falls
+        // through to `reset_keep_likely_virtuals`, the most aggressive
+        // arm. Pass the descr's effectinfo so the elidable / arraycopy /
+        // arraymove fast-paths are honoured if a future descr
+        // classification activates them.
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
+        result
+    }
+
+    /// `call_loopinvariant_void_typed` preserving the caller-supplied
+    /// `EffectInfo`. Mirrors `pyjitpl.py:2087-2110` for `tp == 'v'`.
+    ///
+    /// Upstream's loop-invariant cache (`heapcache.py:629-639
+    /// call_loopinvariant_known_result` / `call_loopinvariant_now_known`)
+    /// stores the *result* op, but `_record_helper_varargs`
+    /// (`pyjitpl.py:2655-2663`) returns `None` for void calls — so the
+    /// cached "known result" is `None`, the lookup always misses, and
+    /// every void loop-invariant call re-executes the concrete C
+    /// function.  The previous bool-returning helper short-circuited
+    /// the bh_call_v dispatch on hit, which was a regression vs both
+    /// upstream and main's legacy void path.  Match upstream by
+    /// recording + invalidating only — no cache lookup, no skip.
+    pub fn call_loopinvariant_void_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let opcode = OpCode::call_loopinvariant_for_type(Type::Void);
+        let descr =
+            crate::call_descr::make_call_descr_with_effect(arg_types, Type::Void, effect_info);
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        let _ = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2659 `_record_helper_varargs` parity (see
+        // `call_typed`): every CALL family record routes through the
+        // canonical heap_cache.invalidate_caches_varargs.
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
     }
 
     pub fn call_may_force_int_typed(
@@ -3484,12 +3755,25 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        self.call_family_typed(
+        // pyjitpl.py:3671-3681 direct_call_release_gil shape:
+        // `[savebox, funcbox_real] + argboxes[1:]`.  Without a per-callee
+        // `effectinfo.call_release_gil_target`, stamp the same sentinel
+        // `(1, 0)` the canonical void emit uses (assembler.rs:1836) so
+        // `is_call_release_gil()` returns true and the cranelift /
+        // dynasm consumers see the upstream-shaped op.
+        let effect_info = majit_ir::EffectInfo {
+            extraeffect: majit_ir::ExtraEffect::RandomEffects,
+            can_invalidate: true,
+            call_release_gil_target: (1, 0),
+            ..majit_ir::EffectInfo::default()
+        };
+        self.record_release_gil_typed_with_effect(
             OpCode::call_release_gil_for_type(Type::Int),
             func_ptr,
             args,
             arg_types,
             Type::Int,
+            effect_info,
         )
     }
 
@@ -3499,12 +3783,19 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        self.call_family_typed(
+        let effect_info = majit_ir::EffectInfo {
+            extraeffect: majit_ir::ExtraEffect::RandomEffects,
+            can_invalidate: true,
+            call_release_gil_target: (1, 0),
+            ..majit_ir::EffectInfo::default()
+        };
+        self.record_release_gil_typed_with_effect(
             OpCode::call_release_gil_for_type(Type::Float),
             func_ptr,
             args,
             arg_types,
             Type::Float,
+            effect_info,
         )
     }
 

@@ -2521,12 +2521,12 @@ impl BlackholeInterpreter {
             // `call_void_function` does the same.  Using the int variant
             // here would force an `extern "C" fn(...) -> i64` ABI on a
             // helper that may genuinely return nothing.
-            jitcode::BC_CALL_MAY_FORCE_VOID
-            | jitcode::BC_CALL_RELEASE_GIL_VOID
-            | jitcode::BC_CALL_LOOPINVARIANT_VOID
-            | jitcode::BC_CALL_ASSEMBLER_VOID => {
+            // BC_CALL_ASSEMBLER_VOID retains the legacy
+            // `(fn_ptr_idx:u16, num_args:u16, [(kind:u8, reg:u16)]...)`
+            // layout — Slice 4 of pyre-call-family-canonical-migration.md
+            // owns its migration.
+            jitcode::BC_CALL_ASSEMBLER_VOID => {
                 let fn_ptr_idx = self.next_u16() as usize;
-                // void calls have no dst field in bytecode (call_void_like encoding)
                 let num_args = self.next_u16() as usize;
                 let args = self.read_call_args(num_args);
                 let target = self.jitcode.call_target(fn_ptr_idx);
@@ -2542,13 +2542,112 @@ impl BlackholeInterpreter {
                     return Err(DispatchError::LeaveFrame);
                 }
             }
-            jitcode::BC_RESIDUAL_CALL_VOID => {
-                let fn_ptr_idx = self.next_u16() as usize;
-                let num_args = self.next_u16() as usize;
-                let args = self.read_call_args(num_args);
-                let target = self.jitcode.call_target(fn_ptr_idx);
+            // Slices 1-2 of `pyre-call-family-canonical-migration.md`:
+            // canonical *_v opcodes (=159..=170) live outside the
+            // translator-allocated insns range (max byte 74), so
+            // dispatch_step_with_fallback always lands here.
+            //
+            // Decode the canonical byte layout (`blackhole.rs:6459-6481
+            // read_list_*` + `blackhole.rs:5853 read_descr` parity), then
+            // dispatch through `majit_backend::call_stub::bh_call_i_dispatch`
+            // for ABI-correct (separate int/float register-file) call —
+            // the same arity table cranelift's `bh_call_i` and dynasm's
+            // Slice 0d `bh_call_v` ride on. We cannot delegate to the
+            // wired handler bodies because production `BlackholeInterpreter`
+            // has `cpu = None` (`builder.cpu` is never set in pyre's
+            // resume path — `pyjitpl.py:2247-2253` parity is satisfied
+            // via direct dispatch rather than cpu.bh_call_v).
+            //
+            // Wrap with the `BH_LAST_EXC_VALUE` TLS handshake so any
+            // exception pyre-jit's call helpers stash into the TLS
+            // (`pyre/pyre-jit/src/call_jit.rs:514, 2976, 3129`)
+            // propagates as a frame-level exception.
+            //
+            // The blackhole side does not distinguish residual_call /
+            // may_force / release_gil / loopinvariant by opcode. RPython
+            // carries that policy on `calldescr.extra_info`; the bytecode
+            // remains the canonical `residual_call_*_v` family.
+            jitcode::BC_RESIDUAL_CALL_R_V
+            | jitcode::BC_RESIDUAL_CALL_IR_V
+            | jitcode::BC_RESIDUAL_CALL_IRF_V => {
+                let has_int = matches!(
+                    opcode,
+                    jitcode::BC_RESIDUAL_CALL_IR_V | jitcode::BC_RESIDUAL_CALL_IRF_V
+                );
+                let has_float = opcode == jitcode::BC_RESIDUAL_CALL_IRF_V;
+                let funcptr_reg = self.next_u8() as usize;
+                let func = self.registers_i[funcptr_reg];
+                let mut args_i: Vec<i64> = Vec::new();
+                let mut args_r: Vec<i64> = Vec::new();
+                let mut args_f: Vec<i64> = Vec::new();
+                if has_int {
+                    let count = self.next_u8() as usize;
+                    for _ in 0..count {
+                        let reg = self.next_u8() as usize;
+                        args_i.push(self.registers_i[reg]);
+                    }
+                }
+                let count_r = self.next_u8() as usize;
+                for _ in 0..count_r {
+                    let reg = self.next_u8() as usize;
+                    args_r.push(self.registers_r[reg]);
+                }
+                if has_float {
+                    let count = self.next_u8() as usize;
+                    for _ in 0..count {
+                        let reg = self.next_u8() as usize;
+                        args_f.push(self.registers_f[reg]);
+                    }
+                }
+                let descr_idx_lo = self.next_u8() as usize;
+                let descr_idx_hi = self.next_u8() as usize;
+                let descr_idx = descr_idx_lo | (descr_idx_hi << 8);
+                // blackhole.py:150-157 + read_descr (`blackhole.rs:5931-5940`)
+                // parity: `descrs[idx]` first looks at the per-jitcode
+                // runtime pool (`JitCodeBuilder` output), then falls
+                // back to the builder-shared `bh.descrs` for
+                // build-time / global jitcodes.
+                let calldescr = match self.jitcode.exec.descrs.get(descr_idx) {
+                    Some(entry) => entry
+                        .as_bh_descr()
+                        .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
+                        .as_calldescr()
+                        .clone(),
+                    None => self
+                        .descrs
+                        .get(descr_idx)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "BC_RESIDUAL_CALL_*_V descr index {descr_idx} \
+                                 out of range in jitcode.exec.descrs ({}) \
+                                 and bh.descrs ({})",
+                                self.jitcode.exec.descrs.len(),
+                                self.descrs.len(),
+                            )
+                        })
+                        .as_calldescr()
+                        .clone(),
+                };
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                call_void_function(target.concrete_ptr, &args);
+                if func != 0 {
+                    let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+                        &calldescr.arg_classes,
+                        Some(&args_i),
+                        Some(&args_r),
+                        Some(&args_f),
+                    );
+                    // llmodel.py:834 bh_call_v: void-returning callees
+                    // require the void-typed dispatcher; reading rax/x0
+                    // through `bh_call_i_dispatch` for a genuinely void
+                    // helper is undefined behavior.
+                    unsafe {
+                        majit_backend::call_stub::bh_call_v_dispatch(
+                            func as usize,
+                            &int_args,
+                            &float_args,
+                        );
+                    }
+                }
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
                 if exc_val != 0 {
                     if self.handle_exception_in_frame(exc_val) {

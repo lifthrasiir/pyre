@@ -19,7 +19,10 @@ pub(crate) const BC_UNREACHABLE: u8 = 19;
 pub(crate) const BC_GOTO_IF_NOT_INT_IS_TRUE: u8 = 15;
 pub(crate) const BC_JUMP: u8 = 16;
 pub(crate) const BC_INLINE_CALL: u8 = 17;
-pub(crate) const BC_RESIDUAL_CALL_VOID: u8 = 18;
+// slot 18 (formerly BC_RESIDUAL_CALL_VOID) freed by Slice 1c —
+// pyre-call-family-canonical-migration.md retired the legacy
+// `(fn_ptr_idx:u16, num_args:u16, [(kind:u8, reg:u16)]...)` payload in
+// favour of canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` (=159..=161).
 pub(crate) const BC_MOVE_I: u8 = 21;
 pub(crate) const BC_CALL_INT: u8 = 22;
 pub(crate) const BC_CALL_PURE_INT: u8 = 23;
@@ -34,17 +37,26 @@ pub(crate) const BC_CALL_PURE_FLOAT: u8 = 35;
 pub(crate) const BC_CALL_MAY_FORCE_INT: u8 = 38;
 pub(crate) const BC_CALL_MAY_FORCE_REF: u8 = 39;
 pub(crate) const BC_CALL_MAY_FORCE_FLOAT: u8 = 40;
-pub(crate) const BC_CALL_MAY_FORCE_VOID: u8 = 41;
+// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed by Slice 1c — the
+// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family carries the may_force
+// policy on `calldescr.extra_info` (RPython `effectinfo.py:201
+// EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`), not via a separate opcode.
 pub(crate) const BC_CALL_RELEASE_GIL_INT: u8 = 42;
 // BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
 // resoperation.py:1243-1244 (`# no such thing`) excludes
 // CALL_RELEASE_GIL_R from the upstream opcode table.
 pub(crate) const BC_CALL_RELEASE_GIL_FLOAT: u8 = 44;
-pub(crate) const BC_CALL_RELEASE_GIL_VOID: u8 = 45;
+// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed by Slice 1c — the
+// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family marks release_gil
+// via `EffectInfo.call_release_gil_target` (RPython
+// `effectinfo.py:255 is_call_release_gil`), not a separate opcode.
 pub(crate) const BC_CALL_LOOPINVARIANT_INT: u8 = 46;
 pub(crate) const BC_CALL_LOOPINVARIANT_REF: u8 = 47;
 pub(crate) const BC_CALL_LOOPINVARIANT_FLOAT: u8 = 48;
-pub(crate) const BC_CALL_LOOPINVARIANT_VOID: u8 = 49;
+// slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed by Slice 1c — the
+// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family carries
+// `EF_LOOPINVARIANT` on `calldescr.extra_info` (RPython
+// `effectinfo.py:202 EF_LOOPINVARIANT`), not a separate opcode.
 pub(crate) const BC_CALL_ASSEMBLER_INT: u8 = 50;
 pub(crate) const BC_CALL_ASSEMBLER_REF: u8 = 51;
 pub(crate) const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
@@ -192,6 +204,14 @@ pub(crate) const BC_PTR_NONZERO: u8 = 156;
 // `bhimpl_goto_if_not_ptr_{iszero,nonzero}`.
 pub(crate) const BC_GOTO_IF_NOT_PTR_ISZERO: u8 = 157;
 pub(crate) const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
+// canonical residual_call_*_v opcodes — RPython `blackhole.py:1240-1255`
+// `bhimpl_residual_call_{r,ir,irf}_v`. Distinct opcodes per argcode shape so
+// `setup_insns` (`blackhole.rs:3241`) keeps its 1:1 opcode→key invariant.
+// Slice 0 of `pyre-call-family-canonical-migration.md` reserves these slots
+// in the 159-255 free range; emit-site migration lives in Slice 1.
+pub(crate) const BC_RESIDUAL_CALL_R_V: u8 = 159;
+pub(crate) const BC_RESIDUAL_CALL_IR_V: u8 = 160;
+pub(crate) const BC_RESIDUAL_CALL_IRF_V: u8 = 161;
 // Typed return opcodes — RPython `blackhole.py:841-862`
 // `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
 // pyre's portal return is REF (see BC_REF_RETURN) but the insns map
@@ -344,6 +364,14 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     // (blackhole.py:113-123 `argtype == 'i'` branch).
     m.insert("jit_merge_point/cIRFIRF", BC_JIT_MERGE_POINT_C);
     m.insert("jit_merge_point/iIRFIRF", BC_JIT_MERGE_POINT);
+    // RPython `blackhole.py:1240-1255` `bhimpl_residual_call_{r,ir,irf}_v`.
+    // Slice 1c of `pyre-call-family-canonical-migration.md` retired the
+    // legacy `BC_RESIDUAL_CALL_VOID` (=18) byte layout in favour of the
+    // canonical `iRd / iIRd / iIRFd` argcode triple; the freed slot is
+    // documented at the const-table site above.
+    m.insert("residual_call_r_v/iRd", BC_RESIDUAL_CALL_R_V);
+    m.insert("residual_call_ir_v/iIRd", BC_RESIDUAL_CALL_IR_V);
+    m.insert("residual_call_irf_v/iIRFd", BC_RESIDUAL_CALL_IRF_V);
     // jtransform.py:292-313 / 1672-1688 conditional/known-result family
     // intentionally omitted. The helper-side `BC_COND_CALL_*` /
     // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags
@@ -706,6 +734,17 @@ impl RuntimeBhDescr {
 pub struct JitCodeExecState {
     /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
     pub descrs: Vec<RuntimeBhDescr>,
+    /// Sidetable mapping the canonical-call `d` argcode descriptor slot
+    /// back to pyre's full `JitCallTarget` (`{trace_ptr, concrete_ptr}`).
+    /// RPython stores the callable address in the `i` operand and the
+    /// signature/effect policy in the `d` operand. Pyre's runtime emitter
+    /// still has a trace/concrete pointer split, so this is the minimal
+    /// adaptation needed for trace recording while preserving the
+    /// RPython-shaped `residual_call_*_v` payload. Keying by descriptor
+    /// slot keeps the bridge per callsite; keying by int-const pool slot
+    /// would collapse distinct trace targets that share a concrete
+    /// pointer.
+    pub call_descr_to_call_target: std::collections::HashMap<u16, JitCallTarget>,
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1004,6 +1043,20 @@ mod tests {
         assert_eq!(
             insns.get("hint_force_virtualizable/r"),
             Some(&BC_HINT_FORCE_VIRTUALIZABLE)
+        );
+        // Slice 0 of `pyre-call-family-canonical-migration.md` — canonical
+        // residual_call_*_v opcodes reserved for Slice 1 emit migration.
+        assert_eq!(
+            insns.get("residual_call_r_v/iRd"),
+            Some(&BC_RESIDUAL_CALL_R_V),
+        );
+        assert_eq!(
+            insns.get("residual_call_ir_v/iIRd"),
+            Some(&BC_RESIDUAL_CALL_IR_V),
+        );
+        assert_eq!(
+            insns.get("residual_call_irf_v/iIRFd"),
+            Some(&BC_RESIDUAL_CALL_IRF_V),
         );
     }
 

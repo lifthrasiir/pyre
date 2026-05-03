@@ -2028,6 +2028,125 @@ impl Backend for DynasmBackend {
         self.lookup_typeid_from_classptr(classptr)
     }
 
+    /// llmodel.py:816 bh_call_i: ABI-correct dispatch via the shared call stub.
+    ///
+    /// On ARM64/x86-64 the C ABI assigns integer and float args to independent
+    /// register files, so a typed `extern "C" fn(I × ints, F × floats) -> i64`
+    /// transmute lands them correctly regardless of original interleaving.
+    /// Routes through `majit_backend::call_stub::bh_call_i_dispatch` (Slice 0d
+    /// of pyre-call-family-canonical-migration) which owns the arity table
+    /// previously embedded in cranelift's `compiler.rs`.
+    fn bh_call_i(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) -> i64 {
+        if func == 0 {
+            return 0;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
+        }
+    }
+
+    /// llmodel.py:818 bh_call_r: GcRef-returning parallel of `bh_call_i`.
+    /// `lltype.Ptr(lltype.GcStruct, ...)` lowers to a host pointer that
+    /// matches `i64` on 64-bit, so we transmute via the shared int
+    /// dispatcher and wrap the result. Without this override
+    /// `bhimpl_residual_call_*_r` would silently no-op via the default
+    /// trait impl at `majit-backend/lib.rs:1992`.
+    fn bh_call_r(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) -> majit_ir::GcRef {
+        if func == 0 {
+            return majit_ir::GcRef::NULL;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        let raw = unsafe {
+            majit_backend::call_stub::bh_call_i_dispatch(func as usize, &int_args, &float_args)
+        };
+        majit_ir::GcRef(raw as usize)
+    }
+
+    /// llmodel.py:825 bh_call_f / descr.py:590-602 create_call_stub
+    /// (`RESULT == lltype.Float`) parity: route through the f64-typed
+    /// dispatcher so an f64-returning C callee delivers via xmm0 / d0
+    /// instead of rax / x0. Without this override
+    /// `bhimpl_residual_call_*_f` would silently no-op via the default
+    /// trait impl at `majit-backend/lib.rs:2003`.
+    fn bh_call_f(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) -> f64 {
+        if func == 0 {
+            return 0.0;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        unsafe {
+            majit_backend::call_stub::bh_call_f_dispatch(func as usize, &int_args, &float_args)
+        }
+    }
+
+    /// llmodel.py:834 bh_call_v / descr.py:590-602 create_call_stub
+    /// (`RESULT == lltype.Void`) parity: dispatch the funcptr through
+    /// the void-typed `bh_call_v_dispatch` so a genuinely void C callee
+    /// is called with the right C-ABI signature. Re-routing through
+    /// `bh_call_i_dispatch` (a `extern "C" fn(...) -> i64` transmute)
+    /// reads garbage from rax/x0 for true void returns.
+    ///
+    /// Without this override the canonical `residual_call_*_v` walker
+    /// would silently no-op via the default trait impl
+    /// (`majit-backend/lib.rs:2013`).
+    fn bh_call_v(
+        &self,
+        func: i64,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        calldescr: &majit_translate::jitcode::BhCallDescr,
+    ) {
+        if func == 0 {
+            return;
+        }
+        let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
+            &calldescr.arg_classes,
+            args_i,
+            args_r,
+            args_f,
+        );
+        unsafe {
+            majit_backend::call_stub::bh_call_v_dispatch(func as usize, &int_args, &float_args);
+        }
+    }
+
     /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
     fn bh_raw_load_i(
         &self,

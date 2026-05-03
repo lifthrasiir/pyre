@@ -1786,11 +1786,14 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Explicit(kind) => match kind {
                 crate::jit_interp::CallPolicyKind::ResidualVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let typed_args = quote! {
+                            &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
+                        };
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
+                                __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     } else {
@@ -1801,18 +1804,21 @@ impl<'c> Lowerer<'c> {
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
+                                __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let typed_args = quote! {
+                            &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
+                        };
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
+                                __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     } else {
@@ -1823,18 +1829,21 @@ impl<'c> Lowerer<'c> {
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
+                                __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::ReleaseGilVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let typed_args = quote! {
+                            &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
+                        };
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
+                                __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     } else {
@@ -1845,18 +1854,21 @@ impl<'c> Lowerer<'c> {
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
+                                __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     }
                 }
                 crate::jit_interp::CallPolicyKind::LoopInvariantVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let typed_args = quote! {
+                            &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
+                        };
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
+                                __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     } else {
@@ -1867,7 +1879,7 @@ impl<'c> Lowerer<'c> {
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
+                                __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
                     }
@@ -1948,8 +1960,7 @@ impl<'c> Lowerer<'c> {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
-                    let call_stmt =
-                        quote! { __builder.residual_call_void_typed_args(__fn_idx, #typed_args); };
+                    let call_stmt = quote! { __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args); };
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                         quote! {
@@ -1981,13 +1992,13 @@ impl<'c> Lowerer<'c> {
                         arg_bindings.iter().map(Register::from_binding).collect();
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::MayForceVoidWrapped => {
-                            quote! { __builder.call_may_force_void_typed_args(__fn_idx, #typed_args); }
+                            quote! { __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args); }
                         }
                         crate::jit_interp::CallPolicyKind::ReleaseGilVoidWrapped => {
-                            quote! { __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args); }
+                            quote! { __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
-                            quote! { __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args); }
+                            quote! { __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args); }
                         }
                         _ => unreachable!(),
                     };
@@ -2152,16 +2163,16 @@ impl<'c> Lowerer<'c> {
                         let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                         match __policy {
                             1u8 => {
-                                __builder.residual_call_void_typed_args(__fn_idx, #typed_args);
+                                __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
                             }
                             9u8 => {
-                                __builder.call_may_force_void_typed_args(__fn_idx, #typed_args);
+                                __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             }
                             13u8 => {
-                                __builder.call_release_gil_void_typed_args(__fn_idx, #typed_args);
+                                __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
                             }
                             17u8 => {
-                                __builder.call_loopinvariant_void_typed_args(__fn_idx, #typed_args);
+                                __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             }
                             _ => {
                                 #unsupported
@@ -2192,7 +2203,10 @@ impl<'c> Lowerer<'c> {
                     OpMeta::linear(OpKind::Call, vec![Register::int(reg)], vec![]),
                     quote! {
                         let __fn_idx = __builder.add_fn_ptr(#shim as *const ());
-                        __builder.residual_call_void_args(__fn_idx, &[#reg]);
+                        __builder.residual_call_void_canonical_via_target(
+                            __fn_idx,
+                            &[majit_metainterp::JitCallArg::int(#reg)],
+                        );
                     },
                 );
                 return Some(());

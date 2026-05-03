@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
 
+pub mod call_stub;
 pub mod jitframe;
 pub mod llmodel;
 

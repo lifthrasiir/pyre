@@ -67,6 +67,15 @@ pub struct JitCodeBuilder {
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
+    /// Pyre-only bridge for canonical `residual_call_*_v`: the bytecode
+    /// itself keeps the RPython shape (`i` funcptr operand + `d`
+    /// calldescr operand), while the runtime trace path still needs the
+    /// separate `{trace_ptr, concrete_ptr}` pair. Keying by the `d`
+    /// operand keeps the bridge per callsite and avoids collapsing
+    /// different trace wrappers that share a concrete function pointer.
+    /// Drained into `JitCodeExecState.call_descr_to_call_target` at
+    /// `finish()`.
+    call_descr_to_call_target: std::collections::HashMap<u16, JitCallTarget>,
     /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
@@ -1575,44 +1584,329 @@ impl JitCodeBuilder {
         }
     }
 
-    pub fn residual_call_void(&mut self, fn_ptr_idx: u16, src_reg: u16) {
-        self.residual_call_void_args(fn_ptr_idx, &[src_reg]);
+    /// Slice 1 adapter — bridges `fn_ptr_idx`-using emit sites to the
+    /// canonical `residual_call_*_v` byte layout. Looks up the
+    /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materializes
+    /// `concrete_ptr` in the int constants pool, derives a `BhCallDescr`
+    /// from `arg_regs` kinds (result `Void`, default `EffectInfo`), and
+    /// records the pyre-only `(calldescr_idx → JitCallTarget)` bridge for
+    /// trace-time pointer selection.
+    ///
+    /// The 7 production emit sites referenced in
+    /// `pyre-call-family-canonical-migration.md` Slice 1 (Slice 1b)
+    /// route through this adapter so callers do not have to thread
+    /// `concrete_ptr` and `BhCallDescr` separately.
+    pub fn residual_call_void_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+    ) {
+        // pyjitpl.py:2655 do_residual_call invalidates the heapcache from
+        // descriptor effects before recording the call. With an unknown
+        // call analyzer result the conservative default writes/reads
+        // every descr — RPython upgrades to bitstring sets but pyre's
+        // u64 bitset defaults to `u64::MAX` per
+        // `crate::call_descr::DEFAULT_EFFECT_INFO`. Using
+        // `EffectInfo::default()` here would carry empty bitsets through
+        // the trace IR and let stale heapcache entries survive a side-
+        // effecting helper call.
+        self.residual_call_void_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            crate::call_descr::DEFAULT_EFFECT_INFO,
+        );
     }
 
-    pub fn residual_call_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.residual_call_void_typed_args(fn_ptr_idx, &args);
+    pub fn residual_call_void_canonical_via_target_with_effect_info(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        effect_info: majit_ir::descr::EffectInfo,
+    ) {
+        self.emit_canonical_call_void_via_target(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_V,
+                jitcode::BC_RESIDUAL_CALL_IR_V,
+                jitcode::BC_RESIDUAL_CALL_IRF_V,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            effect_info,
+            "residual_call_void_canonical_via_target",
+        );
     }
 
-    pub fn residual_call_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(jitcode::BC_RESIDUAL_CALL_VOID, fn_ptr_idx, arg_regs);
+    /// Slice 0e of `pyre-call-family-canonical-migration.md`: emit canonical
+    /// `residual_call_{r,ir,irf}_v` opname/argcodes byte layout.
+    ///
+    /// Policy-specific void calls use this same bytecode family; their
+    /// behaviour is carried by `calldescr.extra_info`, matching RPython
+    /// `pyjitpl.py` `do_residual_call`.
+    pub fn residual_call_void_canonical_typed_args(
+        &mut self,
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+    ) {
+        let calldescr_idx = self.emit_canonical_call_void(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_V,
+                jitcode::BC_RESIDUAL_CALL_IR_V,
+                jitcode::BC_RESIDUAL_CALL_IRF_V,
+            ),
+            funcptr,
+            args,
+            calldescr,
+        );
+        let funcptr = funcptr as *const ();
+        self.call_descr_to_call_target
+            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
     }
 
-    pub fn call_may_force_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_may_force_void_typed_args(fn_ptr_idx, &args);
+    /// Generic canonical `*_v` emission body shared by `residual_call`,
+    /// `call_may_force`, `call_release_gil`, `call_loopinvariant`.
+    ///
+    /// `funcptr` is the raw concrete C-ABI pointer that
+    /// `cpu.bh_call_v` (cranelift `compiler.rs:13934`, dynasm
+    /// `runner.rs` Slice 0d override) will eventually transmute into a
+    /// typed `extern "C" fn(...)`. The pointer is stashed in the int
+    /// constants pool — RPython `assembler.py:127-138 emit_const`
+    /// projects const-pool slot N into the post-regs window of
+    /// `bh.registers_i` so the canonical handler at
+    /// `blackhole.rs:6534, 6580, 6621` can resolve `bh.registers_i[
+    /// code[pos]]` uniformly. `finish()` patches the placeholder byte
+    /// to `num_regs_i + funcptr_const_idx` (1-byte ceiling enforced by
+    /// `patch_const_u8_refs`).
+    ///
+    /// `args` is bucket-sorted by kind into the int / ref / float lists
+    /// the canonical handler reads in order. Sub-form auto-selection:
+    ///   - any float arg → `opcode_irf_v` (`iIRFd`)
+    ///   - else any int arg → `opcode_ir_v` (`iIRd`)
+    ///   - else → `opcode_r_v` (`iRd`)
+    /// (R variant cannot hold int / float bytes — the handler reads only
+    /// the funcptr_reg byte + the R list + the descr.)
+    fn emit_canonical_call_void(
+        &mut self,
+        opcodes: (u8, u8, u8),
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+    ) -> u16 {
+        let (opcode_r_v, opcode_ir_v, opcode_irf_v) = opcodes;
+        let mut int_regs: Vec<u16> = Vec::new();
+        let mut ref_regs: Vec<u16> = Vec::new();
+        let mut float_regs: Vec<u16> = Vec::new();
+        for &arg in args {
+            self.touch_call_arg(arg);
+            match arg.kind {
+                JitArgKind::Int => int_regs.push(arg.reg),
+                JitArgKind::Ref => ref_regs.push(arg.reg),
+                JitArgKind::Float => float_regs.push(arg.reg),
+            }
+        }
+
+        let has_float = !float_regs.is_empty();
+        let has_int = !int_regs.is_empty();
+        let opcode = if has_float {
+            opcode_irf_v
+        } else if has_int {
+            opcode_ir_v
+        } else {
+            opcode_r_v
+        };
+
+        let funcptr_const_idx = self.add_const_i(funcptr);
+        let calldescr_idx = self.add_call_descr(calldescr);
+
+        self.start_instr(opcode);
+        // funcptr_reg: 1-byte placeholder, finish() patches to
+        // `num_regs_i + funcptr_const_idx` once per-kind register counts
+        // freeze (RPython `assembler.py:127-138` const-pool projection).
+        let funcptr_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((funcptr_offset, ConstKind::Int, funcptr_const_idx));
+
+        // IR / IRF carry the int list before the ref list.
+        if has_float || has_int {
+            assert!(
+                int_regs.len() <= u8::MAX as usize,
+                "canonical call_*_v int arg count {} overflows u8",
+                int_regs.len()
+            );
+            self.push_u8(int_regs.len() as u8);
+            for reg in int_regs {
+                self.push_reg_u8(reg, "canonical call_*_v int arg");
+            }
+        }
+        // R / IR / IRF all carry the ref list.
+        assert!(
+            ref_regs.len() <= u8::MAX as usize,
+            "canonical call_*_v ref arg count {} overflows u8",
+            ref_regs.len()
+        );
+        self.push_u8(ref_regs.len() as u8);
+        for reg in ref_regs {
+            self.push_reg_u8(reg, "canonical call_*_v ref arg");
+        }
+        // IRF carries the float list.
+        if has_float {
+            assert!(
+                float_regs.len() <= u8::MAX as usize,
+                "canonical call_*_v float arg count {} overflows u8",
+                float_regs.len()
+            );
+            self.push_u8(float_regs.len() as u8);
+            for reg in float_regs {
+                self.push_reg_u8(reg, "canonical call_*_v float arg");
+            }
+        }
+        // calldescr is encoded as a 2-byte runtime descrs index — read by
+        // `blackhole.rs:5853 read_descr`.
+        self.push_u16(calldescr_idx);
+        calldescr_idx
     }
 
-    pub fn call_may_force_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(jitcode::BC_CALL_MAY_FORCE_VOID, fn_ptr_idx, arg_regs);
+    /// Emit a canonical `residual_call_*_v` whose calldescr carries
+    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
+    pub fn call_may_force_void_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+    ) {
+        self.emit_canonical_call_void_via_target(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_V,
+                jitcode::BC_RESIDUAL_CALL_IR_V,
+                jitcode::BC_RESIDUAL_CALL_IRF_V,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            majit_ir::descr::EffectInfo {
+                // pyjitpl.py:2655 do_residual_call invalidation parity:
+                // when the callee has not been write-analyzed, RPython
+                // falls back to `MOST_GENERAL` (None bitsets read as
+                // "all writes" by `force_from_effectinfo`). Pyre's
+                // bitset model encodes that as `u64::MAX`.
+                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+            "call_may_force_void_canonical_via_target",
+        );
     }
 
-    pub fn call_release_gil_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_release_gil_void_typed_args(fn_ptr_idx, &args);
+    /// Emit a canonical `residual_call_*_v` whose calldescr carries the
+    /// release-gil marker. RPython selects this policy from
+    /// `calldescr.extra_info`, not from a separate bytecode family.
+    pub fn call_release_gil_void_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+    ) {
+        self.emit_canonical_call_void_via_target(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_V,
+                jitcode::BC_RESIDUAL_CALL_IR_V,
+                jitcode::BC_RESIDUAL_CALL_IRF_V,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            majit_ir::descr::EffectInfo {
+                // RPython `effectinfo.py:271-273 MOST_GENERAL` parity:
+                // release-gil callees default to RandomEffects with
+                // `can_invalidate=true` so the heapcache `clear_caches`
+                // path fires (heapcache.py:343-353) instead of only
+                // the escape-based fallback.
+                extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
+                can_invalidate: true,
+                // RPython `effectinfo.py:255 is_call_release_gil` only
+                // checks `bool(tgt_func)`, so any non-zero address marks
+                // the call as release-gil. The pair `(asm_helper_addr,
+                // saveerr)` is consumed by RPython's JIT codegen
+                // (`pyjitpl.py:3675 direct_call_release_gil`) to wrap
+                // the C callee in an asm helper; pyre's backend has no
+                // asm-helper concept and dispatches the C function
+                // directly via `bh_call_v_dispatch`. The trace-side
+                // `call_release_gil_void_typed_with_effect` sentinel-
+                // checks `<= 1` and reuses `func_ptr` as
+                // `realfuncaddr` in that case. PRE-EXISTING-ADAPTATION:
+                // future write-analyzer wiring would substitute the
+                // real `(asm_helper_addr, saveerr)` pair without
+                // changing the trace-side reader.
+                call_release_gil_target: (1, 0),
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+            "call_release_gil_void_canonical_via_target",
+        );
     }
 
-    pub fn call_release_gil_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(jitcode::BC_CALL_RELEASE_GIL_VOID, fn_ptr_idx, arg_regs);
+    /// Emit a canonical `residual_call_*_v` whose calldescr carries
+    /// `EF_LOOPINVARIANT`.
+    pub fn call_loopinvariant_void_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+    ) {
+        self.emit_canonical_call_void_via_target(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_V,
+                jitcode::BC_RESIDUAL_CALL_IR_V,
+                jitcode::BC_RESIDUAL_CALL_IRF_V,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            majit_ir::descr::EffectInfo {
+                // RPython `effectinfo.py:169-181 effectinfo_from_writeanalyze`:
+                // EF_LOOPINVARIANT clears `_write_descrs_*`, matching
+                // pyre's `LOOPINVARIANT_EFFECT_INFO` (`call_descr.rs:174`).
+                // Empty bitsets here are intentional, not the unknown-
+                // callee fallback used by may_force / release_gil.
+                extraeffect: majit_ir::descr::ExtraEffect::LoopInvariant,
+                ..majit_ir::descr::EffectInfo::default()
+            },
+            "call_loopinvariant_void_canonical_via_target",
+        );
     }
 
-    pub fn call_loopinvariant_void_args(&mut self, fn_ptr_idx: u16, arg_regs: &[u16]) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_loopinvariant_void_typed_args(fn_ptr_idx, &args);
-    }
+    /// Generic via_target body shared by Slices 1 and 2: resolves the
+    /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materializes
+    /// `concrete_ptr` in the int constants pool, derives a void
+    /// `BhCallDescr` from arg kinds and effect policy, and records the
+    /// pyre trace/concrete pointer bridge against the emitted `d`
+    /// operand.
+    fn emit_canonical_call_void_via_target(
+        &mut self,
+        opcodes: (u8, u8, u8),
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        effect_info: majit_ir::descr::EffectInfo,
+        helper_name: &'static str,
+    ) {
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => *target,
+            other => panic!(
+                "{helper_name}: descrs[{fn_ptr_idx}] expected \
+                 RuntimeBhDescr::Call, got {other:?}"
+            ),
+        };
+        let concrete_ptr = target.concrete_ptr as i64;
 
-    pub fn call_loopinvariant_void_typed_args(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_void_like(jitcode::BC_CALL_LOOPINVARIANT_VOID, fn_ptr_idx, arg_regs);
+        let arg_classes: String = arg_regs
+            .iter()
+            .map(|a| match a.kind {
+                JitArgKind::Int => 'i',
+                JitArgKind::Ref => 'r',
+                JitArgKind::Float => 'f',
+            })
+            .collect();
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            arg_classes,
+            majit_ir::value::Type::Void,
+            effect_info,
+        );
+        let calldescr_idx =
+            self.emit_canonical_call_void(opcodes, concrete_ptr, arg_regs, calldescr);
+        self.call_descr_to_call_target.insert(calldescr_idx, target);
     }
 
     pub fn call_assembler_void_args(&mut self, target_idx: u16, arg_regs: &[u16]) {
@@ -2243,6 +2537,32 @@ impl JitCodeBuilder {
         })
     }
 
+    /// Append a `CanonicalBhDescr::Call { calldescr }` entry to the descrs
+    /// pool and return its index. Used by canonical `residual_call_*` /
+    /// `call_*` emit paths that need a `d` argcode descriptor (RPython
+    /// `assembler.py:197-207` `_encode_descr(calldescr)`).
+    ///
+    /// Slice 0 of `pyre-call-family-canonical-migration.md`: helper only.
+    /// Slice 1 emits via this from the migrated emit sites.
+    ///
+    /// PRE-EXISTING-ADAPTATION: dedup is intentionally NOT done for the
+    /// `Call` variant. RPython's `descr.py:660-668 _key_for_caching`
+    /// dedups calldescrs on `(arg_classes, RESULT_ERASED, ffi_flags,
+    /// extrainfo)` because the funcptr lives in `op.args[0]` separately
+    /// from the descr. Pyre's adapter records a sidetable
+    /// `JitCodeExecState.call_descr_to_call_target` keyed by the descr
+    /// slot, so dedup'ing two distinct callees that share a signature
+    /// would cause the second emit's `(trace_ptr, concrete_ptr)` pair to
+    /// silently overwrite the first's. The convergence path is to lift
+    /// the sidetable onto the funcptr int-const slot once trace_ptr and
+    /// concrete_ptr unify; until then each emit gets a fresh descr slot.
+    pub fn add_call_descr(
+        &mut self,
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+    ) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::Call { calldescr })
+    }
+
     fn add_bh_descr(&mut self, descr: CanonicalBhDescr) -> u16 {
         for (idx, entry) in self.descrs.iter().enumerate() {
             if let RuntimeBhDescr::Descr(existing) = entry {
@@ -2373,6 +2693,7 @@ impl JitCodeBuilder {
         jc.set_body(body);
         jc.exec = super::JitCodeExecState {
             descrs: self.descrs,
+            call_descr_to_call_target: self.call_descr_to_call_target,
         };
         // codewriter.py:68 `jitcode.index = index` — back-stamped by
         // `state::jitcode_for` at registration time. JitCode::new
@@ -2463,19 +2784,6 @@ impl JitCodeBuilder {
             self.push_u16(arg.reg);
         }
         self.record_resulttype('i');
-    }
-
-    fn call_void_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg]) {
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(fn_ptr_idx);
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
-        }
     }
 
     fn call_assembler_void_like(&mut self, opcode: u8, target_idx: u16, arg_regs: &[JitCallArg]) {
@@ -2719,6 +3027,13 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 && lhs_is_item_signed == rhs_is_item_signed
                 && lhs_interior_fields == rhs_interior_fields
         }
+        // PRE-EXISTING-ADAPTATION: `Call` variant intentionally falls
+        // through `_ => false`. See `add_call_descr`'s docstring — pyre's
+        // per-callsite `JitCodeExecState.call_descr_to_call_target`
+        // sidetable is keyed by descr slot, so dedup'ing two distinct
+        // callees that share a signature would clobber the sidetable
+        // entry. The convergence path requires lifting the sidetable
+        // onto the funcptr int-const slot first.
         _ => false,
     }
 }
@@ -2850,6 +3165,204 @@ mod tests {
     }
 
     #[test]
+    fn add_call_descr_pushes_canonical_call_entry() {
+        // Slice 0 of `pyre-call-family-canonical-migration.md` — verify
+        // that `add_call_descr` puts a `BhDescr::Call { calldescr }` at the
+        // returned pool index so canonical `residual_call_*_v` handlers
+        // (`blackhole.rs:6886-6892`) can reach it via `read_descr` →
+        // `as_calldescr()` (`majit-translate/src/jit_codewriter/jitcode.rs:1265`).
+        let mut builder = JitCodeBuilder::new();
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            "i".to_string(),
+            majit_ir::value::Type::Void,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let idx = builder.add_call_descr(calldescr);
+        assert_eq!(idx, 0);
+        let jitcode = builder.finish();
+        let entry = &jitcode.exec.descrs[idx as usize];
+        let bh_descr = entry.as_bh_descr().expect("call descr must be BhDescr");
+        let cd = bh_descr.as_calldescr();
+        assert_eq!(cd.arg_classes, "i");
+        assert_eq!(cd.result_type, 'v');
+    }
+
+    #[test]
+    fn residual_call_void_canonical_emits_irf_for_mixed_kinds() {
+        // Slice 0e — `residual_call_void_canonical_typed_args` writes the
+        // canonical byte layout that `blackhole.rs:6534 handler_residual_call_irf_v`
+        // reads: 1B funcptr_reg + (countI:1 + regI×N) + (countR:1 + regR×M)
+        // + (countF:1 + regF×K) + descr:2.
+        let mut builder = JitCodeBuilder::new();
+        // Reserve some live registers per kind so num_regs_X > 0 at finish().
+        builder.touch_call_arg(JitCallArg::int(2));
+        builder.touch_call_arg(JitCallArg::reference(3));
+        builder.touch_call_arg(JitCallArg::float(1));
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            "irf".to_string(),
+            majit_ir::value::Type::Void,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let funcptr = 0xDEAD_BEEFi64;
+        let args = [
+            JitCallArg::int(2),
+            JitCallArg::reference(3),
+            JitCallArg::float(1),
+        ];
+        let start = builder.current_pos();
+        builder.residual_call_void_canonical_typed_args(funcptr, &args, calldescr);
+        let jitcode = builder.finish();
+        // Opcode byte (start_instr) + funcptr_reg(1) + countI(1)+regI(1)
+        // + countR(1)+regR(1) + countF(1)+regF(1) + descr(2) = 10 bytes.
+        let bytes = &jitcode.code[start..start + 10];
+        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IRF_V);
+        // funcptr_reg patched to num_regs_i + funcptr_const_idx (=0).
+        assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
+        assert_eq!(bytes[2], 1); // countI
+        assert_eq!(bytes[3], 2); // regI
+        assert_eq!(bytes[4], 1); // countR
+        assert_eq!(bytes[5], 3); // regR
+        assert_eq!(bytes[6], 1); // countF
+        assert_eq!(bytes[7], 1); // regF
+        // descr u16 LE
+        let descr_idx = (bytes[8] as u16) | ((bytes[9] as u16) << 8);
+        let entry = &jitcode.exec.descrs[descr_idx as usize];
+        let cd = entry.as_bh_descr().unwrap().as_calldescr();
+        assert_eq!(cd.arg_classes, "irf");
+    }
+
+    #[test]
+    fn residual_call_void_canonical_uses_r_variant_for_ref_only() {
+        // No int / float args → BC_RESIDUAL_CALL_R_V; layout is
+        // funcptr_reg(1) + countR(1) + regR×M + descr(2).
+        let mut builder = JitCodeBuilder::new();
+        builder.touch_call_arg(JitCallArg::reference(5));
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            "r".to_string(),
+            majit_ir::value::Type::Void,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let start = builder.current_pos();
+        builder.residual_call_void_canonical_typed_args(
+            0x1234_5678,
+            &[JitCallArg::reference(5)],
+            calldescr,
+        );
+        let jitcode = builder.finish();
+        let bytes = &jitcode.code[start..start + 6];
+        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_R_V);
+        // funcptr_reg post-regs slot.
+        assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
+        assert_eq!(bytes[2], 1); // countR
+        assert_eq!(bytes[3], 5); // regR
+        // No int / float lists — descr immediately follows.
+        let descr_idx = (bytes[4] as u16) | ((bytes[5] as u16) << 8);
+        let entry = &jitcode.exec.descrs[descr_idx as usize];
+        assert_eq!(entry.as_bh_descr().unwrap().as_calldescr().arg_classes, "r");
+    }
+
+    #[test]
+    fn residual_call_void_canonical_uses_ir_variant_when_no_floats() {
+        let mut builder = JitCodeBuilder::new();
+        builder.touch_call_arg(JitCallArg::int(2));
+        builder.touch_call_arg(JitCallArg::reference(3));
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            "ir".to_string(),
+            majit_ir::value::Type::Void,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let start = builder.current_pos();
+        builder.residual_call_void_canonical_typed_args(
+            0xCAFEi64,
+            &[JitCallArg::int(2), JitCallArg::reference(3)],
+            calldescr,
+        );
+        let jitcode = builder.finish();
+        let bytes = &jitcode.code[start..start + 8];
+        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IR_V);
+        assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
+        assert_eq!(bytes[2], 1); // countI
+        assert_eq!(bytes[3], 2); // regI
+        assert_eq!(bytes[4], 1); // countR
+        assert_eq!(bytes[5], 3); // regR
+        // No float list. descr 2 bytes.
+        let descr_idx = (bytes[6] as u16) | ((bytes[7] as u16) << 8);
+        let entry = &jitcode.exec.descrs[descr_idx as usize];
+        assert_eq!(
+            entry.as_bh_descr().unwrap().as_calldescr().arg_classes,
+            "ir"
+        );
+    }
+
+    #[test]
+    fn residual_call_void_via_target_keeps_source_arg_classes() {
+        let mut builder = JitCodeBuilder::new();
+        let trace_ptr = 0x1111usize as *const ();
+        let concrete_ptr = 0x2222usize as *const ();
+        let fn_idx = builder.add_call_target(trace_ptr, concrete_ptr);
+        let start = builder.current_pos();
+        builder.residual_call_void_canonical_via_target(
+            fn_idx,
+            &[JitCallArg::reference(1), JitCallArg::int(2)],
+        );
+
+        let jitcode = builder.finish();
+        let bytes = &jitcode.code[start..start + 8];
+        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IR_V);
+        assert_eq!(bytes[2], 1); // countI
+        assert_eq!(bytes[3], 2); // regI: grouped before refs
+        assert_eq!(bytes[4], 1); // countR
+        assert_eq!(bytes[5], 1); // regR
+        let descr_idx = (bytes[6] as u16) | ((bytes[7] as u16) << 8);
+        let entry = &jitcode.exec.descrs[descr_idx as usize];
+        assert_eq!(
+            entry.as_bh_descr().unwrap().as_calldescr().arg_classes,
+            "ri"
+        );
+        assert_eq!(
+            jitcode.exec.call_descr_to_call_target.get(&descr_idx),
+            Some(&JitCallTarget::new(trace_ptr, concrete_ptr))
+        );
+    }
+
+    #[test]
+    fn residual_call_target_bridge_is_keyed_per_calldescr() {
+        let mut builder = JitCodeBuilder::new();
+        let concrete_ptr = 0x3333usize as *const ();
+        let first_idx = builder.add_call_target(0x4444usize as *const (), concrete_ptr);
+        let second_idx = builder.add_call_target(0x5555usize as *const (), concrete_ptr);
+        let first_start = builder.current_pos();
+        builder.residual_call_void_canonical_via_target(first_idx, &[]);
+        let second_start = builder.current_pos();
+        builder.residual_call_void_canonical_via_target(second_idx, &[]);
+
+        let jitcode = builder.finish();
+        let first_descr =
+            (jitcode.code[first_start + 3] as u16) | ((jitcode.code[first_start + 4] as u16) << 8);
+        let second_descr = (jitcode.code[second_start + 3] as u16)
+            | ((jitcode.code[second_start + 4] as u16) << 8);
+        assert_ne!(first_descr, second_descr);
+        assert_eq!(
+            jitcode
+                .exec
+                .call_descr_to_call_target
+                .get(&first_descr)
+                .unwrap()
+                .trace_ptr,
+            0x4444usize as *const ()
+        );
+        assert_eq!(
+            jitcode
+                .exec
+                .call_descr_to_call_target
+                .get(&second_descr)
+                .unwrap()
+                .trace_ptr,
+            0x5555usize as *const ()
+        );
+    }
+
+    #[test]
     fn typed_call_adapters_record_resulttypes_at_end_pc() {
         assert_resulttype_after(
             |b| b.conditional_call_value_ir_i_typed_args(0, 1, &[], 2),
@@ -2864,7 +3377,10 @@ mod tests {
 
     #[test]
     fn typed_void_call_adapters_do_not_record_resulttypes() {
-        assert_no_resulttype_after(|b| b.residual_call_void_typed_args(0, &[]));
+        assert_no_resulttype_after(|b| {
+            let idx = b.add_fn_ptr(std::ptr::null());
+            b.residual_call_void_canonical_via_target(idx, &[]);
+        });
         assert_no_resulttype_after(|b| b.call_assembler_void_typed_args(0, &[]));
     }
 
