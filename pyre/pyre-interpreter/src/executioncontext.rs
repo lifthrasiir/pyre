@@ -58,6 +58,17 @@ fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_l
     if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr(w_frame, "f_lineno") {
         if !new_f_lineno_obj.is_null() && unsafe { pyre_object::is_int(new_f_lineno_obj) } {
             let new_lineno = unsafe { pyre_object::w_int_get_value(new_f_lineno_obj) };
+            // PRE-EXISTING-ADAPTATION (Task #224): pyframe.py:683-764
+            // `PyFrame.fset_f_lineno` is the upstream setter. It runs
+            // line-jump validation against the bytecode (block stack
+            // unwinding through SETUP_LOOP/SETUP_EXCEPT, code address
+            // recomputation via PyCode._signature_addr_to_line, and
+            // last_instr realignment). Pyre's wrapper writes only
+            // debug.f_lineno because PyFrame is not yet a PyObject
+            // and the validator's PyCode internals (try/except
+            // boundaries, generator restart guards) are not exposed
+            // through the wrapper interface. The full setter port
+            // is gated on the PyFrame ↔ PyObject identity epic.
             unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
                 d.f_lineno = new_lineno as isize;
