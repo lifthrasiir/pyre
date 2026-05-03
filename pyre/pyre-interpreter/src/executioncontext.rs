@@ -18,6 +18,54 @@ fn trace_frame_type() -> PyObjectRef {
     raw as PyObjectRef
 }
 
+/// Copy callback-visible mutations on the trace-frame wrapper back to
+/// the live `PyFrame`'s debug data.
+///
+/// PyPy's `_trace` passes the live frame to the callback (`jit.hint(
+/// frame, access_directly=False)`), so `frame.f_trace = local` and
+/// `frame.f_lineno = N` from inside the callback land directly on
+/// `frame.debug`.  Pyre wraps the frame in a `pyre_object` instance
+/// because `PyFrame` is not itself a `PyObject`, so a setattr on the
+/// wrapper would otherwise stay isolated.  After the callback returns,
+/// read the wrapper's mutated attributes and propagate the changes to
+/// the live frame, preserving the user-visible semantics for the
+/// common case (debugger setting `frame.f_trace` to a per-frame
+/// callback while returning `None`).
+///
+/// The `_trace` w_result branch still wins (`executioncontext.py:386-
+/// 391`): a non-None callback return value overrides whichever value
+/// the setattr left behind, matching CPython issue11992 bug-for-bug
+/// compatibility.
+fn flush_trace_frame_writeback(frame: *mut PyFrame, w_frame: PyObjectRef, init_lineno: isize) {
+    if frame.is_null() || w_frame.is_null() {
+        return;
+    }
+    let new_f_trace = match crate::baseobjspace::getattr(w_frame, "f_trace") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    unsafe {
+        let d = (*frame).getorcreatedebug(init_lineno);
+        let normalized = if new_f_trace.is_null() || new_f_trace == pyre_object::w_none() {
+            pyre_object::PY_NULL
+        } else {
+            new_f_trace
+        };
+        if normalized != d.w_f_trace {
+            d.w_f_trace = normalized;
+        }
+    }
+    if let Ok(new_f_lineno_obj) = crate::baseobjspace::getattr(w_frame, "f_lineno") {
+        if !new_f_lineno_obj.is_null() && unsafe { pyre_object::is_int(new_f_lineno_obj) } {
+            let new_lineno = unsafe { pyre_object::w_int_get_value(new_f_lineno_obj) };
+            unsafe {
+                let d = (*frame).getorcreatedebug(init_lineno);
+                d.f_lineno = new_lineno as isize;
+            }
+        }
+    }
+}
+
 fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
     if frame.is_null() {
         return pyre_object::w_none();
@@ -1010,10 +1058,18 @@ impl ExecutionContext {
                 // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
                 let frame_obj = wrap_trace_frame(frame);
                 let w_event = pyre_object::w_str_new(event);
-                let w_result = crate::call::call_function_impl_result(
+                let call_result = crate::call::call_function_impl_result(
                     w_callback,
                     &[frame_obj, w_event, w_arg],
-                )?;
+                );
+                // Mirror in-callback `frame.f_trace = local` /
+                // `frame.f_lineno = N` mutations back onto the live
+                // PyFrame before processing w_result. PyPy passes the
+                // raw frame to the callback, so its setattrs land
+                // directly; pyre runs the callback against a wrapper
+                // and must propagate explicitly.
+                flush_trace_frame_writeback(frame, frame_obj, init_lineno);
+                let w_result = call_result?;
                 if w_result != pyre_object::w_none() {
                     unsafe {
                         (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
