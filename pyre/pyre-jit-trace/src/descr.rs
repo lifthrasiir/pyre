@@ -618,6 +618,11 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 /// `w_function` (for guarding which method) and `w_self` (for recovering
 /// the receiver `OpRef` discarded by `LOAD_METHOD`). `w_class` is included
 /// for layout completeness so the descrs match the struct order.
+///
+/// `w_function` and `w_self` are marked immutable per
+/// `pypy/interpreter/function.py:567`
+/// `_Method._immutable_fields_ = ['w_function', 'w_instance']`. `w_class`
+/// is not listed there and stays mutable.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::methodobject::{
         METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET,
@@ -634,7 +639,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 8,
                 Type::Ref,
                 false,
-                false,
+                true,
                 false,
             ),
             (
@@ -643,7 +648,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 8,
                 Type::Ref,
                 false,
-                false,
+                true,
                 false,
             ),
             (
