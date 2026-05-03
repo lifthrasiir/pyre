@@ -2518,10 +2518,12 @@ mod tests {
     #[test]
     fn assemble_residual_call_ir_v_supports_release_gil_void_flavor() {
         let mut ssarepr = SSARepr::new("residual_call_ir_v");
+        let mut builder = JitCodeBuilder::default();
+        let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
         ssarepr.insns.push(Insn::op(
             "residual_call_ir_v",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(fn_idx as i64),
                 Operand::ListOfKind(ListOfKind::new(
                     Kind::Int,
                     vec![Operand::Register(Register::new(Kind::Int, 0))],
@@ -2541,7 +2543,7 @@ mod tests {
 
         let jitcode = assemble(
             &mut ssarepr,
-            JitCodeBuilder::default(),
+            builder,
             Some(NumRegs {
                 int: 1,
                 ref_: 1,

@@ -1496,7 +1496,7 @@ fn test_call_release_gil_i_compiles_and_executes() {
     // extern "C" fn, returning the correct result through the release-gil path.
     // RPython: CallReleaseGilI must be followed by GuardNotForced.
     //
-    // Trace: input(a, b) -> result = call_release_gil_i(ffi_add, a, b)
+    // Trace: input(a, b) -> result = call_release_gil_i(saveerr, ffi_add, a, b)
     //        -> guard_not_forced(fail_args=[a, b, result]) -> finish(result)
     let cd = call_descr_release_gil_i(60, vec![Type::Int, Type::Int]);
 
@@ -1504,9 +1504,10 @@ fn test_call_release_gil_i_compiles_and_executes() {
     let a = rec.record_input_arg(Type::Int);
     let b = rec.record_input_arg(Type::Int);
 
-    let fn_ptr = OpRef::from_const(0);
+    let saveerr = OpRef::from_const(0);
+    let fn_ptr = OpRef::from_const(1);
 
-    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, a, b], cd);
+    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, a, b], cd);
     rec.record_guard_with_fail_args(
         OpCode::GuardNotForced,
         &[],
@@ -1518,8 +1519,9 @@ fn test_call_release_gil_i_compiles_and_executes() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
+    constants.insert(OpRef::from_const(0).raw(), 0i64);
     constants.insert(
-        OpRef::from_const(0).raw(),
+        OpRef::from_const(1).raw(),
         ffi_add as *const () as usize as i64,
     );
     backend.set_constants(constants);
@@ -1554,9 +1556,10 @@ fn test_call_release_gil_i_no_args() {
 
     let mut rec = Trace::new();
     let dummy = rec.record_input_arg(Type::Int); // need at least one input
-    let fn_ptr = OpRef::from_const(0);
+    let saveerr = OpRef::from_const(0);
+    let fn_ptr = OpRef::from_const(1);
 
-    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr], cd);
+    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr], cd);
     rec.record_guard_with_fail_args(
         OpCode::GuardNotForced,
         &[],
@@ -1568,8 +1571,9 @@ fn test_call_release_gil_i_no_args() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
+    constants.insert(OpRef::from_const(0).raw(), 0i64);
     constants.insert(
-        OpRef::from_const(0).raw(),
+        OpRef::from_const(1).raw(),
         ffi_constant as *const () as usize as i64,
     );
     backend.set_constants(constants);
@@ -1602,17 +1606,19 @@ fn test_call_release_gil_n_void_return() {
 
     let mut rec = Trace::new();
     let input = rec.record_input_arg(Type::Int);
-    let fn_ptr = OpRef::from_const(0);
+    let saveerr = OpRef::from_const(0);
+    let fn_ptr = OpRef::from_const(1);
 
-    rec.record_op_with_descr(OpCode::CallReleaseGilN, &[fn_ptr, input], cd);
+    rec.record_op_with_descr(OpCode::CallReleaseGilN, &[saveerr, fn_ptr, input], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(0)), &[input]);
     rec.finish(&[input], make_descr(1));
     let trace = rec.get_trace();
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
+    constants.insert(OpRef::from_const(0).raw(), 0i64);
     constants.insert(
-        OpRef::from_const(0).raw(),
+        OpRef::from_const(1).raw(),
         ffi_sink as *const () as usize as i64,
     );
     backend.set_constants(constants);
@@ -1635,17 +1641,19 @@ fn test_call_release_gil_n_void_return() {
 fn test_call_release_gil_result_flows_through_trace() {
     // Verify that the result of CallReleaseGilI can be used by subsequent ops.
     // RPython: CallReleaseGilI must be followed by GuardNotForced.
-    // Trace: input(x) -> tmp = call_release_gil_i(ffi_add, x, 10)
+    // Trace: input(x) -> tmp = call_release_gil_i(saveerr, ffi_add, x, 10)
     //        -> guard_not_forced -> result = int_add(tmp, 5) -> finish(result)
     let cd = call_descr_release_gil_i(63, vec![Type::Int, Type::Int]);
 
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
-    let fn_ptr = OpRef::from_const(0);
-    let const_10 = OpRef::from_const(1);
-    let const_5 = OpRef::from_const(2);
+    let saveerr = OpRef::from_const(0);
+    let fn_ptr = OpRef::from_const(1);
+    let const_10 = OpRef::from_const(2);
+    let const_5 = OpRef::from_const(3);
 
-    let tmp = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, x, const_10], cd);
+    let tmp =
+        rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, x, const_10], cd);
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(0)), &[x, tmp]);
     let result = rec.record_op(OpCode::IntAdd, &[tmp, const_5]);
     rec.finish(&[result], make_descr(1));
@@ -1653,12 +1661,13 @@ fn test_call_release_gil_result_flows_through_trace() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
+    constants.insert(OpRef::from_const(0).raw(), 0i64);
     constants.insert(
-        OpRef::from_const(0).raw(),
+        OpRef::from_const(1).raw(),
         ffi_add as *const () as usize as i64,
     );
-    constants.insert(OpRef::from_const(1).raw(), 10i64);
-    constants.insert(OpRef::from_const(2).raw(), 5i64);
+    constants.insert(OpRef::from_const(2).raw(), 10i64);
+    constants.insert(OpRef::from_const(3).raw(), 5i64);
     backend.set_constants(constants);
 
     let mut token = JitCellToken::new(603);
@@ -2126,7 +2135,7 @@ fn test_ffi_call_exception_propagation() {
     // Parity with test_fficall exception semantics.
     // RPython: CallReleaseGilI -> GuardNotForced -> GuardNoException
     //
-    // Trace: input(val) -> result = call_release_gil_i(ffi_raise_exception, val)
+    // Trace: input(val) -> result = call_release_gil_i(saveerr, ffi_raise_exception, val)
     //        -> guard_not_forced(fail_args=[val, result])
     //        -> guard_no_exception(fail_args=[result]) -> finish(result)
     //
@@ -2137,8 +2146,9 @@ fn test_ffi_call_exception_propagation() {
     let mut rec = Trace::new();
     let val = rec.record_input_arg(Type::Int);
 
-    let fn_ptr = OpRef::from_const(0);
-    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, val], cd);
+    let saveerr = OpRef::from_const(0);
+    let fn_ptr = OpRef::from_const(1);
+    let result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, val], cd);
 
     // GuardNotForced: required immediately after CallReleaseGil
     rec.record_guard_with_fail_args(
@@ -2160,8 +2170,9 @@ fn test_ffi_call_exception_propagation() {
 
     let mut backend = CraneliftBackend::new();
     let mut constants = HashMap::new();
+    constants.insert(OpRef::from_const(0).raw(), 0i64);
     constants.insert(
-        OpRef::from_const(0).raw(),
+        OpRef::from_const(1).raw(),
         ffi_raise_exception as *const () as usize as i64,
     );
     backend.set_constants(constants);
@@ -2669,7 +2680,8 @@ fn test_ffi_exchange_buffer_pattern() {
     // Constants: offset_16 = 16 (exchange_args[0]), offset_32 = 32 (exchange_result)
     let off_arg = OpRef::from_const(0); // offset 16
     let off_result = OpRef::from_const(1); // offset 32
-    let fn_ptr = OpRef::from_const(2); // ffi_exchange_buffer_fn
+    let saveerr = OpRef::from_const(2); // CALL_RELEASE_GIL saveerr flag
+    let fn_ptr = OpRef::from_const(3); // ffi_exchange_buffer_fn
 
     let mut rec = Trace::new();
     // Inputs: r0 = exchange buffer pointer, i0 = argument value
@@ -2680,7 +2692,8 @@ fn test_ffi_exchange_buffer_pattern() {
     rec.record_op_with_descr(OpCode::RawStore, &[r0, off_arg, i0], ad.clone());
 
     // Step 2: Call the FFI function with buffer pointer
-    let _call_result = rec.record_op_with_descr(OpCode::CallReleaseGilI, &[fn_ptr, r0], cd);
+    let _call_result =
+        rec.record_op_with_descr(OpCode::CallReleaseGilI, &[saveerr, fn_ptr, r0], cd);
     // RPython: CallReleaseGilI must be followed by GuardNotForced
     rec.record_guard_with_fail_args(OpCode::GuardNotForced, &[], Some(make_descr(1)), &[r0, i0]);
 
@@ -2694,8 +2707,9 @@ fn test_ffi_exchange_buffer_pattern() {
     let mut constants = HashMap::new();
     constants.insert(OpRef::from_const(0).raw(), 16i64);
     constants.insert(OpRef::from_const(1).raw(), 32i64);
+    constants.insert(OpRef::from_const(2).raw(), 0i64);
     constants.insert(
-        OpRef::from_const(2).raw(),
+        OpRef::from_const(3).raw(),
         ffi_exchange_buffer_fn as *const () as usize as i64,
     );
     backend.set_constants(constants);
