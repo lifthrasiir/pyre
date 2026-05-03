@@ -273,7 +273,7 @@ fn named_member(member: &syn::Member) -> Option<String> {
 
 // ── Lowerer ──────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum BindingKind {
     Int,
     Ref,
@@ -285,6 +285,81 @@ struct Binding {
     reg: u16,
     kind: BindingKind,
     depends_on_stack: bool,
+}
+
+/// Mirror of RPython `rpython/jit/codewriter/flatten.py:Register(kind, index)`.
+/// Each emitted register carries its bank with it; the liveness walker
+/// (`liveness.py:33-79`) keeps a single `set()` of `Register` objects per
+/// marker, and `assembler.py:225-232 get_liveness_info(args, kind)` filters
+/// by `reg.kind == kind` at encode time to split into the per-bank bitsets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Register {
+    /// Total order is `(kind, index)` so `BTreeSet<Register>` iterates in
+    /// kind-grouped order — convenient for encoders that emit per-bank
+    /// bitsets.
+    kind: BindingKind,
+    index: u8,
+}
+
+impl Register {
+    /// Construct a `Register` from a `(kind, u16-index)` pair, asserting that
+    /// the index fits in the `assembler.py:225` bitset addressing range
+    /// (0..=255). The lowerer's `Lowerer::next_reg` counter already obeys
+    /// this bound; the assert traps regressions where a u16 reg leaked from
+    /// outside that bound.
+    #[allow(dead_code)]
+    fn new(kind: BindingKind, index: u16) -> Self {
+        assert!(
+            index <= u8::MAX as u16,
+            "Register index {} exceeds u8 (assembler.py:225 bitset range)",
+            index,
+        );
+        Self {
+            kind,
+            index: index as u8,
+        }
+    }
+
+    /// Per-bank constructor shortcut — `Register::int(0)` mirrors the
+    /// RPython sugar of `Register('int', 0)`.
+    #[allow(dead_code)]
+    fn int(index: u16) -> Self {
+        Self::new(BindingKind::Int, index)
+    }
+
+    #[allow(dead_code)]
+    fn ref_(index: u16) -> Self {
+        Self::new(BindingKind::Ref, index)
+    }
+
+    #[allow(dead_code)]
+    fn float(index: u16) -> Self {
+        Self::new(BindingKind::Float, index)
+    }
+
+    /// Convenience: build a typed `Register` from a `Binding`.
+    #[allow(dead_code)]
+    fn from_binding(b: &Binding) -> Self {
+        Self::new(b.kind, b.reg)
+    }
+
+    /// Build a `Vec<Register>` of `Int` from a slice of indices. Used by
+    /// emit sites whose reads list is uniformly Int (binop, guard_value,
+    /// etc.).
+    #[allow(dead_code)]
+    fn ints(indices: &[u16]) -> Vec<Register> {
+        indices.iter().copied().map(Self::int).collect()
+    }
+
+    #[allow(dead_code)]
+    fn refs(indices: &[u16]) -> Vec<Register> {
+        indices.iter().copied().map(Self::ref_).collect()
+    }
+
+    #[allow(dead_code)]
+    fn floats(indices: &[u16]) -> Vec<Register> {
+        indices.iter().copied().map(Self::float).collect()
+    }
 }
 
 // ── Op metadata for backward liveness analysis (Phase 4 Epic B) ─────
@@ -367,23 +442,43 @@ enum ControlFlowClass {
 #[derive(Clone, Debug)]
 struct OpMeta {
     kind: OpKind,
-    /// Source registers (uses).
-    reads: Vec<u16>,
+    /// Source registers (uses). Each `Register` carries `kind` directly per
+    /// `flatten.py:Register(kind, index)` so the liveness walker stays a
+    /// single-bag set and the encoder (`assembler.py:225-232`) splits into
+    /// per-bank bitsets on demand.
+    reads: Vec<Register>,
     /// Destination registers (defs).
-    writes: Vec<u16>,
+    writes: Vec<Register>,
     /// Branch target label, for control-flow ops.
     target_label: Option<Ident>,
+    /// `-live-` marker TLabel operands. RPython stores every TLabel in
+    /// the instruction tuple; a marker can carry more than one.
+    live_target_labels: Vec<Ident>,
     control: ControlFlowClass,
 }
 
 #[allow(dead_code)]
 impl OpMeta {
     fn live_marker() -> Self {
+        Self::live_marker_with(Vec::new(), Vec::new())
+    }
+
+    /// `-live-` marker carrying explicit force-alive register args and/or
+    /// target labels whose accumulated alive sets should fold in. Mirrors
+    /// RPython `rpython/jit/codewriter/liveness.py:44-53`'s handling of
+    /// `-live-` insns whose tuple tail includes Register / TLabel
+    /// entries. The lowerer currently never emits such enriched markers
+    /// itself, but parity-aware consumers (snapshot helpers that synth
+    /// extra live regs around an inline call) can produce them through
+    /// this constructor.
+    #[allow(dead_code)]
+    fn live_marker_with(reads: Vec<Register>, live_target_labels: Vec<Ident>) -> Self {
         Self {
             kind: OpKind::LiveMarker,
-            reads: Vec::new(),
+            reads,
             writes: Vec::new(),
             target_label: None,
+            live_target_labels,
             control: ControlFlowClass::LiveMarker,
         }
     }
@@ -391,12 +486,13 @@ impl OpMeta {
     /// Linear op with explicit reads/writes. The most common shape —
     /// load_const, move, binop, unary, call, vable, state-field,
     /// guard_value, record_known_result, inline_call.
-    fn linear(kind: OpKind, reads: Vec<u16>, writes: Vec<u16>) -> Self {
+    fn linear(kind: OpKind, reads: Vec<Register>, writes: Vec<Register>) -> Self {
         Self {
             kind,
             reads,
             writes,
             target_label: None,
+            live_target_labels: Vec::new(),
             control: ControlFlowClass::Linear,
         }
     }
@@ -408,18 +504,20 @@ impl OpMeta {
             reads: Vec::new(),
             writes: Vec::new(),
             target_label: Some(target),
+            live_target_labels: Vec::new(),
             control: ControlFlowClass::UnconditionalJump,
         }
     }
 
     /// Conditional guard branching to `target` on miss. `cond_reg` is
     /// the read register feeding the guard.
-    fn conditional_guard(cond_reg: u16, target: Ident) -> Self {
+    fn conditional_guard(cond_reg: Register, target: Ident) -> Self {
         Self {
             kind: OpKind::GotoIfNot,
             reads: vec![cond_reg],
             writes: Vec::new(),
             target_label: Some(target),
+            live_target_labels: Vec::new(),
             control: ControlFlowClass::ConditionalGuard,
         }
     }
@@ -432,6 +530,7 @@ impl OpMeta {
             reads: Vec::new(),
             writes: Vec::new(),
             target_label: Some(target),
+            live_target_labels: Vec::new(),
             control: ControlFlowClass::LabelDef,
         }
     }
@@ -444,16 +543,40 @@ impl OpMeta {
             reads: Vec::new(),
             writes: Vec::new(),
             target_label: None,
+            live_target_labels: Vec::new(),
             control: ControlFlowClass::Linear,
+        }
+    }
+}
+
+#[derive(Default)]
+struct LoweredSequence {
+    statements: Vec<TokenStream>,
+    op_metadata: Vec<OpMeta>,
+}
+
+impl LoweredSequence {
+    fn new(statements: Vec<TokenStream>, op_metadata: Vec<OpMeta>) -> Self {
+        debug_assert_eq!(
+            statements.len(),
+            op_metadata.len(),
+            "RPython ssarepr.insns parity requires statement/op_metadata streams to stay paired"
+        );
+        Self {
+            statements,
+            op_metadata,
         }
     }
 }
 
 /// Per-marker live set produced by `compute_per_marker_liveness`.
 /// Index aligns with the order in which `LiveMarker` ops appear in
-/// `op_metadata`.
+/// `op_metadata`. Each entry is a single `BTreeSet<Register>` matching
+/// RPython `liveness.py`'s `set()` of `Register` objects — bank info
+/// rides on `Register.kind` and the encoder splits at emit time per
+/// `assembler.py:225-232 get_liveness_info(args, kind)`.
 #[allow(dead_code)]
-type LiveMarkerLiveSets = Vec<BTreeSet<u16>>;
+type LiveMarkerLiveSets = Vec<BTreeSet<Register>>;
 
 /// Compute the live register set captured at every `LiveMarker` op in
 /// `op_metadata`, mirroring RPython
@@ -466,9 +589,9 @@ type LiveMarkerLiveSets = Vec<BTreeSet<u16>>;
 /// next iteration. Iterations continue until no label or marker entry
 /// changes (fixed-point), matching RPython's `must_continue` loop.
 ///
-/// Returned `Vec<BTreeSet<u16>>` is indexed in `LiveMarker` encounter
-/// order, so callers can pair entries with their `live_placeholder()`
-/// emit sites.
+/// Returned `Vec<BTreeSet<Register>>` is indexed in `LiveMarker`
+/// encounter order, so callers can pair entries with their
+/// `live_placeholder()` emit sites.
 #[allow(dead_code)]
 fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerLiveSets {
     let marker_indices: Vec<usize> = op_metadata
@@ -478,19 +601,30 @@ fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerLiveSets {
         .map(|(i, _)| i)
         .collect();
 
-    let mut label_alive: HashMap<String, BTreeSet<u16>> = HashMap::new();
-    let mut live_at_marker: HashMap<usize, BTreeSet<u16>> = HashMap::new();
+    let mut label_alive: HashMap<String, BTreeSet<Register>> = HashMap::new();
+    let mut live_at_marker: HashMap<usize, BTreeSet<Register>> = HashMap::new();
 
     loop {
         let mut changed = false;
-        let mut alive: BTreeSet<u16> = BTreeSet::new();
+        let mut alive: BTreeSet<Register> = BTreeSet::new();
 
         for i in (0..op_metadata.len()).rev() {
             let op = &op_metadata[i];
             match op.control {
                 ControlFlowClass::LiveMarker => {
-                    // RPython liveness.py:48-53 — record `alive` at this
-                    // marker. Marker carries no def/use.
+                    // RPython liveness.py:44-53 — `-live-` first folds in
+                    // any explicit force-alive register args and any
+                    // TLabel target's accumulated alive set, then records
+                    // the resulting alive at this marker. The mutation
+                    // also propagates upstream so the registers / labels
+                    // the marker keeps alive stay alive in earlier ops.
+                    for target in &op.live_target_labels {
+                        let name = target.to_string();
+                        if let Some(s) = label_alive.get(&name) {
+                            alive.extend(s.iter().copied());
+                        }
+                    }
+                    alive.extend(op.reads.iter().copied());
                     let prev = live_at_marker.get(&i);
                     if prev.is_none() || prev.unwrap() != &alive {
                         live_at_marker.insert(i, alive.clone());
@@ -565,6 +699,258 @@ fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerLiveSets {
         .collect()
 }
 
+/// Encode-time bank split, mirroring RPython
+/// `rpython/jit/codewriter/assembler.py:225-232 get_liveness_info(args,
+/// kind)`. Walks a marker's accumulated alive set and projects out the
+/// indices belonging to a single bank, producing the per-bank u8 vector
+/// the BC_LIVE encoder consumes (`assembler.py:147-157` writes the
+/// `(live_i, live_r, live_f)` triple as three sorted bitsets).
+///
+/// The walker (`compute_per_marker_liveness`) keeps a single
+/// `BTreeSet<Register>` per marker so that the analysis stays
+/// structurally identical to RPython's `set()` of `Register` objects;
+/// the bank split is deferred to this helper at emit time.
+///
+/// `BTreeSet<Register>` already iterates in `(kind, index)` order due
+/// to `Register`'s derived `Ord`, so the resulting `Vec<u8>` is sorted
+/// — matching `assembler.py:148 live = sorted(live)`.
+#[allow(dead_code)]
+fn get_liveness_info(set: &BTreeSet<Register>, kind: BindingKind) -> Vec<u8> {
+    set.iter()
+        .filter(|r| r.kind == kind)
+        .map(|r| r.index)
+        .collect()
+}
+
+/// Convenience: return the `(live_i, live_r, live_f)` triple sourced
+/// from `set`. Used by `maybe_dump_liveness` and by the BC_LIVE
+/// per-marker patcher (`live_placeholder_with_triple` consumers added
+/// in Phase 4 Epic B.3-B.4).
+#[allow(dead_code)]
+fn liveness_triple(set: &BTreeSet<Register>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    (
+        get_liveness_info(set, BindingKind::Int),
+        get_liveness_info(set, BindingKind::Ref),
+        get_liveness_info(set, BindingKind::Float),
+    )
+}
+
+/// Same as [`liveness_triple`] but consuming a typed register slice
+/// (post-`annotate_live_markers_with_liveness` `LiveMarker.reads`).
+/// Mirrors RPython `assembler.py:225-232 get_liveness_info(args, kind)`
+/// applied to the marker's args directly, which by then are the full
+/// alive set per `liveness.py:52`.
+#[allow(dead_code)]
+fn liveness_triple_from_reads(reads: &[Register]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut live_i = Vec::new();
+    let mut live_r = Vec::new();
+    let mut live_f = Vec::new();
+    for reg in reads {
+        match reg.kind {
+            BindingKind::Int => live_i.push(reg.index),
+            BindingKind::Ref => live_r.push(reg.index),
+            BindingKind::Float => live_f.push(reg.index),
+        }
+    }
+    (live_i, live_r, live_f)
+}
+
+/// RPython `compute_liveness(ssarepr)` mutates each `-live-` instruction
+/// (`liveness.py:52 ssarepr.insns[i] = insn[:1] + tuple(alive) + tuple(labels)`)
+/// before `remove_repeated_live(ssarepr)` runs. Mirror that order by
+/// materialising the fixed-point alive set back onto each `LiveMarker`'s
+/// `reads` operand; the repeated-live pass and the emit-time triple
+/// rewrite both consume the ssarepr-mutated shape directly.
+fn annotate_live_markers_with_liveness(op_metadata: &mut [OpMeta]) {
+    let live_sets = compute_per_marker_liveness(op_metadata);
+    let mut next_marker = 0usize;
+    for meta in op_metadata.iter_mut() {
+        if !matches!(meta.control, ControlFlowClass::LiveMarker) {
+            continue;
+        }
+        meta.reads = live_sets[next_marker].iter().copied().collect();
+        next_marker += 1;
+    }
+    debug_assert_eq!(
+        next_marker,
+        live_sets.len(),
+        "compute_per_marker_liveness output count must match LiveMarker op_metadata entries"
+    );
+}
+
+/// Generate the per-marker liveness prebuild tokens that
+/// `__prebuild_jitcode_liveness_*` (codegen_trace.rs) replays into the
+/// driver-shared `Assembler` at install time. Each `LiveMarker` op
+/// emits an `__asm._register_liveness_offset(&[live_i], &[live_r],
+/// &[live_f])` call so RPython `pyjitpl.py:2255 finish_setup` order is
+/// preserved: every per-marker triple lands in `asm.all_liveness`
+/// before `metainterp_sd.liveness_info` snapshots it. Trace-time
+/// `JitCodeBuilder::finalize_liveness` then only dedups against the
+/// pre-registered offsets, never grows the table past the snapshot.
+///
+/// `inline_prebuild` carries any nested-helper prebuild tokens that
+/// were aggregated during lowering.
+fn liveness_prebuild_tokens(
+    op_metadata: &[OpMeta],
+    inline_prebuild: &[TokenStream],
+) -> TokenStream {
+    let live_regs = op_metadata.iter().filter_map(|m| {
+        if !matches!(m.control, ControlFlowClass::LiveMarker) {
+            return None;
+        }
+        let (live_i, live_r, live_f) = liveness_triple_from_reads(&m.reads);
+        Some(quote! {
+            let _ = __asm._register_liveness_offset(
+                &[#(#live_i),*],
+                &[#(#live_r),*],
+                &[#(#live_f),*],
+            );
+        })
+    });
+    quote! {
+        #(#inline_prebuild)*
+        #(#live_regs)*
+    }
+}
+
+/// Collapse runs of consecutive `LiveMarker` ops (and any intervening
+/// `LabelDef` ops) into a single `LiveMarker`, mirroring RPython
+/// `rpython/jit/codewriter/liveness.py:82-117 remove_repeated_live`.
+///
+/// The lowerer currently never emits markers in succession (each
+/// `live_placeholder()` site sits in front of a guard / call op so a
+/// non-marker non-label always intervenes), making this function a
+/// structural no-op for present `#[jit_interp]` consumers. It still
+/// runs end-to-end so future lowerers (or post-processing passes that
+/// inject extra markers around inline-call boundaries) inherit the
+/// RPython collapse semantics for free.
+///
+/// `op_metadata` and `statements` must stay index-aligned; both vectors
+/// are mutated in lockstep.
+#[allow(dead_code)]
+fn remove_repeated_live(op_metadata: &mut Vec<OpMeta>, statements: &mut Vec<TokenStream>) {
+    debug_assert_eq!(op_metadata.len(), statements.len());
+    let mut new_meta: Vec<OpMeta> = Vec::with_capacity(op_metadata.len());
+    let mut new_stmts: Vec<TokenStream> = Vec::with_capacity(statements.len());
+    let mut i = 0;
+    while i < op_metadata.len() {
+        if !matches!(op_metadata[i].control, ControlFlowClass::LiveMarker) {
+            new_meta.push(op_metadata[i].clone());
+            new_stmts.push(statements[i].clone());
+            i += 1;
+            continue;
+        }
+        // Collect the run of consecutive markers (separated by label
+        // definitions only).
+        let first_marker_idx = i;
+        let mut markers: Vec<usize> = vec![i];
+        let mut interleaved_labels: Vec<usize> = Vec::new();
+        i += 1;
+        while i < op_metadata.len() {
+            match op_metadata[i].control {
+                ControlFlowClass::LiveMarker => {
+                    markers.push(i);
+                    i += 1;
+                }
+                ControlFlowClass::LabelDef => {
+                    interleaved_labels.push(i);
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        if markers.len() == 1 {
+            for li in &interleaved_labels {
+                new_meta.push(op_metadata[*li].clone());
+                new_stmts.push(statements[*li].clone());
+            }
+            new_meta.push(op_metadata[first_marker_idx].clone());
+            new_stmts.push(statements[first_marker_idx].clone());
+            continue;
+        }
+        // Multiple markers: union their `reads` registers per RPython
+        // `liveness.py:111-115 liveset.update(live[1:])`. Union typed
+        // Register reads as a single bag (Ord = (kind, index)) and union
+        // `live_target_labels` separately.
+        let mut merged_reads: Vec<Register> = Vec::new();
+        let mut merged_labels: Vec<Ident> = Vec::new();
+        for mi in &markers {
+            let m = &op_metadata[*mi];
+            merged_reads.extend(m.reads.iter().copied());
+            merged_labels.extend(m.live_target_labels.iter().cloned());
+        }
+        merged_reads.sort();
+        merged_reads.dedup();
+        merged_labels.sort_by_key(|label| label.to_string());
+        merged_labels.dedup_by_key(|label| label.to_string());
+        for li in &interleaved_labels {
+            new_meta.push(op_metadata[*li].clone());
+            new_stmts.push(statements[*li].clone());
+        }
+        new_meta.push(OpMeta::live_marker_with(merged_reads, merged_labels));
+        // Reuse the first marker's statement token (a single
+        // `live_placeholder()` call); the duplicated runs don't survive
+        // the collapse since RPython prints just one `-live-` for the
+        // whole run.
+        new_stmts.push(statements[first_marker_idx].clone());
+    }
+    *op_metadata = new_meta;
+    *statements = new_stmts;
+}
+
+/// Phase 4 / Epic B.3-B.4 emit-time bridge: replace each `LiveMarker`
+/// statement's `live_placeholder()` call with the triple-aware
+/// `live_placeholder_with_triple(&[live_i...], &[live_r...], &[live_f...])`
+/// shape, sourcing the per-marker triples from
+/// [`compute_per_marker_liveness`] split per bank by [`liveness_triple`]
+/// (mirrors `assembler.py:225-232 get_liveness_info(args, kind)`).
+///
+/// Runs after [`remove_repeated_live`] so the marker count seen by the
+/// walker matches the number of statements that actually survive into
+/// the lowered output.
+///
+/// The runtime effect is no-op until the factory closure calls
+/// `JitCodeBuilder::finalize_liveness(&mut asm)` — until then,
+/// `pending_live_triples` accumulates per-builder records but the
+/// emitted `live/<00 00>` slot stays at offset 0, identical to the
+/// `live_placeholder()` shape it replaces.  `finalize_liveness` is wired
+/// in a follow-on slice (driver-shared `Arc<Mutex<Assembler>>` plumbing
+/// through `register_jitcode_factory`).
+///
+/// Each register index must fit in `u8` per RPython
+/// `rpython/jit/codewriter/assembler.py:225` — the bitset encoder
+/// only addresses 0..=255 (8 register-bytes × 8 bits). The typed
+/// `Register::new` constructor asserts this bound at every
+/// emit site, so by the time the walker hands us a `BTreeSet<Register>`
+/// the indices are guaranteed `u8`-clean.
+fn rewrite_live_marker_statements_with_triples(
+    op_metadata: &[OpMeta],
+    statements: &mut [TokenStream],
+) {
+    debug_assert_eq!(op_metadata.len(), statements.len());
+    let live_sets = compute_per_marker_liveness(op_metadata);
+    let mut next_marker = 0usize;
+    for (i, m) in op_metadata.iter().enumerate() {
+        if !matches!(m.control, ControlFlowClass::LiveMarker) {
+            continue;
+        }
+        let (live_i, live_r, live_f) = liveness_triple(&live_sets[next_marker]);
+        next_marker += 1;
+        statements[i] = quote! {
+            let _ = __builder.live_placeholder_with_triple(
+                &[#(#live_i),*],
+                &[#(#live_r),*],
+                &[#(#live_f),*],
+            );
+        };
+    }
+    debug_assert_eq!(
+        next_marker,
+        live_sets.len(),
+        "compute_per_marker_liveness output count must match LiveMarker op_metadata entries"
+    );
+}
+
 /// Print per-marker live sets to stderr when `MAJIT_DUMP_LIVENESS` is
 /// set in the proc-macro build environment. `label` is the lowerer
 /// scope being dumped (e.g. helper name) so concurrent expansions are
@@ -585,8 +971,11 @@ fn maybe_dump_liveness(label: &str, op_metadata: &[OpMeta]) {
         marker_count
     );
     for (idx, set) in live_sets.iter().enumerate() {
-        let regs: Vec<u16> = set.iter().copied().collect();
-        eprintln!("  marker[{}] live={:?}", idx, regs);
+        let (live_i, live_r, live_f) = liveness_triple(set);
+        eprintln!(
+            "  marker[{}] live_i={:?} live_r={:?} live_f={:?}",
+            idx, live_i, live_r, live_f,
+        );
     }
 }
 
@@ -604,6 +993,13 @@ struct Lowerer<'c> {
     call_policies: Vec<(Vec<String>, CallPolicySpec)>,
     inference_failure_mode: InferenceFailureMode,
     auto_calls: bool,
+    /// Prebuild tokens carried up from nested inline-helper lowerings.
+    /// These get merged into the parent body's
+    /// `liveness_prebuild_tokens` output so the helper's per-marker
+    /// triples land in `__prebuild_jitcode_liveness_*` alongside the
+    /// outer arm's triples.
+    #[allow(dead_code)]
+    inline_liveness_prebuild: Vec<TokenStream>,
 }
 
 impl<'c> Lowerer<'c> {
@@ -627,6 +1023,7 @@ impl<'c> Lowerer<'c> {
             call_policies,
             inference_failure_mode,
             auto_calls: config.map(|cfg| cfg.auto_calls).unwrap_or(false),
+            inline_liveness_prebuild: Vec::new(),
         };
         this.install_vable_input_binding();
         this
@@ -682,6 +1079,16 @@ impl<'c> Lowerer<'c> {
         self.op_metadata.push(meta);
     }
 
+    fn append_lowered_sequence(&mut self, lowered: LoweredSequence) {
+        debug_assert_eq!(
+            lowered.statements.len(),
+            lowered.op_metadata.len(),
+            "RPython ssarepr.insns parity requires branch statements and metadata to append together"
+        );
+        self.statements.extend(lowered.statements);
+        self.op_metadata.extend(lowered.op_metadata);
+    }
+
     fn emit_label_def(&mut self, label: &Ident) {
         self.emit_op(
             OpMeta::label_def(label.clone()),
@@ -697,8 +1104,11 @@ impl<'c> Lowerer<'c> {
     }
 
     fn emit_conditional_guard(&mut self, cond_reg: u16, target: &Ident) {
+        // `goto_if_not_int_is_true` reads an int-banked register per
+        // `assembler.py:217 'i'` argcode — encode the kind into the
+        // metadata `Register` so the liveness walker keeps it under Int.
         self.emit_op(
-            OpMeta::conditional_guard(cond_reg, target.clone()),
+            OpMeta::conditional_guard(Register::int(cond_reg), target.clone()),
             quote! { __builder.goto_if_not_int_is_true(#cond_reg, #target); },
         );
     }
@@ -790,7 +1200,7 @@ impl<'c> Lowerer<'c> {
             let ident = &pat_ident.ident;
             let init_expr = &init.expr;
             self.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![reg]),
+                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
                 quote! {
                     let #ident = #init_expr;
                     __builder.load_const_i_value(#reg, #ident as i64);
@@ -834,17 +1244,20 @@ impl<'c> Lowerer<'c> {
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
+        // vable_reg is always Ref (the virtualizable input register); src bank
+        // follows `field_type` per `assembler.py:217` argcode mapping.
+        let vable_r = Register::ref_(vable_reg);
         match field_type {
             ValueKind::Ref => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![vable_reg, src], vec![]),
+                OpMeta::linear(OpKind::Vable, vec![vable_r, Register::ref_(src)], vec![]),
                 quote! { __builder.vable_setfield_ref_with_base(#vable_reg, #fi, #src); },
             ),
             ValueKind::Float => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![vable_reg, src], vec![]),
+                OpMeta::linear(OpKind::Vable, vec![vable_r, Register::float(src)], vec![]),
                 quote! { __builder.vable_setfield_float_with_base(#vable_reg, #fi, #src); },
             ),
             ValueKind::Int => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![vable_reg, src], vec![]),
+                OpMeta::linear(OpKind::Vable, vec![vable_r, Register::int(src)], vec![]),
                 quote! { __builder.vable_setfield_int_with_base(#vable_reg, #fi, #src); },
             ),
         }
@@ -885,17 +1298,32 @@ impl<'c> Lowerer<'c> {
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
 
+        // vable_reg: Ref. idx_reg: Int (array index). val_reg: bank by item_type.
+        let vable_r = Register::ref_(vable_reg);
+        let idx_r = Register::int(idx_reg);
         match item_type {
             ValueKind::Ref => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg, val_reg], vec![]),
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![vable_r, idx_r, Register::ref_(val_reg)],
+                    vec![],
+                ),
                 quote! { __builder.vable_setarrayitem_ref_with_base(#vable_reg, #ai, #idx_reg, #val_reg); },
             ),
             ValueKind::Float => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg, val_reg], vec![]),
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![vable_r, idx_r, Register::float(val_reg)],
+                    vec![],
+                ),
                 quote! { __builder.vable_setarrayitem_float_with_base(#vable_reg, #ai, #idx_reg, #val_reg); },
             ),
             ValueKind::Int => self.emit_op(
-                OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg, val_reg], vec![]),
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![vable_r, idx_r, Register::int(val_reg)],
+                    vec![],
+                ),
                 quote! { __builder.vable_setarrayitem_int_with_base(#vable_reg, #ai, #idx_reg, #val_reg); },
             ),
         }
@@ -922,8 +1350,9 @@ impl<'c> Lowerer<'c> {
         let fi = field_index as u16;
         let binding = self.lower_value_expr(&assign.right)?;
         let src = binding.reg;
+        // store_state_field/di — `src` is Int per assembler.py:217 'i' argcode.
         self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![src], vec![]),
+            OpMeta::linear(OpKind::StateField, vec![Register::int(src)], vec![]),
             quote! { __builder.store_state_field(#fi, #src); },
         );
         Some(())
@@ -955,11 +1384,14 @@ impl<'c> Lowerer<'c> {
         let val_binding = self.lower_value_expr(&assign.right)?;
         let val_reg = val_binding.reg;
 
-        // Check virtualizable arrays first, then flattened arrays.
+        // store_state_{varray,array}/dii — both reg args are Int per
+        // assembler.py:217 'i' argcode.
+        let idx_r = Register::int(idx_reg);
+        let val_r = Register::int(val_reg);
         if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
             let ai = va_idx as u16;
             self.emit_op(
-                OpMeta::linear(OpKind::StateField, vec![idx_reg, val_reg], vec![]),
+                OpMeta::linear(OpKind::StateField, vec![idx_r, val_r], vec![]),
                 quote! { __builder.store_state_varray(#ai, #idx_reg, #val_reg); },
             );
             return Some(());
@@ -967,7 +1399,7 @@ impl<'c> Lowerer<'c> {
         let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
         self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![idx_reg, val_reg], vec![]),
+            OpMeta::linear(OpKind::StateField, vec![idx_r, val_r], vec![]),
             quote! { __builder.store_state_array(#ai, #idx_reg, #val_reg); },
         );
         Some(())
@@ -991,8 +1423,9 @@ impl<'c> Lowerer<'c> {
         let arg: Expr = syn::parse2(mac.mac.tokens.clone()).ok()?;
         let binding = self.lower_value_expr(&arg)?;
         let vable_reg = binding.reg;
+        // vable_force/r — vable_reg is Ref per assembler.py:217 'r' argcode.
         self.emit_op(
-            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![]),
+            OpMeta::linear(OpKind::Vable, vec![Register::ref_(vable_reg)], vec![]),
             quote! { __builder.vable_force_with_base(#vable_reg); },
         );
         Some(())
@@ -1082,11 +1515,12 @@ impl<'c> Lowerer<'c> {
         let cond_reg = cond_binding.reg;
         // RPython make_three_lists: tag each arg with its kind (int/ref).
         let mut typed_arg_tokens = Vec::new();
-        let mut arg_regs = vec![cond_reg];
+        // cond_reg is Int per the conditional_call argcode prefix.
+        let mut arg_regs: Vec<Register> = vec![Register::int(cond_reg)];
         for arg in func_args {
             let b = self.lower_value_expr(arg)?;
             let reg = b.reg;
-            arg_regs.push(reg);
+            arg_regs.push(Register::from_binding(&b));
             let token = match b.kind {
                 // jtransform.py:1668: float → raise Exception
                 BindingKind::Float => {
@@ -1144,11 +1578,13 @@ impl<'c> Lowerer<'c> {
         }
         // RPython make_three_lists: tag each arg with its kind.
         let mut typed_arg_tokens = Vec::new();
-        let mut arg_regs = vec![value_reg];
+        // value_reg is Int or Ref per the conditional_call_value_ir_{i|r} arm.
+        let value_kind = value_binding.kind;
+        let mut arg_regs: Vec<Register> = vec![Register::new(value_kind, value_reg)];
         for arg in func_args {
             let b = self.lower_value_expr(arg)?;
             let reg = b.reg;
-            arg_regs.push(reg);
+            arg_regs.push(Register::from_binding(&b));
             let token = match b.kind {
                 BindingKind::Float => {
                     panic!("Conditional call does not support floats");
@@ -1163,7 +1599,7 @@ impl<'c> Lowerer<'c> {
         let func_path = args[1];
         let result_reg = self.alloc_reg();
         // RPython jtransform.py:1687 — conditional_call_value_ir_{i|r}
-        let builder_call = match value_binding.kind {
+        let builder_call = match value_kind {
             BindingKind::Ref => quote! {
                 __builder.conditional_call_value_ir_r_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
@@ -1172,7 +1608,11 @@ impl<'c> Lowerer<'c> {
             },
         };
         self.emit_op(
-            OpMeta::linear(OpKind::Call, arg_regs, vec![result_reg]),
+            OpMeta::linear(
+                OpKind::Call,
+                arg_regs,
+                vec![Register::new(value_kind, result_reg)],
+            ),
             quote! {
                 let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
                 #builder_call
@@ -1180,7 +1620,7 @@ impl<'c> Lowerer<'c> {
         );
         Some(Binding {
             reg: result_reg,
-            kind: value_binding.kind,
+            kind: value_kind,
             depends_on_stack: false,
         })
     }
@@ -1215,11 +1655,11 @@ impl<'c> Lowerer<'c> {
         }
         // RPython make_three_lists: tag each arg with its kind.
         let mut typed_arg_tokens = Vec::new();
-        let mut arg_regs = Vec::new();
+        let mut arg_regs: Vec<Register> = Vec::new();
         for arg in &args[2..] {
             let b = self.lower_value_expr(arg)?;
             let reg = b.reg;
-            arg_regs.push(reg);
+            arg_regs.push(Register::from_binding(&b));
             let token = match b.kind {
                 BindingKind::Float => {
                     panic!("record_known_result does not support floats");
@@ -1241,8 +1681,15 @@ impl<'c> Lowerer<'c> {
                 __builder.record_known_result_i_ir_v_typed_args(__fn_idx, #result_reg, &[#(#typed_arg_tokens),*]);
             },
         };
+        // RPython pyjitpl.py:413-419 passes the known result box as
+        // `prepend_box=resbox`; record_known_result reads that box and
+        // produces no result (`_v` suffix).
+        let result_typed = Register::new(result_binding.kind, result_reg);
+        let mut reads = Vec::with_capacity(arg_regs.len() + 1);
+        reads.push(result_typed);
+        reads.extend(arg_regs);
         self.emit_op(
-            OpMeta::linear(OpKind::RecordKnownResult, arg_regs, vec![result_reg]),
+            OpMeta::linear(OpKind::RecordKnownResult, reads, Vec::new()),
             quote! {
                 let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
                 #builder_call
@@ -1340,7 +1787,7 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ResidualVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.residual_call_void_args(__fn_idx, &[#(#arg_regs),*]);
@@ -1348,7 +1795,8 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
@@ -1361,7 +1809,7 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_may_force_void_args(__fn_idx, &[#(#arg_regs),*]);
@@ -1369,7 +1817,8 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
@@ -1382,7 +1831,7 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ReleaseGilVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_release_gil_void_args(__fn_idx, &[#(#arg_regs),*]);
@@ -1390,7 +1839,8 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
@@ -1403,7 +1853,7 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::LoopInvariantVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![]),
+                            OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_loopinvariant_void_args(__fn_idx, &[#(#arg_regs),*]);
@@ -1411,7 +1861,8 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
@@ -1465,7 +1916,11 @@ impl<'c> Lowerer<'c> {
                     };
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![throwaway_reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::int(throwaway_reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.#untyped_call(__fn_idx, &[#(#arg_regs),*], #throwaway_reg);
@@ -1473,9 +1928,14 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![throwaway_reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::int(throwaway_reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.#typed_call(__fn_idx, #typed_args, #throwaway_reg);
@@ -1486,7 +1946,8 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ResidualVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
-                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
                     let call_stmt =
                         quote! { __builder.residual_call_void_typed_args(__fn_idx, #typed_args); };
                     self.emit_op(
@@ -1516,7 +1977,8 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::LoopInvariantVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
-                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::MayForceVoidWrapped => {
                             quote! { __builder.call_may_force_void_typed_args(__fn_idx, #typed_args); }
@@ -1577,6 +2039,19 @@ impl<'c> Lowerer<'c> {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let throwaway_reg = self.alloc_reg();
+                    // Result bank — pick from the wrapped policy variant family.
+                    let result_kind = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualIntWrapped
+                        | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
+                        | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
+                        | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
+                        | crate::jit_interp::CallPolicyKind::ElidableIntWrapped => BindingKind::Int,
+                        crate::jit_interp::CallPolicyKind::ResidualRefWrapped
+                        | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
+                        | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
+                        | crate::jit_interp::CallPolicyKind::ElidableRefWrapped => BindingKind::Ref,
+                        _ => BindingKind::Float,
+                    };
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
                             quote! { __builder.call_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
@@ -1622,9 +2097,14 @@ impl<'c> Lowerer<'c> {
                         }
                         _ => unreachable!(),
                     };
-                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
                     self.emit_op(
-                        OpMeta::linear(OpKind::Call, __arg_regs, vec![throwaway_reg]),
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::new(result_kind, throwaway_reg)],
+                        ),
                         quote! {
                             let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
@@ -1650,7 +2130,8 @@ impl<'c> Lowerer<'c> {
             CallPolicySpec::Infer => {
                 let policy_path = helper_policy_path(&call.func)?;
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
-                let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                let __arg_regs: Vec<Register> =
+                    arg_bindings.iter().map(Register::from_binding).collect();
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy does not support void calls here",
                 );
@@ -1706,8 +2187,9 @@ impl<'c> Lowerer<'c> {
                 let arg = unwrap_ref_expr(call.args.first()?);
                 let binding = self.lower_value_expr(arg)?;
                 let reg = binding.reg;
+                // residual_call_void_args takes int-banked args.
                 self.emit_op(
-                    OpMeta::linear(OpKind::Call, vec![reg], vec![]),
+                    OpMeta::linear(OpKind::Call, vec![Register::int(reg)], vec![]),
                     quote! {
                         let __fn_idx = __builder.add_fn_ptr(#shim as *const ());
                         __builder.residual_call_void_args(__fn_idx, &[#reg]);
@@ -1995,14 +2477,14 @@ impl<'c> Lowerer<'c> {
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let cond_reg = cond.reg;
-        let then_stmts = self.lower_branch_expr(&Expr::Block(syn::ExprBlock {
+        let then_seq = self.lower_branch_expr(&Expr::Block(syn::ExprBlock {
             attrs: Vec::new(),
             label: None,
             block: expr_if.then_branch.clone(),
         }))?;
-        let else_stmts = match expr_if.else_branch.as_ref() {
+        let else_seq = match expr_if.else_branch.as_ref() {
             Some((_, else_expr)) => self.lower_branch_expr(else_expr)?,
-            None => Vec::new(),
+            None => LoweredSequence::default(),
         };
 
         self.emit_aux(quote! { let #else_label = __builder.new_label(); });
@@ -2021,10 +2503,10 @@ impl<'c> Lowerer<'c> {
             quote! { let _ = __builder.live_placeholder(); },
         );
         self.emit_conditional_guard(cond_reg, &else_label);
-        self.statements.extend(then_stmts);
+        self.append_lowered_sequence(then_seq);
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
-        self.statements.extend(else_stmts);
+        self.append_lowered_sequence(else_seq);
         self.emit_label_def(&end_label);
         Some(())
     }
@@ -2081,13 +2563,17 @@ impl<'c> Lowerer<'c> {
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
                     quote! { __builder.load_const_i_value(#const_reg, #value); },
                 );
                 self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
-            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[disc_reg, const_reg]),
+                        vec![Register::int(eq_reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+                );
                 self.emit_op(
                     OpMeta::live_marker(),
                     quote! { let _ = __builder.live_placeholder(); },
@@ -2100,29 +2586,45 @@ impl<'c> Lowerer<'c> {
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![first_const_reg]),
+                    OpMeta::linear(
+                        OpKind::LoadConstI,
+                        vec![],
+                        vec![Register::int(first_const_reg)],
+                    ),
                     quote! { __builder.load_const_i_value(#first_const_reg, #first_val); },
                 );
                 self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![disc_reg, first_const_reg], vec![or_reg]),
-            quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[disc_reg, first_const_reg]),
+                        vec![Register::int(or_reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
+                );
                 for &lit_val in &literals[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
                     self.emit_op(
-                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
                         quote! { __builder.load_const_i_value(#const_reg, #lit_val); },
                     );
                     self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
-            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[disc_reg, const_reg]),
+                        vec![Register::int(eq_reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+                );
                     self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![or_reg, eq_reg], vec![new_or_reg]),
-            quote! { __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg); },
-        );
+                        OpMeta::linear(
+                            OpKind::BinopI,
+                            Register::ints(&[or_reg, eq_reg]),
+                            vec![Register::int(new_or_reg)],
+                        ),
+                        quote! { __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg); },
+                    );
                     or_reg = new_or_reg;
                 }
                 self.emit_op(
@@ -2132,16 +2634,16 @@ impl<'c> Lowerer<'c> {
                 self.emit_conditional_guard(or_reg, &next_label);
             }
 
-            let body_stmts = self.lower_branch_expr(body)?;
-            self.statements.extend(body_stmts);
+            let body_seq = self.lower_branch_expr(body)?;
+            self.append_lowered_sequence(body_seq);
             self.emit_jump(&end_label);
             self.emit_label_def(&next_label);
         }
 
         // Default arm
         if let Some(default_body) = default_arm {
-            let default_stmts = self.lower_branch_expr(default_body)?;
-            self.statements.extend(default_stmts);
+            let default_seq = self.lower_branch_expr(default_body)?;
+            self.append_lowered_sequence(default_seq);
         }
 
         self.emit_label_def(&end_label);
@@ -2177,8 +2679,8 @@ impl<'c> Lowerer<'c> {
         self.emit_conditional_guard(cond_reg, &loop_end);
 
         // Lower the body, with break targets pointing to loop_end
-        let body_stmts = self.lower_loop_body(&expr_while.body, &loop_end, &loop_start)?;
-        self.statements.extend(body_stmts);
+        let body_seq = self.lower_loop_body(&expr_while.body, &loop_end, &loop_start)?;
+        self.append_lowered_sequence(body_seq);
 
         // Back-edge jump
         self.emit_jump(&loop_start);
@@ -2201,8 +2703,8 @@ impl<'c> Lowerer<'c> {
         self.emit_aux(quote! { let #loop_end = __builder.new_label(); });
         self.emit_label_def(&loop_start);
 
-        let body_stmts = self.lower_loop_body(&expr_loop.body, &loop_end, &loop_start)?;
-        self.statements.extend(body_stmts);
+        let body_seq = self.lower_loop_body(&expr_loop.body, &loop_end, &loop_start)?;
+        self.append_lowered_sequence(body_seq);
 
         self.emit_jump(&loop_start);
         self.emit_label_def(&loop_end);
@@ -2225,7 +2727,7 @@ impl<'c> Lowerer<'c> {
         block: &syn::Block,
         break_label: &syn::Ident,
         continue_label: &syn::Ident,
-    ) -> Option<Vec<TokenStream>> {
+    ) -> Option<LoweredSequence> {
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
             statements: Vec::new(),
@@ -2236,6 +2738,7 @@ impl<'c> Lowerer<'c> {
             call_policies: self.call_policies.clone(),
             inference_failure_mode: self.inference_failure_mode,
             auto_calls: self.auto_calls,
+            inline_liveness_prebuild: Vec::new(),
         };
 
         for stmt in &block.stmts {
@@ -2250,8 +2753,7 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
-        self.op_metadata.extend(nested.op_metadata);
-        Some(nested.statements)
+        Some(LoweredSequence::new(nested.statements, nested.op_metadata))
     }
 
     /// Lower a statement inside a loop body, handling break/continue specially.
@@ -2310,8 +2812,8 @@ impl<'c> Lowerer<'c> {
         self.emit_conditional_guard(cond_reg, &else_label);
 
         // Lower then-branch with loop control
-        let then_stmts = self.lower_loop_body(&expr_if.then_branch, break_label, continue_label)?;
-        self.statements.extend(then_stmts);
+        let then_seq = self.lower_loop_body(&expr_if.then_branch, break_label, continue_label)?;
+        self.append_lowered_sequence(then_seq);
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
 
@@ -2321,8 +2823,8 @@ impl<'c> Lowerer<'c> {
                 Expr::Block(block) => &block.block,
                 _ => return None,
             };
-            let else_stmts = self.lower_loop_body(else_block, break_label, continue_label)?;
-            self.statements.extend(else_stmts);
+            let else_seq = self.lower_loop_body(else_block, break_label, continue_label)?;
+            self.append_lowered_sequence(else_seq);
         }
 
         self.emit_label_def(&end_label);
@@ -2371,13 +2873,17 @@ impl<'c> Lowerer<'c> {
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
                     quote! { __builder.load_const_i_value(#const_reg, #value); },
                 );
                 self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
-            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[disc_reg, const_reg]),
+                        vec![Register::int(eq_reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+                );
                 self.emit_op(
                     OpMeta::live_marker(),
                     quote! { let _ = __builder.live_placeholder(); },
@@ -2388,29 +2894,45 @@ impl<'c> Lowerer<'c> {
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![first_const_reg]),
+                    OpMeta::linear(
+                        OpKind::LoadConstI,
+                        vec![],
+                        vec![Register::int(first_const_reg)],
+                    ),
                     quote! { __builder.load_const_i_value(#first_const_reg, #first_val); },
                 );
                 self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![disc_reg, first_const_reg], vec![or_reg]),
-            quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[disc_reg, first_const_reg]),
+                        vec![Register::int(or_reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
+                );
                 for &lit_val in &literals[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();
                     self.emit_op(
-                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![const_reg]),
+                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(const_reg)]),
                         quote! { __builder.load_const_i_value(#const_reg, #lit_val); },
                     );
                     self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![disc_reg, const_reg], vec![eq_reg]),
-            quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[disc_reg, const_reg]),
+                        vec![Register::int(eq_reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg); },
+                );
                     self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![or_reg, eq_reg], vec![new_or_reg]),
-            quote! { __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg); },
-        );
+                        OpMeta::linear(
+                            OpKind::BinopI,
+                            Register::ints(&[or_reg, eq_reg]),
+                            vec![Register::int(new_or_reg)],
+                        ),
+                        quote! { __builder.record_binop_i(#new_or_reg, majit_ir::OpCode::IntOr, #or_reg, #eq_reg); },
+                    );
                     or_reg = new_or_reg;
                 }
                 self.emit_op(
@@ -2420,15 +2942,19 @@ impl<'c> Lowerer<'c> {
                 self.emit_conditional_guard(or_reg, &next_label);
             }
 
-            let (body_stmts, binding) = self.lower_branch_value_expr(body)?;
+            let (body_seq, binding) = self.lower_branch_value_expr(body)?;
             if !matches!(binding.kind, BindingKind::Int) {
                 return None;
             }
             depends_on_stack |= binding.depends_on_stack;
             let arm_reg = binding.reg;
-            self.statements.extend(body_stmts);
+            self.append_lowered_sequence(body_seq);
             self.emit_op(
-                OpMeta::linear(OpKind::MoveI, vec![arm_reg], vec![result_reg]),
+                OpMeta::linear(
+                    OpKind::MoveI,
+                    vec![Register::int(arm_reg)],
+                    vec![Register::int(result_reg)],
+                ),
                 quote! { __builder.move_i(#result_reg, #arm_reg); },
             );
             self.emit_jump(&end_label);
@@ -2437,15 +2963,19 @@ impl<'c> Lowerer<'c> {
 
         // Default arm
         if let Some(default_body) = default_arm {
-            let (default_stmts, default_binding) = self.lower_branch_value_expr(default_body)?;
+            let (default_seq, default_binding) = self.lower_branch_value_expr(default_body)?;
             if !matches!(default_binding.kind, BindingKind::Int) {
                 return None;
             }
             depends_on_stack |= default_binding.depends_on_stack;
             let default_reg = default_binding.reg;
-            self.statements.extend(default_stmts);
+            self.append_lowered_sequence(default_seq);
             self.emit_op(
-                OpMeta::linear(OpKind::MoveI, vec![default_reg], vec![result_reg]),
+                OpMeta::linear(
+                    OpKind::MoveI,
+                    vec![Register::int(default_reg)],
+                    vec![Register::int(result_reg)],
+                ),
                 quote! { __builder.move_i(#result_reg, #default_reg); },
             );
         }
@@ -2478,24 +3008,38 @@ impl<'c> Lowerer<'c> {
                 let vable_reg = self.vable_base_reg()?;
                 let reg = self.alloc_reg();
                 let fi = field_index as u16;
+                // vable_reg is Ref; result `reg` bank follows field_type.
+                let vable_r = Register::ref_(vable_reg);
                 let kind = match field_type {
                     ValueKind::Ref => {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Vable,
+                                vec![vable_r],
+                                vec![Register::ref_(reg)],
+                            ),
                             quote! { __builder.vable_getfield_ref_with_base(#reg, #vable_reg, #fi); },
                         );
                         BindingKind::Ref
                     }
                     ValueKind::Float => {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Vable,
+                                vec![vable_r],
+                                vec![Register::float(reg)],
+                            ),
                             quote! { __builder.vable_getfield_float_with_base(#reg, #vable_reg, #fi); },
                         );
                         BindingKind::Float
                     }
                     ValueKind::Int => {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Vable,
+                                vec![vable_r],
+                                vec![Register::int(reg)],
+                            ),
                             quote! { __builder.vable_getfield_int_with_base(#reg, #vable_reg, #fi); },
                         );
                         BindingKind::Int
@@ -2541,24 +3085,39 @@ impl<'c> Lowerer<'c> {
 
         let reg = self.alloc_reg();
         let ai = array_index as u16;
+        // vable_reg: Ref. idx_reg: Int. result `reg` bank by item_type.
+        let vable_r = Register::ref_(vable_reg);
+        let idx_r = Register::int(idx_reg);
         let kind = match item_type {
             ValueKind::Ref => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg], vec![reg]),
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![vable_r, idx_r],
+                        vec![Register::ref_(reg)],
+                    ),
                     quote! { __builder.vable_getarrayitem_ref_with_base(#reg, #vable_reg, #ai, #idx_reg); },
                 );
                 BindingKind::Ref
             }
             ValueKind::Float => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg], vec![reg]),
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![vable_r, idx_r],
+                        vec![Register::float(reg)],
+                    ),
                     quote! { __builder.vable_getarrayitem_float_with_base(#reg, #vable_reg, #ai, #idx_reg); },
                 );
                 BindingKind::Float
             }
             ValueKind::Int => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::Vable, vec![vable_reg, idx_reg], vec![reg]),
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![vable_r, idx_r],
+                        vec![Register::int(reg)],
+                    ),
                     quote! { __builder.vable_getarrayitem_int_with_base(#reg, #vable_reg, #ai, #idx_reg); },
                 );
                 BindingKind::Int
@@ -2596,8 +3155,13 @@ impl<'c> Lowerer<'c> {
         let vable_reg = self.vable_base_reg()?;
         let reg = self.alloc_reg();
         let ai = array_index as u16;
+        // vable_arraylen reads vable_reg (Ref) and writes the length to an int reg.
         self.emit_op(
-            OpMeta::linear(OpKind::Vable, vec![vable_reg], vec![reg]),
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(vable_reg)],
+                vec![Register::int(reg)],
+            ),
             quote! { __builder.vable_arraylen_with_base(#reg, #vable_reg, #ai); },
         );
         Some(Binding {
@@ -2622,8 +3186,9 @@ impl<'c> Lowerer<'c> {
         let &field_index = config.state_scalars.get(&member_name)?;
         let fi = field_index as u16;
         let reg = self.alloc_reg();
+        // load_state_field reads the field at int index `fi` into int `reg`.
         self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![], vec![reg]),
+            OpMeta::linear(OpKind::StateField, vec![], vec![Register::int(reg)]),
             quote! { __builder.load_state_field(#fi, #reg); },
         );
         Some(Binding {
@@ -2658,7 +3223,11 @@ impl<'c> Lowerer<'c> {
         if let Some(&va_idx) = config.state_virt_arrays.get(&member_name) {
             let ai = va_idx as u16;
             self.emit_op(
-                OpMeta::linear(OpKind::StateField, vec![idx_reg], vec![reg]),
+                OpMeta::linear(
+                    OpKind::StateField,
+                    vec![Register::int(idx_reg)],
+                    vec![Register::int(reg)],
+                ),
                 quote! { __builder.load_state_varray(#ai, #idx_reg, #reg); },
             );
             return Some(Binding {
@@ -2670,7 +3239,11 @@ impl<'c> Lowerer<'c> {
         let &array_index = config.state_arrays.get(&member_name)?;
         let ai = array_index as u16;
         self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![idx_reg], vec![reg]),
+            OpMeta::linear(
+                OpKind::StateField,
+                vec![Register::int(idx_reg)],
+                vec![Register::int(reg)],
+            ),
             quote! { __builder.load_state_array(#ai, #idx_reg, #reg); },
         );
         Some(Binding {
@@ -2718,7 +3291,7 @@ impl<'c> Lowerer<'c> {
                 let value = int_lit.base10_parse::<i64>().ok()?;
                 let reg = self.alloc_reg();
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![reg]),
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
                     quote! { __builder.load_const_i_value(#reg, #value); },
                 );
                 Some(Binding {
@@ -2772,19 +3345,19 @@ impl<'c> Lowerer<'c> {
         match binding.kind {
             BindingKind::Int => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::GuardValue, vec![reg], vec![]),
+                    OpMeta::linear(OpKind::GuardValue, vec![Register::int(reg)], vec![]),
                     quote! { __builder.int_guard_value(#reg); },
                 );
             }
             BindingKind::Ref => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::GuardValue, vec![reg], vec![]),
+                    OpMeta::linear(OpKind::GuardValue, vec![Register::ref_(reg)], vec![]),
                     quote! { __builder.ref_guard_value(#reg); },
                 );
             }
             BindingKind::Float => {
                 self.emit_op(
-                    OpMeta::linear(OpKind::GuardValue, vec![reg], vec![]),
+                    OpMeta::linear(OpKind::GuardValue, vec![Register::float(reg)], vec![]),
                     quote! { __builder.float_guard_value(#reg); },
                 );
             }
@@ -2814,7 +3387,11 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ResidualInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
@@ -2822,9 +3399,14 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_int_typed(__fn_idx, #typed_args, #reg);
@@ -2835,7 +3417,11 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::MayForceInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
@@ -2843,9 +3429,14 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -2856,7 +3447,11 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
@@ -2864,9 +3459,14 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
@@ -2877,7 +3477,11 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
@@ -2885,9 +3489,14 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
@@ -2898,7 +3507,11 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ElidableInt => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, arg_regs.clone(), vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
@@ -2906,9 +3519,14 @@ impl<'c> Lowerer<'c> {
                         );
                     } else {
                         let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
                         self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::new(result_kind, reg)],
+                            ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
                                 __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
@@ -2986,9 +3604,14 @@ impl<'c> Lowerer<'c> {
                         }
                         _ => unreachable!(),
                     };
-                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
                     self.emit_op(
-                        OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::new(result_kind, reg)],
+                        ),
                         quote! {
                             let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
@@ -3015,11 +3638,16 @@ impl<'c> Lowerer<'c> {
                     result_kind = binding_kind_for_inline_policy(kind).unwrap();
                     let builder_path = inline_builder_path(&call.func)?;
                     let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
-                    let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
                     self.emit_op(
-                        OpMeta::linear(OpKind::InlineCall, __arg_regs, vec![reg]),
+                        OpMeta::linear(
+                            OpKind::InlineCall,
+                            __arg_regs,
+                            vec![Register::new(result_kind, reg)],
+                        ),
                         quote! {
-                            let __sub_jitcode = #builder_path();
+                            let __sub_jitcode = #builder_path(__asm);
                             let (__sub_return_kind, _) = __sub_jitcode
                                 .trailing_return_info()
                                 .expect("inline helper jitcode must end in a typed return opcode");
@@ -3039,10 +3667,20 @@ impl<'c> Lowerer<'c> {
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy only supports int-return value calls here; use an explicit inline_ref/inline_float or *_ref_wrapped/*_float_wrapped policy",
                 );
-                let __arg_regs: Vec<u16> = arg_bindings.iter().map(|b| b.reg).collect();
+                let __arg_regs: Vec<Register> =
+                    arg_bindings.iter().map(Register::from_binding).collect();
                 if let Some(_arg_regs) = int_arg_regs {
+                    // Inferred path: result is Int (the explicit-Inline case is
+                    // handled at line 4u8 of the runtime match below, but the
+                    // emit-time OpMeta destination still tracks the call's
+                    // post-condition register slot — Int matches the typed-call
+                    // helper that produces it).
                     self.emit_op(
-                        OpMeta::linear(OpKind::Call, __arg_regs.clone(), vec![reg]),
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs.clone(),
+                            vec![Register::int(reg)],
+                        ),
                         quote! {
                             let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
@@ -3064,15 +3702,14 @@ impl<'c> Lowerer<'c> {
                                     __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                                 }
                                 4u8 => {
-                                    let __builder_fn: fn() -> majit_metainterp::JitCode =
+                                    let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
                                         unsafe { std::mem::transmute(__inline_builder) };
-                                    let __sub_jitcode = __builder_fn();
+                                    let __sub_jitcode = __builder_fn(__asm);
                                     let (__sub_return_kind, _) =
                                         <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
                                         .expect("inline helper jitcode must end in a typed return opcode");
                                     let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                     #inline_call
-                                    #post_live
                                 }
                                 10u8 => {
                                     __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -3089,9 +3726,24 @@ impl<'c> Lowerer<'c> {
                             }
                         },
                     );
+                    // jtransform.py:480-482 — `inline_call_*` is followed by a
+                    // `-live-` marker; assembler.py:146-158 encodes its
+                    // per-pc liveness offset via `_encode_liveness`.  The
+                    // inferred-policy path resolves the call kind at trace
+                    // time (`__policy == 4u8` → inline; 2/10/14 → residual
+                    // family), so emit the trailing `OpMeta::live_marker()`
+                    // unconditionally — Pure (3u8) / LoopInvariant (18u8)
+                    // get a redundant but harmless 2-byte BC_LIVE slot,
+                    // matching the explicit `Inline*` path
+                    // (`self.emit_op(OpMeta::live_marker, post_live)`).
+                    self.emit_op(OpMeta::live_marker(), post_live.clone());
                 } else {
                     self.emit_op(
-                        OpMeta::linear(OpKind::Call, __arg_regs, vec![reg]),
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::int(reg)],
+                        ),
                         quote! {
                             let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
@@ -3113,15 +3765,14 @@ impl<'c> Lowerer<'c> {
                                     __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
                                 }
                                 4u8 => {
-                                let __builder_fn: fn() -> majit_metainterp::JitCode =
+                                let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
-                                let __sub_jitcode = __builder_fn();
+                                let __sub_jitcode = __builder_fn(__asm);
                                 let (__sub_return_kind, _) =
                                     <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
                                     .expect("inline helper jitcode must end in a typed return opcode");
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
-                                #post_live
                             }
                             10u8 => {
                                 __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
@@ -3137,6 +3788,8 @@ impl<'c> Lowerer<'c> {
                             }
                         }
                     });
+                    // jtransform.py:480-482 — see int_arg_regs branch above.
+                    self.emit_op(OpMeta::live_marker(), post_live);
                 }
             }
         }
@@ -3162,13 +3815,13 @@ impl<'c> Lowerer<'c> {
         let end_label = self.alloc_label();
         let result_reg = self.alloc_reg();
         let cond_reg = cond.reg;
-        let (then_stmts, then_binding) =
+        let (then_seq, then_binding) =
             self.lower_branch_value_expr(&Expr::Block(syn::ExprBlock {
                 attrs: Vec::new(),
                 label: None,
                 block: expr_if.then_branch.clone(),
             }))?;
-        let (else_stmts, else_binding) = self.lower_branch_value_expr(else_expr)?;
+        let (else_seq, else_binding) = self.lower_branch_value_expr(else_expr)?;
         if !matches!(then_binding.kind, BindingKind::Int)
             || !matches!(else_binding.kind, BindingKind::Int)
         {
@@ -3184,16 +3837,24 @@ impl<'c> Lowerer<'c> {
             quote! { let _ = __builder.live_placeholder(); },
         );
         self.emit_conditional_guard(cond_reg, &else_label);
-        self.statements.extend(then_stmts);
+        self.append_lowered_sequence(then_seq);
         self.emit_op(
-            OpMeta::linear(OpKind::MoveI, vec![then_reg], vec![result_reg]),
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(then_reg)],
+                vec![Register::int(result_reg)],
+            ),
             quote! { __builder.move_i(#result_reg, #then_reg); },
         );
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
-        self.statements.extend(else_stmts);
+        self.append_lowered_sequence(else_seq);
         self.emit_op(
-            OpMeta::linear(OpKind::MoveI, vec![else_reg], vec![result_reg]),
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(else_reg)],
+                vec![Register::int(result_reg)],
+            ),
             quote! { __builder.move_i(#result_reg, #else_reg); },
         );
         self.emit_label_def(&end_label);
@@ -3218,15 +3879,19 @@ impl<'c> Lowerer<'c> {
             (0, 1) => {
                 let zero_reg = self.alloc_reg();
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![zero_reg]),
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(zero_reg)]),
                     quote! { __builder.load_const_i_value(#zero_reg, 0); },
                 );
                 let reg = self.alloc_reg();
                 let cond_reg = cond.reg;
                 self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![cond_reg, zero_reg], vec![reg]),
-            quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::IntEq, #cond_reg, #zero_reg); },
-        );
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[cond_reg, zero_reg]),
+                        vec![Register::int(reg)],
+                    ),
+                    quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::IntEq, #cond_reg, #zero_reg); },
+                );
                 Some(Binding {
                     reg,
                     kind: BindingKind::Int,
@@ -3247,7 +3912,11 @@ impl<'c> Lowerer<'c> {
                 let reg = self.alloc_reg();
                 let src_reg = inner.reg;
                 self.emit_op(
-                    OpMeta::linear(OpKind::UnaryI, vec![src_reg], vec![reg]),
+                    OpMeta::linear(
+                        OpKind::UnaryI,
+                        vec![Register::int(src_reg)],
+                        vec![Register::int(reg)],
+                    ),
                     quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::IntNeg, #src_reg); },
                 );
                 Some(Binding {
@@ -3271,7 +3940,11 @@ impl<'c> Lowerer<'c> {
         let lhs_reg = lhs.reg;
         let rhs_reg = rhs.reg;
         self.emit_op(
-            OpMeta::linear(OpKind::BinopI, vec![lhs_reg, rhs_reg], vec![reg]),
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[lhs_reg, rhs_reg]),
+                vec![Register::int(reg)],
+            ),
             quote! { __builder.record_binop_i(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
         );
         Some(Binding {
@@ -3281,7 +3954,7 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    fn lower_branch_expr(&mut self, expr: &Expr) -> Option<Vec<TokenStream>> {
+    fn lower_branch_expr(&mut self, expr: &Expr) -> Option<LoweredSequence> {
         let stmts = extract_stmts(expr);
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
@@ -3293,6 +3966,7 @@ impl<'c> Lowerer<'c> {
             call_policies: self.call_policies.clone(),
             inference_failure_mode: self.inference_failure_mode,
             auto_calls: self.auto_calls,
+            inline_liveness_prebuild: Vec::new(),
         };
 
         for stmt in &stmts {
@@ -3301,11 +3975,10 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
-        self.op_metadata.extend(nested.op_metadata);
-        Some(nested.statements)
+        Some(LoweredSequence::new(nested.statements, nested.op_metadata))
     }
 
-    fn lower_branch_value_expr(&mut self, expr: &Expr) -> Option<(Vec<TokenStream>, Binding)> {
+    fn lower_branch_value_expr(&mut self, expr: &Expr) -> Option<(LoweredSequence, Binding)> {
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
             statements: Vec::new(),
@@ -3316,13 +3989,16 @@ impl<'c> Lowerer<'c> {
             call_policies: self.call_policies.clone(),
             inference_failure_mode: self.inference_failure_mode,
             auto_calls: self.auto_calls,
+            inline_liveness_prebuild: Vec::new(),
         };
 
         let binding = nested.lower_scoped_value_expr(expr)?;
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
-        self.op_metadata.extend(nested.op_metadata);
-        Some((nested.statements, binding))
+        Some((
+            LoweredSequence::new(nested.statements, nested.op_metadata),
+            binding,
+        ))
     }
 
     fn lower_scoped_value_expr(&mut self, expr: &Expr) -> Option<Binding> {
@@ -3658,7 +4334,7 @@ fn inline_builder_path(expr: &Expr) -> Option<Path> {
     };
     let mut path = path.clone();
     let last = path.segments.last_mut()?;
-    last.ident = format_ident!("__majit_inline_jitcode_{}", last.ident);
+    last.ident = format_ident!("__majit_inline_jitcode_{}_with_asm", last.ident);
     Some(path)
 }
 
@@ -3706,14 +4382,39 @@ fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
 
 // ── Public entry points ──────────────────────────────────────────────
 
+/// Generated JitCode body alongside the per-marker liveness prebuild
+/// tokens that `__prebuild_jitcode_liveness_*` (codegen_trace.rs)
+/// replays at install time. The prebuild ensures every per-pc `-live-`
+/// triple lands in `asm.all_liveness` before
+/// `metainterp_sd.liveness_info` snapshot, mirroring RPython
+/// `pyjitpl.py:2255 finish_setup` order.
+pub struct GeneratedJitCodeBody {
+    pub body: TokenStream,
+    pub liveness_prebuild: TokenStream,
+}
+
 pub fn try_generate_jitcode_body(body: &Expr) -> Option<TokenStream> {
-    try_generate_jitcode_body_inner(body, None)
+    try_generate_jitcode_body_inner(body, None).map(|p| p.body)
+}
+
+pub fn try_generate_jitcode_body_parts(
+    body: &Expr,
+    _config: Option<&LowererConfig>,
+) -> Option<GeneratedJitCodeBody> {
+    try_generate_jitcode_body_inner(body, _config)
 }
 
 pub fn try_generate_jitcode_body_with_config(
     config: &LowererConfig,
     body: &Expr,
 ) -> Option<TokenStream> {
+    try_generate_jitcode_body_inner(body, Some(config)).map(|p| p.body)
+}
+
+pub fn try_generate_jitcode_body_with_config_parts(
+    config: &LowererConfig,
+    body: &Expr,
+) -> Option<GeneratedJitCodeBody> {
     try_generate_jitcode_body_inner(body, Some(config))
 }
 
@@ -3790,6 +4491,9 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     };
 
     let helper_name = func.sig.ident.to_string();
+    annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
+    remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
+    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
     maybe_dump_liveness(&helper_name, &lowerer.op_metadata);
     let statements = lowerer.statements;
     Ok(Some(InlineHelperJitCode {
@@ -3861,7 +4565,7 @@ pub(crate) fn inline_helper_param_counts(func: &ItemFn) -> syn::Result<(u16, u16
 fn try_generate_jitcode_body_inner(
     body: &Expr,
     config: Option<&LowererConfig>,
-) -> Option<TokenStream> {
+) -> Option<GeneratedJitCodeBody> {
     let stmts = extract_stmts(body);
     if stmts.is_empty() {
         return None;
@@ -3872,10 +4576,24 @@ fn try_generate_jitcode_body_inner(
         lowerer.lower_stmt(stmt)?;
     }
 
+    // RPython `compute_liveness(ssarepr) → remove_repeated_live(ssarepr)
+    // → assemble()` (codewriter.py call order). `annotate_live_markers_
+    // with_liveness` materialises the per-marker fixed-point alive set
+    // onto each `LiveMarker.reads` so the repeated-live pass and the
+    // emit-time triple rewrite both consume the same ssarepr-mutated
+    // shape `liveness.py:33-79` produces.
+    annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
+    remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
+    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
     maybe_dump_liveness("jitcode_body", &lowerer.op_metadata);
+    let liveness_prebuild =
+        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
     let statements = lowerer.statements;
-    Some(quote! {
-        #(#statements)*
+    Some(GeneratedJitCodeBody {
+        body: quote! {
+            #(#statements)*
+        },
+        liveness_prebuild,
     })
 }
 
@@ -3895,10 +4613,10 @@ mod tests {
         // backward: linear adds 5 → alive={5}; marker saves {5}.
         let ops = vec![
             OpMeta::live_marker(),
-            OpMeta::linear(OpKind::BinopI, vec![5], vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[5]), vec![]),
         ];
         let result = compute_per_marker_liveness(&ops);
-        assert_eq!(result, vec![BTreeSet::from([5u16])]);
+        assert_eq!(result, vec![BTreeSet::from([Register::int(5)])]);
     }
 
     #[test]
@@ -3908,11 +4626,14 @@ mod tests {
         //           linear1 adds 3; marker saves {3, 5}.
         let ops = vec![
             OpMeta::live_marker(),
-            OpMeta::linear(OpKind::BinopI, vec![3], vec![]),
-            OpMeta::linear(OpKind::BinopI, vec![5], vec![3]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[3]), vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[5]), Register::ints(&[3])),
         ];
         let result = compute_per_marker_liveness(&ops);
-        assert_eq!(result, vec![BTreeSet::from([3u16, 5u16])]);
+        assert_eq!(
+            result,
+            vec![BTreeSet::from([Register::int(3), Register::int(5)])],
+        );
     }
 
     #[test]
@@ -3931,12 +4652,12 @@ mod tests {
             OpMeta::live_marker(),
             OpMeta::jump(l1.clone()),
             OpMeta::label_def(l2.clone()),
-            OpMeta::linear(OpKind::BinopI, vec![7], vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[7]), vec![]),
             OpMeta::label_def(l1.clone()),
-            OpMeta::linear(OpKind::BinopI, vec![9], vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[9]), vec![]),
         ];
         let result = compute_per_marker_liveness(&ops);
-        assert_eq!(result, vec![BTreeSet::from([9u16])]);
+        assert_eq!(result, vec![BTreeSet::from([Register::int(9)])]);
     }
 
     #[test]
@@ -3948,11 +4669,11 @@ mod tests {
         let ops = vec![
             OpMeta::label_def(start.clone()),
             OpMeta::live_marker(),
-            OpMeta::linear(OpKind::BinopI, vec![2], vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[2]), vec![]),
             OpMeta::jump(start.clone()),
         ];
         let result = compute_per_marker_liveness(&ops);
-        assert_eq!(result, vec![BTreeSet::from([2u16])]);
+        assert_eq!(result, vec![BTreeSet::from([Register::int(2)])]);
     }
 
     #[test]
@@ -3972,13 +4693,199 @@ mod tests {
         let else_label = format_ident!("ELSE");
         let ops = vec![
             OpMeta::live_marker(),
-            OpMeta::conditional_guard(4, else_label.clone()),
-            OpMeta::linear(OpKind::BinopI, vec![6], vec![]),
+            OpMeta::conditional_guard(Register::int(4), else_label.clone()),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[6]), vec![]),
             OpMeta::label_def(else_label.clone()),
-            OpMeta::linear(OpKind::BinopI, vec![8], vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[8]), vec![]),
         ];
         let result = compute_per_marker_liveness(&ops);
-        assert_eq!(result, vec![BTreeSet::from([4u16, 6, 8])]);
+        assert_eq!(
+            result,
+            vec![BTreeSet::from([
+                Register::int(4),
+                Register::int(6),
+                Register::int(8),
+            ])],
+        );
+    }
+
+    #[test]
+    fn liveness_marker_with_explicit_args_force_alive() {
+        // [marker_with([7]), reads=[5]]
+        // marker carries `7` as a force-alive register; backward walk
+        // adds 5 (linear) then folds 7 into alive at marker → {5, 7}.
+        let ops = vec![
+            OpMeta::live_marker_with(Register::ints(&[7]), Vec::new()),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[5]), vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(
+            result,
+            vec![BTreeSet::from([Register::int(5), Register::int(7)])],
+        );
+    }
+
+    #[test]
+    fn liveness_marker_with_target_label_unions_label_set() {
+        // [marker_with([], target=L1), reads=[3], jump L1, label_def L1, reads=[9]]
+        // pass 1: reads(9) alive={9}; label L1 saved {9}; jump L1 → alive={9};
+        //         reads(3) alive={9,3}; marker fold L1 alive={9,3}∪{9}={9,3}; saved.
+        // pass 2: stable.
+        let l1 = format_ident!("L1");
+        let ops = vec![
+            OpMeta::live_marker_with(Vec::new(), vec![l1.clone()]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[3]), vec![]),
+            OpMeta::jump(l1.clone()),
+            OpMeta::label_def(l1.clone()),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[9]), vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(
+            result,
+            vec![BTreeSet::from([Register::int(3), Register::int(9)])],
+        );
+    }
+
+    #[test]
+    fn liveness_marker_with_multiple_target_labels_unions_all_label_sets() {
+        let l1 = format_ident!("L1");
+        let l2 = format_ident!("L2");
+        let ops = vec![
+            OpMeta::live_marker_with(Vec::new(), vec![l1.clone(), l2.clone()]),
+            OpMeta::jump(l1.clone()),
+            OpMeta::label_def(l2.clone()),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[7]), vec![]),
+            OpMeta::label_def(l1.clone()),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[9]), vec![]),
+        ];
+        let result = compute_per_marker_liveness(&ops);
+        assert_eq!(
+            result,
+            vec![BTreeSet::from([Register::int(7), Register::int(9)])],
+        );
+    }
+
+    #[test]
+    fn remove_repeated_live_is_no_op_when_runs_have_one_marker() {
+        // [marker, reads=[1], marker, reads=[2]] — two markers but each is
+        // separated by a non-marker op, so no run to collapse.
+        let mut ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[1]), vec![]),
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[2]), vec![]),
+        ];
+        let mut stmts: Vec<TokenStream> = (0..ops.len())
+            .map(|i| quote! { /* op #i */ let _ = #i; })
+            .collect();
+        let before_len = ops.len();
+        remove_repeated_live(&mut ops, &mut stmts);
+        assert_eq!(ops.len(), before_len);
+        assert_eq!(stmts.len(), before_len);
+    }
+
+    #[test]
+    fn remove_repeated_live_collapses_consecutive_markers() {
+        // [marker(reads=[1]), marker(reads=[2]), label_def L, marker, reads=[3]]
+        // RPython: collapse the run before reads=[3] into a single marker
+        // carrying union({1, 2}) (label L stays as a separate op kept in
+        // place between original positions, though its position relative
+        // to the merged marker shifts to before per RPython).
+        let l = format_ident!("L");
+        let mut ops = vec![
+            OpMeta::live_marker_with(Register::ints(&[1]), Vec::new()),
+            OpMeta::live_marker_with(Register::ints(&[2]), Vec::new()),
+            OpMeta::label_def(l.clone()),
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[3]), vec![]),
+        ];
+        let mut stmts: Vec<TokenStream> = (0..ops.len()).map(|_| quote! { let _ = (); }).collect();
+        remove_repeated_live(&mut ops, &mut stmts);
+        // Resulting layout: [label_def L, merged_marker(reads={1,2}), reads=[3]].
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0].control, ControlFlowClass::LabelDef));
+        assert!(matches!(ops[1].control, ControlFlowClass::LiveMarker));
+        assert_eq!(ops[1].reads, vec![Register::int(1), Register::int(2)]);
+        assert!(matches!(ops[2].control, ControlFlowClass::Linear));
+    }
+
+    #[test]
+    fn remove_repeated_live_preserves_all_marker_target_labels() {
+        let l1 = format_ident!("L1");
+        let l2 = format_ident!("L2");
+        let mut ops = vec![
+            OpMeta::live_marker_with(Register::ints(&[1]), vec![l2.clone()]),
+            OpMeta::live_marker_with(Register::ints(&[2]), vec![l1.clone()]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[3]), vec![]),
+        ];
+        let mut stmts: Vec<TokenStream> = (0..ops.len()).map(|_| quote! { let _ = (); }).collect();
+        remove_repeated_live(&mut ops, &mut stmts);
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].control, ControlFlowClass::LiveMarker));
+        assert_eq!(ops[0].reads, vec![Register::int(1), Register::int(2)]);
+        let labels: Vec<String> = ops[0]
+            .live_target_labels
+            .iter()
+            .map(|label| label.to_string())
+            .collect();
+        assert_eq!(labels, vec!["L1".to_string(), "L2".to_string()]);
+        assert!(matches!(ops[1].control, ControlFlowClass::Linear));
+    }
+
+    #[test]
+    fn rewrite_live_marker_replaces_placeholder_with_triple() {
+        // [marker, reads=[1], writes=[2]] — backward walk records {1}
+        // alive at marker, def[2] discards 2 from alive carry-over.
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[1]), Register::ints(&[2])),
+        ];
+        let other_marker = quote! { let __probe = 1234; }.to_string();
+        let mut stmts: Vec<TokenStream> = vec![
+            quote! { let _ = __builder.live_placeholder(); },
+            quote! { let __probe = 1234; },
+        ];
+        rewrite_live_marker_statements_with_triples(&ops, &mut stmts);
+        let rendered = stmts[0].to_string();
+        assert!(
+            rendered.contains("live_placeholder_with_triple"),
+            "post-rewrite stmt[0] still uses bare live_placeholder: {rendered}"
+        );
+        // The triple must reflect the walker output: live_i = [1], live_r = [], live_f = [].
+        assert!(
+            rendered.contains("& [1u8]"),
+            "live_i array missing or wrong: {rendered}"
+        );
+        assert!(
+            rendered.contains("& []"),
+            "live_r/live_f empty arrays missing: {rendered}"
+        );
+        // Non-marker statement is untouched (token-stream equality, since
+        // `quote!` strips comments and reformats whitespace).
+        assert_eq!(stmts[1].to_string(), other_marker);
+    }
+
+    #[test]
+    fn rewrite_live_marker_emits_typed_arrays_per_bank() {
+        // [marker, reads_int=[3], reads_ref=[7]] — walker records both
+        // banks; rewrite must emit per-bank typed arrays (live_i, live_r,
+        // live_f) so `live_placeholder_with_triple` sees the right shape.
+        let ops = vec![
+            OpMeta::live_marker(),
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::int(3), Register::ref_(7)],
+                vec![],
+            ),
+        ];
+        let mut stmts: Vec<TokenStream> = vec![
+            quote! { let _ = __builder.live_placeholder(); },
+            quote! { /* op */ },
+        ];
+        rewrite_live_marker_statements_with_triples(&ops, &mut stmts);
+        let rendered = stmts[0].to_string();
+        assert!(rendered.contains("& [3u8]"), "live_i missing: {rendered}");
+        assert!(rendered.contains("& [7u8]"), "live_r missing: {rendered}");
     }
 
     #[test]
@@ -3987,10 +4894,56 @@ mod tests {
         let ops = vec![
             OpMeta::live_marker(),
             OpMeta::aux(),
-            OpMeta::linear(OpKind::BinopI, vec![1], vec![]),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[1]), vec![]),
         ];
         let result = compute_per_marker_liveness(&ops);
-        assert_eq!(result, vec![BTreeSet::from([1u16])]);
+        assert_eq!(result, vec![BTreeSet::from([Register::int(1)])]);
+    }
+
+    #[test]
+    fn get_liveness_info_filters_by_kind() {
+        // RPython `assembler.py:225-232 get_liveness_info(args, kind)` parity:
+        // a single set of typed Registers projected per bank yields the same
+        // sorted u8 indices RPython would emit into the BC_LIVE bitset.
+        let set: BTreeSet<Register> = [
+            Register::int(3),
+            Register::ref_(7),
+            Register::int(5),
+            Register::float(2),
+            Register::ref_(1),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(get_liveness_info(&set, BindingKind::Int), vec![3u8, 5u8]);
+        assert_eq!(get_liveness_info(&set, BindingKind::Ref), vec![1u8, 7u8]);
+        assert_eq!(get_liveness_info(&set, BindingKind::Float), vec![2u8]);
+    }
+
+    #[test]
+    fn liveness_triple_keeps_per_bank_sort_order() {
+        // BTreeSet<Register> orders by (kind, index); `liveness_triple` must
+        // surface that ordering as three independent sorted Vec<u8> slices,
+        // matching `assembler.py:147-157 _encode_liveness` which encodes each
+        // bank as a sorted bitset.
+        let set: BTreeSet<Register> = [
+            Register::float(9),
+            Register::int(2),
+            Register::ref_(4),
+            Register::float(1),
+            Register::int(0),
+        ]
+        .into_iter()
+        .collect();
+        let (live_i, live_r, live_f) = liveness_triple(&set);
+        assert_eq!(live_i, vec![0u8, 2u8]);
+        assert_eq!(live_r, vec![4u8]);
+        assert_eq!(live_f, vec![1u8, 9u8]);
+    }
+
+    #[test]
+    fn liveness_triple_empty_when_set_is_empty() {
+        let set: BTreeSet<Register> = BTreeSet::new();
+        assert_eq!(liveness_triple(&set), (Vec::new(), Vec::new(), Vec::new()));
     }
 
     #[test]
@@ -4047,6 +5000,48 @@ mod tests {
     fn inline_call_tokens_combined(bindings: &[Binding], result_reg: u16) -> String {
         let (call_match, post_live) = inline_call_tokens(bindings, result_reg);
         format!("{} {}", call_match, post_live)
+    }
+
+    #[test]
+    fn append_lowered_sequence_keeps_statements_and_metadata_aligned() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        let seq = LoweredSequence::new(
+            vec![quote! { __builder.load_const_i_value(1, 42); }],
+            vec![OpMeta::linear(
+                OpKind::LoadConstI,
+                Vec::new(),
+                Register::ints(&[1]),
+            )],
+        );
+        lowerer.append_lowered_sequence(seq);
+        assert_eq!(lowerer.statements.len(), lowerer.op_metadata.len());
+        assert!(matches!(lowerer.op_metadata[1].kind, OpKind::LoadConstI));
+    }
+
+    #[test]
+    fn record_known_result_metadata_reads_known_result_and_writes_nothing() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("known".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("record_known_result!(known, helper, arg)").expect("parse macro expr");
+
+        lowerer
+            .lower_record_known_result(&expr)
+            .expect("record_known_result should lower");
+
+        let meta = lowerer.op_metadata.last().expect("metadata emitted");
+        assert!(matches!(meta.kind, OpKind::RecordKnownResult));
+        assert_eq!(meta.reads, Register::ints(&[0, 1]));
+        assert!(meta.writes.is_empty());
     }
 
     #[test]

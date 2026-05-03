@@ -1243,7 +1243,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
-    let helper_name = format_ident!("__majit_inline_jitcode_{}", sig.ident);
+    let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
     let helper_body = helper.body;
     let return_reg = helper.return_reg;
@@ -1262,7 +1262,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         InlineReturnKind::Ref | InlineReturnKind::Float => 0,
     };
     let inferred_inline_builder = match helper.return_kind {
-        InlineReturnKind::Int => quote! { #helper_name as *const () },
+        InlineReturnKind::Int => quote! { #helper_with_asm_name as *const () },
         InlineReturnKind::Ref | InlineReturnKind::Float => quote! { std::ptr::null() },
     };
 
@@ -1292,12 +1292,25 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             #block
         }
 
+        // Phase 4 Epic B.3-B.4: inline helper jitcodes register
+        // per-marker liveness triples through the caller-supplied
+        // `Assembler`.  The production caller threads the driver-shared
+        // `Assembler` (see `JitDriver::shared_asm`) so all jitcodes —
+        // top-level per-pc bodies and inline helpers — share the same
+        // `all_liveness` byte stream and dedup against the same cache.
+        // RPython parity: `rpython/jit/codewriter/assembler.py` is a
+        // single object that assembles every JitCode in the program
+        // (`call.py:174-189`), so liveness offsets are always relative
+        // to one shared table.
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> majit_metainterp::JitCode {
+        pub(crate) fn #helper_with_asm_name(
+            __asm: &mut majit_metainterp::Assembler,
+        ) -> majit_metainterp::JitCode {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
             #(#ensure_param_regs)*
             #helper_body
             #helper_return
+            __builder.finalize_liveness(__asm);
             __builder.finish()
         }
 

@@ -1,13 +1,14 @@
 //! Generate JitState types (Meta, Sym) and impl from the macro configuration.
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
+use syn::ItemFn;
 
 use super::{JitInterpConfig, StateFieldKind};
 
 /// Generate the JitState types and implementation.
-pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
-    generate_state_fields_jit_state(config)
+pub fn generate_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+    generate_state_fields_jit_state(config, func)
 }
 
 /// Generate JitState types for state_fields mode (register/tape machines).
@@ -16,9 +17,10 @@ pub fn generate_jit_state(config: &JitInterpConfig) -> TokenStream {
 /// as JIT-managed values. Scalars become single OpRefs, flattened arrays become
 /// Vec<OpRef>, and virtualizable arrays (`[int; virt]`) track only a data
 /// pointer + length OpRef pair (array stays on heap, accessed via raw memory ops).
-fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
+fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let state_type = &config.state_type;
     let env_type = &config.env_type;
+    let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", func.sig.ident);
     let sf = config.state_fields.as_ref().unwrap();
 
     let unsupported_fields: Vec<String> = sf
@@ -669,73 +671,107 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             /// (`pyjitpl/mod.rs::install_canonical_liveness`) panics
             /// once any tracing setup has cloned the Arc.
             ///
-            /// KNOWN GAP vs RPython `assembler.py:146-158 write_insn`:
-            /// RPython emits a per-guard `-live-` marker whose
-            /// `(live_i, live_r, live_f)` is computed from the next
-            /// instruction's `Register` operands (`get_liveness_info`),
-            /// dedupes the entry into `all_liveness_positions`, and
-            /// patches each BC_LIVE marker's 2-byte offset to point at
-            /// that specific entry (`encode_offset`).  pyre's macro-
-            /// emitted JitCodes call `JitCodeBuilder::live_placeholder`
-            /// which writes BC_LIVE + zero offset, so every guard's
-            /// blackhole resume reads back this single canonical
-            /// entry — an over-approximation that claims all SYM
-            /// scalars / arrays / virt_arrays are live regardless of
-            /// the per-pc liveness actually demanded by the next op.
-            /// For aheui (today's sole `#[jit_interp]` user) the per-
-            /// opcode JitCode body touches every SYM slot, so the
-            /// canonical answer is also precise; the gap is purely
-            /// structural for future polymorphic state-field JIT
-            /// consumers.  Closing it requires the lowerer to track
-            /// per-pc live slot sets during JitCode emission and
-            /// register one liveness entry per distinct set, then
-            /// patch each `live_placeholder` via
-            /// `JitCodeBuilder::patch_live_offset` to point at the
-            /// matching entry — orthogonal to this canonical-bridge
-            /// shim.
+            /// This only installs the canonical liveness entry and
+            /// opcode ids.  Consumers whose macro-emitted per-pc
+            /// JitCodes can register additional liveness entries via
+            /// `JitCodeBuilder::finalize_liveness(__asm)` must build
+            /// those JitCodes before the first trace, then call
+            /// `JitDriver::sync_liveness_info_from_shared_asm()`.  That
+            /// reproduces RPython's order: all `-live-` entries are in
+            /// `asm.all_liveness` before `finish_setup` snapshots
+            /// `metainterp_sd.liveness_info`.
             #[allow(dead_code)]
             fn install_canonical_liveness(
                 &self,
                 driver: &mut majit_metainterp::JitDriver<#state_type>,
             ) {
-                let mut __asm = majit_metainterp::Assembler::new();
-                let (__live_i, __live_r, __live_f) = self.canonical_liveness_slots();
-                let mut __code_buf: ::std::vec::Vec<u8> = ::std::vec::Vec::new();
-                __asm._encode_liveness(
-                    &__live_i,
-                    &__live_r,
-                    &__live_f,
-                    &mut __code_buf,
-                );
-                // RPython `assembler.py:222 self.insns[key] = opnum`
-                // records every opcode the assembler emits during
-                // `assemble()`.  pyre's macro path skips
-                // `assembler.assemble()` (the per-arm `JitCodeBuilder`
-                // emits BC_* directly), so the canonical state-field
-                // JIT entries are registered explicitly here.  The
-                // downstream `MetaInterpStaticData::
-                // install_canonical_liveness` then calls
-                // `setup_insns(asm.insns())` (`pyjitpl.py:2227-2243`)
-                // to dynamically resolve `op_live` /
-                // `op_catch_exception` / `op_*_return` instead of a
-                // parallel hardcoded `BC_*` seeding block.
-                __asm.register_insn("live/", majit_metainterp::BC_LIVE);
-                __asm.register_insn(
-                    "catch_exception/L",
-                    majit_metainterp::BC_CATCH_EXCEPTION,
-                );
-                __asm.register_insn(
-                    "rvmprof_code/ii",
-                    majit_metainterp::BC_RVMPROF_CODE,
-                );
-                __asm.register_insn("int_return/i", majit_metainterp::BC_INT_RETURN);
-                __asm.register_insn("ref_return/r", majit_metainterp::BC_REF_RETURN);
-                __asm.register_insn(
-                    "float_return/f",
-                    majit_metainterp::BC_FLOAT_RETURN,
-                );
-                __asm.register_insn("void_return/", majit_metainterp::BC_VOID_RETURN);
-                driver.install_canonical_liveness(&__asm);
+                // Phase 4 Epic B.3-B.4: register canonical entry +
+                // canonical opcode ids into the driver-shared
+                // `Assembler` (cf. `JitDriver::shared_asm`) so per-pc
+                // factory calls dedup against the same
+                // `all_liveness_positions` and append into the same
+                // `all_liveness` byte stream.
+                let __shared_asm = driver.shared_asm();
+                {
+                    let mut __asm = __shared_asm
+                        .lock()
+                        .expect("shared_asm poisoned at install_canonical_liveness");
+                    let (__live_i, __live_r, __live_f) = self.canonical_liveness_slots();
+                    // Stage the canonical "all-live" triple for lazy
+                    // registration. The first leading-dummy `BC_LIVE`
+                    // patched by `JitCodeBuilder::finalize_liveness`
+                    // calls `ensure_canonical_liveness_offset`, which
+                    // registers the triple at the END of `all_liveness`
+                    // (after the per-marker prebuild has populated the
+                    // IR-walk-ordered head).  Matches RPython
+                    // `assembler.assemble`'s shape: per-marker `-live-`
+                    // entries occupy the early offsets; pyre's canonical
+                    // entry lands at the tail as a leading-dummy
+                    // affordance.
+                    __asm.set_canonical_liveness_triple(
+                        __live_i,
+                        __live_r,
+                        __live_f,
+                    );
+                    // RPython `assembler.py:222 self.insns[key] = opnum`
+                    // records every opcode the assembler emits during
+                    // `assemble()`.  pyre's macro path skips
+                    // `assembler.assemble()` (the per-arm `JitCodeBuilder`
+                    // emits BC_* directly), so the canonical state-field
+                    // JIT entries are registered explicitly here.  The
+                    // downstream `MetaInterpStaticData::
+                    // install_canonical_liveness` then calls
+                    // `setup_insns(asm.insns())` (`pyjitpl.py:2227-2243`)
+                    // to dynamically resolve `op_live` /
+                    // `op_catch_exception` / `op_*_return` instead of a
+                    // parallel hardcoded `BC_*` seeding block.
+                    __asm.register_insn("live/", majit_metainterp::BC_LIVE);
+                    __asm.register_insn(
+                        "catch_exception/L",
+                        majit_metainterp::BC_CATCH_EXCEPTION,
+                    );
+                    __asm.register_insn(
+                        "rvmprof_code/ii",
+                        majit_metainterp::BC_RVMPROF_CODE,
+                    );
+                    __asm.register_insn(
+                        "int_return/i",
+                        majit_metainterp::BC_INT_RETURN,
+                    );
+                    __asm.register_insn(
+                        "ref_return/r",
+                        majit_metainterp::BC_REF_RETURN,
+                    );
+                    __asm.register_insn(
+                        "float_return/f",
+                        majit_metainterp::BC_FLOAT_RETURN,
+                    );
+                    __asm.register_insn(
+                        "void_return/",
+                        majit_metainterp::BC_VOID_RETURN,
+                    );
+                    // RPython `pyjitpl.py:2255 finish_setup` builds every
+                    // JitCode and stamps every per-marker `-live-` triple
+                    // into `asm.all_liveness` *before* snapshotting
+                    // `metainterp_sd.liveness_info`. Pyre's lazy factory
+                    // can't eagerly build (pc, op) pairs, so the macro-
+                    // generated `__prebuild_jitcode_liveness_*` function
+                    // pre-registers each lowered arm's per-marker triples
+                    // into the same locked shared assembler. After the
+                    // snapshot below, trace-time
+                    // `JitCodeBuilder::finalize_liveness` only dedups —
+                    // the table never grows past this point (asserted in
+                    // `__trace_*`).
+                    #prebuild_fn_name(&mut __asm);
+                    // Safety net: ensure the canonical entry has a
+                    // registered offset before the snapshot, even if no
+                    // per-pc factory has run a `finalize_liveness` yet
+                    // to trigger the lazy registration. Subsequent calls
+                    // short-circuit via the cached
+                    // `canonical_liveness_offset`.
+                    let _ = __asm.ensure_canonical_liveness_offset();
+                    driver.install_canonical_liveness(&__asm);
+                }
             }
         }
 

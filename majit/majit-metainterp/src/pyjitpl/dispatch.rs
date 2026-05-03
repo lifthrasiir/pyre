@@ -2041,6 +2041,13 @@ where
                         }
                         _ => unreachable!(),
                     };
+                    // RPython pyjitpl.py opimpl_residual_call_*_may_force_*
+                    // writes the call result into the frame via the opcode
+                    // dispatch *before* vable_after_residual_call fires
+                    // GUARD_NOT_FORCED (rop.GUARD_NOT_FORCED reads the
+                    // post-call frame in capture_resumedata, so the result
+                    // register must already be visible there).
+                    self.set_int_reg(dst, Some(traced), Some(concrete));
                     if opcode == jitcode::BC_CALL_MAY_FORCE_INT
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -2049,7 +2056,6 @@ where
                     {
                         return TraceAction::Abort;
                     }
-                    self.set_int_reg(dst, Some(traced), Some(concrete));
                 }
             }
             // -- Ref-typed bytecodes ----
@@ -2158,6 +2164,10 @@ where
                         }
                         _ => unreachable!(),
                     };
+                    // RPython parity (see BC_CALL_MAY_FORCE_INT note above):
+                    // result is visible in the frame *before* the
+                    // virtualizable guard fires.
+                    self.set_ref_reg(dst, Some(traced), Some(concrete));
                     if opcode == jitcode::BC_CALL_MAY_FORCE_REF
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -2166,7 +2176,6 @@ where
                     {
                         return TraceAction::Abort;
                     }
-                    self.set_ref_reg(dst, Some(traced), Some(concrete));
                 }
             }
             // -- Float-typed bytecodes ---
@@ -2279,6 +2288,10 @@ where
                         }
                         _ => unreachable!(),
                     };
+                    // RPython parity (see BC_CALL_MAY_FORCE_INT note above):
+                    // result is visible in the frame *before* the
+                    // virtualizable guard fires.
+                    self.set_float_reg(dst, Some(traced), Some(concrete));
                     if opcode == jitcode::BC_CALL_MAY_FORCE_FLOAT
                         && matches!(
                             Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
@@ -2287,7 +2300,6 @@ where
                     {
                         return TraceAction::Abort;
                     }
-                    self.set_float_reg(dst, Some(traced), Some(concrete));
                 }
             }
             jitcode::BC_FLOAT_ADD => self.trace_binop_f(ctx, OpCode::FloatAdd),

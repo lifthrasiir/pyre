@@ -70,6 +70,26 @@ pub struct Assembler {
     all_liveness_positions: HashMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
+    /// State-field JIT canonical "all-live" liveness triple, set once at
+    /// `__JitMeta::install_canonical_liveness` time (RPython
+    /// `assembler.py:218-231 get_liveness_info` flat-state adaptation).
+    /// `JitCodeBuilder::live_placeholder` defers patching of the leading
+    /// `BC_LIVE` slot at the start of every per-opcode JitCode until
+    /// `finalize_liveness` runs, at which point this triple is registered
+    /// via `_register_liveness_offset` (the result is cached in
+    /// `canonical_liveness_offset`).
+    ///
+    /// RPython `assembler.assemble` itself has no concept of a canonical
+    /// entry — it only emits `-live-` markers as it walks the IR.  The
+    /// canonical entry exists in pyre because per-opcode JitCodes need a
+    /// leading `BC_LIVE` to satisfy `code[orgpc - SIZE_LIVE_OP] == op_live`
+    /// at JitCode entry; lazy registration via `live_placeholder` keeps
+    /// the `all_liveness` order encounter-driven (matching RPython's
+    /// IR-walk order) instead of pre-seeding canonical at offset 0.
+    canonical_liveness_triple: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// Cached offset returned by the first `_register_liveness_offset`
+    /// call against `canonical_liveness_triple`.
+    canonical_liveness_offset: Option<usize>,
     /// Name of the graph currently being assembled, threaded through so
     /// diagnostic panics (e.g. missing regalloc coloring) can cite the
     /// exact function.  RPython tracks this via `self.jitcode.name`
@@ -109,10 +129,43 @@ impl Assembler {
             all_liveness_length: 0,
             all_liveness_positions: HashMap::new(),
             num_liveness_ops: 0,
+            canonical_liveness_triple: None,
+            canonical_liveness_offset: None,
             current_graph_name: None,
             current_flatop_debug: None,
             current_value_kinds: None,
         }
+    }
+
+    /// Stage the state-field JIT canonical "all-live" triple for lazy
+    /// registration by `ensure_canonical_liveness_offset`.  Called once
+    /// per `__JitMeta::install_canonical_liveness` invocation, before any
+    /// per-pc JitCode is built.
+    pub fn set_canonical_liveness_triple(
+        &mut self,
+        live_i: Vec<u8>,
+        live_r: Vec<u8>,
+        live_f: Vec<u8>,
+    ) {
+        self.canonical_liveness_triple = Some((live_i, live_r, live_f));
+    }
+
+    /// Lazily register the canonical triple via
+    /// `_register_liveness_offset` (deduplicating against
+    /// `all_liveness_positions`) and cache the resulting offset.  Subsequent
+    /// calls return the cached offset.  Panics if the triple has not been
+    /// staged via `set_canonical_liveness_triple`.
+    pub fn ensure_canonical_liveness_offset(&mut self) -> usize {
+        if let Some(off) = self.canonical_liveness_offset {
+            return off;
+        }
+        let (li, lr, lf) = self
+            .canonical_liveness_triple
+            .clone()
+            .expect("canonical_liveness_triple not staged before ensure_canonical_liveness_offset");
+        let off = self._register_liveness_offset(&li, &lr, &lf);
+        self.canonical_liveness_offset = Some(off);
+        off
     }
 
     /// RPython: `Assembler.assemble` descriptor operand path
@@ -682,7 +735,28 @@ impl Assembler {
         live_f: &[u8],
         code: &mut Vec<u8>,
     ) {
-        // assembler.py:235 `key = (frozenset(live_i), frozenset(live_r),
+        let pos = self._register_liveness_offset(live_i, live_r, live_f);
+        // assembler.py:248 `encode_offset(pos, self.code)`.
+        crate::jit_codewriter::liveness::encode_offset(pos, code);
+    }
+
+    /// Registration-only sibling of [`_encode_liveness`]: deduplicate the
+    /// `(live_i, live_r, live_f)` triple into the shared `all_liveness`
+    /// table and return the entry's offset, without writing the 2-byte
+    /// `encode_offset` bytes anywhere.
+    ///
+    /// The `live/<offset>` 2-byte slot in a JitCode is patched by the
+    /// caller via `JitCodeBuilder::patch_live_offset` once the offset is
+    /// known.  Used by the deferred-patch path in
+    /// `JitCodeBuilder::finalize_liveness` (Phase 4 / Epic B.3-B.4) where
+    /// the lowerer collects per-marker triples first, then registers and
+    /// patches them in a single post-emission pass.
+    pub fn _register_liveness_offset(
+        &mut self,
+        live_i: &[u8],
+        live_r: &[u8],
+        live_f: &[u8],
+    ) -> usize {
         // frozenset(live_f))`.  `VecSet` is a Vec-backed sorted set, so
         // collecting the input into one yields the same canonical form
         // `frozenset` would have produced.
@@ -691,26 +765,43 @@ impl Assembler {
             live_r.iter().copied().collect::<VecSet<u8>>(),
             live_f.iter().copied().collect::<VecSet<u8>>(),
         );
-        let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
-            cached
-        } else {
-            let pos = self.all_liveness.len();
-            // assembler.py:241 `chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))`
-            self.all_liveness.push(key.0.len() as u8);
-            self.all_liveness.push(key.1.len() as u8);
-            self.all_liveness.push(key.2.len() as u8);
-            // assembler.py:243-247 `for live in live_i, live_r, live_f:
-            // liveness = encode_liveness(live); …`
-            for live in [key.0.as_slice(), key.1.as_slice(), key.2.as_slice()] {
-                let encoded = crate::jit_codewriter::liveness::encode_liveness(live);
-                self.all_liveness.extend_from_slice(&encoded);
-            }
-            self.all_liveness_length = self.all_liveness.len();
-            self.all_liveness_positions.insert(key, pos);
-            pos
-        };
-        // assembler.py:248 `encode_offset(pos, self.code)`.
-        crate::jit_codewriter::liveness::encode_offset(pos, code);
+        if let Some(&cached) = self.all_liveness_positions.get(&key) {
+            return cached;
+        }
+        let pos = self.all_liveness.len();
+        // assembler.py:241 `chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))`.
+        // RPython `chr(N)` raises `ValueError` for N >= 256; Rust `as u8`
+        // silently wraps. Strict assert mirrors the RPython failure mode
+        // (`assembler.py:265` constants+regs <= 256 bound) so a regression
+        // that emits a 256+-element bank surfaces here instead of being
+        // mis-encoded into a low byte the decoder later misreads.
+        let len_i = key.0.len();
+        let len_r = key.1.len();
+        let len_f = key.2.len();
+        assert!(
+            len_i < 256,
+            "live_i length {len_i} exceeds u8; assembler.py:241 chr() would ValueError"
+        );
+        assert!(
+            len_r < 256,
+            "live_r length {len_r} exceeds u8; assembler.py:241 chr() would ValueError"
+        );
+        assert!(
+            len_f < 256,
+            "live_f length {len_f} exceeds u8; assembler.py:241 chr() would ValueError"
+        );
+        self.all_liveness.push(len_i as u8);
+        self.all_liveness.push(len_r as u8);
+        self.all_liveness.push(len_f as u8);
+        // assembler.py:243-247 `for live in live_i, live_r, live_f:
+        // liveness = encode_liveness(live); …`
+        for live in [key.0.as_slice(), key.1.as_slice(), key.2.as_slice()] {
+            let encoded = crate::jit_codewriter::liveness::encode_liveness(live);
+            self.all_liveness.extend_from_slice(&encoded);
+        }
+        self.all_liveness_length = self.all_liveness.len();
+        self.all_liveness_positions.insert(key, pos);
+        pos
     }
 
     /// Encode a [`LinkArg`] source operand for `{kind}_copy` /
@@ -1545,9 +1636,20 @@ impl Assembler {
     }
 
     /// RPython: opcode key → opcode number.
-    /// RPython assembler.py:220-222: key = opname + '/' + argcodes
+    /// RPython assembler.py:220-222: key = opname + '/' + argcodes.
+    /// `setdefault(key, len(self.insns))` in Python silently grows past
+    /// 255; pyre's bytecode dispatcher reads the opnum as a single byte,
+    /// so going past 255 would silently wrap and alias two distinct
+    /// opcodes onto one. Strict assert surfaces the overflow at the first
+    /// new-opcode registration instead of as a baffling dispatch bug.
     fn get_opnum(&mut self, key: &str) -> u8 {
-        let next = self.insns.len() as u8;
+        let next = self.insns.len();
+        assert!(
+            next < 256,
+            "opcode table grew past 256 entries when registering `{key}`; \
+             a 1-byte opcode dispatcher cannot encode more"
+        );
+        let next = next as u8;
         *self.insns.entry(key.to_string()).or_insert(next)
     }
 

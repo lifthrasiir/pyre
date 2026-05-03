@@ -47,6 +47,14 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
     };
     let mut output = String::new();
 
+    // RPython warmspot.py: make_jitcodes() before pyjitpl.py finish_setup().
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
     loop {
         if pc >= program.len() {
             break;

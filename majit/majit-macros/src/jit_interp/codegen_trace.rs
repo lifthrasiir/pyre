@@ -12,6 +12,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let fn_name = &func.sig.ident;
     let trace_fn_name = format_ident!("__trace_{}", fn_name);
     let jitcode_fn_name = format_ident!("__jitcode_{}", fn_name);
+    let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
 
     let match_expr = find_dispatch_match(&func.block);
     let Some(match_expr) = match_expr else {
@@ -36,9 +37,22 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let classified = classify_arms(&match_expr.arms);
     let env_type = &config.env_type;
 
-    let jitcode_arms = classified
+    // RPython `pyjitpl.py:2255 finish_setup` builds every JitCode and
+    // stamps every `-live-` triple into `asm.all_liveness` *before*
+    // snapshotting `metainterp_sd.liveness_info`. Pyre's lazy factory
+    // can't eagerly build every (pc, op), so the macro pre-registers
+    // each lowered arm's per-marker liveness triples into the
+    // shared assembler at install time, via the generated
+    // `__prebuild_jitcode_liveness_*` function. Trace-time
+    // `JitCodeBuilder::finalize_liveness(asm)` then only dedups against
+    // those entries, preserving the snapshot's immutability invariant
+    // (asserted in `__trace_*` below).
+    let generated_arms: Vec<_> = classified
         .iter()
-        .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &promote_preamble));
+        .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &promote_preamble))
+        .collect();
+    let jitcode_arms = generated_arms.iter().map(|(arm, _)| arm);
+    let liveness_prebuilds = generated_arms.iter().map(|(_, prebuild)| prebuild);
 
     let label_closure = quote! { |_unused_pc| 0usize };
     let trace_jitcode_call = if config.virtualizable_decl.is_some() {
@@ -72,6 +86,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let trace_fn_body = quote! {
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #trace_fn_name(
+            __shared_asm: &::std::sync::Arc<::std::sync::Mutex<majit_metainterp::Assembler>>,
             __ctx: &mut majit_metainterp::TraceCtx,
             __sym: &mut __JitSym,
             program: &#env_type,
@@ -87,7 +102,35 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             // recording immediate operands, so pass `pc + 1` here instead
             // of the opcode's address.
             let __jit_pc = pc + 1;
-            let Some(__jitcode) = #jitcode_fn_name(program, __jit_pc, __op) else {
+            // Lock the driver-shared `Assembler` only across the
+            // `JitCode` build (which calls `finalize_liveness` to register
+            // per-marker triples into `all_liveness`).  RPython does not
+            // hold any assembler lock during tracing — `make_jitcodes()`
+            // finishes before the metainterp starts (`pyjitpl.py:2255
+            // finish_setup`).  Releasing before `trace_jitcode_observer`
+            // avoids a deadlock if a recursive portal/residual callback
+            // re-enters this trace path on the same driver thread.
+            let __jitcode_opt = {
+                let mut __asm_guard = __shared_asm
+                    .lock()
+                    .expect("shared_asm poisoned in __trace_* JitCode build");
+                // RPython `pyjitpl.py:2255-2264` builds all jitcodes before
+                // `finish_setup` snapshots `metainterp_sd.liveness_info`.
+                // Runtime trace-time factory calls may rebuild/dedup, but
+                // must not append new liveness entries past that snapshot.
+                let __liveness_len_before = __asm_guard.all_liveness().len();
+                let __jitcode_opt = #jitcode_fn_name(&mut *__asm_guard, program, __jit_pc, __op);
+                assert_eq!(
+                    __asm_guard.all_liveness().len(),
+                    __liveness_len_before,
+                    "__trace_* JitCode build grew shared_asm.all_liveness past \
+                     staticdata.liveness_info snapshot — pre-build every reachable \
+                     (pc, op) JitCode and call JitDriver::sync_liveness_info_from_shared_asm() \
+                     before tracing starts"
+                );
+                __jitcode_opt
+            };
+            let Some(__jitcode) = __jitcode_opt else {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!(
                         "[jit] no jitcode for pc={} op={}",
@@ -124,6 +167,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     quote! {
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #jitcode_fn_name(
+            __asm: &mut majit_metainterp::Assembler,
             program: &#env_type,
             pc: usize,
             __op: u8,
@@ -131,6 +175,19 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             match __op {
                 #(#jitcode_arms)*
             }
+        }
+
+        /// Pre-register every lowered arm's per-marker liveness triple
+        /// into the driver-shared `Assembler`, mirroring RPython
+        /// `pyjitpl.py:2255 finish_setup`'s "all `-live-` entries land
+        /// in `asm.all_liveness` before the snapshot" invariant.
+        /// Invoked from `__JitMeta::install_canonical_liveness` exactly
+        /// once at install time, before
+        /// `JitDriver::install_canonical_liveness` snapshots
+        /// `metainterp_sd.liveness_info`.
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        fn #prebuild_fn_name(__asm: &mut majit_metainterp::Assembler) {
+            #(#liveness_prebuilds)*
         }
 
         #trace_fn_body
@@ -141,31 +198,53 @@ fn generate_jitcode_arm(
     arm: &super::classify::ClassifiedArm,
     config: &LowererConfig,
     promote_preamble: &TokenStream,
-) -> TokenStream {
+) -> (TokenStream, TokenStream) {
     let pat = &arm.pat;
+    let mut liveness_prebuild = quote! {};
     let build = match &arm.pattern {
         ArmPattern::Lowerable => {
             // Try config-aware lowering first, fall back to basic lowering
-            let code =
-                jitcode_lower::try_generate_jitcode_body_with_config(config, &arm.original_body)
-                    .or_else(|| jitcode_lower::try_generate_jitcode_body(&arm.original_body));
+            let code = jitcode_lower::try_generate_jitcode_body_with_config_parts(
+                config,
+                &arm.original_body,
+            )
+            .or_else(|| jitcode_lower::try_generate_jitcode_body_parts(&arm.original_body, None));
 
             match code {
                 // RPython `assembler.py:146-158` emits a `live/<offset>`
                 // marker ahead of every guard-bearing instruction during
-                // codewriter assemble.  The placeholder offset (0) points
-                // at the per-`__JitMeta` canonical liveness entry installed
-                // by `__JitMeta::install_canonical_liveness`; the dispatcher
-                // records BC_LIVE per `blackhole.py:950 bhimpl_live`, and
-                // the snapshot path decodes that entry via
+                // codewriter assemble.  Each marker's 2-byte offset is
+                // patched per-marker via `JitCodeBuilder::finalize_liveness`
+                // (Phase 4 / Epic B.3-B.4 deferred-patch flow): the lowered
+                // body's `live_placeholder_with_triple(li, lr, lf)` records
+                // each marker's per-pc liveness triple from
+                // `compute_per_marker_liveness` (B.2 walker output), and
+                // the post-emit `finalize_liveness(__asm)` registers each
+                // triple via `Assembler::_register_liveness_offset` and
+                // rewrites the BC_LIVE 2-byte slot to point at the dedup'd
+                // entry.  The dispatcher then records BC_LIVE per
+                // `blackhole.py:950 bhimpl_live` and the snapshot path
+                // decodes the resulting entry via
                 // `MIFrame::get_list_of_active_boxes`.
-                Some(code) => quote! {
-                    let mut __builder = majit_metainterp::JitCodeBuilder::new();
-                    let _live_offset_patch = __builder.live_placeholder();
-                    #promote_preamble
-                    #code
-                    Some(__builder.finish())
-                },
+                //
+                // The leading `live_placeholder()` (without per-pc triple)
+                // sits at the very start of the JitCode and is meant to
+                // satisfy the `code[orgpc - SIZE_LIVE_OP] == op_live`
+                // assertion that fires before the first lowered op.  It
+                // resolves to the canonical entry (offset 0) registered by
+                // `__JitMeta::install_canonical_liveness`.
+                Some(generated) => {
+                    let body = generated.body;
+                    liveness_prebuild = generated.liveness_prebuild;
+                    quote! {
+                        let mut __builder = majit_metainterp::JitCodeBuilder::new();
+                        let _live_offset_patch = __builder.live_placeholder();
+                        #promote_preamble
+                        #body
+                        __builder.finalize_liveness(__asm);
+                        Some(__builder.finish())
+                    }
+                }
                 None => quote! { None },
             }
         }
@@ -192,7 +271,7 @@ fn generate_jitcode_arm(
         }
     };
 
-    quote! { #pat => { #build }, }
+    (quote! { #pat => { #build }, }, liveness_prebuild)
 }
 
 fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch> {

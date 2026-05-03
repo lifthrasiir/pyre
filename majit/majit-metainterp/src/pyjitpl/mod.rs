@@ -1603,6 +1603,28 @@ impl<M: Clone> MetaInterp<M> {
         staticdata.install_canonical_liveness(asm);
     }
 
+    /// Phase 4 Epic B.3-B.4: copy a freshly-snapshotted `all_liveness`
+    /// byte stream into `staticdata.liveness_info` without re-running
+    /// the full `install_canonical_liveness` insn-id seeding.
+    ///
+    /// Invoked from `JitDriver::sync_liveness_info_from_shared_asm`
+    /// after the macro-emitted `__JitMeta::install_canonical_liveness`
+    /// has registered the canonical entry into the driver-shared
+    /// `Assembler`.  Mirrors `pyjitpl.py:2264 self.liveness_info =
+    /// "".join(asm.all_liveness)` for the post-canonical-entry state.
+    ///
+    /// The same single-owner `Arc::get_mut` invariant as
+    /// `install_canonical_liveness` applies: callers must finish any
+    /// liveness-producing factory builds and sync before tracing clones
+    /// `staticdata`.
+    pub fn sync_liveness_info(&mut self, all_liveness: &[u8]) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::sync_liveness_info called after `staticdata` was cloned; \
+             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+        );
+        staticdata.liveness_info = all_liveness.to_vec();
+    }
+
     /// Install a fresh [`ActiveTraceSession`] seeded with the frontend
     /// trace metadata.  Called from `force_start_tracing` /
     /// `bound_reached` / `on_back_edge_typed` and the bridge-resume

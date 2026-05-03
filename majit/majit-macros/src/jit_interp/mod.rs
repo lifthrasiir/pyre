@@ -677,7 +677,7 @@ fn parse_helpers_list(input: ParseStream) -> syn::Result<Vec<CallEntry>> {
 /// Main entry point: transform the function with JIT support.
 pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStream {
     let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
-    let state_impl = codegen_state::generate_jit_state(&config);
+    let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
     let transformed_fn = transform_function(&config, &func);
 
@@ -708,12 +708,23 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __env: &#env_type,
             __pc: usize,
         ) {
+            // Phase 4 Epic B.3-B.4: clone the driver-shared `Assembler`
+            // Arc before the `merge_point` mutable borrow so the trace
+            // closure can forward it into `#trace_fn_name`.  The lock is
+            // acquired *inside* `#trace_fn_name`, scoped tightly around
+            // the `JitCode` build only — `trace_jitcode_observer` runs
+            // outside the lock to mirror RPython's `pyjitpl.py:2255
+            // finish_setup` ordering (assembler is frozen before any
+            // tracing observation runs) and to avoid a deadlock if a
+            // recursive portal/residual callback re-enters this trace
+            // path on the same driver thread.
+            let __shared_asm = __driver.shared_asm();
             __driver.merge_point(|__ctx, __sym| {
                 use majit_metainterp::JitCodeSym;
                 if __sym.trace_started && __pc == __sym.loop_header_pc() {
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
-                let __result = #trace_fn_name(__ctx, __sym, __env, __pc);
+                let __result = #trace_fn_name(&__shared_asm, __ctx, __sym, __env, __pc);
                 __sym.trace_started = true;
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check
                 // AFTER executing the step (RPython _interpret loop order).

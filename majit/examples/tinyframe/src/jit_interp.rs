@@ -45,6 +45,14 @@ fn mainloop(
         state.regs[r] = v;
     }
 
+    // RPython warmspot.py: make_jitcodes() before pyjitpl.py finish_setup().
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
     loop {
         jit_merge_point!();
         let opcode = program[pc];

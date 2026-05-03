@@ -922,9 +922,10 @@ fn fib(n: i64) -> i64 {
     #[test]
     fn specialize_legacy_graph_unported_opkind_propagates_failloud() {
         let _lock = anchor_lock();
-        // Graph carrying an unported OpKind (Call) must surface the
-        // Slice 1b followup pending message — confirms the adapter's
-        // fail-loud flows through the full specialize pipeline.
+        // Graph carrying a still-fail-loud OpKind (Call::Indirect —
+        // requires rclass.rs lowering) must surface the variant's
+        // fail-loud message — confirms the adapter's TyperError flows
+        // through the full specialize pipeline.
         let mut annotations = AnnotationState::new();
         annotations.set(ValueId(1), ValueType::Int);
         annotations.set(ValueId(2), ValueType::Int);
@@ -936,8 +937,9 @@ fn fib(n: i64) -> i64 {
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["foo".into()],
+                    target: crate::model::CallTarget::Indirect {
+                        trait_root: "MyTrait".into(),
+                        method_name: "do_it".into(),
                     },
                     args: vec![ValueId(1)],
                     result_ty: ValueType::Int,
@@ -962,8 +964,8 @@ fn fib(n: i64) -> i64 {
             .expect_err("unported OpKind must surface as TyperError");
         let msg = format!("{err}");
         assert!(
-            msg.contains("Call") && msg.contains("Slice 1b followup"),
-            "fail-loud must propagate the variant + slice tag, got: {msg}"
+            msg.contains("Indirect") && msg.contains("rclass"),
+            "fail-loud must propagate the variant + rclass tag, got: {msg}"
         );
     }
 

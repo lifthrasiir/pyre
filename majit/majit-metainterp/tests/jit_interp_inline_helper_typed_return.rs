@@ -65,7 +65,16 @@ fn wrapped_int_identity(value: i64) -> i64 {
 
 #[test]
 fn jit_inline_ref_identity_generates_valid_jitcode() {
-    let jitcode = __majit_inline_jitcode_inline_ref_identity();
+    // Phase 4 Epic B.3-B.4: inline helper jitcodes register their
+    // per-marker liveness triples into an `Assembler` passed in by the
+    // caller (the production path uses the driver-shared one).  Tests
+    // that only inspect structural properties pass a freshly-allocated
+    // `Assembler`; the resulting BC_LIVE 2-byte slots are scoped to that
+    // local table — ref/float helpers below have no guards/markers, so
+    // there's nothing for the test path to decode beyond the trailing
+    // return.
+    let mut asm = majit_metainterp::Assembler::new();
+    let jitcode = __majit_inline_jitcode_inline_ref_identity_with_asm(&mut asm);
     // RPython jitcode.py:37-39 c_num_regs_i/r/f
     assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
     assert!(jitcode.c_num_regs_r >= 1, "at least 1 ref register needed");
@@ -80,7 +89,8 @@ fn jit_inline_ref_identity_generates_valid_jitcode() {
 
 #[test]
 fn jit_inline_float_identity_generates_valid_jitcode() {
-    let jitcode = __majit_inline_jitcode_inline_float_identity();
+    let mut asm = majit_metainterp::Assembler::new();
+    let jitcode = __majit_inline_jitcode_inline_float_identity_with_asm(&mut asm);
     assert_eq!(jitcode.c_num_regs_i, 0, "no int registers needed");
     assert_eq!(jitcode.c_num_regs_r, 0, "no ref registers needed");
     assert!(
@@ -112,7 +122,8 @@ fn jit_inline_float_identity_keeps_interpreter_behavior() {
 
 #[test]
 fn jit_inline_mixed_identity_generates_dense_per_kind_jitcode() {
-    let jitcode = __majit_inline_jitcode_inline_mixed_int_identity();
+    let mut asm = majit_metainterp::Assembler::new();
+    let jitcode = __majit_inline_jitcode_inline_mixed_int_identity_with_asm(&mut asm);
     assert_eq!(jitcode.c_num_regs_i, 1, "one int register needed");
     assert_eq!(jitcode.c_num_regs_r, 1, "one ref register needed");
     assert_eq!(jitcode.c_num_regs_f, 1, "one float register needed");
@@ -211,7 +222,8 @@ fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_poli
 fn jit_inline_ref_identity_works_through_jitcode_builder() {
     use majit_metainterp::JitCodeBuilder;
 
-    let sub_jitcode = __majit_inline_jitcode_inline_ref_identity();
+    let mut asm = majit_metainterp::Assembler::new();
+    let sub_jitcode = __majit_inline_jitcode_inline_ref_identity_with_asm(&mut asm);
     let (sub_return_kind, _sub_return_reg) = sub_jitcode
         .trailing_return_info()
         .expect("ref helper should end in ref_return");
@@ -246,7 +258,8 @@ fn jit_inline_ref_identity_works_through_jitcode_builder() {
 fn jit_inline_float_identity_works_through_jitcode_builder() {
     use majit_metainterp::JitCodeBuilder;
 
-    let sub_jitcode = __majit_inline_jitcode_inline_float_identity();
+    let mut asm = majit_metainterp::Assembler::new();
+    let sub_jitcode = __majit_inline_jitcode_inline_float_identity_with_asm(&mut asm);
     let (sub_return_kind, _sub_return_reg) = sub_jitcode
         .trailing_return_info()
         .expect("float helper should end in float_return");
@@ -279,7 +292,8 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     use majit_metainterp::JitCodeBuilder;
     use majit_metainterp::blackhole::BlackholeInterpreter;
 
-    let sub_jitcode = __majit_inline_jitcode_inline_mixed_int_identity();
+    let mut asm = majit_metainterp::Assembler::new();
+    let sub_jitcode = __majit_inline_jitcode_inline_mixed_int_identity_with_asm(&mut asm);
     let (sub_return_kind, sub_return_reg) = sub_jitcode
         .trailing_return_info()
         .expect("mixed helper should end in int_return");

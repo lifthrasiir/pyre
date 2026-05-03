@@ -117,6 +117,41 @@ pub struct JitCodeBuilder {
     /// `num_regs[kind]` — so freeze restores parity with the upstream
     /// invariant.
     num_regs_frozen: bool,
+    /// Phase 4 / Epic B.3-B.4 deferred-patch table populated by
+    /// `live_placeholder_with_triple`. Each entry pairs a `live/<offset>`
+    /// patch site (returned by `live_placeholder`) with the per-marker
+    /// `(live_i, live_r, live_f)` triple computed by the macro lowerer's
+    /// liveness walker (`compute_per_marker_liveness`).
+    ///
+    /// `finalize_liveness(asm)` walks this table once after body
+    /// emission, registers each triple via
+    /// `Assembler::_register_liveness_offset` (which dedupes against
+    /// `all_liveness_positions`), and rewrites the BC_LIVE 2-byte slot
+    /// via `patch_live_offset` so each marker points at its specific
+    /// entry instead of the canonical "everything-alive" entry at
+    /// offset 0.
+    ///
+    /// Mirrors the in-line `live` path (`assembler.py:146-158`) for
+    /// callers that cannot supply an `&mut Assembler` at body-emit time —
+    /// e.g. the macro-emitted per-pc JitCode factory which builds bodies
+    /// before the driver-shared `Assembler` is locked.
+    pending_live_triples: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// Phase 4 / Epic B.3-B.4: positions of leading-dummy `BC_LIVE` slots
+    /// (`live_placeholder` without an explicit triple) whose 2-byte offset
+    /// must be back-patched to the assembler's canonical "all-live" entry
+    /// during `finalize_liveness`.
+    ///
+    /// Routing the leading dummy through deferred patching keeps the
+    /// canonical entry from being pre-seeded at `all_liveness` offset 0
+    /// before any real `-live-` marker is registered.  Per-marker triples
+    /// (registered via `liveness_prebuild_tokens`'s direct
+    /// `_register_liveness_offset` calls) get the IR-walk-ordered offsets
+    /// at the head of `all_liveness`, matching `assembler.assemble`'s
+    /// shape; the canonical entry lands at the tail (or wherever
+    /// `ensure_canonical_liveness_offset` first registers it).  The
+    /// leading dummy then back-patches its 2-byte slot to that tail
+    /// offset rather than assuming offset 0.
+    pending_canonical_patches: Vec<usize>,
 }
 
 /// Register-file kind for const_patches entries.
@@ -920,13 +955,27 @@ impl JitCodeBuilder {
         asm._encode_liveness(live_i, live_r, live_f, &mut self.code);
     }
 
-    /// RPython assembler.py: emit `live/` followed by a 2-byte offset into
-    /// the shared all_liveness byte string. Returns the operand offset so the
-    /// caller can patch it after computing liveness.
-    pub fn live_placeholder(&mut self) -> usize {
+    /// Emit the raw `BC_LIVE` opcode + 2-byte zero offset, returning the
+    /// operand offset so a caller can record the patch for one of the
+    /// deferred-patch lists.
+    fn write_live_placeholder_bytes(&mut self) -> usize {
         self.write_insn("live/");
         let patch_offset = self.code.len();
         self.push_u16(0);
+        patch_offset
+    }
+
+    /// RPython assembler.py: emit `live/` followed by a 2-byte offset into
+    /// the shared all_liveness byte string.  Used for the leading dummy
+    /// `BC_LIVE` slot at the start of every per-pc JitCode (which has no
+    /// per-marker triple of its own — it points at the canonical "all
+    /// live" entry).  The 2-byte slot is written as `0x0000` here and
+    /// back-patched during [`finalize_liveness`] via
+    /// `Assembler::ensure_canonical_liveness_offset`.  Returns the operand
+    /// offset so callers may chain into a custom patcher if needed.
+    pub fn live_placeholder(&mut self) -> usize {
+        let patch_offset = self.write_live_placeholder_bytes();
+        self.pending_canonical_patches.push(patch_offset);
         patch_offset
     }
 
@@ -934,6 +983,102 @@ impl JitCodeBuilder {
         let bytes = offset.to_le_bytes();
         self.code[patch_offset] = bytes[0];
         self.code[patch_offset + 1] = bytes[1];
+    }
+
+    /// Phase 4 / Epic B.3-B.4 deferred-patch entry point: emit a `live/`
+    /// opcode followed by a 2-byte placeholder offset (mirroring
+    /// [`live_placeholder`]) and record the per-marker
+    /// `(live_i, live_r, live_f)` triple in `pending_live_triples` so
+    /// [`finalize_liveness`] can later resolve and patch the offset.
+    ///
+    /// Each `live_*` slice must be a sorted+dedup register-set view
+    /// matching the macro lowerer's
+    /// `compute_per_marker_liveness` output (`liveness.py:33-79`).  Pyre
+    /// renormalises in `_register_liveness_offset`, so callers may pass
+    /// arbitrary order; passing the lowerer's already-sorted output
+    /// matches RPython's `liveness.py:148 live = sorted(live)` shape.
+    pub fn live_placeholder_with_triple(
+        &mut self,
+        live_i: &[u8],
+        live_r: &[u8],
+        live_f: &[u8],
+    ) -> usize {
+        let patch_offset = self.write_live_placeholder_bytes();
+        self.pending_live_triples.push((
+            patch_offset,
+            live_i.to_vec(),
+            live_r.to_vec(),
+            live_f.to_vec(),
+        ));
+        patch_offset
+    }
+
+    /// Phase 4 / Epic B.3-B.4 finalisation step: register every pending
+    /// per-marker liveness triple into `asm` (deduplicating against the
+    /// shared `all_liveness_positions`) and rewrite each corresponding
+    /// `live/<offset>` BC_LIVE slot via [`patch_live_offset`].
+    ///
+    /// Mirrors `assembler.py:146-158`'s per-marker
+    /// `_encode_liveness(live_i, live_r, live_f) → encode_offset(pos)`
+    /// pair, deferred to a single post-emit pass for callers (the
+    /// `#[jit_interp]` per-pc JitCode factory) that can only acquire the
+    /// driver-shared `&mut Assembler` after the body is built.
+    ///
+    /// Idempotent: drains `pending_live_triples` and
+    /// `pending_canonical_patches` so a second call is a no-op.
+    ///
+    /// Within a single call, canonical patches are processed before
+    /// per-marker triples; this lets `ensure_canonical_liveness_offset`
+    /// short-circuit to the cached offset on every subsequent invocation.
+    /// At the macro level the per-pc liveness *prebuild*
+    /// (`liveness_prebuild_tokens` in `jitcode_lower.rs`) directly calls
+    /// `_register_liveness_offset` for every walker-emitted marker before
+    /// any `finalize_liveness` runs, so by the time the first leading
+    /// dummy fires (at trace time) per-marker triples already populate
+    /// `all_liveness` and the safety-net
+    /// `ensure_canonical_liveness_offset` call in
+    /// `install_canonical_liveness` has appended canonical at the end.
+    /// This matches RPython `assembler.assemble`'s shape: real `-live-`
+    /// markers occupy the IR-walk-ordered positions; the canonical
+    /// "all-live" entry exists only as a pyre-side affordance for the
+    /// leading-dummy assertion.
+    ///
+    /// If `pending_canonical_patches` is non-empty,
+    /// `Assembler::ensure_canonical_liveness_offset` must succeed (i.e.
+    /// `set_canonical_liveness_triple` must have been called earlier);
+    /// the test paths that emit a leading dummy without ever calling
+    /// `finalize_liveness` keep the original `0x0000` placeholder bytes
+    /// in `code` and never observe this assertion.
+    pub fn finalize_liveness(
+        &mut self,
+        asm: &mut majit_translate::jit_codewriter::assembler::Assembler,
+    ) {
+        let canonical_patches = std::mem::take(&mut self.pending_canonical_patches);
+        if !canonical_patches.is_empty() {
+            let canonical_off = asm.ensure_canonical_liveness_offset();
+            assert!(
+                canonical_off < (1 << 16),
+                "canonical all_liveness offset {} exceeds 2-byte encoding",
+                canonical_off
+            );
+            let canonical_off_u16 = canonical_off as u16;
+            for patch_offset in canonical_patches {
+                self.patch_live_offset(patch_offset, canonical_off_u16);
+            }
+        }
+        for (patch_offset, live_i, live_r, live_f) in std::mem::take(&mut self.pending_live_triples)
+        {
+            let pos = asm._register_liveness_offset(&live_i, &live_r, &live_f);
+            // assembler.py:248 `encode_offset(pos, self.code)` — pyre
+            // patches the already-emitted 2-byte slot in place rather
+            // than appending; the bit pattern is identical.
+            assert!(
+                pos < (1 << 16),
+                "all_liveness offset {} exceeds 2-byte encoding",
+                pos
+            );
+            self.patch_live_offset(patch_offset, pos as u16);
+        }
     }
 
     /// RPython blackhole.py:969 `catch_exception/L`.
@@ -1015,7 +1160,16 @@ impl JitCodeBuilder {
                 .push((jdindex_offset, ConstKind::Int, jdindex_const));
         }
         for list in [greens_i, greens_r, greens_f, reds_i, reds_r, reds_f] {
-            self.push_u8(list.len() as u8);
+            // RPython `assembler.py` encodes list lengths as a single byte
+            // (`chr(len(lst))`); going past 255 silently wraps in Rust and
+            // mis-encodes the per-list count.  Strict assert so the wrap
+            // surfaces as a hard fail.
+            let len = list.len();
+            assert!(
+                len < 256,
+                "jit_merge_point list length {len} exceeds u8 byte encoding"
+            );
+            self.push_u8(len as u8);
             for &idx in list {
                 self.push_u8(idx);
             }
@@ -1519,7 +1673,12 @@ impl JitCodeBuilder {
         self.start_instr(bc);
         self.push_u16(first_reg);
         self.push_u16(fn_ptr_idx);
-        self.push_u8(args.len() as u8);
+        let arg_count = args.len();
+        assert!(
+            arg_count < 256,
+            "conditional_call arg list length {arg_count} exceeds u8 byte encoding"
+        );
+        self.push_u8(arg_count as u8);
         for arg in args {
             self.push_u8(arg.kind as u8);
         }
@@ -1540,7 +1699,12 @@ impl JitCodeBuilder {
         self.start_instr(bc);
         self.push_u16(value_reg);
         self.push_u16(fn_ptr_idx);
-        self.push_u8(args.len() as u8);
+        let arg_count = args.len();
+        assert!(
+            arg_count < 256,
+            "conditional_call_value arg list length {arg_count} exceeds u8 byte encoding"
+        );
+        self.push_u8(arg_count as u8);
         for arg in args {
             self.push_u8(arg.kind as u8);
         }
@@ -2701,5 +2865,88 @@ mod tests {
         // 256 slots overflows the u8 register-index encoding upstream
         // jitcode bytes are written through (assembler.py:241).
         let _ = super::live_slots_for_state_field_jit(256, &[], 0);
+    }
+
+    #[test]
+    fn live_placeholder_with_triple_records_then_finalize_patches() {
+        // B.3-B.4 deferred-patch round-trip: `live_placeholder_with_triple`
+        // emits the same `live/<00 00>` shape as `live_placeholder` but
+        // additionally captures the triple in `pending_live_triples`.
+        // `finalize_liveness` then registers each triple via
+        // `_register_liveness_offset` and rewrites the BC_LIVE 2-byte slot
+        // to point at the dedup'd entry — equivalent to the in-line
+        // `live(asm, ...)` encoding shape, deferred.
+        let mut asm = Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+
+        let _ = builder.live_placeholder_with_triple(&[0, 1], &[2], &[]);
+        // Pre-finalize: BC_LIVE byte + zero placeholder offset.
+        assert_eq!(builder.code.len(), 1 + 2);
+        assert_eq!(builder.code[1], 0);
+        assert_eq!(builder.code[2], 0);
+        assert_eq!(builder.pending_live_triples.len(), 1);
+
+        builder.finalize_liveness(&mut asm);
+        // Post-finalize: drained pending list, BC_LIVE slot patched to
+        // point at the freshly-registered entry (offset 0 because it's
+        // the first entry registered).
+        assert!(builder.pending_live_triples.is_empty());
+        assert_eq!(u16::from_le_bytes([builder.code[1], builder.code[2]]), 0);
+
+        // A `live(asm, ...)` call with the same triple must dedup to the
+        // same offset — no additional `all_liveness` growth.
+        let pre_len = asm.all_liveness().len();
+        let mut builder2 = JitCodeBuilder::new();
+        builder2.live(&mut asm, &[0, 1], &[2], &[]);
+        assert_eq!(asm.all_liveness().len(), pre_len);
+        assert_eq!(u16::from_le_bytes([builder2.code[1], builder2.code[2]]), 0);
+    }
+
+    #[test]
+    fn finalize_liveness_dedups_distinct_then_repeated_triples() {
+        // Multiple pending triples: first distinct entries grow
+        // all_liveness; repeats reuse offsets (assembler.py:235-238 dedup).
+        let mut asm = Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+
+        let pi0 = builder.live_placeholder_with_triple(&[0], &[], &[]);
+        let pi1 = builder.live_placeholder_with_triple(&[5], &[], &[]);
+        let pi2 = builder.live_placeholder_with_triple(&[0], &[], &[]); // repeat of pi0
+
+        assert_eq!(builder.pending_live_triples.len(), 3);
+        builder.finalize_liveness(&mut asm);
+
+        let off0 = u16::from_le_bytes([builder.code[pi0], builder.code[pi0 + 1]]);
+        let off1 = u16::from_le_bytes([builder.code[pi1], builder.code[pi1 + 1]]);
+        let off2 = u16::from_le_bytes([builder.code[pi2], builder.code[pi2 + 1]]);
+
+        assert_eq!(off0, 0, "first distinct entry sits at offset 0");
+        assert_eq!(off1, 4, "second entry follows 3-header + 1 payload");
+        assert_eq!(off2, off0, "repeat triple dedups to first entry");
+    }
+
+    #[test]
+    fn finalize_liveness_is_idempotent_after_drain() {
+        // Calling `finalize_liveness` twice must not double-patch (the
+        // pending list is drained on first call; the second call is a
+        // no-op).  Guards against accidental re-entry from caller flows
+        // that loop or chain finalisation.
+        let mut asm = Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        let patch = builder.live_placeholder_with_triple(&[3], &[], &[]);
+        builder.finalize_liveness(&mut asm);
+        let snapshot = builder.code.clone();
+        let liveness_snapshot_len = asm.all_liveness().len();
+
+        builder.finalize_liveness(&mut asm);
+        assert_eq!(builder.code, snapshot, "second finalize is a no-op");
+        assert_eq!(
+            asm.all_liveness().len(),
+            liveness_snapshot_len,
+            "second finalize does not re-register"
+        );
+        // Sanity: patched offset is preserved.
+        let off = u16::from_le_bytes([builder.code[patch], builder.code[patch + 1]]);
+        assert_eq!(off, 0);
     }
 }

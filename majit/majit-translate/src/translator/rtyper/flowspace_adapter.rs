@@ -63,8 +63,8 @@ use std::rc::Rc;
 
 use crate::flowspace::model::{
     self as flowspace_model, Block as FlowspaceBlock, BlockRef, ConstValue, Constant,
-    FunctionGraph as FlowspaceGraph, Hlvalue, Link as FlowspaceLink, SpaceOperation as FlowspaceOp,
-    Variable, c_last_exception,
+    FunctionGraph as FlowspaceGraph, Hlvalue, HostObject, Link as FlowspaceLink,
+    SpaceOperation as FlowspaceOp, Variable, c_last_exception,
 };
 use crate::jit_codewriter::annotation_state::AnnotationState;
 use crate::model::{
@@ -445,6 +445,59 @@ pub fn translate_op(
         | OpKind::GuardValue { .. }
         | OpKind::VableForce { .. } => Ok(Vec::new()),
 
+        // ─── Skipped: post-rtyper jtransform-emitted variants ───
+        // RPython's jtransform pass (`rpython/jit/codewriter/jtransform.py`)
+        // runs *after* the rtyper has already lowered every high-level op.
+        // The variants below correspond to opcodes jtransform synthesises
+        // on top of an already-rtyped graph, so they cannot legitimately
+        // appear at the rtyper input. Pyre's IR shares one `OpKind` enum
+        // across both pre- and post-rtyper stages for storage convenience;
+        // the flowspace adapter sees the rtyper input shape and treats
+        // these variants as opaque pass-throughs (no SSA result the
+        // downstream flowspace consumer would query). A regression that
+        // routes one of these through the adapter from the front-end side
+        // is caught by the SSA-result-undefined invariant downstream
+        // rather than masquerading as a broken rtype dispatch here.
+        //
+        // Vable family (`getfield_vable_*` / `setfield_vable_*` / etc.)
+        // — `jtransform.py:651-927` rewrites virtualizable accesses
+        // post-rtype.
+        OpKind::VableFieldRead { .. }
+        | OpKind::VableFieldWrite { .. }
+        | OpKind::VableArrayRead { .. }
+        | OpKind::VableArrayWrite { .. } => Ok(Vec::new()),
+        // Call effect classification (CallElidable / CallResidual /
+        // CallMayForce) — `jtransform.py:414-435 rewrite_call()` splits
+        // args into three ListOfKind and emits these specialised opnames.
+        OpKind::CallElidable { .. } | OpKind::CallResidual { .. } | OpKind::CallMayForce { .. } => {
+            Ok(Vec::new())
+        }
+        // Call kind classification — `jtransform.py:473-482` /
+        // `:522-534` for inline_call_* / recursive_call_*.
+        OpKind::InlineCall { .. } | OpKind::RecursiveCall { .. } => Ok(Vec::new()),
+        // JIT builtin ops (`jtransform.py:1731-1743`):
+        // `jit_debug` / `*_assert_green` / `current_trace_length` /
+        // `*_isconstant` / `*_isvirtual`.
+        OpKind::JitDebug { .. }
+        | OpKind::AssertGreen { .. }
+        | OpKind::CurrentTraceLength
+        | OpKind::IsConstant { .. }
+        | OpKind::IsVirtual { .. } => Ok(Vec::new()),
+        // Conditional call ops (`jtransform.py:1665-1688`):
+        // `conditional_call_*_v` / `conditional_call_value_*_*`.
+        OpKind::ConditionalCall { .. } | OpKind::ConditionalCallValue { .. } => Ok(Vec::new()),
+        // Pure-call result hint (`jtransform.py:292-313`) and quasi-
+        // immutable record (`jtransform.py:901-903`).
+        OpKind::RecordKnownResult { .. } | OpKind::RecordQuasiImmutField { .. } => Ok(Vec::new()),
+        // Liveness marker / JIT driver markers — `jtransform.py:469,481,533`,
+        // `jtransform.py:1690-1718`.
+        OpKind::Live | OpKind::JitMergePoint { .. } | OpKind::LoopHeader { .. } => Ok(Vec::new()),
+        // Pyre-only abort marker emitted by the front-end when an
+        // untranslatable form is encountered. Carries no SSA result the
+        // rtyper would consume; downstream blackhole resume handles it
+        // (see `blackhole.rs::handler_abort_marker_pyre`).
+        OpKind::Abort { .. } => Ok(Vec::new()),
+
         // ─── Pre-rtyper opname normalization ───
         // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
         // names (`bitand`, `bitor`, `bitxor`, `add_assign`, ...).
@@ -495,16 +548,292 @@ pub fn translate_op(
             )])
         }
 
+        // ─── Slice 1b: FieldRead / FieldWrite ports ───
+        // RPython `flowspace/operation.py:617 GetAttr.opname = 'getattr'`
+        // and `setattr` (operation.py: same module). The high-level
+        // attribute-access op carries the field name as a
+        // `ConstValue::ByteStr` (Python 2 `str`), matching the rtyper's
+        // `rtype_getattr` / `rtype_setattr` dispatch
+        // (`rtyper.rs:2013-2014`). InstanceRepr later lowers the
+        // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
+        // bytecode keyed on the field's lltype kind.
+        OpKind::FieldRead { base, field, .. } => {
+            let base_hl = lookup_operand(value_map, *base)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "getattr",
+                vec![
+                    base_hl,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                ],
+                result,
+            )])
+        }
+        OpKind::FieldWrite {
+            base, field, value, ..
+        } => {
+            let base_hl = lookup_operand(value_map, *base)?;
+            let value_hl = lookup_operand(value_map, *value)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "setattr",
+                vec![
+                    base_hl,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                    value_hl,
+                ],
+                result,
+            )])
+        }
+
+        // ─── Slice 1b: ArrayRead / ArrayWrite ports ───
+        // RPython `flowspace/operation.py: GetItem.opname = 'getitem'`
+        // and `setitem`. The base[index] form maps directly to
+        // `getitem(base, index)` / `setitem(base, index, value)`; the
+        // rtyper's `rtype_getitem` / `rtype_setitem` later route through
+        // ListRepr / TupleRepr / Fixed-array repr based on the receiver's
+        // resolved type, lowering to `getarrayitem_gc_*` /
+        // `setarrayitem_gc_*` bytecodes.
+        OpKind::ArrayRead { base, index, .. } => {
+            let base_hl = lookup_operand(value_map, *base)?;
+            let index_hl = lookup_operand(value_map, *index)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "getitem",
+                vec![base_hl, index_hl],
+                result,
+            )])
+        }
+        OpKind::ArrayWrite {
+            base, index, value, ..
+        } => {
+            let base_hl = lookup_operand(value_map, *base)?;
+            let index_hl = lookup_operand(value_map, *index)?;
+            let value_hl = lookup_operand(value_map, *value)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "setitem",
+                vec![base_hl, index_hl, value_hl],
+                result,
+            )])
+        }
+
+        // ─── Slice 1b: InteriorFieldRead / InteriorFieldWrite ports ───
+        // RPython `effectinfo.py:313-340` notes that `getinteriorfield_gc`
+        // implicitly carries both a `readarray` and a `readinteriorfield`
+        // effect — the array-of-structs pattern is fundamentally a
+        // chained `getitem(base, index) -> elem` followed by
+        // `getattr(elem, field_name)` (or `setattr` for writes). Pyre's
+        // legacy IR collapses these into a single `InteriorField*` op
+        // for direct lowering convenience, but the rtyper sees the
+        // chained form, so unfold here into two flowspace ops with an
+        // intermediate `Variable` carrying the array element.
+        OpKind::InteriorFieldRead {
+            base, index, field, ..
+        } => {
+            let base_hl = lookup_operand(value_map, *base)?;
+            let index_hl = lookup_operand(value_map, *index)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            let elem_var = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new("getitem", vec![base_hl, index_hl], elem_var.clone()),
+                FlowspaceOp::new(
+                    "getattr",
+                    vec![
+                        elem_var,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                    ],
+                    result,
+                ),
+            ])
+        }
+        OpKind::InteriorFieldWrite {
+            base,
+            index,
+            field,
+            value,
+            ..
+        } => {
+            let base_hl = lookup_operand(value_map, *base)?;
+            let index_hl = lookup_operand(value_map, *index)?;
+            let value_hl = lookup_operand(value_map, *value)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            let elem_var = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new("getitem", vec![base_hl, index_hl], elem_var.clone()),
+                FlowspaceOp::new(
+                    "setattr",
+                    vec![
+                        elem_var,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                        value_hl,
+                    ],
+                    result,
+                ),
+            ])
+        }
+
+        // ─── Slice 1b: Call port (CallTarget per variant) ───
+        // RPython `flowspace/operation.py:663 SimpleCall.opname =
+        // 'simple_call'`. The first arg is a Constant wrapping the
+        // callable (or a Variable carrying a runtime function pointer).
+        // Each `CallTarget` variant maps to a different shape:
+        //
+        //   FunctionPath { segments }     — direct call to `path::func`.
+        //                                    Wrap the joined qualname in
+        //                                    a `HostObject::new_opaque(...)`
+        //                                    Constant; rtyper's
+        //                                    `rtype_simple_call` dispatches
+        //                                    on the callable's resolved
+        //                                    repr (PBCRepr / etc.).
+        //   SyntheticTransparentCtor      — Rust struct ctor `Class { .. }`.
+        //                                    Same shape as FunctionPath:
+        //                                    opaque host wrapping the type
+        //                                    qualname; the rtyper-equivalent
+        //                                    layer routes the ctor to its
+        //                                    InstanceRepr.
+        //   Method { name, .. }           — `obj.method(args)` — chains
+        //                                    `getattr(args[0], name) → meth`
+        //                                    into `simple_call(meth, args[1..])`,
+        //                                    mirroring `flowspace/
+        //                                    flowcontext.py:LOAD_ATTR +
+        //                                    CALL_FUNCTION` shape.
+        //   Indirect { trait_root, name } — `dyn Trait` dispatch. Pyre's
+        //                                    `rclass.rs` rewrites this into
+        //                                    a `VtableMethodPtr` followed
+        //                                    by an `IndirectCall`; reaching
+        //                                    the adapter means rclass.rs
+        //                                    didn't run, so fail-loud.
+        //   UnsupportedExpr               — frontend coverage gap; fail-loud
+        //                                    surfaces the missing
+        //                                    `front/ast.rs` arm.
+        OpKind::Call { target, args, .. } => {
+            use crate::model::CallTarget;
+            let arg_hls: Result<Vec<_>, _> =
+                args.iter().map(|v| lookup_operand(value_map, *v)).collect();
+            let arg_hls = arg_hls?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            match target {
+                CallTarget::FunctionPath { segments } => {
+                    let qualname = segments.join("::");
+                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                        HostObject::new_opaque(qualname),
+                    )));
+                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                    call_args.push(callable);
+                    call_args.extend(arg_hls);
+                    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+                }
+                CallTarget::SyntheticTransparentCtor { name } => {
+                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                        HostObject::new_opaque(name.clone()),
+                    )));
+                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                    call_args.push(callable);
+                    call_args.extend(arg_hls);
+                    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+                }
+                CallTarget::Method { name, .. } => {
+                    let mut iter = arg_hls.into_iter();
+                    let receiver = iter.next().ok_or_else(|| {
+                        TyperError::message(
+                            "Call::Method has empty args: receiver must be args[0]".to_string(),
+                        )
+                    })?;
+                    let bound_method = Hlvalue::Variable(Variable::new());
+                    let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
+                    call_args.push(bound_method.clone());
+                    call_args.extend(iter);
+                    Ok(vec![
+                        FlowspaceOp::new(
+                            "getattr",
+                            vec![
+                                receiver,
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(name))),
+                            ],
+                            bound_method,
+                        ),
+                        FlowspaceOp::new("simple_call", call_args, result),
+                    ])
+                }
+                CallTarget::Indirect { .. } => Err(TyperError::message(format!(
+                    "translate_op: Call with CallTarget::Indirect at result={:?} \
+                     must be lowered to VtableMethodPtr + IndirectCall by \
+                     rclass.rs before reaching the flowspace adapter; \
+                     reaching here means the rclass rewrite didn't run",
+                    op.result
+                ))),
+                CallTarget::UnsupportedExpr => Err(TyperError::message(format!(
+                    "translate_op: Call with CallTarget::UnsupportedExpr at \
+                     result={:?} — frontend coverage gap; the `front/ast.rs` \
+                     arm that emitted this Call must classify the call shape \
+                     before the rtyper sees it",
+                    op.result
+                ))),
+            }
+        }
+
+        // ─── Slice 1b: IndirectCall port ───
+        // RPython `rpython/rtyper/rpbc.py:216-217`:
+        // ```python
+        // vlist.append(hop.inputconst(Void, row_of_graphs.values()))
+        // v = hop.genop('indirect_call', vlist, resulttype=rresult)
+        // ```
+        // Trailing `c_graphs` Constant of type Void carries the candidate
+        // graph list. Pyre stores the graphs as `Option<Vec<CallPath>>` and
+        // packages each segment list as a `ConstValue::List` of byte-string
+        // qualnames so the rtyper sees the same Void-typed list shape.
+        OpKind::IndirectCall {
+            funcptr,
+            args,
+            graphs,
+            ..
+        } => {
+            let funcptr_hl = lookup_operand(value_map, *funcptr)?;
+            let arg_hls: Result<Vec<_>, _> =
+                args.iter().map(|v| lookup_operand(value_map, *v)).collect();
+            let arg_hls = arg_hls?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            let graphs_const = match graphs {
+                Some(paths) => {
+                    let elements: Vec<ConstValue> = paths
+                        .iter()
+                        .map(|p| ConstValue::byte_str(p.segments.join("::")))
+                        .collect();
+                    ConstValue::List(elements)
+                }
+                None => ConstValue::List(Vec::new()),
+            };
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
+            call_args.push(funcptr_hl);
+            call_args.extend(arg_hls);
+            call_args.push(Hlvalue::Constant(Constant::new(graphs_const)));
+            Ok(vec![FlowspaceOp::new("indirect_call", call_args, result)])
+        }
+
+        // ─── Pyre-internal: VtableMethodPtr ───
+        // PRE-EXISTING-ADAPTATION of `rclass.py:371-377 getclsfield()`.
+        // Emitted by `translator/rtyper/rclass.rs` to project the function
+        // pointer out of a `dyn Trait` receiver's vtable. It exists only
+        // *inside* the rtyper pipeline (rclass produces it; jtransform
+        // consumes it), so reaching the flowspace adapter input means an
+        // rtyper-stage layer missed its own emit/consume invariant.
+        OpKind::VtableMethodPtr { .. } => Err(TyperError::message(format!(
+            "translate_op: VtableMethodPtr at result={:?} is rtyper-internal \
+             (PRE-EXISTING-ADAPTATION of rclass.py:371-377); rclass.rs emits \
+             it and the jtransform layer consumes it before flowspace \
+             adapter input — reaching here means the rclass→jtransform \
+             pipeline broke",
+            op.result
+        ))),
+
         // ─── Slice 1b followups: deferred per-variant ports ───
-        // `Call` deliberately falls through to fail-loud here. The
-        // upstream `simple_call` opname (operation.py:152) needs a
-        // proper `Hlvalue::Constant` target argument, which requires
-        // resolving `CallTarget` variants (FunctionPath / Method /
-        // Indirect / SyntheticTransparentCtor) to their RPython
-        // equivalents. Each variant lands in its own followup so
-        // Slice 4's anchor tests can exercise them in isolation.
-        // Each fail-loud message names the specific OpKind so Slice 4's
-        // anchor tests pinpoint exactly which followup to land next.
+        // No remaining variants — every `OpKind` either has an explicit
+        // arm above or is intentionally fail-loud (Indirect / VtableMethod).
+        // The catch-all stays as defence-in-depth for future enum
+        // additions: a new variant added to `model::OpKind` without a
+        // matching arm here surfaces immediately as a fail-loud anchor
+        // for the Slice 4 dual-gate tests.
         other => Err(TyperError::message(format!(
             "translate_op: OpKind variant `{}` not yet ported \
              (Slice 1b followup pending) — reachable from legacy graph \
@@ -1392,12 +1721,15 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_call_surfaces_followup_pending() {
-        // Slice 1b-core leaves Call unimplemented. The fail-loud message
-        // names the variant so Slice 4 dual-gate failures pinpoint the
-        // followup commit.
+    fn translate_op_call_function_path_lowers_to_simple_call() {
+        // Call::FunctionPath → `simple_call(opaque_host(qualname),
+        // args...)` per `flowspace/operation.py:663
+        // SimpleCall.opname = 'simple_call'`. The callable Constant
+        // wraps a `HostObject::new_opaque(qualname)` so the rtyper has
+        // a routing key.
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::Call {
@@ -1408,22 +1740,171 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        // Ensure the result ValueId is in the map so resolve_result_hlvalue
-        // wouldn't trip first.
-        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let translated = translate_op(&op, &value_map).expect("Call::FunctionPath must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        assert_eq!(lowered.args.len(), 2, "callable + 1 arg");
+        let Hlvalue::Constant(ref callable) = lowered.args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("FunctionPath callable must be ConstValue::HostObject");
+        };
+        assert_eq!(host.qualname(), "a::b");
+    }
 
+    #[test]
+    fn translate_op_call_synthetic_transparent_ctor_lowers_to_simple_call() {
+        // Call::SyntheticTransparentCtor mirrors Rust's `Class { fields }`
+        // ctor — flowspace receives a `simple_call(class_const, fields)`
+        // shape just like FunctionPath; rtyper's InstanceRepr handles it.
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(ValueId(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::SyntheticTransparentCtor {
+                    name: "Point".into(),
+                },
+                args: vec![ValueId(1)],
+                result_ty: ValueType::Ref,
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map).expect("Call::SyntheticTransparentCtor must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("ctor callable must be ConstValue::HostObject");
+        };
+        assert_eq!(host.qualname(), "Point");
+    }
+
+    #[test]
+    fn translate_op_call_method_chains_getattr_simple_call() {
+        // Call::Method `obj.method(args)` → 2-op chain `[getattr(obj,
+        // "method") -> meth, simple_call(meth, args[1..])]`, mirroring
+        // `flowspace/flowcontext.py: LOAD_ATTR + CALL_FUNCTION` shape.
+        // args[0] is the receiver (matches Rust method-call lowering).
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new())); // receiver
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new())); // arg
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new())); // result
+        let op = SpaceOperation {
+            result: Some(ValueId(3)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::Method {
+                    name: "push".into(),
+                    receiver_root: Some("Vec".into()),
+                },
+                args: vec![ValueId(1), ValueId(2)],
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("Call::Method must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[1].opname, "simple_call");
+        // getattr's name arg is the method name as a byte string.
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("getattr method-name arg must be a Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"push"
+        ));
+        // Bound-method Variable identity threads from getattr.result into
+        // simple_call.args[0].
+        let Hlvalue::Variable(ref m1) = translated[0].result else {
+            panic!("getattr result must be Variable");
+        };
+        let Hlvalue::Variable(ref m2) = translated[1].args[0] else {
+            panic!("simple_call's first arg must be Variable (bound method)");
+        };
+        assert_eq!(
+            m1.id(),
+            m2.id(),
+            "bound method Variable identity must thread"
+        );
+        // simple_call args = [bound_method, args[1..]]
+        assert_eq!(translated[1].args.len(), 2);
+    }
+
+    #[test]
+    fn translate_op_call_indirect_surfaces_rclass_invariant() {
+        // Call::Indirect must be lowered to VtableMethodPtr +
+        // IndirectCall by `rclass.rs` before reaching the flowspace
+        // adapter. Reaching here means the rclass rewrite didn't run;
+        // surface the structural invariant break.
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(ValueId(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::Indirect {
+                    trait_root: "MyTrait".into(),
+                    method_name: "do_it".into(),
+                },
+                args: vec![ValueId(1)],
+                result_ty: ValueType::Int,
+            },
+        };
         let err = translate_op(&op, &value_map)
-            .expect_err("Call lowering is a Slice 1b followup — must fail loud");
+            .expect_err("Call::Indirect must surface rclass invariant break");
         let msg = format!("{err}");
         assert!(
-            msg.contains("Call") && msg.contains("Slice 1b followup"),
-            "fail-loud message must name the variant + slice tag, got: {msg}"
+            msg.contains("Indirect") && msg.contains("rclass"),
+            "fail-loud must cite Indirect + rclass.rs, got: {msg}"
         );
     }
 
     #[test]
-    fn translate_op_field_read_surfaces_followup_pending() {
-        let value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+    fn translate_op_indirect_call_lowers_to_indirect_call_op() {
+        // OpKind::IndirectCall → `indirect_call(funcptr, args...,
+        // graphs_const)` per `rpbc.py:216-217`. Trailing Constant
+        // wraps the candidate-graph list (Void-typed in upstream).
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new())); // funcptr
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new())); // arg
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new())); // result
+        let op = SpaceOperation {
+            result: Some(ValueId(3)),
+            kind: OpKind::IndirectCall {
+                funcptr: ValueId(1),
+                args: vec![ValueId(2)],
+                graphs: None,
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("IndirectCall arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "indirect_call");
+        // funcptr + arg + graphs_const = 3 args
+        assert_eq!(translated[0].args.len(), 3);
+        let Hlvalue::Constant(ref graphs_const) = translated[0].args[2] else {
+            panic!("trailing graphs arg must be Constant");
+        };
+        assert!(matches!(graphs_const.value, ConstValue::List(ref lst) if lst.is_empty()));
+    }
+
+    #[test]
+    fn translate_op_field_read_lowers_to_getattr() {
+        // FieldRead → flowspace `getattr(base, ConstValue::ByteStr(name))`
+        // mirroring `flowspace/operation.py:617 GetAttr.opname = 'getattr'`.
+        // The rtyper later dispatches via `rtype_getattr` based on the
+        // base operand's resolved repr (InstanceRepr / etc.).
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        let base_var = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(ValueId(1), base_var.clone());
+        value_map.insert(ValueId(2), result_var.clone());
+
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::FieldRead {
@@ -1433,13 +1914,161 @@ mod tests {
                 pure: false,
             },
         };
-        let err =
-            translate_op(&op, &value_map).expect_err("FieldRead lowering is a Slice 1b followup");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("FieldRead"),
-            "fail-loud message must name the variant, got: {msg}"
+        let translated = translate_op(&op, &value_map).expect("FieldRead arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "getattr");
+        assert_eq!(lowered.args.len(), 2);
+        let Hlvalue::Constant(ref name_const) = lowered.args[1] else {
+            panic!("FieldRead lowering must pass field name as Hlvalue::Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"f"
+        ));
+    }
+
+    #[test]
+    fn translate_op_field_write_lowers_to_setattr() {
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: ValueId(1),
+                field: crate::model::FieldDescriptor::new("g", Some("Owner".into())),
+                value: ValueId(2),
+                ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("FieldWrite arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "setattr");
+        assert_eq!(lowered.args.len(), 3);
+        let Hlvalue::Constant(ref name_const) = lowered.args[1] else {
+            panic!("FieldWrite lowering must pass field name as Hlvalue::Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"g"
+        ));
+    }
+
+    #[test]
+    fn translate_op_array_read_lowers_to_getitem() {
+        // ArrayRead → flowspace `getitem(base, index)` mirroring
+        // `flowspace/operation.py: GetItem.opname = 'getitem'`. RTyper's
+        // `rtype_getitem` dispatches via the receiver's resolved repr
+        // (ListRepr / TupleRepr / FixedSizeArrayRepr) and lowers to
+        // `getarrayitem_gc_*`.
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(ValueId(3)),
+            kind: OpKind::ArrayRead {
+                base: ValueId(1),
+                index: ValueId(2),
+                item_ty: ValueType::Int,
+                array_type_id: None,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("ArrayRead arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "getitem");
+        assert_eq!(lowered.args.len(), 2);
+    }
+
+    #[test]
+    fn translate_op_array_write_lowers_to_setitem() {
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ArrayWrite {
+                base: ValueId(1),
+                index: ValueId(2),
+                value: ValueId(3),
+                item_ty: ValueType::Int,
+                array_type_id: None,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("ArrayWrite arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "setitem");
+        assert_eq!(lowered.args.len(), 3);
+    }
+
+    #[test]
+    fn translate_op_interior_field_read_unfolds_to_getitem_getattr_chain() {
+        // InteriorFieldRead → `getitem(base, index)` chained into
+        // `getattr(elem, field_name)`, mirroring `effectinfo.py:313-340`'s
+        // implicit `readarray + readinteriorfield` effects. Two flowspace
+        // ops surface from one legacy op; the rtyper sees the chain.
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(ValueId(3)),
+            kind: OpKind::InteriorFieldRead {
+                base: ValueId(1),
+                index: ValueId(2),
+                field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
+                item_ty: ValueType::Int,
+                array_type_id: None,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("InteriorFieldRead arm must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getitem");
+        assert_eq!(translated[0].args.len(), 2);
+        assert_eq!(translated[1].opname, "getattr");
+        assert_eq!(translated[1].args.len(), 2);
+        // The second op's first arg must be the element variable
+        // produced by the first op.
+        let Hlvalue::Variable(ref elem_v1) = translated[0].result else {
+            panic!("getitem result must be a Variable");
+        };
+        let Hlvalue::Variable(ref elem_v2) = translated[1].args[0] else {
+            panic!("getattr base arg must be the chained element Variable");
+        };
+        assert_eq!(
+            elem_v1.id(),
+            elem_v2.id(),
+            "elem Variable identity must thread"
         );
+    }
+
+    #[test]
+    fn translate_op_interior_field_write_unfolds_to_getitem_setattr_chain() {
+        let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::InteriorFieldWrite {
+                base: ValueId(1),
+                index: ValueId(2),
+                field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
+                value: ValueId(3),
+                item_ty: ValueType::Int,
+                array_type_id: None,
+            },
+        };
+        let translated = translate_op(&op, &value_map).expect("InteriorFieldWrite arm must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getitem");
+        assert_eq!(translated[1].opname, "setattr");
+        assert_eq!(translated[1].args.len(), 3);
     }
 
     #[test]
@@ -1734,9 +2363,11 @@ mod tests {
 
     #[test]
     fn function_graph_to_flowspace_unported_opkind_surfaces_failloud() {
-        // A graph carrying a Slice 1b-followup-pending OpKind (Call)
-        // must surface that op's translate_op error from inside Pass 2,
-        // not silently emit a partial graph.
+        // A graph carrying a still-fail-loud OpKind (Call::Indirect —
+        // requires rclass.rs lowering to VtableMethodPtr + IndirectCall
+        // before reaching the adapter) must surface that op's
+        // translate_op error from inside Pass 2, not silently emit a
+        // partial graph.
         let mut annotations = AnnotationState::new();
         annotations.set(ValueId(1), ValueType::Int);
         annotations.set(ValueId(2), ValueType::Int);
@@ -1748,8 +2379,9 @@ mod tests {
             operations: vec![SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["foo".into()],
+                    target: crate::model::CallTarget::Indirect {
+                        trait_root: "MyTrait".into(),
+                        method_name: "do_it".into(),
                     },
                     args: vec![ValueId(1)],
                     result_ty: ValueType::Int,
@@ -1775,7 +2407,7 @@ mod tests {
             .expect_err("unported OpKind must surface as TyperError");
         let msg = format!("{err}");
         assert!(
-            msg.contains("Call") && msg.contains("Slice 1b followup"),
+            msg.contains("Indirect") && msg.contains("rclass"),
             "unported-op error must propagate translate_op's fail-loud message, got: {msg}"
         );
     }
