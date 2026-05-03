@@ -4084,54 +4084,38 @@ fn unsupported_semantics(opcode: OpCode, detail: &str) -> BackendError {
     ))
 }
 
-/// Scan `ops[op_idx + 1..]` for the paired `GuardNotForced(_2)` of a
-/// `CallMayForce*` / `CallReleaseGil*`.
-///
-/// PRE-EXISTING-ADAPTATION. RPython
-/// (`rpython/jit/backend/x86/assembler.py:2234-2235 _genop_call_may_force`
-/// / `:2242-2244 _genop_call_release_gil`) takes that guard via
-/// `_find_nearby_operation(+1)` and asserts `isinstance(GuardOp)`.
-/// Upstream's invariant holds because `optimizeopt/heap.py` does not
-/// schedule `NEW_WITH_VTABLE` / `SETFIELD_GC` between a force-able call
-/// and its paired guard. Pyre's heap pass currently does — the virtual
-/// forcing it inserts to satisfy `GuardNotForced`'s fail_args lands in
-/// the gap — so a strict +1 check spuriously rejects list-method-heavy
-/// traces (e.g. `lst.append(i)` loops) even though the codegen below
-/// tolerates the gap: `guard_idx` only advances on guards, so as long
-/// as no *other* guard precedes the paired `GuardNotForced`,
-/// `guard_infos[guard_idx]` already points at it.
-///
-/// Convergence path: align pyre's `optimizeopt/heap.py` op-scheduling
-/// with upstream so virtual-forcing materialization happens *before*
-/// the call and `GuardNotForced` lands at +1 unconditionally. Once
-/// that lands this scanner can collapse back to upstream's `+1`-only
-/// check.
+/// Strict `+1` paired-guard check matching RPython
+/// (`rpython/jit/backend/x86/assembler.py:2225-2244`):
+/// `_genop_call_may_force` / `_genop_call_release_gil` both invoke
+/// `_store_force_index(self._find_nearby_operation(+1))`, and
+/// `_store_force_index` asserts `isinstance(guard_op, GuardOp)` with
+/// `getopnum() in {GUARD_NOT_FORCED, GUARD_NOT_FORCED_2}`. Upstream
+/// preserves this invariant by ensuring `optimizeopt` never schedules
+/// any op between a force-able call and its paired guard — pyre's
+/// optimizer must do the same.
 fn check_paired_guard_not_forced(
     ops: &[Op],
     op_idx: usize,
     opcode: OpCode,
     label: &str,
 ) -> Result<(), BackendError> {
-    for next in &ops[op_idx + 1..] {
-        match next.opcode {
-            OpCode::GuardNotForced | OpCode::GuardNotForced2 => return Ok(()),
-            other if other.is_guard() => {
-                return Err(unsupported_semantics(
-                    opcode,
-                    &format!(
-                        "{label}: intervening guard {other:?} between call and \
-                         paired guard_not_forced(_2) — guard_infos[guard_idx] \
-                         would mismatch"
-                    ),
-                ));
-            }
-            _ => continue,
-        }
+    let Some(next) = ops.get(op_idx + 1) else {
+        return Err(unsupported_semantics(
+            opcode,
+            &format!("{label}: no paired guard_not_forced(_2) at +1 — trace ends"),
+        ));
+    };
+    match next.opcode {
+        OpCode::GuardNotForced | OpCode::GuardNotForced2 => Ok(()),
+        other => Err(unsupported_semantics(
+            opcode,
+            &format!(
+                "{label}: expected guard_not_forced(_2) at +1, found {other:?} — \
+                 optimizer must not schedule ops between force-able call and its \
+                 paired guard (RPython x86/assembler.py:2225-2244 invariant)"
+            ),
+        )),
     }
-    Err(unsupported_semantics(
-        opcode,
-        &format!("{label}: no paired guard_not_forced(_2) found in remaining trace"),
-    ))
 }
 
 fn missing_gc_runtime(opcode: OpCode) -> BackendError {
@@ -9681,8 +9665,6 @@ impl CraneliftBackend {
                     // x86/assembler.py:2234-2235 _genop_call_may_force:
                     //   self._store_force_index(self._find_nearby_operation(+1))
                     //   self._genop_call(op, arglocs, result_loc)
-                    // RPython traces always have GuardNotForced at +1; pyre's
-                    // optimizer is allowed to slot virtual-forcing ops in between.
                     check_paired_guard_not_forced(ops, op_idx, op.opcode, "call_may_force")?;
                     let info = &guard_infos[guard_idx];
                     // x86/assembler.py _store_force_index parity:
@@ -18770,12 +18752,12 @@ mod tests {
         let _guard = may_force_test_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        // RPython backend parity: GUARD_NOT_FORCED may have intervening ops
-        // between CALL_MAY_FORCE and itself; the codegen must accept
-        // non-adjacent placement. (Relaxed in
-        // `check_paired_guard_not_forced` forward-scan — see the helper's
-        // PRE-EXISTING-ADAPTATION note for the convergence path back to
-        // upstream's strict +1 invariant.)
+        // RPython parity: `_genop_call_may_force` takes the paired guard
+        // via `_find_nearby_operation(+1)` (x86/assembler.py:2225-2244)
+        // — the optimizer is required to keep CALL_MAY_FORCE and
+        // GUARD_NOT_FORCED adjacent. The cranelift backend mirrors the
+        // assertion; any intervening op (here, a SameAsI between the call
+        // and its guard) must be rejected at compile time.
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
@@ -18797,8 +18779,6 @@ mod tests {
                 3,
                 descr,
             ),
-            // Intervening op: SameAsI copies the call result.
-            // This proves the codegen accepts non-adjacent placement.
             mk_op(OpCode::SameAsI, &[OpRef::from_raw(3)], 4),
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::from_raw(4)], OpRef::NONE.raw()),
@@ -18812,21 +18792,15 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         backend.set_constants(constants);
         let mut token = JitCellToken::new(1500_410);
-        // Non-adjacent GuardNotForced placement is now accepted.
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
-
-        // Not forced: function returns 42; SameAsI propagates it to Finish.
-        let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(0)]);
-        assert!(backend.get_latest_descr(&frame).is_finish());
-        assert_eq!(backend.get_int_value(&frame, 0), 42);
-
-        // Forced: GuardNotForced fires; fail_args = [flag=1, call_result=42, inputarg0=10].
-        let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
-        assert_eq!(backend.get_int_value(&frame, 0), 1);
-        assert_eq!(backend.get_int_value(&frame, 1), 42);
-        assert_eq!(backend.get_int_value(&frame, 2), 10);
-        assert_eq!(backend.get_savedata_ref(&frame).unwrap(), GcRef(0xBABA));
+        let err = backend
+            .compile_loop(&inputargs, &ops, &mut token)
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("expected guard_not_forced(_2) at +1")
+                && msg.contains("SameAsI"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
