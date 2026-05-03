@@ -4265,13 +4265,43 @@ impl CodeWriter {
                         // Assembler / blackhole / backend (`assembler.rs:712`)
                         // assert the canonical 7-arg form on the way out.
                         //
-                        // pycode is carried as an `Opaque(Ref)` Constant at
-                        // the graph layer so `Constant` Eq/Hash stays Clone +
-                        // PartialEq-deriveable (raw pointers cannot hash
-                        // cleanly); the `lower_constant` callback below
-                        // recovers the original `w_code` pointer from its
-                        // closure capture and routes it through the runtime
-                        // constant pool.
+                        // DEVIATION (β.2 migration target — see plan
+                        // `~/.claude/plans/inline-call-portal-migration.md`
+                        // + memory `inline_call_portal_beta2_audit_2026_05_03.md`):
+                        //
+                        // pycode is currently carried as an `Opaque(Ref)`
+                        // Constant at the graph layer, then lowered by the
+                        // `lower_constant` callback below to `Operand::ConstRef`
+                        // which routes through `builder.add_const_r` and bakes
+                        // the user CodeObject pointer into the per-CodeObject
+                        // jitcode's constants_r pool. This is one of the
+                        // primary sources of the `drained.r > portal_canonical.r`
+                        // divergence measured in
+                        // `inline_call_portal_b5_probe_a_2026_05_03.md`
+                        // (nbody drained.r=163 vs portal canonical.r=0).
+                        //
+                        // RPython orthodox: pycode is a green argument to
+                        // `portal_runner` (`pypyjit/interp_jit.py:67-78
+                        // PyPyJitDriver greens=['next_instr','is_being_profiled',
+                        // 'pycode']`), present at runtime in a calling-convention
+                        // register. To migrate, replace the `Constant::opaque(…)`
+                        // in `portal_jit_merge_point_graph_args` (line 152) with
+                        // a Variable produced by emitting `getfield_vable_r
+                        // frame, PYCODE_FIELD_IDX → pycode_var` immediately
+                        // before `emit_space_operation`. The `lower_variable`
+                        // closure (line 4361) gains a third arm mapping
+                        // `pycode_var.id` to the dst register of the new
+                        // getfield. Empirical Probe A re-run after the change
+                        // should show `drained.r` reduced by 1 per jit_merge_point
+                        // emission (~10-30 for nbody).
+                        //
+                        // Existing pattern reusable: the `emit_vable_getfield_ref!`
+                        // macro at line 3728 already emits the
+                        // `getfield_vable_r [vable_reg, descr_vable_static_field(idx)]
+                        // → Register(Ref, dst)` shape that this migration needs.
+                        // PYFRAME_VABLE_FIELDS in `virtualizable_spec.rs` enumerates
+                        // the field indices (pycode is field 1 per
+                        // `interp_jit.py:25-31`).
                         let jdindex = portal_jd_index
                             .expect("portal jit_merge_point requires a registered jitdriver");
                         let w_code_i64 = w_code as i64;
