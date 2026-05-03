@@ -875,6 +875,17 @@ struct GraphBuildContext<'a> {
     local_type_roots: HashMap<String, String>,
     local_type_strings: HashMap<String, String>,
     local_value_types: HashMap<String, ValueType>,
+    /// RPython `LOAD_FAST` parity: locals' definition sites carried as
+    /// `(ValueId, defining BlockId)` so a body `Expr::Path` reference
+    /// can reuse the existing definition's `ValueId` instead of
+    /// emitting a fresh `OpKind::Input`. Same-block reuse only —
+    /// cross-block reads keep the legacy fresh-`Input` behaviour
+    /// because pyre does not yet thread the locals stack across
+    /// `Link.args` / `inputarg` the way RPython
+    /// `flowspace/flowcontext.py:835 LOAD_FAST` does. Closing the
+    /// cross-block gap is a deferred Cat 3.2 follow-up; this field
+    /// owns the same-block half of the parity.
+    local_value_ids: HashMap<String, (ValueId, BlockId)>,
     local_trait_bound_roots: HashMap<String, String>,
     generic_trait_roots: HashMap<String, String>,
     /// RPython: ARRAY element type identity — maps variable name to the
@@ -932,6 +943,7 @@ impl<'a> GraphBuildContext<'a> {
             local_type_roots: HashMap::new(),
             local_type_strings: HashMap::new(),
             local_value_types: HashMap::new(),
+            local_value_ids: HashMap::new(),
             local_trait_bound_roots: HashMap::new(),
             generic_trait_roots: HashMap::new(),
             local_array_types: HashMap::new(),
@@ -950,6 +962,7 @@ struct LocalBindingSnapshot {
     local_type_roots: HashMap<String, String>,
     local_type_strings: HashMap<String, String>,
     local_value_types: HashMap<String, ValueType>,
+    local_value_ids: HashMap<String, (ValueId, BlockId)>,
     local_trait_bound_roots: HashMap<String, String>,
     local_array_types: HashMap<String, String>,
     local_dyn_trait_roots: HashMap<String, String>,
@@ -961,6 +974,7 @@ impl LocalBindingSnapshot {
             local_type_roots: ctx.local_type_roots.clone(),
             local_type_strings: ctx.local_type_strings.clone(),
             local_value_types: ctx.local_value_types.clone(),
+            local_value_ids: ctx.local_value_ids.clone(),
             local_trait_bound_roots: ctx.local_trait_bound_roots.clone(),
             local_array_types: ctx.local_array_types.clone(),
             local_dyn_trait_roots: ctx.local_dyn_trait_roots.clone(),
@@ -971,6 +985,7 @@ impl LocalBindingSnapshot {
         ctx.local_type_roots = self.local_type_roots;
         ctx.local_type_strings = self.local_type_strings;
         ctx.local_value_types = self.local_value_types;
+        ctx.local_value_ids = self.local_value_ids;
         ctx.local_trait_bound_roots = self.local_trait_bound_roots;
         ctx.local_array_types = self.local_array_types;
         ctx.local_dyn_trait_roots = self.local_dyn_trait_roots;
@@ -1066,6 +1081,14 @@ fn build_function_graph(
                 ) {
                     graph.name_value(vid, "self".to_string());
                     graph.block_mut(entry).inputargs.push(vid);
+                    // RPython `LOAD_FAST` parity: record the receiver
+                    // binding so a body `Expr::Path` reference to
+                    // `self` within the entry block reuses this
+                    // `ValueId` instead of emitting a fresh
+                    // `OpKind::Input` — same treatment as typed
+                    // parameters on the `FnArg::Typed` arm below
+                    // (`flowspace/flowcontext.py:835`).
+                    ctx.local_value_ids.insert("self".to_string(), (vid, entry));
                 }
             }
             syn::FnArg::Typed(pat_type) => {
@@ -1113,12 +1136,18 @@ fn build_function_graph(
                     entry,
                     OpKind::Input {
                         name: name.clone(),
-                        ty: arg_ty,
+                        ty: arg_ty.clone(),
                     },
                     true,
                 ) {
-                    graph.name_value(vid, name);
+                    graph.name_value(vid, name.clone());
                     graph.block_mut(entry).inputargs.push(vid);
+                    // RPython `LOAD_FAST` parity: record the parameter
+                    // binding so a body `Expr::Path` reference within
+                    // the entry block reuses this `ValueId` instead of
+                    // emitting a fresh `OpKind::Input`
+                    // (`flowspace/flowcontext.py:835`).
+                    ctx.local_value_ids.insert(name.clone(), (vid, entry));
                 }
             }
         }
@@ -1359,6 +1388,13 @@ fn lower_stmt(
                         if let Some(ty) = graph_value_type(graph, vid) {
                             ctx.local_value_types.insert(name.clone(), ty);
                         }
+                        // RPython `LOAD_FAST` parity: record the
+                        // let-binding's `(ValueId, defining BlockId)`
+                        // so a same-block `Expr::Path` reference
+                        // reuses this `ValueId` instead of emitting a
+                        // fresh `OpKind::Input`
+                        // (`flowspace/flowcontext.py:835`).
+                        ctx.local_value_ids.insert(name.clone(), (vid, *block));
                         if let Some(type_string) = init_type_string {
                             // Mirror `bind_ident_type` on let-with-annotation:
                             // record the receiver root so subsequent
@@ -1666,6 +1702,26 @@ fn lower_expr(
                         },
                         false,
                     );
+                }
+                syn::Expr::Path(path) if path.path.segments.len() == 1 && path.qself.is_none() => {
+                    // Generic local assignment `x = rhs` — RPython STORE_FAST
+                    // parity (`flowspace/flowcontext.py:878`): replace the
+                    // locals slot for `x` with the rhs `ValueId` so a
+                    // subsequent same-block LOAD_FAST (`flowcontext.py:835`)
+                    // reads the new value, not the let-binding's stale one.
+                    // Same-block dedup machinery installed at
+                    // `lower_stmt`'s let arm (`ast.rs:1389
+                    // local_value_ids.insert`) caches `(let-rhs ValueId,
+                    // defining block)`; without this STORE_FAST update
+                    // a later `x` read returns the stale let value.
+                    let name = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|seg| seg.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    ctx.local_value_ids.insert(name, (value, *block));
                 }
                 _ => {
                     // Generic assignment — value already lowered
@@ -2026,13 +2082,65 @@ fn lower_expr(
                 .map(|seg| seg.ident.to_string())
                 .collect::<Vec<_>>()
                 .join("::");
+            // RPython `flowspace/flowcontext.py:835 LOAD_FAST`: the
+            // bytecode reads the existing local-stack entry rather
+            // than introducing a new `Variable`.  Pyre's analogue:
+            // when a single-segment path names a local whose
+            // definition lives in the *same* block as the read,
+            // forward the bound `ValueId` directly so downstream
+            // passes see a single SSA definition with multiple uses
+            // — matching upstream's frame-locals model.  Cross-block
+            // reads still fall through to the legacy fresh-`Input`
+            // emit; threading the locals stack across `Link.args` /
+            // `inputarg` is the deferred Cat 3.2 follow-up.
+            if path.path.segments.len() == 1
+                && path.qself.is_none()
+                && let Some(&(vid, defining_block)) = ctx.local_value_ids.get(&name)
+                && defining_block == *block
+            {
+                return Ok(Lowered {
+                    value: Some(vid),
+                    path_closed: false,
+                });
+            }
             let ty = ctx
                 .local_value_types
                 .get(&name)
                 .cloned()
                 .unwrap_or(ValueType::Unknown);
+            let value = graph.push_op(
+                *block,
+                OpKind::Input {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                },
+                true,
+            );
+            // RPython `LOAD_FAST` parity (`flowspace/flowcontext.py:835`):
+            // once the local-stack slot is read into a Variable in the
+            // current block, subsequent reads of the same name in the
+            // same block must return the same Variable — RPython's
+            // bytecode reads the slot, not a fresh copy.  Pyre's
+            // single-segment `Expr::Path` lowers to `OpKind::Input` when
+            // the name has no same-block defining `ValueId`; we now
+            // register the freshly-emitted `Input` result as the
+            // authoritative `(ValueId, current_block)` so further reads
+            // of `name` within the same block dedup against this
+            // Input.  Cross-block threading (`Link.args` /
+            // target-`inputarg` join after a control-flow split)
+            // remains the deferred follow-up.
+            //
+            // `LocalBindingSnapshot` saves and restores
+            // `ctx.local_value_ids` across `If` / `Match` / `Loop` /
+            // `While` / `ForLoop` boundaries, so the cached `(vid,
+            // block)` does not leak into a sibling control-flow arm.
+            if let Some(vid) = value {
+                if path.path.segments.len() == 1 && path.qself.is_none() {
+                    ctx.local_value_ids.insert(name.clone(), (vid, *block));
+                }
+            }
             Ok(Lowered {
-                value: graph.push_op(*block, OpKind::Input { name, ty }, true),
+                value,
                 path_closed: false,
             })
         }
@@ -2078,17 +2186,43 @@ fn lower_expr(
             let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
             let op_name = binary_op_name(&bin.op);
             let result_ty = binary_result_value_type(graph, lhs, rhs, op_name);
+            let value = graph.push_op(
+                *block,
+                OpKind::BinOp {
+                    op: op_name.into(),
+                    lhs,
+                    rhs,
+                    result_ty,
+                },
+                true,
+            );
+            // RPython INPLACE_* + STORE_FAST parity
+            // (`flowspace/flowcontext.py:878`): compound assignment
+            // `x += y` (and -=, *=, /=, %=, &=, |=, ^=, <<=, >>=) push
+            // the inplace result and immediately replace the locals
+            // slot for `x`.  Without the local_value_ids update, the
+            // same-block dedup cache (`ast.rs:1389` let arm,
+            // `:1724` simple-assign arm) still points at the
+            // pre-inplace ValueId, so a later same-block read of
+            // `x` returns the stale value.  Simple assignment `x = y`
+            // is handled at the Expr::Assign arm above; this branch
+            // owns the compound path that lowers as Expr::Binary.
+            if op_name.ends_with("_assign") {
+                if let (Some(vid), syn::Expr::Path(path)) = (value, &*bin.left) {
+                    if path.path.segments.len() == 1 && path.qself.is_none() {
+                        let name = path
+                            .path
+                            .segments
+                            .iter()
+                            .map(|seg| seg.ident.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        ctx.local_value_ids.insert(name, (vid, *block));
+                    }
+                }
+            }
             Ok(Lowered {
-                value: graph.push_op(
-                    *block,
-                    OpKind::BinOp {
-                        op: op_name.into(),
-                        lhs,
-                        rhs,
-                        result_ty,
-                    },
-                    true,
-                ),
+                value,
                 path_closed: false,
             })
         }

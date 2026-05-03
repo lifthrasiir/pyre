@@ -42,10 +42,13 @@
 //! Today this function still fails on graphs containing Slice 1b
 //! followups that are not yet ported (`Call`, `FieldRead`,
 //! `ArrayRead`, ...). The Slice 4 anchor corpus will surface which
-//! followup is the next priority. `Ref`-typed operands additionally
-//! fail in `bindingrepr` per the documented Slice 1a blocker
-//! (`SomeObject.rtyper_makerepr` returns
-//! `TyperError::missing_rtype_operation` from `rmodel.rs:2475`).
+//! followup is the next priority. `Ref`-typed operands now route
+//! through `valuetype_to_someshell(Ref) → SomeInstance(classdef=None)`
+//! (`jit_codewriter/annotation_state.rs:69`), so the rtyper picks
+//! `getinstancerepr(rtyper, None, Gc) → InstanceRepr::new_rootinstance
+//! → Ptr(GcStruct(OBJECT))` and the projection collapses to
+//! `ConcreteType::GcRef` matching the legacy resolver — the previous
+//! `SomeObject` blocker is closed.
 
 use std::rc::Rc;
 
@@ -53,7 +56,7 @@ use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{BlockKey, BlockRef, GraphRef};
 use crate::jit_codewriter::annotation_state::AnnotationState;
 use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
-use crate::model::{FunctionGraph as LegacyGraph, ValueType};
+use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::flowspace_adapter::{
     FlowspaceAdapterOutput, function_graph_to_flowspace,
@@ -63,37 +66,39 @@ use crate::translator::rtyper::rtyper::RPythonTyper;
 
 /// Project a post-`specialize` `LowLevelType` back to the legacy
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
-/// GcRef / Void). Returns `ConcreteType::Unknown` only when the
-/// `Variable.concretetype` slot was never populated (i.e. the rtyper
-/// silently skipped the variable — Slice 4 anchor tests will surface
-/// any silent skip as a divergence).
+/// GcRef / Void).
 ///
-/// Mapping follows RPython's JIT `history.getkind(TYPE)`:
+/// Mapping follows RPython's JIT `history.getkind(TYPE)`
+/// (`rpython/jit/metainterp/history.py:46-71`):
 /// `Void -> void`, primitive float -> float, `SingleFloat -> int`,
 /// machine-word primitives and raw pointers -> int, GC pointers -> ref.
 /// `SignedLongLong` / `UnsignedLongLong` follow PyPy's target-size
 /// check: they are float kind only when they are wider than `Signed`
 /// (32-bit targets); on 64-bit targets they collapse to int kind.
-/// Unsupported container/non-pointer shapes stay `Unknown`.
-pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> ConcreteType {
+/// Unsupported container/non-pointer shapes return
+/// `Err(TyperError::missing_rtype_operation(..))`, mirroring
+/// `history.py:70 raise NotImplementedError("type %s not supported")`
+/// while routing the failure through the `specialize_legacy_graph`
+/// `Result<...>` channel rather than unwinding direct callers.
+pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, TyperError> {
     match ll {
-        LowLevelType::Void => ConcreteType::Void,
+        LowLevelType::Void => Ok(ConcreteType::Void),
         LowLevelType::Signed
         | LowLevelType::Unsigned
         | LowLevelType::Bool
         | LowLevelType::Char
         | LowLevelType::UniChar
         | LowLevelType::SingleFloat
-        | LowLevelType::Address => ConcreteType::Signed,
+        | LowLevelType::Address => Ok(ConcreteType::Signed),
         LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
-            longlong_getkind_concrete()
+            Ok(longlong_getkind_concrete())
         }
-        LowLevelType::Float => ConcreteType::Float,
+        LowLevelType::Float => Ok(ConcreteType::Float),
         LowLevelType::Ptr(ptr) => {
             if ptr._gckind() == GcKind::Raw {
-                ConcreteType::Signed
+                Ok(ConcreteType::Signed)
             } else {
-                ConcreteType::GcRef
+                Ok(ConcreteType::GcRef)
             }
         }
         LowLevelType::SignedLongLongLong
@@ -105,7 +110,10 @@ pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> ConcreteType {
         | LowLevelType::FixedSizeArray(_)
         | LowLevelType::Opaque(_)
         | LowLevelType::ForwardReference(_)
-        | LowLevelType::InteriorPtr(_) => ConcreteType::Unknown,
+        | LowLevelType::InteriorPtr(_) => Err(TyperError::missing_rtype_operation(format!(
+            "lowleveltype_to_concrete: type {ll:?} not supported \
+             (history.py:70 raise NotImplementedError)"
+        ))),
     }
 }
 
@@ -114,16 +122,6 @@ fn longlong_getkind_concrete() -> ConcreteType {
         ConcreteType::Float
     } else {
         ConcreteType::Signed
-    }
-}
-
-fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
-    match vt {
-        ValueType::Int => ConcreteType::Signed,
-        ValueType::Float => ConcreteType::Float,
-        ValueType::Ref => ConcreteType::GcRef,
-        ValueType::Void => ConcreteType::Void,
-        ValueType::State | ValueType::Unknown => ConcreteType::Unknown,
     }
 }
 
@@ -165,8 +163,8 @@ fn seed_annotator_blocks(
 /// Returns `Err(message)` when:
 ///
 /// - the real path errors out (typer error from an unported `OpKind`
-///   arm or a documented Slice 4 blocker like the `Ref → SomeObject`
-///   arm), OR
+///   arm — the `Ref → SomeObject` blocker is closed via
+///   `valuetype_to_someshell(Ref) → SomeInstance(classdef=None)`), OR
 /// - a legacy-known `ValueId` is missing / `Unknown` / different in
 ///   the real path, OR
 /// - the real path produced a definite kind for a `ValueId` the legacy
@@ -265,7 +263,7 @@ pub fn specialize_legacy_graph(
     let FlowspaceAdapterOutput {
         graph,
         value_to_var,
-        constant_value_ids,
+        constant_concretetypes,
         block_map,
     } = function_graph_to_flowspace(legacy, annotations)?;
 
@@ -289,14 +287,19 @@ pub fn specialize_legacy_graph(
         if let Some(lltype) = concretetype.as_ref() {
             state
                 .concrete_types
-                .insert(vid, lowleveltype_to_concrete(lltype));
+                .insert(vid, lowleveltype_to_concrete(lltype)?);
         }
     }
-    for vid in constant_value_ids {
-        let concrete = valuetype_to_concrete(annotations.get(vid));
-        if concrete != ConcreteType::Unknown {
-            state.concrete_types.insert(vid, concrete);
-        }
+    // RPython `Constant.concretetype` is the ground truth for constant
+    // operands.  Read it directly from the adapter's per-`ValueId` map
+    // rather than reconstructing the kind from `AnnotationState`, so a
+    // pyre-side annotation gap (e.g. an `Unknown` slot left by the
+    // legacy graph builder) does not silently strip the constant's
+    // resolved kind.
+    for (vid, lltype) in &constant_concretetypes {
+        state
+            .concrete_types
+            .insert(*vid, lowleveltype_to_concrete(lltype)?);
     }
     Ok(state)
 }
@@ -322,7 +325,7 @@ mod tests {
             LowLevelType::Address,
         ] {
             assert_eq!(
-                lowleveltype_to_concrete(&ll),
+                lowleveltype_to_concrete(&ll).expect("supported lltype"),
                 ConcreteType::Signed,
                 "{ll:?} must project to Signed"
             );
@@ -333,7 +336,7 @@ mod tests {
     fn lowleveltype_to_concrete_float_family_collapses_to_float() {
         for ll in [LowLevelType::Float] {
             assert_eq!(
-                lowleveltype_to_concrete(&ll),
+                lowleveltype_to_concrete(&ll).expect("supported lltype"),
                 ConcreteType::Float,
                 "{ll:?} must project to Float"
             );
@@ -345,7 +348,7 @@ mod tests {
         let expected = longlong_getkind_concrete();
         for ll in [LowLevelType::SignedLongLong, LowLevelType::UnsignedLongLong] {
             assert_eq!(
-                lowleveltype_to_concrete(&ll),
+                lowleveltype_to_concrete(&ll).expect("supported lltype"),
                 expected,
                 "{ll:?} must match history.getkind's sizeof(TYPE) > sizeof(Signed) branch"
             );
@@ -353,24 +356,30 @@ mod tests {
     }
 
     #[test]
-    fn lowleveltype_to_concrete_unsupported_shapes_stay_unknown() {
-        for ll in [
-            LowLevelType::SignedLongLongLong,
-            LowLevelType::UnsignedLongLongLong,
-            LowLevelType::LongFloat,
-        ] {
-            assert_eq!(
-                lowleveltype_to_concrete(&ll),
-                ConcreteType::Unknown,
-                "{ll:?} must stay Unknown like getkind's unsupported branch"
-            );
-        }
+    fn lowleveltype_to_concrete_signedlonglonglong_returns_missing_rtype_err() {
+        let err = lowleveltype_to_concrete(&LowLevelType::SignedLongLongLong)
+            .expect_err("SignedLongLongLong has no history.getkind mapping");
+        assert!(err.is_missing_rtype_operation());
+    }
+
+    #[test]
+    fn lowleveltype_to_concrete_unsignedlonglonglong_returns_missing_rtype_err() {
+        let err = lowleveltype_to_concrete(&LowLevelType::UnsignedLongLongLong)
+            .expect_err("UnsignedLongLongLong has no history.getkind mapping");
+        assert!(err.is_missing_rtype_operation());
+    }
+
+    #[test]
+    fn lowleveltype_to_concrete_longfloat_returns_missing_rtype_err() {
+        let err = lowleveltype_to_concrete(&LowLevelType::LongFloat)
+            .expect_err("LongFloat has no history.getkind mapping");
+        assert!(err.is_missing_rtype_operation());
     }
 
     #[test]
     fn lowleveltype_to_concrete_void_passes_through() {
         assert_eq!(
-            lowleveltype_to_concrete(&LowLevelType::Void),
+            lowleveltype_to_concrete(&LowLevelType::Void).expect("supported lltype"),
             ConcreteType::Void
         );
     }
@@ -453,13 +462,16 @@ mod tests {
     }
 
     #[test]
-    fn specialize_legacy_graph_ref_typed_inputarg_surfaces_slice4_blocker() {
+    fn specialize_legacy_graph_ref_typed_inputarg_resolves_to_gcref() {
         let _lock = anchor_lock();
-        // Slice 1a's documented blocker: ValueType::Ref → SomeObject,
-        // and `rmodel.rs:2475` returns
-        // `TyperError::missing_rtype_operation` for SomeObject. This
-        // test pins the failure mode so any future fix (robject port
-        // or AnnotationState enrichment) flips this assertion.
+        // Cat 3.1 fix: `valuetype_to_someshell(Ref)` now lifts to
+        // `SomeInstance(classdef=None)` instead of the illegal
+        // `SomeObject` placeholder (`model.py:51-69` `SomeObject` is
+        // abstract).  The rtyper routes through `getinstancerepr(rtyper,
+        // None, Gc)` -> `InstanceRepr::new_rootinstance` ->
+        // `Ptr(GcStruct(OBJECT))` and `lowleveltype_to_concrete`
+        // collapses any GC pointer to `ConcreteType::GcRef`, matching
+        // legacy `resolve_types(Ref) -> GcRef`.
         let mut annotations = AnnotationState::new();
         annotations.set(ValueId(1), ValueType::Ref);
 
@@ -483,12 +495,12 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let err = specialize_legacy_graph(&graph, &annotations)
-            .expect_err("Ref-typed inputarg must surface the documented Slice 4 blocker");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("SomeObject") || msg.contains("rtype"),
-            "Slice 4 blocker should be a SomeObject / rtyper-related error, got: {msg}"
+        let state = specialize_legacy_graph(&graph, &annotations)
+            .expect("Ref-typed inputarg must specialize via SomeInstance(classdef=None)");
+        assert_eq!(
+            state.get(ValueId(1)),
+            &ConcreteType::GcRef,
+            "Ref-typed inputarg must project to GcRef matching legacy"
         );
     }
 
@@ -603,6 +615,198 @@ mod tests {
     }
 
     #[test]
+    fn anchor_load_fast_same_block_dedups_path_reads() {
+        let _lock = anchor_lock();
+        // Cat 3.2 first slice: a body `Expr::Path` whose name resolves
+        // to a same-block local definition reuses the existing
+        // `ValueId` instead of emitting a fresh `OpKind::Input`.
+        // RPython `flowspace/flowcontext.py:835 LOAD_FAST` reads the
+        // existing locals-stack entry; pyre's analogue forwards the
+        // bound `ValueId`.
+        //
+        // The graph for `fn id(x: &Foo) -> &Foo { x }` lifts the
+        // parameter as a single `OpKind::Input { name: "x", .. }` in
+        // the entry block.  The body's `x` reference is in the same
+        // block as the parameter binding, so the lookup returns the
+        // existing `ValueId` and the graph carries exactly one
+        // `OpKind::Input` named `"x"` — not two.
+        let graph = build_anchor_graph(
+            r#"
+struct Foo {}
+fn id(x: &Foo) -> &Foo { x }
+"#,
+            "id",
+        );
+        let input_x_count: usize = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    crate::model::OpKind::Input { name, .. } if name == "x"
+                )
+            })
+            .count();
+        assert_eq!(
+            input_x_count, 1,
+            "Cat 3.2 same-block dedup must collapse the body Path read \
+             into the parameter's existing ValueId — expected exactly \
+             one OpKind::Input{{name:\"x\"}}, got {input_x_count}"
+        );
+    }
+
+    #[test]
+    fn anchor_ref_identity_dual_gate_agrees() {
+        let _lock = anchor_lock();
+        // Cat 3.1 anchor: a typed-`Ref` identity graph must agree under
+        // dual-gate now that `valuetype_to_someshell(Ref)` projects to
+        // `SomeInstance(classdef=None)` instead of the illegal
+        // `SomeObject` placeholder.  The rtyper routes through
+        // `getinstancerepr(rtyper, None, Gc)` ->
+        // `InstanceRepr::new_rootinstance` -> `Ptr(GcStruct(OBJECT))`,
+        // which `lowleveltype_to_concrete` collapses to GcRef matching
+        // legacy `resolve_types(Ref) -> GcRef`.
+        let graph = build_anchor_graph(
+            r#"
+struct Foo {}
+fn id(x: &Foo) -> &Foo { x }
+"#,
+            "id",
+        );
+        let (annotations, legacy_state) = run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph, &annotations, &legacy_state);
+        assert!(
+            result.is_ok(),
+            "Ref-typed identity graph must agree under dual-gate via \
+             SomeInstance(classdef=None) -> GcRef, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn anchor_int_negation_dual_gate_agrees() {
+        let _lock = anchor_lock();
+        // Cat 3.3 follow-on: `OpKind::UnaryOp{op:"neg",..}` ports as
+        // a pre-rtyper opname pass-through (`neg` is registered
+        // upstream by `operation.py:466 add_operator('neg', 1, ...)`)
+        // and the rtyper rewrites `neg` -> `int_neg` for `Signed`
+        // operands via the unary `pair_int_*` dispatch, agreeing with
+        // the legacy resolver.
+        let graph = build_anchor_graph("fn negate(x: i64) -> i64 { -x }\n", "negate");
+        let (annotations, legacy_state) = run_legacy_resolve(&graph);
+        let result = dual_gate_check(&graph, &annotations, &legacy_state);
+        assert!(
+            result.is_ok(),
+            "Int negation must agree under dual-gate post-UnaryOp port, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn anchor_unary_not_surfaces_failloud_no_flowspace_peer() {
+        let _lock = anchor_lock();
+        // `OpKind::UnaryOp{op:"not",..}` (Rust `!x`) has no RPython
+        // flowspace counterpart — `flowspace/operation.py:465-474`
+        // registers only `pos` / `neg` / `bool` / `invert` / `abs`
+        // as unary ops.  Rust `!x` means logical not on `bool` and
+        // bitwise invert on integers; aliasing the result to the
+        // operand silently drops both semantics.  Until the
+        // frontend desugars `!cond` to `bool` + branch and bitwise
+        // `!int` to `invert`, the adapter must surface a fail-loud
+        // `TyperError` rather than emit a no-op.
+        let mut annotations = AnnotationState::new();
+        annotations.set(ValueId(1), ValueType::Int);
+        annotations.set(ValueId(2), ValueType::Int);
+
+        let mut graph = LegacyGraph::new("not_int");
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: vec![ValueId(1)],
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(ValueId(2)),
+                kind: crate::model::OpKind::UnaryOp {
+                    op: "not".into(),
+                    operand: ValueId(1),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(ValueId(2))],
+                graph.returnblock,
+            )],
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![ValueId(2)],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let err = specialize_legacy_graph(&graph, &annotations)
+            .expect_err("UnaryOp `not` must surface a TyperError until frontend desugaring lands");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("normalize_unary_op_name") && msg.contains("not"),
+            "fail-loud must name the unsupported opname, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn anchor_unary_deref_surfaces_failloud_no_flowspace_peer() {
+        let _lock = anchor_lock();
+        // `OpKind::UnaryOp{op:"deref",..}` (Rust `*x`) has no
+        // RPython peer — the operand table at
+        // `flowspace/operation.py:465-474` registers no `deref`,
+        // and pyre carries no global invariant proving Rust `*x` is
+        // type/reference-transparent.  Aliasing the result to the
+        // operand could silently fold a real value load.  Until
+        // the frontend either removes `deref` ops or proves the
+        // invariant, the adapter must surface fail-loud.
+        let mut annotations = AnnotationState::new();
+        annotations.set(ValueId(1), ValueType::Int);
+        annotations.set(ValueId(2), ValueType::Int);
+
+        let mut graph = LegacyGraph::new("deref_int");
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: vec![ValueId(1)],
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(ValueId(2)),
+                kind: crate::model::OpKind::UnaryOp {
+                    op: "deref".into(),
+                    operand: ValueId(1),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(ValueId(2))],
+                graph.returnblock,
+            )],
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![ValueId(2)],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let err = specialize_legacy_graph(&graph, &annotations)
+            .expect_err("UnaryOp `deref` must surface a TyperError until frontend invariant lands");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("normalize_unary_op_name") && msg.contains("deref"),
+            "fail-loud must name the unsupported opname, got: {msg}"
+        );
+    }
+
+    #[test]
     fn anchor_field_read_surfaces_followup() {
         let _lock = anchor_lock();
         // From `pipeline_e2e_with_virtualizable`. Frame.next_instr is a
@@ -667,6 +871,55 @@ fn fib(n: i64) -> i64 {
     }
 
     #[test]
+    fn specialize_legacy_graph_guard_value_skips_translation_keeps_kind() {
+        let _lock = anchor_lock();
+        // Cat 3.3 first slice: pyre JIT trace markers
+        // (`GuardTrue` / `GuardFalse` / `GuardValue`) have no peer in
+        // RPython flowspace's high-level operator set
+        // (`operation.py:475-510`).  The adapter now skips them
+        // (`Ok(Vec::new())`); the operand they read is defined
+        // elsewhere and the absence of a result keeps the SSA chain
+        // intact.  Specialize must succeed and project the Int operand
+        // to `Signed`.
+        let mut annotations = AnnotationState::new();
+        annotations.set(ValueId(1), ValueType::Int);
+
+        let mut graph = LegacyGraph::new("guard_passthrough");
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: vec![ValueId(1)],
+            operations: vec![crate::model::SpaceOperation {
+                result: None,
+                kind: crate::model::OpKind::GuardValue {
+                    value: ValueId(1),
+                    kind_char: 'i',
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(ValueId(1))],
+                graph.returnblock,
+            )],
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![ValueId(1)],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let state = specialize_legacy_graph(&graph, &annotations)
+            .expect("GuardValue must be a no-op for the rtyper adapter");
+        assert_eq!(
+            state.get(ValueId(1)),
+            &ConcreteType::Signed,
+            "Int operand passing through GuardValue must specialize to Signed"
+        );
+    }
+
+    #[test]
     fn specialize_legacy_graph_unported_opkind_propagates_failloud() {
         let _lock = anchor_lock();
         // Graph carrying an unported OpKind (Call) must surface the
@@ -711,6 +964,105 @@ fn fib(n: i64) -> i64 {
         assert!(
             msg.contains("Call") && msg.contains("Slice 1b followup"),
             "fail-loud must propagate the variant + slice tag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn anchor_load_fast_repeated_cross_block_read_dedups_within_block() {
+        let _lock = anchor_lock();
+        // Cat 3.2 next slice: when an `Expr::Path` cross-block read
+        // emits a fresh `OpKind::Input` (because the local name was
+        // bound in a predecessor block), the freshly-emitted result
+        // is registered as the authoritative `(ValueId, current_block)`
+        // so subsequent same-name reads within the *same* current
+        // block reuse it instead of emitting another `OpKind::Input`.
+        // RPython parity: `flowspace/flowcontext.py:835 LOAD_FAST` reads
+        // the existing locals slot rather than introducing a fresh
+        // Variable on every read.
+        //
+        // Construct a function whose post-`if` block reads the
+        // pre-`if` parameter `x` twice: `x + x`.  Without this slice
+        // both reads emit a separate `OpKind::Input{name:"x"}` in the
+        // post-`if` block; with the slice the second read reuses the
+        // first.  Total `OpKind::Input{name:"x"}` count drops from 3
+        // (entry + post-if x2) to 2 (entry + post-if x1).
+        let graph = build_anchor_graph(
+            r#"
+fn cross_block(x: i64, cond: bool) -> i64 {
+    if cond { return 0; }
+    x + x
+}
+"#,
+            "cross_block",
+        );
+        let input_x_count: usize = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    crate::model::OpKind::Input { name, .. } if name == "x"
+                )
+            })
+            .count();
+        assert_eq!(
+            input_x_count, 2,
+            "Cat 3.2 cross-block dedup: post-`if` block reads of `x` must \
+             collapse to one OpKind::Input — expected 2 total \
+             (entry + post-if), got {input_x_count}"
+        );
+    }
+
+    #[test]
+    fn anchor_cat_2_1_cross_block_reads_fail_dual_gate_until_link_args_thread() {
+        let _lock = anchor_lock();
+        // Cat 2.1 — cross-block locals threading via `Link.args` /
+        // target-`inputarg` join is a deferred multi-session epic.
+        //
+        // Pyre's frontend emits a fresh `OpKind::Input { name }` in
+        // each block that reads a local across a control-flow split
+        // (post-`if`, post-`loop`, ...) instead of threading the
+        // local through `Link.args` / target `inputargs` the way
+        // RPython's `flowspace/flowcontext.py:835 LOAD_FAST` does.
+        // The adapter's per-block `name_to_value` (built from
+        // `block.inputargs`) cannot resolve such a name when the
+        // post-split block has no inputargs of its own — surfacing
+        // as `function_graph_to_flowspace`'s
+        // `"Input \`x\` ... has no in-scope flowspace Variable/Constant"`
+        // diagnostic.
+        //
+        // A previous attempt to alias cross-block reads to the
+        // defining block's inputarg `Variable` (without modifying
+        // the legacy graph shape) was reverted because it tripped
+        // `flowspace/model.py:checkgraph`'s
+        // "variable used in more than one block" assertion (line
+        // 3886-3893 in the Rust port) — Variables must be defined
+        // in exactly one block, so cross-block locals genuinely
+        // require a target-`inputarg` introduction with matching
+        // `LinkArg::Value` plumbed at every predecessor `Link.exits`.
+        //
+        // This anchor pins the current failure mode so a future
+        // Cat 2.1 slice that lands proper Link.args threading can
+        // flip the assertion from `expect_err` to `expect` cleanly.
+        let graph = build_anchor_graph(
+            r#"
+fn cross_block(x: i64, cond: bool) -> i64 {
+    if cond { return 0; }
+    x + x
+}
+"#,
+            "cross_block",
+        );
+        let (annotations, legacy_state) = run_legacy_resolve(&graph);
+        let err = dual_gate_check(&graph, &annotations, &legacy_state)
+            .expect_err("cross_block surfaces Cat 2.1 cross-block locals gap");
+        assert!(
+            err.contains("has no in-scope flowspace Variable/Constant")
+                || err.contains("variable")
+                || err.contains("real path failed")
+                || err.contains("real path panicked"),
+            "Cat 2.1 anchor must pin the cross-block locals diagnostic, got: {err}"
         );
     }
 }

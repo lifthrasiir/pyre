@@ -58,10 +58,9 @@
 //!   migration, test fixture migration, legacy deletion.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::annotator::model::{SomeFloat, SomeInteger, SomeObjectBase, SomeValue};
 use crate::flowspace::model::{
     self as flowspace_model, Block as FlowspaceBlock, BlockRef, ConstValue, Constant,
     FunctionGraph as FlowspaceGraph, Hlvalue, Link as FlowspaceLink, SpaceOperation as FlowspaceOp,
@@ -70,7 +69,6 @@ use crate::flowspace::model::{
 use crate::jit_codewriter::annotation_state::AnnotationState;
 use crate::model::{
     BlockId, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueId,
-    ValueType,
 };
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -86,44 +84,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// `ValueId` keyed `TypeResolutionState`.
 pub type ValueIdToVariable = HashMap<ValueId, Variable>;
 
-/// RPython `SomeValue` lattice projection of the legacy `ValueType`.
-///
-/// `RPythonTyper.bindingrepr` (rtyper.rs:961) dispatches purely on the
-/// `SomeValue` shape via `rtyper_makekey` / `rtyper_makerepr`. `Int`
-/// and `Float` resolve cleanly through `rint::IntegerRepr` /
-/// `rfloat::FloatRepr`. The `Ref` and `Unknown` arms have **known
-/// blockers** in Slice 4 — see the table below.
-///
-/// Mapping:
-///
-/// | legacy `ValueType` | `SomeValue` shell      | RPython source / status |
-/// |--------------------|------------------------|--------------------------|
-/// | `Int`              | `Integer(SomeInteger)` | model.py:206-224 — resolves via [`crate::translator::rtyper::rmodel::rtyper_makerepr`] `SomeValue::Integer` arm. |
-/// | `Float`            | `Float(SomeFloat)`     | model.py:164-183 — resolves via the `SomeValue::Float` arm. |
-/// | `Ref`              | `Object(SomeObjectBase)` | model.py:51-125 lattice top. **Slice 4 blocker:** `rmodel.rs:2475` returns `TyperError::missing_rtype_operation("SomeObject.rtyper_makerepr — port rpython/rtyper/robject.py")`. The dual-gate cannot resolve any `Ref`-typed operand until either (a) `rpython/rtyper/robject.py` lands or (b) pyre's legacy `AnnotationState` is enriched to carry classdef metadata so this projection can return `SomeInstance` instead. |
-/// | `Void`             | `Impossible`           | model.py:627 — resolves via `SomeValue::Impossible` arm to `impossible_repr`. |
-/// | `State`/`Unknown`  | `Object(SomeObjectBase)` | Same Slice 4 blocker as `Ref`. `State`/`Unknown` are pyre-only `ValueType` variants with no RPython lattice point; the fallback keeps Slice 1a self-consistent but inherits the `Ref` failure mode. |
-///
-/// `SomeInteger::default()` returns `nonneg=false, unsigned=false,
-/// knowntype=Int` (model.rs:502-505) — the bottom of the integer
-/// sub-lattice. `SomeFloat::default()` analogously returns
-/// `knowntype=Float, immutable=true` (model.rs:352-355).
-///
-/// **Slice 1a scope deliberately excludes the fix** for the `Ref`
-/// blocker. Discovery of the failure mode is what Slice 4's dual-gate is
-/// designed for — the anchor test corpus will pin down which legacy
-/// graphs actually flow Ref-typed operands through `bindingrepr`, so
-/// the fix can be sized accurately (full robject port vs. minimal
-/// Instance shell vs. AnnotationState enrichment).
-pub fn valuetype_to_someshell(vt: &ValueType) -> SomeValue {
-    match vt {
-        ValueType::Int => SomeValue::Integer(SomeInteger::default()),
-        ValueType::Float => SomeValue::Float(SomeFloat::default()),
-        ValueType::Ref => SomeValue::Object(SomeObjectBase::default()),
-        ValueType::Void => SomeValue::Impossible,
-        ValueType::State | ValueType::Unknown => SomeValue::Object(SomeObjectBase::default()),
-    }
-}
+pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 
 /// Allocate a fresh `flowspace::Variable` and attach the projected
 /// `SomeValue` shell to its `annotation` slot.
@@ -134,9 +95,22 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> SomeValue {
 /// out-of-band by [`ValueIdToVariable`].
 fn seed_variable(vid: ValueId, annotations: &AnnotationState) -> Variable {
     let var = Variable::new();
-    let shell = valuetype_to_someshell(annotations.get(vid));
-    *var.annotation.borrow_mut() = Some(Rc::new(shell));
-    let _ = vid; // suppress unused-warning until Slice 1b consumes it via debug naming
+    // Prefer the precise per-`ValueId` `SomeValue` when a producer
+    // attached one (`AnnotationState::set_some`), matching upstream
+    // `_setbinding(v, s_value)` semantics
+    // (`rpython/annotator/annrpython.py:333-340`).  Fall back to the
+    // `ValueType` -> `SomeValue` projection at `valuetype_to_someshell`,
+    // which lifts `Int`/`Float`/`Ref`/`State` to definite shells and
+    // returns `None` for `Unknown` (annotation gap → leave the
+    // `Variable.annotation` slot empty, surfacing the producer-side
+    // gap as a fail-loud `KeyError: no binding for arg` at
+    // `bindingrepr` instead of silently bridging to `GcRef` via a
+    // fabricated `SomeInstance(None)` shell).
+    if let Some(s) = annotations.some(vid) {
+        *var.annotation.borrow_mut() = Some(s.clone());
+    } else if let Some(shell) = valuetype_to_someshell(annotations.get(vid)) {
+        *var.annotation.borrow_mut() = Some(Rc::new(shell));
+    }
     var
 }
 
@@ -171,7 +145,20 @@ fn seed_variable(vid: ValueId, annotations: &AnnotationState) -> Variable {
 /// translator looks up the same Variable instance for every reader of a
 /// given `ValueId`, matching upstream Python's reference semantics where
 /// `op.args[i]` and `op2.args[j]` may be the same `Variable` object.
-pub fn build_value_to_variable_map(
+///
+/// **Restricted to the adapter / its tests.**  `function_graph_to_flowspace`
+/// builds a *block-local* `ValueId -> Variable` map per block in the
+/// topology assembly pass, mirroring `RPython` `checkgraph`'s
+/// per-block Variable invariant
+/// (`rpython/flowspace/model.py:585-590`: a Variable must be defined in
+/// exactly one block).  Using this whole-graph helper as the source of
+/// truth for the adapter's main path would violate that invariant by
+/// reusing a single `Variable` across blocks.  The helper stays in the
+/// crate solely to back the adapter's regression tests
+/// (`build_value_to_variable_map_*`); production cutover code must use
+/// the per-block maps owned by `function_graph_to_flowspace`.
+#[cfg(test)]
+pub(crate) fn build_value_to_variable_map(
     legacy: &FunctionGraph,
     annotations: &AnnotationState,
 ) -> ValueIdToVariable {
@@ -341,6 +328,81 @@ fn resolve_result_hlvalue(
     }
 }
 
+/// Map a pyre-frontend unary op name (`front/ast.rs:3274-3281
+/// unary_op_name`) onto the RPython flowspace operator name
+/// (`rpython/flowspace/operation.py:465-474`).
+///
+/// `neg` passes through (registered upstream as `add_operator('neg',
+/// 1, ..)` at line 466).  `not` and `deref` are not flowspace
+/// operators — Python's `not x` is control flow (the truthy / falsy
+/// branch lives in the abstract interpreter, not the operator
+/// table), and Rust's `*x` has no Python peer.  Both surface as a
+/// fail-loud `TyperError`; resolution is at the frontend (Bool
+/// `not` should desugar to `bool` + branch; integer `!` should map
+/// to `invert` distinctly from logical `not`; `*` should not produce
+/// a body op at all).
+fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
+    match pyre_name {
+        "neg" => Ok("neg".to_string()),
+        other => Err(TyperError::missing_rtype_operation(format!(
+            "normalize_unary_op_name: pyre UnaryOp `{other}` has no \
+             flowspace counterpart (operation.py:465-474 registers \
+             only `pos` / `neg` / `invert` / `bool` as unary ops). \
+             Frontend must distinguish bitwise `invert` from logical \
+             `not` and remove `deref` before reaching the rtyper."
+        ))),
+    }
+}
+
+/// Map a pyre-frontend binary op name (`front/ast.rs:3227-3258
+/// binary_op_name`) onto the RPython flowspace operator name
+/// (`rpython/flowspace/operation.py:485-507 add_operator(...)`).
+///
+/// Rust-side identifiers (`bitand`, `bitor`, `bitxor`, `add_assign`,
+/// ...) become the trailing-underscore / `inplace_*` forms RPython
+/// registers and `RPythonTyper::translate_op_with_map`
+/// (`rtyper.rs:2023-2078`) dispatches on.  Names already matching
+/// RPython (`add`, `sub`, `mul`, `mod`, `lshift`, `rshift`, `lt`, ...)
+/// pass through unchanged.
+///
+/// Pyre's short-circuit `and` / `or` (Rust `&&` / `||`) are NOT
+/// flowspace operations — Python's `and`/`or` are control flow and
+/// `operation.py:475-510` does not register them as binary operators.
+/// They surface here as a fail-loud `TyperError`; the proper
+/// resolution is at the frontend, where `&&`/`||` should desugar to
+/// short-circuit control-flow blocks (mirroring `flowcontext.py`'s
+/// `JUMP_IF_FALSE_OR_POP` handling) instead of becoming `OpKind::BinOp`
+/// nodes.  Until that frontend desugaring lands, the adapter must
+/// refuse to forward an unregistered opname to the rtyper.
+fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
+    let normalized = match pyre_name {
+        "bitand" => "and_",
+        "bitor" => "or_",
+        "bitxor" => "xor",
+        "add_assign" => "inplace_add",
+        "sub_assign" => "inplace_sub",
+        "mul_assign" => "inplace_mul",
+        "div_assign" => "inplace_div",
+        "mod_assign" => "inplace_mod",
+        "bitand_assign" => "inplace_and",
+        "bitor_assign" => "inplace_or",
+        "bitxor_assign" => "inplace_xor",
+        "lshift_assign" => "inplace_lshift",
+        "rshift_assign" => "inplace_rshift",
+        "and" | "or" => {
+            return Err(TyperError::missing_rtype_operation(format!(
+                "normalize_binop_name: pyre BinOp `{pyre_name}` has no \
+                 flowspace counterpart (operation.py:475-510 does not \
+                 register short-circuit `and`/`or` as binary operators; \
+                 they are control flow). Frontend must desugar `&&`/`||` \
+                 to short-circuit blocks before reaching the rtyper."
+            )));
+        }
+        other => other,
+    };
+    Ok(normalized.to_string())
+}
+
 /// Translate a single legacy `model::SpaceOperation` into zero or more
 /// `flowspace::SpaceOperation`s.
 ///
@@ -363,20 +425,36 @@ pub fn translate_op(
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
         OpKind::ConstInt(_) | OpKind::ConstFloat(_) => Ok(Vec::new()),
+        // ─── Skipped: pyre JIT trace markers without a flowspace peer ───
+        // `GuardTrue` / `GuardFalse` / `GuardValue` are JIT-side
+        // assertions emitted by pyre's tracer — they constrain the
+        // runtime value of an existing SSA operand and produce no new
+        // SSA result.  `VableForce` is a virtualizable-flush hint
+        // (`hint_force_virtualizable`, no operands, no result).
+        // RPython's flowspace abstract interpreter does not have any
+        // of these at the high-level rtyper input
+        // (`rpython/flowspace/operation.py:475-510`); the equivalent
+        // checks appear later in `pyjitpl` / `codewriter` after the
+        // rtyper has already lowered to lltype.  For the type
+        // resolution pass driven by `specialize_legacy_graph` they
+        // are pure no-ops: skipping them preserves the SSA chain
+        // (any operand they read is defined elsewhere; the absence
+        // of a result means no consumer is left unsatisfied).
+        OpKind::GuardTrue { .. }
+        | OpKind::GuardFalse { .. }
+        | OpKind::GuardValue { .. }
+        | OpKind::VableForce { .. } => Ok(Vec::new()),
 
-        // ─── Pre-rtyper opname pass-through ───
-        // `binary_op_name` (front/ast.rs:2959-2978) emits the same
-        // pre-rtyper opnames RPython's flowspace registers via
-        // `add_operator('add', 2, ...)` etc. (operation.py:475-507):
-        // `add`, `sub`, `mul`, `mod`, `lt`, `eq`, ... So the legacy
-        // `op` string passes straight through into the flowspace
-        // SpaceOperation; the real rtyper will rewrite `add` →
-        // `int_add` per the operand types via the same
-        // `pair_int_int` machinery used for upstream graphs. Compound
-        // forms like `add_assign` (front/ast.rs:2980+) have no
-        // RPython counterpart and will surface as TyperError when
-        // the rtyper fails to find a `rtype_add_assign`; that's a
-        // deferred Slice 1b sub-followup, not a regression.
+        // ─── Pre-rtyper opname normalization ───
+        // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
+        // names (`bitand`, `bitor`, `bitxor`, `add_assign`, ...).
+        // RPython flowspace registers operators via
+        // `add_operator('and_', 2, ...)` etc.
+        // (`rpython/flowspace/operation.py:485-507`): `and_`, `or_`,
+        // `xor`, `inplace_add`, `inplace_sub`, ...  Translate the
+        // pyre-side name to its RPython counterpart so the rtyper's
+        // `translate_op` arm matching (`rtyper.rs:2023-2078`) finds
+        // the proper `pair_rtype_*` dispatch.
         OpKind::BinOp {
             op: opname,
             lhs,
@@ -386,7 +464,35 @@ pub fn translate_op(
             let l = lookup_operand(value_map, *lhs)?;
             let r = lookup_operand(value_map, *rhs)?;
             let result = resolve_result_hlvalue(op, value_map)?;
-            Ok(vec![FlowspaceOp::new(opname.clone(), vec![l, r], result)])
+            Ok(vec![FlowspaceOp::new(
+                normalize_binop_name(opname)?,
+                vec![l, r],
+                result,
+            )])
+        }
+
+        // ─── Pre-rtyper opname normalization for unary ops ───
+        // `unary_op_name` (`front/ast.rs:3274-3281`) emits Rust-side
+        // names (`neg`, `not`, `deref`).  RPython flowspace registers
+        // unary operators via `add_operator('neg', 1, ..)` /
+        // `add_operator('invert', 1, ..)` /
+        // `add_operator('pos', 1, ..)` etc.
+        // (`rpython/flowspace/operation.py:465-474`).  Translate the
+        // pyre-side name to its RPython counterpart so the rtyper's
+        // unary dispatch (`rtyper.rs:2023-2078 translate_op_*`) finds
+        // the proper `unary_rtype_*` arm.
+        OpKind::UnaryOp {
+            op: opname,
+            operand,
+            ..
+        } => {
+            let v = lookup_operand(value_map, *operand)?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                normalize_unary_op_name(opname)?,
+                vec![v],
+                result,
+            )])
         }
 
         // ─── Slice 1b followups: deferred per-variant ports ───
@@ -427,6 +533,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
         OpKind::GuardValue { .. } => "GuardValue",
+        OpKind::VableForce { .. } => "VableForce",
         // Catch-all for variants pyre may add without bumping this
         // table — surfaces as `<unknown>` in the fail-loud message
         // rather than a misleading variant tag.
@@ -450,13 +557,13 @@ pub struct FlowspaceAdapterOutput {
     /// `ValueId → flowspace::Variable` (Slice 1a output) — Slice 2 reads
     /// `Variable.concretetype` per `ValueId` after `specialize` returns.
     pub value_to_var: ValueIdToVariable,
-    /// Legacy constant define ValueIds that were intentionally
-    /// materialised as `flowspace::Constant`s instead of graph
-    /// `Variable` definitions. RPython stores concretetype on
-    /// Constants directly; pyre's legacy `TypeResolutionState` is
-    /// ValueId-keyed, so Slice 2 uses this adapter-local set to project
-    /// constant ValueIds back without inventing a graph Variable.
-    pub constant_value_ids: HashSet<ValueId>,
+    /// Legacy constant define `ValueId` -> `Constant.concretetype`.
+    /// Materialised at lift time from `OpKind::ConstInt` / `ConstFloat`
+    /// via `Constant::with_concretetype` (`flowspace_adapter.rs:518-527`),
+    /// matching RPython's `Constant.concretetype` ground truth.  Slice 2
+    /// reads the per-`ValueId` `LowLevelType` directly so the projector
+    /// does not have to reconstruct the kind from `AnnotationState`.
+    pub constant_concretetypes: HashMap<ValueId, LowLevelType>,
     /// `BlockId → flowspace::BlockRef` mapping. Includes the canonical
     /// `returnblock` and `exceptblock` (mapped to the
     /// `FunctionGraph::with_return_var`-allocated final blocks) so any
@@ -585,13 +692,17 @@ pub fn function_graph_to_flowspace(
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
     let mut value_to_var: ValueIdToVariable = HashMap::new();
     let mut constant_hlvalues: HashMap<ValueId, Hlvalue> = HashMap::new();
-    let mut constant_value_ids: HashSet<ValueId> = HashSet::new();
+    let mut constant_concretetypes: HashMap<ValueId, LowLevelType> = HashMap::new();
 
     for legacy_block in &legacy.blocks {
         for legacy_op in &legacy_block.operations {
             if let Some((vid, hlvalue)) = legacy_const_define_hlvalue(legacy_op) {
+                if let Hlvalue::Constant(c) = &hlvalue {
+                    if let Some(ct) = &c.concretetype {
+                        constant_concretetypes.insert(vid, ct.clone());
+                    }
+                }
                 constant_hlvalues.insert(vid, hlvalue);
-                constant_value_ids.insert(vid);
             }
         }
     }
@@ -797,11 +908,12 @@ pub fn function_graph_to_flowspace(
                 .collect::<Result<Vec<_>, _>>()?;
             let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref());
             let mut link = FlowspaceLink::new(args, Some(target), exitcase);
-            if let Some(llexitcase) = &legacy_link.llexitcase {
-                link.llexitcase = Some(Hlvalue::Constant(constant_from_constvalue(
-                    llexitcase.clone(),
-                )));
-            }
+            // RPython `Link.__init__` (`flowspace/model.rs:Link::new`) leaves
+            // `llexitcase` unset; `RPythonTyper._convert_link`
+            // (`rpython/rtyper/rtyper.py:353-360`) populates it during
+            // specialization via `r_case.convert_const(link.exitcase)`.
+            // Pre-seeding `llexitcase` here would diverge from upstream
+            // `pre-rtyper` graph shape; the rtyper overwrites it anyway.
             link.extravars(last_exception, last_exc_value);
             link.prevblock = Some(Rc::downgrade(&block_ref));
             translated_exits.push(link.into_ref());
@@ -829,7 +941,7 @@ pub fn function_graph_to_flowspace(
     Ok(FlowspaceAdapterOutput {
         graph: graph_ref,
         value_to_var,
-        constant_value_ids,
+        constant_concretetypes,
         block_map,
     })
 }
@@ -837,12 +949,14 @@ pub fn function_graph_to_flowspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotator::model::{KnownType, SomeObjectTrait};
-    use crate::model::{Block, BlockId, FunctionGraph as LegacyGraph, OpKind, SpaceOperation};
+    use crate::annotator::model::{KnownType, SomeObjectTrait, SomeValue};
+    use crate::model::{
+        Block, BlockId, FunctionGraph as LegacyGraph, OpKind, SpaceOperation, ValueType,
+    };
 
     #[test]
     fn valuetype_int_lifts_to_someinteger_default() {
-        let s = valuetype_to_someshell(&ValueType::Int);
+        let s = valuetype_to_someshell(&ValueType::Int).expect("Int must project");
         match s {
             SomeValue::Integer(i) => {
                 assert_eq!(i.knowntype(), KnownType::Int);
@@ -855,7 +969,7 @@ mod tests {
 
     #[test]
     fn valuetype_float_lifts_to_somefloat_default() {
-        let s = valuetype_to_someshell(&ValueType::Float);
+        let s = valuetype_to_someshell(&ValueType::Float).expect("Float must project");
         match s {
             SomeValue::Float(f) => {
                 assert_eq!(f.knowntype(), KnownType::Float);
@@ -866,20 +980,32 @@ mod tests {
     }
 
     #[test]
-    fn valuetype_ref_lifts_to_someobject_lattice_top() {
-        let s = valuetype_to_someshell(&ValueType::Ref);
+    fn valuetype_ref_lifts_to_someinstance_classdef_none() {
+        let s = valuetype_to_someshell(&ValueType::Ref).expect("Ref must project");
         match s {
-            SomeValue::Object(b) => {
-                assert_eq!(b.knowntype, KnownType::Object);
-                assert!(!b.immutable, "default SomeObjectBase is mutable");
+            SomeValue::Instance(inst) => {
+                assert!(
+                    inst.classdef.is_none(),
+                    "Ref placeholder must carry classdef=None (model.py:438 default)"
+                );
+                assert!(
+                    !inst.can_be_none,
+                    "SomeInstance.__init__ default `can_be_None=False` (model.py:438)"
+                );
+                assert!(
+                    inst.flags.is_empty(),
+                    "SomeInstance.__init__ default `flags={{}}` (model.py:438)"
+                );
             }
-            other => panic!("ValueType::Ref must lift to SomeValue::Object, got {other:?}"),
+            other => panic!(
+                "ValueType::Ref must lift to SomeValue::Instance(classdef=None), got {other:?}"
+            ),
         }
     }
 
     #[test]
     fn valuetype_void_lifts_to_impossible_lattice_bottom() {
-        let s = valuetype_to_someshell(&ValueType::Void);
+        let s = valuetype_to_someshell(&ValueType::Void).expect("Void must project");
         assert!(
             matches!(s, SomeValue::Impossible),
             "ValueType::Void must lift to SomeValue::Impossible, got {s:?}"
@@ -887,14 +1013,40 @@ mod tests {
     }
 
     #[test]
-    fn valuetype_state_and_unknown_lift_to_someobject_fallback() {
-        for vt in [ValueType::State, ValueType::Unknown] {
-            let s = valuetype_to_someshell(&vt);
-            assert!(
-                matches!(s, SomeValue::Object(_)),
-                "{vt:?} must fall back to SomeValue::Object, got {s:?}"
-            );
+    fn valuetype_state_lifts_to_someinstance_classdef_none() {
+        // PRE-EXISTING-ADAPTATION: pyre-only `State` (JIT state pointer)
+        // — temporary fallback shell.
+        let s = valuetype_to_someshell(&ValueType::State).expect("State must project");
+        match s {
+            SomeValue::Instance(inst) => {
+                assert!(
+                    inst.classdef.is_none(),
+                    "State placeholder must carry classdef=None"
+                );
+            }
+            other => panic!(
+                "ValueType::State must lift to SomeValue::Instance(classdef=None), got {other:?}"
+            ),
         }
+    }
+
+    #[test]
+    fn valuetype_unknown_returns_none_for_failloud_at_bindingrepr() {
+        // Cat 2.4 fix: `Unknown` is an annotation gap with no
+        // annotation-stage shell.  Returning `None` leaves
+        // `Variable.annotation` empty so `bindingrepr` panics with
+        // `KeyError: no binding for arg`
+        // (`annotator/annrpython.rs:418`), surfacing the producer-side
+        // gap instead of silently bridging it to `GcRef` via a
+        // fabricated `SomeInstance(None)` shell — that bridging
+        // conflated the annotation-stage lattice node with the
+        // **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown
+        // -> GcRef` resolver-stage backfill.
+        assert!(
+            valuetype_to_someshell(&ValueType::Unknown).is_none(),
+            "ValueType::Unknown must return None — annotation gap, no \
+             annotation-stage shell"
+        );
     }
 
     #[test]
@@ -918,18 +1070,25 @@ mod tests {
     }
 
     #[test]
-    fn seed_variable_unknown_value_id_lifts_to_object_fallback() {
-        // Missing entries in AnnotationState.types resolve to
-        // ValueType::Unknown via AnnotationState::get
-        // (annotation_state.rs:30-32). The adapter must still produce a
-        // Variable with a non-None annotation so bindingrepr can resolve.
+    fn seed_variable_unknown_value_id_leaves_annotation_empty_for_failloud() {
+        // Cat 2.4 fix: missing entries in AnnotationState.types resolve
+        // to ValueType::Unknown via AnnotationState::get
+        // (annotation_state.rs:117). The adapter must NOT fabricate a
+        // SomeInstance(classdef=None) shell for these — that would
+        // silently bridge an annotation gap to GcRef via the
+        // resolver-stage backfill at the wrong layer. Instead, leave
+        // Variable.annotation empty so `bindingrepr` panics with
+        // `KeyError: no binding for arg`
+        // (annotator/annrpython.rs:418), surfacing the producer-side
+        // gap as a fail-loud signal.
         let annotations = AnnotationState::new();
         let var = seed_variable(ValueId(42), &annotations);
         let ann = var.annotation.borrow();
-        let shell = ann.as_ref().expect("annotation slot must be populated");
         assert!(
-            matches!(shell.as_ref(), SomeValue::Object(_)),
-            "missing annotation must fall back to SomeValue::Object, got {shell:?}"
+            ann.is_none(),
+            "Unknown ValueId must leave annotation empty (Cat 2.4 fail-loud), \
+             got {:?}",
+            ann.as_ref()
         );
     }
 
@@ -982,9 +1141,9 @@ mod tests {
                     .borrow()
                     .as_ref()
                     .map(|s| s.as_ref().clone()),
-                Some(SomeValue::Object(_))
+                Some(SomeValue::Instance(_))
             ),
-            "op-result ValueId(2) (Ref) must be seeded with SomeObject"
+            "op-result ValueId(2) (Ref) must be seeded with SomeInstance(classdef=None)"
         );
     }
 
