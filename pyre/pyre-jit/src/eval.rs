@@ -1321,8 +1321,16 @@ impl __extend__ {
             let decr_by = _get_adapted_tick_counter();
             frame.set_last_instr_from_next_instr(jumpto);
             if !ec.is_null() {
+                // executioncontext.py:392-395 — _trace re-raises callback
+                // exceptions; this JIT-side helper returns `usize` so the
+                // error cannot ride the call stack directly. Stash via
+                // `set_call_error` so the surrounding eval loop's
+                // `take_call_error` checkpoints surface it on the next
+                // hand-off.
                 unsafe {
-                    (*ec).bytecode_trace(frame as *mut PyFrame, decr_by);
+                    if let Err(err) = (*ec).bytecode_trace(frame as *mut PyFrame, decr_by) {
+                        pyre_interpreter::call::set_call_error(err);
+                    }
                 }
             }
             // Re-read: trace/profile hook may have changed the jump target

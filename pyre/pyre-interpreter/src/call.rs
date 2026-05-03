@@ -27,7 +27,7 @@ thread_local! {
 
 /// Stash an error from the bare-PyObjectRef call path so a caller that
 /// recognizes the NULL return can recover the original PyError.
-pub(crate) fn set_call_error(e: PyError) {
+pub fn set_call_error(e: PyError) {
     PENDING_CALL_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(e);
     });

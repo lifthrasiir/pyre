@@ -471,7 +471,7 @@ pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) 
     let mut got_exception = true;
     let mut w_exitvalue = pyre_object::w_none();
     let result = (|| {
-        execution_context.call_trace(frame as *mut PyFrame);
+        execution_context.call_trace(frame as *mut PyFrame)?;
         if let Some(err) = operr {
             let mut next_instr = frame.next_instr();
             if !handle_exception(frame, &err, &mut next_instr) {
@@ -484,9 +484,16 @@ pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) 
         got_exception = false;
         Ok(result)
     })();
-    execution_context.return_trace(frame as *mut PyFrame, w_exitvalue);
-    execution_context.leave(frame as *mut PyFrame, w_exitvalue, got_exception);
+    // executioncontext.py:91-103 — leave wraps `_trace('leaveframe', …)` in
+    // try/finally; the topframeref restore must run regardless of trace
+    // outcome.  Capture both trace results, run leave's cleanup, then
+    // funnel exceptions back into `result` (eval body errors win over
+    // late-trace errors, matching the upstream raise order).
+    let return_trace_result = execution_context.return_trace(frame as *mut PyFrame, w_exitvalue);
+    let leave_result = execution_context.leave(frame as *mut PyFrame, w_exitvalue, got_exception);
     result
+        .and_then(|v| return_trace_result.map(|()| v))
+        .and_then(|v| leave_result.map(|()| v))
 }
 
 /// Resume interpretation after compiled code guard failure.

@@ -522,11 +522,22 @@ impl ExecutionContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn leave(&mut self, frame: *mut PyFrame, w_exitvalue: PyObjectRef, got_exception: bool) {
+    pub fn leave(
+        &mut self,
+        frame: *mut PyFrame,
+        w_exitvalue: PyObjectRef,
+        got_exception: bool,
+    ) -> Result<(), crate::PyError> {
         // pypy/interpreter/executioncontext.py:91-109 leave parity.
-        if self.profilefunc.is_some() {
-            self._trace(frame, "leaveframe", w_exitvalue, None);
-        }
+        // The original wraps `_trace('leaveframe', …)` in try/finally so
+        // the topframeref restore and the vref dance always run.  We
+        // capture the trace result and propagate it after the cleanup
+        // block below.
+        let trace_result = if self.profilefunc.is_some() {
+            self._trace(frame, "leaveframe", w_exitvalue, None)
+        } else {
+            Ok(())
+        };
         let _frame_vref = self.topframeref;
         unsafe {
             self.topframeref = (*frame).f_backref;
@@ -541,6 +552,7 @@ impl ExecutionContext {
         // `jit.virtual_ref_finish(frame_vref, frame)` — no-op until
         // jit.virtual_ref is ported.
         self._revdb_leave(got_exception);
+        trace_result
     }
 
     pub fn c_call_trace(
@@ -548,9 +560,9 @@ impl ExecutionContext {
         frame: *mut PyFrame,
         w_func: PyObjectRef,
         args: Option<PyObjectRef>,
-    ) {
+    ) -> Result<(), crate::PyError> {
         let args = args.unwrap_or(pyre_object::PY_NULL);
-        self._c_call_return_trace(frame, w_func, args, "c_call");
+        self._c_call_return_trace(frame, w_func, args, "c_call")
     }
 
     pub fn c_return_trace(
@@ -558,9 +570,9 @@ impl ExecutionContext {
         frame: *mut PyFrame,
         w_func: PyObjectRef,
         args: Option<PyObjectRef>,
-    ) {
+    ) -> Result<(), crate::PyError> {
         let args = args.unwrap_or(pyre_object::PY_NULL);
-        self._c_call_return_trace(frame, w_func, args, "c_return");
+        self._c_call_return_trace(frame, w_func, args, "c_return")
     }
 
     pub fn _c_call_return_trace(
@@ -569,14 +581,14 @@ impl ExecutionContext {
         mut w_func: PyObjectRef,
         args: PyObjectRef,
         event: &str,
-    ) {
+    ) -> Result<(), crate::PyError> {
         if self.profilefunc.is_none() {
             if !frame.is_null() {
                 unsafe {
                     (*frame).getorcreatedebug(-1).is_being_profiled = false;
                 }
             }
-            return;
+            return Ok(());
         }
         // executioncontext.py:125-134 FunctionWithFixedCode method-call
         // rebinding. Pyre represents FunctionWithFixedCode and builtin
@@ -603,24 +615,28 @@ impl ExecutionContext {
                 }
             }
         }
-        self._trace(frame, event, w_func, None);
+        self._trace(frame, event, w_func, None)
     }
 
-    pub fn c_exception_trace(&mut self, frame: *mut PyFrame, _w_exc: PyObjectRef) {
+    pub fn c_exception_trace(
+        &mut self,
+        frame: *mut PyFrame,
+        _w_exc: PyObjectRef,
+    ) -> Result<(), crate::PyError> {
         if self.profilefunc.is_none() {
             if !frame.is_null() {
                 unsafe {
                     (*frame).getorcreatedebug(-1).is_being_profiled = false;
                 }
             }
-            return;
+            return Ok(());
         }
-        self._trace(frame, "c_exception", _w_exc, None);
+        self._trace(frame, "c_exception", _w_exc, None)
     }
 
-    pub fn call_trace(&mut self, frame: *mut PyFrame) {
+    pub fn call_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         if !self.gettrace().is_null() || self.profilefunc.is_some() {
-            self._trace(frame, "call", pyre_object::w_none(), None);
+            self._trace(frame, "call", pyre_object::w_none(), None)?;
             if self.profilefunc.is_some() {
                 if !frame.is_null() {
                     unsafe {
@@ -629,40 +645,51 @@ impl ExecutionContext {
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn return_trace(&mut self, frame: *mut PyFrame, w_retval: PyObjectRef) {
+    pub fn return_trace(
+        &mut self,
+        frame: *mut PyFrame,
+        w_retval: PyObjectRef,
+    ) -> Result<(), crate::PyError> {
         let _ = (frame, w_retval);
         if !self.gettrace().is_null() {
-            self._trace(frame, "return", w_retval, None);
+            self._trace(frame, "return", w_retval, None)?;
         }
+        Ok(())
     }
 
-    pub fn bytecode_trace(&mut self, frame: *mut PyFrame, decr_by: usize) {
-        self.bytecode_only_trace(frame);
+    pub fn bytecode_trace(
+        &mut self,
+        frame: *mut PyFrame,
+        decr_by: usize,
+    ) -> Result<(), crate::PyError> {
+        let trace_result = self.bytecode_only_trace(frame);
         let _ = self.actionflag.decrement_ticker(decr_by as isize);
+        trace_result
     }
 
-    pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) {
+    pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         if self.space.is_null() || frame.is_null() || self.is_tracing != 0 {
-            return;
+            return Ok(());
         }
         if self.w_tracefunc.is_null() {
-            return;
+            return Ok(());
         }
-        self.run_trace_func(frame);
+        self.run_trace_func(frame)
     }
 
     pub fn _run_finalizers_now(&mut self) {
         let _ = self;
     }
 
-    pub fn run_trace_func(&mut self, frame: *mut PyFrame) {
+    pub fn run_trace_func(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         let _ = frame;
         if self.space.is_null() {
-            return;
+            return Ok(());
         }
-        self._trace(frame, "line", pyre_object::w_none(), None);
+        self._trace(frame, "line", pyre_object::w_none(), None)
     }
 
     pub fn bytecode_trace_after_exception(&mut self, frame: *mut PyFrame) {
@@ -696,15 +723,16 @@ impl ExecutionContext {
         w_type: PyObjectRef,
         w_value: PyObjectRef,
         w_traceback: PyObjectRef,
-    ) {
+    ) -> Result<(), crate::PyError> {
         if !self.gettrace().is_null() {
             self._trace(
                 frame,
                 "exception",
                 w_value,
                 Some((w_type, w_value, w_traceback)),
-            );
+            )?;
         }
+        Ok(())
     }
 
     pub fn sys_exc_info(&self, _for_hidden: bool) -> PyObjectRef {
@@ -831,16 +859,16 @@ impl ExecutionContext {
         event: &str,
         w_arg: PyObjectRef,
         operr: Option<(PyObjectRef, PyObjectRef, PyObjectRef)>,
-    ) {
+    ) -> Result<(), crate::PyError> {
         // executioncontext.py:347 if self.is_tracing or frame.hide():
         if self.is_tracing != 0 {
-            return;
+            return Ok(());
         }
         if frame.is_null() {
-            return;
+            return Ok(());
         }
         if unsafe { (*frame).hide() } {
-            return;
+            return Ok(());
         }
 
         let space = self.space;
@@ -938,9 +966,14 @@ impl ExecutionContext {
             if had_locals {
                 unsafe { (*frame).locals2fast(false) };
             }
+            // executioncontext.py:392-395 — re-raise the callback's
+            // exception after restoring trace bookkeeping. Caller chain
+            // (call_trace/return_trace/bytecode_trace/exception_trace
+            // → eval_frame_plain) propagates the error up so the
+            // tracefunc behaves like an inline raise from the executing
+            // frame.
             if let Err(err) = call_result {
-                crate::call::set_call_error(err);
-                return;
+                return Err(err);
             }
         }
 
@@ -957,7 +990,7 @@ impl ExecutionContext {
             {
                 event
             } else {
-                return;
+                return Ok(());
             };
 
             // executioncontext.py:416-417 assert self.is_tracing == 0; self.is_tracing += 1
@@ -967,15 +1000,18 @@ impl ExecutionContext {
             // profile slots on exceptions.
             let profile_result = profilefunc(space, self.w_profilefuncarg, frame, event, w_arg);
             if let Err(err) = profile_result {
+                // executioncontext.py:421-425 — clear profile slots and
+                // re-raise so the caller observes the failure (matches
+                // the bare `raise` after the `except:` block).
                 self.profilefunc = None;
                 self.w_profilefuncarg = pyre_object::PY_NULL;
                 self.is_tracing -= 1;
-                crate::call::set_call_error(err);
-                return;
+                return Err(err);
             }
             // executioncontext.py:427-428 self.is_tracing -= 1
             self.is_tracing -= 1;
         }
+        Ok(())
     }
 
     pub fn checksignals(&mut self) {
