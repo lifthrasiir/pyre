@@ -411,16 +411,42 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usi
     {
         return false;
     }
-    // pyopcode.py:148 `ec.exception_trace(self, operr)` — fire the
-    // trace event before the unrollstack search so the tracer observes
-    // the exception at its raise point.  Gate on the live tracefunc
-    // before materialising the exception object (`to_exc_object`
-    // allocates) so the no-tracer hot path stays allocation-free.
+    // pyopcode.py:135-148 — exception trace plumbing:
+    //   try:
+    //       trace = self.get_w_f_trace()
+    //       if trace is not None:
+    //           self.getorcreatedebug().w_f_trace = None
+    //       try:
+    //           ec.bytecode_trace_after_exception(self)
+    //       finally:
+    //           if trace is not None:
+    //               self.getorcreatedebug().w_f_trace = trace
+    //   except OperationError as e:
+    //       operr = e
+    //   ...
+    //   ec.exception_trace(self, operr)
+    //
+    // Gated on a live tracefunc so the no-tracer hot path skips both
+    // the f_trace save/restore dance and the `to_exc_object` alloc.
     // A trace-callback exception replaces the in-flight one through
-    // the TLS `set_call_error` slot — handlers that subsequently
-    // unwind via `take_call_error` see the tracer error.
+    // the TLS `set_call_error` slot; pyre keeps `err` unchanged for
+    // handler dispatch (so the resume PC and pushed exception still
+    // reflect the original raise) — the take_call_error checkpoints
+    // downstream surface the tracer error after this frame unwinds.
     let ec = frame.execution_context as *mut crate::PyExecutionContext;
     if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+        let saved_trace = frame.get_w_f_trace();
+        if !saved_trace.is_null() {
+            frame.getorcreatedebug(-1).w_f_trace = pyre_object::PY_NULL;
+        }
+        let after_exc_result =
+            unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
+        if !saved_trace.is_null() {
+            frame.getorcreatedebug(-1).w_f_trace = saved_trace;
+        }
+        if let Err(trace_err) = after_exc_result {
+            crate::call::set_call_error(trace_err);
+        }
         let exc_obj = err.to_exc_object();
         if let Err(trace_err) = unsafe {
             (*ec).exception_trace(

@@ -696,11 +696,36 @@ impl ExecutionContext {
         self._trace(frame, "line", pyre_object::w_none(), None)
     }
 
-    pub fn bytecode_trace_after_exception(&mut self, frame: *mut PyFrame) {
-        let _ = frame;
+    /// pypy/interpreter/executioncontext.py:202-208
+    /// `bytecode_trace_after_exception`.
+    ///
+    /// ```python
+    /// def bytecode_trace_after_exception(self, frame):
+    ///     "Like bytecode_trace(), but without increasing the ticker."
+    ///     actionflag = self.space.actionflag
+    ///     self.bytecode_only_trace(frame)
+    ///     if actionflag.get_ticker() < 0:
+    ///         actionflag.action_dispatcher(self, frame)     # slow path
+    /// ```
+    ///
+    /// pyre's action_dispatcher slow path is not yet wired (the
+    /// pre-existing stub only decremented the ticker once); the
+    /// `bytecode_only_trace` call mirrors upstream so a tracer error
+    /// surfaces through this helper's `Result`.
+    pub fn bytecode_trace_after_exception(
+        &mut self,
+        frame: *mut PyFrame,
+    ) -> Result<(), crate::PyError> {
+        self.bytecode_only_trace(frame)?;
         if self.actionflag.get_ticker() < 0 {
+            // PRE-EXISTING-ADAPTATION: pyre's actionflag has no
+            // `action_dispatcher` slow path yet (executioncontext.py:165);
+            // the prior stub only nudged the ticker so the deferred
+            // signal/AsyncAction queue would not loop.  Preserve that
+            // behaviour until the dispatcher port lands.
             let _ = self.actionflag.decrement_ticker(0);
         }
+        Ok(())
     }
 
     /// pypy/interpreter/executioncontext.py:430-433 exception_trace.
