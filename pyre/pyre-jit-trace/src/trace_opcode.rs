@@ -4717,15 +4717,20 @@ impl MIFrame {
             return self.trace_call_callable(callable, args);
         }
 
-        // PRE-EXISTING-ADAPTATION. RPython recognizes `lst.append(i)` /
-        // `lst.pop()` at codewriter time via `@oopspec("list.append")`
-        // (`rpython/rtyper/extregistry.py` registration consumed by
-        // `rpython/jit/codewriter/jtransform.py:do_resizable_list_append`),
-        // which rewrites the IR before tracing ever runs. Pyre's
-        // codewriter is `partial` (per `majit/COMPATIBILITY_MATRIX.md`),
-        // so the analogous specialization happens here at trace recording
-        // time instead. Convergence path: port the codewriter's oopspec
-        // pass and remove this arm.
+        // PRE-EXISTING-ADAPTATION. In RPython the `lst.append(i)` /
+        // `lst.pop()` lowering goes through rtyper helpers in
+        // `rpython/rtyper/rlist.py`: `ll_append` (rlist.py:588) is
+        // documented "no oopspec — inlined by the JIT", and the pop
+        // path picks `ll_pop_nonneg` / `ll_pop_zero` (which carry
+        // `oopspec = 'list.pop(l, index)'` / `'list.pop(l, 0)'`) over
+        // `ll_pop_default` based on the index sign. By the time the
+        // metainterp sees the trace, those helpers have already been
+        // inlined or oopspec'd into direct array operations. Pyre's
+        // codewriter is `partial` (per `majit/COMPATIBILITY_MATRIX.md`)
+        // and does not run that pass, so the analogous specialization
+        // happens here at trace recording time instead. Convergence
+        // path: port the rtyper/codewriter inlining + oopspec
+        // recognition and remove this arm.
         //
         // `baseobjspace::getattr` returns a fresh `W_MethodObject` per
         // iteration, so the receiver is pushed by `load_method` as

@@ -1223,13 +1223,10 @@ pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
-/// rlist.py:116 `l.length` — live length of a list under the Object
-/// strategy. Under Integer/Float strategies this field is 0 and
-/// consumers must dispatch on `list.strategy` first.
 /// `W_MethodObject.w_function` — the underlying function (W_FunctionObject
-/// or W_BuiltinFunction) bound by `getattr(obj, name)`. Mutable in storage
-/// (the field is a Ref slot the GC traces) but the value the JIT observes is
-/// stable across calls to the same bound method. Used by the
+/// or W_BuiltinFunction) bound by `getattr(obj, name)`. Marked immutable
+/// per `pypy/interpreter/function.py:567` `_Method._immutable_fields_`,
+/// so reads survive cache invalidation across calls. Used by the
 /// bound-method specialization in `call_callable_value`.
 pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
@@ -1238,11 +1235,15 @@ pub fn method_w_function_descr() -> DescrRef {
 /// `W_MethodObject.w_self` — the receiver object. The bound-method
 /// specialization extracts this via `GetfieldGcR` to recover the receiver
 /// `OpRef` after `LOAD_METHOD` discarded it (load_method.rs:6334 pushes
-/// `null_value` for `is_method` attrs).
+/// `null_value` for `is_method` attrs). Immutable per
+/// `_Method._immutable_fields_`.
 pub fn method_w_self_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 1)
 }
 
+/// rlist.py:116 `l.length` — live length of a list under the Object
+/// strategy. Under Integer/Float strategies this field is 0 and
+/// consumers must dispatch on `list.strategy` first.
 pub fn list_length_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 0)
 }
