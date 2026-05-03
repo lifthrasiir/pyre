@@ -230,7 +230,23 @@ impl JitCodeBuilder {
     }
 
     /// Add a ref constant to the constant pool. Returns pool index.
+    ///
+    /// RPython `assembler.py:127-134 emit_const` dedups every kind via the
+    /// shared `constants_dict` keyed by `(kind, Constant(value_key))`, where
+    /// the ref `value_key` is `None` for nullptr and `value._obj.container`
+    /// otherwise. Pyre's pool stores raw `i64` pointers; identical raw values
+    /// represent the same logical container, so a value-equality lookup
+    /// matches upstream's container-identity dedup for all live cases
+    /// (PY_NULL collapses against itself; pointer constants collapse when the
+    /// caller emits the same address twice).
     pub fn add_const_r(&mut self, value: i64) -> u16 {
+        if let Some(index) = self
+            .constants_r
+            .iter()
+            .position(|&existing| existing == value)
+        {
+            return index as u16;
+        }
         let index = self.constants_r.len() as u16;
         self.constants_r.push(value);
         index
