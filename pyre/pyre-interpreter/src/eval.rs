@@ -411,6 +411,28 @@ pub fn handle_exception(frame: &mut PyFrame, err: &PyError, next_instr: &mut usi
     {
         return false;
     }
+    // pyopcode.py:148 `ec.exception_trace(self, operr)` — fire the
+    // trace event before the unrollstack search so the tracer observes
+    // the exception at its raise point.  Gate on the live tracefunc
+    // before materialising the exception object (`to_exc_object`
+    // allocates) so the no-tracer hot path stays allocation-free.
+    // A trace-callback exception replaces the in-flight one through
+    // the TLS `set_call_error` slot — handlers that subsequently
+    // unwind via `take_call_error` see the tracer error.
+    let ec = frame.execution_context as *mut crate::PyExecutionContext;
+    if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
+        let exc_obj = err.to_exc_object();
+        if let Err(trace_err) = unsafe {
+            (*ec).exception_trace(
+                frame as *mut PyFrame,
+                pyre_object::PY_NULL,
+                exc_obj,
+                pyre_object::PY_NULL,
+            )
+        } {
+            crate::call::set_call_error(trace_err);
+        }
+    }
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     let pc = frame.last_instr as u32;
 

@@ -4821,13 +4821,71 @@ pub fn call_valuestack(
     call_function(callable, &args)
 }
 
-/// PyPy: baseobjspace.py `call_args_and_c_profile`.
+/// PyPy: baseobjspace.py:1269-1277 `call_args_and_c_profile`.
+///
+/// ```python
+/// def call_args_and_c_profile(self, frame, w_func, args):
+///     ec = self.getexecutioncontext()
+///     ec.c_call_trace(frame, w_func, args)
+///     try:
+///         w_res = self.call_args(w_func, args)
+///     except OperationError:
+///         ec.c_exception_trace(frame, w_func)
+///         raise
+///     ec.c_return_trace(frame, w_func, args)
+///     return w_res
+/// ```
+///
+/// Pyre's `call_function` returns `PyObjectRef` and stashes any error
+/// via `set_call_error`; we recover it through `take_call_error` to
+/// run the c_exception_trace branch.  Trace-callback errors raised by
+/// the c_call/c_return/c_exception events propagate via the same TLS
+/// stash so the JIT-side and interpreter-side error paths see them.
+///
+/// PRE-EXISTING-ADAPTATION: PyPy passes the live `Arguments` object
+/// to the trace callback as the third positional, allowing the profile
+/// hook to introspect kw layout etc.  Pyre's call surface is a flat
+/// `&[PyObjectRef]`; until an `Arguments` wrapper exists we pass
+/// `None` so the callback sees a missing args parameter (the
+/// `c_call/c_return/c_exception` event itself still fires, which is
+/// the user-visible bit).
 pub fn call_args_and_c_profile(
-    _frame: &mut crate::pyframe::PyFrame,
+    frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
-    call_function(callable, args)
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if !ec.is_null() {
+        if let Err(err) =
+            unsafe { (*ec).c_call_trace(frame as *mut crate::pyframe::PyFrame, callable, None) }
+        {
+            crate::call::set_call_error(err);
+            return pyre_object::PY_NULL;
+        }
+    }
+    let w_res = call_function(callable, args);
+    if w_res == pyre_object::PY_NULL {
+        if !ec.is_null() {
+            // baseobjspace.py:1275-1276 — fire c_exception_trace then
+            // re-raise the original OperationError. The TLS stash already
+            // holds the user error; if c_exception_trace raises, that
+            // newer error replaces it (matches the bare `raise` after
+            // the except-block — Python's exception chaining keeps the
+            // newer one as the active exception).
+            let _ =
+                unsafe { (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable) };
+        }
+        return pyre_object::PY_NULL;
+    }
+    if !ec.is_null() {
+        if let Err(err) =
+            unsafe { (*ec).c_return_trace(frame as *mut crate::pyframe::PyFrame, callable, None) }
+        {
+            crate::call::set_call_error(err);
+            return pyre_object::PY_NULL;
+        }
+    }
+    w_res
 }
 
 /// PyPy: baseobjspace.py `call_method`.

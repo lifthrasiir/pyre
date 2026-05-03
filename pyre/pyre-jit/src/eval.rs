@@ -2055,7 +2055,17 @@ pub(crate) fn pyre_portal_runner(
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     loop {
-        match eval_loop_jit(frame) {
+        let loop_outcome = eval_loop_jit(frame);
+        // jump_absolute (line ~1315) calls ec.bytecode_trace from inside
+        // a JIT-compiled trace; its `usize` return type cannot ride a
+        // PyError, so executioncontext.py:392-395's re-raise is staged
+        // through TLS via `set_call_error`. Drain the TLS slot here so
+        // the tracer exception surfaces at the same point PyPy raises
+        // from `bytecode_trace`, before the next eval iteration starts.
+        if let Some(err) = pyre_interpreter::call::take_call_error() {
+            return Err(err);
+        }
+        match loop_outcome {
             LoopResult::Done(result) => return result,
             LoopResult::ContinueRunningNormally => {
                 // RPython warmspot.py:976-978: result = portal_ptr(*args).
