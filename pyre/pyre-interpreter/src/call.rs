@@ -380,9 +380,29 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
         }
     }
 
+    let frame_ptr = frame as *mut PyFrame;
     dispatch_callable(
         callable,
         |callable| {
+            // baseobjspace.py:1247-1267 _call_function_or_call_args_and_c_profile
+            // — when a profilefunc is installed, route the builtin
+            // call through `call_args_and_c_profile` so the
+            // `c_call`/`c_return`/`c_exception` events fire around
+            // the underlying `space.call_args(w_func, args)`.
+            let ec_ptr = getexecutioncontext() as *mut crate::PyExecutionContext;
+            let profile_active = !ec_ptr.is_null() && unsafe { (*ec_ptr).profilefunc.is_some() };
+            if profile_active {
+                let w_res = crate::baseobjspace::call_args_and_c_profile(
+                    unsafe { &mut *frame_ptr },
+                    callable,
+                    args,
+                );
+                if w_res == pyre_object::PY_NULL {
+                    return Err(take_call_error()
+                        .unwrap_or_else(|| crate::PyError::value_error("call failed")));
+                }
+                return Ok(w_res);
+            }
             let code = unsafe { crate::getcode(callable) };
             let func = unsafe { builtin_code_get(code as pyre_object::PyObjectRef) };
             func(args)
