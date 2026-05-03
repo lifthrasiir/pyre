@@ -170,6 +170,11 @@ pub struct Optimizer {
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: SnapshotBoxes,
+    /// Per-guard virtualref boxes from tracing-time snapshots.
+    /// resume.py:243-247 _number_boxes reads vref_array as a separate
+    /// section. opencoder.py:767 create_top_snapshot records vref_boxes
+    /// alongside vable_boxes.
+    pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// Phase 1 emit ops carried into Phase 2's lookup surface (Slice 0.6).
@@ -1091,6 +1096,7 @@ impl Optimizer {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             phase1_emit_ops: Vec::new(),
             opt_ops_emitted: 0,
@@ -1859,6 +1865,7 @@ impl Optimizer {
             .snapshot_boxes
             .iter()
             .chain(self.snapshot_vable_boxes.iter())
+            .chain(self.snapshot_vref_boxes.iter())
             .flatten()
             .flat_map(|boxes| boxes.iter().map(|boxref| boxref.opref))
             .filter(|opref| !opref.is_none() && !opref.is_constant())
@@ -1884,6 +1891,7 @@ impl Optimizer {
         ctx.snapshot_boxes = self.snapshot_boxes.clone();
         ctx.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         ctx.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+        ctx.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
         ctx.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         ctx.constant_types_for_numbering = self.constant_types.clone();
         // RPython parity: merge numbering_type_overrides (ob_type Ref types)

@@ -395,6 +395,10 @@ pub struct OptContext {
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: SnapshotBoxes,
+    /// Per-guard virtualref boxes from tracing-time snapshots.
+    /// resume.py:243-247 _number_boxes consumes vref_array as a section
+    /// after vable_array. opencoder.py:767 records vref_boxes here.
+    pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// ConstantPool type map for BoxEnv.is_const() during inline numbering.
@@ -1185,6 +1189,7 @@ impl OptContext {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
             constant_types_for_numbering: HashMap::new(),
@@ -1266,6 +1271,7 @@ impl OptContext {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
 
             constant_types_for_numbering: HashMap::new(),
@@ -3458,6 +3464,9 @@ impl OptContext {
         let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position)
             .cloned()
             .unwrap_or_default();
+        let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position)
+            .cloned()
+            .unwrap_or_default();
         let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position)
             .cloned()
             .unwrap_or_default();
@@ -3488,6 +3497,10 @@ impl OptContext {
         // TAGBOX numbering. The same OpRefs also appear in fail_args —
         // _number_boxes deduplicates via liveboxes HashMap.
         snapshot.vable_array = vable_oprefs;
+        // resume.py:243-247 _number_boxes also reads vref_array as a
+        // separate section after vable_array. opencoder.py:767
+        // create_top_snapshot writes both arrays into the snapshot.
+        snapshot.vref_array = vref_oprefs;
 
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             let env = OptBoxEnv { ctx: self };

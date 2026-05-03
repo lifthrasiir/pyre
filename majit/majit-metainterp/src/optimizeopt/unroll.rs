@@ -83,6 +83,8 @@ pub struct UnrollOptimizer {
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: SnapshotBoxes,
+    /// Per-guard virtualref boxes from tracing-time snapshots.
+    pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
@@ -138,6 +140,7 @@ impl UnrollOptimizer {
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
+            snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
             all_descrs: Vec::new(),
             trace_inputarg_types: Vec::new(),
@@ -313,6 +316,7 @@ impl UnrollOptimizer {
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
             opt_p1.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+            opt_p1.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
             opt_p1.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
             opt_p1.call_pure_results = self.call_pure_results.clone();
             // RPython optimize_preamble (unroll.py:101-103): flush=False.
@@ -433,6 +437,7 @@ impl UnrollOptimizer {
                         exported_infos: std::collections::HashMap::new(),
                         exported_short_ops: Vec::new(),
                         exported_short_boxes: Vec::new(),
+                        short_boxes: Vec::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
                         renamed_inputarg_types: state.renamed_inputarg_types.clone(),
@@ -511,6 +516,7 @@ impl UnrollOptimizer {
         opt_p2.snapshot_boxes = self.snapshot_boxes.clone();
         opt_p2.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
         opt_p2.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+        opt_p2.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
         opt_p2.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
         opt_p2.call_pure_results = self.call_pure_results.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
@@ -651,6 +657,11 @@ impl UnrollOptimizer {
                 *r = r.map_opref(translate_opref);
             }
         }
+        for boxes in opt_p2.snapshot_vref_boxes.iter_mut().flatten() {
+            for r in boxes.iter_mut() {
+                *r = r.map_opref(translate_opref);
+            }
+        }
         // Phase 1's emitted ops are already in Phase 1's emitted
         // namespace `[num_inputs..next_global_opref)`. Phase 2 body may
         // reference these via `imported_label_args`. They are NOT in the
@@ -775,7 +786,7 @@ impl UnrollOptimizer {
             exported_vs,
             exported_end_args,
             exported_short_inputargs,
-            exported_short_boxes_for_builder,
+            exported_short_boxes_produced,
             exported_renamed_inputargs,
         ) = {
             let es = opt_p2
@@ -786,7 +797,7 @@ impl UnrollOptimizer {
                 es.virtual_state.clone(),
                 es.end_args.clone(),
                 es.short_inputargs.clone(),
-                es.exported_short_boxes.clone(),
+                es.short_boxes.clone(),
                 es.renamed_inputargs.clone(),
             )
         };
@@ -874,21 +885,13 @@ impl UnrollOptimizer {
                 )
             };
         let mut initial_sp = rebuilt_imported_short_preamble.unwrap_or_else(|| {
-            // Phase B B1: derive `produced_short_boxes` from the
-            // canonical `exported_short_boxes` snapshot, then drive the
-            // builder. RPython `unroll.py:497-504 short_boxes` parity.
-            // Lazy derivation eliminates the stale-copy risk that came
-            // with caching the per-OpRef view on `ExportedState`.
-            let produced =
-                crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
-                    &exported_end_args,
-                    &exported_short_inputargs,
-                    &exported_short_boxes_for_builder,
-                );
+            // RPython unroll.py:497-504 `for produced_op in
+            // exported_state.short_boxes` parity: consume the eagerly-derived
+            // ProducedShortOp list stored on ExportedState at export time.
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
-                &produced,
+                &exported_short_boxes_produced,
                 &consts_p1,
                 &self.constant_types,
             )
@@ -1264,7 +1267,7 @@ impl UnrollOptimizer {
             &exported_end_args,
             opt_p2
                 .final_ctx
-                .as_ref()
+                .as_mut()
                 .expect("assemble peeled trace requires Phase 2 OptContext for Box.type parity"),
         );
         // RPython Box parity: drop duplicate-position ops. In RPython
@@ -1400,6 +1403,13 @@ pub struct ExportedState {
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+    /// RPython unroll.py:466-477 `short_boxes = sb.create_short_boxes(...)`
+    /// stored directly on ExportedState. Consumer sites
+    /// (`build_imported_short_preamble`, `import_short_preamble_state`)
+    /// iterate this list verbatim. Pyre derives this eagerly from
+    /// `exported_short_boxes + label_args + short_inputargs` at export time
+    /// (`shortpreamble.py:269-270 ShortBoxes.create_short_boxes` parity).
+    pub short_boxes: Vec<(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
@@ -1528,6 +1538,16 @@ impl ExportedState {
         renamed_inputarg_types: Vec<Type>,
         short_inputargs: Vec<OpRef>,
     ) -> Self {
+        // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
+        // pre-derives the per-OpRef ProducedShortOp view (with label-arg
+        // refs renamed to short-inputarg slots) and stores it directly,
+        // matching RPython's `ExportedState.short_boxes`.
+        let short_boxes =
+            crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
+                &end_args,
+                &short_inputargs,
+                &exported_short_boxes,
+            );
         ExportedState {
             end_args,
             next_iteration_args,
@@ -1536,6 +1556,7 @@ impl ExportedState {
             exported_infos,
             exported_short_ops,
             exported_short_boxes,
+            short_boxes,
             short_preamble: None,
             renamed_inputargs,
             renamed_inputarg_types,
@@ -1924,6 +1945,7 @@ impl Clone for ExportedState {
             exported_infos: self.exported_infos.clone(),
             exported_short_ops: self.exported_short_ops.clone(),
             exported_short_boxes: self.exported_short_boxes.clone(),
+            short_boxes: self.short_boxes.clone(),
             short_preamble: self.short_preamble.clone(),
             renamed_inputargs: self.renamed_inputargs.clone(),
             renamed_inputarg_types: self.renamed_inputarg_types.clone(),
@@ -4004,7 +4026,7 @@ fn assemble_peeled_trace(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
-    let ctx = assemble_test_context(p1_ops, p2_ops, body_num_inputs);
+    let mut ctx = assemble_test_context(p1_ops, p2_ops, body_num_inputs);
     assemble_peeled_trace_with_jump_args(
         p1_ops,
         p2_ops,
@@ -4021,7 +4043,7 @@ fn assemble_peeled_trace(
         start_label_descr,
         loop_label_descr,
         &[], // no p1_end_args for simple assembly
-        &ctx,
+        &mut ctx,
     )
 }
 
@@ -4053,7 +4075,7 @@ fn assemble_peeled_trace_with_jump_args(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     p1_end_args: &[OpRef],
-    ctx: &crate::optimizeopt::OptContext,
+    ctx: &mut crate::optimizeopt::OptContext,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -4385,7 +4407,6 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    let mut jump_source_to_label_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
         .iter()
@@ -4393,27 +4414,15 @@ fn assemble_peeled_trace_with_jump_args(
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    // PRE-EXISTING-ADAPTATION: jump_source → label_slot remap for Case A/B
-    // end-of-preamble SameAs alias canonicalization.
-    //
-    // RPython parity: body op args reach the assembler pre-resolved through
-    // `ctx.get_box_replacement` (optimizer.rs:2236-2262 forwarding-resolve
-    // pass) when the Box-replacement chain encodes `body_alias → label_slot`.
-    // For most cases the existing `replace_op(source, result_opref)` call at
-    // line 3568 (PURE) / 3854 (LoopInvariant) covers this.
-    //
-    // The remaining gap, captured here: when `sp.used_boxes[i] != sp.jump_args[i]`
-    // (Case A/B SameAs alias splits identity — the preamble JUMP delivers
-    // `jump_source` while the LABEL takes `source_slot`), the body may reference
-    // `jump_source` directly without going through any registered forwarding.
-    // The proper RPython-orthodox fix is to register
-    // `replace_op(jump_args[i], used_boxes[i])` at import_state time, which
-    // requires threading `sp` (currently loaded only at assembly time, line 1177)
-    // earlier into Phase 2 setup. Not done in this slice — see Phase F follow-up.
-    //
-    // dynasm correctness depends on this remap (cranelift's SSA lowering
-    // papers over it via def-reaches-all-uses, but dynasm reads the
-    // preamble-time caller-save register which the first body Call clobbers).
+    // shortpreamble.py:436-439 + unroll.py:497-504 parity: when
+    // `sp.used_boxes[i] != sp.jump_args[i]` (Case A/B end-of-preamble
+    // SameAs alias splits identity — preamble JUMP carries `jump_source`,
+    // LABEL takes `source_slot`), register the forwarding chain so body
+    // ops referencing `jump_source` resolve to `source_slot` via
+    // `ctx.get_box_replacement` (`optimizer.py:266 set_forwarded`).
+    // RPython's Box identity makes this implicit — the alias's Box is
+    // the same Python object that body ops already hold. Pyre's flat
+    // OpRef model needs an explicit forwarding registration here.
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
@@ -4428,7 +4437,7 @@ fn assemble_peeled_trace_with_jump_args(
         );
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
-                jump_source_to_label_remap.insert(jump_source, extended_label_arg);
+                ctx.replace_op(jump_source, extended_label_arg);
             }
         }
     }
@@ -4453,39 +4462,28 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        // 2-way priority remap for body op args:
-        //   1. body redefine (shift-back from Phase 2 inputarg_base to
-        //      body layout; populated by body_result_remap pass below)
-        //   2. jump_source → label_slot (Case A/B SameAs alias —
-        //      jump_source_to_label_remap, see PRE-EXISTING-ADAPTATION above)
+        // Body op args go through Phase 2 forwarding (set by both the
+        // optimizer's regular forwarding-resolve pass at end of Phase 2,
+        // optimizer.rs:2236-2262, AND the Case A/B SameAs alias
+        // registration above) followed by the shift-back from Phase 2
+        // inputarg_base to the body layout (body_result_remap, populated
+        // by the dedicated pass below).
         let remap_body_arg = |arg: OpRef,
-                              jump_source_to_label_remap: &HashMap<OpRef, OpRef>,
                               body_result_remap: &HashMap<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
          -> OpRef {
-            // 1. Body-redefined values take priority.
-            //    With Phase 2's disjoint OpRef namespace this map carries
-            //    the shift-back from `[phase2_inputarg_base..)` to the
-            //    shared body layout `[next_body_pos..)`; the dedicated
-            //    pass below feeds it.
             if let Some(&mapped) = body_result_remap.get(&arg) {
                 if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
                     return mapped;
                 }
             }
-            // 2. jump_source → label_slot — body inputarg → label arg.
-            //    Case A/B end-of-preamble SameAs alias canonicalization
-            //    that hasn't been registered into `ctx.replace_op` yet.
-            if let Some(&mapped) = jump_source_to_label_remap.get(&arg) {
-                return mapped;
-            }
             arg
         };
         for arg in &mut new_op.args {
+            *arg = ctx.get_box_replacement(*arg);
             *arg = remap_body_arg(
                 *arg,
-                &jump_source_to_label_remap,
                 &body_result_remap,
                 &seen_body_defs,
                 &visible_before_label,
@@ -4515,10 +4513,11 @@ fn assemble_peeled_trace_with_jump_args(
                     {
                         continue;
                     }
+                    let resolved_arg = ctx.get_box_replacement(arg);
                     let available_before_label = visible_before_label.contains(&arg)
+                        || visible_before_label.contains(&resolved_arg)
                         || seen_body_defs.contains(&arg)
-                        || short_source_map.contains_key(&arg)
-                        || jump_source_to_label_remap.contains_key(&arg);
+                        || short_source_map.contains_key(&arg);
                     if available_before_label {
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);
@@ -4538,9 +4537,9 @@ fn assemble_peeled_trace_with_jump_args(
             // so each source_arg appears at most once — which is the
             // RPython-parity behavior for Box-keyed live-in sets.
             for &source_arg in &extra_inner_sources {
+                let resolved = ctx.get_box_replacement(source_arg);
                 let mapped_arg = remap_body_arg(
-                    source_arg,
-                    &jump_source_to_label_remap,
+                    resolved,
                     &body_result_remap,
                     &seen_body_defs,
                     &visible_before_label,
@@ -4602,9 +4601,8 @@ fn assemble_peeled_trace_with_jump_args(
                             .copied()
                             .unwrap_or(target_label_args[jump_args.len()])
                     };
-                    // Extra args are assembly-allocated label positions; the
-                    // body-scoped maps (jump_source_to_label_remap,
-                    // body_result_remap) never contain them. Probe across 14
+                    // Extra args are assembly-allocated label positions;
+                    // body-scoped remaps never contain them. Probe across 14
                     // benchmarks × 2 backends showed the prior lookup chain
                     // returned identity in 100% of fires. Pass through.
                     jump_args.push(extra_arg);
@@ -4891,6 +4889,13 @@ fn clone_guard_snapshot_remapped(
             &mut ctx.snapshot_vable_boxes,
             new_pos,
             remap_snapshot_boxes(&vable_boxes, ref_map),
+        );
+    }
+    if let Some(vref_boxes) = snapshot_get(&ctx.snapshot_vref_boxes, old_pos).cloned() {
+        snapshot_insert(
+            &mut ctx.snapshot_vref_boxes,
+            new_pos,
+            remap_snapshot_boxes(&vref_boxes, ref_map),
         );
     }
     if let Some(frame_pcs) = snapshot_get(&ctx.snapshot_frame_pcs, old_pos).cloned() {
@@ -6164,7 +6169,7 @@ mod tests {
             (OpRef::from_const(0).0, 2_i64),
         ]);
 
-        let ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
+        let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &p2_ops,
@@ -6181,7 +6186,7 @@ mod tests {
             None,
             None,
             &[],
-            &ctx,
+            &mut ctx,
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);

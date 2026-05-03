@@ -254,11 +254,13 @@ fn snapshot_map_from_trace_snapshots(
     SnapshotBoxes,
     SnapshotFrameSizes,
     SnapshotBoxes,
+    SnapshotBoxes,
     SnapshotFramePcs,
 ) {
     let mut box_map = Vec::new();
     let mut size_map = Vec::new();
     let mut vable_map = Vec::new();
+    let mut vref_map = Vec::new();
     let mut pc_map = Vec::new();
     let mut next_const_idx = constants
         .keys()
@@ -319,6 +321,10 @@ fn snapshot_map_from_trace_snapshots(
         let frame_sizes: Vec<usize> = snap.frames.iter().map(|f| f.boxes.len()).collect();
         let vable_boxes: Vec<SnapshotBox> =
             snap.vable_boxes.iter().map(&mut tagged_to_box).collect();
+        // opencoder.py:767 create_top_snapshot writes BOTH vable_array
+        // AND vref_array. resume.py:243-247 _number_boxes consumes
+        // vref_array as a separate section after vable_array.
+        let vref_boxes: Vec<SnapshotBox> = snap.vref_boxes.iter().map(&mut tagged_to_box).collect();
         let frame_pcs: Vec<(i32, i32)> = snap
             .frames
             .iter()
@@ -328,9 +334,10 @@ fn snapshot_map_from_trace_snapshots(
         snapshot_insert(&mut box_map, id, boxes);
         snapshot_insert(&mut size_map, id, frame_sizes);
         snapshot_insert(&mut vable_map, id, vable_boxes);
+        snapshot_insert(&mut vref_map, id, vref_boxes);
         snapshot_insert(&mut pc_map, id, frame_pcs);
     }
-    (box_map, size_map, vable_map, pc_map)
+    (box_map, size_map, vable_map, vref_map, pc_map)
 }
 
 struct PreparedBridgeTrace {
@@ -339,6 +346,7 @@ struct PreparedBridgeTrace {
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
 }
@@ -397,6 +405,7 @@ fn prepare_bridge_trace_for_optimizer(
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
+    snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     bridge_inputarg_base: u32,
@@ -425,6 +434,7 @@ fn prepare_bridge_trace_for_optimizer(
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
+    let snapshot_vref_boxes = translate_trace_iter_box_map(snapshot_vref_boxes, &cache);
     let pending_bridge_rd = pending_bridge_rd.map(|mut prd| {
         prd.liveboxes = prd
             .liveboxes
@@ -439,6 +449,7 @@ fn prepare_bridge_trace_for_optimizer(
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
+        snapshot_vref_boxes,
         snapshot_frame_pcs,
         pending_bridge_rd,
     }
@@ -3675,15 +3686,21 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
-            snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
-                &mut constants,
-                &mut constant_types,
-            );
+        let (
+            snapshot_map,
+            snapshot_frame_size_map,
+            snapshot_vable_map,
+            snapshot_vref_map,
+            snapshot_pc_map,
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            &mut constant_types,
+        );
         unroll_opt.snapshot_boxes = snapshot_map.clone();
         unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
         unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
+        unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
         unroll_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
@@ -3745,6 +3762,7 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_boxes = snapshot_map.clone();
                         simple_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
                         simple_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
+                        simple_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
                         simple_opt.call_pure_results = call_pure_results.clone();
                         let retry_result =
@@ -4392,12 +4410,17 @@ impl<M: Clone> MetaInterp<M> {
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
         let trace_snapshots = ctx.snapshots().to_vec();
-        let (snapshot_boxes, snapshot_frame_sizes, snapshot_vable_boxes, snapshot_frame_pcs) =
-            snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
-                &mut constants,
-                &mut constant_types,
-            );
+        let (
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_vref_boxes,
+            snapshot_frame_pcs,
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            &mut constant_types,
+        );
 
         // pyjitpl.py:3195 finally: always cut — pop the tentative JUMP/FINISH.
         ctx.cut_trace(cut_at);
@@ -4471,6 +4494,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_boxes,
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
+                    snapshot_vref_boxes,
                     snapshot_frame_pcs,
                 );
                 if success {
@@ -4500,6 +4524,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_boxes,
                     snapshot_frame_sizes,
                     snapshot_vable_boxes,
+                    snapshot_vref_boxes,
                     snapshot_frame_pcs,
                 );
                 if success {
@@ -4675,6 +4700,7 @@ impl<M: Clone> MetaInterp<M> {
             retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
             retrace_snapshot_vable_boxes,
+            retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
         ) = snapshot_map_from_trace_snapshots(
             &trace.snapshots,
@@ -4684,6 +4710,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_boxes = retrace_snapshot_boxes;
         unroll_opt.snapshot_frame_sizes = retrace_snapshot_frame_sizes;
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
+        unroll_opt.snapshot_vref_boxes = retrace_snapshot_vref_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
@@ -5150,12 +5177,17 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
-            snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
-                &mut constants,
-                &mut constant_types,
-            );
+        let (
+            snapshot_map,
+            snapshot_frame_size_map,
+            snapshot_vable_map,
+            snapshot_vref_map,
+            snapshot_pc_map,
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            &mut constant_types,
+        );
         // compile.py:92-96 SimpleCompileData.optimize → optimize_loop parity.
         // Wire snapshot data through to the optimizer so guard
         // store_final_boxes_in_guard (mod.rs:2261) can properly populate
@@ -5167,6 +5199,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_boxes = snapshot_map;
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
+        optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
@@ -5525,15 +5558,21 @@ impl<M: Clone> MetaInterp<M> {
             optimizer.constant_types.insert(ia.index, ia.tp);
         }
 
-        let (snapshot_map, snapshot_frame_size_map, snapshot_vable_map, snapshot_pc_map) =
-            snapshot_map_from_trace_snapshots(
-                &trace_snapshots,
-                &mut constants,
-                &mut constant_types,
-            );
+        let (
+            snapshot_map,
+            snapshot_frame_size_map,
+            snapshot_vable_map,
+            snapshot_vref_map,
+            snapshot_pc_map,
+        ) = snapshot_map_from_trace_snapshots(
+            &trace_snapshots,
+            &mut constants,
+            &mut constant_types,
+        );
         optimizer.snapshot_boxes = snapshot_map;
         optimizer.snapshot_frame_sizes = snapshot_frame_size_map;
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
+        optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
 
         let mut updated_constant_types = constant_types.clone();
@@ -7693,6 +7732,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
+        snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
@@ -7724,6 +7764,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_boxes,
             snapshot_frame_sizes,
             snapshot_vable_boxes,
+            snapshot_vref_boxes,
             snapshot_frame_pcs,
             None,
             bridge_inputarg_base,
@@ -7741,6 +7782,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
+        optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         optimizer.trace_inputarg_types = bridge_inputargs.iter().map(|ia| ia.tp).collect();
 
@@ -8020,6 +8062,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
+        snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
@@ -8121,6 +8164,7 @@ impl<M: Clone> MetaInterp<M> {
             snapshot_boxes,
             snapshot_frame_sizes,
             snapshot_vable_boxes,
+            snapshot_vref_boxes,
             snapshot_frame_pcs,
             pending_bridge_rd,
             bridge_inputarg_base,
@@ -8142,6 +8186,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
+        optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         // Store bridge inputarg types so export_state can propagate them
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
@@ -16299,6 +16344,7 @@ mod tests {
             snapshot_boxes,
             Vec::new(),
             snapshot_vable_boxes,
+            Vec::new(),
             Vec::new(),
             Some(pending_bridge_rd),
             10,
