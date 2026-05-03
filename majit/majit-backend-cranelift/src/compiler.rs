@@ -4093,6 +4093,20 @@ fn unsupported_semantics(opcode: OpCode, detail: &str) -> BackendError {
 /// preserves this invariant by ensuring `optimizeopt` never schedules
 /// any op between a force-able call and its paired guard — pyre's
 /// optimizer must do the same.
+///
+/// Forward-looking note (review feedback): the wrong shape to watch
+/// for is `CMF -> NEW_WITH_VTABLE -> SETFIELD_GC -> GUARD_NOT_FORCED`,
+/// where a virtual escapes *after* the call. RPython's
+/// `optimizeopt/virtualize.py` always materializes escaping virtuals
+/// *before* the force-able call, producing
+/// `NEW_WITH_VTABLE -> SETFIELD_GC -> CMF -> GUARD_NOT_FORCED` so that
+/// every box reachable from `GuardNotForced.fail_args` already lives
+/// in memory at call time. If this strict check ever rejects a real
+/// trace, the fix is in the optimizer (force virtuals before the
+/// call), not by relaxing the backend assertion — the backend's
+/// `_store_force_index` runs once, on the operation at +1, so a
+/// post-call materialization would leave fail_args pointing at boxes
+/// the force path cannot read coherently.
 fn check_paired_guard_not_forced(
     ops: &[Op],
     op_idx: usize,
