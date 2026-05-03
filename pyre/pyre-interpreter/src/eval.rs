@@ -2229,38 +2229,38 @@ impl OpcodeStepExecutor for PyFrame {
                 )
             };
         if is_builtin {
-            // Builtin functions: pack kwargs into a dict as last arg
             let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
                 unsafe { pyre_object::w_tuple_len(kwarg_names) }
             } else {
                 0
             };
-            let resolved = if nkw > 0 {
+            if nkw > 0 {
                 let n_pos = args.len() - nkw;
-                let mut resolved = args[..n_pos].to_vec();
-                let kwargs_dict = pyre_object::w_dict_new();
-                // Marker key so print() can distinguish kwargs dict from regular dict arg
-                unsafe {
-                    pyre_object::w_dict_store(
-                        kwargs_dict,
-                        pyre_object::w_str_new("__pyre_kw__"),
-                        pyre_object::w_bool_from(true),
-                    );
-                }
+                let pos_args = args[..n_pos].to_vec();
+                let mut kw_entries = Vec::with_capacity(nkw);
                 for ki in 0..nkw {
                     let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
                     if let Some(name_obj) = name {
-                        unsafe {
-                            pyre_object::w_dict_store(kwargs_dict, name_obj, args[n_pos + ki]);
-                        }
+                        let key = unsafe { pyre_object::w_str_get_value(name_obj) }.to_string();
+                        kw_entries.push((key, args[n_pos + ki]));
                     }
                 }
-                resolved.push(kwargs_dict);
-                resolved
-            } else {
-                args.clone()
-            };
-            let result = call_callable(self, callable_unwrapped, &resolved)?;
+                // PyPy CALL_FUNCTION_KW builds an Arguments object with
+                // keyword_names_w / keywords_w, and the profiled-builtin path
+                // passes that same object to call_args_and_c_profile.  Route
+                // through call_with_kwargs so pyre's profile path constructs
+                // Arguments::with_kw instead of treating the kwargs dict tail
+                // as a positional firstarg.
+                let result = crate::call::call_with_kwargs(
+                    self,
+                    callable_unwrapped,
+                    &pos_args,
+                    &kw_entries,
+                )?;
+                self.push(result);
+                return Ok(());
+            }
+            let result = call_callable(self, callable_unwrapped, &args)?;
             self.push(result);
             return Ok(());
         }

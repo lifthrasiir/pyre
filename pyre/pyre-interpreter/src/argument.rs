@@ -16,19 +16,30 @@ use pyre_object::PyObjectRef;
 
 /// `pypy/interpreter/argument.py:20 class Arguments`.
 ///
-/// PyPy fields (argument.py:34-46):
+/// PyPy fields (argument.py:34-53):
 /// ```text
 /// self.space            -- always available; pyre passes context implicitly
 /// self.arguments_w      -- list[w_obj]
 /// self.keyword_names_w  -- list[w_text] or None
-/// self.keywords_w       -- list[w_obj]   or None  (parallel to keyword_names_w)
+/// self.keywords_w       -- list[w_obj]   or None
+/// self.methodcall       -- bool flag
 /// ```
 ///
-/// `w_stararg`, `w_starstararg`, `methodcall`, `w_function` are constructor
-/// inputs that PyPy's `_combine_wrapped` expands into `arguments_w` /
-/// `keyword_names_w` / `keywords_w`.  Pyre's call surface already
-/// pre-resolves them at `call.rs:711-756`, so the struct stores only
-/// the resolved fields.
+/// `w_stararg`, `w_starstararg`, `w_function` are constructor inputs
+/// that PyPy's `_combine_wrapped` (argument.py:85-90) expands into
+/// `arguments_w` / `keyword_names_w` / `keywords_w` at construction
+/// time.  They are NOT stored as instance state in PyPy — only their
+/// expanded form is.  Pyre matches that contract: callers that have
+/// raw star-args must run the equivalent of `_combine_wrapped`
+/// (Slice 2 of the deeper port — pending) before constructing
+/// Arguments.
+///
+/// `methodcall` (argument.py:53 `self.methodcall = methodcall`) is the
+/// only true instance-state field beyond the three list fields.  Pyre
+/// stores it for parity with PyPy's signature even though the trace
+/// path's `_c_call_return_trace` does not consume it (argument.py
+/// uses it inside `_match_signature` for better error messages on
+/// bound-method calls).
 ///
 /// Borrows from the caller's slice; Arguments is short-lived (passes
 /// through a single trace event call) and does not own its data.
@@ -41,6 +52,10 @@ pub struct Arguments<'a> {
     /// must be parallel to `keyword_names_w` when present —
     /// argument.py:42 `assert len(keywords_w) == len(keyword_names_w)`).
     pub keywords_w: Option<&'a [PyObjectRef]>,
+    /// argument.py:53 `self.methodcall = methodcall`.  Default `false`
+    /// for the `positional_only` / `with_kw` shortcuts; the future
+    /// CALL_METHOD opcode port should set it `true`.
+    pub methodcall: bool,
 }
 
 impl<'a> Arguments<'a> {
@@ -55,6 +70,7 @@ impl<'a> Arguments<'a> {
             arguments_w: args_w,
             keyword_names_w: None,
             keywords_w: None,
+            methodcall: false,
         }
     }
 
@@ -80,6 +96,33 @@ impl<'a> Arguments<'a> {
             arguments_w: args_w,
             keyword_names_w: Some(keyword_names_w),
             keywords_w: Some(keywords_w),
+            methodcall: false,
+        }
+    }
+
+    /// argument.py:31-53 `__init__` (full PyPy signature).
+    ///
+    /// `_combine_wrapped(w_stararg, w_starstararg, w_function)` is
+    /// expected to have already been folded into the caller — pyre
+    /// does not yet preserve the raw star-args (Slice 2 pending).
+    /// Use this constructor when the caller has both kwargs and the
+    /// `methodcall` flag (e.g. CALL_METHOD lowering); when methodcall
+    /// is false, `with_kw` is the lighter alternative.
+    #[inline]
+    pub fn full(
+        args_w: &'a [PyObjectRef],
+        keyword_names_w: Option<&'a [PyObjectRef]>,
+        keywords_w: Option<&'a [PyObjectRef]>,
+        methodcall: bool,
+    ) -> Self {
+        if let (Some(names), Some(values)) = (keyword_names_w, keywords_w) {
+            debug_assert_eq!(names.len(), values.len());
+        }
+        Self {
+            arguments_w: args_w,
+            keyword_names_w,
+            keywords_w,
+            methodcall,
         }
     }
 

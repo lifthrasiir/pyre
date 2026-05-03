@@ -26,6 +26,145 @@ impl OperationError {
     pub fn match_(&self, _space: PyObjectRef, _check: PyObjectRef) -> bool {
         false
     }
+
+    /// pypy/interpreter/error.py:180-249 `normalize_exception`.
+    ///
+    /// ```python
+    /// def normalize_exception(self, space):
+    ///     w_type = self.w_type
+    ///     w_value = self.get_w_value(space)
+    ///     if space.exception_is_valid_obj_as_class_w(w_type):
+    ///         if space.is_w(w_value, space.w_None):
+    ///             w_value = space.call_function(w_type)
+    ///             w_type = self._exception_getclass(space, w_value)
+    ///         else:
+    ///             w_valuetype = space.exception_getclass(w_value)
+    ///             if space.exception_issubclass_w(w_valuetype, w_type):
+    ///                 w_type = w_valuetype
+    ///             else:
+    ///                 if space.isinstance_w(w_value, space.w_tuple):
+    ///                     w_value = space.call(w_type, w_value)
+    ///                 else:
+    ///                     w_value = space.call_function(w_type, w_value)
+    ///                 w_type = self._exception_getclass(space, w_value)
+    ///         # ... traceback handling
+    ///     else:
+    ///         w_inst = w_type
+    ///         w_instclass = self._exception_getclass(space, w_inst)
+    ///         if not space.is_w(w_value, space.w_None):
+    ///             raise oefmt(space.w_TypeError, ...)
+    ///         w_value = w_inst
+    ///         w_type = w_instclass
+    ///     self.w_type = w_type
+    ///     self._w_value = w_value
+    ///     return w_value
+    /// ```
+    ///
+    /// Mutates `self` to install the normalized `(w_type, w_value)` and
+    /// returns the new `w_value`.  Traceback handling
+    /// (error.py:225-236) is skipped — pyre has no `W_BaseException
+    /// .w_traceback` slot yet.
+    pub fn normalize_exception(&mut self, space: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        let _ = space;
+        let mut w_type = self.w_type;
+        let mut w_value = self.w_value;
+        unsafe {
+            if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_type) {
+                if w_value.is_null() || w_value == pyre_object::w_none() {
+                    // (Class, None) → call Class()
+                    w_value = crate::baseobjspace::call_function(w_type, &[]);
+                    if w_value.is_null() {
+                        // Constructor raised — surface stash.
+                        return Err(crate::call::take_call_error()
+                            .unwrap_or_else(|| PyError::type_error("constructor failed")));
+                    }
+                    w_type = self._exception_getclass(w_value)?;
+                } else {
+                    let w_valuetype =
+                        crate::typedef::r#type(w_value).unwrap_or(pyre_object::PY_NULL);
+                    if !w_valuetype.is_null()
+                        && crate::baseobjspace::issubtype_w(w_valuetype, w_type)
+                    {
+                        // (Class, inst) where inst : Class → (inst.__class__, inst)
+                        w_type = w_valuetype;
+                    } else if pyre_object::is_tuple(w_value) {
+                        // (Class, tuple) → Class(*tuple)
+                        let items = pyre_object::w_tuple_items_copy_as_vec(w_value);
+                        w_value = crate::baseobjspace::call_function(w_type, &items);
+                        if w_value.is_null() {
+                            return Err(crate::call::take_call_error()
+                                .unwrap_or_else(|| PyError::type_error("constructor failed")));
+                        }
+                        w_type = self._exception_getclass(w_value)?;
+                    } else {
+                        // (Class, x) → Class(x)
+                        w_value = crate::baseobjspace::call_function(w_type, &[w_value]);
+                        if w_value.is_null() {
+                            return Err(crate::call::take_call_error()
+                                .unwrap_or_else(|| PyError::type_error("constructor failed")));
+                        }
+                        w_type = self._exception_getclass(w_value)?;
+                    }
+                }
+            } else {
+                // (inst, None) — `raise inst`
+                let w_inst = w_type;
+                let w_instclass = self._exception_getclass(w_inst)?;
+                if !w_value.is_null() && w_value != pyre_object::w_none() {
+                    return Err(PyError::type_error(
+                        "instance exception may not have a separate value",
+                    ));
+                }
+                w_value = w_inst;
+                w_type = w_instclass;
+            }
+        }
+        self.w_type = w_type;
+        self.w_value = w_value;
+        Ok(w_value)
+    }
+
+    /// error.py:251-257 `_exception_getclass(space, w_inst, what="exceptions")`.
+    fn _exception_getclass(&self, w_inst: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        let w_type = crate::typedef::r#type(w_inst).unwrap_or(pyre_object::PY_NULL);
+        if w_type.is_null()
+            || !unsafe { crate::baseobjspace::exception_is_valid_obj_as_class_w(w_type) }
+        {
+            return Err(PyError::type_error(
+                "exceptions must derive from BaseException",
+            ));
+        }
+        Ok(w_type)
+    }
+
+    /// pypy/interpreter/error.py:418-427 `chain_exceptions`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (Slice 3 of OperationError port,
+    /// blocked): line-by-line port requires
+    ///   - `W_BaseException.descr_setcontext(space, w_context)` to
+    ///     write the `__context__` slot
+    ///   - `_break_context_cycle` helper (error.py:443-)
+    ///   - `W_BaseException` instance-of check
+    ///
+    /// Pyre's `W_ExceptionObject` (pyre-object/excobject.rs:59) carries
+    /// only `kind` + `message` — no `w_context` / `w_cause` /
+    /// `w_traceback` slots.  Adding those fields is the
+    /// `W_BaseException` expansion epic (pypy/module/exceptions/
+    /// interp_exceptions.py W_BaseException, ~200 LOC).
+    ///
+    /// Until that epic lands, `chain_exceptions` cannot be ported.
+    /// `record_context` / `chain_exceptions_from_cause` (error.py:406,
+    /// 429) inherit the same blocker.
+    pub fn chain_exceptions(
+        &mut self,
+        _space: PyObjectRef,
+        _context: &mut OperationError,
+    ) -> Result<(), PyError> {
+        // Stub: return Ok(()) until the W_BaseException expansion epic
+        // wires up `descr_setcontext` and the per-exception
+        // w_context / w_cause / w_traceback slots.
+        Ok(())
+    }
 }
 
 impl From<OperationError> for PyError {

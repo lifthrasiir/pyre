@@ -514,6 +514,22 @@ pub struct WRootFinalizerQueue;
 
 impl WRootFinalizerQueue {
     pub fn finalizer_trigger(&mut self) {}
+
+    /// `pypy/interpreter/executioncontext.py:640` —
+    /// `self.space.finalizer_queue.next_dead()`.
+    ///
+    /// Returns the next `w_obj` whose finalizer should run, or `None`
+    /// when the death queue is empty.
+    ///
+    /// PRE-EXISTING-ADAPTATION: the real death queue requires the GC
+    /// integration epic (Task #224 PyFrame=PyObject) to land a
+    /// `WRootFinalizerQueue` instance backed by `rgc.FinalizerQueue`.
+    /// Until then this is a constant-`None` stub so callers
+    /// (`UserDelAction::_run_finalizers`) can mirror PyPy's loop shape
+    /// line-by-line.
+    pub fn next_dead(&mut self) -> Option<PyObjectRef> {
+        None
+    }
 }
 
 /// Shared execution context for all frames in one interpreter run.
@@ -940,15 +956,13 @@ impl ExecutionContext {
     ///                     operationerr.get_w_value(self.space), operationerr)
     /// ```
     ///
-    /// PyPy unpacks the `OperationError` inside `_trace` via
-    /// `operr.w_type` / `operr.normalize_exception(space)` /
-    /// `operr.get_w_traceback(space)` (executioncontext.py:359-363) to
-    /// build the `(w_type, w_value, w_traceback)` tuple passed to the
-    /// trace callback.  Pyre carries the equivalent fields explicitly
-    /// because there is no `OperationError` plumbed through the trace
-    /// surface yet — callers supply the raised type, the wrapped value,
-    /// and the traceback (the latter two may be `w_none()` while pyre
-    /// lacks traceback objects at this layer).
+    /// `_trace` consumes the live `OperationError` (Slice 1 of the
+    /// OperationError port).  Callers wrap their raised
+    /// `(w_type, w_value, w_traceback)` triple into a temporary
+    /// `OperationError` instance whose lifetime spans the call;
+    /// inside `_trace`, executioncontext.py:359-363 reads the
+    /// fields directly via `operr.w_type` / `get_w_value` /
+    /// `_application_traceback`.
     pub fn exception_trace(
         &mut self,
         frame: *mut PyFrame,
@@ -957,12 +971,13 @@ impl ExecutionContext {
         w_traceback: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         if !self.gettrace().is_null() {
-            self._trace(
-                frame,
-                "exception",
-                w_value,
-                Some((w_type, w_value, w_traceback)),
-            )?;
+            let mut operr = crate::error::OperationError::new(w_type, w_value);
+            operr._application_traceback = if w_traceback.is_null() {
+                None
+            } else {
+                Some(w_traceback)
+            };
+            self._trace(frame, "exception", w_value, Some(&operr))?;
         }
         Ok(())
     }
@@ -1075,22 +1090,22 @@ impl ExecutionContext {
     /// `profilefunc` low-level trampoline (`app_profile_call` for
     /// `setprofile`-installed callbacks).
     ///
-    /// `operr` carries the `(w_type, w_value, w_traceback)` triple
-    /// `executioncontext.py:359-363` reads from the upstream
-    /// `OperationError` via `operr.w_type`,
+    /// `operr` carries the live `OperationError` instance that
+    /// `executioncontext.py:359-363` reads via `operr.w_type`,
     /// `operr.normalize_exception(space)`, and
-    /// `operr.get_w_traceback(space)`.  Pyre passes the three fields
-    /// explicitly because no `OperationError` flows through the trace
-    /// surface yet; `w_traceback` is typically `w_none()` until pyre
-    /// gains traceback objects at this layer.  The structural early
-    /// returns, event filtering, and `is_tracing` bookkeeping mirror
-    /// upstream.
+    /// `operr.get_w_traceback(space)`.  Pyre's `error::OperationError`
+    /// is the line-by-line port of `error.OperationError` (the same
+    /// `w_type` / `w_value` / `_application_traceback` shape).
+    /// Reading the fields here mirrors PyPy 1:1 — `operr.w_type` for
+    /// the type, `get_w_value(space)` for the (possibly-normalized)
+    /// value, `_application_traceback` for the traceback (or
+    /// `space.w_None` when absent).
     pub fn _trace(
         &mut self,
         frame: *mut PyFrame,
         event: &str,
         w_arg: PyObjectRef,
-        operr: Option<(PyObjectRef, PyObjectRef, PyObjectRef)>,
+        operr: Option<&crate::error::OperationError>,
     ) -> Result<(), crate::PyError> {
         // executioncontext.py:347 if self.is_tracing or frame.hide():
         if self.is_tracing != 0 {
@@ -1113,25 +1128,34 @@ impl ExecutionContext {
         };
 
         if !w_callback.is_null() && event != "leaveframe" {
-            // executioncontext.py:359-363 normalize_exception + rebuild
-            // `w_arg` as `(w_type, w_value, w_traceback)` when an
-            // `operr` triple accompanies the trace event.  Caller
-            // (`exception_trace`) already supplies the explicit raised
-            // type; only fall back to `typedef::r#type(w_value)` when
-            // it was passed as null, mirroring the cases where pyre
-            // cannot yet preserve `operr.w_type` distinct from the
-            // value's runtime type.
-            let w_arg = if let Some((w_type, w_value, w_traceback)) = operr {
-                let w_type = if w_type.is_null() {
+            // executioncontext.py:359-363:
+            //   if operr is not None:
+            //       w_value = operr.normalize_exception(space)
+            //       w_arg = space.newtuple([operr.w_type, w_value,
+            //                               operr.get_w_traceback(space)])
+            // Pyre's OperationError carries the same `w_type` /
+            // `w_value` / `_application_traceback` shape as PyPy's.
+            // Slice 2 of the OperationError port: route through
+            // `normalize_exception` so a `raise SubCls` with a bare
+            // class instantiates `SubCls()` before the callback sees
+            // it, matching PyPy's `_w_value` mutation.
+            //
+            // PyPy mutates the caller's operr in place (line 247
+            // `self.w_type = w_type`); pyre clones to a local so the
+            // caller's operr stays untouched (the trace path is the
+            // only consumer in this scope, and the next `_trace`
+            // invocation gets a fresh operr from `exception_trace`).
+            let w_arg = if let Some(operr_ref) = operr {
+                let mut operr_local = operr_ref.clone();
+                let w_value = operr_local.normalize_exception(space)?;
+                let w_type = if operr_local.w_type.is_null() {
                     crate::typedef::r#type(w_value).unwrap_or_else(pyre_object::w_none)
                 } else {
-                    w_type
+                    operr_local.w_type
                 };
-                let w_traceback = if w_traceback.is_null() {
-                    pyre_object::w_none()
-                } else {
-                    w_traceback
-                };
+                let w_traceback = operr_local
+                    ._application_traceback
+                    .unwrap_or_else(pyre_object::w_none);
                 pyre_object::tupleobject::w_tuple_new(vec![w_type, w_value, w_traceback])
             } else {
                 w_arg
@@ -1341,11 +1365,15 @@ impl AbstractActionFlag {
         }
     }
 
+    /// pypy/interpreter/executioncontext.py:488-491:
+    ///   def fire(self, action):
+    ///       self._fired_bitmask |= action.bitmask
     pub fn fire(&mut self, action: *mut AsyncAction) {
-        let _ = action;
-        if !self._fired_bitmask == 0 {
+        if action.is_null() {
             return;
         }
+        let bitmask = unsafe { (*action).bitmask };
+        self._fired_bitmask |= bitmask;
     }
 
     pub fn register_periodic_action(
@@ -1378,9 +1406,69 @@ impl AbstractActionFlag {
         self.reset_ticker(-1);
     }
 
-    pub fn action_dispatcher(&mut self, _ec: &mut ExecutionContext, _frame: *mut PyFrame) {
-        let _ = _frame;
+    /// pypy/interpreter/executioncontext.py:531-562 `action_dispatcher`.
+    ///
+    /// ```python
+    /// def action_dispatcher(ec, frame):
+    ///     # periodic actions (first reset the bytecode counter)
+    ///     self.reset_ticker(self.checkinterval_scaled)
+    ///     for action in periodic_actions:
+    ///         action.perform(ec, frame)
+    ///     # nonperiodic actions
+    ///     if self._fired_bitmask:
+    ///         for i in range(len(self._nonperiodic_actions)):
+    ///             mask = r_uint(1) << i
+    ///             if self._fired_bitmask & mask:
+    ///                 action = self._nonperiodic_actions[i]
+    ///                 self._fired_bitmask &= ~mask
+    ///                 action.perform(ec, frame)
+    ///         if self._fired_bitmask:
+    ///             self.reset_ticker(-1)
+    /// ```
+    ///
+    /// Pyre's `AsyncAction::perform` is currently a no-op stub — the
+    /// concrete actions (CheckSignalAction, GcCollectAction, etc.) are
+    /// not yet ported.  The iteration shape here matches PyPy so the
+    /// dispatch surface lands correctly when those actions are ported
+    /// individually.
+    pub fn action_dispatcher(&mut self, ec: &mut ExecutionContext, frame: *mut PyFrame) {
+        // Periodic — first reset the bytecode counter, then fire each.
         self.reset_ticker(self.checkinterval_scaled as isize);
+        // Snapshot pointers before iteration; perform() may register
+        // additional actions and mutate `_periodic_actions`.
+        let periodic: Vec<*mut PeriodicAsyncAction> = self._periodic_actions.clone();
+        for action_ptr in periodic {
+            if action_ptr.is_null() {
+                continue;
+            }
+            unsafe {
+                (*action_ptr).base.perform(ec, frame);
+            }
+        }
+        // Nonperiodic — bit-mask scan; clear each bit before perform()
+        // so a fire() during perform() re-arms cleanly (PyPy's
+        // executioncontext.py:545-549 NB).
+        if self._fired_bitmask != 0 {
+            for i in 0..self._nonperiodic_actions.len() {
+                let mask: usize = 1usize << i;
+                if self._fired_bitmask & mask != 0 {
+                    let action_ptr = self._nonperiodic_actions[i];
+                    self._fired_bitmask &= !mask;
+                    if !action_ptr.is_null() {
+                        unsafe {
+                            (*action_ptr).perform(ec, frame);
+                        }
+                    }
+                }
+            }
+            // executioncontext.py:560-561 — a higher-index action's
+            // perform() may have re-fired an earlier bit; defer the
+            // re-scan by forcing the ticker negative so the next
+            // bytecode_trace re-enters action_dispatcher.
+            if self._fired_bitmask != 0 {
+                self.reset_ticker(-1);
+            }
+        }
     }
 
     pub fn _rebuild_action_dispatcher(&mut self) {}
@@ -1454,9 +1542,26 @@ impl ActionFlag {
         self._ticker
     }
 
+    /// pypy/interpreter/executioncontext.py — `ActionFlag` inherits
+    /// `action_dispatcher` from `AbstractActionFlag`.  Pyre composes
+    /// (struct-with-base) instead of inheriting, so route the call
+    /// through `self.base.action_dispatcher`.  The ticker reset
+    /// inside the base hits `AbstractActionFlag::reset_ticker` which
+    /// only clears `_fired_bitmask`; ActionFlag overrides
+    /// `reset_ticker` to also write `_ticker`, so the ticker reset
+    /// has to happen at this layer too.
     pub fn action_dispatcher(&mut self, ec: *mut ExecutionContext, frame: *mut PyFrame) {
-        let _ = (ec, frame);
-        self.base._rebuild_action_dispatcher();
+        // executioncontext.py:538 reset_ticker(checkinterval_scaled).
+        // Use the ActionFlag override so `_ticker` is written too.
+        self.reset_ticker(self.base.checkinterval_scaled as isize);
+        // Defer the iteration to the base (which will redundantly run
+        // its own AbstractActionFlag::reset_ticker for the bitmask
+        // clear at top — that's a no-op overwrite of the same value).
+        unsafe {
+            if !ec.is_null() {
+                self.base.action_dispatcher(&mut *ec, frame);
+            }
+        }
     }
 
     pub fn perform_frame_action(&mut self, ec: &mut ExecutionContext, frame: *mut PyFrame) {
@@ -1467,6 +1572,10 @@ impl ActionFlag {
 pub struct AsyncAction {
     pub space: PyObjectRef,
     _action_index: isize,
+    /// pypy/interpreter/executioncontext.py:600 `self.bitmask = 1 << index`.
+    /// Set by `AbstractActionFlag::register_nonperiodic_action` and
+    /// consumed by `fire` / `action_dispatcher`'s bit test.
+    pub bitmask: usize,
 }
 
 impl Default for AsyncAction {
@@ -1474,6 +1583,7 @@ impl Default for AsyncAction {
         Self {
             space: pyre_object::PY_NULL,
             _action_index: -1,
+            bitmask: 0,
         }
     }
 }
@@ -1487,6 +1597,7 @@ impl AsyncAction {
         let mut action = Self {
             space,
             _action_index: -1,
+            bitmask: 0,
         };
         if is_periodic {
             let _ = action;
@@ -1495,6 +1606,7 @@ impl AsyncAction {
         } else {
             let index = actionflag.register_nonperiodic_action(std::ptr::null_mut());
             action._action_index = index;
+            action.bitmask = 1usize << (index as usize);
         }
         action
     }
@@ -1519,6 +1631,7 @@ impl PeriodicAsyncAction {
             base: AsyncAction {
                 space,
                 _action_index: -1,
+                bitmask: 0,
             },
         }
         .with_actionflag(actionflag)
@@ -1536,6 +1649,15 @@ pub struct UserDelAction {
     pub finalizers_lock_count: usize,
     pub enabled_at_app_level: bool,
     pub pending_with_disabled_del: Option<Vec<PyObjectRef>>,
+    /// `pypy/interpreter/executioncontext.py:640` —
+    /// `self.space.finalizer_queue` access target.
+    ///
+    /// PRE-EXISTING-ADAPTATION: PyPy reads the queue via `self.space`
+    /// (typed `ObjSpace`).  Pyre's `space` is an opaque `PyObjectRef`,
+    /// so the queue is held as a UserDelAction field instead.  When the
+    /// GC integration epic (Task #224) lands a typed space surface this
+    /// can be folded back into `space.finalizer_queue`.
+    pub finalizer_queue: WRootFinalizerQueue,
 }
 
 impl UserDelAction {
@@ -1544,10 +1666,12 @@ impl UserDelAction {
             base: AsyncAction {
                 space,
                 _action_index: -1,
+                bitmask: 0,
             },
             finalizers_lock_count: 0,
             enabled_at_app_level: true,
             pending_with_disabled_del: None,
+            finalizer_queue: WRootFinalizerQueue,
         }
     }
 
@@ -1556,16 +1680,29 @@ impl UserDelAction {
         self._run_finalizers();
     }
 
+    /// `pypy/interpreter/executioncontext.py:636-643`:
+    /// ```python
+    /// def _run_finalizers(self):
+    ///     # called by perform() when we have to "perform" this action,
+    ///     # and also directly at the end of gc.collect).
+    ///     while True:
+    ///         w_obj = self.space.finalizer_queue.next_dead()
+    ///         if w_obj is None:
+    ///             break
+    ///         self._call_finalizer(w_obj)
+    /// ```
+    ///
+    /// `self.space.finalizer_queue` is read via the local
+    /// `self.finalizer_queue` field (see struct doc for
+    /// PRE-EXISTING-ADAPTATION).
     pub fn _run_finalizers(&mut self) {
-        while let Some(_w_obj) = self
-            .pending_with_disabled_del
-            .as_ref()
-            .and_then(|v| v.first())
-        {
-            self._call_finalizer(*_w_obj);
-            return;
+        loop {
+            let w_obj = self.finalizer_queue.next_dead();
+            match w_obj {
+                None => break,
+                Some(w) => self._call_finalizer(w),
+            }
         }
-        let _ = self.finalizers_lock_count;
     }
 
     pub fn gc_disabled(&mut self, w_obj: PyObjectRef) -> bool {

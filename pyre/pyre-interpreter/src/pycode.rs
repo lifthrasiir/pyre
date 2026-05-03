@@ -42,6 +42,8 @@ pub struct W_CodeObject {
     pub code_ptr: *const (),
     /// PyPy: `PyCode.w_globals`.
     pub w_globals: *mut crate::DictStorage,
+    /// pycode.py:96 `self.hidden_applevel = hidden_applevel`.
+    pub hidden_applevel: bool,
 }
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
@@ -107,6 +109,7 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
         },
         code_ptr,
         w_globals: std::ptr::null_mut(),
+        hidden_applevel: false,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -144,6 +147,15 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::Dict
     unsafe {
         (*(obj as *mut W_CodeObject)).w_globals = w_globals;
     }
+}
+
+/// PyPy: `PyCode.hidden_applevel`.
+#[inline]
+pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.

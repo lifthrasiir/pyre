@@ -2109,13 +2109,24 @@ pub(crate) unsafe fn objspace_compare_floats(
 /// `OpCode::GetfieldGcR` because `pyframe_locals_cells_stack_descr`
 /// is field 0 of `PYFRAME_DESCR_GROUP` with `field_type = Type::Ref`
 /// on a `PYFRAME_GC_TYPE_ID`-typed PyFrame, so the read goes through
-/// the GC barrier in RPython's `rclass.py` getfield emission. Pyre's
-/// cranelift backend has incomplete GC-barrier coverage for the
-/// PYFRAME_DESCR_GROUP read path — a direct swap to `GetfieldGcR`
-/// SIGABRTs in fib_recursive — so the emission stays `GetfieldRawI`
-/// pending a cranelift barrier port (separate parity epic). The
-/// runtime descr's `field_type = Type::Ref` is preserved so the
-/// optimizer's view of the field as a boxed pointer is correct.
+/// the GC barrier in RPython's `rclass.py` getfield emission.
+///
+/// Cranelift backend status (probe 2026-05-04, MAJIT_PROBE_GETFIELD_GC_R=1):
+///   - `OpCode::GetfieldGcR` lowering exists at
+///     `majit-backend-cranelift/src/compiler.rs:10691`.
+///   - Direct swap on fib_recursive panics inside
+///     `gc_alloc_nursery_shim` with non-unwinding abort.  The
+///     post-getfield write-barrier path triggers a nursery
+///     allocation (remembered-set slot) which overflows or hits
+///     a missing slow-path stub.
+///
+/// The convergence path is to either (a) implement the missing
+/// nursery allocation slow-path for the post-GetfieldGcR remembered
+/// set write, or (b) audit why the GC barrier emits a nursery
+/// allocation here when dynasm doesn't.  Either is a separate
+/// cranelift backend epic.  Until then the emission stays
+/// `GetfieldRawI` and the runtime descr's `field_type = Type::Ref`
+/// preserves the optimizer's boxed-pointer view.
 pub(crate) fn frame_locals_cells_stack_array(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(
         OpCode::GetfieldRawI,
