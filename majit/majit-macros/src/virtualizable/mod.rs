@@ -516,8 +516,8 @@ fn generate_layout_helpers(
 
         /// First OpRef index of the vable static field block.
         ///
-        /// Equals `1 + NUM_EXTRA_REDS` — the frame pointer occupies OpRef(0),
-        /// extra reds occupy OpRef(1..1+NUM_EXTRA_REDS), and vable static
+        /// Equals `1 + NUM_EXTRA_REDS` — the frame pointer occupies OpRef::from_raw(0),
+        /// extra reds occupy OpRef::from_raw(1..1+NUM_EXTRA_REDS), and vable static
         /// fields begin at this index. Use when seeding `virtualizable_boxes`
         /// with vable scalar OpRefs (the start point shifts when extra reds
         /// wire in).

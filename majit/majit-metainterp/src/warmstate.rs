@@ -2021,7 +2021,11 @@ mod tests {
         let input_types = [Type::Ref, Type::Int, Type::Float];
         ws.start_retrace(&input_types);
         let mut recorder = crate::recorder::Trace::with_input_types(&input_types);
-        recorder.close_loop(&[majit_ir::OpRef(0), majit_ir::OpRef(1), majit_ir::OpRef(2)]);
+        recorder.close_loop(&[
+            majit_ir::OpRef::input_arg_ref(0),
+            majit_ir::OpRef::input_arg_int(1),
+            majit_ir::OpRef::input_arg_float(2),
+        ]);
         let trace = recorder.get_trace();
         let seen: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp).collect();
         assert_eq!(seen, input_types.to_vec());

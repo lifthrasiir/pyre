@@ -351,6 +351,19 @@ pub enum DispatchOutcome {
     /// `catch_exception/L` metadata pipe and is deferred until the
     /// per-PC exceptiontable plumb-through lands).
     SubRaise { exc: OpRef },
+    /// Trace recording must abort and resume in blackhole mode.
+    ///
+    /// RPython parity: `pyjitpl.py:2003-2006` routes
+    /// `OS_NOT_IN_TRACE` residual calls through
+    /// `do_not_in_trace_call`; `pyjitpl.py:3695` raises
+    /// `SwitchToBlackhole(ABORT_ESCAPE)` if the concrete call raises.
+    /// The trace walker cannot execute the callee concretely yet, so a
+    /// reached `OS_NOT_IN_TRACE` site is surfaced as this non-local
+    /// outcome instead of recording a call that upstream would omit.
+    SwitchToBlackhole {
+        reason: i32,
+        raising_exception: bool,
+    },
 }
 
 /// Errors surfaced by the trace-side walker.
@@ -486,6 +499,12 @@ pub enum DispatchError {
     /// choosing a branch without a concrete value would record the wrong
     /// guard chain, so surface the missing concrete value explicitly.
     SwitchValueNotConcrete { pc: usize, value: OpRef },
+    /// `OS_NOT_IN_TRACE` must run the callee concretely and record no
+    /// IR on the normal path (`pyjitpl.py:3683-3693`). The standalone
+    /// symbolic walker has no concrete executor, so it must stop here
+    /// instead of faking either the normal return or
+    /// `SwitchToBlackhole`.
+    NotInTraceRequiresConcreteExecution { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -535,7 +554,9 @@ pub fn walk(
         pc = next_pc;
         match outcome {
             DispatchOutcome::Continue => {}
-            DispatchOutcome::Terminate | DispatchOutcome::SubReturn { .. } => {
+            DispatchOutcome::Terminate
+            | DispatchOutcome::SubReturn { .. }
+            | DispatchOutcome::SwitchToBlackhole { .. } => {
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc } => {
@@ -1740,15 +1761,14 @@ fn select_residual_call_opcode(
 /// threading concrete-int shadow alongside OpRef for non-const ints
 /// (Task #137 territory) — multi-session work.
 ///
-/// `descr_index` is the per-trace CallDescr slot index emitted by
-/// the codewriter (`decode_descr_index`) — pyre's stand-in for
-/// upstream's identity comparison on `descr` (PRE-EXISTING-ADAPTATION
-/// per the per-trace descriptor slot model).
+/// `descr_key` is the descriptor's stable identity key (`Descr::index()`),
+/// matching upstream's identity comparison on `descr` more closely than
+/// the operand-encoded descr-table slot.
 #[inline]
 fn loopinvariant_lookup(
     ctx: &WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
-    descr_index: usize,
+    descr_key: u32,
     funcptr: OpRef,
 ) -> Option<OpRef> {
     if ei.extraeffect != majit_ir::ExtraEffect::LoopInvariant {
@@ -1757,7 +1777,7 @@ fn loopinvariant_lookup(
     let arg0_int = funcptr_concrete_int(ctx, funcptr)?;
     ctx.trace_ctx
         .heap_cache()
-        .call_loopinvariant_known_result(descr_index as u32, arg0_int)
+        .call_loopinvariant_known_result(descr_key, arg0_int)
         .map(|(opref, _resvalue)| opref)
 }
 
@@ -1785,7 +1805,7 @@ fn loopinvariant_lookup(
 fn loopinvariant_now_known(
     ctx: &mut WalkContext<'_, '_>,
     ei: &majit_ir::EffectInfo,
-    descr_index: usize,
+    descr_key: u32,
     funcptr: OpRef,
     result: OpRef,
 ) {
@@ -1795,12 +1815,9 @@ fn loopinvariant_now_known(
     let Some(arg0_int) = funcptr_concrete_int(ctx, funcptr) else {
         return;
     };
-    ctx.trace_ctx.heap_cache_mut().call_loopinvariant_now_known(
-        descr_index as u32,
-        arg0_int,
-        result,
-        0,
-    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .call_loopinvariant_now_known(descr_key, arg0_int, result, 0);
 }
 
 /// Resolve a residual-call funcptr OpRef to the concrete function
@@ -1808,12 +1825,13 @@ fn loopinvariant_now_known(
 /// (`heapcache.py:629-634` calls `allboxes[0].getint()`).
 ///
 /// Returns `Some(int)` when `funcptr` is a constant int OpRef whose
-/// value lives in pyre's per-trace constant pool, mirroring upstream's
-/// guarantee that `do_residual_or_indirect_call` (`pyjitpl.py:2174-2186`)
-/// only reaches the residual path with a `Const` funcbox.  Returns
-/// `None` for non-constant or non-int OpRefs — the caller treats this
-/// as a cache skip rather than substituting a sentinel that could
-/// alias distinct callees.
+/// value lives in pyre's per-trace constant pool. For the RPython-legal
+/// `EF_LOOPINVARIANT` direct-call producer, `call.py:249-251` asserts
+/// no runtime args and emits a constant function box; that is the path
+/// this cache is meant to mirror. General residual calls can arrive
+/// from indirect calls with non-constant funcboxes
+/// (`pyjitpl.py:2174-2186`), so `None` means "skip the loop-invariant
+/// cache" rather than inventing an alias-prone sentinel key.
 #[inline]
 fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64> {
     if !funcptr.is_constant() {
@@ -1902,39 +1920,37 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
 /// ```
 ///
 /// Upstream's `do_not_in_trace_call` (pyjitpl.py:3683-3697) executes the
-/// callee concretely and raises `SwitchToBlackhole(ABORT_ESCAPE)` if
-/// it raised, otherwise returns `None` so no IR op is recorded.
+/// callee concretely and raises `SwitchToBlackhole(ABORT_ESCAPE,
+/// raising_exception=True)` if it raised, otherwise returns `None` so
+/// no IR op is recorded.
 ///
-/// The pyre trace-walker has no concrete-execution / abort-to-blackhole
-/// path for jitcode-walked residual_call bytecodes — concrete execution
-/// happens in the metainterp layer (`pyjitpl/mod.rs:11122-11124
+/// The pyre trace-walker has no concrete-execution callback for
+/// jitcode-walked residual_call bytecodes yet — concrete execution
+/// happens in the metainterp layer (`pyjitpl/mod.rs:9631-9659
 /// do_not_in_trace_call`) which dispatches `BC_CALL_*` not
-/// `BC_RESIDUAL_CALL_*`.  Therefore an `OS_NOT_IN_TRACE` callee that
-/// reached this dispatcher would have to be either silently lowered to
-/// a regular `CALL_*` op (NEW-DEVIATION: trace records a call upstream
-/// would not record) or aborted (no abort path exists).
+/// `BC_RESIDUAL_CALL_*`. Therefore an `OS_NOT_IN_TRACE` callee that
+/// reached this dispatcher cannot be safely treated as a regular
+/// residual call: upstream records no IR for the normal case, and
+/// aborts to blackhole only when the concrete call raises. Until that
+/// concrete callback is threaded into `WalkContext`, the walker reports
+/// a typed error instead of inventing either outcome.
 ///
 /// `effect_info_for_call_flavor` (`flatten.rs:431` audit table) never
 /// sets `oopspecindex`, so this branch is unreachable from production
-/// today.  A future producer that begins populating `oopspecindex`
-/// (e.g. when the `majit-translate` analyzer trio ports `OS_NOT_IN_TRACE`
-/// detection) would otherwise silently introduce the deviation; the
-/// fail-loud panic surfaces it at first reach so the convergence work
-/// can wire the proper abort path.
+/// today. A future producer that begins populating `oopspecindex`
+/// should replace this guard with a real `do_not_in_trace_call`
+/// callback returning `Ok(None)` on normal completion and
+/// `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)` only on
+/// raise.
 #[inline]
-fn guard_not_os_not_in_trace(ei: &majit_ir::EffectInfo, caller: &'static str) {
+fn do_not_in_trace_call_result(
+    ei: &majit_ir::EffectInfo,
+    pc: usize,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     if ei.oopspecindex == OopSpecIndex::NotInTrace {
-        panic!(
-            "{caller}: OS_NOT_IN_TRACE callee reached the trace-walker \
-             residual_call dispatcher (pyjitpl.py:2003-2005); upstream \
-             routes this through do_not_in_trace_call (pyjitpl.py:3683-3697) \
-             which executes concretely and raises \
-             SwitchToBlackhole(ABORT_ESCAPE) on raise.  Pyre's trace-walker \
-             has no concrete-execution / abort-to-blackhole path here; \
-             convergence requires a SwitchToBlackhole analog in WalkContext \
-             alongside the producer that sets `oopspecindex`."
-        );
+        return Err(DispatchError::NotInTraceRequiresConcreteExecution { pc });
     }
+    Ok(None)
 }
 
 fn direct_call_release_gil(
@@ -1944,7 +1960,7 @@ fn direct_call_release_gil(
     descr: DescrRef,
     dst_bank: char,
     caller: &'static str,
-) -> OpRef {
+) -> Option<OpRef> {
     // pyjitpl.py:3675: realfuncaddr, saveerr = effectinfo.call_release_gil_target
     let (realfuncaddr, saveerr) = ei.call_release_gil_target;
     // pyjitpl.py:3676-3677: funcbox/savebox ConstInt
@@ -2008,7 +2024,10 @@ fn direct_call_release_gil(
     if ei.check_can_raise(false) {
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     }
-    result
+    match dst_bank {
+        'v' => None,
+        _ => Some(result),
+    }
 }
 
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
@@ -2063,7 +2082,7 @@ fn direct_call_release_gil(
 /// returns `CallMayForce*` for the forces classification).  Release-gil
 /// helper invalidates with `CALL_MAY_FORCE_*` matching
 /// `pyjitpl.py:2072`'s `opnum1`. The `OS_NOT_IN_TRACE` check fires up
-/// front via [`guard_not_os_not_in_trace`] — unreachable today (no
+/// front via [`do_not_in_trace_call_result`] — unreachable today (no
 /// producer populates `oopspecindex`) but fail-loud against future
 /// silent NEW-DEVIATIONs once `majit-translate` analyzers land. Still
 /// missing relative to upstream `do_residual_call`:
@@ -2105,6 +2124,7 @@ fn dispatch_residual_call_iRd_kind(
             pc: op.pc,
             descr_index,
         })?;
+    let descr_key = descr.index();
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
@@ -2113,7 +2133,9 @@ fn dispatch_residual_call_iRd_kind(
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
-    guard_not_os_not_in_trace(ei, "dispatch_residual_call_iRd_kind");
+    if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
@@ -2142,8 +2164,8 @@ fn dispatch_residual_call_iRd_kind(
         // LoopInvariant` AND the `(descr_index, funcptr)` pair matches
         // the heapcache; for all other EI branches it falls through
         // and the normal record path runs.
-        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr) {
-            cached
+        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_key, funcptr) {
+            Some(cached)
         } else {
             let recorded =
                 ctx.trace_ctx
@@ -2183,42 +2205,44 @@ fn dispatch_residual_call_iRd_kind(
             // populate the cache so a subsequent matching call short-
             // circuits via the lookup above.  No-op for non-loopinvariant
             // EI per `loopinvariant_now_known`'s extraeffect check.
-            loopinvariant_now_known(ctx, ei, descr_index, funcptr, recorded);
+            loopinvariant_now_known(ctx, ei, descr_key, funcptr, recorded);
 
-            recorded
+            Some(recorded)
         }
     };
 
     // dst writeback (`>X`).
     let dst = code[op.pc + 1 + descr_offset + 2] as usize;
-    match dst_bank {
-        'r' => {
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+    if let Some(result) = result {
+        match dst_bank {
+            'r' => {
+                let len = ctx.registers_r.len();
+                let slot =
+                    ctx.registers_r
+                        .get_mut(dst)
+                        .ok_or(DispatchError::RegisterOutOfRange {
+                            pc: op.pc,
+                            reg: dst,
+                            len,
+                            bank: "r",
+                        })?;
+                *slot = result;
+            }
+            'i' => {
+                let len = ctx.registers_i.len();
+                let slot =
+                    ctx.registers_i
+                        .get_mut(dst)
+                        .ok_or(DispatchError::RegisterOutOfRange {
+                            pc: op.pc,
+                            reg: dst,
+                            len,
+                            bank: "i",
+                        })?;
+                *slot = result;
+            }
+            _ => unreachable!("dst_bank validated above"),
         }
-        'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
-        }
-        _ => unreachable!("dst_bank validated above"),
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -2252,7 +2276,7 @@ fn dispatch_residual_call_iRd_kind(
 /// recorded call op (`pyjitpl.py:2659 _record_helper_varargs`); the
 /// release-gil helper invalidates with `CALL_MAY_FORCE_*` per
 /// `pyjitpl.py:2072`. `OS_NOT_IN_TRACE` is fail-loud-guarded up front
-/// via [`guard_not_os_not_in_trace`] (matches `iRd_kind`). Still
+/// via [`do_not_in_trace_call_result`] (matches `iRd_kind`). Still
 /// PRE-EXISTING-ADAPTATION: vable bookkeeping
 /// (`vable_and_vrefs_before/after_residual_call`), `OS_NOT_IN_TRACE`
 /// abort-to-blackhole convergence (unreachable until
@@ -2281,6 +2305,7 @@ fn dispatch_residual_call_iIRd_kind(
             pc: op.pc,
             descr_index,
         })?;
+    let descr_key = descr.index();
 
     // Flat argboxes = i_args ++ r_args (`boxes2` argcode order).
     // Parallel argbox_types stamps each entry with its source bank so
@@ -2296,7 +2321,9 @@ fn dispatch_residual_call_iIRd_kind(
     let ei = call_descr.get_extra_info();
     // pyjitpl.py:2003-2005 OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
-    guard_not_os_not_in_trace(ei, "dispatch_residual_call_iIRd_kind");
+    if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     // pyjitpl.py:2063 forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
@@ -2317,8 +2344,8 @@ fn dispatch_residual_call_iIRd_kind(
         // short-circuit. See [`loopinvariant_lookup`] /
         // [`loopinvariant_now_known`] for the upstream citation; the
         // structure mirrors `dispatch_residual_call_iRd_kind`.
-        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr) {
-            cached
+        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_key, funcptr) {
+            Some(cached)
         } else {
             let recorded =
                 ctx.trace_ctx
@@ -2340,41 +2367,43 @@ fn dispatch_residual_call_iIRd_kind(
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             }
 
-            loopinvariant_now_known(ctx, ei, descr_index, funcptr, recorded);
+            loopinvariant_now_known(ctx, ei, descr_key, funcptr, recorded);
 
-            recorded
+            Some(recorded)
         }
     };
 
     let dst = code[op.pc + 1 + descr_offset + 2] as usize;
-    match dst_bank {
-        'r' => {
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+    if let Some(result) = result {
+        match dst_bank {
+            'r' => {
+                let len = ctx.registers_r.len();
+                let slot =
+                    ctx.registers_r
+                        .get_mut(dst)
+                        .ok_or(DispatchError::RegisterOutOfRange {
+                            pc: op.pc,
+                            reg: dst,
+                            len,
+                            bank: "r",
+                        })?;
+                *slot = result;
+            }
+            'i' => {
+                let len = ctx.registers_i.len();
+                let slot =
+                    ctx.registers_i
+                        .get_mut(dst)
+                        .ok_or(DispatchError::RegisterOutOfRange {
+                            pc: op.pc,
+                            reg: dst,
+                            len,
+                            bank: "i",
+                        })?;
+                *slot = result;
+            }
+            _ => unreachable!("dst_bank validated above"),
         }
-        'i' => {
-            let len = ctx.registers_i.len();
-            let slot = ctx
-                .registers_i
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "i",
-                })?;
-            *slot = result;
-        }
-        _ => unreachable!("dst_bank validated above"),
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
@@ -2508,8 +2537,20 @@ fn dispatch_inline_call_dr_kind(
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::SwitchToBlackhole {
+            reason,
+            raising_exception,
+        } => Ok((
+            DispatchOutcome::SwitchToBlackhole {
+                reason,
+                raising_exception,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::Continue => {
-            unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
+            unreachable!(
+                "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
+            )
         }
     }
 }
@@ -2652,8 +2693,20 @@ fn dispatch_inline_call_dir_kind(
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::SwitchToBlackhole {
+            reason,
+            raising_exception,
+        } => Ok((
+            DispatchOutcome::SwitchToBlackhole {
+                reason,
+                raising_exception,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::Continue => {
-            unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
+            unreachable!(
+                "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
+            )
         }
     }
 }
@@ -2806,8 +2859,20 @@ fn dispatch_inline_call_dirf_kind(
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::SwitchToBlackhole {
+            reason,
+            raising_exception,
+        } => Ok((
+            DispatchOutcome::SwitchToBlackhole {
+                reason,
+                raising_exception,
+            },
+            op.next_pc,
+        )),
         DispatchOutcome::Continue => {
-            unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
+            unreachable!(
+                "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
+            )
         }
     }
 }
@@ -3375,7 +3440,7 @@ mod tests {
             0x00, // d descr index 0
         ];
         let mut tc = fresh_trace_ctx();
-        let mut regs_i = vec![OpRef(0)];
+        let mut regs_i = vec![OpRef::from_raw(0)];
         let descr_pool = switch_descr_pool(&[(5, 17)]);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
@@ -3400,7 +3465,7 @@ mod tests {
             err,
             DispatchError::SwitchValueNotConcrete {
                 pc: 0,
-                value: OpRef(0),
+                value: OpRef::from_raw(0),
             }
         );
     }

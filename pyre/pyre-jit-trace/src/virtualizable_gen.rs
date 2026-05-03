@@ -22,7 +22,7 @@ majit_macros::virtualizable! {
     frame_field = frame,
 
     // Non-vable JitDriver reds (`interp_jit.py:67 reds = ['frame', 'ec']`).
-    // `frame` is implicit at OpRef(0); each entry here shifts
+    // `frame` is implicit at OpRef::from_raw(0); each entry here shifts
     // `NUM_SCALAR_INPUTARGS` and `SYM_ARRAY_BASE` by one and occupies
     // `OpRef(1..1+NUM_EXTRA_REDS)` between frame and the vable static
     // fields.

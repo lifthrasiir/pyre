@@ -632,25 +632,25 @@ mod tests {
 
     #[test]
     fn lowers_simple_integer_loop_shape() {
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
         let c1 = OpRef::from_const(1);
         let c10 = OpRef::from_const(10);
 
         let mut label = Op::new(OpCode::Label, &[i0]);
-        label.pos = OpRef(10);
+        label.pos = OpRef::from_raw(10);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
-        add.pos = OpRef(1);
+        add.pos = OpRef::from_raw(1);
 
-        let mut lt = Op::new(OpCode::IntLt, &[OpRef(1), c10]);
-        lt.pos = OpRef(2);
+        let mut lt = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), c10]);
+        lt.pos = OpRef::from_raw(2);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
-        guard.pos = OpRef(3);
-        guard.fail_args = Some(vec![OpRef(1)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
+        guard.pos = OpRef::from_raw(3);
+        guard.fail_args = Some(vec![OpRef::from_raw(1)].into());
 
-        let mut jump = Op::new(OpCode::Jump, &[OpRef(1)]);
-        jump.pos = OpRef(4);
+        let mut jump = Op::new(OpCode::Jump, &[OpRef::from_raw(1)]);
+        jump.pos = OpRef::from_raw(4);
 
         let plan = TracePlan::build(
             &[InputArg {
@@ -687,21 +687,21 @@ mod tests {
 
     #[test]
     fn reverse_liveness_keeps_guard_fail_args_available() {
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
         let c1 = OpRef::from_const(1);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
-        add.pos = OpRef(1);
+        add.pos = OpRef::from_raw(1);
 
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[OpRef(1)]);
-        is_true.pos = OpRef(2);
+        let mut is_true = Op::new(OpCode::IntIsTrue, &[OpRef::from_raw(1)]);
+        is_true.pos = OpRef::from_raw(2);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
-        guard.pos = OpRef(3);
-        guard.fail_args = Some(vec![OpRef(1)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
+        guard.pos = OpRef::from_raw(3);
+        guard.fail_args = Some(vec![OpRef::from_raw(1)].into());
 
         let mut finish = Op::new(OpCode::Finish, &[]);
-        finish.pos = OpRef(4);
+        finish.pos = OpRef::from_raw(4);
 
         let plan = TracePlan::build(
             &[InputArg {
@@ -712,14 +712,14 @@ mod tests {
         );
 
         let guard_live = &plan.live_points[2].live_in;
-        assert!(guard_live.contains(&OpRef(1)));
-        assert!(guard_live.contains(&OpRef(2)));
+        assert!(guard_live.contains(&OpRef::from_raw(1)));
+        assert!(guard_live.contains(&OpRef::from_raw(2)));
 
         assert_eq!(
             plan.deopt_spill_points,
             vec![super::DeoptSpillPoint {
                 op_index: 2,
-                args: vec![OpRef(1)]
+                args: vec![OpRef::from_raw(1)]
             }]
         );
 
@@ -730,21 +730,21 @@ mod tests {
 
     #[test]
     fn deopt_spill_point_keeps_jump_args_on_fast_path() {
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
         let c1 = OpRef::from_const(1);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
-        add.pos = OpRef(1);
+        add.pos = OpRef::from_raw(1);
 
-        let mut is_true = Op::new(OpCode::IntIsTrue, &[OpRef(1)]);
-        is_true.pos = OpRef(2);
+        let mut is_true = Op::new(OpCode::IntIsTrue, &[OpRef::from_raw(1)]);
+        is_true.pos = OpRef::from_raw(2);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
-        guard.pos = OpRef(3);
-        guard.fail_args = Some(vec![OpRef(1)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
+        guard.pos = OpRef::from_raw(3);
+        guard.fail_args = Some(vec![OpRef::from_raw(1)].into());
 
-        let mut jump = Op::new(OpCode::Jump, &[OpRef(1)]);
-        jump.pos = OpRef(4);
+        let mut jump = Op::new(OpCode::Jump, &[OpRef::from_raw(1)]);
+        jump.pos = OpRef::from_raw(4);
 
         let plan = TracePlan::build(
             &[InputArg {
@@ -759,15 +759,15 @@ mod tests {
 
     #[test]
     fn lowers_indexed_memory_operands_by_role() {
-        let base = OpRef(0);
-        let index = OpRef(1);
-        let value = OpRef(2);
+        let base = OpRef::from_raw(0);
+        let index = OpRef::from_raw(1);
+        let value = OpRef::from_raw(2);
         let scale = OpRef::from_const(1);
         let offset = OpRef::from_const(16);
         let size = OpRef::from_const(8);
 
         let mut load = Op::new(OpCode::GcLoadIndexedI, &[base, index, scale, offset, size]);
-        load.pos = OpRef(3);
+        load.pos = OpRef::from_raw(3);
         let store = Op::new(
             OpCode::GcStoreIndexed,
             &[base, index, value, scale, offset, size],
@@ -777,15 +777,15 @@ mod tests {
             &[
                 InputArg {
                     tp: Type::Ref,
-                    index: base.0,
+                    index: base.raw(),
                 },
                 InputArg {
                     tp: Type::Int,
-                    index: index.0,
+                    index: index.raw(),
                 },
                 InputArg {
                     tp: Type::Int,
-                    index: value.0,
+                    index: value.raw(),
                 },
             ],
             &[load, store],
@@ -818,15 +818,15 @@ mod tests {
 
     #[test]
     fn lowers_misc_opcode_without_fallback() {
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
         let mut same_as = Op::new(OpCode::SameAsI, &[i0]);
-        same_as.pos = OpRef(1);
+        same_as.pos = OpRef::from_raw(1);
         let debug = Op::new(OpCode::JitDebug, &[]);
 
         let plan = TracePlan::build(
             &[InputArg {
                 tp: Type::Int,
-                index: i0.0,
+                index: i0.raw(),
             }],
             &[same_as, debug],
         );
@@ -836,7 +836,7 @@ mod tests {
             plan.ops[0],
             LirOp::Opcode {
                 opcode: OpCode::SameAsI,
-                dst: Some(OpRef(1)),
+                dst: Some(OpRef::Untyped(1)),
                 ..
             }
         ));
@@ -851,19 +851,19 @@ mod tests {
 
     #[test]
     fn lowers_remaining_guard_kinds_without_fallback() {
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
         let mut is_object = Op::new(OpCode::GuardIsObject, &[i0]);
-        is_object.pos = OpRef(1);
+        is_object.pos = OpRef::from_raw(1);
         is_object.fail_args = Some(vec![i0].into());
 
         let mut future = Op::new(OpCode::GuardFutureCondition, &[]);
-        future.pos = OpRef(2);
+        future.pos = OpRef::from_raw(2);
         future.fail_args = Some(vec![i0].into());
 
         let plan = TracePlan::build(
             &[InputArg {
                 tp: Type::Ref,
-                index: i0.0,
+                index: i0.raw(),
             }],
             &[is_object, future],
         );

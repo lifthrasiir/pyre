@@ -92,13 +92,17 @@ impl<'a> OpTypeIndex<'a> {
             if op.pos.is_none() || op.type_ == Type::Void {
                 continue;
             }
-            if let Some(&prev_idx) = map.get(&op.pos.0) {
+            if let Some(&prev_idx) = map.get(&op.pos.raw()) {
                 panic!(
                     "OpTypeIndex: OpRef({}) bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
-                    op.pos.0, prev_idx, ops[prev_idx].opcode, idx, op.opcode,
+                    op.pos.raw(),
+                    prev_idx,
+                    ops[prev_idx].opcode,
+                    idx,
+                    op.opcode,
                 );
             }
-            map.insert(op.pos.0, idx);
+            map.insert(op.pos.raw(), idx);
         }
         map
     }
@@ -158,12 +162,12 @@ impl<'a> OpTypeIndex<'a> {
             // — multi-session work, see audit "Section 2.1".
             return Some(
                 self.constant_types
-                    .get(&opref.0)
+                    .get(&opref.raw())
                     .copied()
                     .unwrap_or(Type::Int),
             );
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.ops[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -172,10 +176,10 @@ impl<'a> OpTypeIndex<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.0) {
+        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.ops[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -187,7 +191,7 @@ impl<'a> OpTypeIndex<'a> {
     /// Direct `OpRef → &Op` lookup; returns `None` for constants,
     /// inputargs, or `OpRef::NONE`.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
-        let idx = *self.op_index.get(&opref.0)?;
+        let idx = *self.op_index.get(&opref.raw())?;
         Some(&self.ops[idx])
     }
 
@@ -196,7 +200,7 @@ impl<'a> OpTypeIndex<'a> {
     /// an OpRef's pre-redefinition type when an op later overwrote the
     /// same OpRef with a different type.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
-        let idx = *self.inputarg_index.get(&opref.0)?;
+        let idx = *self.inputarg_index.get(&opref.raw())?;
         Some(self.inputargs[idx].tp)
     }
 }

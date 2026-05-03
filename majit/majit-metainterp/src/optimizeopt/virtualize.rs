@@ -52,14 +52,14 @@ pub struct VirtualizableConfig {
     /// args back into VirtualizableFieldState without falling back to raw
     /// heap reads.
     pub array_lengths: Vec<usize>,
-    /// Number of input slots between `OpRef(0)` (frame) and the first vable
+    /// Number of input slots between `OpRef::from_raw(0)` (frame) and the first vable
     /// scalar slot. Equals `JitDriverStaticData::num_reds() - 1` after the
     /// frame is excluded — typically `NUM_EXTRA_REDS` from the
     /// virtualizable!{} macro (e.g. `1` for pyre's `extra_reds = { ec: Ref }`).
     /// `0` means the legacy `[frame, vable_scalars..., array_items...]`
     /// layout; nonzero shifts every input-derived OpRef by that count.
     /// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` — the non-vable
-    /// extra reds occupy `OpRef(1..1+vable_input_offset)`.
+    /// extra reds occupy `OpRef::from_raw(1..1+vable_input_offset)`.
     pub vable_input_offset: usize,
 }
 
@@ -79,7 +79,7 @@ pub struct OptVirtualize {
     /// Phase 2 (loop body): don't virtualize New() because guard failure
     /// recovery_layout is not yet populated (RPython rd_virtuals equivalent).
     pub is_phase2: bool,
-    /// If set, frame OpRef(0) is treated as a virtualizable object
+    /// If set, frame OpRef::from_raw(0) is treated as a virtualizable object
     /// whose field accesses are absorbed by the optimizer.
     vable_config: Option<VirtualizableConfig>,
     /// Whether virtualizable state has been initialized from existing trace inputs.
@@ -193,7 +193,7 @@ impl OptVirtualize {
                 break;
             }
             let field_idx = virtualizable_field_index(offset);
-            let input_ref = OpRef(flat_input_idx as u32);
+            let input_ref = OpRef::from_raw(flat_input_idx as u32);
             set_field(&mut state.fields, field_idx, input_ref);
             set_field_descr(
                 &mut state.field_descrs,
@@ -229,7 +229,7 @@ impl OptVirtualize {
                 if flat_input_idx >= ctx.num_inputs() {
                     break;
                 }
-                elements.push(OpRef(flat_input_idx as u32));
+                elements.push(OpRef::from_raw(flat_input_idx as u32));
                 flat_input_idx += 1;
             }
             if !elements.is_empty() {
@@ -237,7 +237,7 @@ impl OptVirtualize {
             }
         }
 
-        ctx.set_ptr_info(OpRef(0), PtrInfo::Virtualizable(state));
+        ctx.set_ptr_info(OpRef::from_raw(0), PtrInfo::Virtualizable(state));
     }
 
     /// Given a virtualizable array field descr's byte offset, return the
@@ -290,20 +290,20 @@ impl OptVirtualize {
 
     fn is_standard_virtualizable_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
         self.vable_config.is_some()
-            && opref == ctx.get_box_replacement(OpRef(0))
+            && opref == ctx.get_box_replacement(OpRef::from_raw(0))
             && matches!(ctx.get_ptr_info(opref), Some(PtrInfo::Virtualizable(_)))
     }
 
     /// Apply deferred virtualizable setup if needed.
-    /// Skips if OpRef(0) already has PtrInfo (e.g. tests pre-populate).
+    /// Skips if OpRef::from_raw(0) already has PtrInfo (e.g. tests pre-populate).
     fn ensure_vable_setup(&mut self, ctx: &mut OptContext) {
         if self.needs_vable_setup {
             self.needs_vable_setup = false;
-            if ctx.get_ptr_info(OpRef(0)).is_none() {
+            if ctx.get_ptr_info(OpRef::from_raw(0)).is_none() {
                 self.init_virtualizable(ctx);
-                if ctx.get_ptr_info(OpRef(0)).is_none() {
+                if ctx.get_ptr_info(OpRef::from_raw(0)).is_none() {
                     ctx.set_ptr_info(
-                        OpRef(0),
+                        OpRef::from_raw(0),
                         PtrInfo::Virtualizable(VirtualizableFieldState {
                             fields: vec![],
                             field_descrs: vec![],
@@ -660,7 +660,7 @@ impl OptVirtualize {
         // PyFrame is also inputarg 0, so applying this shortcut to v0 would
         // corrupt virtualizable field loads such as locals_cells_stack_w.
         if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
-            let pool_ref = ctx.get_box_replacement(OpRef(0)); // pool is always inputarg 0
+            let pool_ref = ctx.get_box_replacement(OpRef::from_raw(0)); // pool is always inputarg 0
             if struct_ref == pool_ref && !is_standard_vable_ref {
                 for &(descr_idx, virtual_head) in &ctx.imported_virtual_heads {
                     if field_idx == descr_idx as u32 {
@@ -766,7 +766,11 @@ impl OptVirtualize {
                         if probe {
                             eprintln!(
                                 "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → VirtualArray.items[{}] = value (REMOVE)",
-                                op.pos.0, array_ref, idx, value_ref, idx,
+                                op.pos.raw(),
+                                array_ref,
+                                idx,
+                                value_ref,
+                                idx,
                             );
                         }
                         return OptimizationResult::Remove;
@@ -783,7 +787,13 @@ impl OptVirtualize {
                 if probe {
                     eprintln!(
                         "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → Vable[{}].arrays[{}].elem[{}] = value (mirror, PASS)",
-                        op.pos.0, array_ref, elem_idx, value_ref, frame_ref.0, array_idx, elem_idx,
+                        op.pos.raw(),
+                        array_ref,
+                        elem_idx,
+                        value_ref,
+                        frame_ref.raw(),
+                        array_idx,
+                        elem_idx,
                     );
                 }
                 if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
@@ -792,13 +802,19 @@ impl OptVirtualize {
             } else if probe {
                 eprintln!(
                     "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → no vable mirror (passthrough)",
-                    op.pos.0, array_ref, index as usize, value_ref,
+                    op.pos.raw(),
+                    array_ref,
+                    index as usize,
+                    value_ref,
                 );
             }
         } else if probe {
             eprintln!(
                 "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} value_ref={:?} (passthrough)",
-                op.pos.0, array_ref, index_ref, value_ref,
+                op.pos.raw(),
+                array_ref,
+                index_ref,
+                value_ref,
             );
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
@@ -830,7 +846,11 @@ impl OptVirtualize {
                             if probe {
                                 eprintln!(
                                     "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → VirtualArray.items[{}] = {:?} (REMOVE → fold)",
-                                    op.pos.0, array_ref, idx, idx, item_ref,
+                                    op.pos.raw(),
+                                    array_ref,
+                                    idx,
+                                    idx,
+                                    item_ref,
                                 );
                             }
                             ctx.replace_op(op.pos, item_ref);
@@ -842,13 +862,17 @@ impl OptVirtualize {
             if probe {
                 eprintln!(
                     "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → no fold (PASS, runtime read)",
-                    op.pos.0, array_ref, index as usize,
+                    op.pos.raw(),
+                    array_ref,
+                    index as usize,
                 );
             }
         } else if probe {
             eprintln!(
                 "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} (PASS)",
-                op.pos.0, array_ref, index_ref,
+                op.pos.raw(),
+                array_ref,
+                index_ref,
             );
         }
         OptimizationResult::PassOn
@@ -1250,7 +1274,7 @@ impl OptVirtualize {
     /// Handle operations that may cause virtuals to escape.
     fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let mut forced = op.clone();
-        let frame_ref = ctx.get_box_replacement(OpRef(0));
+        let frame_ref = ctx.get_box_replacement(OpRef::from_raw(0));
         for arg in &mut forced.args {
             let resolved = ctx.get_box_replacement(*arg);
             if self.vable_config.is_some()
@@ -2178,7 +2202,7 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
         }
     }
 
@@ -2302,7 +2326,7 @@ mod tests {
         });
         pass.setup();
         ctx.set_ptr_info(
-            OpRef(0),
+            OpRef::from_raw(0),
             PtrInfo::Virtualizable(VirtualizableFieldState {
                 fields: vec![],
                 field_descrs: vec![],
@@ -2311,8 +2335,8 @@ mod tests {
             }),
         );
 
-        let forced = pass.force_virtual(OpRef(0), &mut ctx);
-        assert_eq!(forced, OpRef(0));
+        let forced = pass.force_virtual(OpRef::from_raw(0), &mut ctx);
+        assert_eq!(forced, OpRef::from_raw(0));
         assert!(
             ctx.new_operations.is_empty(),
             "standard virtualizable should not be forced to raw heap ops by optimizer"
@@ -2337,16 +2361,20 @@ mod tests {
         let field_descr =
             make_field_index_descr(0x1000_0000 | (((8_u32) & 0x000f_ffff) << 4) | (0x7 << 1));
         let arr_descr = array_descr(20);
-        ctx.make_constant(OpRef(50), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(50), Value::Int(0));
 
-        let get_array_ptr = Op::with_descr(OpCode::GetfieldRawI, &[OpRef(0)], field_descr);
+        let get_array_ptr =
+            Op::with_descr(OpCode::GetfieldRawI, &[OpRef::from_raw(0)], field_descr);
         let get_item = Op::with_descr(
             OpCode::GetarrayitemRawI,
-            &[OpRef(0), OpRef(50)],
+            &[OpRef::from_raw(0), OpRef::from_raw(50)],
             arr_descr.clone(),
         );
-        let get_item_again =
-            Op::with_descr(OpCode::GetarrayitemRawI, &[OpRef(0), OpRef(50)], arr_descr);
+        let get_item_again = Op::with_descr(
+            OpCode::GetarrayitemRawI,
+            &[OpRef::from_raw(0), OpRef::from_raw(50)],
+            arr_descr,
+        );
 
         let mut ops = vec![get_array_ptr, get_item, get_item_again];
         assign_positions(&mut ops);
@@ -2399,7 +2427,10 @@ mod tests {
         });
         pass.setup();
 
-        let mut call = Op::new(OpCode::CallMayForceI, &[OpRef(0), OpRef(100), OpRef(1)]);
+        let mut call = Op::new(
+            OpCode::CallMayForceI,
+            &[OpRef::from_raw(0), OpRef::from_raw(100), OpRef::from_raw(1)],
+        );
         call.descr = Some(majit_ir::descr::make_call_descr(
             vec![Type::Int, Type::Int, Type::Int],
             Type::Int,
@@ -2410,7 +2441,7 @@ mod tests {
             OptimizationResult::Replace(op) => op,
             other => panic!("expected call replacement, got {other:?}"),
         };
-        assert_eq!(replaced.arg(0), OpRef(0));
+        assert_eq!(replaced.arg(0), OpRef::from_raw(0));
         assert!(
             ctx.new_operations
                 .iter()
@@ -2434,9 +2465,9 @@ mod tests {
         });
         pass.setup();
 
-        let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef(0)]);
+        let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef::from_raw(0)]);
         get.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
-        get.pos = OpRef(10);
+        get.pos = OpRef::from_raw(10);
 
         let result = pass.propagate_forward(&get, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2457,7 +2488,10 @@ mod tests {
         });
         pass.setup();
 
-        let mut set = Op::new(OpCode::SetfieldRaw, &[OpRef(0), OpRef(1)]);
+        let mut set = Op::new(
+            OpCode::SetfieldRaw,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+        );
         set.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
 
         let result = pass.propagate_forward(&set, &mut ctx);
@@ -2478,8 +2512,8 @@ mod tests {
         pass.setup();
         pass.ensure_vable_setup(&mut ctx);
 
-        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef(0)) else {
-            panic!("expected standard virtualizable ptr info on OpRef(0)");
+        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef::from_raw(0)) else {
+            panic!("expected standard virtualizable ptr info on OpRef::from_raw(0)");
         };
         let seeded = get_field_descr(&vstate.field_descrs, virtualizable_field_index(8))
             .expect("virtualizable init should seed field descr");
@@ -2541,16 +2575,19 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef(0)]);
+        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::from_raw(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef(10);
+        get_field.pos = OpRef::from_raw(10);
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
         ));
         ctx.emit(get_field);
 
-        let mut get_item = Op::new(OpCode::GetarrayitemRawI, &[OpRef(10), OpRef(1)]);
+        let mut get_item = Op::new(
+            OpCode::GetarrayitemRawI,
+            &[OpRef::from_raw(10), OpRef::from_raw(1)],
+        );
         get_item.descr = Some(array_descr(24));
         let result = pass.propagate_forward(&get_item, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2571,16 +2608,19 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef(0)]);
+        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::from_raw(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef(10);
+        get_field.pos = OpRef::from_raw(10);
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
         ));
         ctx.emit(get_field);
 
-        let mut set_item = Op::new(OpCode::SetarrayitemRaw, &[OpRef(10), OpRef(1), OpRef(2)]);
+        let mut set_item = Op::new(
+            OpCode::SetarrayitemRaw,
+            &[OpRef::from_raw(10), OpRef::from_raw(1), OpRef::from_raw(2)],
+        );
         set_item.descr = Some(array_descr(24));
         let result = pass.propagate_forward(&set_item, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2589,7 +2629,7 @@ mod tests {
     #[test]
     fn test_standard_virtualizable_raw_setarrayitem_updates_vable_state_without_side_table() {
         let mut ctx = OptContext::with_num_inputs(3, 2);
-        ctx.seed_constant(OpRef(50), Value::Int(0));
+        ctx.seed_constant(OpRef::from_raw(50), Value::Int(0));
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
@@ -2602,26 +2642,32 @@ mod tests {
         });
         pass.setup();
 
-        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef(0)]);
+        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::from_raw(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef(10);
+        get_field.pos = OpRef::from_raw(10);
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
         ));
         ctx.emit(get_field);
 
-        let mut set_item = Op::new(OpCode::SetarrayitemRaw, &[OpRef(10), OpRef(50), OpRef(2)]);
+        let mut set_item = Op::new(
+            OpCode::SetarrayitemRaw,
+            &[OpRef::from_raw(10), OpRef::from_raw(50), OpRef::from_raw(2)],
+        );
         set_item.descr = Some(array_descr(24));
         assert!(matches!(
             pass.propagate_forward(&set_item, &mut ctx),
             OptimizationResult::PassOn
         ));
 
-        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef(0)) else {
-            panic!("expected standard virtualizable ptr info on OpRef(0)");
+        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef::from_raw(0)) else {
+            panic!("expected standard virtualizable ptr info on OpRef::from_raw(0)");
         };
-        assert_eq!(get_array_element(&vstate.arrays, 0, 0), Some(OpRef(2)));
+        assert_eq!(
+            get_array_element(&vstate.arrays, 0, 0),
+            Some(OpRef::from_raw(2))
+        );
     }
 
     #[test]
@@ -2638,9 +2684,15 @@ mod tests {
         });
         let mut constants = HashMap::new();
         let mut ops = vec![
-            Op::new(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]),
-            Op::new(OpCode::Jump, &[OpRef(0), OpRef(1), OpRef(2)]),
+            Op::new(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            ),
         ];
         ops[1].fail_args = Some(Default::default());
         assign_positions(&mut ops);
@@ -2688,8 +2740,12 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], fd.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -2730,24 +2786,30 @@ mod tests {
         pass.setup();
 
         let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
-        new_op.pos = OpRef(0);
+        new_op.pos = OpRef::from_raw(0);
         assert!(matches!(
             pass.propagate_forward(&new_op, &mut ctx),
             OptimizationResult::Remove
         ));
 
-        let mut set_op = Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd);
-        set_op.pos = OpRef(1);
+        let mut set_op = Op::with_descr(
+            OpCode::SetfieldGc,
+            &[OpRef::from_raw(0), OpRef::from_raw(100)],
+            fd,
+        );
+        set_op.pos = OpRef::from_raw(1);
         assert!(matches!(
             pass.propagate_forward(&set_op, &mut ctx),
             OptimizationResult::Remove
         ));
 
-        let info = ctx.get_ptr_info(OpRef(0)).expect("virtual info missing");
+        let info = ctx
+            .get_ptr_info(OpRef::from_raw(0))
+            .expect("virtual info missing");
         let PtrInfo::Virtual(vinfo) = info else {
             panic!("expected Virtual ptr info, got {info:?}");
         };
-        assert_eq!(vinfo.fields, vec![(0, OpRef(100))]);
+        assert_eq!(vinfo.fields, vec![(0, OpRef::from_raw(100))]);
         assert_eq!(vinfo.field_descrs.len(), 1);
         assert_eq!(
             vinfo.field_descrs[0]
@@ -2768,8 +2830,12 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::new(OpCode::CallN, &[OpRef(0)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -2808,22 +2874,29 @@ mod tests {
         // All removed, i2 forwards to i_val42.
         let ad = array_descr(20);
 
-        // OpRef(50) = constant 3 (array size)
-        // OpRef(51) = constant 0 (index)
-        // OpRef(52) = value to store (arbitrary opref)
+        // OpRef::from_raw(50) = constant 3 (array size)
+        // OpRef::from_raw(51) = constant 0 (index)
+        // OpRef::from_raw(52) = value to store (arbitrary opref)
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef(50)], ad.clone()), // pos=0
+            Op::with_descr(OpCode::NewArray, &[OpRef::from_raw(50)], ad.clone()), // pos=0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(51), OpRef(52)],
+                &[OpRef::from_raw(0), OpRef::from_raw(51), OpRef::from_raw(52)],
                 ad.clone(),
             ), // pos=1
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(0), OpRef(51)], ad.clone()), // pos=2
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(0), OpRef::from_raw(51)],
+                ad.clone(),
+            ), // pos=2
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef(50), Value::Int(3)), (OpRef(51), Value::Int(0))];
+        let constants = vec![
+            (OpRef::from_raw(50), Value::Int(3)),
+            (OpRef::from_raw(51), Value::Int(0)),
+        ];
 
         let result = run_pass_with_constants(&ops, &constants);
         assert!(
@@ -2840,12 +2913,12 @@ mod tests {
         let ad = array_descr(20);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef(50)], ad.clone()),
-            Op::with_descr(OpCode::ArraylenGc, &[OpRef(0)], ad.clone()),
+            Op::with_descr(OpCode::NewArray, &[OpRef::from_raw(50)], ad.clone()),
+            Op::with_descr(OpCode::ArraylenGc, &[OpRef::from_raw(0)], ad.clone()),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef(50), Value::Int(5))];
+        let constants = vec![(OpRef::from_raw(50), Value::Int(5))];
 
         let result = run_pass_with_constants(&ops, &constants);
         // Both NEW_ARRAY and ARRAYLEN_GC should be removed
@@ -2873,7 +2946,10 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(200)]),
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -2900,7 +2976,7 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -2931,9 +3007,17 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd1.clone()), // pos=0
             Op::with_descr(OpCode::NewWithVtable, &[], sd2.clone()), // pos=1
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], fd_ref.clone()), // pos=2
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(100)], fd_int.clone()), // pos=3
-            Op::new(OpCode::CallN, &[OpRef(0)]),                     // pos=4
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                fd_ref.clone(),
+            ), // pos=2
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(1), OpRef::from_raw(100)],
+                fd_int.clone(),
+            ), // pos=3
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),           // pos=4
         ];
         assign_positions(&mut ops);
 
@@ -2977,8 +3061,12 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], fd.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -3000,8 +3088,12 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::new(OpCode::CallN, &[OpRef(0)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -3025,9 +3117,13 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd),
-            Op::new(OpCode::CallR, &[OpRef(200), OpRef(0)]),
-            Op::new(OpCode::Finish, &[OpRef(2)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd,
+            ),
+            Op::new(OpCode::CallR, &[OpRef::from_raw(200), OpRef::from_raw(0)]),
+            Op::new(OpCode::Finish, &[OpRef::from_raw(2)]),
         ];
         assign_positions(&mut ops);
 
@@ -3065,9 +3161,17 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd),
-            Op::with_descr(OpCode::CallR, &[OpRef(200), OpRef(0)], call_descr),
-            Op::new(OpCode::Finish, &[OpRef(2)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd,
+            ),
+            Op::with_descr(
+                OpCode::CallR,
+                &[OpRef::from_raw(200), OpRef::from_raw(0)],
+                call_descr,
+            ),
+            Op::new(OpCode::Finish, &[OpRef::from_raw(2)]),
         ];
         assign_positions(&mut ops);
 
@@ -3105,10 +3209,18 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd_a.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(200)], fd_b.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd_a.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], fd_b.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd_a.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+                fd_b.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], fd_a.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], fd_b.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -3131,9 +3243,17 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(200)], fd.clone()),
-            Op::new(OpCode::CallN, &[OpRef(0)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+                fd.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -3161,8 +3281,14 @@ mod tests {
         // known class and removes itself. virtualize.py doesn't handle
         // GUARD_CLASS at all; run the full default pipeline.
         let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(200)]),
-            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(200)]),
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+            ),
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+            ),
         ];
         assign_positions(&mut ops);
 
@@ -3187,8 +3313,12 @@ mod tests {
         let fd = field_descr(10);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(200)], fd.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(200)],
+                fd.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], fd.clone()),
         ];
         assign_positions(&mut ops);
 
@@ -3207,13 +3337,19 @@ mod tests {
         //
         // Expected output: only ForceToken (emitted by optimizer) + SameAsR for the null constant
         let mut ops = vec![
-            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
-            Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(102)]), // pos=1
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // pos=0
+            Op::new(
+                OpCode::VirtualRefFinish,
+                &[OpRef::from_raw(0), OpRef::from_raw(102)],
+            ), // pos=1
         ];
         assign_positions(&mut ops);
 
-        // OpRef(102) = CONST_NULL (Ref-typed null, matching producer `const_null()`).
-        let constants = vec![(OpRef(102), Value::Ref(majit_ir::GcRef(0)))];
+        // OpRef::from_raw(102) = CONST_NULL (Ref-typed null, matching producer `const_null()`).
+        let constants = vec![(OpRef::from_raw(102), Value::Ref(majit_ir::GcRef(0)))];
         let result = run_pass_with_constants(&ops, &constants);
 
         // VirtualRefR should be removed (virtual), VirtualRefFinish should be removed.
@@ -3242,8 +3378,11 @@ mod tests {
         //
         // Expected: NEW (forced struct) + SETFIELD_GC (fields) + CALL_N
         let mut ops = vec![
-            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
-            Op::new(OpCode::CallN, &[OpRef(0)]),                     // pos=1
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // pos=0
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]), // pos=1
         ];
         assign_positions(&mut ops);
 
@@ -3275,8 +3414,14 @@ mod tests {
         // the forced field is updated in the virtual struct.
         // No ops should be emitted for the VirtualRefFinish itself.
         let mut ops = vec![
-            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
-            Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(200)]), // pos=1, non-null
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // pos=0
+            Op::new(
+                OpCode::VirtualRefFinish,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+            ), // pos=1, non-null
         ];
         assign_positions(&mut ops);
 
@@ -3304,8 +3449,11 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
-            Op::new(OpCode::VirtualRefR, &[OpRef(0), OpRef(101)]),  // pos=1
-            Op::new(OpCode::CallN, &[OpRef(1)]),                    // pos=2
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+            ), // pos=1
+            Op::new(OpCode::CallN, &[OpRef::from_raw(1)]),          // pos=2
         ];
         assign_positions(&mut ops);
 
@@ -3343,9 +3491,15 @@ mod tests {
         //
         // VirtualRefFinish on a non-virtual vref should emit SETFIELD_GC ops.
         let mut ops = vec![
-            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
-            Op::new(OpCode::CallN, &[OpRef(0)]),                     // pos=1
-            Op::new(OpCode::VirtualRefFinish, &[OpRef(0), OpRef(200)]), // pos=2
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // pos=0
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]), // pos=1
+            Op::new(
+                OpCode::VirtualRefFinish,
+                &[OpRef::from_raw(0), OpRef::from_raw(200)],
+            ), // pos=2
         ];
         assign_positions(&mut ops);
 
@@ -3374,8 +3528,11 @@ mod tests {
         let forced_descr = ref_field_descr(super::VREF_FORCED_FIELD_INDEX);
 
         let mut ops = vec![
-            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]), // pos=0
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], forced_descr), // pos=1
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // pos=0
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(0)], forced_descr), // pos=1
         ];
         assign_positions(&mut ops);
 
@@ -3466,15 +3623,23 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef(0), OpRef(100), OpRef(200)],
+                &[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
+                ],
                 ad.clone(),
             ),
-            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(100)], ad),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                ad,
+            ),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef(100), Value::Int(0))]; // offset = 0
-        let raw_bufs = vec![(OpRef(0), 32)];
+        let constants = vec![(OpRef::from_raw(100), Value::Int(0))]; // offset = 0
+        let raw_bufs = vec![(OpRef::from_raw(0), 32)];
 
         let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
         assert!(
@@ -3497,21 +3662,40 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef(0), OpRef(100), OpRef(200)],
+                &[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
+                ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef(0), OpRef(101), OpRef(201)],
+                &[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(101),
+                    OpRef::from_raw(201),
+                ],
                 ad.clone(),
             ),
-            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(100)], ad.clone()),
-            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(101)], ad),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                ad.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                ad,
+            ),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef(100), Value::Int(0)), (OpRef(101), Value::Int(8))];
-        let raw_bufs = vec![(OpRef(0), 32)];
+        let constants = vec![
+            (OpRef::from_raw(100), Value::Int(0)),
+            (OpRef::from_raw(101), Value::Int(8)),
+        ];
+        let raw_bufs = vec![(OpRef::from_raw(0), 32)];
 
         let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
         assert!(
@@ -3532,20 +3716,32 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef(0), OpRef(100), OpRef(200)],
+                &[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
+                ],
                 ad.clone(),
             ),
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef(0), OpRef(100), OpRef(201)],
+                &[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(201),
+                ],
                 ad.clone(),
             ),
-            Op::with_descr(OpCode::RawLoadI, &[OpRef(0), OpRef(100)], ad),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                ad,
+            ),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef(100), Value::Int(0))];
-        let raw_bufs = vec![(OpRef(0), 32)];
+        let constants = vec![(OpRef::from_raw(100), Value::Int(0))];
+        let raw_bufs = vec![(OpRef::from_raw(0), 32)];
 
         let result = run_pass_with_raw_buffer(&ops, &constants, &raw_bufs);
         // All removed: stores absorbed into virtual, load forwarded.
@@ -3564,15 +3760,23 @@ mod tests {
         let mut ops = vec![
             Op::with_descr(
                 OpCode::RawStore,
-                &[OpRef(50), OpRef(100), OpRef(200)],
+                &[
+                    OpRef::from_raw(50),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
+                ],
                 ad.clone(),
             ),
-            Op::with_descr(OpCode::RawLoadI, &[OpRef(50), OpRef(100)], ad),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[OpRef::from_raw(50), OpRef::from_raw(100)],
+                ad,
+            ),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef(100), Value::Int(0))];
-        // No raw_bufs — OpRef(50) is NOT a virtual buffer.
+        let constants = vec![(OpRef::from_raw(100), Value::Int(0))];
+        // No raw_bufs — OpRef::from_raw(50) is NOT a virtual buffer.
         let result = run_pass_with_raw_buffer(&ops, &constants, &[]);
         assert_eq!(
             result.len(),
@@ -3625,11 +3829,15 @@ mod tests {
         let fd = group.field_descrs[0].clone() as DescrRef;
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], fd.clone()),
-            Op::new(OpCode::CallN, &[OpRef(0)]),
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], fd.clone()),
-            Op::new(OpCode::CallN, &[OpRef(3)]),
-            Op::new(OpCode::Jump, &[OpRef(100)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                fd.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(0)], fd.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(3)]),
+            Op::new(OpCode::Jump, &[OpRef::from_raw(100)]),
         ];
         assign_positions(&mut ops);
 
@@ -3649,8 +3857,8 @@ mod tests {
                 OpCode::Jump,
             ]
         );
-        assert_eq!(result[3].arg(0), OpRef(100));
-        assert_eq!(result[4].arg(0), OpRef(100));
+        assert_eq!(result[3].arg(0), OpRef::from_raw(100));
+        assert_eq!(result[4].arg(0), OpRef::from_raw(100));
     }
 
     #[test]
@@ -3670,12 +3878,16 @@ mod tests {
         let next_fd = ref_field_descr(11);
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], next_fd.clone()),
-            Op::new(OpCode::Jump, &[OpRef(0)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                next_fd.clone(),
+            ),
+            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
         ];
-        ops[0].pos = OpRef(1);
-        ops[1].pos = OpRef(2);
-        ops[2].pos = OpRef(3);
+        ops[0].pos = OpRef::from_raw(1);
+        ops[1].pos = OpRef::from_raw(2);
+        ops[2].pos = OpRef::from_raw(3);
 
         let mut opt = Optimizer::default_pipeline();
         let mut constants = HashMap::new();
@@ -3715,8 +3927,12 @@ mod tests {
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], float_sd),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], float_fd),
-            Op::with_descr(OpCode::CallR, &[OpRef(0)], call_descr),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                float_fd,
+            ),
+            Op::with_descr(OpCode::CallR, &[OpRef::from_raw(0)], call_descr),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -3745,21 +3961,37 @@ mod tests {
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef(2), OpRef(100)],
+                &[OpRef::from_raw(2), OpRef::from_raw(100)],
                 value_fd.clone(),
             ),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(2), OpRef(0)], next_fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(2), OpRef::from_raw(0)],
+                next_fd.clone(),
+            ),
             Op::with_descr(OpCode::New, &[], node_sd.clone()),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef(5), OpRef(101)],
+                &[OpRef::from_raw(5), OpRef::from_raw(101)],
                 value_fd.clone(),
             ),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(5), OpRef(2)], next_fd.clone()),
-            Op::new(OpCode::Finish, &[OpRef(5), OpRef(2), OpRef(1), OpRef(0)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(5), OpRef::from_raw(2)],
+                next_fd.clone(),
+            ),
+            Op::new(
+                OpCode::Finish,
+                &[
+                    OpRef::from_raw(5),
+                    OpRef::from_raw(2),
+                    OpRef::from_raw(1),
+                    OpRef::from_raw(0),
+                ],
+            ),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef((idx + 2) as u32);
+            op.pos = OpRef::from_raw((idx + 2) as u32);
         }
 
         let mut opt = Optimizer::default_pipeline();
@@ -3805,11 +4037,11 @@ mod tests {
             result
         );
         assert!(
-            !constants.contains_key(&finish.arg(0).0),
+            !constants.contains_key(&finish.arg(0).raw()),
             "forced allocation ref must not collide with an exported int constant"
         );
         assert!(
-            !constants.contains_key(&finish.arg(1).0),
+            !constants.contains_key(&finish.arg(1).raw()),
             "forced allocation ref must not collide with an exported int constant"
         );
     }
@@ -3828,12 +4060,16 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
-        guard.fail_args = Some(vec![OpRef(0)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(20)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(0)].into());
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()), // pos=1
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                fd.clone(),
+            ), // pos=1
             guard,                                                  // pos=2
         ];
         assign_positions(&mut ops);
@@ -3872,8 +4108,8 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(10)),
-            "virtual's int field (OpRef(10)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(10)),
+            "virtual's int field (OpRef::from_raw(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
@@ -3892,17 +4128,22 @@ mod tests {
         //
         // RPython resume.py:411-417 parity: liveboxes is TAGBOX-only — virtual
         // p0 is encoded into rd_virtuals; the surviving liveboxes are the
-        // concrete TAGBOX boxes (OpRef(30), OpRef(40), and the virtual's
-        // field value OpRef(10)).
+        // concrete TAGBOX boxes (OpRef::from_raw(30), OpRef::from_raw(40), and the virtual's
+        // field value OpRef::from_raw(10)).
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
-        guard.fail_args = Some(vec![OpRef(30), OpRef(0), OpRef(40)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(20)]);
+        guard.fail_args =
+            Some(vec![OpRef::from_raw(30), OpRef::from_raw(0), OpRef::from_raw(40)].into());
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()), // pos=0
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()), // pos=1
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                fd.clone(),
+            ), // pos=1
             guard,                                        // pos=2
         ];
         assign_positions(&mut ops);
@@ -3934,18 +4175,18 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(30)),
-            "non-virtual OpRef(30) should remain in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(30)),
+            "non-virtual OpRef::from_raw(30) should remain in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(40)),
-            "non-virtual OpRef(40) should remain in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(40)),
+            "non-virtual OpRef::from_raw(40) should remain in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(10)),
-            "virtual's field (OpRef(10)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(10)),
+            "virtual's field (OpRef::from_raw(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
@@ -3957,8 +4198,8 @@ mod tests {
     #[test]
     fn test_guard_fail_args_no_virtual_no_rd_numb() {
         // Guard with no virtuals in fail_args should not have rd_numb.
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(10)]);
-        guard.fail_args = Some(vec![OpRef(20), OpRef(30)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(10)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(20), OpRef::from_raw(30)].into());
 
         let mut ops = vec![guard];
         assign_positions(&mut ops);
@@ -3983,12 +4224,16 @@ mod tests {
         let sd = size_descr(1);
         let fd = field_descr(10);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
-        guard.fail_args = Some(vec![OpRef(0)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(20)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(0)].into());
 
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                fd.clone(),
+            ),
             guard,
         ];
         assign_positions(&mut ops);
@@ -4018,7 +4263,7 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(10)),
+            fa.iter().any(|&a| a == OpRef::from_raw(10)),
             "virtual struct's int field should appear in liveboxes; got {:?}",
             fa
         );
@@ -4035,13 +4280,21 @@ mod tests {
         let fd_a = field_descr(10);
         let fd_b = field_descr(20);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(30)]);
-        guard.fail_args = Some(vec![OpRef(0)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(30)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(0)].into());
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], fd_a.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(20)], fd_b.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                fd_a.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(20)],
+                fd_b.clone(),
+            ),
             guard,
         ];
         assign_positions(&mut ops);
@@ -4067,13 +4320,13 @@ mod tests {
         );
         // Both field values must appear in liveboxes.
         assert!(
-            fa.iter().any(|&a| a == OpRef(10)),
-            "first field value (OpRef(10)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(10)),
+            "first field value (OpRef::from_raw(10)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(20)),
-            "second field value (OpRef(20)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(20)),
+            "second field value (OpRef::from_raw(20)) should appear in liveboxes; got {:?}",
             fa
         );
         assert!(
@@ -4084,7 +4337,7 @@ mod tests {
 
     #[test]
     fn test_guard_fail_args_nested_virtual_field_encodes_into_rd_virtuals() {
-        // Nested virtual: outer.field = inner_virtual (Ref), inner.field = OpRef(40) (Int).
+        // Nested virtual: outer.field = inner_virtual (Ref), inner.field = OpRef::from_raw(40) (Int).
         // RPython resume.py:_number_virtuals (resume.py:454-475 _number_virtuals;
         // visitor_walk_recursive at resume.py:426) recursively encodes nested
         // virtuals as TAGVIRTUAL inside rd_virtuals; no New/NewWithVtable is
@@ -4095,14 +4348,22 @@ mod tests {
         let outer_fd = ref_field_descr(10);
         let inner_fd = field_descr(20);
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(30)]);
-        guard.fail_args = Some(vec![OpRef(0)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(30)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(0)].into());
 
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(40)], inner_fd),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)], outer_fd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(1), OpRef::from_raw(40)],
+                inner_fd,
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                outer_fd,
+            ),
             guard,
         ];
         assign_positions(&mut ops);
@@ -4133,7 +4394,7 @@ mod tests {
             "rd_virtuals should encode the nested virtual tree"
         );
 
-        // Liveboxes are TAGBOX-only — only the leaf int OpRef(40) survives.
+        // Liveboxes are TAGBOX-only — only the leaf int OpRef::from_raw(40) survives.
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
             fa.iter().all(|a| !a.is_none()),
@@ -4141,27 +4402,27 @@ mod tests {
             fa
         );
         assert!(
-            fa.iter().any(|&a| a == OpRef(40)),
-            "leaf int field (OpRef(40)) should appear in liveboxes; got {:?}",
+            fa.iter().any(|&a| a == OpRef::from_raw(40)),
+            "leaf int field (OpRef::from_raw(40)) should appear in liveboxes; got {:?}",
             fa
         );
     }
 
     #[test]
     fn test_guard_fail_args_virtual_array_encodes_into_rd_virtuals() {
-        // Virtual array: NewArray(len=1), set item 0 = OpRef(12).
+        // Virtual array: NewArray(len=1), set item 0 = OpRef::from_raw(12).
         // RPython resume.py:_number_virtuals encodes the array virtually;
         // the array's elements are added to liveboxes as TAGBOX, the array
         // identity stays TAGVIRTUAL inside rd_virtuals.
         let ad = array_descr(30);
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
-        guard.fail_args = Some(vec![OpRef(0)].into());
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(20)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(0)].into());
 
         let mut ops = vec![
-            Op::with_descr(OpCode::NewArray, &[OpRef(10)], ad.clone()),
+            Op::with_descr(OpCode::NewArray, &[OpRef::from_raw(10)], ad.clone()),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(11), OpRef(12)],
+                &[OpRef::from_raw(0), OpRef::from_raw(11), OpRef::from_raw(12)],
                 ad,
             ),
             guard,
@@ -4169,9 +4430,9 @@ mod tests {
         assign_positions(&mut ops);
 
         let constants = &[
-            (OpRef(10), Value::Int(1)),
-            (OpRef(11), Value::Int(0)),
-            (OpRef(12), Value::Int(99)),
+            (OpRef::from_raw(10), Value::Int(1)),
+            (OpRef::from_raw(11), Value::Int(0)),
+            (OpRef::from_raw(12), Value::Int(99)),
         ];
         let result = run_pass_with_constants(&ops, constants);
 

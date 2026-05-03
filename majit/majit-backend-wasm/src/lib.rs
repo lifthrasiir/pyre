@@ -212,7 +212,7 @@ impl WasmBackend {
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
             ) && op.args.len() >= 2
             {
-                if let Some(&classptr) = self.constants.get(&op.args[1].0) {
+                if let Some(&classptr) = self.constants.get(&op.args[1].raw()) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
                     }
@@ -256,7 +256,7 @@ impl WasmBackend {
             // for every constant GuardSubclass arg1.
             for op in ops {
                 if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
-                    if let Some(&classptr) = self.constants.get(&op.args[1].0) {
+                    if let Some(&classptr) = self.constants.get(&op.args[1].raw()) {
                         if let Some(range) = gc.subclass_range(classptr as usize) {
                             info.subclass_ranges.insert(classptr, range);
                         }
@@ -272,15 +272,15 @@ impl WasmBackend {
     fn collect_constants_from_ops(&mut self, ops: &[Op]) {
         for op in ops {
             for &arg in &op.args {
-                if arg.is_constant() && !self.constants.contains_key(&arg.0) {
+                if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
                     // Default to 0 if not already registered
-                    self.constants.insert(arg.0, 0);
+                    self.constants.insert(arg.raw(), 0);
                 }
             }
             if let Some(ref fail_args) = op.fail_args {
                 for &arg in fail_args.iter() {
-                    if arg.is_constant() && !self.constants.contains_key(&arg.0) {
-                        self.constants.insert(arg.0, 0);
+                    if arg.is_constant() && !self.constants.contains_key(&arg.raw()) {
+                        self.constants.insert(arg.raw(), 0);
                     }
                 }
             }

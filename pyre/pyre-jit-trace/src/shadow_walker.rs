@@ -423,7 +423,7 @@ mod tests {
             opcode,
             args: args.iter().copied().collect(),
             descr,
-            pos: OpRef(0),
+            pos: OpRef::from_raw(0),
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
@@ -459,8 +459,8 @@ mod tests {
     fn diff_recorded_ops_returns_none_for_identical_traces() {
         let descr = make_fail_descr_ref();
         let trace_a = vec![
-            op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], None),
-            op(OpCode::Finish, &[OpRef(2)], Some(descr.clone())),
+            op(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)], None),
+            op(OpCode::Finish, &[OpRef::int_op(2)], Some(descr.clone())),
         ];
         let trace_b = trace_a.clone();
         assert_eq!(diff_recorded_ops(&trace_a, &trace_b), None);
@@ -468,7 +468,11 @@ mod tests {
 
     #[test]
     fn diff_recorded_ops_reports_count_mismatch() {
-        let trace_a = vec![op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], None)];
+        let trace_a = vec![op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(0), OpRef::int_op(1)],
+            None,
+        )];
         let trace_b: Vec<Op> = vec![];
         let diff = diff_recorded_ops(&trace_a, &trace_b).expect("must report mismatch");
         assert!(diff.contains("op count mismatch"), "diff was: {diff}");
@@ -478,8 +482,16 @@ mod tests {
 
     #[test]
     fn diff_recorded_ops_reports_opcode_mismatch() {
-        let trace_a = vec![op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], None)];
-        let trace_b = vec![op(OpCode::IntSub, &[OpRef(0), OpRef(1)], None)];
+        let trace_a = vec![op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(0), OpRef::int_op(1)],
+            None,
+        )];
+        let trace_b = vec![op(
+            OpCode::IntSub,
+            &[OpRef::int_op(0), OpRef::int_op(1)],
+            None,
+        )];
         let diff = diff_recorded_ops(&trace_a, &trace_b).expect("must report mismatch");
         assert!(diff.contains("op[0] opcode mismatch"), "diff was: {diff}");
         assert!(diff.contains("IntAdd"));
@@ -488,8 +500,16 @@ mod tests {
 
     #[test]
     fn diff_recorded_ops_reports_args_mismatch() {
-        let trace_a = vec![op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], None)];
-        let trace_b = vec![op(OpCode::IntAdd, &[OpRef(0), OpRef(2)], None)];
+        let trace_a = vec![op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(0), OpRef::int_op(1)],
+            None,
+        )];
+        let trace_b = vec![op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(0), OpRef::int_op(2)],
+            None,
+        )];
         let diff = diff_recorded_ops(&trace_a, &trace_b).expect("must report mismatch");
         assert!(diff.contains("op[0]"));
         assert!(diff.contains("args mismatch"), "diff was: {diff}");
@@ -499,8 +519,8 @@ mod tests {
     fn diff_recorded_ops_reports_descr_identity_mismatch() {
         let descr_a = make_fail_descr_ref();
         let descr_b = make_fail_descr_ref();
-        let trace_a = vec![op(OpCode::Finish, &[OpRef(0)], Some(descr_a))];
-        let trace_b = vec![op(OpCode::Finish, &[OpRef(0)], Some(descr_b))];
+        let trace_a = vec![op(OpCode::Finish, &[OpRef::int_op(0)], Some(descr_a))];
+        let trace_b = vec![op(OpCode::Finish, &[OpRef::int_op(0)], Some(descr_b))];
         let diff = diff_recorded_ops(&trace_a, &trace_b).expect("must report mismatch");
         assert!(diff.contains("descr identity mismatch"), "diff was: {diff}");
     }
@@ -508,8 +528,8 @@ mod tests {
     #[test]
     fn diff_recorded_ops_reports_descr_presence_mismatch() {
         let descr = make_fail_descr_ref();
-        let trace_a = vec![op(OpCode::Finish, &[OpRef(0)], Some(descr))];
-        let trace_b = vec![op(OpCode::Finish, &[OpRef(0)], None)];
+        let trace_a = vec![op(OpCode::Finish, &[OpRef::int_op(0)], Some(descr))];
+        let trace_b = vec![op(OpCode::Finish, &[OpRef::int_op(0)], None)];
         let diff = diff_recorded_ops(&trace_a, &trace_b).expect("must report mismatch");
         assert!(diff.contains("descr presence mismatch"), "diff was: {diff}");
         assert!(diff.contains("production_has_descr=true"));

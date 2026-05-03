@@ -107,11 +107,14 @@ mod tests {
             (OpCode::CallPureF, OpCode::CallF),
             (OpCode::CallPureN, OpCode::CallN),
         ] {
-            let ops = vec![Op::new(pure_op, &[OpRef(0), OpRef(1)])];
+            let ops = vec![Op::new(pure_op, &[OpRef::from_raw(0), OpRef::from_raw(1)])];
             let result = run_pass(&ops);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
-            assert_eq!(result[0].args.as_slice(), &[OpRef(0), OpRef(1)]);
+            assert_eq!(
+                result[0].args.as_slice(),
+                &[OpRef::from_raw(0), OpRef::from_raw(1)]
+            );
         }
     }
 
@@ -123,7 +126,7 @@ mod tests {
             (OpCode::CallLoopinvariantF, OpCode::CallF),
             (OpCode::CallLoopinvariantN, OpCode::CallN),
         ] {
-            let ops = vec![Op::new(loopinv_op, &[OpRef(0)])];
+            let ops = vec![Op::new(loopinv_op, &[OpRef::from_raw(0)])];
             let result = run_pass(&ops);
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].opcode, expected_op);
@@ -132,11 +135,14 @@ mod tests {
 
     #[test]
     fn test_virtual_ref_to_same_as() {
-        let ops = vec![Op::new(OpCode::VirtualRefR, &[OpRef(0), OpRef(1)])];
+        let ops = vec![Op::new(
+            OpCode::VirtualRefR,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+        )];
         let result = run_pass(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::SameAsR);
-        assert_eq!(result[0].args.as_slice(), &[OpRef(0)]);
+        assert_eq!(result[0].args.as_slice(), &[OpRef::from_raw(0)]);
     }
 
     #[test]
@@ -152,7 +158,7 @@ mod tests {
         ];
         for opcode in removed_opcodes {
             let arity = opcode.arity().unwrap_or(0) as usize;
-            let args: Vec<OpRef> = (0..arity).map(|i| OpRef(i as u32)).collect();
+            let args: Vec<OpRef> = (0..arity).map(|i| OpRef::from_raw(i as u32)).collect();
             let ops = vec![Op::new(opcode, &args)];
             let result = run_pass(&ops);
             assert!(result.is_empty(), "{:?} should be removed", opcode);
@@ -162,8 +168,8 @@ mod tests {
     #[test]
     fn test_passthrough() {
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         let result = run_pass(&ops);
         assert_eq!(result.len(), 2);
@@ -173,20 +179,29 @@ mod tests {
 
     #[test]
     fn test_preserves_args_on_call_rewrite() {
-        let ops = vec![Op::new(OpCode::CallPureI, &[OpRef(0), OpRef(1), OpRef(2)])];
+        let ops = vec![Op::new(
+            OpCode::CallPureI,
+            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+        )];
         let result = run_pass(&ops);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallI);
-        assert_eq!(result[0].args.as_slice(), &[OpRef(0), OpRef(1), OpRef(2)]);
+        assert_eq!(
+            result[0].args.as_slice(),
+            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]
+        );
     }
 
     #[test]
     fn test_mixed_ops() {
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::CallPureI, &[OpRef(0)]),
-            Op::new(OpCode::RecordExactClass, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::CallPureI, &[OpRef::from_raw(0)]),
+            Op::new(
+                OpCode::RecordExactClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         let result = run_pass(&ops);
         assert_eq!(result.len(), 3);
@@ -199,7 +214,10 @@ mod tests {
     fn test_guard_future_condition_removed() {
         let ops = vec![
             Op::new(OpCode::GuardFutureCondition, &[]),
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
         let result = run_pass(&ops);
@@ -215,7 +233,7 @@ mod tests {
     #[test]
     fn test_assert_not_none_removed() {
         let ops = vec![
-            Op::new(OpCode::AssertNotNone, &[OpRef(100)]),
+            Op::new(OpCode::AssertNotNone, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Finish, &[]),
         ];
         let result = run_pass(&ops);
@@ -225,7 +243,10 @@ mod tests {
     #[test]
     fn test_virtual_ref_r_to_same_as() {
         let ops = vec![
-            Op::new(OpCode::VirtualRefR, &[OpRef(100), OpRef(101)]),
+            Op::new(
+                OpCode::VirtualRefR,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
         let result = run_pass(&ops);
@@ -235,7 +256,10 @@ mod tests {
     #[test]
     fn test_record_exact_class_removed() {
         let ops = vec![
-            Op::new(OpCode::RecordExactClass, &[OpRef(100), OpRef(200)]),
+            Op::new(
+                OpCode::RecordExactClass,
+                &[OpRef::from_raw(100), OpRef::from_raw(200)],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
         let result = run_pass(&ops);

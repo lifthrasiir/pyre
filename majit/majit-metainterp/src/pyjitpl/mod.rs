@@ -264,8 +264,8 @@ fn snapshot_map_from_trace_snapshots(
     let mut pc_map = Vec::new();
     let mut next_const_idx = constants
         .keys()
-        .filter(|k| majit_ir::OpRef(**k).is_constant())
-        .map(|k| majit_ir::OpRef(*k).const_index())
+        .filter(|k| majit_ir::OpRef::from_raw(**k).is_constant())
+        .map(|k| majit_ir::OpRef::from_raw(*k).const_index())
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
@@ -279,7 +279,7 @@ fn snapshot_map_from_trace_snapshots(
     let mut tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
         match t {
             crate::recorder::SnapshotTagged::Box(n, tp) => {
-                SnapshotBox::typed(majit_ir::OpRef(*n), *tp)
+                SnapshotBox::typed(majit_ir::OpRef::from_raw(*n), *tp)
             }
             crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
@@ -303,11 +303,11 @@ fn snapshot_map_from_trace_snapshots(
                 let key = existing.unwrap_or_else(|| {
                     let opref = majit_ir::OpRef::from_const(next_const_idx);
                     next_const_idx += 1;
-                    constants.insert(opref.0, *val);
-                    constant_types.insert(opref.0, *tp);
-                    opref.0
+                    constants.insert(opref.raw(), *val);
+                    constant_types.insert(opref.raw(), *tp);
+                    opref.raw()
                 });
-                SnapshotBox::typed(majit_ir::OpRef(key), *tp)
+                SnapshotBox::typed(majit_ir::OpRef::from_raw(key), *tp)
             }
         }
     };
@@ -362,7 +362,7 @@ fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
     // trace. Snapshot/vable feeds that flow through here MUST reference
     // OpRefs the recorder produced for this bridge.
     cache
-        .get(opref.0 as usize)
+        .get(opref.raw() as usize)
         .copied()
         .flatten()
         .unwrap_or_else(|| {
@@ -414,12 +414,13 @@ fn prepare_bridge_trace_for_optimizer(
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
     // TraceIterator walk with `start_fresh = bridge_inputarg_base`.
+    let bridge_inputarg_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
     let mut iter = crate::opencoder::TraceIterator::new(
         bridge_ops,
         0,
         bridge_ops.len(),
         None,
-        bridge_inputargs.len(),
+        &bridge_inputarg_types,
         bridge_inputarg_base,
     );
     let mut ops = Vec::with_capacity(bridge_ops.len());
@@ -429,7 +430,7 @@ fn prepare_bridge_trace_for_optimizer(
     let inputargs = bridge_inputargs
         .iter()
         .zip(iter.inputargs.iter().copied())
-        .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.0))
+        .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.raw()))
         .collect();
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
@@ -531,7 +532,7 @@ pub(crate) struct CompiledEntry<M> {
     /// RPython `opencoder.py:249-273 TraceIterator.__init__` allocates
     /// fresh `InputArg` Python objects every iteration, so bridge
     /// inputargs are automatically disjoint from the parent loop's boxes
-    /// by Python `is` identity. In pyre `OpRef(u32)` IS the identity, so
+    /// by Python `is` identity. In pyre `OpRef::from_raw(u32)` IS the identity, so
     /// a bridge that re-uses the `[0..num_inputs)` range collides with
     /// the parent loop's OpRefs. `next_global_opref` records the first
     /// OpRef Phase 2 did *not* allocate; `compile_bridge` /
@@ -564,7 +565,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
         if r.is_none() || r.is_constant() {
             0
         } else {
-            r.0.saturating_add(1)
+            r.raw().saturating_add(1)
         }
     }
     let from_inputargs = inputargs
@@ -1909,8 +1910,9 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py:3293-3295: index = num_green_args + index_of_virtualizable.
         // The caller derives `index` above from jitdriver_sd so the bootstrap
-        // path and the regular JitDriver registry agree.
-        let virtualizable_box = OpRef(index as u32);
+        // path and the regular JitDriver registry agree. The virtualizable
+        // is a Ref-typed inputarg (resoperation.py:739 InputArgRef).
+        let virtualizable_box = OpRef::input_arg_ref(index as u32);
         let virtualizable_value = live_values[index];
         let has_expanded_tail = live_values.len() >= num_reds + total_vable;
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
@@ -1940,7 +1942,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let vable_oprefs: Vec<OpRef> = if has_expanded_tail {
             (0..total_vable)
-                .map(|i| OpRef((num_reds + i) as u32))
+                .map(|i| OpRef::from_raw((num_reds + i) as u32))
                 .collect()
         } else {
             vable_values
@@ -2381,7 +2383,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// On `StartedTracing`, the framework registers each value in `live_values`
     /// as an InputArg. The interpreter should then build its symbolic state
-    /// from the returned InputArg OpRefs (OpRef(0), OpRef(1), ...).
+    /// from the returned InputArg OpRefs (OpRef::from_raw(0), OpRef::from_raw(1), ...).
     pub fn on_back_edge(&mut self, green_key: u64, live_values: &[i64]) -> BackEdgeAction {
         let typed_values: Vec<Value> = live_values.iter().copied().map(Value::Int).collect();
         self.on_back_edge_typed(green_key, (0, 0), None, None, &typed_values)
@@ -3900,8 +3902,10 @@ impl<M: Clone> MetaInterp<M> {
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated {
                     if let Some(ref fa) = op.fail_args {
-                        let raw: Vec<String> =
-                            fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
+                        let raw: Vec<String> = fa
+                            .iter()
+                            .map(|a| format!("OpRef::from_raw({})", a.raw()))
+                            .collect();
                         eprintln!("[jit] FINAL GuardNotInv fail_args=[{}]", raw.join(", "));
                     }
                 }
@@ -7849,7 +7853,7 @@ impl<M: Clone> MetaInterp<M> {
                                 i, es.renamed_inputargs.len()
                             )
                         });
-                        InputArg::from_type(tp, opref.0)
+                        InputArg::from_type(tp, opref.raw())
                     })
                     .collect();
                 self.retrace_needed(
@@ -8106,7 +8110,7 @@ impl<M: Clone> MetaInterp<M> {
                     .get(&fail_index)
                     .and_then(|layout| layout.storage.clone())?;
                 let liveboxes: Vec<OpRef> = (0..bridge_inputargs.len())
-                    .map(|i| OpRef(i as u32))
+                    .map(|i| OpRef::from_raw(i as u32))
                     .collect();
                 // bridgeopt.py parity: the deserializer's `liveboxes` type
                 // filter (box.type == "r") is driven by the type each box
@@ -8285,7 +8289,7 @@ impl<M: Clone> MetaInterp<M> {
                                     )
                                 },
                             );
-                            InputArg::from_type(tp, opref.0)
+                            InputArg::from_type(tp, opref.raw())
                         })
                         .collect();
                 self.retrace_needed(
@@ -8998,7 +9002,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut initial_values = HashMap::with_capacity(fail_args.len());
         for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {
-            initial_values.insert(arg.0, value);
+            initial_values.insert(arg.raw(), value);
         }
 
         Some(blackhole_execute_with_state_ca(
@@ -11738,7 +11742,7 @@ impl<M: Clone> MetaInterp<M> {
             .tracing
             .as_mut()
             .map(|ctx| ctx.const_null())
-            .unwrap_or(OpRef(0));
+            .unwrap_or(OpRef::from_raw(0));
         self.virtualref_boxes[i + 1] = (null_const, 0);
     }
 
@@ -13707,7 +13711,7 @@ mod metainterp_static_data_tests {
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
-        let funcbox = (JitArgKind::Ref, OpRef(0), fnaddr);
+        let funcbox = (JitArgKind::Ref, OpRef::from_raw(0), fnaddr);
         let result = meta
             .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok");
@@ -13774,7 +13778,7 @@ mod metainterp_static_data_tests {
             meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(fnaddr))]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
-        let funcbox = (JitArgKind::Ref, OpRef(0), fnaddr as i64); // non-Const
+        let funcbox = (JitArgKind::Ref, OpRef::from_raw(0), fnaddr as i64); // non-Const
         let result = meta
             .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok — falls through to residual call, no ChangeFrame");
@@ -13819,7 +13823,10 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:2499-2500.
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let result = meta.finishframe(Some((JitArgKind::Ref, 0, OpRef(101), 0xfeed)), true);
+        let result = meta.finishframe(
+            Some((JitArgKind::Ref, 0, OpRef::from_raw(101), 0xfeed)),
+            true,
+        );
         assert!(matches!(
             result,
             Err(FinishFrameSignal::Done(DoneWithThisFrame::Ref(r))) if r.0 == 0xfeed
@@ -13832,7 +13839,10 @@ mod metainterp_static_data_tests {
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         let bits = f64::to_bits(2.5) as i64;
-        let result = meta.finishframe(Some((JitArgKind::Float, 0, OpRef(102), bits)), true);
+        let result = meta.finishframe(
+            Some((JitArgKind::Float, 0, OpRef::from_raw(102), bits)),
+            true,
+        );
         assert!(matches!(
             result,
             Err(FinishFrameSignal::Done(DoneWithThisFrame::Float(v))) if v.to_bits() == bits as u64
@@ -13885,7 +13895,7 @@ mod metainterp_static_data_tests {
             std::sync::Arc::new(jitcode),
             0,
         ));
-        let result = meta.finishframe(Some((JitArgKind::Int, 0, OpRef(1), 0xfeed)), true);
+        let result = meta.finishframe(Some((JitArgKind::Int, 0, OpRef::from_raw(1), 0xfeed)), true);
         assert!(matches!(
             result,
             Err(FinishFrameSignal::Done(DoneWithThisFrame::Ref(r))) if r.0 == 0xfeed
@@ -13908,10 +13918,10 @@ mod metainterp_static_data_tests {
         let result = meta.perform_call(
             jitcode,
             &[
-                (JitArgKind::Int, OpRef(10), 100),
-                (JitArgKind::Ref, OpRef(20), 200),
-                (JitArgKind::Int, OpRef(11), 101),
-                (JitArgKind::Float, OpRef(30), 300),
+                (JitArgKind::Int, OpRef::from_raw(10), 100),
+                (JitArgKind::Ref, OpRef::from_raw(20), 200),
+                (JitArgKind::Int, OpRef::from_raw(11), 101),
+                (JitArgKind::Float, OpRef::from_raw(30), 300),
             ],
             None,
         );
@@ -13919,13 +13929,13 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.framestack.len(), 1);
         let f = meta.framestack.current_mut();
         assert_eq!(f.pc, 0);
-        assert_eq!(f.int_regs[0], Some(OpRef(10)));
+        assert_eq!(f.int_regs[0], Some(OpRef::from_raw(10)));
         assert_eq!(f.int_values[0], Some(100));
-        assert_eq!(f.int_regs[1], Some(OpRef(11)));
+        assert_eq!(f.int_regs[1], Some(OpRef::from_raw(11)));
         assert_eq!(f.int_values[1], Some(101));
-        assert_eq!(f.ref_regs[0], Some(OpRef(20)));
+        assert_eq!(f.ref_regs[0], Some(OpRef::from_raw(20)));
         assert_eq!(f.ref_values[0], Some(200));
-        assert_eq!(f.float_regs[0], Some(OpRef(30)));
+        assert_eq!(f.float_regs[0], Some(OpRef::from_raw(30)));
         assert_eq!(f.float_values[0], Some(300));
     }
 
@@ -13975,12 +13985,12 @@ mod metainterp_static_data_tests {
         // `caller.jitcode.body.resulttypes[caller.pc]` matches the
         // runtime kind — both are 'i' here, so the debug_assert
         // passes and the result is written.
-        let result = meta.finishframe(Some((JitArgKind::Int, 1, OpRef(42), 4242)), true);
+        let result = meta.finishframe(Some((JitArgKind::Int, 1, OpRef::from_raw(42), 4242)), true);
         assert!(matches!(result, Err(FinishFrameSignal::ChangeFrame)));
         assert_eq!(meta.framestack.len(), 1);
         let caller_frame = meta.framestack.current_mut();
         assert_eq!(caller_frame.pc, post_call_pc);
-        assert_eq!(caller_frame.int_regs[1], Some(OpRef(42)));
+        assert_eq!(caller_frame.int_regs[1], Some(OpRef::from_raw(42)));
         assert_eq!(caller_frame.int_values[1], Some(4242));
     }
 
@@ -13996,13 +14006,16 @@ mod metainterp_static_data_tests {
         meta.perform_call(caller, &[], None).unwrap_err();
         // Mutate the caller's register 0 so we can detect any
         // accidental write triggered by the void return.
-        meta.framestack.current_mut().int_regs[0] = Some(OpRef(7));
+        meta.framestack.current_mut().int_regs[0] = Some(OpRef::from_raw(7));
         meta.framestack.current_mut().int_values[0] = Some(7);
         meta.perform_call(callee, &[], None).unwrap_err();
         let result = meta.finishframe(None, true);
         assert!(matches!(result, Err(FinishFrameSignal::ChangeFrame)));
         // Void return preserves whatever was already there in the caller.
-        assert_eq!(meta.framestack.current_mut().int_regs[0], Some(OpRef(7)));
+        assert_eq!(
+            meta.framestack.current_mut().int_regs[0],
+            Some(OpRef::from_raw(7))
+        );
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
     }
 
@@ -14026,11 +14039,14 @@ mod metainterp_static_data_tests {
             .unwrap_err();
         assert_eq!(meta.framestack.len(), 1);
         // Pre-populate virtualref_boxes to verify it gets cleared.
-        meta.virtualref_boxes.push((OpRef(99), 99));
+        meta.virtualref_boxes.push((OpRef::from_raw(99), 99));
 
-        meta.initialize_state_from_start(mainjitcode, &[(JitArgKind::Int, OpRef(7), 7)]);
+        meta.initialize_state_from_start(mainjitcode, &[(JitArgKind::Int, OpRef::from_raw(7), 7)]);
         assert_eq!(meta.framestack.len(), 1);
-        assert_eq!(meta.framestack.current_mut().int_regs[0], Some(OpRef(7)));
+        assert_eq!(
+            meta.framestack.current_mut().int_regs[0],
+            Some(OpRef::from_raw(7))
+        );
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(7));
         assert!(meta.virtualref_boxes.is_empty());
         // pyjitpl.py:3272 assert.
@@ -14326,7 +14342,7 @@ mod metainterp_static_data_tests {
         let fnaddr = not_in_trace_record_arg_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
-        let argbox = (JitArgKind::Int, OpRef(1), 0xc0ffee);
+        let argbox = (JitArgKind::Int, OpRef::from_raw(1), 0xc0ffee);
         let allboxes = [funcbox, argbox];
 
         // Pre-populate last_exc_value to verify clear_exception runs.
@@ -14459,8 +14475,8 @@ mod metainterp_static_data_tests {
         };
         let fnaddr = execute_varargs_float_concrete_helper as *const () as i64;
         let argboxes = [
-            (JitArgKind::Ref, OpRef(0), fnaddr),
-            (JitArgKind::Int, OpRef(1), 6),
+            (JitArgKind::Ref, OpRef::from_raw(0), fnaddr),
+            (JitArgKind::Int, OpRef::from_raw(1), 6),
         ];
         let raw = executor::execute_varargs(&mut meta, OpCode::CallF, &argboxes, &descr);
         // Helper returns `f64::to_bits(3.0)`; executor must carry the
@@ -14502,8 +14518,8 @@ mod metainterp_static_data_tests {
         };
         let fnaddr = execute_varargs_raising_int_helper as *const () as i64;
         let argboxes = [
-            (JitArgKind::Ref, OpRef(0), fnaddr),
-            (JitArgKind::Int, OpRef(1), 7),
+            (JitArgKind::Ref, OpRef::from_raw(0), fnaddr),
+            (JitArgKind::Int, OpRef::from_raw(1), 7),
         ];
 
         let raw = executor::execute_varargs(&mut meta, OpCode::CallI, &argboxes, &descr);
@@ -14608,9 +14624,9 @@ mod metainterp_static_data_tests {
         );
         let fnaddr = execute_varargs_int_helper as *const () as i64;
         let argboxes = [
-            (JitArgKind::Ref, OpRef(0), fnaddr),
-            (JitArgKind::Int, OpRef(1), 3),
-            (JitArgKind::Int, OpRef(2), 4),
+            (JitArgKind::Ref, OpRef::from_raw(0), fnaddr),
+            (JitArgKind::Int, OpRef::from_raw(1), 3),
+            (JitArgKind::Int, OpRef::from_raw(2), 4),
         ];
         let _ = meta.execute_and_record_varargs(OpCode::CallI, &argboxes, descr_ref, &descr_view);
         let snap = meta.staticdata.profiler.snapshot();
@@ -14646,8 +14662,8 @@ mod metainterp_static_data_tests {
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argboxes = [
-            (JitArgKind::Int, OpRef(1), 4),
-            (JitArgKind::Int, OpRef(2), 6),
+            (JitArgKind::Int, OpRef::from_raw(1), 4),
+            (JitArgKind::Int, OpRef::from_raw(2), 6),
         ];
 
         let result = meta.do_residual_call_full(
@@ -14912,11 +14928,11 @@ mod metainterp_static_data_tests {
         jd.is_recursive = true;
         jd.portal_runner_adr = portal_runner_helper as *const () as i64;
 
-        // OpRef(0) is in the operation namespace (CONST_BIT clear) so
+        // OpRef::from_raw(0) is in the operation namespace (CONST_BIT clear) so
         // is_constant() returns false — upstream demands ConstInt /
         // ConstPtr / ConstFloat at this slot.
         let allboxes = [
-            (JitArgKind::Int, OpRef(0), 0),
+            (JitArgKind::Int, OpRef::from_raw(0), 0),
             (JitArgKind::Int, OpRef::from_const(1), 0xfeed),
         ];
         let _ = meta.do_recursive_call(&jd, &allboxes, descr_ref, &descr_view, 0, 0, false);
@@ -14990,7 +15006,7 @@ mod metainterp_static_data_tests {
         );
         let fnaddr = cond_call_void_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
-        let condbox = (JitArgKind::Int, OpRef(50), 1);
+        let condbox = (JitArgKind::Int, OpRef::from_raw(50), 1);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let result = meta.do_conditional_call(
             condbox,
@@ -15017,7 +15033,7 @@ mod metainterp_static_data_tests {
     fn do_conditional_call_emits_cond_call_value_int_when_is_value() {
         // pyjitpl.py:2141-2146 — is_value=True + Int result → COND_CALL_VALUE_I.
         // RPython sets funcbox to a Const* fn pointer; we deliberately
-        // seed funcbox as a live Ref inputarg (OpRef(0)) instead because
+        // seed funcbox as a live Ref inputarg (OpRef::from_raw(0)) instead because
         // pyre's record_result_of_call_pure (trace_ctx.rs:2685-2706)
         // unconditionally folds when normargboxes (`argboxes[1..]`,
         // skipping condbox) are all Const. With a Const funcbox + empty
@@ -15049,8 +15065,8 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Int,
             majit_ir::EffectInfo::default(),
         );
-        let condbox = (JitArgKind::Int, OpRef(50), 0);
-        let funcbox = (JitArgKind::Ref, OpRef(0), fnaddr);
+        let condbox = (JitArgKind::Int, OpRef::from_raw(50), 0);
+        let funcbox = (JitArgKind::Ref, OpRef::from_raw(0), fnaddr);
         let result = meta.do_conditional_call(
             condbox,
             funcbox,
@@ -15145,8 +15161,8 @@ mod metainterp_static_data_tests {
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argboxes = [
             funcbox,
-            (JitArgKind::Int, OpRef(1), 5),
-            (JitArgKind::Int, OpRef(2), 9),
+            (JitArgKind::Int, OpRef::from_raw(1), 5),
+            (JitArgKind::Int, OpRef::from_raw(2), 9),
         ];
         // Pre-set last_exc_value to verify clear_exception runs.
         meta.last_exc_value = 0xdead;
@@ -15190,8 +15206,8 @@ mod metainterp_static_data_tests {
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argboxes = [
             funcbox,
-            (JitArgKind::Int, OpRef(1), 7),
-            (JitArgKind::Int, OpRef(2), 3),
+            (JitArgKind::Int, OpRef::from_raw(1), 7),
+            (JitArgKind::Int, OpRef::from_raw(2), 3),
         ];
         let result =
             meta.execute_and_record_varargs(OpCode::CallI, &argboxes, descr_ref, &descr_view);
@@ -15208,8 +15224,8 @@ mod metainterp_static_data_tests {
         assert_eq!(op.pos, opref);
         assert_eq!(op.args.len(), 3);
         assert_eq!(op.args[0], funcbox_ref);
-        assert_eq!(op.args[1], OpRef(1));
-        assert_eq!(op.args[2], OpRef(2));
+        assert_eq!(op.args[1], OpRef::from_raw(1));
+        assert_eq!(op.args[2], OpRef::from_raw(2));
     }
 
     #[test]
@@ -15284,7 +15300,7 @@ mod metainterp_static_data_tests {
         meta.framestack.current_mut().pc = 7;
 
         meta.ovf_flag = true;
-        let result = meta.handle_possible_overflow_error(99, 0, OpRef(42));
+        let result = meta.handle_possible_overflow_error(99, 0, OpRef::from_raw(42));
         assert!(result.is_none(), "expected None on overflow");
         assert_eq!(meta.framestack.current_mut().pc, 99);
 
@@ -15307,8 +15323,8 @@ mod metainterp_static_data_tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         meta.ovf_flag = false;
-        let result = meta.handle_possible_overflow_error(99, 0, OpRef(42));
-        assert_eq!(result, Some(OpRef(42)));
+        let result = meta.handle_possible_overflow_error(99, 0, OpRef::from_raw(42));
+        assert_eq!(result, Some(OpRef::from_raw(42)));
 
         let ctx = meta.trace_ctx().expect("active trace");
         assert!(
@@ -16265,13 +16281,13 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
@@ -16286,8 +16302,12 @@ mod tests {
             InputArg::new_int(2),
         ];
         let ops = vec![
-            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 3),
-            mk_op(OpCode::Jump, &[OpRef(3), OpRef(2), OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 3),
+            mk_op(
+                OpCode::Jump,
+                &[OpRef::from_raw(3), OpRef::from_raw(2), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let err =
@@ -16302,7 +16322,11 @@ mod tests {
             InputArg::new_int(1),
             InputArg::new_int(2),
         ];
-        let ops = vec![mk_op(OpCode::Jump, &[OpRef(0), OpRef(1)], OpRef::NONE.0)];
+        let ops = vec![mk_op(
+            OpCode::Jump,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            OpRef::NONE.raw(),
+        )];
 
         let err =
             normalize_root_loop_entry_contract(inputargs, ops).expect_err("missing LABEL rejects");
@@ -16313,26 +16337,34 @@ mod tests {
     fn test_prepare_bridge_trace_for_optimizer_freshens_inputargs_and_snapshots() {
         let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
         let bridge_ops = vec![
-            mk_op(OpCode::SameAsR, &[OpRef(1)], 2),
-            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(0)], 3),
-            mk_op(OpCode::Jump, &[OpRef(2), OpRef(3)], OpRef::NONE.0),
+            mk_op(OpCode::SameAsR, &[OpRef::from_raw(1)], 2),
+            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)], 3),
+            mk_op(
+                OpCode::Jump,
+                &[OpRef::from_raw(2), OpRef::from_raw(3)],
+                OpRef::NONE.raw(),
+            ),
         ];
         let mut snapshot_boxes = Vec::new();
         snapshot_insert(
             &mut snapshot_boxes,
             0,
-            vec![OpRef(0).into(), OpRef(2).into(), OpRef(3).into()],
+            vec![
+                OpRef::from_raw(0).into(),
+                OpRef::from_raw(2).into(),
+                OpRef::from_raw(3).into(),
+            ],
         );
         let mut snapshot_vable_boxes = Vec::new();
         snapshot_insert(
             &mut snapshot_vable_boxes,
             0,
-            vec![OpRef(1).into(), OpRef(2).into()],
+            vec![OpRef::from_raw(1).into(), OpRef::from_raw(2).into()],
         );
         let pending_bridge_rd = PendingBridgeRd {
             storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
             frontend_boxes: vec![11, 22],
-            liveboxes: vec![OpRef(0), OpRef(1)],
+            liveboxes: vec![OpRef::from_raw(0), OpRef::from_raw(1)],
             livebox_types: vec![Type::Int, Type::Ref],
             all_descrs: vec![],
             cls_of_box: None,
@@ -16358,18 +16390,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
-        assert_eq!(prepared.ops[0].pos, OpRef(12));
-        assert_eq!(prepared.ops[0].args.to_vec(), vec![OpRef(11)]);
-        assert_eq!(prepared.ops[1].pos, OpRef(13));
-        assert_eq!(prepared.ops[1].args.to_vec(), vec![OpRef(10), OpRef(10)]);
-        assert_eq!(prepared.ops[2].args.to_vec(), vec![OpRef(12), OpRef(13)]);
+        assert_eq!(prepared.ops[0].pos, OpRef::from_raw(12));
+        assert_eq!(prepared.ops[0].args.to_vec(), vec![OpRef::from_raw(11)]);
+        assert_eq!(prepared.ops[1].pos, OpRef::from_raw(13));
+        assert_eq!(
+            prepared.ops[1].args.to_vec(),
+            vec![OpRef::from_raw(10), OpRef::from_raw(10)]
+        );
+        assert_eq!(
+            prepared.ops[2].args.to_vec(),
+            vec![OpRef::from_raw(12), OpRef::from_raw(13)]
+        );
         assert_eq!(
             snapshot_get(&prepared.snapshot_boxes, 0)
                 .unwrap()
                 .iter()
                 .map(|boxref| boxref.opref)
                 .collect::<Vec<_>>(),
-            vec![OpRef(10), OpRef(12), OpRef(13)]
+            vec![
+                OpRef::from_raw(10),
+                OpRef::from_raw(12),
+                OpRef::from_raw(13)
+            ]
         );
         assert_eq!(
             snapshot_get(&prepared.snapshot_vable_boxes, 0)
@@ -16377,7 +16419,7 @@ mod tests {
                 .iter()
                 .map(|boxref| boxref.opref)
                 .collect::<Vec<_>>(),
-            vec![OpRef(11), OpRef(12)]
+            vec![OpRef::from_raw(11), OpRef::from_raw(12)]
         );
         assert_eq!(
             prepared
@@ -16386,7 +16428,7 @@ mod tests {
                 .unwrap()
                 .liveboxes
                 .clone(),
-            vec![OpRef(10), OpRef(11)]
+            vec![OpRef::from_raw(10), OpRef::from_raw(11)]
         );
     }
 
@@ -16400,12 +16442,21 @@ mod tests {
         let start_descr = start_token.as_jump_target_descr();
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
         let ops = vec![
-            mk_op(OpCode::SameAsR, &[OpRef(0)], 2),
-            mk_op(OpCode::IntAdd, &[OpRef(100), OpRef(101)], 3),
+            mk_op(OpCode::SameAsR, &[OpRef::from_raw(0)], 2),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                3,
+            ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef(0), OpRef(1), OpRef(2), OpRef(3)],
-                OpRef::NONE.0,
+                &[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(1),
+                    OpRef::from_raw(2),
+                    OpRef::from_raw(3),
+                ],
+                OpRef::NONE.raw(),
                 start_descr,
             ),
         ];
@@ -16810,12 +16861,12 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 30;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17030,12 +17081,12 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 77;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17088,12 +17139,12 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 87;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17139,12 +17190,12 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 88;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17223,12 +17274,12 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 89;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17297,10 +17348,13 @@ mod tests {
             .clear();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.0);
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1), OpRef(0)]));
+        let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+            OpRef::from_raw(1),
+            OpRef::from_raw(0),
+        ]));
         // pyre cranelift test-fixture quirk (NOT RPython parity): the bare
-        // OpRef(100) literal is paired with `constants.insert(100, ...)` below
+        // OpRef::from_raw(100) literal is paired with `constants.insert(100, ...)` below
         // because `backend.set_constants` keys the function-pointer literal by
         // raw OpRef value. RPython expresses the same callable as a `Const*`
         // box wrapping the address; pyre's test backend short-circuits that by
@@ -17308,16 +17362,20 @@ mod tests {
         // the OpRef raw bits. Keep the literal in sync with the constants
         // entry — they are co-load-bearing.
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
             mk_op(OpCode::ForceToken, &[], 2),
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef(100), OpRef(2), OpRef(1)],
-                OpRef::NONE.0,
+                &[OpRef::from_raw(100), OpRef::from_raw(2), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
                 descr,
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         let mut constants = HashMap::new();
         constants.insert(
@@ -17390,7 +17448,7 @@ mod tests {
     fn take_recorded_ops(meta: &mut MetaInterp<()>) -> Vec<Op> {
         let mut ctx = meta.tracing.take().expect("expected active trace context");
         let num_inputs = ctx.num_inputargs();
-        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef::from_raw(i as u32)).collect();
         ctx.close_loop(&jump_args);
         let trace = ctx.into_tree_loop();
         trace
@@ -17420,7 +17478,7 @@ mod tests {
         assert_eq!(snapshot_id, 0);
 
         let (trace, _) = meta
-            .finish_trace_for_parity(&[OpRef(0)])
+            .finish_trace_for_parity(&[OpRef::from_raw(0)])
             .expect("trace should finish");
         assert_eq!(trace.snapshots.len(), 1);
         assert_eq!(trace.snapshots[0].frames.len(), 1);
@@ -17488,11 +17546,11 @@ mod tests {
         assert_eq!(ctx.inputarg_types(), vec![Type::Ref, Type::Int]);
         assert_eq!(
             ctx.collect_virtualizable_boxes().unwrap(),
-            vec![OpRef(1), OpRef(0)]
+            vec![OpRef::from_raw(1), OpRef::from_raw(0)]
         );
         assert_eq!(
             ctx.virtualizable_entry_at(0),
-            Some((OpRef(1), Value::Int(41)))
+            Some((OpRef::from_raw(1), Value::Int(41)))
         );
     }
 
@@ -17508,8 +17566,8 @@ mod tests {
             Vec::new(),
         );
 
-        let (result, _) = meta.opimpl_getfield_vable_int(OpRef(0), fd8);
-        assert_eq!(result, OpRef(1));
+        let (result, _) = meta.opimpl_getfield_vable_int(OpRef::from_raw(0), fd8);
+        assert_eq!(result, OpRef::from_raw(1));
 
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.num_ops(), 0);
@@ -17531,7 +17589,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(99)
         };
-        meta.opimpl_setfield_vable_int(OpRef(0), fd8, new_val, Value::Int(99));
+        meta.opimpl_setfield_vable_int(OpRef::from_raw(0), fd8, new_val, Value::Int(99));
 
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
@@ -17562,8 +17620,9 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let (result, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24, adesc);
-        assert_eq!(result, OpRef(2));
+        let (result, _) =
+            meta.opimpl_getarrayitem_vable_int(OpRef::from_raw(0), index, 1, fd24, adesc);
+        assert_eq!(result, OpRef::from_raw(2));
 
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.num_ops(), 0);
@@ -17582,7 +17641,7 @@ mod tests {
             vec![2],
         );
 
-        let len_ref = meta.opimpl_arraylen_vable(OpRef(0), fd24, adesc);
+        let len_ref = meta.opimpl_arraylen_vable(OpRef::from_raw(0), fd24, adesc);
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
         assert_eq!(ctx.num_ops(), 0);
@@ -17670,8 +17729,8 @@ mod tests {
             Vec::new(),
         );
 
-        meta.opimpl_hint_force_virtualizable(OpRef(0));
-        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
 
         let ops = take_recorded_ops(&mut meta);
         assert_eq!(ops.len(), 2);
@@ -17715,7 +17774,7 @@ mod tests {
             ctx.const_int((&mut obj as *mut ResidualCallVableObj) as usize as i64)
         };
         let allboxes = [
-            (JitArgKind::Int, OpRef(99), 0),
+            (JitArgKind::Int, OpRef::from_raw(99), 0),
             (
                 JitArgKind::Int,
                 vref_box,
@@ -17732,7 +17791,7 @@ mod tests {
             )
             .expect("should resolve to standard virtualizable");
 
-        assert_eq!(result.0, OpRef(0));
+        assert_eq!(result.0, OpRef::from_raw(0));
         assert_eq!(
             result.1,
             (&mut obj as *mut ResidualCallVableObj) as usize as i64
@@ -17756,7 +17815,7 @@ mod tests {
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(ctx.const_value(boxes[0]), Some(99));
-        assert_eq!(boxes[1], OpRef(0));
+        assert_eq!(boxes[1], OpRef::from_raw(0));
     }
 
     #[test]
@@ -17919,7 +17978,7 @@ mod tests {
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
         let _ = meta.finish_trace_for_parity(&[]);
 
         start_tracing_with_virtualizable(
@@ -17928,7 +17987,7 @@ mod tests {
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
 
         let ops = take_recorded_ops(&mut meta);
         assert_eq!(ops.len(), 2);
@@ -17948,9 +18007,9 @@ mod tests {
             Vec::new(),
         );
 
-        meta.opimpl_hint_force_virtualizable(OpRef(0));
-        let _ = meta.opimpl_getfield_vable_int(OpRef(0), fd8);
-        meta.opimpl_hint_force_virtualizable(OpRef(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
+        let _ = meta.opimpl_getfield_vable_int(OpRef::from_raw(0), fd8);
+        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
 
         let ops = take_recorded_ops(&mut meta);
         assert_eq!(ops.len(), 4);
@@ -17985,13 +18044,24 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(1)
         };
-        let (item, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24, adesc);
+        let (item, _) =
+            meta.opimpl_getarrayitem_vable_int(OpRef::from_raw(0), index, 1, fd24, adesc);
         if let Some(ctx) = meta.trace_ctx() {
             let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
-            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)], 0, 0);
-            ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
+            ctx.capture_snapshot_for_last_guard(
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                0,
+                0,
+            );
+            ctx.set_fail_args(
+                g,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            );
         }
-        meta.compile_loop(&[OpRef(0), OpRef(1), OpRef(2)], ());
+        meta.compile_loop(
+            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            (),
+        );
 
         let compiled = meta.compiled_loops.get(&777).expect("compiled entry");
         let trace = compiled
@@ -18016,7 +18086,7 @@ mod tests {
             "standard virtualizable loop should use vable boxes, not raw heap ops: {}",
             majit_ir::format_trace(&trace.ops, &trace.constants)
         );
-        assert_eq!(item, OpRef(2));
+        assert_eq!(item, OpRef::from_raw(2));
     }
 
     #[test]
@@ -18095,14 +18165,14 @@ mod tests {
 
         // Record a simple operation and close the trace
         if let Some(ctx) = meta.trace_ctx() {
-            let i0 = OpRef(0);
+            let i0 = OpRef::from_raw(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef(0)], ());
+        meta.compile_loop(&[OpRef::from_raw(0)], ());
 
         let events = compile_events.lock().unwrap();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
@@ -18191,14 +18261,14 @@ mod tests {
             meta.on_back_edge(green_key2, &[0]);
         }
         if let Some(ctx) = meta.trace_ctx() {
-            let i0 = OpRef(0);
+            let i0 = OpRef::from_raw(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef(0)], ());
+        meta.compile_loop(&[OpRef::from_raw(0)], ());
         assert_eq!(
             *compile_count.lock().unwrap(),
             1,
@@ -18228,8 +18298,8 @@ mod tests {
                 meta.on_back_edge(green_key, &[0, 0]);
             }
             if let Some(ctx) = meta.trace_ctx() {
-                let i0 = OpRef(0);
-                let i1 = OpRef(1);
+                let i0 = OpRef::from_raw(0);
+                let i1 = OpRef::from_raw(1);
                 let const_one = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
                 let sum2 = ctx.record_op(OpCode::IntAdd, &[sum, const_one]);
@@ -18237,7 +18307,7 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }
-            meta.compile_loop(&[OpRef(0), OpRef(1)], ());
+            meta.compile_loop(&[OpRef::from_raw(0), OpRef::from_raw(1)], ());
         }
 
         let events = events.lock().unwrap();
@@ -18270,20 +18340,34 @@ mod tests {
         // are paired with `constants.insert(100|101, ...)` below; the
         // backend HashMap keys the function-pointer / value literals by
         // raw OpRef value. RPython expresses these as Const* boxes.
-        let _const_one = OpRef(100);
-        let const_zero = OpRef(101);
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1)]));
+        let _const_one = OpRef::from_raw(100);
+        let const_zero = OpRef::from_raw(101);
+        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(2)], OpRef::NONE.raw());
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
+            OpRef::from_raw(0),
+            OpRef::from_raw(1),
+        ]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
-            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
-            mk_op(OpCode::IntGt, &[OpRef(2), const_zero], 3),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
+            mk_op(OpCode::IntGt, &[OpRef::from_raw(2), const_zero], 3),
             {
-                let mut g = mk_op(OpCode::GuardTrue, &[OpRef(3)], OpRef::NONE.0);
-                g.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(0), OpRef(1)]));
+                let mut g = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(3)], OpRef::NONE.raw());
+                g.fail_args = Some(smallvec::SmallVec::from_slice(&[
+                    OpRef::from_raw(0),
+                    OpRef::from_raw(1),
+                ]));
                 g
             },
-            mk_op(OpCode::Jump, &[OpRef(2), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Jump,
+                &[OpRef::from_raw(2), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
         let mut constants = HashMap::new();
         constants.insert(100, 1);

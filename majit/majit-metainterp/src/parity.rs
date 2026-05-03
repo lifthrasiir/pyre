@@ -22,12 +22,12 @@ pub struct TraceParityCase<'a> {
 #[derive(Default)]
 struct VarRenumbering {
     next_id: u32,
-    ids: HashMap<u32, u32>,
+    ids: HashMap<OpRef, u32>,
 }
 
 impl VarRenumbering {
     fn id_for(&mut self, opref: OpRef) -> u32 {
-        *self.ids.entry(opref.0).or_insert_with(|| {
+        *self.ids.entry(opref).or_insert_with(|| {
             let id = self.next_id;
             self.next_id += 1;
             id
@@ -36,7 +36,7 @@ impl VarRenumbering {
 }
 
 fn render_arg(arg: OpRef, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) -> String {
-    if let Some(value) = constants.get(&arg.0) {
+    if let Some(value) = constants.get(&arg.raw()) {
         value.to_string()
     } else {
         format!("v{}", vars.id_for(arg))
@@ -82,9 +82,9 @@ pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<S
     let mut vars = VarRenumbering::default();
     for i in 0..trace.inputargs.len() {
         // Pre-allocate v0..vN for the inputarg slots. Inputargs occupy
-        // `OpRef(0)..OpRef(num_inputargs)` per `record_input_arg` in
+        // `OpRef::from_raw(0)..OpRef::from_raw(num_inputargs)` per `record_input_arg` in
         // `recorder.rs`; any later render_arg hit reuses these IDs.
-        vars.id_for(OpRef(i as u32));
+        vars.id_for(OpRef::from_raw(i as u32));
     }
     trace
         .ops

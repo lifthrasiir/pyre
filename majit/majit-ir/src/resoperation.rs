@@ -9,12 +9,61 @@ use smallvec::SmallVec;
 use crate::descr::DescrRef;
 use crate::value::{Const, GcRef, Type};
 
-/// Index into an operation list, used as a reference to an operation's result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct OpRef(pub u32);
+/// Index into an operation list, used as a reference to an operation's
+/// result. Variant-tagged enum mirroring RPython's `AbstractValue` class
+/// hierarchy (resoperation.py:29 + history.py:182).
+///
+/// Each typed variant carries the same raw u32 encoding used by the
+/// pre-Phase-3 tuple struct (`CONST_BIT` set for `Const*`, plain `pos`
+/// for `InputArg*` / `*Op`). The `Untyped` variant is a transitional
+/// state produced by `from_raw()` when reconstructing an OpRef from a
+/// u32 of unknown type (HashMap key, ConstantPool index, etc.); Phase 4
+/// audits each `from_raw` call site and specializes it to a typed
+/// factory.
+///
+/// `PartialEq` / `Eq` / `Hash` are implemented manually on `.raw()` so
+/// that two OpRefs with the same raw u32 but different variant tags
+/// (e.g. `Untyped(x)` vs `ConstInt(x)`) compare equal — preserving
+/// pre-Phase-3 equality semantics until Phase 5 migrates HashMap keys
+/// from u32 to OpRef.
+#[derive(Clone, Copy, Debug)]
+pub enum OpRef {
+    /// Sentinel for missing/absent reference; `OpRef::NONE` aliases this.
+    /// RPython has no equivalent — missing values are Python `None`.
+    None,
+    /// history.py:220 `ConstInt` — `type = 'i'`. Payload: raw u32 with
+    /// `CONST_BIT` set; low bits are the constant pool index.
+    ConstInt(u32),
+    /// history.py:261 `ConstFloat` — `type = 'f'`.
+    ConstFloat(u32),
+    /// history.py:307 `ConstPtr` — `type = 'r'`.
+    ConstPtr(u32),
+    /// resoperation.py:719 `InputArgInt` — `type = 'i'`. Payload: input
+    /// arg slot position.
+    InputArgInt(u32),
+    /// resoperation.py:727 `InputArgFloat` — `type = 'f'`.
+    InputArgFloat(u32),
+    /// resoperation.py:739 `InputArgRef` — `type = 'r'`.
+    InputArgRef(u32),
+    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: op
+    /// result OpRef position.
+    IntOp(u32),
+    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`.
+    FloatOp(u32),
+    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
+    RefOp(u32),
+    /// `AbstractResOp` default — `type = 'v'` (resoperation.py:260).
+    /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …) carry no result
+    /// type but still occupy an op position.
+    VoidOp(u32),
+    /// Transitional — `from_raw()` lands here when reconstructing from
+    /// a u32 of unknown type. Phase 4 audits each call site and
+    /// specializes to a typed variant.
+    Untyped(u32),
+}
 
 impl OpRef {
-    pub const NONE: OpRef = OpRef(u32::MAX);
+    pub const NONE: OpRef = OpRef::None;
     /// High bit distinguishes constant-namespace OpRefs from operation OpRefs.
     /// opencoder.py: TAGINT/TAGCONSTPTR/TAGCONSTOTHER/TAGBOX use 2-bit tags;
     /// here a single high bit suffices (op vs const).
@@ -25,10 +74,45 @@ impl OpRef {
     const SENTINEL_BASE: u32 = u32::MAX - 16;
 
     pub fn is_none(self) -> bool {
-        self.0 == u32::MAX
+        matches!(self, Self::None | Self::Untyped(u32::MAX))
+    }
+
+    /// Extract the raw u32 payload. For `None` returns `u32::MAX` to
+    /// preserve pre-Phase-3 round-trip semantics.
+    #[inline]
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::None => u32::MAX,
+            Self::ConstInt(x)
+            | Self::ConstFloat(x)
+            | Self::ConstPtr(x)
+            | Self::InputArgInt(x)
+            | Self::InputArgFloat(x)
+            | Self::InputArgRef(x)
+            | Self::IntOp(x)
+            | Self::FloatOp(x)
+            | Self::RefOp(x)
+            | Self::VoidOp(x)
+            | Self::Untyped(x) => x,
+        }
+    }
+
+    /// Mirrors RPython `AbstractValue.type` — the type embedded in the
+    /// variant tag. `Untyped` returns `None`; Phase 4 audits and
+    /// specializes those sites.
+    pub fn ty(self) -> Option<Type> {
+        match self {
+            Self::None | Self::Untyped(_) => None,
+            Self::ConstInt(_) | Self::InputArgInt(_) | Self::IntOp(_) => Some(Type::Int),
+            Self::ConstFloat(_) | Self::InputArgFloat(_) | Self::FloatOp(_) => Some(Type::Float),
+            Self::ConstPtr(_) | Self::InputArgRef(_) | Self::RefOp(_) => Some(Type::Ref),
+            Self::VoidOp(_) => Some(Type::Void),
+        }
     }
 
     /// Create an OpRef in the constant namespace from a zero-based index.
+    /// Type-erased — prefer `const_int` / `const_float` / `const_ptr`
+    /// where the type is known.
     pub fn from_const(index: u32) -> OpRef {
         debug_assert!(
             index & Self::CONST_BIT == 0,
@@ -41,18 +125,293 @@ impl OpRef {
             "const index collides with regalloc sentinel range: {}",
             index
         );
-        OpRef(raw)
+        OpRef::Untyped(raw)
     }
 
     /// Extract the zero-based constant index (masks off high bit).
     pub fn const_index(self) -> u32 {
         debug_assert!(self.is_constant());
-        self.0 & !Self::CONST_BIT
+        self.raw() & !Self::CONST_BIT
     }
 
     /// resoperation.py: is_constant() — Const subclass check.
     pub fn is_constant(self) -> bool {
-        self.0 & Self::CONST_BIT != 0 && self.0 < Self::SENTINEL_BASE
+        match self {
+            Self::ConstInt(_) | Self::ConstFloat(_) | Self::ConstPtr(_) => true,
+            Self::Untyped(x) if x & Self::CONST_BIT != 0 && x < Self::SENTINEL_BASE => true,
+            _ => false,
+        }
+    }
+
+    // ── Typed constructors mirroring RPython AbstractValue variants ──
+    //
+    // Each factory produces the matching enum variant carrying the
+    // pre-Phase-3 raw u32 encoding. These are the canonical OpRef
+    // construction entry points; `from_raw` is reserved for type-erased
+    // reconstruction during the Phase 3→4 migration window.
+
+    /// history.py:220 `ConstInt` — `type = 'i'`. Index points into the
+    /// integer constant pool.
+    pub const fn const_int(idx: u32) -> OpRef {
+        OpRef::ConstInt(idx | Self::CONST_BIT)
+    }
+
+    /// history.py:261 `ConstFloat` — `type = 'f'`.
+    pub const fn const_float(idx: u32) -> OpRef {
+        OpRef::ConstFloat(idx | Self::CONST_BIT)
+    }
+
+    /// history.py:307 `ConstPtr` — `type = 'r'`.
+    pub const fn const_ptr(idx: u32) -> OpRef {
+        OpRef::ConstPtr(idx | Self::CONST_BIT)
+    }
+
+    /// resoperation.py:719 `InputArgInt` — `type = 'i'`.
+    pub const fn input_arg_int(pos: u32) -> OpRef {
+        OpRef::InputArgInt(pos)
+    }
+
+    /// resoperation.py:727 `InputArgFloat` — `type = 'f'`.
+    pub const fn input_arg_float(pos: u32) -> OpRef {
+        OpRef::InputArgFloat(pos)
+    }
+
+    /// resoperation.py:739 `InputArgRef` — `type = 'r'`.
+    pub const fn input_arg_ref(pos: u32) -> OpRef {
+        OpRef::InputArgRef(pos)
+    }
+
+    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`.
+    pub const fn int_op(pos: u32) -> OpRef {
+        OpRef::IntOp(pos)
+    }
+
+    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`.
+    pub const fn float_op(pos: u32) -> OpRef {
+        OpRef::FloatOp(pos)
+    }
+
+    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
+    pub const fn ref_op(pos: u32) -> OpRef {
+        OpRef::RefOp(pos)
+    }
+
+    /// `AbstractResOp` default — `type = 'v'` (resoperation.py:260).
+    pub const fn void_op(pos: u32) -> OpRef {
+        OpRef::VoidOp(pos)
+    }
+
+    /// Allocate a typed `Const*` OpRef from a zero-based pool index. The
+    /// type tag picks the matching variant (history.py:220/261/307).
+    /// `Type::Void` is rejected — RPython has no Const-Void class.
+    pub fn const_typed(idx: u32, tp: Type) -> OpRef {
+        match tp {
+            Type::Int => OpRef::const_int(idx),
+            Type::Float => OpRef::const_float(idx),
+            Type::Ref => OpRef::const_ptr(idx),
+            Type::Void => panic!("Void constants are not supported (no ConstVoid class upstream)"),
+        }
+    }
+
+    /// Allocate a typed `InputArg*` OpRef from a position. The type tag
+    /// picks the matching variant (resoperation.py:719/727/739).
+    /// `Type::Void` is rejected — RPython has no Void inputarg class.
+    pub fn input_arg_typed(pos: u32, tp: Type) -> OpRef {
+        match tp {
+            Type::Int => OpRef::input_arg_int(pos),
+            Type::Float => OpRef::input_arg_float(pos),
+            Type::Ref => OpRef::input_arg_ref(pos),
+            Type::Void => panic!("Void input args are not supported"),
+        }
+    }
+
+    /// Allocate a typed `*Op` OpRef from a position. The type tag picks
+    /// the matching mixin variant (resoperation.py:564-638).
+    /// `Type::Void` lands on `VoidOp` — `AbstractResOp.type = 'v'`
+    /// (resoperation.py:260), the default for ops with no result-type
+    /// mixin.
+    pub const fn op_typed(pos: u32, tp: Type) -> OpRef {
+        match tp {
+            Type::Int => OpRef::int_op(pos),
+            Type::Float => OpRef::float_op(pos),
+            Type::Ref => OpRef::ref_op(pos),
+            Type::Void => OpRef::void_op(pos),
+        }
+    }
+
+    /// Type-erased reconstruction from a previously-stored raw u32.
+    /// Used when an OpRef was serialized into a u32-keyed container
+    /// (HashMap key, ConstantPool index, etc.) and must be reconstructed
+    /// without a known type. Phase 4 audits each call site and
+    /// specializes to a typed factory; until then `Untyped(_)` carries
+    /// the value.
+    pub const fn from_raw(raw: u32) -> OpRef {
+        if raw == u32::MAX {
+            OpRef::None
+        } else {
+            OpRef::Untyped(raw)
+        }
+    }
+
+    /// Re-encode this OpRef's variant with a fresh raw payload while
+    /// preserving the type tag. Used by post-optimization remaps that
+    /// renumber positions but keep RPython's `box.type` attached
+    /// (history.py:802 record_same_as parity, where the remapped Box
+    /// inherits the source Box's `.type`).
+    ///
+    /// `None` round-trips to `None` regardless of `new_raw`.
+    pub const fn with_raw(self, new_raw: u32) -> OpRef {
+        match self {
+            Self::None => Self::None,
+            Self::ConstInt(_) => Self::ConstInt(new_raw),
+            Self::ConstFloat(_) => Self::ConstFloat(new_raw),
+            Self::ConstPtr(_) => Self::ConstPtr(new_raw),
+            Self::InputArgInt(_) => Self::InputArgInt(new_raw),
+            Self::InputArgFloat(_) => Self::InputArgFloat(new_raw),
+            Self::InputArgRef(_) => Self::InputArgRef(new_raw),
+            Self::IntOp(_) => Self::IntOp(new_raw),
+            Self::FloatOp(_) => Self::FloatOp(new_raw),
+            Self::RefOp(_) => Self::RefOp(new_raw),
+            Self::VoidOp(_) => Self::VoidOp(new_raw),
+            Self::Untyped(_) => Self::Untyped(new_raw),
+        }
+    }
+}
+
+/// PRE-EXISTING-ADAPTATION: Eq/Hash use only `.raw()`, so
+/// `ConstInt(x) == ConstFloat(x) == ConstPtr(x) == Untyped(x)` when raw
+/// payloads coincide. RPython's `AbstractValue.same_box` is `self is
+/// other` (object identity); `ConstInt.same_constant` rejects against
+/// `ConstFloat` (history.py:244, history.py:285). Variant-aware Eq/Hash
+/// is the correct port but cascades into ~45 test fixture assertions
+/// (`assert_eq!(typed, from_raw)`) and at least one regalloc round-trip
+/// path that reconstructs OpRefs via `from_raw(stored_raw)` and looks
+/// them up in `HashMap<OpRef, V>` storage. Convergence requires a
+/// dedicated slice that (a) flips fixtures to typed factories and (b)
+/// audits every storage round-trip site for typed reconstruction —
+/// most likely co-landing with the Phase 5 `HashMap<u32, V> →
+/// HashMap<OpRef, V>` migration that retires the `Untyped` variant.
+impl PartialEq for OpRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw() == other.raw()
+    }
+}
+
+impl Eq for OpRef {}
+
+impl std::hash::Hash for OpRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw().hash(state);
+    }
+}
+
+/// AbstractValue parity: rpython/jit/metainterp/resoperation.py:29
+/// + history.py:182.
+///
+/// RPython's `AbstractValue` is the root of the value hierarchy that
+/// carries `type` ('i' / 'r' / 'f') as a class-level constant. The
+/// concrete subclasses split into three families:
+///
+/// 1. **`Const` family** (history.py:220 `ConstInt`, history.py:261
+///    `ConstFloat`, history.py:307 `ConstPtr`).
+/// 2. **`AbstractInputArg` family** (resoperation.py:719 `InputArgInt`,
+///    resoperation.py:727 `InputArgFloat`, resoperation.py:739
+///    `InputArgRef`).
+/// 3. **`AbstractResOp`** (resoperation.py:250) mixed with one of the
+///    `IntOp` / `FloatOp` / `RefOp` mixins (resoperation.py:564-638) —
+///    every concrete ResOp subclass picks up its `type` attribute via
+///    one of these three mixins.
+///
+/// In pyre, [`OpRef`] carries only a numeric handle (CONST_BIT-encoded
+/// for constants, `pos` for inputargs and op results) and the type lives
+/// in side tables (`OptContext::value_types`, the constant pool, op
+/// result types). `AbstractValue` is the Rust analogue of an
+/// instantiated RPython value: `type` is intrinsic to the variant.
+///
+/// The `None` variant is a Rust adaptation for missing/sentinel
+/// references; in RPython missing values are Python `None` or absent
+/// attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AbstractValue {
+    None,
+    /// history.py:220 `ConstInt` — `type = 'i'`. Payload: index into
+    /// the integer constant pool.
+    ConstInt(u32),
+    /// history.py:261 `ConstFloat` — `type = 'f'`.
+    ConstFloat(u32),
+    /// history.py:307 `ConstPtr` — `type = 'r'`.
+    ConstPtr(u32),
+    /// resoperation.py:719 `InputArgInt` — `type = 'i'`. Payload: input
+    /// arg slot position.
+    InputArgInt(u32),
+    /// resoperation.py:727 `InputArgFloat` — `type = 'f'`.
+    InputArgFloat(u32),
+    /// resoperation.py:739 `InputArgRef` — `type = 'r'`.
+    InputArgRef(u32),
+    /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: op
+    /// result OpRef position.
+    IntOp(u32),
+    /// `AbstractResOp` + `FloatOp` mixin — `type = 'f'`.
+    FloatOp(u32),
+    /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
+    RefOp(u32),
+    /// `AbstractResOp` default — `type = 'v'` (resoperation.py:260).
+    /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …).
+    VoidOp(u32),
+}
+
+impl AbstractValue {
+    /// Mirrors RPython `AbstractValue.type` access.
+    pub fn ty(self) -> Option<Type> {
+        match self {
+            Self::None => None,
+            Self::ConstInt(_) | Self::InputArgInt(_) | Self::IntOp(_) => Some(Type::Int),
+            Self::ConstFloat(_) | Self::InputArgFloat(_) | Self::FloatOp(_) => Some(Type::Float),
+            Self::ConstPtr(_) | Self::InputArgRef(_) | Self::RefOp(_) => Some(Type::Ref),
+            Self::VoidOp(_) => Some(Type::Void),
+        }
+    }
+
+    /// Mirrors RPython `isinstance(value, Const)`.
+    pub fn is_constant(self) -> bool {
+        matches!(
+            self,
+            Self::ConstInt(_) | Self::ConstFloat(_) | Self::ConstPtr(_)
+        )
+    }
+
+    /// Mirrors RPython `isinstance(value, AbstractInputArg)`.
+    pub fn is_input_arg(self) -> bool {
+        matches!(
+            self,
+            Self::InputArgInt(_) | Self::InputArgFloat(_) | Self::InputArgRef(_)
+        )
+    }
+
+    /// Mirrors RPython `isinstance(value, AbstractResOp)`.
+    pub fn is_res_op(self) -> bool {
+        matches!(
+            self,
+            Self::IntOp(_) | Self::FloatOp(_) | Self::RefOp(_) | Self::VoidOp(_)
+        )
+    }
+
+    /// Returns the variant payload (constant index, input arg position,
+    /// or op result position). `None` variant returns `None`.
+    pub fn raw(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::ConstInt(x)
+            | Self::ConstFloat(x)
+            | Self::ConstPtr(x)
+            | Self::InputArgInt(x)
+            | Self::InputArgFloat(x)
+            | Self::InputArgRef(x)
+            | Self::IntOp(x)
+            | Self::FloatOp(x)
+            | Self::RefOp(x)
+            | Self::VoidOp(x) => Some(x),
+        }
     }
 }
 
@@ -748,7 +1107,7 @@ impl Op {
             let mut seen = std::collections::HashSet::new();
             for &b in &boxes {
                 if !b.is_none() {
-                    debug_assert!(seen.insert(b.0), "duplicate box in fail_args: {:?}", b);
+                    debug_assert!(seen.insert(b.raw()), "duplicate box in fail_args: {:?}", b);
                 }
             }
         }
@@ -764,7 +1123,7 @@ impl std::fmt::Display for Op {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "v{}", arg.0)?;
+                write!(f, "v{}", arg.raw())?;
             }
             write!(f, ")")?;
             if let Some(ref fa) = self.fail_args {
@@ -773,18 +1132,18 @@ impl std::fmt::Display for Op {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "v{}", arg.0)?;
+                    write!(f, "v{}", arg.raw())?;
                 }
                 write!(f, "]")?;
             }
             Ok(())
         } else if self.result_type() != Type::Void {
-            write!(f, "v{} = {:?}(", self.pos.0, self.opcode)?;
+            write!(f, "v{} = {:?}(", self.pos.raw(), self.opcode)?;
             for (i, arg) in self.args.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "v{}", arg.0)?;
+                write!(f, "v{}", arg.raw())?;
             }
             write!(f, ")")
         } else {
@@ -793,7 +1152,7 @@ impl std::fmt::Display for Op {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "v{}", arg.0)?;
+                write!(f, "v{}", arg.raw())?;
             }
             write!(f, ")")
         }
@@ -810,7 +1169,7 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
         if op.opcode.is_guard() {
             write!(out, "{:?}(", op.opcode).unwrap();
         } else if op.type_ != Type::Void {
-            write!(out, "v{} = {:?}(", op.pos.0, op.opcode).unwrap();
+            write!(out, "v{} = {:?}(", op.pos.raw(), op.opcode).unwrap();
         } else {
             write!(out, "{:?}(", op.opcode).unwrap();
         }
@@ -818,10 +1177,10 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
             if i > 0 {
                 write!(out, ", ").unwrap();
             }
-            if let Some(&val) = constants.get(&arg.0) {
+            if let Some(&val) = constants.get(&arg.raw()) {
                 write!(out, "{val}").unwrap();
             } else {
-                write!(out, "v{}", arg.0).unwrap();
+                write!(out, "v{}", arg.raw()).unwrap();
             }
         }
         write!(out, ")").unwrap();
@@ -838,10 +1197,10 @@ pub fn format_trace(ops: &[Op], constants: &std::collections::HashMap<u32, i64>)
                 if i > 0 {
                     write!(out, ", ").unwrap();
                 }
-                if let Some(&val) = constants.get(&arg.0) {
+                if let Some(&val) = constants.get(&arg.raw()) {
                     write!(out, "{val}").unwrap();
                 } else {
-                    write!(out, "v{}", arg.0).unwrap();
+                    write!(out, "v{}", arg.raw()).unwrap();
                 }
             }
             write!(out, "]").unwrap();
@@ -3454,11 +3813,11 @@ mod tests {
 
     #[test]
     fn test_op_new() {
-        let op = Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        let op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
         assert_eq!(op.opcode, OpCode::IntAdd);
         assert_eq!(op.args.len(), 2);
-        assert_eq!(op.args[0], OpRef(0));
-        assert_eq!(op.args[1], OpRef(1));
+        assert_eq!(op.args[0], OpRef::from_raw(0));
+        assert_eq!(op.args[1], OpRef::from_raw(1));
         assert!(op.descr.is_none());
         assert!(op.fail_args.is_none());
         assert_eq!(op.result_type(), Type::Int);
@@ -3467,9 +3826,9 @@ mod tests {
 
     #[test]
     fn test_op_getarg() {
-        let op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef(20)]);
-        assert_eq!(op.arg(0), OpRef(10));
-        assert_eq!(op.arg(1), OpRef(20));
+        let op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_raw(20)]);
+        assert_eq!(op.arg(0), OpRef::from_raw(10));
+        assert_eq!(op.arg(1), OpRef::from_raw(20));
     }
 
     // ── Descriptor requirements ──
@@ -3673,9 +4032,9 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef(1), OpRef(2)],
+                args: smallvec::smallvec![OpRef::from_raw(1), OpRef::from_raw(2)],
                 descr: None,
-                pos: OpRef(3),
+                pos: OpRef::from_raw(3),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3683,9 +4042,9 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef(3), OpRef(10_000)],
+                args: smallvec::smallvec![OpRef::from_raw(3), OpRef::from_raw(10_000)],
                 descr: None,
-                pos: OpRef(4),
+                pos: OpRef::from_raw(4),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3693,7 +4052,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Jump,
-                args: smallvec::smallvec![OpRef(0), OpRef(4), OpRef(3)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(4), OpRef::from_raw(3)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -3715,9 +4074,9 @@ mod tests {
     fn test_op_display_int_result() {
         let op = op! {
             opcode: OpCode::IntAdd,
-            args: smallvec::smallvec![OpRef(1), OpRef(2)],
+            args: smallvec::smallvec![OpRef::from_raw(1), OpRef::from_raw(2)],
             descr: None,
-            pos: OpRef(6),
+            pos: OpRef::from_raw(6),
             fail_args: None,
 
             fail_arg_types: None,
@@ -3731,7 +4090,7 @@ mod tests {
     fn test_op_display_void() {
         let op = op! {
             opcode: OpCode::SetfieldGc,
-            args: smallvec::smallvec![OpRef(0), OpRef(1)],
+            args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)],
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
@@ -3747,10 +4106,10 @@ mod tests {
     fn test_op_display_guard_with_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: smallvec::smallvec![OpRef(0)],
+            args: smallvec::smallvec![OpRef::from_raw(0)],
             descr: None,
             pos: OpRef::NONE,
-            fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+            fail_args: Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]),
 
 
             fail_arg_types: None,
@@ -3764,7 +4123,7 @@ mod tests {
     fn test_op_display_guard_without_fail_args() {
         let op = op! {
             opcode: OpCode::GuardTrue,
-            args: smallvec::smallvec![OpRef(0)],
+            args: smallvec::smallvec![OpRef::from_raw(0)],
             descr: None,
             pos: OpRef::NONE,
             fail_args: None,
@@ -3780,9 +4139,9 @@ mod tests {
     fn test_format_trace_constants_rendered_with_values() {
         let ops = vec![op! {
             opcode: OpCode::IntAdd,
-            args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
+            args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(10_000)],
             descr: None,
-            pos: OpRef(1),
+            pos: OpRef::from_raw(1),
             fail_args: None,
 
             fail_arg_types: None,
@@ -3800,9 +4159,9 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(10_000)],
                 descr: None,
-                pos: OpRef(1),
+                pos: OpRef::from_raw(1),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3810,17 +4169,17 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef(0)],
+                args: smallvec::smallvec![OpRef::from_raw(0)],
                 descr: None,
                 pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+                fail_args: Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]),
 
                 fail_arg_types: None,
                 rd_resume_position: -1,
             },
             op! {
                 opcode: OpCode::Finish,
-                args: smallvec::smallvec![OpRef(1)],
+                args: smallvec::smallvec![OpRef::from_raw(1)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -3840,10 +4199,10 @@ mod tests {
     fn test_format_trace_constants_in_fail_args() {
         let ops = vec![op! {
             opcode: OpCode::GuardTrue,
-            args: smallvec::smallvec![OpRef(0)],
+            args: smallvec::smallvec![OpRef::from_raw(0)],
             descr: None,
             pos: OpRef::NONE,
-            fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(10_000)]),
+            fail_args: Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(10_000)]),
 
 
             fail_arg_types: None,
@@ -3872,7 +4231,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -3882,9 +4241,9 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef(1), OpRef(2)],
+                args: smallvec::smallvec![OpRef::from_raw(1), OpRef::from_raw(2)],
                 descr: None,
-                pos: OpRef(3),
+                pos: OpRef::from_raw(3),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3892,9 +4251,9 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef(3), OpRef(10_000)],
+                args: smallvec::smallvec![OpRef::from_raw(3), OpRef::from_raw(10_000)],
                 descr: None,
-                pos: OpRef(4),
+                pos: OpRef::from_raw(4),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3902,7 +4261,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Jump,
-                args: smallvec::smallvec![OpRef(0), OpRef(4), OpRef(3)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(4), OpRef::from_raw(3)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -3935,9 +4294,9 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::IntSub,
-                args: smallvec::smallvec![OpRef(0), OpRef(10_000)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(10_000)],
                 descr: None,
-                pos: OpRef(1),
+                pos: OpRef::from_raw(1),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3945,9 +4304,9 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntGt,
-                args: smallvec::smallvec![OpRef(1), OpRef(10_001)],
+                args: smallvec::smallvec![OpRef::from_raw(1), OpRef::from_raw(10_001)],
                 descr: None,
-                pos: OpRef(2),
+                pos: OpRef::from_raw(2),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -3955,17 +4314,17 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef(2)],
+                args: smallvec::smallvec![OpRef::from_raw(2)],
                 descr: None,
                 pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
+                fail_args: Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]),
 
                 fail_arg_types: None,
                 rd_resume_position: -1,
             },
             op! {
                 opcode: OpCode::Finish,
-                args: smallvec::smallvec![OpRef(1)],
+                args: smallvec::smallvec![OpRef::from_raw(1)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -4026,7 +4385,7 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::Label,
-                args: smallvec::smallvec![OpRef(0), OpRef(1)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -4036,9 +4395,9 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntAdd,
-                args: smallvec::smallvec![OpRef(0), OpRef(1)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)],
                 descr: None,
-                pos: OpRef(2),
+                pos: OpRef::from_raw(2),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4046,9 +4405,9 @@ mod tests {
             },
             op! {
                 opcode: OpCode::IntLt,
-                args: smallvec::smallvec![OpRef(2), OpRef(10_000)],
+                args: smallvec::smallvec![OpRef::from_raw(2), OpRef::from_raw(10_000)],
                 descr: None,
-                pos: OpRef(3),
+                pos: OpRef::from_raw(3),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4056,19 +4415,19 @@ mod tests {
             },
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef(3)],
+                args: smallvec::smallvec![OpRef::from_raw(3)],
                 descr: None,
                 pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
+                fail_args: Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(2)]),
 
                 fail_arg_types: None,
                 rd_resume_position: -1,
             },
             op! {
                 opcode: OpCode::IntSub,
-                args: smallvec::smallvec![OpRef(0), OpRef(10_001)],
+                args: smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(10_001)],
                 descr: None,
-                pos: OpRef(4),
+                pos: OpRef::from_raw(4),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4076,7 +4435,7 @@ mod tests {
             },
             op! {
                 opcode: OpCode::Jump,
-                args: smallvec::smallvec![OpRef(4), OpRef(2)],
+                args: smallvec::smallvec![OpRef::from_raw(4), OpRef::from_raw(2)],
                 descr: None,
                 pos: OpRef::NONE,
                 fail_args: None,
@@ -4109,20 +4468,20 @@ mod tests {
         let ops = vec![
             op! {
                 opcode: OpCode::GuardTrue,
-                args: smallvec::smallvec![OpRef(0)],
+                args: smallvec::smallvec![OpRef::from_raw(0)],
                 descr: None,
                 pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef(0)]),
+                fail_args: Some(smallvec::smallvec![OpRef::from_raw(0)]),
 
                 fail_arg_types: None,
                 rd_resume_position: -1,
             },
             op! {
                 opcode: OpCode::GuardFalse,
-                args: smallvec::smallvec![OpRef(1)],
+                args: smallvec::smallvec![OpRef::from_raw(1)],
                 descr: None,
                 pos: OpRef::NONE,
-                fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2)]),
+                fail_args: Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]),
 
 
                 fail_arg_types: None,
@@ -4162,5 +4521,141 @@ mod tests {
     fn test_is_setinteriorfield() {
         assert!(OpCode::SetinteriorfieldGc.is_setinteriorfield());
         assert!(!OpCode::GetinteriorfieldGcI.is_setinteriorfield());
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // AbstractValue parity tests
+    // Mirror rpython/jit/metainterp/test/test_history.py and
+    // rpython/jit/metainterp/test/test_resoperation.py for the
+    // AbstractValue / Const / InputArg / ResOp class hierarchy.
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_abstract_value_ty_const() {
+        assert_eq!(AbstractValue::ConstInt(0).ty(), Some(Type::Int));
+        assert_eq!(AbstractValue::ConstFloat(0).ty(), Some(Type::Float));
+        assert_eq!(AbstractValue::ConstPtr(0).ty(), Some(Type::Ref));
+    }
+
+    #[test]
+    fn test_abstract_value_ty_input_arg() {
+        assert_eq!(AbstractValue::InputArgInt(0).ty(), Some(Type::Int));
+        assert_eq!(AbstractValue::InputArgFloat(0).ty(), Some(Type::Float));
+        assert_eq!(AbstractValue::InputArgRef(0).ty(), Some(Type::Ref));
+    }
+
+    #[test]
+    fn test_abstract_value_ty_res_op() {
+        assert_eq!(AbstractValue::IntOp(0).ty(), Some(Type::Int));
+        assert_eq!(AbstractValue::FloatOp(0).ty(), Some(Type::Float));
+        assert_eq!(AbstractValue::RefOp(0).ty(), Some(Type::Ref));
+        assert_eq!(AbstractValue::VoidOp(0).ty(), Some(Type::Void));
+    }
+
+    #[test]
+    fn test_abstract_value_ty_none() {
+        assert_eq!(AbstractValue::None.ty(), None);
+    }
+
+    #[test]
+    fn test_abstract_value_is_constant() {
+        assert!(AbstractValue::ConstInt(7).is_constant());
+        assert!(AbstractValue::ConstFloat(7).is_constant());
+        assert!(AbstractValue::ConstPtr(7).is_constant());
+        assert!(!AbstractValue::InputArgInt(7).is_constant());
+        assert!(!AbstractValue::IntOp(7).is_constant());
+        assert!(!AbstractValue::None.is_constant());
+    }
+
+    #[test]
+    fn test_abstract_value_is_input_arg() {
+        assert!(AbstractValue::InputArgInt(7).is_input_arg());
+        assert!(AbstractValue::InputArgFloat(7).is_input_arg());
+        assert!(AbstractValue::InputArgRef(7).is_input_arg());
+        assert!(!AbstractValue::ConstInt(7).is_input_arg());
+        assert!(!AbstractValue::IntOp(7).is_input_arg());
+        assert!(!AbstractValue::None.is_input_arg());
+    }
+
+    #[test]
+    fn test_abstract_value_is_res_op() {
+        assert!(AbstractValue::IntOp(7).is_res_op());
+        assert!(AbstractValue::FloatOp(7).is_res_op());
+        assert!(AbstractValue::RefOp(7).is_res_op());
+        assert!(!AbstractValue::ConstInt(7).is_res_op());
+        assert!(!AbstractValue::InputArgInt(7).is_res_op());
+        assert!(!AbstractValue::None.is_res_op());
+    }
+
+    #[test]
+    fn test_abstract_value_raw() {
+        assert_eq!(AbstractValue::ConstInt(11).raw(), Some(11));
+        assert_eq!(AbstractValue::InputArgRef(22).raw(), Some(22));
+        assert_eq!(AbstractValue::IntOp(33).raw(), Some(33));
+        assert_eq!(AbstractValue::None.raw(), None);
+    }
+
+    #[test]
+    fn test_abstract_value_disjoint_categories() {
+        // RPython parity: Const / AbstractInputArg / AbstractResOp
+        // are disjoint sub-hierarchies under AbstractValue.
+        let const_iv = AbstractValue::ConstInt(0);
+        let input_iv = AbstractValue::InputArgInt(0);
+        let res_iv = AbstractValue::IntOp(0);
+        assert!(const_iv.is_constant() && !const_iv.is_input_arg() && !const_iv.is_res_op());
+        assert!(!input_iv.is_constant() && input_iv.is_input_arg() && !input_iv.is_res_op());
+        assert!(!res_iv.is_constant() && !res_iv.is_input_arg() && res_iv.is_res_op());
+    }
+
+    // ── Typed OpRef constructors (Phase 2A) ──
+
+    #[test]
+    fn test_typed_const_constructors_match_legacy() {
+        for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
+            assert_eq!(OpRef::const_int(idx), OpRef::from_const(idx));
+            assert_eq!(OpRef::const_float(idx), OpRef::from_const(idx));
+            assert_eq!(OpRef::const_ptr(idx), OpRef::from_const(idx));
+        }
+    }
+
+    #[test]
+    fn test_typed_input_arg_constructors_match_legacy() {
+        for pos in [0u32, 1, 7, 100] {
+            assert_eq!(OpRef::input_arg_int(pos), OpRef::from_raw(pos));
+            assert_eq!(OpRef::input_arg_float(pos), OpRef::from_raw(pos));
+            assert_eq!(OpRef::input_arg_ref(pos), OpRef::from_raw(pos));
+        }
+    }
+
+    #[test]
+    fn test_typed_op_result_constructors_match_legacy() {
+        for pos in [0u32, 1, 7, 100, 1_000_000] {
+            assert_eq!(OpRef::int_op(pos), OpRef::from_raw(pos));
+            assert_eq!(OpRef::float_op(pos), OpRef::from_raw(pos));
+            assert_eq!(OpRef::ref_op(pos), OpRef::from_raw(pos));
+        }
+    }
+
+    #[test]
+    fn test_typed_constructors_classification() {
+        // is_constant() distinguishes Const family from the rest.
+        assert!(OpRef::const_int(0).is_constant());
+        assert!(OpRef::const_float(0).is_constant());
+        assert!(OpRef::const_ptr(0).is_constant());
+        assert!(!OpRef::input_arg_int(0).is_constant());
+        assert!(!OpRef::input_arg_float(0).is_constant());
+        assert!(!OpRef::input_arg_ref(0).is_constant());
+        assert!(!OpRef::int_op(0).is_constant());
+        assert!(!OpRef::float_op(0).is_constant());
+        assert!(!OpRef::ref_op(0).is_constant());
+    }
+
+    #[test]
+    fn test_typed_const_round_trip_via_const_index() {
+        for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
+            assert_eq!(OpRef::const_int(idx).const_index(), idx);
+            assert_eq!(OpRef::const_float(idx).const_index(), idx);
+            assert_eq!(OpRef::const_ptr(idx).const_index(), idx);
+        }
     }
 }

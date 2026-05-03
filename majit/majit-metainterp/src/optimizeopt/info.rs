@@ -2898,23 +2898,28 @@ mod tests {
         let mut buf = make_buf(32);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
-        buf.write_value(8, 4, d4.clone(), OpRef(20)).unwrap();
-        buf.write_value(16, 8, d.clone(), OpRef(30)).unwrap();
+        buf.write_value(0, 8, d.clone(), OpRef::from_raw(10))
+            .unwrap();
+        buf.write_value(8, 4, d4.clone(), OpRef::from_raw(20))
+            .unwrap();
+        buf.write_value(16, 8, d.clone(), OpRef::from_raw(30))
+            .unwrap();
 
-        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef(10));
-        assert_eq!(buf.read_value(8, 4, &d4).unwrap(), OpRef(20));
-        assert_eq!(buf.read_value(16, 8, &d).unwrap(), OpRef(30));
+        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef::from_raw(10));
+        assert_eq!(buf.read_value(8, 4, &d4).unwrap(), OpRef::from_raw(20));
+        assert_eq!(buf.read_value(16, 8, &d).unwrap(), OpRef::from_raw(30));
     }
 
     #[test]
     fn rawbuffer_update_same_offset() {
         let mut buf = make_buf(16);
         let d = int_descr();
-        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
-        buf.write_value(0, 8, d.clone(), OpRef(99)).unwrap();
+        buf.write_value(0, 8, d.clone(), OpRef::from_raw(10))
+            .unwrap();
+        buf.write_value(0, 8, d.clone(), OpRef::from_raw(99))
+            .unwrap();
 
-        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef(99));
+        assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef::from_raw(99));
         assert_eq!(buf.offsets.len(), 1);
     }
 
@@ -2922,9 +2927,12 @@ mod tests {
     fn rawbuffer_overlap_next() {
         let mut buf = make_buf(32);
         let d = int_descr();
-        buf.write_value(8, 8, d.clone(), OpRef(10)).unwrap();
+        buf.write_value(8, 8, d.clone(), OpRef::from_raw(10))
+            .unwrap();
         // Write at offset 4 with length 8 overlaps [8, 16)
-        let err = buf.write_value(4, 8, d.clone(), OpRef(20)).unwrap_err();
+        let err = buf
+            .write_value(4, 8, d.clone(), OpRef::from_raw(20))
+            .unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
@@ -2933,9 +2941,10 @@ mod tests {
         let mut buf = make_buf(32);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
+        buf.write_value(0, 8, d.clone(), OpRef::from_raw(10))
+            .unwrap();
         // Write at offset 4 overlaps with [0, 8)
-        let err = buf.write_value(4, 4, d4, OpRef(20)).unwrap_err();
+        let err = buf.write_value(4, 4, d4, OpRef::from_raw(20)).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
@@ -2944,8 +2953,8 @@ mod tests {
         let mut buf = make_buf(16);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d, OpRef(10)).unwrap();
-        let err = buf.write_value(0, 4, d4, OpRef(20)).unwrap_err();
+        buf.write_value(0, 8, d, OpRef::from_raw(10)).unwrap();
+        let err = buf.write_value(0, 4, d4, OpRef::from_raw(20)).unwrap_err();
         assert!(matches!(err, RawBufferError::OverlappingWrite { .. }));
     }
 
@@ -2968,7 +2977,7 @@ mod tests {
         let mut buf = make_buf(16);
         let d = int_descr();
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 8, d, OpRef(10)).unwrap();
+        buf.write_value(0, 8, d, OpRef::from_raw(10)).unwrap();
         let err = buf.read_value(0, 4, &d4).unwrap_err();
         assert_eq!(
             err,
@@ -2984,8 +2993,10 @@ mod tests {
     fn rawbuffer_read_fully_covered() {
         let mut buf = make_buf(32);
         let d = int_descr();
-        buf.write_value(0, 8, d.clone(), OpRef(10)).unwrap();
-        buf.write_value(8, 8, d.clone(), OpRef(20)).unwrap();
+        buf.write_value(0, 8, d.clone(), OpRef::from_raw(10))
+            .unwrap();
+        buf.write_value(8, 8, d.clone(), OpRef::from_raw(20))
+            .unwrap();
 
         // [0, 16) is fully covered by [0,8) + [8,16)
         assert!(buf.is_read_fully_covered(0, 16));
@@ -2999,8 +3010,10 @@ mod tests {
     fn rawbuffer_read_partially_covered_fails() {
         let mut buf = make_buf(32);
         let d4 = int_descr_sz(4);
-        buf.write_value(0, 4, d4.clone(), OpRef(10)).unwrap();
-        buf.write_value(8, 4, d4.clone(), OpRef(20)).unwrap();
+        buf.write_value(0, 4, d4.clone(), OpRef::from_raw(10))
+            .unwrap();
+        buf.write_value(8, 4, d4.clone(), OpRef::from_raw(20))
+            .unwrap();
 
         // Bytes 4..8 are not covered by any write
         assert!(!buf.is_read_fully_covered(0, 8));
@@ -3012,8 +3025,10 @@ mod tests {
     fn rawbuffer_overwritten_write_detected() {
         let mut buf = make_buf(32);
         let d4 = int_descr_sz(4);
-        buf.write_value(4, 4, d4.clone(), OpRef(10)).unwrap();
-        buf.write_value(12, 4, d4.clone(), OpRef(20)).unwrap();
+        buf.write_value(4, 4, d4.clone(), OpRef::from_raw(10))
+            .unwrap();
+        buf.write_value(12, 4, d4.clone(), OpRef::from_raw(20))
+            .unwrap();
 
         // A write [4, 12) fully contains [4, 8)
         assert_eq!(buf.find_overwritten_write(4, 8), Some(0));
@@ -3029,9 +3044,12 @@ mod tests {
     fn rawbuffer_sorted_insertion() {
         let mut buf = make_buf(32);
         let d4 = int_descr_sz(4);
-        buf.write_value(16, 4, d4.clone(), OpRef(30)).unwrap();
-        buf.write_value(0, 4, d4.clone(), OpRef(10)).unwrap();
-        buf.write_value(8, 4, d4.clone(), OpRef(20)).unwrap();
+        buf.write_value(16, 4, d4.clone(), OpRef::from_raw(30))
+            .unwrap();
+        buf.write_value(0, 4, d4.clone(), OpRef::from_raw(10))
+            .unwrap();
+        buf.write_value(8, 4, d4.clone(), OpRef::from_raw(20))
+            .unwrap();
 
         // Entries should be sorted by offset
         assert_eq!(buf.offsets[0], 0);
@@ -3078,22 +3096,34 @@ mod tests {
         let mut buf = make_buf(16);
 
         // Write with ArrayS_8_1
-        buf.write_value(0, 4, array_s_8_1.clone(), OpRef(10))
+        buf.write_value(0, 4, array_s_8_1.clone(), OpRef::from_raw(10))
             .unwrap();
 
         // Read with same descr
-        assert_eq!(buf.read_value(0, 4, &array_s_8_1).unwrap(), OpRef(10));
+        assert_eq!(
+            buf.read_value(0, 4, &array_s_8_1).unwrap(),
+            OpRef::from_raw(10)
+        );
         // Read with non-identical but compatible descr
-        assert_eq!(buf.read_value(0, 4, &array_s_8_2).unwrap(), OpRef(10));
+        assert_eq!(
+            buf.read_value(0, 4, &array_s_8_2).unwrap(),
+            OpRef::from_raw(10)
+        );
 
         // Overwrite with non-identical compatible descr
-        buf.write_value(0, 4, array_s_8_2.clone(), OpRef(20))
+        buf.write_value(0, 4, array_s_8_2.clone(), OpRef::from_raw(20))
             .unwrap();
-        assert_eq!(buf.read_value(0, 4, &array_s_8_1).unwrap(), OpRef(20));
+        assert_eq!(
+            buf.read_value(0, 4, &array_s_8_1).unwrap(),
+            OpRef::from_raw(20)
+        );
 
         // Incompatible descr (unsigned) must fail
         assert!(buf.read_value(0, 4, &array_u_8).is_err());
-        assert!(buf.write_value(0, 4, array_u_8, OpRef(30)).is_err());
+        assert!(
+            buf.write_value(0, 4, array_u_8, OpRef::from_raw(30))
+                .is_err()
+        );
     }
 
     #[test]
@@ -3160,13 +3190,13 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
-            lgtop: Some(OpRef(3)), // vstring.py:223: self.lgtop = length
+            lgtop: Some(OpRef::from_raw(3)), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
-                s: OpRef(1),
-                start: OpRef(2),
-                lgtop: OpRef(3),
+                s: OpRef::from_raw(1),
+                start: OpRef::from_raw(2),
+                lgtop: OpRef::from_raw(3),
             }),
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
@@ -3179,8 +3209,8 @@ mod tests {
             mode: 0,
             length: -1,
             variant: VStringVariant::Concat(VStringConcatInfo {
-                vleft: OpRef(4),
-                vright: OpRef(5),
+                vleft: OpRef::from_raw(4),
+                vright: OpRef::from_raw(5),
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
@@ -3203,9 +3233,9 @@ mod tests {
     #[test]
     fn test_str_ptr_info_constant_string_spec_and_strgetitem() {
         let mut ctx = OptContext::new(16);
-        ctx.make_constant(OpRef(10), Value::Int(97));
-        ctx.make_constant(OpRef(11), Value::Int(98));
-        ctx.make_constant(OpRef(12), Value::Int(99));
+        ctx.make_constant(OpRef::from_raw(10), Value::Int(97));
+        ctx.make_constant(OpRef::from_raw(11), Value::Int(98));
+        ctx.make_constant(OpRef::from_raw(12), Value::Int(99));
 
         let info = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
@@ -3213,7 +3243,11 @@ mod tests {
             mode: 0,
             length: 3,
             variant: VStringVariant::Plain(VStringPlainInfo {
-                _chars: vec![Some(OpRef(10)), Some(OpRef(11)), Some(OpRef(12))],
+                _chars: vec![
+                    Some(OpRef::from_raw(10)),
+                    Some(OpRef::from_raw(11)),
+                    Some(OpRef::from_raw(12)),
+                ],
             }),
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
@@ -3224,19 +3258,19 @@ mod tests {
             Some(vec![97, 98, 99])
         );
         assert_eq!(info.get_known_str_length(&ctx, 0), Some(3));
-        assert_eq!(info.strgetitem(1, &ctx), Some(OpRef(11)));
+        assert_eq!(info.strgetitem(1, &ctx), Some(OpRef::from_raw(11)));
     }
 
     #[test]
     fn test_str_ptr_info_slice_and_concat_dispatch() {
         let mut ctx = OptContext::new(32);
-        ctx.make_constant(OpRef(10), Value::Int(97));
-        ctx.make_constant(OpRef(11), Value::Int(98));
-        ctx.make_constant(OpRef(12), Value::Int(99));
-        ctx.make_constant(OpRef(20), Value::Int(1));
-        ctx.make_constant(OpRef(21), Value::Int(2));
+        ctx.make_constant(OpRef::from_raw(10), Value::Int(97));
+        ctx.make_constant(OpRef::from_raw(11), Value::Int(98));
+        ctx.make_constant(OpRef::from_raw(12), Value::Int(99));
+        ctx.make_constant(OpRef::from_raw(20), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(21), Value::Int(2));
 
-        let source = OpRef(1);
+        let source = OpRef::from_raw(1);
         ctx.set_ptr_info(
             source,
             PtrInfo::Str(StrPtrInfo {
@@ -3245,7 +3279,11 @@ mod tests {
                 mode: 0,
                 length: 3,
                 variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: vec![Some(OpRef(10)), Some(OpRef(11)), Some(OpRef(12))],
+                    _chars: vec![
+                        Some(OpRef::from_raw(10)),
+                        Some(OpRef::from_raw(11)),
+                        Some(OpRef::from_raw(12)),
+                    ],
                 }),
                 last_guard_pos: -1,
                 cached_vinfo: std::cell::RefCell::new(None),
@@ -3254,20 +3292,20 @@ mod tests {
 
         let slice = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
-            lgtop: Some(OpRef(21)), // vstring.py:223: self.lgtop = length
+            lgtop: Some(OpRef::from_raw(21)), // vstring.py:223: self.lgtop = length
             mode: 0,
             length: -1,
             variant: VStringVariant::Slice(VStringSliceInfo {
                 s: source,
-                start: OpRef(20),
-                lgtop: OpRef(21),
+                start: OpRef::from_raw(20),
+                lgtop: OpRef::from_raw(21),
             }),
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         });
         assert_eq!(slice.get_known_str_length(&ctx, 0), Some(2));
         assert_eq!(slice.get_constant_string_spec(&ctx, 0), Some(vec![98, 99]));
-        assert_eq!(slice.strgetitem(0, &ctx), Some(OpRef(11)));
+        assert_eq!(slice.strgetitem(0, &ctx), Some(OpRef::from_raw(11)));
 
         let concat = PtrInfo::Str(StrPtrInfo {
             lenbound: None,
@@ -3276,21 +3314,21 @@ mod tests {
             length: -1,
             variant: VStringVariant::Concat(VStringConcatInfo {
                 vleft: source,
-                vright: OpRef(2),
+                vright: OpRef::from_raw(2),
                 _is_virtual: true,
             }),
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         });
         ctx.set_ptr_info(
-            OpRef(2),
+            OpRef::from_raw(2),
             PtrInfo::Str(StrPtrInfo {
                 lenbound: None,
                 lgtop: None,
                 mode: 0,
                 length: 2,
                 variant: VStringVariant::Plain(VStringPlainInfo {
-                    _chars: vec![Some(OpRef(11)), Some(OpRef(12))],
+                    _chars: vec![Some(OpRef::from_raw(11)), Some(OpRef::from_raw(12))],
                 }),
                 last_guard_pos: -1,
                 cached_vinfo: std::cell::RefCell::new(None),
@@ -3302,7 +3340,7 @@ mod tests {
             concat.get_constant_string_spec(&ctx, 0),
             Some(vec![97, 98, 99, 98, 99])
         );
-        assert_eq!(concat.strgetitem(3, &ctx), Some(OpRef(11)));
+        assert_eq!(concat.strgetitem(3, &ctx), Some(OpRef::from_raw(11)));
     }
 
     #[test]
@@ -3311,12 +3349,21 @@ mod tests {
         let mut info = PtrInfo::virtual_obj(descr, None);
 
         assert!(info.getfield(0).is_none());
-        info.setfield(0, OpRef(10));
-        assert_eq!(info.getfield(0).and_then(|e| e.as_opref()), Some(OpRef(10)));
-        info.setfield(0, OpRef(20)); // overwrite
-        assert_eq!(info.getfield(0).and_then(|e| e.as_opref()), Some(OpRef(20)));
-        info.setfield(1, OpRef(30));
-        assert_eq!(info.getfield(1).and_then(|e| e.as_opref()), Some(OpRef(30)));
+        info.setfield(0, OpRef::from_raw(10));
+        assert_eq!(
+            info.getfield(0).and_then(|e| e.as_opref()),
+            Some(OpRef::from_raw(10))
+        );
+        info.setfield(0, OpRef::from_raw(20)); // overwrite
+        assert_eq!(
+            info.getfield(0).and_then(|e| e.as_opref()),
+            Some(OpRef::from_raw(20))
+        );
+        info.setfield(1, OpRef::from_raw(30));
+        assert_eq!(
+            info.getfield(1).and_then(|e| e.as_opref()),
+            Some(OpRef::from_raw(30))
+        );
     }
 
     #[test]
@@ -3328,10 +3375,16 @@ mod tests {
             info.getitem(0).and_then(|e| e.as_opref()),
             Some(OpRef::NONE)
         ); // initialized to NONE
-        info.setitem(0, OpRef(10));
-        assert_eq!(info.getitem(0).and_then(|e| e.as_opref()), Some(OpRef(10)));
-        info.setitem(2, OpRef(30));
-        assert_eq!(info.getitem(2).and_then(|e| e.as_opref()), Some(OpRef(30)));
+        info.setitem(0, OpRef::from_raw(10));
+        assert_eq!(
+            info.getitem(0).and_then(|e| e.as_opref()),
+            Some(OpRef::from_raw(10))
+        );
+        info.setitem(2, OpRef::from_raw(30));
+        assert_eq!(
+            info.getitem(2).and_then(|e| e.as_opref()),
+            Some(OpRef::from_raw(30))
+        );
         assert!(info.getitem(5).is_none()); // out of bounds
     }
 
@@ -3339,14 +3392,20 @@ mod tests {
     fn test_preamble_item_keeps_regular_array_item_visible() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative());
-        info.setitem(1, OpRef(77));
-        assert_eq!(info.getitem(1).and_then(|e| e.as_opref()), Some(OpRef(77)));
+        info.setitem(1, OpRef::from_raw(77));
+        assert_eq!(
+            info.getitem(1).and_then(|e| e.as_opref()),
+            Some(OpRef::from_raw(77))
+        );
 
-        let mut replay = Op::new(OpCode::GetarrayitemGcI, &[OpRef(10), OpRef::from_const(0)]);
-        replay.pos = OpRef(88);
+        let mut replay = Op::new(
+            OpCode::GetarrayitemGcI,
+            &[OpRef::from_raw(10), OpRef::from_const(0)],
+        );
+        replay.pos = OpRef::from_raw(88);
         let pop = PreambleOp {
-            op: OpRef(88),
-            resolved: OpRef(99),
+            op: OpRef::from_raw(88),
+            resolved: OpRef::from_raw(99),
             invented_name: false,
             preamble_op: replay,
         };
@@ -3358,7 +3417,7 @@ mod tests {
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");
-        assert_eq!(recovered.resolved, OpRef(99));
+        assert_eq!(recovered.resolved, OpRef::from_raw(99));
         // After take_preamble_item, slot is Value(NONE)
         assert_eq!(
             info.getitem(1).and_then(|e| e.as_opref()),
@@ -3370,10 +3429,10 @@ mod tests {
     fn test_all_items_exposes_preamble_source_box() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::instance(Some(descr), None);
-        let replay = Op::new(OpCode::GetfieldGcI, &[OpRef(10)]);
+        let replay = Op::new(OpCode::GetfieldGcI, &[OpRef::from_raw(10)]);
         let pop = PreambleOp {
-            op: OpRef(88),
-            resolved: OpRef(99),
+            op: OpRef::from_raw(88),
+            resolved: OpRef::from_raw(99),
             invented_name: false,
             preamble_op: replay,
         };
@@ -3405,10 +3464,10 @@ mod tests {
     fn test_ptr_info_visitor_walk() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::virtual_obj(descr, None);
-        info.setfield(0, OpRef(10));
-        info.setfield(1, OpRef(20));
+        info.setfield(0, OpRef::from_raw(10));
+        info.setfield(1, OpRef::from_raw(20));
         let refs = info.visitor_walk_recursive();
-        assert_eq!(refs, vec![OpRef(10), OpRef(20)]);
+        assert_eq!(refs, vec![OpRef::from_raw(10), OpRef::from_raw(20)]);
     }
 
     #[test]

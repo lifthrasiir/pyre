@@ -59,7 +59,7 @@ pub fn trace_bytecode(
     let start_key = crate::driver::make_green_key(w_code, start_pc);
     {
         let input_args: Vec<majit_ir::OpRef> = (0..ctx.num_inputs())
-            .map(|i| majit_ir::OpRef(i as u32))
+            .map(|i| majit_ir::OpRef::from_raw(i as u32))
             .collect();
         let input_types = ctx.inputarg_types();
         ctx.add_merge_point(start_key, input_args, input_types, start_pc);

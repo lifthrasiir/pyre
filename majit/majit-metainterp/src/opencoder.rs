@@ -253,7 +253,7 @@ impl<'a> TraceIterator<'a> {
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
-        num_inputargs: usize,
+        inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
     ) -> Self {
         // self._cache = [None] * trace._index
@@ -261,6 +261,7 @@ impl<'a> TraceIterator<'a> {
         // position we may encounter. RPython sizes it from `trace._index`
         // (the encoder's monotonic op-result counter); here the equivalent
         // is the maximum raw position seen in `trace[start..end]` plus one.
+        let num_inputargs = inputarg_types.len();
         let max_pos = trace[start..end]
             .iter()
             .flat_map(|op| {
@@ -269,7 +270,7 @@ impl<'a> TraceIterator<'a> {
                     .chain(op.fail_args.iter().flat_map(|fa| fa.iter().copied()))
             })
             .filter(|opref| !opref.is_none() && !opref.is_constant())
-            .map(|opref| opref.0)
+            .map(|opref| opref.raw())
             .max()
             .unwrap_or(0);
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
@@ -277,33 +278,44 @@ impl<'a> TraceIterator<'a> {
         let mut _fresh = start_fresh;
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
-            // self.inputargs = [rop.inputarg_from_tp(arg.type) for
-            //                   arg in force_inputargs]
-            // for i, arg in enumerate(force_inputargs):
-            //     self._cache[arg.get_position()] = self.inputargs[i]
+            // opencoder.py:259-262 self.inputargs =
+            //     [rop.inputarg_from_tp(arg.type) for arg in force_inputargs]
+            //   for i, arg in enumerate(force_inputargs):
+            //       self._cache[arg.get_position()] = self.inputargs[i]
             inputargs = force
                 .iter()
-                .map(|_| {
-                    let r = OpRef(_fresh);
+                .map(|arg| {
+                    // opencoder.py:259-262: rop.inputarg_from_tp(arg.type)
+                    // — every force_inputargs entry has a known type tag.
+                    let tp = arg.ty().unwrap_or_else(|| {
+                        panic!(
+                            "TraceIterator::new(force_inputargs): untyped OpRef ({:?}) — \
+                             upstream `inputarg_from_tp(arg.type)` requires every entry to \
+                             carry a type tag",
+                            arg
+                        )
+                    });
+                    let r = OpRef::input_arg_typed(_fresh, tp);
                     _fresh += 1;
                     r
                 })
                 .collect();
             for (i, &arg) in force.iter().enumerate() {
-                let p = arg.0 as usize;
+                let p = arg.raw() as usize;
                 if p >= _cache.len() {
                     _cache.resize(p + 1, None);
                 }
                 _cache[p] = Some(inputargs[i]);
             }
         } else {
-            // self.inputargs = [rop.inputarg_from_tp(arg.type) for
-            //                   arg in self.trace.inputargs]
-            // for i, arg in enumerate(self.inputargs):
-            //     self._cache[self.trace.inputargs[i].get_position()] = arg
-            inputargs = (0..num_inputargs)
-                .map(|_| {
-                    let r = OpRef(_fresh);
+            // opencoder.py:264-267 self.inputargs =
+            //     [rop.inputarg_from_tp(arg.type) for arg in self.trace.inputargs]
+            //   for i, arg in enumerate(self.inputargs):
+            //       self._cache[self.trace.inputargs[i].get_position()] = arg
+            inputargs = inputarg_types
+                .iter()
+                .map(|&tp| {
+                    let r = OpRef::input_arg_typed(_fresh, tp);
                     _fresh += 1;
                     r
                 })
@@ -358,7 +370,7 @@ impl<'a> TraceIterator<'a> {
         if opref.is_none() || opref.is_constant() {
             opref
         } else {
-            self._get(opref.0 as usize)
+            self._get(opref.raw() as usize)
         }
     }
 
@@ -415,11 +427,11 @@ impl<'a> TraceIterator<'a> {
         // with the void op's raw `pos`. With this in place,
         // `start_fresh = 0` over a recorder-emitted trace produces a
         // bit-identical sequence of OpRefs (every op `i` gets
-        // `OpRef(num_inputs + i)`, matching `recorder.record_op`'s
+        // `OpRef::from_raw(num_inputs + i)`, matching `recorder.record_op`'s
         // monotonic `op_count`).
         let is_void_result = src.pos.is_none() || src.opcode.result_type() == majit_ir::Type::Void;
         if !is_void_result {
-            let orig = src.pos.0 as usize;
+            let orig = src.pos.raw() as usize;
             if orig >= self._cache.len() {
                 self._cache.resize(orig + 1, None);
             }
@@ -427,8 +439,11 @@ impl<'a> TraceIterator<'a> {
             // instance and then overwrites `_cache[self._index]` with it.
             // Reusing an existing cache entry collapses distinct box
             // identities when a raw op slot collides with an inputarg or
-            // earlier phase-local box.
-            let fresh = OpRef(self._fresh);
+            // earlier phase-local box. The ResOp class (`opclasses[opnum]`
+            // / cls()) is intrinsically typed via the IntOp/FloatOp/RefOp
+            // mixin (resoperation.py:564-638); pyre uses
+            // `opcode.result_type()`.
+            let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
             self._fresh += 1;
             self._cache[orig] = Some(fresh);
             res.pos = fresh;
@@ -444,8 +459,9 @@ impl<'a> TraceIterator<'a> {
             // fresh OpRef so the `_fresh` counter stays in lockstep with
             // the raw trace position counter. The op is not cached
             // (RPython doesn't cache void results either), so later args
-            // never reference it.
-            let f = OpRef(self._fresh);
+            // never reference it. `AbstractResOp.type = 'v'`
+            // (resoperation.py:260) → VoidOp variant.
+            let f = OpRef::void_op(self._fresh);
             self._fresh += 1;
             res.pos = f;
         } else {
@@ -490,11 +506,15 @@ pub struct CutTrace<'a> {
     pub start: usize,
     pub count: u32,
     pub index: u32,
-    /// Templates: each `Box::ResOp(p)` names an op position in the
-    /// parent trace; `get_iter` seeds `_cache[p]` with the fresh
-    /// OpRef so downstream TAGBOX(p) decodes resolve to the new
-    /// iterator-local inputarg.
-    pub inputargs: Vec<Box>,
+    /// Templates: each typed `OpRef` names an op position in the
+    /// parent trace and carries that op's result type; `get_iter`
+    /// seeds `_cache[opref.raw()]` with the fresh OpRef so downstream
+    /// TAGBOX(p) decodes resolve to the new iterator-local inputarg.
+    /// Mirrors RPython `cut_trace_from(cut, inputargs)` where
+    /// `inputargs` is a list of `Box{Int,Float,Ref}` — each Box
+    /// carries `Box.type` (`history.py:182 AbstractValue.type`) which
+    /// pyre encodes as the typed `OpRef` variant tag.
+    pub inputargs: Vec<OpRef>,
     _marker: std::marker::PhantomData<&'a TraceRecordBuffer>,
 }
 
@@ -595,13 +615,16 @@ impl<'a> ByteTraceIter<'a> {
         start_fresh: u32,
         const_pool: Option<&'a mut crate::constant_pool::ConstantPool>,
     ) -> Self {
-        let num_inputargs = trace.inputargs.len();
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
-        let inputargs: Vec<OpRef> = (0..num_inputargs)
-            .map(|_| {
-                let r = OpRef(_fresh);
+        // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
+        // self.trace.inputargs]` — type comes from each `InputArg.tp`.
+        let inputargs: Vec<OpRef> = trace
+            .inputargs
+            .iter()
+            .map(|ia| {
+                let r = OpRef::input_arg_typed(_fresh, ia.tp);
                 _fresh += 1;
                 r
             })
@@ -630,17 +653,20 @@ impl<'a> ByteTraceIter<'a> {
 
     /// opencoder.py:250-273 + opencoder.py:421-427 `CutTrace.get_iter`
     /// — specialised `TraceIterator` constructor for `cut_trace_from`
-    /// that seeds `_cache` from explicit inputarg templates (Boxes
-    /// whose `ResOp` position is the location the op originally lived
-    /// at in the uncut trace).  The seeded fresh OpRefs are the
-    /// iterator-local inputargs the cut sub-trace operates over.
+    /// that seeds `_cache` from explicit typed-`OpRef` inputarg
+    /// templates.  Each template names an op position in the uncut
+    /// trace and carries that op's result type via its variant tag,
+    /// matching RPython's `Box.type` (`history.py:182`).  The seeded
+    /// fresh OpRefs reuse the template's type via
+    /// `OpRef::input_arg_typed`, so downstream consumers preserve the
+    /// `Box.type` invariant the cut sub-trace operates under.
     pub fn new_for_cut(
         trace: &'a TraceRecordBuffer,
         start: usize,
         end: usize,
         count: u32,
         index: u32,
-        inputarg_templates: &[Box],
+        inputarg_templates: &[OpRef],
         const_pool: Option<&'a mut crate::constant_pool::ConstantPool>,
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
@@ -648,28 +674,32 @@ impl<'a> ByteTraceIter<'a> {
         let mut inputargs: Vec<OpRef> = Vec::with_capacity(inputarg_templates.len());
         let mut _fresh = 0u32;
         for &template in inputarg_templates {
-            let fresh_ref = OpRef(_fresh);
-            _fresh += 1;
-            inputargs.push(fresh_ref);
-            // Only `ResOp(p)` templates carry a raw position we can map.
             // Constant templates would imply the cut sub-trace treats a
             // literal as an inputarg — not a shape RPython's
-            // `cut_trace_from` emits — so panic rather than silently
-            // drop the seed.
-            match template {
-                Box::ResOp(p) => {
-                    let slot = p as usize;
-                    if slot >= _cache.len() {
-                        _cache.resize(slot + 1, None);
-                    }
-                    _cache[slot] = Some(fresh_ref);
-                }
-                _ => panic!(
-                    "ByteTraceIter::new_for_cut: non-ResOp inputarg template {:?} has \
+            // `cut_trace_from` emits — so reject up front rather than
+            // silently substitute.
+            if template.is_constant() {
+                panic!(
+                    "ByteTraceIter::new_for_cut: constant inputarg template {:?} has \
                      no original trace position to map into `_cache`",
                     template
-                ),
+                );
             }
+            let tp = template.ty().unwrap_or_else(|| {
+                panic!(
+                    "ByteTraceIter::new_for_cut: untyped inputarg template {:?} has no \
+                     `Box.type` to carry into the fresh inputarg variant",
+                    template
+                )
+            });
+            let fresh_ref = OpRef::input_arg_typed(_fresh, tp);
+            _fresh += 1;
+            inputargs.push(fresh_ref);
+            let slot = template.raw() as usize;
+            if slot >= _cache.len() {
+                _cache.resize(slot + 1, None);
+            }
+            _cache[slot] = Some(fresh_ref);
         }
         ByteTraceIter {
             trace,
@@ -844,7 +874,12 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             None => majit_ir::Op::new(opcode, &args),
         };
         op.rd_resume_position = rd_resume_position;
-        let fresh_pos = OpRef(self._fresh);
+        // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
+        // the ResOp class is intrinsically typed via the IntOp/FloatOp/
+        // RefOp mixin (resoperation.py:564-638) or the AbstractResOp
+        // default `'v'` (resoperation.py:260). pyre routes through
+        // `op_typed` which lands on the matching variant.
+        let fresh_pos = OpRef::op_typed(self._fresh, opcode.result_type());
         self._fresh += 1;
         op.pos = fresh_pos;
         // opencoder.py:429-431 — cache non-void result at `_index`, bump.
@@ -1242,7 +1277,7 @@ fn update_live_from_tagged(tagged: i64, index: usize, liveranges: &mut [usize]) 
 /// * `ResOp` — RPython `AbstractResOp.get_position()` value. Also
 ///   covers `AbstractInputArg` because both types expose
 ///   `get_position()` returning the same `_index` slot (pyre's
-///   `OpRef(u32)` unifies them).
+///   `OpRef::from_raw(u32)` unifies them).
 ///
 /// Tagged values can also be pre-computed via the free `_encode_*`
 /// helpers (`_encode_smallint`, `_encode_bigint`, `_encode_float`,
@@ -1267,10 +1302,10 @@ pub enum Box {
 }
 
 impl Box {
-    /// Convenience: `Box::ResOp(opref.0)`.
+    /// Convenience: `Box::ResOp(opref.raw())`.
     #[inline]
     pub fn of_op(op: majit_ir::OpRef) -> Self {
-        Box::ResOp(op.0)
+        Box::ResOp(op.raw())
     }
 }
 
@@ -1481,7 +1516,7 @@ impl TraceRecordBuffer {
             self.max_num_inputargs
         );
         self.inputargs.push(InputArg::from_type(tp, index));
-        OpRef(index)
+        OpRef::input_arg_typed(index, tp)
     }
 
     /// Number of inputargs registered so far.
@@ -1682,7 +1717,7 @@ impl TraceRecordBuffer {
     pub fn cut_trace_from(
         &self,
         cut: crate::recorder::TracePosition,
-        inputargs: Vec<Box>,
+        inputargs: Vec<OpRef>,
     ) -> CutTrace<'_> {
         CutTrace {
             trace: self as *const _ as *mut _,
@@ -2832,7 +2867,7 @@ mod tests {
     /// Helper: build an Op with a specific raw trace position.
     fn op_at(pos: u32, opcode: majit_ir::OpCode, args: &[OpRef]) -> majit_ir::Op {
         let mut op = majit_ir::Op::new(opcode, args);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
@@ -2842,37 +2877,45 @@ mod tests {
         //
         // Phase-1 iteration over a 2-inputarg trace producing two IntAdd
         // results. Inputargs occupy positions [0, 2); the first non-void
-        // result is allocated at OpRef(2) (= start_fresh = num_inputargs).
+        // result is allocated at OpRef::from_raw(2) (= start_fresh = num_inputargs).
         let ops = vec![
-            op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            op_at(3, majit_ir::OpCode::IntAdd, &[OpRef(2), OpRef(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(3)]),
+            op_at(
+                2,
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            op_at(
+                3,
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::from_raw(2), OpRef::from_raw(0)],
+            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef::from_raw(3)]),
         ];
-        let num_inputargs = 2;
+        let inputarg_types = vec![majit_ir::Type::Int; 2];
 
         // Phase 1 / legacy layout: start_fresh = 0 → inputargs allocated
-        // at [OpRef(0), OpRef(1)], op results follow at [OpRef(2), …).
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, 0);
-        assert_eq!(iter.inputargs, vec![OpRef(0), OpRef(1)]);
-        assert_eq!(iter._cache[0], Some(OpRef(0)));
-        assert_eq!(iter._cache[1], Some(OpRef(1)));
+        // at [OpRef::from_raw(0), OpRef::from_raw(1)], op results follow at [OpRef::from_raw(2), …).
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
+        assert_eq!(iter.inputargs, vec![OpRef::from_raw(0), OpRef::from_raw(1)]);
+        assert_eq!(iter._cache[0], Some(OpRef::from_raw(0)));
+        assert_eq!(iter._cache[1], Some(OpRef::from_raw(1)));
 
-        // First IntAdd: result at fresh OpRef(2), args translated via cache.
+        // First IntAdd: result at fresh OpRef::from_raw(2), args translated via cache.
         let r1 = iter.next().unwrap();
-        assert_eq!(r1.pos, OpRef(2));
-        assert_eq!(r1.args[0], OpRef(0));
-        assert_eq!(r1.args[1], OpRef(1));
+        assert_eq!(r1.pos, OpRef::from_raw(2));
+        assert_eq!(r1.args[0], OpRef::from_raw(0));
+        assert_eq!(r1.args[1], OpRef::from_raw(1));
 
-        // Second IntAdd: result at fresh OpRef(3); first arg references the
-        // previous result (raw pos 2 → cached OpRef(2)).
+        // Second IntAdd: result at fresh OpRef::from_raw(3); first arg references the
+        // previous result (raw pos 2 → cached OpRef::from_raw(2)).
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.pos, OpRef(3));
-        assert_eq!(r2.args[0], OpRef(2));
-        assert_eq!(r2.args[1], OpRef(0));
+        assert_eq!(r2.pos, OpRef::from_raw(3));
+        assert_eq!(r2.args[0], OpRef::from_raw(2));
+        assert_eq!(r2.args[1], OpRef::from_raw(0));
 
-        // Finish is void: pos unchanged, arg cached → OpRef(3).
+        // Finish is void: pos unchanged, arg cached → OpRef::from_raw(3).
         let finish = iter.next().unwrap();
-        assert_eq!(finish.args[0], OpRef(3));
+        assert_eq!(finish.args[0], OpRef::from_raw(3));
         assert!(iter.done());
     }
 
@@ -2886,15 +2929,23 @@ mod tests {
         // each phase passes a different `start_fresh` and the iterator
         // produces disjoint OpRefs by construction.
         let ops = vec![
-            op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            op_at(3, majit_ir::OpCode::IntAdd, &[OpRef(2), OpRef(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(3)]),
+            op_at(
+                2,
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            op_at(
+                3,
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::from_raw(2), OpRef::from_raw(0)],
+            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef::from_raw(3)]),
         ];
-        let num_inputargs = 2;
+        let inputarg_types = vec![majit_ir::Type::Int; 2];
 
         // Phase 1: start_fresh = 0 reproduces the legacy positional layout
         // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
-        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, 0);
+        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let mut p1_ops = Vec::new();
         while let Some(op) = p1.next() {
             p1_ops.push(op);
@@ -2907,29 +2958,29 @@ mod tests {
         assert_eq!(p1._index, 4);
 
         // Phase 2: start_fresh = phase1 high water → disjoint namespace.
-        let mut p2 = TraceIterator::new(&ops, 0, ops.len(), None, num_inputargs, p1_high_water);
+        let mut p2 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, p1_high_water);
         let mut p2_ops = Vec::new();
         while let Some(op) = p2.next() {
             p2_ops.push(op);
         }
-        assert_eq!(p2.inputargs, vec![OpRef(4), OpRef(5)]);
-        assert_eq!(p2_ops[0].pos, OpRef(6));
-        assert_eq!(p2_ops[0].args[0], OpRef(4));
-        assert_eq!(p2_ops[0].args[1], OpRef(5));
-        assert_eq!(p2_ops[1].pos, OpRef(7));
-        assert_eq!(p2_ops[1].args[0], OpRef(6));
-        assert_eq!(p2_ops[1].args[1], OpRef(4));
-        assert_eq!(p2_ops[2].args[0], OpRef(7));
+        assert_eq!(p2.inputargs, vec![OpRef::from_raw(4), OpRef::from_raw(5)]);
+        assert_eq!(p2_ops[0].pos, OpRef::from_raw(6));
+        assert_eq!(p2_ops[0].args[0], OpRef::from_raw(4));
+        assert_eq!(p2_ops[0].args[1], OpRef::from_raw(5));
+        assert_eq!(p2_ops[1].pos, OpRef::from_raw(7));
+        assert_eq!(p2_ops[1].args[0], OpRef::from_raw(6));
+        assert_eq!(p2_ops[1].args[1], OpRef::from_raw(4));
+        assert_eq!(p2_ops[2].args[0], OpRef::from_raw(7));
 
         // No Phase 1 OpRef equals any Phase 2 OpRef.
         let p1_set: std::collections::HashSet<u32> = p1_ops
             .iter()
-            .map(|op| op.pos.0)
+            .map(|op| op.pos.raw())
             .filter(|&p| p != u32::MAX)
             .collect();
         let p2_set: std::collections::HashSet<u32> = p2_ops
             .iter()
-            .map(|op| op.pos.0)
+            .map(|op| op.pos.raw())
             .filter(|&p| p != u32::MAX)
             .collect();
         assert!(p1_set.is_disjoint(&p2_set));
@@ -2941,11 +2992,16 @@ mod tests {
         // pass through unchanged. In majit, constant OpRefs (is_constant
         // high-bit marker) must NOT be remapped through `_cache`.
         let const_ref = OpRef::from_const(5);
-        let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), const_ref])];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 0);
+        let ops = vec![op_at(
+            1,
+            majit_ir::OpCode::IntAdd,
+            &[OpRef::from_raw(0), const_ref],
+        )];
+        let inputarg_types = vec![majit_ir::Type::Int; 1];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
         let r = iter.next().unwrap();
-        assert_eq!(r.pos, OpRef(1));
-        assert_eq!(r.args[0], OpRef(0));
+        assert_eq!(r.pos, OpRef::from_raw(1));
+        assert_eq!(r.args[0], OpRef::from_raw(0));
         assert_eq!(r.args[1], const_ref);
     }
 
@@ -2959,29 +3015,38 @@ mod tests {
         // is still the raw trace position, so `_index` must stay in raw
         // trace position coordinates.
         let ops = vec![
-            op_at(1, majit_ir::OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
-            op_at(2, majit_ir::OpCode::IntAdd, &[OpRef(1), OpRef(0)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(2)]),
+            op_at(
+                1,
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::from_raw(0), OpRef::from_raw(0)],
+            ),
+            op_at(
+                2,
+                majit_ir::OpCode::IntAdd,
+                &[OpRef::from_raw(1), OpRef::from_raw(0)],
+            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef::from_raw(2)]),
         ];
         // Shifted phase: start_fresh = 100 so any confusion between
         // _index (raw trace position) and _fresh (fresh OpRef counter)
         // surfaces as an out-of-bounds panic or stale cache slot.
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 100);
+        let inputarg_types = vec![majit_ir::Type::Int; 1];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
         let r1 = iter.next().unwrap();
         // After writing raw pos 1, _index should be 2 (next slot).
         assert_eq!(iter._index, 2);
-        assert_eq!(r1.pos, OpRef(101));
-        // replace_last_cached(oldbox=OpRef(101), new_box=OpRef(999))
+        assert_eq!(r1.pos, OpRef::from_raw(101));
+        // replace_last_cached(oldbox=OpRef::from_raw(101), new_box=OpRef::from_raw(999))
         // must target _cache[_index - 1] = _cache[1], where the last
-        // write placed OpRef(101).
-        iter.replace_last_cached(OpRef(101), OpRef(999));
-        assert_eq!(iter._cache[1], Some(OpRef(999)));
+        // write placed OpRef::from_raw(101).
+        iter.replace_last_cached(OpRef::from_raw(101), OpRef::from_raw(999));
+        assert_eq!(iter._cache[1], Some(OpRef::from_raw(999)));
 
         // The next op references raw pos 1 as its first arg, so the
         // replaced value should flow through _untag → _get.
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.args[0], OpRef(999));
-        assert_eq!(r2.args[1], OpRef(100));
+        assert_eq!(r2.args[0], OpRef::from_raw(999));
+        assert_eq!(r2.args[1], OpRef::from_raw(100));
         // After writing raw pos 2, _index advances to 3.
         assert_eq!(iter._index, 3);
     }
@@ -2990,22 +3055,27 @@ mod tests {
     fn test_trace_iterator_fail_args_remapped() {
         // opencoder.py:362-406 next() routes guard fail_args through the
         // same _untag/_get path as regular args.
-        let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[OpRef(1)]);
-        guard.fail_args = Some(vec![OpRef(0), OpRef(1)].into());
+        let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[OpRef::from_raw(1)]);
+        guard.fail_args = Some(vec![OpRef::from_raw(0), OpRef::from_raw(1)].into());
         let ops = vec![
-            op_at(1, majit_ir::OpCode::IntEq, &[OpRef(0), OpRef(0)]),
+            op_at(
+                1,
+                majit_ir::OpCode::IntEq,
+                &[OpRef::from_raw(0), OpRef::from_raw(0)],
+            ),
             guard,
         ];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 1, 10);
+        let inputarg_types = vec![majit_ir::Type::Int; 1];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10);
         let r1 = iter.next().unwrap();
-        assert_eq!(r1.pos, OpRef(11));
-        assert_eq!(r1.args[0], OpRef(10));
-        assert_eq!(r1.args[1], OpRef(10));
+        assert_eq!(r1.pos, OpRef::from_raw(11));
+        assert_eq!(r1.args[0], OpRef::from_raw(10));
+        assert_eq!(r1.args[1], OpRef::from_raw(10));
         let r2 = iter.next().unwrap();
-        assert_eq!(r2.args[0], OpRef(11));
+        assert_eq!(r2.args[0], OpRef::from_raw(11));
         let fa = r2.fail_args.as_ref().unwrap();
-        assert_eq!(fa[0], OpRef(10));
-        assert_eq!(fa[1], OpRef(11));
+        assert_eq!(fa[0], OpRef::from_raw(10));
+        assert_eq!(fa[1], OpRef::from_raw(11));
     }
 
     #[test]
@@ -3013,29 +3083,47 @@ mod tests {
         // RPython next() allocates a fresh result box even when the raw trace
         // position collides with an already-seeded inputarg cache slot.
         let ops = vec![
-            op_at(3, majit_ir::OpCode::GetfieldRawI, &[OpRef(0)]),
-            op_at(1, majit_ir::OpCode::GetarrayitemGcR, &[OpRef(3), OpRef(1)]),
-            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef(1)]),
+            op_at(3, majit_ir::OpCode::GetfieldRawI, &[OpRef::from_raw(0)]),
+            op_at(
+                1,
+                majit_ir::OpCode::GetarrayitemGcR,
+                &[OpRef::from_raw(3), OpRef::from_raw(1)],
+            ),
+            majit_ir::Op::new(majit_ir::OpCode::Finish, &[OpRef::from_raw(1)]),
         ];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, 4, 100);
+        let inputarg_types = vec![
+            majit_ir::Type::Ref,
+            majit_ir::Type::Ref,
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
 
         assert_eq!(
             iter.inputargs,
-            vec![OpRef(100), OpRef(101), OpRef(102), OpRef(103)]
+            vec![
+                OpRef::from_raw(100),
+                OpRef::from_raw(101),
+                OpRef::from_raw(102),
+                OpRef::from_raw(103)
+            ]
         );
-        assert_eq!(iter._cache[1], Some(OpRef(101)));
+        assert_eq!(iter._cache[1], Some(OpRef::from_raw(101)));
 
         let op0 = iter.next().unwrap();
-        assert_eq!(op0.pos, OpRef(104));
-        assert_eq!(op0.args.as_slice(), &[OpRef(100)]);
+        assert_eq!(op0.pos, OpRef::from_raw(104));
+        assert_eq!(op0.args.as_slice(), &[OpRef::from_raw(100)]);
 
         let op1 = iter.next().unwrap();
-        assert_eq!(op1.args.as_slice(), &[OpRef(104), OpRef(101)]);
-        assert_eq!(op1.pos, OpRef(105));
-        assert_eq!(iter._cache[1], Some(OpRef(105)));
+        assert_eq!(
+            op1.args.as_slice(),
+            &[OpRef::from_raw(104), OpRef::from_raw(101)]
+        );
+        assert_eq!(op1.pos, OpRef::from_raw(105));
+        assert_eq!(iter._cache[1], Some(OpRef::from_raw(105)));
 
         let finish = iter.next().unwrap();
-        assert_eq!(finish.args.as_slice(), &[OpRef(105)]);
+        assert_eq!(finish.args.as_slice(), &[OpRef::from_raw(105)]);
     }
 
     // Phase B1 intentionally drops `test_trace_record_buffer` and
@@ -3165,9 +3253,9 @@ mod tests {
         let a = buf.record_input_arg(Type::Int);
         let b = buf.record_input_arg(Type::Float);
         let c = buf.record_input_arg(Type::Ref);
-        assert_eq!(a, OpRef(0));
-        assert_eq!(b, OpRef(1));
-        assert_eq!(c, OpRef(2));
+        assert_eq!(a, OpRef::from_raw(0));
+        assert_eq!(b, OpRef::from_raw(1));
+        assert_eq!(c, OpRef::from_raw(2));
         assert_eq!(buf.num_inputargs(), 3);
         assert_eq!(
             buf.inputarg_types(),
@@ -3204,9 +3292,9 @@ mod tests {
         assert!(it.done());
         assert!(it.next().is_none());
         assert_eq!(it.inputargs.len(), 2);
-        // start_fresh = max_num_inputargs = 2; inputargs get OpRef(2), OpRef(3).
-        assert_eq!(it.inputargs[0], OpRef(2));
-        assert_eq!(it.inputargs[1], OpRef(3));
+        // start_fresh = max_num_inputargs = 2; inputargs get OpRef::from_raw(2), OpRef::from_raw(3).
+        assert_eq!(it.inputargs[0], OpRef::from_raw(2));
+        assert_eq!(it.inputargs[1], OpRef::from_raw(3));
     }
 
     /// M4 step 1: TAGBOX-only round-trip for 2-arg fixed-arity op.
@@ -3834,7 +3922,12 @@ mod tests {
         let mut expected = TraceRecordBuffer::new(2, empty_sd());
         let mut actual = TraceRecordBuffer::new(2, empty_sd());
         let pos_e = expected.record_op(OpCode::IntAdd, &[Box::ResOp(0), Box::ResOp(1)], None);
-        let pos_a = actual.record_op_oprefs(OpCode::IntAdd, &[OpRef(0), OpRef(1)], None, &pool);
+        let pos_a = actual.record_op_oprefs(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            None,
+            &pool,
+        );
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
         assert_eq!(expected._count, actual._count);
@@ -3851,7 +3944,7 @@ mod tests {
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         let pos_e = expected.record_op(OpCode::IntAdd, &[Box::ResOp(0), Box::ConstInt(42)], None);
-        let pos_a = actual.record_op_oprefs(OpCode::IntAdd, &[OpRef(0), c], None, &pool);
+        let pos_a = actual.record_op_oprefs(OpCode::IntAdd, &[OpRef::from_raw(0), c], None, &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -3870,7 +3963,8 @@ mod tests {
             &[Box::ResOp(0), Box::ConstFloat(raw as u64)],
             None,
         );
-        let pos_a = actual.record_op_oprefs(OpCode::FloatAdd, &[OpRef(0), c], None, &pool);
+        let pos_a =
+            actual.record_op_oprefs(OpCode::FloatAdd, &[OpRef::from_raw(0), c], None, &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
         // Both should have registered the float constant in the pool.
@@ -3887,7 +3981,7 @@ mod tests {
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         let pos_e = expected.record_op(OpCode::PtrEq, &[Box::ResOp(0), Box::ConstPtr(addr)], None);
-        let pos_a = actual.record_op_oprefs(OpCode::PtrEq, &[OpRef(0), c], None, &pool);
+        let pos_a = actual.record_op_oprefs(OpCode::PtrEq, &[OpRef::from_raw(0), c], None, &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
         assert_eq!(expected._refs, actual._refs);
@@ -3901,7 +3995,7 @@ mod tests {
         let pool = crate::constant_pool::ConstantPool::new();
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
         let orphan = OpRef::from_const(7);
-        buf.record_op_oprefs(OpCode::IntAdd, &[OpRef(0), orphan], None, &pool);
+        buf.record_op_oprefs(OpCode::IntAdd, &[OpRef::from_raw(0), orphan], None, &pool);
     }
 
     // ── M2 Step 2c · ops / get_op_by_pos / last_op tests ──────────────
@@ -3924,7 +4018,7 @@ mod tests {
     /// Step 2c: `get_op_by_pos` returns the Op whose `.pos` equals the
     /// requested OpRef. `ByteTraceIter` seeds `_fresh` at
     /// `max_num_inputargs` and then bumps it once per inputarg before
-    /// any op, so with 2 inputargs the first op has `op.pos == OpRef(4)`
+    /// any op, so with 2 inputargs the first op has `op.pos == OpRef::from_raw(4)`
     /// (pyre-only disjoint-namespace behaviour documented on
     /// `ByteTraceIter::new`).
     #[test]
@@ -3934,14 +4028,16 @@ mod tests {
         buf.record_input_arg(Type::Int);
         let _ = buf.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ResOp(1), None);
         let _ = buf.record_op2(OpCode::IntMul, Box::ResOp(2), Box::ResOp(0), None);
-        let first = buf.get_op_by_pos(OpRef(4), None).expect("first op present");
+        let first = buf
+            .get_op_by_pos(OpRef::from_raw(4), None)
+            .expect("first op present");
         assert_eq!(first.opcode, OpCode::IntAdd);
-        assert_eq!(first.pos, OpRef(4));
+        assert_eq!(first.pos, OpRef::from_raw(4));
         let second = buf
-            .get_op_by_pos(OpRef(5), None)
+            .get_op_by_pos(OpRef::from_raw(5), None)
             .expect("second op present");
         assert_eq!(second.opcode, OpCode::IntMul);
-        assert!(buf.get_op_by_pos(OpRef(99), None).is_none());
+        assert!(buf.get_op_by_pos(OpRef::from_raw(99), None).is_none());
     }
 
     /// Step 2c: `last_op` returns the final recorded op.  On an empty
@@ -3988,7 +4084,7 @@ mod tests {
         actual.record_input_arg(Type::Int);
         actual.record_input_arg(Type::Int);
         let pos_e = expected.record_op(OpCode::Jump, &[Box::ResOp(0), Box::ResOp(1)], None);
-        let pos_a = actual.close_loop_oprefs(&[OpRef(0), OpRef(1)], &pool);
+        let pos_a = actual.close_loop_oprefs(&[OpRef::from_raw(0), OpRef::from_raw(1)], &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -4005,7 +4101,7 @@ mod tests {
         expected.record_input_arg(Type::Int);
         actual.record_input_arg(Type::Int);
         let pos_e = expected.record_op(OpCode::Jump, &[Box::ResOp(0)], Some(&descr));
-        let pos_a = actual.close_loop_oprefs_with_descr(&[OpRef(0)], Some(&descr), &pool);
+        let pos_a = actual.close_loop_oprefs_with_descr(&[OpRef::from_raw(0)], Some(&descr), &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -4021,7 +4117,7 @@ mod tests {
         expected.record_input_arg(Type::Int);
         actual.record_input_arg(Type::Int);
         let pos_e = expected.record_op(OpCode::Finish, &[Box::ResOp(0)], Some(&descr));
-        let pos_a = actual.finish_oprefs(&[OpRef(0)], &descr, &pool);
+        let pos_a = actual.finish_oprefs(&[OpRef::from_raw(0)], &descr, &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -4035,7 +4131,7 @@ mod tests {
         let c = pool.get_or_insert_typed(42, Type::Int);
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
         buf.record_input_arg(Type::Int);
-        buf.record_op_oprefs(OpCode::IntAdd, &[OpRef(0), c], None, &pool);
+        buf.record_op_oprefs(OpCode::IntAdd, &[OpRef::from_raw(0), c], None, &pool);
         let ops = buf.ops(Some(&mut pool));
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
@@ -4061,7 +4157,8 @@ mod tests {
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         let pos_e = expected.record_op(OpCode::CallN, &[Box::ResOp(0)], Some(&descr));
-        let pos_a = actual.record_op_oprefs(OpCode::CallN, &[OpRef(0)], Some(&descr), &pool);
+        let pos_a =
+            actual.record_op_oprefs(OpCode::CallN, &[OpRef::from_raw(0)], Some(&descr), &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
         assert_eq!(expected._descrs.len(), actual._descrs.len());
@@ -4164,7 +4261,7 @@ mod tests {
 
         let mut frame = crate::pyjitpl::MIFrame::new(jc, 0);
         frame.pc = 0;
-        frame.int_regs[0] = Some(majit_ir::OpRef(1));
+        frame.int_regs[0] = Some(majit_ir::OpRef::from_raw(1));
         frame.int_values[0] = Some(123);
 
         let mut stack = vec![frame];
@@ -4259,7 +4356,12 @@ mod tests {
         let i0 = t.record_input_arg(Type::Int);
         let i1 = t.record_input_arg(Type::Int);
         // add = t.record_op(rop.INT_ADD, [i0, i1])
-        let add_pos = t.record_op2(OpCode::IntAdd, Box::ResOp(i0.0), Box::ResOp(i1.0), None);
+        let add_pos = t.record_op2(
+            OpCode::IntAdd,
+            Box::ResOp(i0.raw()),
+            Box::ResOp(i1.raw()),
+            None,
+        );
         // t.record_op(rop.INT_ADD, [add, ConstInt(1)])
         let _ = t.record_op2(OpCode::IntAdd, Box::ResOp(add_pos), Box::ConstInt(1), None);
 
@@ -4369,10 +4471,10 @@ mod tests {
         let some_descr: majit_ir::DescrRef = majit_ir::descr::make_size_descr(64);
         let p0 = t.record_op0(OpCode::NewWithVtable, Some(&some_descr));
         // t.record_op(rop.GUARD_TRUE, [i0])
-        let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(i0.0), None);
+        let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(i0.raw()), None);
         // t.capture_resumedata([], [i1, i2, p0], [p0, i1])
-        let vable = [Box::ResOp(i1.0), Box::ResOp(i2.0), Box::ResOp(p0)];
-        let vref = [Box::ResOp(p0), Box::ResOp(i1.0)];
+        let vable = [Box::ResOp(i1.raw()), Box::ResOp(i2.raw()), Box::ResOp(p0)];
+        let vref = [Box::ResOp(p0), Box::ResOp(i1.raw())];
         let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
         let _ = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
         // assert t.get_live_ranges() == [4, 4, 4, 4]
@@ -4392,17 +4494,26 @@ mod tests {
         let i1 = t.record_input_arg(Type::Int);
         let _i2 = t.record_input_arg(Type::Int);
         // add1 = t.record_op(rop.INT_ADD, [i0, i1])
-        let add1 = t.record_op2(OpCode::IntAdd, Box::ResOp(i0.0), Box::ResOp(i1.0), None);
+        let add1 = t.record_op2(
+            OpCode::IntAdd,
+            Box::ResOp(i0.raw()),
+            Box::ResOp(i1.raw()),
+            None,
+        );
         // cut_point = t.cut_point()
         let cut_point = t.cut_point();
         // add2 = t.record_op(rop.INT_ADD, [add1, i1])
-        let add2 = t.record_op2(OpCode::IntAdd, Box::ResOp(add1), Box::ResOp(i1.0), None);
+        let add2 = t.record_op2(OpCode::IntAdd, Box::ResOp(add1), Box::ResOp(i1.raw()), None);
         // t.record_op(rop.GUARD_TRUE, [add2])
         let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(add2), None);
         // t.record_op(rop.INT_SUB, [add2, add1])
         let _ = t.record_op2(OpCode::IntSub, Box::ResOp(add2), Box::ResOp(add1), None);
         // t2 = t.cut_trace_from(cut_point, [add1, i1])
-        let cut = t.cut_trace_from(cut_point, vec![Box::ResOp(add1), Box::ResOp(i1.0)]);
+        // RPython `cut_trace_from(cut, inputargs)` takes BoxInt/Float/Ref objects
+        // carrying `Box.type` (history.py:182); pyre's typed-OpRef variants encode
+        // the same type tag — `IntOp(p)` for IntAdd's result, the `i1` InputArgInt
+        // verbatim.
+        let cut = t.cut_trace_from(cut_point, vec![OpRef::int_op(add1), i1]);
         // (i0, i1), l, iter = self.unpack(t2)
         let mut it = cut.get_iter();
         let fresh_add1 = it.inputargs[0];
@@ -4437,8 +4548,8 @@ mod tests {
         let some_descr: majit_ir::DescrRef = majit_ir::descr::make_size_descr(64);
         let p0 = t.record_op0(OpCode::NewWithVtable, Some(&some_descr));
         let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
-        let vable = [Box::ResOp(i1.0), Box::ResOp(i2.0), Box::ResOp(p0)];
-        let vref = [Box::ResOp(p0), Box::ResOp(i1.0)];
+        let vable = [Box::ResOp(i1.raw()), Box::ResOp(i2.raw()), Box::ResOp(p0)];
+        let vref = [Box::ResOp(p0), Box::ResOp(i1.raw())];
         let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
         let snap = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
         let it = t.get_snapshot_iter(snap as usize);
@@ -4447,8 +4558,8 @@ mod tests {
         let vable_decoded: Vec<i64> = it.iter_vable_array().collect();
         let vref_decoded: Vec<i64> = it.iter_vref_array().collect();
         let p0_tag = TraceRecordBuffer::_encode_box_position(p0);
-        let i1_tag = TraceRecordBuffer::_encode_box_position(i1.0);
-        let i2_tag = TraceRecordBuffer::_encode_box_position(i2.0);
+        let i1_tag = TraceRecordBuffer::_encode_box_position(i1.raw());
+        let i2_tag = TraceRecordBuffer::_encode_box_position(i2.raw());
         // `virtualizables == [p0, i1, i2]` after the last-first rotation.
         assert_eq!(vable_decoded, vec![p0_tag, i1_tag, i2_tag]);
         // `vref_boxes == [p0, i1]` verbatim.
@@ -4471,9 +4582,9 @@ mod tests {
         let p0 = t.record_op0(OpCode::NewWithVtable, Some(&some_descr));
         let _ = t.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
         // capture_resumedata([], [i1] * 127 + [p0], [p0, i1])
-        let mut vable: Vec<Box> = (0..127).map(|_| Box::ResOp(i1.0)).collect();
+        let mut vable: Vec<Box> = (0..127).map(|_| Box::ResOp(i1.raw())).collect();
         vable.push(Box::ResOp(p0));
-        let vref = [Box::ResOp(p0), Box::ResOp(i1.0)];
+        let vref = [Box::ResOp(p0), Box::ResOp(i1.raw())];
         let mut stack: Vec<crate::pyjitpl::MIFrame> = Vec::new();
         let snap = t.capture_resumedata(&mut stack, &vable, &vref, None, 0, &[], false);
         // Unpack the snapshot and decode the vable/vref arrays. The
@@ -4491,7 +4602,7 @@ mod tests {
         // decoded stream should therefore open with p0 and continue with
         // 127 × i1.
         let p0_tag = TraceRecordBuffer::_encode_box_position(p0);
-        let i1_tag = TraceRecordBuffer::_encode_box_position(i1.0);
+        let i1_tag = TraceRecordBuffer::_encode_box_position(i1.raw());
         assert_eq!(vable_decoded[0], p0_tag);
         for (idx, entry) in vable_decoded.iter().enumerate().skip(1) {
             assert_eq!(*entry, i1_tag, "vable[{idx}] == i1");

@@ -250,13 +250,13 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .map(|(i, field)| {
             let offset = i as u32;
             quote! {
-                self.#field = majit_ir::OpRef(first_vable_scalar_idx + #offset);
+                self.#field = majit_ir::OpRef::from_raw(first_vable_scalar_idx + #offset);
             }
         })
         .collect();
 
     let init_frame = frame_field.map(|f| {
-        quote! { self.#f = majit_ir::OpRef(0); }
+        quote! { self.#f = majit_ir::OpRef::input_arg_ref(0); }
     });
 
     let restore_inputarg_writes: Vec<TokenStream> = inputarg_fields

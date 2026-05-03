@@ -1812,7 +1812,7 @@ impl VirtualState {
             // otherwise mark as bad. (virtualstate.py line 400)
             (VirtualStateInfo::Constant(_val), _) => {
                 if runtime_box.is_some() {
-                    let val_const = OpRef(10_000 + idx as u32);
+                    let val_const = OpRef::from_raw(10_000 + idx as u32);
                     let mut op = Op::new(OpCode::GuardValue, &[box_opref, val_const]);
                     op.fail_args = Some(Default::default());
                     state.add_guard(op);
@@ -2288,9 +2288,9 @@ fn export_single_value_inner(
         // registered via mark_const_type get the Ref override.
         let has_ref_override = ctx
             .constant_types_for_numbering
-            .get(&opref.0)
+            .get(&opref.raw())
             .is_some_and(|&t| t == majit_ir::Type::Ref);
-        if opref.0 >= 10000 || has_ref_override {
+        if opref.raw() >= 10000 || has_ref_override {
             let export_val = if has_ref_override && matches!(value, Value::Int(v) if *v != 0) {
                 Value::Ref(majit_ir::GcRef(match value {
                     Value::Int(v) => *v as usize,
@@ -2747,7 +2747,7 @@ mod tests {
             VirtualStateInfo::Unknown(Type::Ref),
         ]);
 
-        let boxes = vec![OpRef(100), OpRef(101)];
+        let boxes = vec![OpRef::from_raw(100), OpRef::from_raw(101)];
         let ctx = OptContext::new(128);
         // runtime_boxes=Some enables non-permanent guard emission (RPython
         // _jump_to_existing_trace path). With None, Unknown incoming → Err.
@@ -2757,11 +2757,11 @@ mod tests {
         assert_eq!(guards.len(), 2);
         assert!(matches!(
             &guards[0],
-            GuardRequirement::GuardClass { arg_index: 0, box_opref, .. } if *box_opref == OpRef(100)
+            GuardRequirement::GuardClass { arg_index: 0, box_opref, .. } if *box_opref == OpRef::from_raw(100)
         ));
         assert!(matches!(
             &guards[1],
-            GuardRequirement::GuardNonnull { arg_index: 1, box_opref } if *box_opref == OpRef(101)
+            GuardRequirement::GuardNonnull { arg_index: 1, box_opref } if *box_opref == OpRef::from_raw(101)
         ));
     }
 
@@ -2769,7 +2769,7 @@ mod tests {
     fn test_constant_guard_requires_matching_runtime_box() {
         let expected = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(7))]);
         let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
-        let boxes = vec![OpRef(10)];
+        let boxes = vec![OpRef::from_raw(10)];
 
         let mut ctx = OptContext::new(128);
         let matching_runtime = ctx.make_constant_int(7);
@@ -2792,10 +2792,10 @@ mod tests {
         let expected = GcRef(0x1234);
         let guard = GuardRequirement::GuardValue {
             arg_index: 0,
-            box_opref: OpRef(10),
+            box_opref: OpRef::from_raw(10),
             expected_value: Value::Ref(expected),
         }
-        .to_op(&[OpRef(10)], &mut ctx)
+        .to_op(&[OpRef::from_raw(10)], &mut ctx)
         .unwrap();
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
@@ -2822,7 +2822,7 @@ mod tests {
         // VStruct walker to descend; mirror by attaching a virtual
         // PtrInfo to the corresponding OpRef.
         ctx.set_ptr_info(
-            OpRef(11),
+            OpRef::from_raw(11),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -2834,13 +2834,17 @@ mod tests {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let inputargs = state
             .make_inputargs(
-                &[OpRef(10), OpRef(11), OpRef(12)],
+                &[
+                    OpRef::from_raw(10),
+                    OpRef::from_raw(11),
+                    OpRef::from_raw(12),
+                ],
                 &mut optimizer,
                 &mut ctx,
                 false,
             )
             .expect("make_inputargs");
-        assert_eq!(inputargs, vec![OpRef(10), OpRef(12)]);
+        assert_eq!(inputargs, vec![OpRef::from_raw(10), OpRef::from_raw(12)]);
     }
 
     #[test]
@@ -2858,7 +2862,7 @@ mod tests {
 
         let mut ctx = OptContext::new(16);
         ctx.set_ptr_info(
-            OpRef(21),
+            OpRef::from_raw(21),
             PtrInfo::VirtualStruct(VirtualStructInfo {
                 descr,
                 fields: vec![],
@@ -2870,14 +2874,18 @@ mod tests {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let (inputargs, virtuals) = state
             .make_inputargs_and_virtuals(
-                &[OpRef(20), OpRef(21), OpRef(22)],
+                &[
+                    OpRef::from_raw(20),
+                    OpRef::from_raw(21),
+                    OpRef::from_raw(22),
+                ],
                 &mut optimizer,
                 &mut ctx,
                 false,
             )
             .expect("make_inputargs_and_virtuals");
-        assert_eq!(inputargs, vec![OpRef(20), OpRef(22)]);
-        assert_eq!(virtuals, vec![OpRef(21)]);
+        assert_eq!(inputargs, vec![OpRef::from_raw(20), OpRef::from_raw(22)]);
+        assert_eq!(virtuals, vec![OpRef::from_raw(21)]);
     }
 
     /// virtualstate.py:196 / 274 / 352 — `state.position > self.position`
@@ -2908,9 +2916,9 @@ mod tests {
         // (matching RPython numnotvirtuals on the same shared object).
         assert_eq!(state.num_boxes(), 1);
 
-        let inner_field_value = OpRef(31);
-        let outer_a_ref = OpRef(40);
-        let outer_b_ref = OpRef(41);
+        let inner_field_value = OpRef::from_raw(31);
+        let outer_a_ref = OpRef::from_raw(40);
+        let outer_b_ref = OpRef::from_raw(41);
         let mut ctx = OptContext::new(64);
         // Both outer boxes resolve to a virtual struct whose field 0 is
         // the shared inner OpRef.
@@ -2959,7 +2967,7 @@ mod tests {
             VirtualState::from_shared_rcs(vec![Rc::clone(&shared_leaf), Rc::clone(&shared_leaf)]);
         assert_eq!(state.num_boxes(), 1);
 
-        let outer_ref = OpRef(50);
+        let outer_ref = OpRef::from_raw(50);
         let mut ctx = OptContext::new(64);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let inputargs = state
@@ -2972,8 +2980,8 @@ mod tests {
     #[test]
     fn test_make_inputargs_recursively_extracts_virtual_fields() {
         let descr = test_descr(11);
-        let field_value = OpRef(21);
-        let virtual_ref = OpRef(20);
+        let field_value = OpRef::from_raw(21);
+        let virtual_ref = OpRef::from_raw(20);
         let state = VirtualState::new(vec![VirtualStateInfo::VStruct {
             descr: descr.clone(),
             fields: vec![
@@ -3041,7 +3049,7 @@ mod tests {
     #[test]
     fn test_make_inputargs_with_optimizer_retries_virtual_into_nonvirtual_slot() {
         let descr = test_descr(12);
-        let virtual_ref = OpRef(20);
+        let virtual_ref = OpRef::from_raw(20);
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         let mut ctx = OptContext::with_num_inputs(32, 1024);
         ctx.set_ptr_info(
@@ -3081,10 +3089,14 @@ mod tests {
             VirtualStateInfo::NonNull,
             VirtualStateInfo::Unknown(Type::Int),
         ]);
-        state.compute_renum(&[OpRef(10), OpRef(20), OpRef(30)]);
-        assert_eq!(state.get_renum(OpRef(10)), Some(0));
-        assert_eq!(state.get_renum(OpRef(20)), Some(1));
-        assert_eq!(state.get_renum(OpRef(30)), Some(2));
-        assert_eq!(state.get_renum(OpRef(99)), None);
+        state.compute_renum(&[
+            OpRef::from_raw(10),
+            OpRef::from_raw(20),
+            OpRef::from_raw(30),
+        ]);
+        assert_eq!(state.get_renum(OpRef::from_raw(10)), Some(0));
+        assert_eq!(state.get_renum(OpRef::from_raw(20)), Some(1));
+        assert_eq!(state.get_renum(OpRef::from_raw(30)), Some(2));
+        assert_eq!(state.get_renum(OpRef::from_raw(99)), None);
     }
 }

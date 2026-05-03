@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use majit_backend::JitCellToken;
 use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Type, VableExpansion};
@@ -9,10 +11,54 @@ use majit_ir::{CallDescr, DescrRef, EffectInfo, ExtraEffect, OopSpecIndex, Type,
 /// `effectinfo_from_writeanalyze` (call.py:320).
 #[derive(Debug)]
 struct MetaCallDescr {
+    heapcache_index: u32,
     arg_types: Vec<Type>,
     result_type: Type,
     effect_info: EffectInfo,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EffectInfoKey {
+    extraeffect: ExtraEffect,
+    oopspecindex: OopSpecIndex,
+    readonly_descrs_fields: u64,
+    write_descrs_fields: u64,
+    readonly_descrs_arrays: u64,
+    write_descrs_arrays: u64,
+    readonly_descrs_interiorfields: u64,
+    write_descrs_interiorfields: u64,
+    can_invalidate: bool,
+    can_collect: bool,
+    call_release_gil_target: (u64, i32),
+}
+
+impl EffectInfoKey {
+    fn from_effect_info(effect_info: &EffectInfo) -> Self {
+        Self {
+            extraeffect: effect_info.extraeffect,
+            oopspecindex: effect_info.oopspecindex,
+            readonly_descrs_fields: effect_info.readonly_descrs_fields,
+            write_descrs_fields: effect_info.write_descrs_fields,
+            readonly_descrs_arrays: effect_info.readonly_descrs_arrays,
+            write_descrs_arrays: effect_info.write_descrs_arrays,
+            readonly_descrs_interiorfields: effect_info.readonly_descrs_interiorfields,
+            write_descrs_interiorfields: effect_info.write_descrs_interiorfields,
+            can_invalidate: effect_info.can_invalidate,
+            can_collect: effect_info.can_collect,
+            call_release_gil_target: effect_info.call_release_gil_target,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CallDescrKey {
+    arg_types: Vec<Type>,
+    result_type: Type,
+    effect_info: EffectInfoKey,
+}
+
+static CALL_DESCR_CACHE: OnceLock<Mutex<HashMap<CallDescrKey, DescrRef>>> = OnceLock::new();
+static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000);
 
 /// `compile.py:187 isinstance(descr, JitCellToken)` parity.
 ///
@@ -35,7 +81,7 @@ struct MetaCallAssemblerDescr {
 
 impl majit_ir::Descr for MetaCallDescr {
     fn index(&self) -> u32 {
-        u32::MAX
+        self.heapcache_index
     }
     fn as_call_descr(&self) -> Option<&dyn CallDescr> {
         Some(self)
@@ -213,11 +259,44 @@ pub fn make_call_descr_with_effect(
     result_type: Type,
     effect_info: EffectInfo,
 ) -> DescrRef {
-    Arc::new(MetaCallDescr {
+    // effectinfo.py:144-146: `if tgt_func: key += (object(),)  # don't
+    // care about caching in this case` — release-gil targets bypass the
+    // EffectInfo._cache because each one carries a unique target
+    // function pointer that the deduplicator should not collapse.
+    // Mirror by short-circuiting the cache lookup/insert when the
+    // release-gil target is non-null.
+    if effect_info.call_release_gil_target.0 != 0 {
+        return Arc::new(MetaCallDescr {
+            heapcache_index: NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed),
+            arg_types: arg_types.to_vec(),
+            result_type,
+            effect_info,
+        });
+    }
+
+    let key = CallDescrKey {
+        arg_types: arg_types.to_vec(),
+        result_type,
+        effect_info: EffectInfoKey::from_effect_info(&effect_info),
+    };
+
+    // descr.py:22 `GcCache._cache_call`: call descriptors are cached
+    // structurally, so repeated construction of the same call shape
+    // yields the same descr identity.  The HashMap is that RPython
+    // descriptor cache, not a side table for per-box optimizer state.
+    let cache = CALL_DESCR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    if let Some(descr) = cache.get(&key) {
+        return descr.clone();
+    }
+    let descr: DescrRef = Arc::new(MetaCallDescr {
+        heapcache_index: NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed),
         arg_types: arg_types.to_vec(),
         result_type,
         effect_info,
-    })
+    });
+    cache.insert(key, descr.clone());
+    descr
 }
 
 /// Create a CallDescr for CALL_MAY_FORCE_* operations.

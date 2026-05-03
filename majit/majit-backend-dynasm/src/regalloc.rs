@@ -1184,8 +1184,9 @@ impl RegisterManager {
         constants: &HashMap<u32, i64>,
     ) -> Loc {
         if v.is_constant() {
-            let val = constants.get(&v.0).copied().unwrap_or(0);
-            if tp == Type::Float || self.constant_types.get(&v.0).copied() == Some(Type::Float) {
+            let val = constants.get(&v.raw()).copied().unwrap_or(0);
+            if tp == Type::Float || self.constant_types.get(&v.raw()).copied() == Some(Type::Float)
+            {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
             return Loc::Immed(ImmedLoc::new(val));
@@ -1203,8 +1204,9 @@ impl RegisterManager {
         // Fallback: check constants map. The optimizer may leave constants
         // as plain OpRefs (without CONST_BIT) when they originate from
         // short preamble or constant folding.
-        if let Some(&val) = constants.get(&v.0) {
-            if tp == Type::Float || self.constant_types.get(&v.0).copied() == Some(Type::Float) {
+        if let Some(&val) = constants.get(&v.raw()) {
+            if tp == Type::Float || self.constant_types.get(&v.raw()).copied() == Some(Type::Float)
+            {
                 return Loc::Immed(ImmedLoc::new_float(val));
             }
             return Loc::Immed(ImmedLoc::new(val));
@@ -1501,9 +1503,9 @@ impl RegisterManager {
     /// x86/regalloc.py:55 convert_to_imm
     pub fn convert_to_imm(&self, v: OpRef, constants: &HashMap<u32, i64>) -> Loc {
         debug_assert!(v.is_constant());
-        // constants map key is opref.0 (raw value WITH CONST_BIT), not const_index
-        let val = constants.get(&v.0).copied().unwrap_or(0);
-        if self.constant_types.get(&v.0).copied() == Some(Type::Float) {
+        // constants map key is opref.raw() (raw value WITH CONST_BIT), not const_index
+        let val = constants.get(&v.raw()).copied().unwrap_or(0);
+        if self.constant_types.get(&v.raw()).copied() == Some(Type::Float) {
             Loc::Immed(ImmedLoc::new_float(val))
         } else {
             Loc::Immed(ImmedLoc::new(val))
@@ -1662,9 +1664,9 @@ impl<'a> RegAlloc<'a> {
             return None;
         }
         if opref.is_constant() {
-            return self.constant_types.get(&opref.0).copied();
+            return self.constant_types.get(&opref.raw()).copied();
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.operations[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -1673,10 +1675,10 @@ impl<'a> RegAlloc<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.0) {
+        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.operations[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -2311,7 +2313,7 @@ impl<'a> RegAlloc<'a> {
     /// line 1475 and the fail-args handling at line 2079. This helper
     /// must use the same key convention.
     fn const_value(&self, v: OpRef) -> i64 {
-        self.constants.get(&v.0).copied().unwrap_or(0)
+        self.constants.get(&v.raw()).copied().unwrap_or(0)
     }
 
     // ── walk_operations + consider_* ──
@@ -3475,7 +3477,7 @@ impl<'a> RegAlloc<'a> {
             self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
             let l1 = self.loc(arg1, Type::Int);
             self.possibly_free_var(arg2, Type::Int);
-            let tmp = OpRef(u32::MAX - 1);
+            let tmp = OpRef::from_raw(u32::MAX - 1);
             if !self.longevity.contains(tmp) {
                 self.longevity
                     .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
@@ -3670,7 +3672,7 @@ impl<'a> RegAlloc<'a> {
             // eax will be trash after the operation
             self.possibly_free_var(arg2, Type::Int);
             // allocate temporary in eax (will be trashed by MUL)
-            let tmp = OpRef(u32::MAX - 1); // temp var
+            let tmp = OpRef::from_raw(u32::MAX - 1); // temp var
             if !self.longevity.contains(tmp) {
                 self.longevity
                     .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
@@ -3770,7 +3772,7 @@ impl<'a> RegAlloc<'a> {
         let x = self.make_sure_var_in_reg(value, Type::Ref, &[], None, false);
         #[cfg(target_arch = "x86_64")]
         {
-            let tmp = OpRef(u32::MAX - 3);
+            let tmp = OpRef::from_raw(u32::MAX - 3);
             if !self.longevity.contains(tmp) {
                 self.longevity
                     .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
@@ -3805,7 +3807,7 @@ impl<'a> RegAlloc<'a> {
         let y = self.loc(class, Type::Int);
         #[cfg(target_arch = "x86_64")]
         {
-            let tmp = OpRef(u32::MAX - 4);
+            let tmp = OpRef::from_raw(u32::MAX - 4);
             if !self.longevity.contains(tmp) {
                 self.longevity
                     .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
@@ -3841,7 +3843,7 @@ impl<'a> RegAlloc<'a> {
         };
         let loc = self.make_sure_var_in_reg(exception_class, Type::Ref, &[], None, false);
         // x86/regalloc.py:470-471 TempVar for scratch register
-        let tmp = OpRef(u32::MAX - 2);
+        let tmp = OpRef::from_raw(u32::MAX - 2);
         if !self.longevity.contains(tmp) {
             self.longevity
                 .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
@@ -3908,7 +3910,7 @@ impl<'a> RegAlloc<'a> {
     fn consider_guard_exception(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &[], None, false);
         // x86/regalloc.py:470-471 TempVar for scratch register
-        let tmp = OpRef(u32::MAX - 2);
+        let tmp = OpRef::from_raw(u32::MAX - 2);
         if !self.longevity.contains(tmp) {
             self.longevity
                 .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
@@ -5260,7 +5262,7 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         let result_reg = self.rm.force_allocate_reg(
-            dst.unwrap_or(OpRef(u32::MAX)),
+            dst.unwrap_or(OpRef::from_raw(u32::MAX)),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -5319,7 +5321,7 @@ impl<'a> RegAlloc<'a> {
         );
         // aarch64/regalloc.py:990-993: reserve x1 as the malloc temp and
         // exclude it from the gcmap before emitting malloc_cond_varsize_frame.
-        let tmp = OpRef(u32::MAX - 11);
+        let tmp = OpRef::from_raw(u32::MAX - 11);
         self.longevity
             .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
         self.rm.force_allocate_reg(
@@ -5365,14 +5367,14 @@ impl<'a> RegAlloc<'a> {
         );
         self.possibly_free_var(size_arg, Type::Int);
         let result_reg = self.rm.force_allocate_reg(
-            dst.unwrap_or(OpRef(u32::MAX)),
+            dst.unwrap_or(OpRef::from_raw(u32::MAX)),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
             &mut self.longevity,
             &mut self.fm,
         );
-        let tmp = OpRef(u32::MAX - 11);
+        let tmp = OpRef::from_raw(u32::MAX - 11);
         self.longevity
             .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
         self.rm.force_allocate_reg(
@@ -5463,7 +5465,7 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         let result_reg = self.rm.force_allocate_reg(
-            dst.unwrap_or(OpRef(u32::MAX)),
+            dst.unwrap_or(OpRef::from_raw(u32::MAX)),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -5840,7 +5842,7 @@ mod tests {
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
@@ -5866,13 +5868,13 @@ mod tests {
         // i1 = int_add(i0, i0)  [pos 0]
         // guard_true(i1)         [pos 1, fail_args=[i0]]
         // jump(i1)               [pos 2]
-        let i0 = OpRef(100);
-        let i1 = OpRef(0);
-        let _i2 = OpRef(1);
-        let _i3 = OpRef(2);
+        let i0 = OpRef::from_raw(100);
+        let i1 = OpRef::from_raw(0);
+        let _i2 = OpRef::from_raw(1);
+        let _i3 = OpRef::from_raw(2);
 
         let inputargs = vec![InputArg {
-            index: i0.0,
+            index: i0.raw(),
             tp: Type::Int,
         }];
         let ops = vec![
@@ -5912,9 +5914,9 @@ mod tests {
     #[test]
     fn test_frame_manager_allocate() {
         let mut longevity = LifetimeManager::new();
-        let v0 = OpRef(0);
-        let v1 = OpRef(1);
-        let v2 = OpRef(2);
+        let v0 = OpRef::from_raw(0);
+        let v1 = OpRef::from_raw(1);
+        let v2 = OpRef::from_raw(2);
         longevity.set(v0, Lifetime::new(0, 10));
         longevity.set(v1, Lifetime::new(1, 10));
         longevity.set(v2, Lifetime::new(2, 10));
@@ -5933,8 +5935,8 @@ mod tests {
     #[test]
     fn test_register_manager_allocate() {
         let mut longevity = LifetimeManager::new();
-        let v0 = OpRef(0);
-        let v1 = OpRef(1);
+        let v0 = OpRef::from_raw(0);
+        let v1 = OpRef::from_raw(1);
         longevity.set(v0, Lifetime::new(0, 5));
         longevity.set(v1, Lifetime::new(1, 5));
 
@@ -5970,21 +5972,42 @@ mod tests {
         lt1.real_usages = Some(vec![6]);
         let mut lt2 = Lifetime::new(2, 10);
         lt2.real_usages = Some(vec![7]);
-        longevity.set(OpRef(0), lt0);
-        longevity.set(OpRef(1), lt1);
-        longevity.set(OpRef(2), lt2);
+        longevity.set(OpRef::from_raw(0), lt0);
+        longevity.set(OpRef::from_raw(1), lt1);
+        longevity.set(OpRef::from_raw(2), lt2);
 
         // Only 2 registers available
         let mut rm = RegisterManager::new(vec![EAX, ECX], vec![], vec![EAX, ECX], EBP, None, EAX);
         rm.position = 3;
         let mut fm = FrameManager::new(0);
 
-        let reg0 = rm.force_allocate_reg(OpRef(0), &[], None, false, &mut longevity, &mut fm);
-        let reg1 = rm.force_allocate_reg(OpRef(1), &[], None, false, &mut longevity, &mut fm);
+        let reg0 = rm.force_allocate_reg(
+            OpRef::from_raw(0),
+            &[],
+            None,
+            false,
+            &mut longevity,
+            &mut fm,
+        );
+        let reg1 = rm.force_allocate_reg(
+            OpRef::from_raw(1),
+            &[],
+            None,
+            false,
+            &mut longevity,
+            &mut fm,
+        );
         assert!(reg0 != reg1);
 
         // Third allocation forces a spill
-        let reg2 = rm.force_allocate_reg(OpRef(2), &[], None, false, &mut longevity, &mut fm);
+        let reg2 = rm.force_allocate_reg(
+            OpRef::from_raw(2),
+            &[],
+            None,
+            false,
+            &mut longevity,
+            &mut fm,
+        );
         assert!(reg2 == reg0 || reg2 == reg1);
         // The spilled variable should now be in the frame
         assert!(fm.get_frame_depth() >= 1);
@@ -5992,13 +6015,13 @@ mod tests {
 
     #[test]
     fn test_j2_deopt_only_failarg_spilled_before_guard() {
-        let i0 = OpRef(0);
-        let i1 = OpRef(1);
-        let i2 = OpRef(2);
+        let i0 = OpRef::from_raw(0);
+        let i1 = OpRef::from_raw(1);
+        let i2 = OpRef::from_raw(2);
         let c1 = OpRef::from_const(0);
 
         let inputargs = vec![InputArg {
-            index: i0.0,
+            index: i0.raw(),
             tp: Type::Int,
         }];
 
@@ -6007,15 +6030,15 @@ mod tests {
         let mut is_true = Op::new(OpCode::IntIsTrue, &[i1]);
         is_true.pos = i2;
         let mut guard = Op::new(OpCode::GuardTrue, &[i2]);
-        guard.pos = OpRef(3);
+        guard.pos = OpRef::from_raw(3);
         guard.fail_args = Some(vec![i1].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
-        finish.pos = OpRef(4);
+        finish.pos = OpRef::from_raw(4);
         finish.fail_args = Some(vec![].into());
         finish.fail_arg_types = Some(vec![]);
 
         let mut constants = HashMap::new();
-        constants.insert(c1.0, 1);
+        constants.insert(c1.raw(), 1);
 
         let ops = vec![add, is_true, guard, finish];
         let mut ra = RegAlloc::new(constants, HashMap::new(), &inputargs, &ops);
@@ -6046,10 +6069,10 @@ mod tests {
 
     #[test]
     fn test_walk_operations_dispatches_from_j2_lir() {
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
         let c0 = OpRef::from_const(0);
         let inputargs = vec![InputArg {
-            index: i0.0,
+            index: i0.raw(),
             tp: Type::Ref,
         }];
 
@@ -6089,17 +6112,17 @@ mod tests {
 
     #[test]
     fn test_j2_integer_dispatch_uses_lir_operands() {
-        let i0 = OpRef(0);
-        let i1 = OpRef(1);
-        let i2 = OpRef(2);
+        let i0 = OpRef::from_raw(0);
+        let i1 = OpRef::from_raw(1);
+        let i2 = OpRef::from_raw(2);
 
         let inputargs = vec![
             InputArg {
-                index: i0.0,
+                index: i0.raw(),
                 tp: Type::Int,
             },
             InputArg {
-                index: i1.0,
+                index: i1.raw(),
                 tp: Type::Int,
             },
         ];
@@ -6107,7 +6130,7 @@ mod tests {
         let mut raw = Op::new(OpCode::IntIsTrue, &[i0]);
         raw.pos = i2;
         let mut finish = Op::new(OpCode::Finish, &[i1]);
-        finish.pos = OpRef(3);
+        finish.pos = OpRef::from_raw(3);
         let ops = vec![raw, finish];
 
         let mut ra = RegAlloc::new(HashMap::new(), HashMap::new(), &inputargs, &ops);
@@ -6140,25 +6163,25 @@ mod tests {
 
     #[test]
     fn test_j2_guard_dispatch_uses_lir_operands() {
-        let i0 = OpRef(0);
-        let i1 = OpRef(1);
+        let i0 = OpRef::from_raw(0);
+        let i1 = OpRef::from_raw(1);
 
         let inputargs = vec![
             InputArg {
-                index: i0.0,
+                index: i0.raw(),
                 tp: Type::Int,
             },
             InputArg {
-                index: i1.0,
+                index: i1.raw(),
                 tp: Type::Int,
             },
         ];
 
         let mut raw = Op::new(OpCode::GuardTrue, &[i0]);
-        raw.pos = OpRef(2);
+        raw.pos = OpRef::from_raw(2);
         raw.fail_args = Some(vec![].into());
         let mut finish = Op::new(OpCode::Finish, &[i1]);
-        finish.pos = OpRef(3);
+        finish.pos = OpRef::from_raw(3);
         let ops = vec![raw, finish];
 
         let mut ra = RegAlloc::new(HashMap::new(), HashMap::new(), &inputargs, &ops);
@@ -6180,19 +6203,19 @@ mod tests {
 
     #[test]
     fn test_j2_load_dispatch_uses_lir_operands() {
-        let i0 = OpRef(0);
-        let i1 = OpRef(1);
-        let i2 = OpRef(2);
+        let i0 = OpRef::from_raw(0);
+        let i1 = OpRef::from_raw(1);
+        let i2 = OpRef::from_raw(2);
         let c0 = OpRef::from_const(0);
         let c8 = OpRef::from_const(8);
 
         let inputargs = vec![
             InputArg {
-                index: i0.0,
+                index: i0.raw(),
                 tp: Type::Ref,
             },
             InputArg {
-                index: i1.0,
+                index: i1.raw(),
                 tp: Type::Ref,
             },
         ];
@@ -6200,12 +6223,12 @@ mod tests {
         let mut raw = Op::new(OpCode::GcLoadI, &[i0, c0, c8]);
         raw.pos = i2;
         let mut finish = Op::new(OpCode::Finish, &[i1]);
-        finish.pos = OpRef(3);
+        finish.pos = OpRef::from_raw(3);
         let ops = vec![raw, finish];
 
         let mut constants = HashMap::new();
-        constants.insert(c0.0, 0);
-        constants.insert(c8.0, 8);
+        constants.insert(c0.raw(), 0);
+        constants.insert(c8.raw(), 8);
 
         let mut ra = RegAlloc::new(constants, HashMap::new(), &inputargs, &ops);
         ra.prepare_loop();
@@ -6230,35 +6253,35 @@ mod tests {
 
     #[test]
     fn test_j2_store_dispatch_uses_lir_operands() {
-        let i0 = OpRef(0);
-        let i1 = OpRef(1);
-        let i2 = OpRef(2);
+        let i0 = OpRef::from_raw(0);
+        let i1 = OpRef::from_raw(1);
+        let i2 = OpRef::from_raw(2);
         let c0 = OpRef::from_const(0);
         let c8 = OpRef::from_const(8);
 
         let inputargs = vec![
             InputArg {
-                index: i0.0,
+                index: i0.raw(),
                 tp: Type::Ref,
             },
             InputArg {
-                index: i1.0,
+                index: i1.raw(),
                 tp: Type::Ref,
             },
             InputArg {
-                index: i2.0,
+                index: i2.raw(),
                 tp: Type::Int,
             },
         ];
 
         let raw = Op::new(OpCode::GcStore, &[i0, c0, i2, c8]);
         let mut finish = Op::new(OpCode::Finish, &[i1]);
-        finish.pos = OpRef(3);
+        finish.pos = OpRef::from_raw(3);
         let ops = vec![raw, finish];
 
         let mut constants = HashMap::new();
-        constants.insert(c0.0, 0);
-        constants.insert(c8.0, 8);
+        constants.insert(c0.raw(), 0);
+        constants.insert(c8.raw(), 8);
 
         let mut ra = RegAlloc::new(constants, HashMap::new(), &inputargs, &ops);
         ra.prepare_loop();
@@ -6283,17 +6306,17 @@ mod tests {
 
     #[test]
     fn test_j2_opcode_dispatch_uses_lir_operands() {
-        let i0 = OpRef(0);
-        let i1 = OpRef(1);
-        let i2 = OpRef(2);
+        let i0 = OpRef::from_raw(0);
+        let i1 = OpRef::from_raw(1);
+        let i2 = OpRef::from_raw(2);
 
         let inputargs = vec![
             InputArg {
-                index: i0.0,
+                index: i0.raw(),
                 tp: Type::Int,
             },
             InputArg {
-                index: i1.0,
+                index: i1.raw(),
                 tp: Type::Int,
             },
         ];
@@ -6301,7 +6324,7 @@ mod tests {
         let mut raw = Op::new(OpCode::SameAsI, &[i0]);
         raw.pos = i2;
         let mut finish = Op::new(OpCode::Finish, &[i1]);
-        finish.pos = OpRef(3);
+        finish.pos = OpRef::from_raw(3);
         let ops = vec![raw, finish];
 
         let mut ra = RegAlloc::new(HashMap::new(), HashMap::new(), &inputargs, &ops);
@@ -6333,9 +6356,9 @@ mod tests {
     #[test]
     #[ignore = "GuardNotForced2 frame-depth argloc emission (assembler.py:935 check_frame_depth wiring) not yet ported on side3; test added ahead of supporting code"]
     fn test_guard_not_forced_2_carries_frame_depth_argloc() {
-        let i0 = OpRef(100);
+        let i0 = OpRef::from_raw(100);
         let inputargs = vec![InputArg {
-            index: i0.0,
+            index: i0.raw(),
             tp: Type::Ref,
         }];
         let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];

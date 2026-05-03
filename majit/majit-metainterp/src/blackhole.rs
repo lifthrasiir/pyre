@@ -247,7 +247,7 @@ pub fn blackhole_execute_full(
         .unwrap_or(0);
     let label_inputarg_positions: Vec<u32> = ops
         .get(label_index)
-        .map(|op| op.args.iter().map(|a| a.0).collect())
+        .map(|op| op.args.iter().map(|a| a.raw()).collect())
         .unwrap_or_default();
 
     let mut op_idx = start_index;
@@ -259,7 +259,7 @@ pub fn blackhole_execute_full(
         match result {
             OpResult::Value(v) => {
                 if !op.pos.is_none() {
-                    tv.set(op.pos.0, v);
+                    tv.set(op.pos.raw(), v);
                 }
             }
             OpResult::Void => {}
@@ -595,7 +595,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
     // Label's args define the loop's inputargs (their OpRef positions).
     let label_inputarg_positions: Vec<u32> = ops
         .get(label_index)
-        .map(|op| op.args.iter().map(|a| a.0).collect())
+        .map(|op| op.args.iter().map(|a| a.raw()).collect())
         .unwrap_or_default();
 
     let mut op_idx = start_index;
@@ -608,7 +608,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
         match result {
             OpResult::Value(v) => {
                 if !op.pos.is_none() {
-                    tv.set(op.pos.0, v);
+                    tv.set(op.pos.raw(), v);
                 }
             }
             OpResult::Void => {}
@@ -621,7 +621,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
                 let frame_ptr = tv.resolve(op.args[0]);
                 let result = ca_fn(frame_ptr);
                 if !op.pos.is_none() {
-                    tv.set(op.pos.0, result);
+                    tv.set(op.pos.raw(), result);
                 }
             }
             OpResult::Finish(args) => {
@@ -3814,16 +3814,20 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
     #[test]
     fn test_blackhole_simple_arithmetic() {
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
-            mk_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 10i64);
@@ -3844,9 +3848,9 @@ mod tests {
     #[test]
     fn test_blackhole_guard_passes() {
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 1i64);
@@ -3860,9 +3864,9 @@ mod tests {
     #[test]
     fn test_blackhole_exception_guard_no_exception_passes() {
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0),
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 42i64);
@@ -3875,13 +3879,13 @@ mod tests {
 
     #[test]
     fn test_blackhole_initial_exception_fails_guard_no_exception_without_restore() {
-        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
 
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 42i64);
@@ -3905,9 +3909,9 @@ mod tests {
     #[test]
     fn test_blackhole_initial_exception_satisfies_guard_exception_without_restore() {
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(OpCode::GuardException, &[OpRef(0)], 1),
-            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardException, &[OpRef::from_raw(0)], 1),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 100i64);
@@ -3932,15 +3936,23 @@ mod tests {
     fn test_blackhole_exception_save_exc_class() {
         // RestoreException sets exception state, then SaveExcClass reads it.
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
             mk_op(
                 OpCode::RestoreException,
-                &[OpRef(0), OpRef(1)],
-                OpRef::NONE.0,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
             ),
             mk_op(OpCode::SaveExcClass, &[], 2),
             mk_op(OpCode::SaveException, &[], 3),
-            mk_op(OpCode::Finish, &[OpRef(2), OpRef(3)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::from_raw(2), OpRef::from_raw(3)],
+                OpRef::NONE.raw(),
+            ),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 100i64); // exc_class
@@ -3955,18 +3967,22 @@ mod tests {
     #[test]
     fn test_blackhole_guard_no_exception_fails_with_exception() {
         // RestoreException then GuardNoException should fail.
-        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.0);
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
 
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
             mk_op(
                 OpCode::RestoreException,
-                &[OpRef(0), OpRef(1)],
-                OpRef::NONE.0,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 100i64);
@@ -3982,15 +3998,19 @@ mod tests {
     fn test_blackhole_guard_exception_matches() {
         // Set exception, then GuardException with matching class should pass.
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
             mk_op(
                 OpCode::RestoreException,
-                &[OpRef(0), OpRef(1)],
-                OpRef::NONE.0,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
             ),
             // GuardException expects class in arg(0)
-            mk_op(OpCode::GuardException, &[OpRef(0)], 2),
-            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+            mk_op(OpCode::GuardException, &[OpRef::from_raw(0)], 2),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 100i64); // exc_class
@@ -4007,13 +4027,13 @@ mod tests {
 
     #[test]
     fn test_blackhole_guard_fails() {
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(0)], OpRef::NONE.0);
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef(0)]);
+        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        guard_op.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
 
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef(0)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, 0i64);
@@ -4034,9 +4054,13 @@ mod tests {
     /// Helper: build and execute a single binop, returning the i64 result.
     fn exec_binop(opcode: OpCode, a: i64, b: i64) -> i64 {
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
-            mk_op(opcode, &[OpRef(0), OpRef(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef(2)], OpRef::NONE.0),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(opcode, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, a);
@@ -4057,9 +4081,9 @@ mod tests {
     /// Helper: build and execute a single unary op, returning the i64 result.
     fn exec_unop(opcode: OpCode, a: i64) -> i64 {
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
-            mk_op(opcode, &[OpRef(0)], 1),
-            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(opcode, &[OpRef::from_raw(0)], 1),
+            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
         ];
         let mut initial = HashMap::new();
         initial.insert(0, a);
@@ -4506,7 +4530,11 @@ mod tests {
     /// (i.e., none falls through to the Unsupported catch-all).
     #[test]
     fn test_all_opcodes_have_blackhole_handler() {
-        let dummy_args = &[OpRef(10_000), OpRef(10_001), OpRef(10_002)];
+        let dummy_args = &[
+            OpRef::from_raw(10_000),
+            OpRef::from_raw(10_001),
+            OpRef::from_raw(10_002),
+        ];
         let mut constants = HashMap::new();
         constants.insert(10_000, 1i64);
         constants.insert(10_001, 2i64);
@@ -4520,12 +4548,12 @@ mod tests {
             let arity = opcode.arity().unwrap_or(3) as usize;
             let args = &dummy_args[..arity.min(3)];
             let mut op = Op::new(opcode, args);
-            op.pos = OpRef(opcode.as_u16() as u32 + 20_000);
+            op.pos = OpRef::from_raw(opcode.as_u16() as u32 + 20_000);
 
             let result = execute_one(&op, &values, &mut exc);
             // Store the result so subsequent ops can reference it
             if let OpResult::Value(v) = &result {
-                values.insert(op.pos.0, *v);
+                values.insert(op.pos.raw(), *v);
             }
 
             match result {

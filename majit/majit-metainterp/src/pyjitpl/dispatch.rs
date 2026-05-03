@@ -3134,9 +3134,6 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
     }
 }
 
-/// Build a multi-frame `recorder::Snapshot` over the framestack for a
-/// state-field-JIT guard.
-///
 /// RPython captures snapshots by walking `MetaInterp.framestack` and
 /// reading per-frame liveness via `MIFrame.get_list_of_active_boxes`
 /// (`opencoder.py:819 capture_resumedata`).  The Rust state-field JIT
@@ -3342,21 +3339,21 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 4);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
         );
-        let set_token = recorder.get_op_by_pos(OpRef(1)).unwrap();
+        let set_token = recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap();
         assert_eq!(set_token.opcode, OpCode::SetfieldGc);
         assert_eq!(
             set_token.descr.as_ref().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
             OpCode::CallMayForceN
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
     }
@@ -3393,15 +3390,15 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 3);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
             OpCode::CallMayForceN
         );
     }
@@ -3438,19 +3435,19 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 4);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
             OpCode::CallMayForceI
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
     }
@@ -3487,19 +3484,19 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 4);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
             OpCode::CallMayForceR
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
     }
@@ -3536,19 +3533,19 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 4);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
             OpCode::CallMayForceF
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
     }
@@ -3725,7 +3722,7 @@ mod tests {
         let mut frame = MIFrame::new(jitcode, 0);
         // Pre-fill regs with sentinels so a stray write would surface.
         for slot in &mut frame.int_regs {
-            *slot = Some(majit_ir::OpRef(99));
+            *slot = Some(majit_ir::OpRef::from_raw(99));
         }
         for slot in &mut frame.int_values {
             *slot = Some(0xDEAD);
@@ -3744,10 +3741,10 @@ mod tests {
     fn populate_frame_int_regs_writes_scalars_and_arrays() {
         // Hand-rolled override that mirrors the macro emit
         // (`majit-macros/src/jit_interp/codegen_state.rs`):
-        //   - 2 scalar slots (idx 0, 1) → `(OpRef(10), 100)`,
-        //     `(OpRef(11), 101)`.
+        //   - 2 scalar slots (idx 0, 1) → `(OpRef::from_raw(10), 100)`,
+        //     `(OpRef::from_raw(11), 101)`.
         //   - 1 array slot of length 3 (idx 2..5) →
-        //     `(OpRef(20+i), 200+i)` for `i in 0..3`.
+        //     `(OpRef::from_raw(20+i), 200+i)` for `i in 0..3`.
         // Asserts the canonical liveness slot layout from
         // `live_slots_for_state_field_jit(num_scalars=2,
         // array_lens=&[3], num_virt_arrays=0)` is honored.
@@ -3765,15 +3762,15 @@ mod tests {
             fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
                 let mut slot = 0;
                 // scalars
-                frame.int_regs[slot] = Some(majit_ir::OpRef(10));
+                frame.int_regs[slot] = Some(majit_ir::OpRef::from_raw(10));
                 frame.int_values[slot] = Some(100);
                 slot += 1;
-                frame.int_regs[slot] = Some(majit_ir::OpRef(11));
+                frame.int_regs[slot] = Some(majit_ir::OpRef::from_raw(11));
                 frame.int_values[slot] = Some(101);
                 slot += 1;
                 // array (len 3)
                 for i in 0..3 {
-                    frame.int_regs[slot + i] = Some(majit_ir::OpRef(20 + i as u32));
+                    frame.int_regs[slot + i] = Some(majit_ir::OpRef::from_raw(20 + i as u32));
                     frame.int_values[slot + i] = Some(200 + i as i64);
                 }
             }
@@ -3789,12 +3786,15 @@ mod tests {
         let sym = StateFieldLikeSym;
         sym.populate_frame_int_regs(&mut frame);
 
-        assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef(10)));
+        assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef::from_raw(10)));
         assert_eq!(frame.int_values[0], Some(100));
-        assert_eq!(frame.int_regs[1], Some(majit_ir::OpRef(11)));
+        assert_eq!(frame.int_regs[1], Some(majit_ir::OpRef::from_raw(11)));
         assert_eq!(frame.int_values[1], Some(101));
         for i in 0..3 {
-            assert_eq!(frame.int_regs[2 + i], Some(majit_ir::OpRef(20 + i as u32)));
+            assert_eq!(
+                frame.int_regs[2 + i],
+                Some(majit_ir::OpRef::from_raw(20 + i as u32))
+            );
             assert_eq!(frame.int_values[2 + i], Some(200 + i as i64));
         }
     }
@@ -3863,11 +3863,15 @@ mod tests {
         // — the actual values are arbitrary; the snapshot must mirror
         // them slot-for-slot post-`populate_frame_int_regs`.
         let mut sym = StateFieldLikeSym {
-            fail_args: vec![OpRef(50), OpRef(51), OpRef(52)],
+            fail_args: vec![
+                OpRef::from_raw(50),
+                OpRef::from_raw(51),
+                OpRef::from_raw(52),
+            ],
             populated: vec![
-                (0, OpRef(50), 500),
-                (1, OpRef(51), 510),
-                (2, OpRef(52), 520),
+                (0, OpRef::from_raw(50), 500),
+                (1, OpRef::from_raw(51), 510),
+                (2, OpRef::from_raw(52), 520),
             ],
         };
 
@@ -3960,12 +3964,12 @@ mod tests {
         let jitcode = std::sync::Arc::new(builder.finish());
         jitcode.set_index(7);
         let mut frame = MIFrame::new(jitcode, pc);
-        frame.int_regs[0] = Some(majit_ir::OpRef(10));
+        frame.int_regs[0] = Some(majit_ir::OpRef::from_raw(10));
         frame.int_values[0] = Some(100);
-        frame.int_regs[1] = Some(majit_ir::OpRef(11));
+        frame.int_regs[1] = Some(majit_ir::OpRef::from_raw(11));
         frame.int_values[1] = Some(101);
         for i in 0..3 {
-            frame.int_regs[2 + i] = Some(majit_ir::OpRef(20 + i as u32));
+            frame.int_regs[2 + i] = Some(majit_ir::OpRef::from_raw(20 + i as u32));
             frame.int_values[2 + i] = Some(200 + i as i64);
         }
         let mut stack = MIFrameStack::empty();
@@ -4009,7 +4013,7 @@ mod tests {
         let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, pc);
-        frame.int_regs[1] = Some(majit_ir::OpRef(42));
+        frame.int_regs[1] = Some(majit_ir::OpRef::from_raw(42));
         frame.int_values[1] = Some(420);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
@@ -4043,7 +4047,7 @@ mod tests {
             root_builder.current_pos() - (majit_translate::liveness::OFFSET_SIZE + 1);
         let root_jitcode = std::sync::Arc::new(root_builder.finish());
         let mut root = MIFrame::new(root_jitcode, root_live_pc);
-        root.int_regs[0] = Some(majit_ir::OpRef(100));
+        root.int_regs[0] = Some(majit_ir::OpRef::from_raw(100));
         root.int_values[0] = Some(1000);
         root._result_argcode = b'i';
         root.result_arg_index = Some(0);
@@ -4057,11 +4061,11 @@ mod tests {
         let sub_jitcode = std::sync::Arc::new(sub_builder.finish());
         let mut sub = MIFrame::new(sub_jitcode, sub_pc);
         sub.parent_descr_idx = 3;
-        sub.int_regs[0] = Some(majit_ir::OpRef(11));
+        sub.int_regs[0] = Some(majit_ir::OpRef::from_raw(11));
         sub.int_values[0] = Some(110);
-        sub.ref_regs[0] = Some(majit_ir::OpRef(22));
+        sub.ref_regs[0] = Some(majit_ir::OpRef::from_raw(22));
         sub.ref_values[0] = Some(220);
-        sub.float_regs[0] = Some(majit_ir::OpRef(33));
+        sub.float_regs[0] = Some(majit_ir::OpRef::from_raw(33));
         sub.float_values[0] = Some(330);
 
         let mut stack = MIFrameStack::empty();
@@ -4110,7 +4114,7 @@ mod tests {
         let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, pc);
-        frame.int_regs[0] = Some(majit_ir::OpRef(5));
+        frame.int_regs[0] = Some(majit_ir::OpRef::from_raw(5));
         frame.int_values[0] = Some(50);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);

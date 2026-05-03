@@ -80,9 +80,9 @@ fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
         return Type::Ref;
     }
     if opref.is_constant() {
-        value_types.get(&opref.0).copied().unwrap_or(Type::Int)
+        value_types.get(&opref.raw()).copied().unwrap_or(Type::Int)
     } else {
-        value_types.get(&opref.0).copied().unwrap_or(Type::Ref)
+        value_types.get(&opref.raw()).copied().unwrap_or(Type::Ref)
     }
 }
 
@@ -246,7 +246,7 @@ pub(crate) fn build_guard_metadata(
 
     for (op_idx, op) in ops.iter().enumerate() {
         if !op.pos.is_none() && op.result_type() != Type::Void {
-            value_types.insert(op.pos.0, op.result_type());
+            value_types.insert(op.pos.raw(), op.result_type());
         }
 
         let is_guard = op.opcode.is_guard();
@@ -294,14 +294,14 @@ pub(crate) fn build_guard_metadata(
                     // matches the descr arity.
                     op.args
                         .iter()
-                        .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                        .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                         .collect()
                 }
             } else {
                 // No descr — synthetic test FINISH only.
                 op.args
                     .iter()
-                    .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                    .map(|opref| value_types.get(&opref.raw()).copied().unwrap_or(Type::Int))
                     .collect()
             }
         } else if let Some(ref fail_args) = op.fail_args {
@@ -329,7 +329,7 @@ pub(crate) fn build_guard_metadata(
                                     return tp;
                                 }
                             }
-                            if let Some(&tp) = value_types.get(&opref.0) {
+                            if let Some(&tp) = value_types.get(&opref.raw()) {
                                 return tp;
                             }
                             fail_arg_type(opref, &value_types)
@@ -347,7 +347,7 @@ pub(crate) fn build_guard_metadata(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            if let Some(&tp) = value_types.get(&opref.0) {
+                            if let Some(&tp) = value_types.get(&opref.raw()) {
                                 return tp;
                             }
                             fail_arg_type(opref, &value_types)
@@ -358,7 +358,7 @@ pub(crate) fn build_guard_metadata(
                 fail_args
                     .iter()
                     .map(|opref| {
-                        if let Some(&tp) = value_types.get(&opref.0) {
+                        if let Some(&tp) = value_types.get(&opref.raw()) {
                             return tp;
                         }
                         fail_arg_type(opref, &value_types)
@@ -1489,10 +1489,10 @@ pub(crate) fn normalize_closing_jump_args(
         if idx >= label_args.len() {
             break;
         }
-        if constants.contains_key(&arg.0) {
+        if constants.contains_key(&arg.raw()) {
             continue;
         }
-        if (arg.0 as usize) < num_inputs {
+        if (arg.raw() as usize) < num_inputs {
             continue;
         }
         if defined.contains(arg) {
@@ -1595,7 +1595,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         if source.is_none() || source.is_constant() {
             return;
         }
-        let idx = source.0 as usize;
+        let idx = source.raw() as usize;
         if idx >= forwarding.len() {
             forwarding.resize(idx + 1, OpRef::NONE);
         }
@@ -1607,7 +1607,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             return opref;
         }
         loop {
-            let idx = opref.0 as usize;
+            let idx = opref.raw() as usize;
             if idx >= forwarding.len() {
                 return opref;
             }
@@ -1635,7 +1635,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 if !replaced {
                     emitted = op.copy_and_change(op.opcode, None, None);
                     if op.result_type() != Type::Void && !op.pos.is_none() {
-                        let new_pos = OpRef(*next_opref);
+                        let new_pos = OpRef::op_typed(*next_opref, op.result_type());
                         *next_opref += 1;
                         emitted.pos = new_pos;
                         // compile.py:414-418 `orig_op.set_forwarded(op)`:
@@ -1675,7 +1675,10 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     let expanded_inputargs = inputargs.clone();
 
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
-    let vable_box = OpRef(expanded_inputargs[index_of_virtualizable].index);
+    let vable_box = OpRef::input_arg_typed(
+        expanded_inputargs[index_of_virtualizable].index,
+        expanded_inputargs[index_of_virtualizable].tp,
+    );
 
     // compile.py keeps Box identities disjoint automatically; in the flat
     // OpRef model we must allocate above every runtime ref already reachable
@@ -1689,7 +1692,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         })
         .chain(expanded_inputargs.iter().map(|ia| ia.opref()))
         .filter(|opref| !opref.is_none() && !opref.is_constant())
-        .map(|opref| opref.0)
+        .map(|opref| opref.raw())
         .max()
         .unwrap_or(0);
     let mut next_opref = max_runtime_ref + 1;
@@ -1698,7 +1701,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     let mut next_const_idx = constants
         .keys()
         .filter_map(|&k| {
-            let opref = OpRef(k);
+            let opref = OpRef::from_raw(k);
             opref.is_constant().then(|| opref.const_index())
         })
         .max()
@@ -1731,8 +1734,9 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             Type::Float => OpCode::GetfieldGcF,
             Type::Void => panic!("virtualizable static field {fi} has Void type"),
         };
-        let old_opref = OpRef(expanded_inputargs[i].index);
-        let new_opref = OpRef(next_opref);
+        let old_opref =
+            OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
+        let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
         let mut op = Op::new(opcode, &[vable_box]);
         op.pos = new_opref;
@@ -1751,8 +1755,8 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             "array {ai} length {array_len} would overrun inputargs (i={i}, len={})",
             expanded_inputargs.len()
         );
-        // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer.
-        let array_opref = OpRef(next_opref);
+        // GETFIELD_GC_R(vable_box, array_field_descr) → array pointer (Ref-typed).
+        let array_opref = OpRef::ref_op(next_opref);
         next_opref += 1;
         let mut arr_load = Op::new(OpCode::GetfieldGcR, &[vable_box]);
         arr_load.pos = array_opref;
@@ -1790,7 +1794,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
                 // base-pointer indirection step is added. Convergence
                 // would require switching pyre's `FixedObjectArray` to
                 // RPython's flat GC-array layout — out of scope.
-                let ptr_opref = OpRef(next_opref);
+                let ptr_opref = OpRef::int_op(next_opref);
                 next_opref += 1;
                 let mut ptr_load = Op::new(OpCode::GetfieldGcI, &[array_opref]);
                 ptr_load.pos = ptr_opref;
@@ -1818,13 +1822,14 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         };
         for index in 0..array_len {
             // compile.py:453 — ConstInt(index) for the array subscript.
-            let const_opref = OpRef::from_const(next_const_idx);
+            let const_opref = OpRef::const_int(next_const_idx);
             next_const_idx += 1;
-            constants.insert(const_opref.0, index as i64);
-            constant_types.insert(const_opref.0, Type::Int);
+            constants.insert(const_opref.raw(), index as i64);
+            constant_types.insert(const_opref.raw(), Type::Int);
 
-            let old_opref = OpRef(expanded_inputargs[i].index);
-            let new_opref = OpRef(next_opref);
+            let old_opref =
+                OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
+            let new_opref = OpRef::op_typed(next_opref, vinfo.array_fields[ai].item_type);
             next_opref += 1;
             let mut elem_op = Op::new(item_opcode, &[item_base, const_opref]);
             elem_op.pos = new_opref;
@@ -2520,8 +2525,8 @@ pub fn compile_tmp_callback(
     // `compile.py:1127` `callargs = [funcbox] + greenboxes + inputargs`.
     //
     // pyre layout: the CALL op's `args` slots reference `OpRef` numbers.
-    // InputArgs occupy `OpRef(0..num_inputs)`; constants (funcbox +
-    // greens) are allocated at `OpRef(CONST_BASE..)` and registered with
+    // InputArgs occupy `OpRef::from_raw(0..num_inputs)`; constants (funcbox +
+    // greens) are allocated at `OpRef::from_raw(CONST_BASE..)` and registered with
     // the backend via `set_constants` / `set_constant_types`.  This
     // matches the existing pyre convention that constants live at large
     // OpRef indices with lookup through the backend's `constants` map.
@@ -2529,27 +2534,27 @@ pub fn compile_tmp_callback(
     let mut constants: HashMap<u32, i64> = HashMap::new();
     let mut constant_types: HashMap<u32, Type> = HashMap::new();
     // `compile.py:1126` funcbox.
-    let funcbox_ref = OpRef(CONST_BASE);
-    constants.insert(funcbox_ref.0, jitdriver_sd.portal_runner_adr);
-    constant_types.insert(funcbox_ref.0, Type::Int);
+    let funcbox_ref = OpRef::from_raw(CONST_BASE);
+    constants.insert(funcbox_ref.raw(), jitdriver_sd.portal_runner_adr);
+    constant_types.insert(funcbox_ref.raw(), Type::Int);
     // Green boxes follow in declaration order.
     let mut callargs: Vec<OpRef> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs.push(funcbox_ref);
     for (i, gb) in greenboxes.iter().enumerate() {
-        let g_ref = OpRef(CONST_BASE + 1 + i as u32);
+        let g_ref = OpRef::from_raw(CONST_BASE + 1 + i as u32);
         let (raw, tp) = match *gb {
             Value::Int(v) => (v, Type::Int),
             Value::Ref(r) => (r.0 as i64, Type::Ref),
             Value::Float(f) => (f.to_bits() as i64, Type::Float),
             Value::Void => panic!("compile_tmp_callback: void greenbox"),
         };
-        constants.insert(g_ref.0, raw);
-        constant_types.insert(g_ref.0, tp);
+        constants.insert(g_ref.raw(), raw);
+        constant_types.insert(g_ref.raw(), tp);
         callargs.push(g_ref);
     }
     // Red args — inputargs occupy contiguous low OpRefs.
     for (i, _) in inputargs.iter().enumerate() {
-        callargs.push(OpRef(i as u32));
+        callargs.push(OpRef::from_raw(i as u32));
     }
     //
     let portal_calldescr = jitdriver_sd
@@ -2586,7 +2591,7 @@ pub fn compile_tmp_callback(
         Vec::new()
     } else {
         // The CALL writes to the first free OpRef after inputargs.
-        let call_result_ref = OpRef(num_inputs);
+        let call_result_ref = OpRef::from_raw(num_inputs);
         call_op.pos = call_result_ref;
         vec![call_result_ref]
     };
@@ -2639,16 +2644,18 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Ref);
         env.types.insert(1, Type::Int);
-        env.constants.insert(OpRef::from_const(1).0, (8, Type::Int));
         env.constants
-            .insert(OpRef::from_const(2).0, (777, Type::Int)); // code object payload
-        env.constants.insert(OpRef::from_const(3).0, (2, Type::Int));
+            .insert(OpRef::from_const(1).raw(), (8, Type::Int));
         env.constants
-            .insert(OpRef::from_const(4).0, (999, Type::Int)); // namespace payload
+            .insert(OpRef::from_const(2).raw(), (777, Type::Int)); // code object payload
+        env.constants
+            .insert(OpRef::from_const(3).raw(), (2, Type::Int));
+        env.constants
+            .insert(OpRef::from_const(4).raw(), (999, Type::Int)); // namespace payload
 
         let snapshot = Snapshot {
             vable_array: vec![
-                OpRef(0).into(),
+                OpRef::from_raw(0).into(),
                 OpRef::from_const(1).into(),
                 OpRef::from_const(2).into(),
                 OpRef::from_const(3).into(),
@@ -2658,7 +2665,7 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                boxes: vec![OpRef(1).into()],
+                boxes: vec![OpRef::from_raw(1).into()],
             }],
         };
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
@@ -2667,14 +2674,14 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(1)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
         guard.descr = Some(descr);
-        guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
+        guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]);
         guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
 
         let (_resume_data, _guard_indices, exit_layouts) =
@@ -2712,7 +2719,7 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2720,7 +2727,12 @@ mod tests {
             .unwrap()
             .set_fail_arg_types(fail_arg_types.clone());
         guard.descr = Some(descr);
-        guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2), OpRef(3)]);
+        guard.fail_args = Some(smallvec::smallvec![
+            OpRef::from_raw(0),
+            OpRef::from_raw(1),
+            OpRef::from_raw(2),
+            OpRef::from_raw(3)
+        ]);
         guard.fail_arg_types = Some(fail_arg_types);
 
         let (_resume_data, _guard_indices, exit_layouts) =
@@ -2741,14 +2753,14 @@ mod tests {
 
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::SameAsR, &[OpRef(1)]);
-                op.pos = OpRef(10);
+                let mut op = Op::new(OpCode::SameAsR, &[OpRef::from_raw(1)]);
+                op.pos = OpRef::from_raw(10);
                 op
             },
-            Op::new(OpCode::Label, &[OpRef(0), OpRef(10)]),
+            Op::new(OpCode::Label, &[OpRef::from_raw(0), OpRef::from_raw(10)]),
             {
-                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef(10)]);
-                op.pos = OpRef(11);
+                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::from_raw(10)]);
+                op.pos = OpRef::from_raw(11);
                 op.descr = Some(majit_ir::descr::make_field_descr(
                     16,
                     8,
@@ -2781,10 +2793,13 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
         assert_eq!(ops[1].args.as_slice(), &[vable_field]);
         let forwarded_same_as = ops[1].pos;
-        assert_ne!(forwarded_same_as, OpRef(10));
+        assert_ne!(forwarded_same_as, OpRef::from_raw(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
-        assert_eq!(ops[2].args.as_slice(), &[OpRef(0), forwarded_same_as]);
+        assert_eq!(
+            ops[2].args.as_slice(),
+            &[OpRef::from_raw(0), forwarded_same_as]
+        );
 
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
         assert_eq!(ops[3].args.as_slice(), &[forwarded_same_as]);
@@ -2804,7 +2819,10 @@ mod tests {
         );
         vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
 
-        let mut ops = vec![Op::new(OpCode::Label, &[OpRef(0), OpRef(1), OpRef(2)])];
+        let mut ops = vec![Op::new(
+            OpCode::Label,
+            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+        )];
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -2834,7 +2852,10 @@ mod tests {
         assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawR);
         assert_eq!(ops[3].args[0], ops[1].pos);
         assert_eq!(ops[4].opcode, OpCode::Label);
-        assert_eq!(ops[4].args.as_slice(), &[OpRef(0), ops[2].pos, ops[3].pos]);
+        assert_eq!(
+            ops[4].args.as_slice(),
+            &[OpRef::from_raw(0), ops[2].pos, ops[3].pos]
+        );
     }
 }
 /// `compile.py:855` ResumeGuardDescr `_attrs_ = ('rd_numb', 'rd_consts',
@@ -4285,16 +4306,16 @@ mod fail_descr_tests {
         fail_descr.attach_vector_info(AccumInfo {
             prev: None,
             failargs_pos: 0,
-            variable: majit_ir::OpRef(10),
-            location: majit_ir::OpRef(20),
+            variable: majit_ir::OpRef::int_op(10),
+            location: majit_ir::OpRef::int_op(20),
             accum_operation: '+',
             scalar: majit_ir::OpRef::NONE,
         });
         fail_descr.attach_vector_info(AccumInfo {
             prev: None,
             failargs_pos: 1,
-            variable: majit_ir::OpRef(11),
-            location: majit_ir::OpRef(21),
+            variable: majit_ir::OpRef::int_op(11),
+            location: majit_ir::OpRef::int_op(21),
             accum_operation: '*',
             scalar: majit_ir::OpRef::NONE,
         });

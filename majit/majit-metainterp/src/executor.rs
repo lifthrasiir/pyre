@@ -54,15 +54,15 @@ impl TraceValues {
     pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
         let max_op = map
             .keys()
-            .filter(|&&k| !OpRef(k).is_constant())
+            .filter(|&&k| !OpRef::from_raw(k).is_constant())
             .max()
             .copied()
             .unwrap_or(0) as usize;
         let max_const = map
             .keys()
-            .filter(|&&k| OpRef(k).is_constant())
+            .filter(|&&k| OpRef::from_raw(k).is_constant())
             .max()
-            .map(|&k| OpRef(k).const_index() as usize)
+            .map(|&k| OpRef::from_raw(k).const_index() as usize)
             .unwrap_or(0);
         let mut tv = Self::new(max_op + 1, max_const + 1);
         for (&k, &v) in map {
@@ -73,7 +73,7 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn get(&self, idx: u32) -> i64 {
-        let opref = OpRef(idx);
+        let opref = OpRef::from_raw(idx);
         if opref.is_constant() {
             let ci = opref.const_index() as usize;
             if ci < self.constants.len() {
@@ -93,7 +93,7 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn set(&mut self, idx: u32, value: i64) {
-        let opref = OpRef(idx);
+        let opref = OpRef::from_raw(idx);
         if opref.is_constant() {
             let ci = opref.const_index() as usize;
             if ci >= self.constants.len() {
@@ -111,7 +111,7 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn resolve(&self, opref: OpRef) -> i64 {
-        self.get(opref.0)
+        self.get(opref.raw())
     }
 }
 
@@ -124,14 +124,14 @@ pub(crate) trait ValueStore {
 impl ValueStore for HashMap<u32, i64> {
     #[inline(always)]
     fn resolve(&self, opref: OpRef) -> i64 {
-        self.get(&opref.0).copied().unwrap_or(0)
+        self.get(&opref.raw()).copied().unwrap_or(0)
     }
 }
 
 impl ValueStore for TraceValues {
     #[inline(always)]
     fn resolve(&self, opref: OpRef) -> i64 {
-        self.get(opref.0)
+        self.get(opref.raw())
     }
 }
 

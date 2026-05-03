@@ -439,14 +439,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         })
         .collect();
 
-    // ── create_sym: assign sequential OpRef(0), OpRef(1), ... ──
+    // ── create_sym: assign sequential OpRef::from_raw(0), OpRef::from_raw(1), ... ──
     let create_sym_scalar_inits: Vec<TokenStream> = scalars
         .iter()
         .map(|(_, f)| {
             let fname = &f.name;
             let value_name = quote::format_ident!("{}_value", f.name);
             quote! {
-                let #fname = majit_ir::OpRef(__offset as u32);
+                let #fname = majit_ir::OpRef::input_arg_int(__offset as u32);
                 __offset += 1;
                 let #value_name = 0i64;
             }
@@ -461,7 +461,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             quote! {
                 let #fname: Vec<majit_ir::OpRef> = (0..meta.#len_name)
                     .map(|i| {
-                        let r = majit_ir::OpRef((__offset + i) as u32);
+                        let r = majit_ir::OpRef::from_raw((__offset + i) as u32);
                         r
                     })
                     .collect();
@@ -478,9 +478,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
             let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! {
-                let #ptr_name = majit_ir::OpRef(__offset as u32);
+                let #ptr_name = majit_ir::OpRef::input_arg_ref(__offset as u32);
                 __offset += 1;
-                let #len_name = majit_ir::OpRef(__offset as u32);
+                let #len_name = majit_ir::OpRef::input_arg_int(__offset as u32);
                 __offset += 1;
                 let #ptr_value_name = 0i64;
                 let #len_value_name = 0i64;

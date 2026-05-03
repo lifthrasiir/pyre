@@ -3156,16 +3156,16 @@ mod tests {
         descr.attach_vector_info(AccumInfo {
             prev: None,
             failargs_pos: 0,
-            variable: OpRef(10),
-            location: OpRef(20),
+            variable: OpRef::int_op(10),
+            location: OpRef::int_op(20),
             accum_operation: '+',
             scalar: OpRef::NONE,
         });
         descr.attach_vector_info(AccumInfo {
             prev: None,
             failargs_pos: 1,
-            variable: OpRef(11),
-            location: OpRef(21),
+            variable: OpRef::int_op(11),
+            location: OpRef::int_op(21),
             accum_operation: '*',
             scalar: OpRef::NONE,
         });

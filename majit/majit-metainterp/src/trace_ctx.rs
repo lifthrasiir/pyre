@@ -458,10 +458,12 @@ impl TraceCtx {
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
         let initial_position = recorder.get_position();
-        let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
-            .map(|i| OpRef(i as u32))
-            .collect();
         let initial_types: Vec<Type> = recorder.inputarg_types().to_vec();
+        let initial_boxes: Vec<OpRef> = initial_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
+            .collect();
         TraceCtx {
             recorder,
             metainterp_sd,
@@ -510,12 +512,14 @@ impl TraceCtx {
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
         let initial_position = recorder.get_position();
-        let initial_boxes: Vec<OpRef> = (0..recorder.num_inputargs())
-            .map(|i| OpRef(i as u32))
-            .collect();
         // RPython pyjitpl.py:2878: initial merge point types come from
         // live_arg_boxes which carry actual types (INT/REF/FLOAT).
         let initial_input_types = recorder.inputarg_types();
+        let initial_boxes: Vec<OpRef> = initial_input_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
+            .collect();
         TraceCtx {
             recorder,
             metainterp_sd,
@@ -759,14 +763,14 @@ impl TraceCtx {
     pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         self.constants
             .numbering_type_overrides()
-            .get(&opref.0)
+            .get(&opref.raw())
             .copied()
             .or_else(|| self.constants.constant_type(opref))
     }
 
     /// Return the concrete value for a constant OpRef, if it is a pooled constant.
     pub fn const_value(&self, opref: OpRef) -> Option<i64> {
-        self.constants.as_ref().get(&opref.0).copied()
+        self.constants.as_ref().get(&opref.raw()).copied()
     }
 
     /// Root an Int-typed constant on the GC shadow stack.
@@ -928,7 +932,7 @@ impl TraceCtx {
                     );
                     crate::recorder::SnapshotTagged::Const(value, tp)
                 } else {
-                    crate::recorder::SnapshotTagged::Box(opref.0, tp)
+                    crate::recorder::SnapshotTagged::Box(opref.raw(), tp)
                 }
             })
             .collect();
@@ -964,7 +968,7 @@ impl TraceCtx {
 
     /// Look up a constant value by its OpRef (>= 10_000).
     pub fn constant_value(&self, opref: OpRef) -> Option<i64> {
-        self.constants.as_ref().get(&opref.0).copied()
+        self.constants.as_ref().get(&opref.raw()).copied()
     }
 
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
@@ -1023,11 +1027,11 @@ impl TraceCtx {
     // `_index`-based positions (box-yielding count, opencoder.py:664-670
     // `record_op` returns `pos = self._index`), while
     // `recorder::Trace::record_op` (recorder.rs:159-169) returns
-    // `OpRef(op_count)` — every op (void or not) gets a unique index.
+    // `OpRef::from_raw(op_count)` — every op (void or not) gets a unique index.
     // TRB's `_untag` (opencoder.rs:717-770) resolves `TAGBOX(v)` via
     // `_cache[v]`, and `_cache` is indexed by `_index`, so callers that
     // store an OpRef and later pass it as an arg must have stored an
-    // `_index`-based value. Across pyre, `op.pos.0` is used as a HashMap
+    // `_index`-based value. Across pyre, `op.pos.raw()` is used as a HashMap
     // key (compile.rs, blackhole.rs, optimizeopt/*, pyjitpl/mod.rs) under
     // the pyre-legacy "all ops unique" invariant; a straight swap would
     // corrupt those maps. The swap therefore has to land together with
@@ -1177,7 +1181,7 @@ impl TraceCtx {
             Type::Float => JitArgKind::Float,
             Type::Void => return None,
         };
-        Some((kind, OpRef(index as u32), bits))
+        Some((kind, OpRef::from_raw(index as u32), bits))
     }
 
     /// JitCode setup argbox for the standard virtualizable.
@@ -1286,8 +1290,8 @@ impl TraceCtx {
     /// fall back to a safe default rather than letting Void leak into
     /// `livebox_types` / `fail_arg_types`.
     pub fn get_opref_type(&self, opref: OpRef) -> Option<Type> {
-        if (opref.0 as usize) < self.recorder.num_inputargs() {
-            return Some(self.recorder.inputarg_types()[opref.0 as usize]);
+        if (opref.raw() as usize) < self.recorder.num_inputargs() {
+            return Some(self.recorder.inputarg_types()[opref.raw() as usize]);
         }
         // ConstantPool: check constant_type first, then numbering
         // type overrides (mark_type for resume-data-only Ref constants).
@@ -1295,7 +1299,7 @@ impl TraceCtx {
             if let Some(tp) = self.constants.constant_type(opref) {
                 return Some(tp);
             }
-            if let Some(&tp) = self.constants.numbering_type_overrides().get(&opref.0) {
+            if let Some(&tp) = self.constants.numbering_type_overrides().get(&opref.raw()) {
                 return Some(tp);
             }
         }
@@ -1702,7 +1706,7 @@ impl TraceCtx {
     ///      concrete.
     pub fn concrete_of_opref(&self, opref: OpRef) -> Value {
         if opref.is_constant() {
-            if let Some(raw) = self.constants.as_ref().get(&opref.0).copied() {
+            if let Some(raw) = self.constants.as_ref().get(&opref.raw()).copied() {
                 // Constants always have their type pinned by the
                 // pool's `get_or_insert*` paths (constant_pool.rs:101 /
                 // 134); a constant present in the pool with no recorded
@@ -1712,7 +1716,8 @@ impl TraceCtx {
                         "constant_pool.constant_type missing for constant OpRef({}) (raw={}): \
                          constant_pool.get_or_insert / get_or_insert_typed must populate \
                          constant_types in lockstep",
-                        opref.0, raw
+                        opref.raw(),
+                        raw
                     )
                 });
                 return match tp {
@@ -1740,7 +1745,7 @@ impl TraceCtx {
     ///
     /// Used at bridge entry: `init_symbolic` seeds the cache with OpRefs
     /// derived from the *parent* loop's `vable_array_base`, but the
-    /// bridge owns a fresh inputarg stream (its own `OpRef(0..N)` bound
+    /// bridge owns a fresh inputarg stream (its own `OpRef::from_raw(0..N)` bound
     /// to parent-guard fail_args). Keeping the parent seed makes
     /// subsequent `vable_getarrayitem_*` / `vable_setarrayitem_*` reads
     /// return stale parent-loop OpRefs; clearing forces the vable path
@@ -3543,7 +3548,14 @@ impl TraceCtx {
         ret_type: Type,
     ) -> OpRef {
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
-        let descr_index = func_ref.0;
+        let opcode = OpCode::call_loopinvariant_for_type(ret_type);
+        let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
+        // RPython `heapcache.py:629-639` keys by descriptor identity
+        // and `allboxes[0].getint()`. `MetaCallDescr` is cached through
+        // the local equivalent of `GcCache._cache_call`, so `index()`
+        // is a stable identity key for this heapcache slot while
+        // `get_descr_index()` keeps its opencoder meaning.
+        let descr_index = descr.index();
         let arg0_int = func_ptr as usize as i64;
         // heapcache: check loop-invariant cache
         if let Some((cached, _resvalue)) = self
@@ -3555,8 +3567,6 @@ impl TraceCtx {
             // is enough for the consumers of this method.
             return cached;
         }
-        let opcode = OpCode::call_loopinvariant_for_type(ret_type);
-        let descr = crate::call_descr::make_call_descr_for_opcode(opcode, arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
         let result = self
@@ -3983,16 +3993,16 @@ mod tests {
     // ── M1 · opref_to_box bridge tests ─────────────────────────────────
 
     /// M1: non-constant OpRefs (inputargs + recorded op results) map
-    /// straight to Box::ResOp(opref.0).  No constant-pool lookup.
+    /// straight to Box::ResOp(opref.raw()).  No constant-pool lookup.
     #[test]
     fn test_opref_to_box_non_constant_m1() {
         let mut ctx = TraceCtx::for_test(2);
-        let i0 = OpRef(0); // first inputarg
-        let i1 = OpRef(1); // second inputarg
+        let i0 = OpRef::input_arg_int(0); // first inputarg
+        let i1 = OpRef::input_arg_int(1); // second inputarg
         let add = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
         assert_eq!(ctx.opref_to_box(i0), OcBox::ResOp(0));
         assert_eq!(ctx.opref_to_box(i1), OcBox::ResOp(1));
-        assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.0));
+        assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.raw()));
     }
 
     /// M1: constant OpRefs route through ConstantPool::get_value for
@@ -4233,7 +4243,7 @@ mod tests {
     #[test]
     fn call_assembler_red_only_ref_emits_no_vable_expansion() {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let frame = OpRef(0);
+        let frame = OpRef::input_arg_ref(0);
         ctx.set_driver_descriptor(JitDriverStaticData::with_virtualizable(
             Vec::new(),
             vec![("frame", Type::Ref)],
@@ -4262,7 +4272,7 @@ mod tests {
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
         let mut recorder = ctx.recorder;
         let num_inputs = recorder.num_inputargs();
-        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef(i as u32)).collect();
+        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef::from_raw(i as u32)).collect();
         recorder.close_loop(&jump_args);
         let trace = recorder.get_trace();
         // Return only non-JUMP ops
@@ -4303,7 +4313,7 @@ mod tests {
             2,
         );
 
-        assert!(result.0 > 0);
+        assert!(result.raw() > 0);
         assert_eq!(sync.updated_fields.len(), 1);
         assert_eq!(sync.updated_fields[0].0, 42);
         assert_ne!(sync.updated_fields[0].1, field_val);
@@ -4430,7 +4440,7 @@ mod tests {
             1,
         );
 
-        assert!(result.0 > 0);
+        assert!(result.raw() > 0);
         assert!(sync.updated_fields.is_empty());
 
         let ops = take_all_ops(ctx);
@@ -4524,7 +4534,7 @@ mod tests {
         );
 
         // Default JitState does no sync => no extra ops
-        assert!(result.0 > 0);
+        assert!(result.raw() > 0);
         assert!(!sync.forced);
         assert!(sync.updated_fields.is_empty());
 
@@ -4604,7 +4614,7 @@ mod tests {
             2,
         );
 
-        assert!(result.0 > 0);
+        assert!(result.raw() > 0);
         assert!(!sync.forced);
         assert_eq!(sync.updated_fields.len(), 1);
         assert_eq!(sync.updated_fields[0].0, 0);
@@ -4753,7 +4763,7 @@ mod tests {
             2,
         );
 
-        assert!(result.0 > 0);
+        assert!(result.raw() > 0);
         assert!(!sync.forced);
         assert_eq!(sync.updated_fields.len(), 1);
 
@@ -4833,7 +4843,7 @@ mod tests {
             2,
         );
 
-        assert!(result.0 > 0);
+        assert!(result.raw() > 0);
         assert!(!sync.forced);
         assert_eq!(sync.updated_fields.len(), 1);
 

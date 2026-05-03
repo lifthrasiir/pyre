@@ -49,7 +49,7 @@ impl RegisterHints {
         if !arg.is_constant() {
             return None;
         }
-        self.constants.get(&arg.0).copied()
+        self.constants.get(&arg.raw()).copied()
     }
 
     /// reghint.py:30 `add_hints` — main entry called from

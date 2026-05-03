@@ -356,9 +356,9 @@ impl<'a> AssemblerARM64<'a> {
             return None;
         }
         if opref.is_constant() {
-            return self.constant_types.get(&opref.0).copied();
+            return self.constant_types.get(&opref.raw()).copied();
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.operations[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -367,10 +367,10 @@ impl<'a> AssemblerARM64<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.0) {
+        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.operations[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -480,10 +480,10 @@ impl<'a> AssemblerARM64<'a> {
     /// (regardless of CONST_BIT), then fall back to slot mapping.
     fn resolve_opref(&self, opref: OpRef) -> ResolvedArg {
         // Op results take precedence over constants (Cranelift parity).
-        if let Some(&slot) = self.opref_to_slot.get(&opref.0) {
+        if let Some(&slot) = self.opref_to_slot.get(&opref.raw()) {
             return ResolvedArg::Slot(Self::slot_offset(slot));
         }
-        if let Some(&val) = self.constants.get(&opref.0) {
+        if let Some(&val) = self.constants.get(&opref.raw()) {
             return ResolvedArg::Const(val);
         }
         // Unmapped OpRef — treat as 0.
@@ -496,7 +496,7 @@ impl<'a> AssemblerARM64<'a> {
     ///
     /// Reuses the existing slot if the OpRef has already been allocated.
     fn allocate_slot(&mut self, opref: OpRef) -> usize {
-        if let Some(&existing) = self.opref_to_slot.get(&opref.0) {
+        if let Some(&existing) = self.opref_to_slot.get(&opref.raw()) {
             return existing;
         }
         let slot = self.next_slot;
@@ -504,7 +504,7 @@ impl<'a> AssemblerARM64<'a> {
         if self.next_slot + 1 > self.frame_depth {
             self.frame_depth = self.next_slot + 1;
         }
-        self.opref_to_slot.insert(opref.0, slot);
+        self.opref_to_slot.insert(opref.raw(), slot);
         slot
     }
 
@@ -1577,7 +1577,7 @@ impl<'a> AssemblerARM64<'a> {
         for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
             if let Some(floc) = lifetime.current_frame_loc {
                 self.opref_to_slot
-                    .insert(opref.0, JITFRAME_FIXED_SIZE + floc.position);
+                    .insert(opref.raw(), JITFRAME_FIXED_SIZE + floc.position);
             }
         }
         // frame_slot_depth is already absolute (see calculation above).
@@ -4060,7 +4060,7 @@ impl<'a> AssemblerARM64<'a> {
                     None
                 } else {
                     self.opref_to_slot
-                        .get(&opref.0)
+                        .get(&opref.raw())
                         .copied()
                         .map(|slot| slot + JITFRAME_FIXED_SIZE)
                 }
@@ -4276,10 +4276,10 @@ impl<'a> AssemblerARM64<'a> {
                 let dst = Self::slot_offset(i);
                 dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, dst as u32] ; str x0, [sp, #-16]!);
             } else if arg_ref.is_constant() {
-                let val = self.constants.get(&arg_ref.0).copied().unwrap_or(0);
+                let val = self.constants.get(&arg_ref.raw()).copied().unwrap_or(0);
                 self.emit_mov_imm64(0, val);
                 dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
-            } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref.0) {
+            } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref.raw()) {
                 let src = Self::slot_offset(old_slot);
                 dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x29, src as u32] ; str x0, [sp, #-16]!);
             } else {
@@ -4308,7 +4308,7 @@ impl<'a> AssemblerARM64<'a> {
         // Remap: Label's arg[i] → canonical slot i
         for (i, &arg_ref) in op.args.iter().enumerate() {
             if !arg_ref.is_none() {
-                self.opref_to_slot.insert(arg_ref.0, i);
+                self.opref_to_slot.insert(arg_ref.raw(), i);
             }
         }
         self.next_slot = self.next_slot.max(op.args.len());
@@ -4530,8 +4530,8 @@ impl<'a> AssemblerARM64<'a> {
     /// regalloc.py parity: no code emitted — just alias the slot.
     fn genop_same_as(&mut self, op: &Op) {
         let arg = op.arg(0);
-        if let Some(&slot) = self.opref_to_slot.get(&arg.0) {
-            self.opref_to_slot.insert(op.pos.0, slot);
+        if let Some(&slot) = self.opref_to_slot.get(&arg.raw()) {
+            self.opref_to_slot.insert(op.pos.raw(), slot);
         } else {
             self.load_arg_to_rax(arg);
             self.store_rax_to_result(op.pos);
@@ -5785,9 +5785,9 @@ impl<'a> AssemblerARM64<'a> {
         let size_ref = op.arg(0);
         let total_size = self
             .constants
-            .get(&size_ref.0)
+            .get(&size_ref.raw())
             .copied()
-            .unwrap_or(size_ref.0 as i64);
+            .unwrap_or(size_ref.raw() as i64);
         let gc_hdr = majit_gc::header::GcHeader::SIZE as i64;
         // gc.py:525-531 — read nursery slot addresses from the active GC
         // descriptor (cpu.gc_ll_descr.get_nursery_free_addr() parity), not

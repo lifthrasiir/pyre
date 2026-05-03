@@ -3062,7 +3062,7 @@ mod tests {
     /// Helper: assign positions to ops so the optimizer can track them.
     fn with_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
         }
     }
 
@@ -3118,13 +3118,13 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(opcode, &[OpRef(0), OpRef(1)]),
+            Op::new(opcode, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(const_pos as u32), Value::Int(const_val));
+        ctx.make_constant(OpRef::from_raw(const_pos as u32), Value::Int(const_val));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(
@@ -3132,8 +3132,8 @@ mod tests {
             "{opcode:?} with const {const_val} at pos {const_pos} should Remove"
         );
         assert_eq!(
-            ctx.get_box_replacement(OpRef(2)),
-            OpRef(expected_forward_to),
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(expected_forward_to),
             "{opcode:?} should forward to {expected_forward_to}"
         );
     }
@@ -3143,14 +3143,14 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(opcode, &[OpRef(0), OpRef(1)]),
+            Op::new(opcode, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(a));
-        ctx.make_constant(OpRef(1), Value::Int(b));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(a));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(b));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(
@@ -3158,7 +3158,7 @@ mod tests {
             "{opcode:?}({a}, {b}) should constant-fold"
         );
         assert_eq!(
-            ctx.get_constant_int(OpRef(2)),
+            ctx.get_constant_int(OpRef::from_raw(2)),
             Some(expected),
             "{opcode:?}({a}, {b}) = {expected}"
         );
@@ -3168,7 +3168,7 @@ mod tests {
     fn assert_binop_self(opcode: OpCode, expected_const: Option<i64>) {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(opcode, &[OpRef(0), OpRef(0)]),
+            Op::new(opcode, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -3181,7 +3181,7 @@ mod tests {
         );
         if let Some(val) = expected_const {
             assert_eq!(
-                ctx.get_constant_int(OpRef(1)),
+                ctx.get_constant_int(OpRef::from_raw(1)),
                 Some(val),
                 "{opcode:?}(x, x) = {val}"
             );
@@ -3203,7 +3203,7 @@ mod tests {
         // x + x → lshift(x, 1) — keep as separate test (rewrite, not identity)
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -3234,17 +3234,17 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(0));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0));
 
         // x * 1 = x
         assert_binop_identity(OpCode::IntMul, 1, 1, 0);
@@ -3258,13 +3258,13 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Int(8));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(8));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         match result {
@@ -3283,17 +3283,20 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntFloorDiv, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::IntFloorDiv,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0));
         // x / x = 1
         assert_binop_self(OpCode::IntFloorDiv, Some(1));
         // x / -1 = neg(x)
@@ -3307,17 +3310,17 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntMod, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntMod, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(1));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0));
         // x % x = 0
         assert_binop_self(OpCode::IntMod, Some(0));
     }
@@ -3353,29 +3356,29 @@ mod tests {
         // neg constant
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntNeg, &[OpRef(0)]),
+            Op::new(OpCode::IntNeg, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Int(42));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(42));
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(-42));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(1)), Some(-42));
 
         // invert constant
         let mut ops2 = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntInvert, &[OpRef(0)]),
+            Op::new(OpCode::IntInvert, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops2);
         let mut ctx2 = OptContext::new(2);
         ctx2.emit(ops2[0].clone());
-        ctx2.make_constant(OpRef(0), Value::Int(0xFF));
+        ctx2.make_constant(OpRef::from_raw(0), Value::Int(0xFF));
         let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(ctx2.get_constant_int(OpRef(1)), Some(!0xFF));
+        assert_eq!(ctx2.get_constant_int(OpRef::from_raw(1)), Some(!0xFF));
     }
 
     #[test]
@@ -3384,28 +3387,28 @@ mod tests {
         // is_zero(0) = 1
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntIsZero, &[OpRef(0)]),
+            Op::new(OpCode::IntIsZero, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(1)), Some(1));
 
         // is_zero(5) = 0
         let mut ops2 = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntIsZero, &[OpRef(0)]),
+            Op::new(OpCode::IntIsZero, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops2);
         let mut ctx2 = OptContext::new(2);
         ctx2.emit(ops2[0].clone());
-        ctx2.make_constant(OpRef(0), Value::Int(5));
+        ctx2.make_constant(OpRef::from_raw(0), Value::Int(5));
         let result2 = pass.propagate_forward(&ops2[1], &mut ctx2);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(ctx2.get_constant_int(OpRef(1)), Some(0));
+        assert_eq!(ctx2.get_constant_int(OpRef::from_raw(1)), Some(0));
     }
 
     #[test]
@@ -3423,12 +3426,12 @@ mod tests {
     fn test_guard_true_known_true() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
@@ -3439,12 +3442,12 @@ mod tests {
     fn test_guard_true_known_false() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3458,7 +3461,7 @@ mod tests {
     fn test_guard_true_unknown() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -3473,12 +3476,12 @@ mod tests {
     fn test_guard_false_known_false() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
@@ -3489,12 +3492,12 @@ mod tests {
     fn test_guard_false_known_true() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3509,14 +3512,17 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::GuardValue, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::GuardValue,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(42));
-        ctx.make_constant(OpRef(1), Value::Int(42));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(42));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(42));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
@@ -3529,7 +3535,7 @@ mod tests {
     fn test_same_as_i() {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::SameAsI, &[OpRef(0)]),
+            Op::new(OpCode::SameAsI, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -3538,7 +3544,10 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(1)),
+            OpRef::from_raw(0)
+        );
     }
 
     // ── Integration test: full optimizer with OptRewrite ──
@@ -3550,9 +3559,9 @@ mod tests {
 
         // Create a trace: x = SameAsI(), y = SameAsI(constant 0), z = IntAdd(x, y)
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                  // op0: x
-            Op::new(OpCode::SameAsI, &[]),                  // op1: 0
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]), // op2: x + 0
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::SameAsI, &[]), // op1: 0
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]), // op2: x + 0
         ];
         with_positions(&mut ops);
 
@@ -3590,7 +3599,7 @@ mod tests {
             }
             // Set op1 as constant 0 after it has been emitted
             if i == 1 {
-                ctx.make_constant(OpRef(1), Value::Int(0));
+                ctx.make_constant(OpRef::from_raw(1), Value::Int(0));
             }
         }
 
@@ -3599,16 +3608,19 @@ mod tests {
         // the IntAdd was removed and the result is forwarded.
         // op0 is emitted, op1 is emitted (just a constant), op2 is removed.
         // After forwarding, any reference to op2 should resolve to op0.
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
     fn test_optimizer_integration_chain() {
         // RPython parity: x - x -> 0, then guard_true(0) makes the trace impossible.
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                  // op0: x
-            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(0)]), // op1: x - x -> 0
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]),        // op2: guard_true(0)
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(0)]), // op1: x - x -> 0
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]), // op2: guard_true(0)
         ];
         with_positions(&mut ops);
 
@@ -3652,19 +3664,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(i64::MAX));
-        ctx.make_constant(OpRef(1), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(i64::MAX));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(i64::MIN)); // wrapping
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(i64::MIN)); // wrapping
     }
 
     // ── Shift of zero constant tests ──
@@ -3674,18 +3686,18 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntLshift, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntLshift, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0));
     }
 
     #[test]
@@ -3693,18 +3705,18 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntRshift, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntRshift, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0));
     }
 
     // ── Non-optimizable cases (should PassOn) ──
@@ -3714,7 +3726,7 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
@@ -3728,7 +3740,10 @@ mod tests {
 
     #[test]
     fn test_unknown_opcode_passthrough() {
-        let mut ops = vec![Op::new(OpCode::SetfieldGc, &[OpRef(0), OpRef(1)])];
+        let mut ops = vec![Op::new(
+            OpCode::SetfieldGc,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+        )];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(1);
 
@@ -3744,19 +3759,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntAnd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntAnd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0xFF));
-        ctx.make_constant(OpRef(1), Value::Int(0x0F));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0xFF));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0x0F));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0x0F));
     }
 
     // ── INT_OR constant fold ──
@@ -3766,19 +3781,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::IntOr, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntOr, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0xF0));
-        ctx.make_constant(OpRef(1), Value::Int(0x0F));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0xF0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(0x0F));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0xFF));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0xFF));
     }
 
     // ── UINT_RSHIFT tests ──
@@ -3788,18 +3803,24 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::UintRshift, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::UintRshift,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -3807,20 +3828,23 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]),
             Op::new(OpCode::SameAsI, &[]),
-            Op::new(OpCode::UintRshift, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::UintRshift,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(-1)); // all ones
-        ctx.make_constant(OpRef(1), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(-1)); // all ones
+        ctx.make_constant(OpRef::from_raw(1), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         // u64::MAX >> 1 = i64::MAX
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(i64::MAX));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(i64::MAX));
     }
 
     // ── Float optimization tests ──
@@ -3830,18 +3854,21 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]), // op0: x
             Op::new(OpCode::SameAsF, &[]), // op1: 0.0
-            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Float(0.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(0.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -3849,18 +3876,21 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]), // op0: 0.0
             Op::new(OpCode::SameAsF, &[]), // op1: x
-            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(0.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(0.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(1)
+        );
     }
 
     #[test]
@@ -3868,19 +3898,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(1.5));
-        ctx.make_constant(OpRef(1), Value::Float(2.5));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(1.5));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(2.5));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(4.0));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(2)), Some(4.0));
     }
 
     #[test]
@@ -3888,18 +3918,21 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatSub, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Float(0.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(0.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -3907,19 +3940,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatSub, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(5.0));
-        ctx.make_constant(OpRef(1), Value::Float(3.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(5.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(3.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(2.0));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(2)), Some(2.0));
     }
 
     #[test]
@@ -3927,18 +3960,21 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Float(1.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -3946,18 +3982,21 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(1.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(1)
+        );
     }
 
     #[test]
@@ -3965,19 +4004,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatMul, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(3.0));
-        ctx.make_constant(OpRef(1), Value::Float(4.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(3.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(4.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(12.0));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(2)), Some(12.0));
     }
 
     #[test]
@@ -3985,18 +4024,24 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatTrueDiv, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::FloatTrueDiv,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(1), Value::Float(1.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(1.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -4004,45 +4049,48 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatTrueDiv, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::FloatTrueDiv,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(10.0));
-        ctx.make_constant(OpRef(1), Value::Float(2.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(10.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(5.0));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(2)), Some(5.0));
     }
 
     #[test]
     fn test_float_neg_constant_fold() {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatNeg, &[OpRef(0)]),
+            Op::new(OpCode::FloatNeg, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
         ctx.emit(ops[0].clone());
-        ctx.make_constant(OpRef(0), Value::Float(3.14));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(3.14));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(1)), Some(-3.14));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(1)), Some(-3.14));
     }
 
     #[test]
     fn test_float_neg_double_negation() {
         // FloatNeg(FloatNeg(x)) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),          // op0: x
-            Op::new(OpCode::FloatNeg, &[OpRef(0)]), // op1: -x
-            Op::new(OpCode::FloatNeg, &[OpRef(1)]), // op2: -(-x) -> x
+            Op::new(OpCode::SameAsF, &[]),                    // op0: x
+            Op::new(OpCode::FloatNeg, &[OpRef::from_raw(0)]), // op1: -x
+            Op::new(OpCode::FloatNeg, &[OpRef::from_raw(1)]), // op2: -(-x) -> x
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
@@ -4057,7 +4105,10 @@ mod tests {
         // Process op2: should detect double negation
         let result2 = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -4065,19 +4116,22 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatFloorDiv, &[OpRef(0), OpRef(1)]),
+            Op::new(
+                OpCode::FloatFloorDiv,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(7.0));
-        ctx.make_constant(OpRef(1), Value::Float(2.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(7.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(2.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(3.0));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(2)), Some(3.0));
     }
 
     #[test]
@@ -4085,19 +4139,19 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatMod, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatMod, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Float(7.0));
-        ctx.make_constant(OpRef(1), Value::Float(3.0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Float(7.0));
+        ctx.make_constant(OpRef::from_raw(1), Value::Float(3.0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef(2)), Some(1.0));
+        assert_eq!(ctx.get_constant_float(OpRef::from_raw(2)), Some(1.0));
     }
 
     #[test]
@@ -4105,7 +4159,7 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsF, &[]),
             Op::new(OpCode::SameAsF, &[]),
-            Op::new(OpCode::FloatAdd, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
@@ -4126,14 +4180,17 @@ mod tests {
             Op::new(OpCode::SameAsI, &[]), // op0: condition (const 0)
             Op::new(OpCode::SameAsI, &[]), // op1: func
             Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
+            Op::new(
+                OpCode::CondCallN,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            ), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4147,14 +4204,17 @@ mod tests {
             Op::new(OpCode::SameAsI, &[]), // op0: condition (const 1)
             Op::new(OpCode::SameAsI, &[]), // op1: func
             Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
+            Op::new(
+                OpCode::CondCallN,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            ), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef(0), Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(1));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4163,8 +4223,8 @@ mod tests {
                 assert_eq!(op.opcode, OpCode::CallN);
                 // Should have args [func, arg1] (condition arg stripped)
                 assert_eq!(op.args.len(), 2);
-                assert_eq!(op.arg(0), OpRef(1));
-                assert_eq!(op.arg(1), OpRef(2));
+                assert_eq!(op.arg(0), OpRef::from_raw(1));
+                assert_eq!(op.arg(1), OpRef::from_raw(2));
             }
             other => panic!("expected Replace(CallN), got {:?}", other),
         }
@@ -4179,19 +4239,25 @@ mod tests {
             Op::new(OpCode::SameAsI, &[]), // op0: value (const 42)
             Op::new(OpCode::SameAsI, &[]), // op1: func
             Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(OpCode::CondCallValueI, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
+            Op::new(
+                OpCode::CondCallValueI,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            ), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef(0), Value::Int(42));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(42));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(3)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(3)),
+            OpRef::from_raw(0)
+        );
     }
 
     #[test]
@@ -4201,14 +4267,17 @@ mod tests {
             Op::new(OpCode::SameAsI, &[]), // op0: value (const 0)
             Op::new(OpCode::SameAsI, &[]), // op1: func
             Op::new(OpCode::SameAsI, &[]), // op2: arg1
-            Op::new(OpCode::CondCallValueI, &[OpRef(0), OpRef(1), OpRef(2)]), // op3
+            Op::new(
+                OpCode::CondCallValueI,
+                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            ), // op3
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
         ctx.emit(ops[2].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
@@ -4216,8 +4285,8 @@ mod tests {
             OptimizationResult::Replace(op) => {
                 assert_eq!(op.opcode, OpCode::CallPureI);
                 assert_eq!(op.args.len(), 2);
-                assert_eq!(op.arg(0), OpRef(1));
-                assert_eq!(op.arg(1), OpRef(2));
+                assert_eq!(op.arg(0), OpRef::from_raw(1));
+                assert_eq!(op.arg(1), OpRef::from_raw(2));
             }
             other => panic!("expected Replace(CallPureI), got {:?}", other),
         }
@@ -4229,8 +4298,8 @@ mod tests {
     fn test_ptr_eq_same_opref() {
         // PtrEq(x, x) -> 1
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                 // op0: x
-            Op::new(OpCode::PtrEq, &[OpRef(0), OpRef(0)]), // op1
+            Op::new(OpCode::SameAsR, &[]), // op0: x
+            Op::new(OpCode::PtrEq, &[OpRef::from_raw(0), OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4239,15 +4308,15 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(1)), Some(1));
     }
 
     #[test]
     fn test_ptr_ne_same_opref() {
         // PtrNe(x, x) -> 0
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                 // op0: x
-            Op::new(OpCode::PtrNe, &[OpRef(0), OpRef(0)]), // op1
+            Op::new(OpCode::SameAsR, &[]), // op0: x
+            Op::new(OpCode::PtrNe, &[OpRef::from_raw(0), OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4256,15 +4325,18 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(1)), Some(0));
     }
 
     #[test]
     fn test_instance_ptr_eq_same_opref() {
         // InstancePtrEq(x, x) -> 1
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                         // op0: x
-            Op::new(OpCode::InstancePtrEq, &[OpRef(0), OpRef(0)]), // op1
+            Op::new(OpCode::SameAsR, &[]), // op0: x
+            Op::new(
+                OpCode::InstancePtrEq,
+                &[OpRef::from_raw(0), OpRef::from_raw(0)],
+            ), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4273,15 +4345,18 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(1));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(1)), Some(1));
     }
 
     #[test]
     fn test_instance_ptr_ne_same_opref() {
         // InstancePtrNe(x, x) -> 0
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                         // op0: x
-            Op::new(OpCode::InstancePtrNe, &[OpRef(0), OpRef(0)]), // op1
+            Op::new(OpCode::SameAsR, &[]), // op0: x
+            Op::new(
+                OpCode::InstancePtrNe,
+                &[OpRef::from_raw(0), OpRef::from_raw(0)],
+            ), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4290,28 +4365,28 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(1)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(1)), Some(0));
     }
 
     #[test]
     fn test_ptr_eq_constant_fold() {
         // PtrEq(const 100, const 200) -> 0
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),                 // op0: const 100
-            Op::new(OpCode::SameAsR, &[]),                 // op1: const 200
-            Op::new(OpCode::PtrEq, &[OpRef(0), OpRef(1)]), // op2
+            Op::new(OpCode::SameAsR, &[]), // op0: const 100
+            Op::new(OpCode::SameAsR, &[]), // op1: const 200
+            Op::new(OpCode::PtrEq, &[OpRef::from_raw(0), OpRef::from_raw(1)]), // op2
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Ref(GcRef(100)));
-        ctx.make_constant(OpRef(1), Value::Ref(GcRef(200)));
+        ctx.make_constant(OpRef::from_raw(0), Value::Ref(GcRef(100)));
+        ctx.make_constant(OpRef::from_raw(1), Value::Ref(GcRef(200)));
 
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[2], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef(2)), Some(0));
+        assert_eq!(ctx.get_constant_int(OpRef::from_raw(2)), Some(0));
     }
 
     // ── CAST round-trip tests ──
@@ -4320,8 +4395,8 @@ mod tests {
     fn test_cast_ptr_to_int_passes_through() {
         // rewrite.py:807-809: CastPtrToInt registers pure inverse, emits.
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),              // op0: x
-            Op::new(OpCode::CastPtrToInt, &[OpRef(0)]), // op1
+            Op::new(OpCode::SameAsR, &[]),                        // op0: x
+            Op::new(OpCode::CastPtrToInt, &[OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4336,8 +4411,8 @@ mod tests {
     fn test_cast_int_to_ptr_passes_through() {
         // rewrite.py:811-813: CastIntToPtr registers pure inverse, emits.
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),              // op0: x
-            Op::new(OpCode::CastIntToPtr, &[OpRef(0)]), // op1
+            Op::new(OpCode::SameAsI, &[]),                        // op0: x
+            Op::new(OpCode::CastIntToPtr, &[OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4352,8 +4427,8 @@ mod tests {
     fn test_cast_opaque_ptr_eliminated() {
         // CastOpaquePtr(x) -> x
         let mut ops = vec![
-            Op::new(OpCode::SameAsR, &[]),               // op0: x
-            Op::new(OpCode::CastOpaquePtr, &[OpRef(0)]), // op1
+            Op::new(OpCode::SameAsR, &[]),                         // op0: x
+            Op::new(OpCode::CastOpaquePtr, &[OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4362,7 +4437,10 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[1], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(0));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(1)),
+            OpRef::from_raw(0)
+        );
     }
 
     // ── CONVERT_FLOAT_BYTES tests ──
@@ -4373,8 +4451,8 @@ mod tests {
     #[test]
     fn test_convert_float_bytes_to_longlong_passes_through() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsF, &[]),                             // op0: x
-            Op::new(OpCode::ConvertFloatBytesToLonglong, &[OpRef(0)]), // op1
+            Op::new(OpCode::SameAsF, &[]), // op0: x
+            Op::new(OpCode::ConvertFloatBytesToLonglong, &[OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4388,8 +4466,8 @@ mod tests {
     #[test]
     fn test_convert_longlong_bytes_to_float_passes_through() {
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),                             // op0: x
-            Op::new(OpCode::ConvertLonglongBytesToFloat, &[OpRef(0)]), // op1
+            Op::new(OpCode::SameAsI, &[]), // op0: x
+            Op::new(OpCode::ConvertLonglongBytesToFloat, &[OpRef::from_raw(0)]), // op1
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(2);
@@ -4409,14 +4487,14 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::SameAsI, &[]), // op0: condition (const 0)
             Op::new(OpCode::SameAsI, &[]), // op1: func
-            Op::new(OpCode::CondCallN, &[OpRef(0), OpRef(1)]), // op2: removed
+            Op::new(OpCode::CondCallN, &[OpRef::from_raw(0), OpRef::from_raw(1)]), // op2: removed
             Op::new(OpCode::GuardNoException, &[]), // op3: should be removed
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(4);
         ctx.emit(ops[0].clone());
         ctx.emit(ops[1].clone());
-        ctx.make_constant(OpRef(0), Value::Int(0));
+        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
 
         let mut pass = OptRewrite::new();
         // Process CondCallN -> removed
@@ -4432,9 +4510,9 @@ mod tests {
     fn test_guard_no_exception_after_emitted_call() {
         // CallN(...) -> emitted, then GuardNoException -> kept
         let mut ops = vec![
-            Op::new(OpCode::SameAsI, &[]),          // op0: func
-            Op::new(OpCode::CallN, &[OpRef(0)]),    // op1: call
-            Op::new(OpCode::GuardNoException, &[]), // op2: should NOT be removed
+            Op::new(OpCode::SameAsI, &[]),                 // op0: func
+            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]), // op1: call
+            Op::new(OpCode::GuardNoException, &[]),        // op2: should NOT be removed
         ];
         with_positions(&mut ops);
         let mut ctx = OptContext::new(3);
@@ -4455,7 +4533,7 @@ mod tests {
     fn test_guard_future_condition_records_and_removes() {
         // rewrite.py: GUARD_FUTURE_CONDITION → record in patchguardop + remove
         let mut op = Op::new(OpCode::GuardFutureCondition, &[]);
-        op.pos = OpRef(0);
+        op.pos = OpRef::from_raw(0);
         let mut ctx = OptContext::new(1);
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&op, &mut ctx);
@@ -4472,13 +4550,16 @@ mod tests {
         // GUARD_VALUE(v, 0) → GUARD_FALSE(v)
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)]);
-                op.pos = OpRef(0);
+                let mut op = Op::new(
+                    OpCode::GuardValue,
+                    &[OpRef::from_raw(100), OpRef::from_raw(200)],
+                );
+                op.pos = OpRef::from_raw(0);
                 op
             },
             Op::new(OpCode::Finish, &[]),
         ];
-        ops[1].pos = OpRef(1);
+        ops[1].pos = OpRef::from_raw(1);
 
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
@@ -4498,8 +4579,11 @@ mod tests {
     fn test_int_mul_neg_one() {
         // x * (-1) → INT_NEG(x)
         let mut ops = vec![
-            Op::new(OpCode::IntMul, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::Finish, &[OpRef(0)]),
+            Op::new(
+                OpCode::IntMul,
+                &[OpRef::from_raw(100), OpRef::from_raw(200)],
+            ),
+            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
 
@@ -4519,8 +4603,11 @@ mod tests {
     fn test_float_mul_neg_one() {
         // x * (-1.0) → FLOAT_NEG(x)
         let mut ops = vec![
-            Op::new(OpCode::FloatMul, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::Finish, &[OpRef(0)]),
+            Op::new(
+                OpCode::FloatMul,
+                &[OpRef::from_raw(100), OpRef::from_raw(200)],
+            ),
+            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
         ];
         with_positions(&mut ops);
 
@@ -4538,7 +4625,14 @@ mod tests {
     fn test_cond_call_n_zero_removes() {
         // COND_CALL_N(0, func, args...) → removed (condition is false)
         let mut ops = vec![
-            Op::new(OpCode::CondCallN, &[OpRef(200), OpRef(100), OpRef(101)]),
+            Op::new(
+                OpCode::CondCallN,
+                &[
+                    OpRef::from_raw(200),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(101),
+                ],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
         with_positions(&mut ops);
@@ -4557,7 +4651,14 @@ mod tests {
     fn test_cond_call_n_nonzero_converts() {
         // COND_CALL_N(1, func, args...) → CALL_N(func, args...)
         let mut ops = vec![
-            Op::new(OpCode::CondCallN, &[OpRef(200), OpRef(100), OpRef(101)]),
+            Op::new(
+                OpCode::CondCallN,
+                &[
+                    OpRef::from_raw(200),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(101),
+                ],
+            ),
             Op::new(OpCode::Finish, &[]),
         ];
         with_positions(&mut ops);

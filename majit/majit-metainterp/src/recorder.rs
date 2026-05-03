@@ -147,6 +147,9 @@ impl Trace {
     /// Returns an OpRef that can be used as an argument to subsequent operations.
     /// Input arguments are numbered starting from 0; the OpRef index matches
     /// the input argument index.
+    ///
+    /// resoperation.py:719/727/739 — InputArgInt/InputArgFloat/InputArgRef
+    /// each pin `type = 'i'/'f'/'r'` at construction.
     pub fn record_input_arg(&mut self, tp: Type) -> OpRef {
         assert!(
             self.ops.is_empty(),
@@ -154,7 +157,12 @@ impl Trace {
         );
         let index = self.inputargs.len() as u32;
         self.inputargs.push(InputArg::from_type(tp, index));
-        let opref = OpRef(self.op_count);
+        let opref = match tp {
+            Type::Int => OpRef::input_arg_int(self.op_count),
+            Type::Float => OpRef::input_arg_float(self.op_count),
+            Type::Ref => OpRef::input_arg_ref(self.op_count),
+            Type::Void => panic!("input args cannot be Void"),
+        };
         self.op_count += 1;
         self.box_count += 1;
         opref
@@ -162,9 +170,13 @@ impl Trace {
 
     /// Record a regular (non-guard) operation.
     /// Returns the OpRef for this operation's result.
+    ///
+    /// `AbstractResOp` + IntOp/FloatOp/RefOp mixins (resoperation.py:564-638)
+    /// pin the result type at construction. Void-result ops have no mixin
+    /// upstream — they remain `Untyped(_)` here, the position-only marker.
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
-        let opref = OpRef(self.op_count);
+        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let mut op = Op::new(opcode, args);
         op.pos = opref;
         self.ops.push(op);
@@ -184,7 +196,7 @@ impl Trace {
         descr: DescrRef,
     ) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
-        let opref = OpRef(self.op_count);
+        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let mut op = Op::with_descr(opcode, args, descr);
         op.pos = opref;
         self.ops.push(op);
@@ -209,7 +221,7 @@ impl Trace {
         descr: Option<DescrRef>,
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
-        let opref = OpRef(self.op_count);
+        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let mut op = match descr {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
@@ -234,7 +246,7 @@ impl Trace {
         fail_args: &[OpRef],
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
-        let opref = OpRef(self.op_count);
+        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let mut op = match descr {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
@@ -302,7 +314,7 @@ impl Trace {
         // RPython parity: Jump args may differ from InputArgs count when
         // virtualizable arrays change depth. The optimizer (OptUnroll preamble
         // peeling) bridges the gap by creating a Label with the extended count.
-        let opref = OpRef(self.op_count);
+        let opref = OpRef::op_typed(self.op_count, OpCode::Jump.result_type());
         let mut op = match descr {
             Some(descr) => Op::with_descr(OpCode::Jump, jump_args, descr),
             None => Op::new(OpCode::Jump, jump_args),
@@ -318,7 +330,7 @@ impl Trace {
     /// Finish the trace (non-looping): add a FINISH operation.
     /// `finish_args` are the values returned from the trace.
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
-        let opref = OpRef(self.op_count);
+        let opref = OpRef::op_typed(self.op_count, OpCode::Finish.result_type());
         let mut op = Op::with_descr(OpCode::Finish, finish_args, descr);
         op.pos = opref;
         self.ops.push(op);
@@ -448,10 +460,10 @@ mod tests {
         // Trace: i0 -> i1 = int_add(i0, i0) -> jump(i1)
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
-        assert_eq!(i0, OpRef(0));
+        assert_eq!(i0, OpRef::from_raw(0));
 
         let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        assert_eq!(i1, OpRef(1));
+        assert_eq!(i1, OpRef::from_raw(1));
 
         rec.close_loop(&[i1]);
 
@@ -502,9 +514,9 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
         let r0 = rec.record_input_arg(Type::Ref);
         let f0 = rec.record_input_arg(Type::Float);
-        assert_eq!(i0, OpRef(0));
-        assert_eq!(r0, OpRef(1));
-        assert_eq!(f0, OpRef(2));
+        assert_eq!(i0, OpRef::from_raw(0));
+        assert_eq!(r0, OpRef::from_raw(1));
+        assert_eq!(f0, OpRef::from_raw(2));
         assert_eq!(rec.num_inputargs(), 3);
 
         let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
@@ -524,27 +536,27 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
-        assert_eq!(i0, OpRef(0));
-        assert_eq!(i1, OpRef(1));
+        assert_eq!(i0, OpRef::from_raw(0));
+        assert_eq!(i1, OpRef::from_raw(1));
 
         let i2 = rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        assert_eq!(i2, OpRef(2));
+        assert_eq!(i2, OpRef::from_raw(2));
 
         let descr = make_fail_descr(0);
         let g0 = rec.record_guard(OpCode::GuardTrue, &[i2], Some(descr));
-        assert_eq!(g0, OpRef(3));
+        assert_eq!(g0, OpRef::from_raw(3));
 
         let i3 = rec.record_op(OpCode::IntSub, &[i2, i0]);
-        assert_eq!(i3, OpRef(4));
+        assert_eq!(i3, OpRef::from_raw(4));
 
         rec.close_loop(&[i3, i1]);
         let trace = rec.get_trace();
 
         // The op's .pos should match
-        assert_eq!(trace.ops[0].pos, OpRef(2)); // IntAdd
-        assert_eq!(trace.ops[1].pos, OpRef(3)); // GuardTrue
-        assert_eq!(trace.ops[2].pos, OpRef(4)); // IntSub
-        assert_eq!(trace.ops[3].pos, OpRef(5)); // Jump
+        assert_eq!(trace.ops[0].pos, OpRef::from_raw(2)); // IntAdd
+        assert_eq!(trace.ops[1].pos, OpRef::from_raw(3)); // GuardTrue
+        assert_eq!(trace.ops[2].pos, OpRef::from_raw(4)); // IntSub
+        assert_eq!(trace.ops[3].pos, OpRef::from_raw(5)); // Jump
     }
 
     #[test]
@@ -553,7 +565,7 @@ mod tests {
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         // Should panic: guard opcodes must use record_guard
-        rec.record_op(OpCode::GuardTrue, &[OpRef(0)]);
+        rec.record_op(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
     }
 
     #[test]
@@ -574,7 +586,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
         let descr = make_fail_descr(42);
         let i1 = rec.record_op_with_descr(OpCode::CallI, &[i0], descr);
-        assert_eq!(i1, OpRef(1));
+        assert_eq!(i1, OpRef::from_raw(1));
 
         // Verify the op has a descriptor
         assert!(rec.ops[0].descr.is_some());
@@ -647,7 +659,7 @@ mod tests {
         assert_eq!(rec.num_inputargs(), 2);
 
         rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        let add = rec.record_op(OpCode::IntAdd, &[OpRef(2), i1]);
+        let add = rec.record_op(OpCode::IntAdd, &[OpRef::from_raw(2), i1]);
         rec.close_loop(&[add, i1]);
 
         let trace = rec.get_trace();
@@ -670,7 +682,7 @@ mod tests {
         let trace = rec.get_trace();
 
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(trace.ops[0].pos, OpRef(1)); // after 1 inputarg
+        assert_eq!(trace.ops[0].pos, OpRef::from_raw(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
         assert_eq!(trace.ops[1].args[0], add); // references the add result
         assert_eq!(trace.ops[1].args[1], i0); // references the input arg
@@ -789,14 +801,14 @@ mod tests {
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
         assert_eq!(rec.num_ops(), 1);
 
-        rec.record_op(OpCode::IntSub, &[OpRef(1), i0]);
+        rec.record_op(OpCode::IntSub, &[OpRef::from_raw(1), i0]);
         assert_eq!(rec.num_ops(), 2);
 
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::GuardTrue, &[OpRef(2)], Some(descr));
+        rec.record_guard(OpCode::GuardTrue, &[OpRef::from_raw(2)], Some(descr));
         assert_eq!(rec.num_ops(), 3);
 
-        rec.close_loop(&[OpRef(2)]);
+        rec.close_loop(&[OpRef::from_raw(2)]);
         // After close_loop, Jump is added.
         assert_eq!(rec.num_ops(), 4);
     }
@@ -830,17 +842,17 @@ mod tests {
 
     #[test]
     fn test_with_num_inputs_oprefs() {
-        // Input args from with_num_inputs get OpRef(0), OpRef(1), ...
+        // Input args from with_num_inputs get OpRef::from_raw(0), OpRef::from_raw(1), ...
         let mut rec = Trace::with_num_inputs(3);
 
-        // The input args consumed OpRef(0..2), so next op gets OpRef(3).
-        let add = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
-        assert_eq!(add, OpRef(3));
+        // The input args consumed OpRef::from_raw(0..2), so next op gets OpRef::from_raw(3).
+        let add = rec.record_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+        assert_eq!(add, OpRef::from_raw(3));
 
-        rec.close_loop(&[OpRef(0), OpRef(1), OpRef(2)]);
+        rec.close_loop(&[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]);
         let trace = rec.get_trace();
         assert_eq!(trace.num_inputargs(), 3);
-        assert_eq!(trace.ops[0].pos, OpRef(3));
+        assert_eq!(trace.ops[0].pos, OpRef::from_raw(3));
     }
 
     #[test]
@@ -900,7 +912,7 @@ mod tests {
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::IntAdd, &[OpRef(0)], Some(descr));
+        rec.record_guard(OpCode::IntAdd, &[OpRef::from_raw(0)], Some(descr));
     }
 
     #[test]
@@ -974,8 +986,8 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        rec.record_op(OpCode::IntSub, &[OpRef(1), i0]);
-        rec.close_loop(&[OpRef(2)]);
+        rec.record_op(OpCode::IntSub, &[OpRef::from_raw(1), i0]);
+        rec.close_loop(&[OpRef::from_raw(2)]);
 
         let trace = rec.get_trace();
         let opcodes: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
@@ -1098,12 +1110,12 @@ mod tests {
         assert!(trace.is_loop());
 
         // Verify chain: each op references the previous op's result.
-        // i0 = OpRef(0), first IntAdd = OpRef(1), second = OpRef(2), ...
+        // i0 = OpRef::from_raw(0), first IntAdd = OpRef::from_raw(1), second = OpRef::from_raw(2), ...
         for (i, op) in trace.ops[..200].iter().enumerate() {
             assert_eq!(op.opcode, OpCode::IntAdd);
             if i > 0 {
-                // The previous IntAdd produced OpRef(i as u32) (offset by inputarg)
-                assert_eq!(op.args[0], OpRef(i as u32));
+                // The previous IntAdd produced OpRef::from_raw(i as u32) (offset by inputarg)
+                assert_eq!(op.args[0], OpRef::from_raw(i as u32));
             }
         }
     }
@@ -1117,10 +1129,10 @@ mod tests {
         let r0 = rec.record_input_arg(Type::Ref);
         let i1 = rec.record_input_arg(Type::Int);
 
-        assert_eq!(i0, OpRef(0));
-        assert_eq!(f0, OpRef(1));
-        assert_eq!(r0, OpRef(2));
-        assert_eq!(i1, OpRef(3));
+        assert_eq!(i0, OpRef::from_raw(0));
+        assert_eq!(f0, OpRef::from_raw(1));
+        assert_eq!(r0, OpRef::from_raw(2));
+        assert_eq!(i1, OpRef::from_raw(3));
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, f0, r0, i1]);
@@ -1265,14 +1277,14 @@ mod tests {
         assert_eq!(pos0.snapshot_data_len, 0);
         assert_eq!(pos0.snapshot_array_data_len, 0);
 
-        let _a = rec.record_op(OpCode::IntAdd, &[OpRef(0), OpRef(1)]);
+        let _a = rec.record_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
         let pos1 = rec.get_position();
         assert_eq!(pos1._pos, 1);
         assert_eq!(pos1._count, 3);
         assert_eq!(pos1._index, 3);
 
-        let _b = rec.record_op(OpCode::IntSub, &[OpRef(0), OpRef(1)]);
-        let _c = rec.record_op(OpCode::IntMul, &[OpRef(0), OpRef(1)]);
+        let _b = rec.record_op(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+        let _c = rec.record_op(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
         assert_eq!(rec.num_ops(), 3);
 
         // Cut back to pos1 — should discard IntSub and IntMul
@@ -1281,8 +1293,8 @@ mod tests {
         assert_eq!(rec.get_position(), pos1);
 
         // Can record more ops after cut
-        let d = rec.record_op(OpCode::IntNeg, &[OpRef(0)]);
-        assert_eq!(d, OpRef(3)); // continues from pos1._count
+        let d = rec.record_op(OpCode::IntNeg, &[OpRef::from_raw(0)]);
+        assert_eq!(d, OpRef::from_raw(3)); // continues from pos1._count
         assert_eq!(rec.num_ops(), 2);
 
         // Cut back to pos0 — should discard everything
@@ -1293,7 +1305,7 @@ mod tests {
     #[test]
     fn test_get_position_tracks_count_and_index_separately() {
         let mut rec = Trace::with_num_inputs(1);
-        let i0 = OpRef(0);
+        let i0 = OpRef::from_raw(0);
 
         let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
         let pos_after_add = rec.get_position();
@@ -1301,7 +1313,7 @@ mod tests {
         assert_eq!(pos_after_add._index, 2);
 
         let descr = make_fail_descr(1);
-        rec.record_guard(OpCode::GuardTrue, &[OpRef(1)], Some(descr));
+        rec.record_guard(OpCode::GuardTrue, &[OpRef::from_raw(1)], Some(descr));
         let pos_after_guard = rec.get_position();
         assert_eq!(pos_after_guard._pos, 2);
         assert_eq!(pos_after_guard._count, 3);

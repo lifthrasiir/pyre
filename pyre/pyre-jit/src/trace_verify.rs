@@ -52,7 +52,7 @@ mod tests {
     #[test]
     fn test_unbox_int_ops() {
         let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
+        let obj = OpRef::input_arg_ref(0);
         let _intval = crate::trace_unbox_int(
             &mut ctx,
             obj,
@@ -73,7 +73,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(1);
         let _obj = crate::trace_box_int(
             &mut ctx,
-            OpRef(0),
+            OpRef::input_arg_ref(0),
             w_int_size_descr(),
             ob_type_descr(),
             intval_descr(),
@@ -92,8 +92,8 @@ mod tests {
         let mut ctx = TraceCtx::for_test(2);
         let _result = crate::trace_int_binop_ovf(
             &mut ctx,
-            OpRef(0),
-            OpRef(1),
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
             OpCode::IntAddOvf,
             FAKE_INT_TYPE,
             ob_type_descr(),
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn test_unbox_float_ops() {
         let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
+        let obj = OpRef::input_arg_ref(0);
         let _floatval = crate::trace_unbox_float(
             &mut ctx,
             obj,
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn test_unbox_int_ops_use_pure_reads_for_immutable_descrs() {
         let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
+        let obj = OpRef::input_arg_ref(0);
         let _intval = crate::trace_unbox_int(
             &mut ctx,
             obj,
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_unbox_float_ops_use_pure_reads_for_immutable_descrs() {
         let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
+        let obj = OpRef::input_arg_ref(0);
         let _floatval = crate::trace_unbox_float(
             &mut ctx,
             obj,
@@ -170,7 +170,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test(1);
         let _obj = crate::trace_box_float(
             &mut ctx,
-            OpRef(0),
+            OpRef::input_arg_ref(0),
             w_float_size_descr(),
             ob_type_descr(),
             floatval_descr(),
@@ -186,8 +186,8 @@ mod tests {
         let mut ctx = TraceCtx::for_test(2);
         let _result = crate::trace_float_binop(
             &mut ctx,
-            OpRef(0),
-            OpRef(1),
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
             OpCode::FloatAdd,
             FAKE_FLOAT_TYPE,
             ob_type_descr(),

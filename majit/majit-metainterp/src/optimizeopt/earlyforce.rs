@@ -103,13 +103,22 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            let pos = i as u32;
+            op.pos = match op.result_type() {
+                majit_ir::Type::Int => OpRef::int_op(pos),
+                majit_ir::Type::Float => OpRef::float_op(pos),
+                majit_ir::Type::Ref => OpRef::ref_op(pos),
+                majit_ir::Type::Void => OpRef::from_raw(pos),
+            };
         }
     }
 
     #[test]
     fn test_earlyforce_resolves_call_may_force_args() {
-        let mut ops = vec![Op::new(OpCode::CallMayForceN, &[OpRef(100), OpRef(101)])];
+        let mut ops = vec![Op::new(
+            OpCode::CallMayForceN,
+            &[OpRef::from_raw(100), OpRef::from_raw(101)],
+        )];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -126,7 +135,10 @@ mod tests {
 
     #[test]
     fn test_earlyforce_passthrough_non_call() {
-        let mut ops = vec![Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)])];
+        let mut ops = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(100), OpRef::from_raw(101)],
+        )];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -143,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_earlyforce_call_assembler_handled() {
-        let mut ops = vec![Op::new(OpCode::CallAssemblerI, &[OpRef(100)])];
+        let mut ops = vec![Op::new(OpCode::CallAssemblerI, &[OpRef::from_raw(100)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -189,7 +201,7 @@ mod tests {
             OpCode::CallMayForceF,
             OpCode::CallMayForceN,
         ] {
-            let mut ops = vec![Op::new(opcode, &[OpRef(100)])];
+            let mut ops = vec![Op::new(opcode, &[OpRef::from_raw(100)])];
             assign_positions(&mut ops);
 
             let mut opt = Optimizer::new();
@@ -206,7 +218,10 @@ mod tests {
     #[test]
     fn test_earlyforce_exempt_setfield() {
         // SETFIELD_GC should NOT force args (earlyforce.py:18)
-        let mut ops = vec![Op::new(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)])];
+        let mut ops = vec![Op::new(
+            OpCode::SetfieldGc,
+            &[OpRef::from_raw(100), OpRef::from_raw(101)],
+        )];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();

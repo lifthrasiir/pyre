@@ -1583,7 +1583,7 @@ impl MIFrame {
             } else {
                 // Active vable owner whose registers_r[idx] is NONE cannot
                 // exist: init_symbolic (state.rs:2618-2619) seeds
-                // registers_r[idx] = OpRef(base + idx) for every i in
+                // registers_r[idx] = OpRef::from_raw(base + idx) for every i in
                 // 0..nlocals before any load_local_value runs. Reachability
                 // audit (2026-04-28, MAJIT_PROBE_VABLE_FALLBACK) confirmed
                 // this empirically: 0 firings across debug unit tests
@@ -3228,7 +3228,7 @@ impl MIFrame {
             let tp = ctx
                 .get_opref_type(opref)
                 .unwrap_or_else(|| panic!("missing snapshot box type for {:?}", opref));
-            majit_metainterp::recorder::SnapshotTagged::Box(opref.0, tp)
+            majit_metainterp::recorder::SnapshotTagged::Box(opref.raw(), tp)
         }
     }
 
@@ -3522,7 +3522,7 @@ impl MIFrame {
                     let tp = types.get(i).copied().unwrap_or_else(|| {
                         panic!("missing fail-arg box type at index {} for {:?}", i, opref)
                     });
-                    majit_metainterp::recorder::SnapshotTagged::Box(opref.0, tp)
+                    majit_metainterp::recorder::SnapshotTagged::Box(opref.raw(), tp)
                 }
             })
             .collect()
@@ -6874,9 +6874,9 @@ mod tests {
         };
         let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
 
-        let int_box = OpRef(10);
-        let ref_box = OpRef(20);
-        let float_box = OpRef(30);
+        let int_box = OpRef::int_op(10);
+        let ref_box = OpRef::ref_op(20);
+        let float_box = OpRef::float_op(30);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
         // `registers_r` is the unified abstract register file

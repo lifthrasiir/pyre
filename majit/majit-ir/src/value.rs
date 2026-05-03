@@ -251,7 +251,7 @@ impl InputArg {
     /// that construction so call sites do not reach for the raw `.index`
     /// field directly.
     pub fn opref(&self) -> crate::resoperation::OpRef {
-        crate::resoperation::OpRef(self.index)
+        crate::resoperation::OpRef::input_arg_typed(self.index, self.tp)
     }
 }
 

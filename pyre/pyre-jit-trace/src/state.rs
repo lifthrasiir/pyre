@@ -2737,7 +2737,7 @@ impl PyreSym {
         }
         let shift = |opref: &mut OpRef| {
             if !opref.is_none() {
-                *opref = OpRef(opref.0 + extra_reds);
+                *opref = opref.with_raw(opref.raw() + extra_reds);
             }
         };
         shift(&mut self.vable_last_instr);
@@ -2782,12 +2782,14 @@ impl PyreSym {
         // store_local_value updates the per-color slot directly.
         self.registers_r = if let Some(ref overrides) = self.bridge_local_oprefs {
             // resume.py:1042 parity: bridge trace uses OpRefs derived from
-            // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef(n)).
+            // rebuild_from_resumedata (Box(n) → bridge InputArg OpRef::from_raw(n)).
             let mut locals = overrides.clone();
             locals.resize(nlocals, OpRef::NONE);
             locals
         } else if let Some(base) = self.vable_array_base {
-            (0..nlocals).map(|i| OpRef(base + i as u32)).collect()
+            (0..nlocals)
+                .map(|i| OpRef::input_arg_ref(base + i as u32))
+                .collect()
         } else {
             vec![OpRef::NONE; nlocals]
         };
@@ -2812,7 +2814,7 @@ impl PyreSym {
                             if opref.is_none() || opref.is_constant() {
                                 None
                             } else {
-                                inputarg_types.get(opref.0 as usize).copied()
+                                inputarg_types.get(opref.raw() as usize).copied()
                             }
                         })
                         .unwrap_or(Type::Ref)
@@ -2876,7 +2878,7 @@ impl PyreSym {
         let stack_seed: Vec<OpRef> = if let Some(base) = self.vable_array_base {
             let stack_base = base + nlocals as u32;
             (0..stack_only_depth)
-                .map(|i| OpRef(stack_base + i as u32))
+                .map(|i| OpRef::input_arg_ref(stack_base + i as u32))
                 .collect()
         } else {
             vec![OpRef::NONE; stack_only_depth]
@@ -2943,24 +2945,33 @@ impl PyreSym {
             let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let live_prefix = nlocals + stack_only_depth;
             let array_len = concrete_frame_array_len(concrete_frame).unwrap_or(live_prefix);
-            // Static fields inputargs at OpRef(FIRST_VABLE_SCALAR_IDX..+NUM_VABLE_SCALARS).
-            // virtualizable_boxes carries vable static fields only — non-vable
-            // extra reds (e.g. `ec`) sit between frame and vable scalars in the
-            // inputarg space (`pyjitpl.py:2957 redboxes` then `:2964
-            // + virtualizable_boxes`) and never enter the shadow.
-            let first = crate::virtualizable_gen::FIRST_VABLE_SCALAR_IDX;
-            let scalar_oprefs: Vec<OpRef> = (first..first + num_vable_scalars as u32)
-                .map(OpRef)
-                .collect();
-            // Array items inputargs OpRef(base..base + live_prefix).
-            let array_items: Vec<OpRef> =
-                (0..live_prefix).map(|i| OpRef(base + i as u32)).collect();
-            let vable_ref = OpRef(crate::virtualizable_gen::SYM_FRAME_IDX);
             // pyjitpl.py:3302 initialize_virtualizable parity: the concrete
             // half of virtualizable_boxes at portal entry comes from a live
             // heap read (vinfo.read_boxes(cpu, virtualizable, 0)). There is
             // no resume-data stream at root-trace start.
             let info = crate::frame_layout::build_pyframe_virtualizable_info();
+            // Static fields inputargs at FIRST_VABLE_SCALAR_IDX..+NUM_VABLE_SCALARS.
+            // virtualizable_boxes carries vable static fields only — non-vable
+            // extra reds (e.g. `ec`) sit between frame and vable scalars in the
+            // inputarg space (`pyjitpl.py:2957 redboxes` then `:2964
+            // + virtualizable_boxes`) and never enter the shadow. Per-slot
+            // type follows `info.static_fields[i].field_type` so the OpRef
+            // variant matches RPython's BoxInt/BoxRef inputarg classes.
+            let first = crate::virtualizable_gen::FIRST_VABLE_SCALAR_IDX;
+            let scalar_oprefs: Vec<OpRef> = (0..num_vable_scalars)
+                .map(|i| {
+                    let pos = first + i as u32;
+                    let tp = info.static_fields[i].field_type;
+                    OpRef::input_arg_typed(pos, tp)
+                })
+                .collect();
+            // Array items inputargs at base..base + live_prefix. Items are
+            // W_Root (Ref) per `array_item_type = Ref` in virtualizable_gen.
+            let array_items: Vec<OpRef> = (0..live_prefix)
+                .map(|i| OpRef::input_arg_ref(base + i as u32))
+                .collect();
+            // SYM_FRAME_IDX is the virtualizable identity (Ref).
+            let vable_ref = OpRef::input_arg_ref(crate::virtualizable_gen::SYM_FRAME_IDX);
             let array_lengths = [array_len];
             let (input_values, vable_ref_value) = if concrete_frame != 0 {
                 let (static_boxes, array_boxes) =
@@ -3182,13 +3193,13 @@ impl PyreJitState {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn pypyjit_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.execution_context = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_typed(0, Type::Ref));
+        sym.execution_context = OpRef::input_arg_typed(1, Type::Ref);
         // `become_active_vable_owner` calls `init_vable_indices(FIRST_VABLE_SCALAR_IDX)`
         // where `FIRST_VABLE_SCALAR_IDX = 1 + NUM_EXTRA_REDS` already accounts for
         // the `ec` extra red.  An extra `shift_virtualizable_input_indices(1)`
-        // here would double-count, leaving e.g. `vable_pycode = OpRef(4)` (= the
-        // valuestackdepth slot, type Int) instead of `OpRef(3)` — the resume-time
+        // here would double-count, leaving e.g. `vable_pycode = OpRef::from_raw(4)` (= the
+        // valuestackdepth slot, type Int) instead of `OpRef::from_raw(3)` — the resume-time
         // type assertion in `value_to_static_vable_bits` then catches the Int(1)
         // value flowing into a Ref-typed slot.
         sym.become_active_vable_owner();
@@ -3813,7 +3824,7 @@ fn materialize_bridge_virtual(
                 //   return liveboxes[num]
                 // Negative `val` is Python-style indexing into the parent
                 // guard's liveboxes array (`num_failargs` long). For
-                // bridges, the boxes are inputargs at OpRef(0..n_inputargs).
+                // bridges, the boxes are inputargs at OpRef::from_raw(0..n_inputargs).
                 let idx = if val < 0 {
                     val + resume_data.num_failargs
                 } else {
@@ -3822,7 +3833,7 @@ fn materialize_bridge_virtual(
                 if idx < 0 {
                     OpRef::NONE
                 } else {
-                    OpRef(idx as u32)
+                    OpRef::from_raw(idx as u32)
                 }
             }
             TAGINT => ctx.const_int(val as i64),
@@ -3936,8 +3947,9 @@ fn materialize_bridge_virtual(
             );
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VirtualInfo → OpRef({})",
-                    vidx, new_op.0,
+                    "[jit][bridge-virtual] vidx={} VirtualInfo → OpRef::from_raw({})",
+                    vidx,
+                    new_op.raw(),
                 );
             }
             new_op
@@ -3970,8 +3982,9 @@ fn materialize_bridge_virtual(
             );
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VStructInfo → OpRef({})",
-                    vidx, new_op.0,
+                    "[jit][bridge-virtual] vidx={} VStructInfo → OpRef::from_raw({})",
+                    vidx,
+                    new_op.raw(),
                 );
             }
             new_op
@@ -4042,8 +4055,10 @@ fn materialize_bridge_virtual(
             }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VArrayInfo(clear={}) → OpRef({})",
-                    vidx, clear, new_op.0,
+                    "[jit][bridge-virtual] vidx={} VArrayInfo(clear={}) → OpRef::from_raw({})",
+                    vidx,
+                    clear,
+                    new_op.raw(),
                 );
             }
             new_op
@@ -4104,8 +4119,9 @@ fn materialize_bridge_virtual(
             }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VArrayStructInfo → OpRef({})",
-                    vidx, new_op.0,
+                    "[jit][bridge-virtual] vidx={} VArrayStructInfo → OpRef::from_raw({})",
+                    vidx,
+                    new_op.raw(),
                 );
             }
             new_op
@@ -4156,8 +4172,11 @@ fn materialize_bridge_virtual(
             }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VRawBufferInfo(func={:#x}, size={}) → OpRef({})",
-                    vidx, func, size, buffer.0,
+                    "[jit][bridge-virtual] vidx={} VRawBufferInfo(func={:#x}, size={}) → OpRef::from_raw({})",
+                    vidx,
+                    func,
+                    size,
+                    buffer.raw(),
                 );
             }
             buffer
@@ -4178,8 +4197,10 @@ fn materialize_bridge_virtual(
             cache.set_int(vidx, buffer);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} VRawSliceInfo(offset={}) → OpRef({})",
-                    vidx, offset, buffer.0,
+                    "[jit][bridge-virtual] vidx={} VRawSliceInfo(offset={}) → OpRef::from_raw({})",
+                    vidx,
+                    offset,
+                    buffer.raw(),
                 );
             }
             buffer
@@ -4231,11 +4252,11 @@ fn materialize_bridge_virtual(
             }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} V{}PlainInfo(length={}) → OpRef({})",
+                    "[jit][bridge-virtual] vidx={} V{}PlainInfo(length={}) → OpRef::from_raw({})",
                     vidx,
                     if is_unicode { "Uni" } else { "Str" },
                     length,
-                    string.0,
+                    string.raw(),
                 );
             }
             string
@@ -4276,10 +4297,10 @@ fn materialize_bridge_virtual(
             cache.set_ptr(vidx, string);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} V{}ConcatInfo → OpRef({})",
+                    "[jit][bridge-virtual] vidx={} V{}ConcatInfo → OpRef::from_raw({})",
                     vidx,
                     if is_unicode { "Uni" } else { "Str" },
-                    string.0,
+                    string.raw(),
                 );
             }
             string
@@ -4327,10 +4348,10 @@ fn materialize_bridge_virtual(
             cache.set_ptr(vidx, string);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-virtual] vidx={} V{}SliceInfo → OpRef({})",
+                    "[jit][bridge-virtual] vidx={} V{}SliceInfo → OpRef::from_raw({})",
                     vidx,
                     if is_unicode { "Uni" } else { "Str" },
-                    string.0,
+                    string.raw(),
                 );
             }
             string
@@ -4412,14 +4433,14 @@ impl JitState for PyreJitState {
         if _meta.trace_extra_reds == 1 {
             Self::pypyjit_create_sym(_meta, _header_pc)
         } else {
-            let mut sym = PyreSym::new_uninit(OpRef(0));
+            let mut sym = PyreSym::new_uninit(OpRef::input_arg_typed(0, Type::Ref));
             // `extra_reds = { ec: Ref }` in virtualizable_gen.rs places ec
-            // at OpRef(1). `init_vable_indices` shifts the vable static
+            // at OpRef::from_raw(1). `init_vable_indices` shifts the vable static
             // field + array_base OpRefs but does not own the extra_red
             // sym storage; initialize it explicitly when the constant
             // declares an ec slot.
             if crate::virtualizable_gen::NUM_EXTRA_REDS > 0 {
-                sym.execution_context = OpRef(1);
+                sym.execution_context = OpRef::input_arg_typed(1, Type::Ref);
             }
             sym.become_active_vable_owner();
             sym.nlocals = _meta.num_locals;
@@ -4608,7 +4629,7 @@ impl JitState for PyreJitState {
                        v: &RebuiltValue|
          -> OpRef {
             match v {
-                RebuiltValue::Box(n, _tp) => OpRef(*n as u32),
+                RebuiltValue::Box(n, tp) => OpRef::input_arg_typed(*n as u32, *tp),
                 // history.py:220-360 ConstInt/ConstPtr/ConstFloat dispatch by
                 // `.type`; register the constant via the typed pool helper so
                 // the returned OpRef maps to a real pool entry (not a bare
@@ -4784,7 +4805,7 @@ impl JitState for PyreJitState {
         // bridge_local_oprefs == None and falls into the vable_array_base
         // branch (init_vable_indices hard-codes vable_array_base = 7 for
         // pyre's 7-slot virtualizable header). That branch produces
-        // OpRef(base+i) values from the PARENT trace's namespace, leaving
+        // OpRef::from_raw(base+i) values from the PARENT trace's namespace, leaving
         // stale parent OpRefs in registers_r after we set
         // bridge_local_oprefs here.
         //
@@ -4809,7 +4830,7 @@ impl JitState for PyreJitState {
         // PyPy threads ec as a JIT red so it survives guard resume.
         // pyre's macro flip lands the same shape (`extra_reds = { ec:
         // Ref }`, `_meta.trace_extra_reds = 1` at state.rs:4967) and the
-        // root portal seeds `sym.execution_context = OpRef(1)` from the
+        // root portal seeds `sym.execution_context = OpRef::from_raw(1)` from the
         // ec inputarg.
         //
         // Bridge resume in pyre rebuilds the MIFrame register banks from
@@ -4820,7 +4841,7 @@ impl JitState for PyreJitState {
         // does not appear in any bank — there is no "ec slot" in
         // `frame0.values` to read out.  Recovering ec from
         // `frame0.values` would require either Box identity (so the
-        // optimizer's forwarding chain for the original OpRef(1) survives
+        // optimizer's forwarding chain for the original OpRef::from_raw(1) survives
         // through to the bridge resume layout) or a side-table on the
         // guard descr recording "ec lives at fail_arg[X]" — both touch
         // the resume encoder and the optimizer across crates.
@@ -6771,14 +6792,14 @@ mod tests {
 
         let sym = PyreJitState::pypyjit_create_sym(&meta, 0);
 
-        assert_eq!(sym.frame, OpRef(0));
-        assert_eq!(sym.execution_context, OpRef(1));
-        assert_eq!(sym.vable_last_instr, OpRef(2));
-        assert_eq!(sym.vable_pycode, OpRef(3));
-        assert_eq!(sym.vable_valuestackdepth, OpRef(4));
-        assert_eq!(sym.vable_debugdata, OpRef(5));
-        assert_eq!(sym.vable_lastblock, OpRef(6));
-        assert_eq!(sym.vable_w_globals, OpRef(7));
+        assert_eq!(sym.frame, OpRef::from_raw(0));
+        assert_eq!(sym.execution_context, OpRef::from_raw(1));
+        assert_eq!(sym.vable_last_instr, OpRef::from_raw(2));
+        assert_eq!(sym.vable_pycode, OpRef::from_raw(3));
+        assert_eq!(sym.vable_valuestackdepth, OpRef::from_raw(4));
+        assert_eq!(sym.vable_debugdata, OpRef::from_raw(5));
+        assert_eq!(sym.vable_lastblock, OpRef::from_raw(6));
+        assert_eq!(sym.vable_w_globals, OpRef::from_raw(7));
         assert_eq!(sym.vable_array_base, Some(8));
         assert_eq!(sym.symbolic_local_types.len(), 2);
         assert_eq!(sym.symbolic_stack_types.len(), 2);
@@ -6850,7 +6871,7 @@ mod tests {
                 debug-only fallback was removed; needs a populated-jitcode harness."]
     fn test_guard_class_uses_guard_nonnull_class() {
         let mut ctx = TraceCtx::for_test(1);
-        let obj = OpRef(0);
+        let obj = OpRef::from_raw(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![obj];
         sym.symbolic_local_types = vec![Type::Ref];
@@ -6887,7 +6908,7 @@ mod tests {
         // intrinsic parity, history.py:220) so the inputarg must be Ref for
         // trace_guarded_int_payload to take the fast path rather than short-circuit.
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let int_obj = OpRef(0);
+        let int_obj = OpRef::from_raw(0);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![int_obj];
         sym.symbolic_local_types = vec![Type::Ref];
@@ -6912,7 +6933,7 @@ mod tests {
         let mut saw_guard_nonnull_class = false;
         let mut saw_pure_payload = false;
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::GuardNonnullClass {
@@ -6965,7 +6986,7 @@ mod tests {
             .expect("payload op should be present");
         assert_eq!(payload_op.opcode, OpCode::GetfieldGcPureI);
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             assert_ne!(
@@ -7037,7 +7058,7 @@ mod tests {
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         install_test_jitcode(&code, frame.pycode);
         let mut ctx = TraceCtx::for_test(1);
-        let mut sym = PyreSym::new_uninit(OpRef(0));
+        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
         sym.become_active_vable_owner();
 
         sym.init_symbolic(&mut ctx, frame_ptr);
@@ -7045,7 +7066,7 @@ mod tests {
         assert_eq!(sym.locals_cells_stack_array_ref, OpRef::NONE);
         let recorder = ctx.into_recorder();
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             assert_ne!(
@@ -7362,7 +7383,7 @@ mod tests {
     fn test_load_local_checked_value_respects_symbolic_local_type() {
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test(1);
-            let local = OpRef(0);
+            let local = OpRef::from_raw(0);
             let mut sym = PyreSym::new_uninit(OpRef::NONE);
             sym.registers_r = vec![local];
             sym.symbolic_local_types = vec![symbolic_type];
@@ -7446,8 +7467,8 @@ mod tests {
     #[test]
     fn test_trace_binary_value_boxes_typed_raw_operands_for_python_helper() {
         let mut ctx = TraceCtx::for_test(2);
-        let lhs = OpRef(0);
-        let rhs = OpRef(1);
+        let lhs = OpRef::from_raw(0);
+        let rhs = OpRef::from_raw(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![lhs, rhs];
         sym.symbolic_local_types = vec![Type::Float, Type::Int];
@@ -7487,8 +7508,8 @@ mod tests {
     #[test]
     fn test_trace_known_builtin_call_boxes_typed_raw_args_for_python_helper_boundary() {
         let mut ctx = TraceCtx::for_test(2);
-        let callable = OpRef(0);
-        let arg = OpRef(1);
+        let callable = OpRef::from_raw(0);
+        let arg = OpRef::from_raw(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.registers_r = vec![callable, arg];
         sym.symbolic_local_types = vec![Type::Ref, Type::Int];
@@ -7550,8 +7571,8 @@ mod tests {
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
-        let lhs = OpRef(0);
-        let rhs = OpRef(1);
+        let lhs = OpRef::from_raw(0);
+        let rhs = OpRef::from_raw(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
@@ -7586,7 +7607,7 @@ mod tests {
         let mut saw_bool_call = false;
         let mut saw_bool_unbox = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::IntLt {
@@ -7605,7 +7626,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            OpRef(2),
+            OpRef::from_raw(2),
             "with two input args, the immediate branch consumer should receive the raw comparison truth"
         );
         assert!(
@@ -7632,8 +7653,8 @@ mod tests {
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
-        let lhs = OpRef(0);
-        let rhs = OpRef(1);
+        let lhs = OpRef::from_raw(0);
+        let rhs = OpRef::from_raw(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
@@ -7666,7 +7687,7 @@ mod tests {
         let recorder = ctx.into_recorder();
         let mut saw_bool_call = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::CallR {
@@ -7946,9 +7967,9 @@ mod tests {
             Type::Ref, // stack1
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.frame = OpRef(0);
-        sym.execution_context = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
+        sym.frame = OpRef::from_raw(0);
+        sym.execution_context = OpRef::from_raw(1);
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
@@ -8020,10 +8041,13 @@ mod tests {
         );
 
         assert_eq!(sym.valuestackdepth, 3);
-        assert_eq!(sym.registers_r, vec![OpRef(8), OpRef(9), OpRef(10)]);
+        assert_eq!(
+            sym.registers_r,
+            vec![OpRef::from_raw(8), OpRef::from_raw(9), OpRef::from_raw(10)]
+        );
         assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
         assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
-        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef(8)]));
+        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::from_raw(8)]));
     }
 
     #[test]
@@ -8046,17 +8070,17 @@ mod tests {
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.execution_context = OpRef(1);
+        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
+        sym.execution_context = OpRef::from_raw(1);
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
-        sym.vable_last_instr = OpRef(2);
-        sym.vable_pycode = OpRef(3);
-        sym.vable_valuestackdepth = OpRef(4);
-        sym.vable_debugdata = OpRef(5);
-        sym.vable_lastblock = OpRef(6);
-        sym.vable_w_globals = OpRef(7);
-        sym.registers_r = vec![OpRef(8), OpRef(9), OpRef(10)];
+        sym.vable_last_instr = OpRef::from_raw(2);
+        sym.vable_pycode = OpRef::from_raw(3);
+        sym.vable_valuestackdepth = OpRef::from_raw(4);
+        sym.vable_debugdata = OpRef::from_raw(5);
+        sym.vable_lastblock = OpRef::from_raw(6);
+        sym.vable_w_globals = OpRef::from_raw(7);
+        sym.registers_r = vec![OpRef::from_raw(8), OpRef::from_raw(9), OpRef::from_raw(10)];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
@@ -8077,10 +8101,13 @@ mod tests {
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
 
         assert_eq!(jump_args.len(), 11);
-        assert_eq!(jump_args[0], OpRef(0));
-        assert_eq!(jump_args[1], OpRef(1));
-        assert_eq!(&jump_args[8..], &[OpRef(8), OpRef(9), OpRef(10)]);
-        assert_eq!(state.sym().execution_context, OpRef(1));
+        assert_eq!(jump_args[0], OpRef::from_raw(0));
+        assert_eq!(jump_args[1], OpRef::from_raw(1));
+        assert_eq!(
+            &jump_args[8..],
+            &[OpRef::from_raw(8), OpRef::from_raw(9), OpRef::from_raw(10)]
+        );
+        assert_eq!(state.sym().execution_context, OpRef::from_raw(1));
     }
 
     #[test]
@@ -8116,16 +8143,16 @@ mod tests {
         input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
-        let mut sym = PyreSym::new_uninit(OpRef(0));
+        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
-        sym.vable_last_instr = OpRef(1);
-        sym.vable_pycode = OpRef(2);
-        sym.vable_valuestackdepth = OpRef(3);
-        sym.vable_debugdata = OpRef(4);
-        sym.vable_lastblock = OpRef(5);
-        sym.vable_w_globals = OpRef(6);
-        sym.registers_r = vec![OpRef(7)];
+        sym.vable_last_instr = OpRef::from_raw(1);
+        sym.vable_pycode = OpRef::from_raw(2);
+        sym.vable_valuestackdepth = OpRef::from_raw(3);
+        sym.vable_debugdata = OpRef::from_raw(4);
+        sym.vable_lastblock = OpRef::from_raw(5);
+        sym.vable_w_globals = OpRef::from_raw(6);
+        sym.registers_r = vec![OpRef::from_raw(7)];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
         sym.concrete_vable_ptr = frame_ptr as *mut u8;

@@ -25,8 +25,8 @@ pub use effectinfo::{
 };
 pub use op_type_index::OpTypeIndex;
 pub use resoperation::{
-    ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT, Op, OpCode,
-    OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
+    AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
+    Op, OpCode, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
     Const, FAILARGS_LIMIT, GcRef, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn, StrHashFn,

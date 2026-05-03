@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(ctx.new_operations.len(), 6); // 1 input + 5 queued ops
 
         // Check the final op is IntXor (sign correction)
-        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        let final_op = &ctx.new_operations[result_ref.raw() as usize];
         assert_eq!(final_op.opcode, OpCode::IntXor);
 
         // Verify UintMulHigh is present
@@ -309,7 +309,7 @@ mod tests {
         // known_nonneg emits two queued operations after the input.
         assert_eq!(ctx.new_operations.len(), 3); // 1 input + 2 queued ops
 
-        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        let final_op = &ctx.new_operations[result_ref.raw() as usize];
         assert_eq!(final_op.opcode, OpCode::UintRshift);
     }
 
@@ -327,7 +327,7 @@ mod tests {
         // Five queued division ops + IntMul + IntSub after the input.
         assert_eq!(ctx.new_operations.len(), 8); // 1 input + 7 queued ops
 
-        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        let final_op = &ctx.new_operations[result_ref.raw() as usize];
         assert_eq!(final_op.opcode, OpCode::IntSub);
 
         // Verify IntMul is present (div_result * m)
@@ -350,7 +350,7 @@ mod tests {
         // Two queued division ops + IntMul + IntSub after the input.
         assert_eq!(ctx.new_operations.len(), 5); // 1 input + 4 queued ops
 
-        let final_op = &ctx.new_operations[result_ref.0 as usize];
+        let final_op = &ctx.new_operations[result_ref.raw() as usize];
         assert_eq!(final_op.opcode, OpCode::IntSub);
     }
 

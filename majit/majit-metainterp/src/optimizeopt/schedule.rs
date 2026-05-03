@@ -797,7 +797,7 @@ impl VecScheduleState {
 
     /// Allocate a fresh OpRef for a newly created vector op.
     pub fn alloc_op_pos(&mut self) -> OpRef {
-        let pos = OpRef(self.next_pos);
+        let pos = OpRef::from_raw(self.next_pos);
         self.next_pos += 1;
         pos
     }

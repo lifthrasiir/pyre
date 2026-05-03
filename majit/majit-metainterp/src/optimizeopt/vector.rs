@@ -120,7 +120,12 @@ impl VectorLoop {
             OpCode::DebugMergePoint,
         ];
 
-        let base_offset = original_body.iter().map(|op| op.pos.0).max().unwrap_or(0) + 1;
+        let base_offset = original_body
+            .iter()
+            .map(|op| op.pos.raw())
+            .max()
+            .unwrap_or(0)
+            + 1;
 
         for u in 0..count {
             let offset = base_offset + (u as u32) * (original_body.len() as u32);
@@ -141,7 +146,7 @@ impl VectorLoop {
                     continue;
                 }
                 let mut new_op = op.clone();
-                let new_pos = OpRef(op.pos.0 + offset);
+                let new_pos = op.pos.with_raw(op.pos.raw() + offset);
                 if !op.pos.is_none() {
                     remap.insert(op.pos, new_pos);
                 }
@@ -850,7 +855,7 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(base + i as u32);
+            op.pos = OpRef::from_raw(base + i as u32);
         }
     }
 
@@ -859,9 +864,15 @@ mod tests {
     #[test]
     fn test_dep_graph_basic() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]), // depends on op 0
-            Op::new(OpCode::IntSub, &[OpRef(100), OpRef(101)]), // independent of op 0
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(101)]), // depends on op 0
+            Op::new(
+                OpCode::IntSub,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // independent of op 0
         ];
         assign_positions(&mut ops, 0);
 
@@ -876,7 +887,10 @@ mod tests {
 
     #[test]
     fn test_dep_graph_no_self_dep() {
-        let mut ops = vec![Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(101)])];
+        let mut ops = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(0), OpRef::from_raw(101)],
+        )];
         assign_positions(&mut ops, 0);
 
         let graph = DependencyGraph::build(&ops, &|_| None);
@@ -890,8 +904,14 @@ mod tests {
     fn test_find_packable_groups() {
         // Two independent IntAdd ops
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ),
         ];
         assign_positions(&mut ops, 0);
 
@@ -908,8 +928,11 @@ mod tests {
     fn test_dependent_ops_not_packed() {
         // Two IntAdd ops where second depends on first
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(101)]), // depends on op 0
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(101)]), // depends on op 0
         ];
         assign_positions(&mut ops, 0);
 
@@ -924,8 +947,14 @@ mod tests {
     fn test_different_opcodes_not_packed() {
         // IntAdd and IntSub — not isomorphic
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntSub, &[OpRef(102), OpRef(103)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(
+                OpCode::IntSub,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ),
         ];
         assign_positions(&mut ops, 0);
 
@@ -941,9 +970,18 @@ mod tests {
     #[test]
     fn test_three_independent_ops() {
         let mut ops = vec![
-            Op::new(OpCode::IntMul, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntMul, &[OpRef(102), OpRef(103)]),
-            Op::new(OpCode::IntMul, &[OpRef(104), OpRef(105)]),
+            Op::new(
+                OpCode::IntMul,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ),
+            Op::new(
+                OpCode::IntMul,
+                &[OpRef::from_raw(104), OpRef::from_raw(105)],
+            ),
         ];
         assign_positions(&mut ops, 0);
 
@@ -1045,8 +1083,11 @@ mod tests {
         use crate::optimizeopt::optimizer::Optimizer;
 
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::Finish, &[OpRef(0)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -1069,10 +1110,16 @@ mod tests {
 
         // A simple loop with independent ops
         let mut ops = vec![
-            Op::new(OpCode::Label, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntSub, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::Jump, &[OpRef(1), OpRef(2)]),
+            Op::new(OpCode::Label, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(
+                OpCode::IntSub,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::Jump, &[OpRef::from_raw(1), OpRef::from_raw(2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -1095,9 +1142,12 @@ mod tests {
     fn test_schedule_respects_dependencies() {
         // A → B → C: linear chain must stay in order
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]),   // B depends on A
-            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(101)]),   // C depends on B
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // A
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(101)]), // B depends on A
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(1), OpRef::from_raw(101)]), // C depends on B
         ];
         assign_positions(&mut ops, 0);
 
@@ -1119,8 +1169,14 @@ mod tests {
         // dependent op). With no dependents, both have height 1 and both
         // should be in the first two schedule slots.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A
-            Op::new(OpCode::IntSub, &[OpRef(102), OpRef(103)]), // B (independent)
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // A
+            Op::new(
+                OpCode::IntSub,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ), // B (independent)
         ];
         assign_positions(&mut ops, 0);
 
@@ -1139,10 +1195,16 @@ mod tests {
         // Independent: D (height=1)
         // A should be scheduled before D because A has higher height.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A (idx 0)
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]),   // B (idx 1, depends on A)
-            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(101)]),   // C (idx 2, depends on B)
-            Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]), // D (idx 3, independent)
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // A (idx 0)
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(101)]), // B (idx 1, depends on A)
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(1), OpRef::from_raw(101)]), // C (idx 2, depends on B)
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ), // D (idx 3, independent)
         ];
         assign_positions(&mut ops, 0);
 
@@ -1161,10 +1223,13 @@ mod tests {
         // Diamond: A → B, A → C, B → D, C → D
         // Valid orders: [A, B, C, D] or [A, C, B, D]
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // A (idx 0)
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(101)]),   // B (idx 1, depends on A)
-            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(102)]),   // C (idx 2, depends on A)
-            Op::new(OpCode::IntAdd, &[OpRef(1), OpRef(2)]),     // D (idx 3, depends on B and C)
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // A (idx 0)
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(101)]), // B (idx 1, depends on A)
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(102)]), // C (idx 2, depends on A)
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::from_raw(2)]), // D (idx 3, depends on B and C)
         ];
         assign_positions(&mut ops, 0);
 
@@ -1202,8 +1267,8 @@ mod tests {
     #[test]
     fn test_user_loop_heuristic_too_small() {
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::Jump, &[OpRef(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
         ];
         assert!(!VectorizingOptimizer::user_loop_heuristic(&ops));
     }
@@ -1211,10 +1276,10 @@ mod tests {
     #[test]
     fn test_user_loop_heuristic_no_vectorizable() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(2)]),
-            Op::new(OpCode::Jump, &[OpRef(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(2)]),
+            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
         ];
         assert!(!VectorizingOptimizer::user_loop_heuristic(&ops));
     }
@@ -1276,15 +1341,27 @@ mod tests {
 
     #[test]
     fn test_isomorphic_same_opcode() {
-        let a = Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]);
-        let b = Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]);
+        let a = Op::new(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(100), OpRef::from_raw(101)],
+        );
+        let b = Op::new(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(102), OpRef::from_raw(103)],
+        );
         assert!(isomorphic(&a, &b));
     }
 
     #[test]
     fn test_isomorphic_different_opcode() {
-        let a = Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]);
-        let b = Op::new(OpCode::IntSub, &[OpRef(102), OpRef(103)]);
+        let a = Op::new(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(100), OpRef::from_raw(101)],
+        );
+        let b = Op::new(
+            OpCode::IntSub,
+            &[OpRef::from_raw(102), OpRef::from_raw(103)],
+        );
         assert!(!isomorphic(&a, &b));
     }
 
@@ -1292,8 +1369,14 @@ mod tests {
     fn test_can_be_packed_independent_seed() {
         // Two independent IntAdd ops, no origin_pack (seed case)
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ),
         ];
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
@@ -1312,8 +1395,11 @@ mod tests {
     fn test_can_be_packed_dependent_no_origin() {
         // Dependent ops without origin_pack → None (not accumulation candidate)
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(101)]),
         ];
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
@@ -1334,10 +1420,16 @@ mod tests {
         // Origin pack = (op0, op1) — the array element pair.
         // can_be_packed(op2, op3, origin, forward=true) should detect accumulation.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // 0: element a[0]
-            Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]), // 1: element a[1]
-            Op::new(OpCode::IntAdd, &[OpRef(200), OpRef(0)]),   // 2: sum0 = seed + a[0]
-            Op::new(OpCode::IntAdd, &[OpRef(2), OpRef(1)]),     // 3: sum1 = sum0 + a[1]
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // 0: element a[0]
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ), // 1: element a[1]
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(200), OpRef::from_raw(0)]), // 2: sum0 = seed + a[0]
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(2), OpRef::from_raw(1)]), // 3: sum1 = sum0 + a[1]
         ];
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
@@ -1376,9 +1468,18 @@ mod tests {
         // vector.py:706-707: contains_pair check — if lnode is already leftmost
         // or rnode is already rightmost of some pack, can_be_packed returns None.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::IntAdd, &[OpRef(102), OpRef(103)]),
-            Op::new(OpCode::IntAdd, &[OpRef(104), OpRef(105)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(102), OpRef::from_raw(103)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(104), OpRef::from_raw(105)],
+            ),
         ];
         assign_positions(&mut ops, 0);
         let graph = DependencyGraph::build(&ops, &|_| None);
@@ -1413,13 +1514,16 @@ mod tests {
     #[test]
     fn test_guard_analysis_hoistable() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(100)]), // loop-invariant (100 not produced)
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]), // body-dependent (1 = IntAdd result)
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(100)]), // loop-invariant (100 not produced)
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]), // body-dependent (1 = IntAdd result)
         ];
         let mut positioned = ops;
         for (i, op) in positioned.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
         }
         let analysis = GuardAnalysis::analyze(&positioned);
         assert_eq!(analysis.hoistable.len(), 1);
@@ -1431,13 +1535,19 @@ mod tests {
     #[test]
     fn test_follow_def_use_chain() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // 0: result used by 1
-            Op::new(OpCode::IntMul, &[OpRef(0), OpRef(102)]),   // 1: uses result of 0
-            Op::new(OpCode::IntSub, &[OpRef(1), OpRef(103)]),   // 2: uses result of 1
-            Op::new(OpCode::IntAdd, &[OpRef(104), OpRef(105)]), // 3: independent
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // 0: result used by 1
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(102)]), // 1: uses result of 0
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(1), OpRef::from_raw(103)]), // 2: uses result of 1
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(104), OpRef::from_raw(105)],
+            ), // 3: independent
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
         }
         let chain = follow_def_use_chain(&ops, 0, 10);
         assert!(chain.contains(&0));
@@ -1449,14 +1559,20 @@ mod tests {
     #[test]
     fn test_vector_loop_from_trace() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // preamble
-            Op::new(OpCode::Label, &[OpRef(100)]),              // loop header
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]), // body
-            Op::new(OpCode::IntMul, &[OpRef(2), OpRef(102)]),   // body
-            Op::new(OpCode::Jump, &[OpRef(3)]),                 // back-edge
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // preamble
+            Op::new(OpCode::Label, &[OpRef::from_raw(100)]), // loop header
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ), // body
+            Op::new(OpCode::IntMul, &[OpRef::from_raw(2), OpRef::from_raw(102)]), // body
+            Op::new(OpCode::Jump, &[OpRef::from_raw(3)]),    // back-edge
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
         }
         let vloop = VectorLoop::from_trace(&ops).unwrap();
         assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul

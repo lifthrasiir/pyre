@@ -348,15 +348,15 @@ struct RewriteState {
     /// whose write barrier has already been emitted (freshly allocated
     /// objects, or objects we already issued a WB for). Cleared whenever
     /// we emit an operation that can trigger a collection or on LABEL.
-    wb_applied: HashSet<u32>,
+    wb_applied: HashSet<OpRef>,
     /// Forwarding map from original result OpRefs to rewritten result OpRefs.
-    forwarding: HashMap<u32, OpRef>,
+    forwarding: HashMap<OpRef, OpRef>,
 
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
     /// constant length operand (rewrite.py:551). Cleared on LABEL
     /// (rewrite.py:1005) and emitting_an_operation_that_can_collect.
-    known_lengths: HashMap<u32, usize>,
+    known_lengths: HashMap<OpRef, usize>,
 
     // ── Pending zero tracking ──
     /// Deferred ZERO_ARRAY ops that may be optimized away if subsequent
@@ -364,7 +364,7 @@ struct RewriteState {
     pending_zeros: Vec<PendingZero>,
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
-    initialized_indices: HashMap<u32, HashSet<usize>>,
+    initialized_indices: HashMap<OpRef, HashSet<usize>>,
     /// rewrite.py:61 `_delayed_zero_setfields = {}`.
     ///
     /// Map from base OpRef → {byte-offset: ()} of zero-init
@@ -374,7 +374,7 @@ struct RewriteState {
     /// pending at the next can-collect / flush point is emitted as
     /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
     /// (rewrite.py:761-766).
-    _delayed_zero_setfields: HashMap<u32, BTreeMap<i64, ()>>,
+    _delayed_zero_setfields: HashMap<OpRef, BTreeMap<i64, ()>>,
 
     // ── INT_ADD/INT_SUB constant-fold tracking (rewrite.py:64) ──
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
@@ -389,7 +389,7 @@ struct RewriteState {
     /// ported.  The parity skeleton is kept here so the structural
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
-    _constant_additions: HashMap<u32, (OpRef, i64)>,
+    _constant_additions: HashMap<OpRef, (OpRef, i64)>,
     /// Next constant index for `OpRef::from_const`. Shares the
     /// constant-namespace with the tracer's ConstantPool; initialized in
     /// `with_constants` from the passed-in map so newly emitted constants
@@ -451,8 +451,8 @@ impl RewriteState {
     fn with_constants(hint: usize, next_pos: u32, constants: HashMap<u32, i64>) -> Self {
         let next_const_idx = constants
             .keys()
-            .filter(|&&k| OpRef(k).is_constant())
-            .map(|&k| OpRef(k).const_index())
+            .filter(|&&k| OpRef::from_raw(k).is_constant())
+            .map(|&k| OpRef::from_raw(k).const_index())
             .max()
             .map_or(0, |m| m + 1);
         let mut s = Self::new(hint, next_pos);
@@ -472,10 +472,12 @@ impl RewriteState {
     /// `ConstInt(value)` at each call site without caching. Mirrors that
     /// — every call grows the constant pool by one entry in the shared
     /// high-bit constant namespace (same as the tracer's ConstantPool).
+    /// Mints `OpRef::ConstInt` (history.py:220 `ConstInt.type = 'i'`)
+    /// rather than the type-erased `from_const` Untyped variant.
     fn const_int(&mut self, value: i64) -> OpRef {
-        let opref = OpRef::from_const(self.next_const_idx);
+        let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;
-        self.constants.insert(opref.0, value);
+        self.constants.insert(opref.raw(), value);
         opref
     }
 
@@ -492,9 +494,14 @@ impl RewriteState {
         let pos = if rt == Type::Void {
             OpRef::NONE
         } else {
-            let pos = OpRef(self.next_pos);
+            let pos = match rt {
+                Type::Int => OpRef::int_op(self.next_pos),
+                Type::Float => OpRef::float_op(self.next_pos),
+                Type::Ref => OpRef::ref_op(self.next_pos),
+                Type::Void => unreachable!("Void filtered above"),
+            };
             self.next_pos += 1;
-            self.result_types.insert(pos.0, rt);
+            self.result_types.insert(pos.raw(), rt);
             pos
         };
         op.pos = pos;
@@ -514,13 +521,13 @@ impl RewriteState {
     fn emit_result(&mut self, mut op: Op, preferred_pos: OpRef) -> OpRef {
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
-            let pos = OpRef(self.next_pos);
+            let pos = OpRef::op_typed(self.next_pos, rt);
             self.next_pos += 1;
             pos
         } else {
             preferred_pos
         };
-        self.result_types.insert(pos.0, rt);
+        self.result_types.insert(pos.raw(), rt);
         op.pos = pos;
         self.out.push(op);
         pos
@@ -550,12 +557,12 @@ impl RewriteState {
     fn record_int_add_or_sub(&mut self, op: &Op, is_subtraction: bool) {
         let v_arg0 = op.arg(0);
         let v_arg1 = op.arg(1);
-        let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(v_arg1.0) {
+        let (box_arg, mut constant) = if let Some(c) = self.resolve_constant(v_arg1.raw()) {
             let signed = if is_subtraction { -c } else { c };
             (v_arg0, signed)
         } else if !is_subtraction {
             // rewrite.py:1019-1024: int_add only — try arg0 as constant.
-            let Some(c) = self.resolve_constant(v_arg0.0) else {
+            let Some(c) = self.resolve_constant(v_arg0.raw()) else {
                 return;
             };
             (v_arg1, c)
@@ -564,14 +571,13 @@ impl RewriteState {
         };
         // rewrite.py:1026-1030 invariant: if box itself is a recorded
         // sum, fold its constant in and chain to the older origin.
-        let box_arg = if let Some(&(older, extra)) = self._constant_additions.get(&box_arg.0) {
+        let box_arg = if let Some(&(older, extra)) = self._constant_additions.get(&box_arg) {
             constant += extra;
             older
         } else {
             box_arg
         };
-        self._constant_additions
-            .insert(op.pos.0, (box_arg, constant));
+        self._constant_additions.insert(op.pos, (box_arg, constant));
     }
 
     /// rewrite.py:173-182 _try_use_older_box.
@@ -580,40 +586,40 @@ impl RewriteState {
     /// it with the older box and add `factor * extra_offset` to
     /// `offset`.
     fn _try_use_older_box(&self, index_box: OpRef, factor: i64, offset: i64) -> (OpRef, i64) {
-        if let Some(&(older, extra)) = self._constant_additions.get(&index_box.0) {
+        if let Some(&(older, extra)) = self._constant_additions.get(&index_box) {
             return (older, offset + factor * extra);
         }
         (index_box, offset)
     }
 
     fn remember_wb(&mut self, r: OpRef) {
-        self.wb_applied.insert(r.0);
+        self.wb_applied.insert(r);
     }
 
     /// rewrite.py:66-67: remember_known_length
     fn remember_known_length(&mut self, op: OpRef, length: usize) {
-        self.known_lengths.insert(op.0, length);
+        self.known_lengths.insert(op, length);
     }
 
     /// rewrite.py:81-82: known_length(op, default)
     fn known_length(&self, op: OpRef, default: usize) -> usize {
-        self.known_lengths.get(&op.0).copied().unwrap_or(default)
+        self.known_lengths.get(&op).copied().unwrap_or(default)
     }
 
     /// rewrite.py:714: write_barrier_applied(op)
     fn wb_already_applied(&self, r: OpRef) -> bool {
-        self.wb_applied.contains(&r.0)
+        self.wb_applied.contains(&r)
     }
 
     /// rewrite.py:930 parity: `v.type` — get the type of an OpRef.
     fn result_type_of(&self, r: OpRef) -> Option<Type> {
-        self.result_types.get(&r.0).copied()
+        self.result_types.get(&r.raw()).copied()
     }
 
     /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
     /// A null ConstPtr never needs a write barrier.
     fn is_null_constant(&self, r: OpRef) -> bool {
-        if let Some(&val) = self.constants.get(&r.0) {
+        if let Some(&val) = self.constants.get(&r.raw()) {
             val == 0
         } else {
             false
@@ -624,7 +630,7 @@ impl RewriteState {
         if r.is_none() {
             return r;
         }
-        self.forwarding.get(&r.0).copied().unwrap_or(r)
+        self.forwarding.get(&r).copied().unwrap_or(r)
     }
 
     fn rewrite_op(&self, op: &Op) -> Op {
@@ -643,7 +649,7 @@ impl RewriteState {
 
     fn record_result_mapping(&mut self, old_pos: OpRef, new_pos: OpRef) {
         if !old_pos.is_none() {
-            self.forwarding.insert(old_pos.0, new_pos);
+            self.forwarding.insert(old_pos, new_pos);
         }
     }
 
@@ -692,7 +698,7 @@ impl RewriteState {
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
     fn delayed_zero_setfields(&mut self, r: OpRef) -> &mut BTreeMap<i64, ()> {
-        let key = self.resolve(r).0;
+        let key = self.resolve(r);
         self._delayed_zero_setfields.entry(key).or_default()
     }
 
@@ -705,7 +711,7 @@ impl RewriteState {
             .any(|pz| pz.array_ref == array_ref)
         {
             self.initialized_indices
-                .entry(array_ref.0)
+                .entry(array_ref)
                 .or_default()
                 .insert(index);
         }
@@ -725,7 +731,7 @@ impl RewriteState {
         let inited = std::mem::take(&mut self.initialized_indices);
 
         for pz in pending {
-            let written = inited.get(&pz.array_ref.0);
+            let written = inited.get(&pz.array_ref);
 
             // rewrite.py:744-753 trim-from-front / trim-from-back.
             let mut start: usize = 0;
@@ -758,8 +764,7 @@ impl RewriteState {
         // ConstInt(0), ConstInt(WORD))`, which is what we emit here
         // directly.
         let pending_zsf = std::mem::take(&mut self._delayed_zero_setfields);
-        for (key, entries) in pending_zsf {
-            let ptr = OpRef(key);
+        for (ptr, entries) in pending_zsf {
             for ofs in entries.keys().copied() {
                 let ofs_ref = self.const_int(ofs);
                 let zero_ref = self.const_int(0);
@@ -988,7 +993,7 @@ impl GcRewriterImpl {
 
         let item_size = descr.item_size();
         let v_length = st.resolve(op.arg(0)); // the length operand
-        let length_const = st.resolve_constant(v_length.0);
+        let length_const = st.resolve_constant(v_length.raw());
 
         // rewrite.py:548-558 — total_size for the constant-size /
         // zero-itemsize fast path.  Stays at -1 when v_length is a
@@ -1172,7 +1177,7 @@ impl GcRewriterImpl {
             return;
         }
         // rewrite.py:590-591 constant zero-length short-circuit.
-        let length_const = st.resolve_constant(v_length.0);
+        let length_const = st.resolve_constant(v_length.raw());
         if matches!(length_const, Some(0)) {
             return;
         }
@@ -1500,7 +1505,7 @@ impl GcRewriterImpl {
             st.resolve(op.arg(4))
         } else {
             let v_length = st.resolve(op.arg(4));
-            if let Some(c) = st.resolve_constant(v_length.0) {
+            if let Some(c) = st.resolve_constant(v_length.raw()) {
                 // rewrite.py:1073-1074 — constant-fold the shift.
                 st.const_int(c << itemscale)
             } else {
@@ -1635,7 +1640,7 @@ impl GcRewriterImpl {
             return;
         };
         let offset = fd.offset() as i64;
-        let base = st.resolve(op.arg(0)).0;
+        let base = st.resolve(op.arg(0));
         if let Some(entries) = st._delayed_zero_setfields.get_mut(&base) {
             entries.remove(&offset);
         }
@@ -1656,10 +1661,10 @@ impl GcRewriterImpl {
     fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
         let array_ref = st.resolve(op.arg(0));
         let index_ref = op.arg(1);
-        if st.resolve_constant(array_ref.0).is_some() {
+        if st.resolve_constant(array_ref.raw()).is_some() {
             return;
         }
-        let Some(idx_val) = st.resolve_constant(index_ref.0) else {
+        let Some(idx_val) = st.resolve_constant(index_ref.raw()) else {
             return;
         };
         st.record_setarrayitem_index(array_ref, idx_val as usize);
@@ -1820,7 +1825,7 @@ impl GcRewriterImpl {
         st: &mut RewriteState,
     ) -> (i64, i64, ScaledIndex) {
         // rewrite.py:1118-1122 — ConstInt path.
-        if let Some(index_val) = st.resolve_constant(index_box.0) {
+        if let Some(index_val) = st.resolve_constant(index_box.raw()) {
             return (1, index_val * factor + offset, ScaledIndex::Const);
         }
         // rewrite.py:1124-1133 — non-constant path.
@@ -2256,13 +2261,13 @@ impl GcRewriterImpl {
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
         ) {
             let scale = st
-                .resolve_constant(op.arg(2).0)
+                .resolve_constant(op.arg(2).raw())
                 .expect("GC_LOAD_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(op.arg(3).0)
+                .resolve_constant(op.arg(3).raw())
                 .expect("GC_LOAD_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(op.arg(4).0)
+                .resolve_constant(op.arg(4).raw())
                 .expect("GC_LOAD_INDEXED size must be ConstInt");
             let ptr = st.resolve(op.arg(0));
             let index = st.resolve(op.arg(1));
@@ -2271,13 +2276,13 @@ impl GcRewriterImpl {
         }
         if matches!(opnum, OpCode::GcStoreIndexed) {
             let scale = st
-                .resolve_constant(op.arg(3).0)
+                .resolve_constant(op.arg(3).raw())
                 .expect("GC_STORE_INDEXED scale must be ConstInt");
             let offset = st
-                .resolve_constant(op.arg(4).0)
+                .resolve_constant(op.arg(4).raw())
                 .expect("GC_STORE_INDEXED offset must be ConstInt");
             let size = st
-                .resolve_constant(op.arg(5).0)
+                .resolve_constant(op.arg(5).raw())
                 .expect("GC_STORE_INDEXED size must be ConstInt");
             let ptr = st.resolve(op.arg(0));
             let index = st.resolve(op.arg(1));
@@ -2674,7 +2679,7 @@ impl GcRewriter for GcRewriterImpl {
 
         let next_pos = ops
             .iter()
-            .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.0))
+            .filter_map(|op| (!op.pos.is_none()).then_some(op.pos.raw()))
             .max()
             .map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
@@ -2683,7 +2688,7 @@ impl GcRewriter for GcRewriterImpl {
         for op in &ops {
             let rt = op.result_type();
             if rt != Type::Void && !op.pos.is_none() {
-                st.result_types.insert(op.pos.0, rt);
+                st.result_types.insert(op.pos.raw(), rt);
             }
         }
         // Merge constant types — RPython's ConstPtr/ConstInt carry type
@@ -3061,13 +3066,13 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = OpRef(pos);
+        op.pos = OpRef::from_raw(pos);
         op
     }
 
@@ -3159,17 +3164,17 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
         // rewrite.py:474-484 parity: size arg is ConstInt(descr.size + GcHeader::SIZE).
-        let size_val = constants[&result[0].args[0].0];
+        let size_val = constants[&result[0].args[0].raw()];
         assert_eq!(size_val, (32 + crate::header::GcHeader::SIZE) as i64);
         assert_eq!(result[1].opcode, OpCode::GcStore); // tid init
-        let tid_val = constants[&result[1].args[2].0];
+        let tid_val = constants[&result[1].args[2].raw()];
         assert_eq!(tid_val, 7); // type_id = 7
         // GcHeader packs type id (lower 32 bits) and gc flags (upper 32
         // bits) into a single u64.  gen_initialize_tid must emit a
         // 4-byte store so that the runtime-set flags
         // (collector.rs:449 alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
         // oldgen-promoted allocs) survive the type id stamp.
-        let store_size = constants[&result[1].args[3].0];
+        let store_size = constants[&result[1].args[3].raw()];
         assert_eq!(
             store_size, 4,
             "gen_initialize_tid must emit a 4-byte store (type id half) so \
@@ -3182,7 +3187,7 @@ mod tests {
     #[test]
     fn test_new_array_rewrite() {
         let rw = make_rewriter();
-        let length_ref = OpRef(100); // some prior op producing the length
+        let length_ref = OpRef::int_op(100); // some prior op producing the length
         let ops = vec![Op::with_descr(
             OpCode::NewArray,
             &[length_ref],
@@ -3213,14 +3218,14 @@ mod tests {
     #[test]
     fn test_new_array_const_oversize_uses_malloc_array_helper() {
         let rw = make_rewriter(); // max_nursery_size = 4096
-        let len_ref = OpRef(10_000);
+        let len_ref = OpRef::int_op(10_000);
         // array_descr_ref: base_size=8, item_size=8 →
         //   total = 8 + 8*512 = 4104; gen_malloc_nursery sees
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
         let mut constants = HashMap::new();
         constants.insert(10_000, 512_i64);
         let mut new_array = Op::with_descr(OpCode::NewArray, &[len_ref], array_descr_ref());
-        new_array.pos = OpRef(0);
+        new_array.pos = OpRef::ref_op(0);
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
         let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
@@ -3237,9 +3242,9 @@ mod tests {
             .position(|o| o.opcode == OpCode::CallR)
             .expect("constant-length oversize must emit CALL_R slow helper");
         let call = &result[call_idx];
-        assert_eq!(consts[&call.args[0].0], TEST_MALLOC_ARRAY_FN);
-        assert_eq!(consts[&call.args[1].0], 8);
-        assert_eq!(consts[&call.args[2].0], 5);
+        assert_eq!(consts[&call.args[0].raw()], TEST_MALLOC_ARRAY_FN);
+        assert_eq!(consts[&call.args[1].raw()], 8);
+        assert_eq!(consts[&call.args[2].raw()], 5);
         assert_eq!(call.args[3], len_ref);
         assert!(
             result
@@ -3257,8 +3262,8 @@ mod tests {
         // SETFIELD_GC to GC_STORE; the write-barrier arm emits WB then
         // emit_maybe_forwarded follows the forward.
         let rw = make_rewriter();
-        let obj = OpRef(0);
-        let val = OpRef(1);
+        let obj = OpRef::ref_op(0);
+        let val = OpRef::ref_op(1);
         let ops = vec![Op::with_descr(
             OpCode::SetfieldGc,
             &[obj, val],
@@ -3284,7 +3289,7 @@ mod tests {
         // at `resoperation.rs:1228` and must retain that identity; a
         // stray lowering to GC_LOAD_R would drop purity semantics.
         let rw = make_rewriter();
-        let obj = OpRef(0);
+        let obj = OpRef::ref_op(0);
         let ops = vec![Op::with_descr(
             OpCode::GetfieldGcPureR,
             &[obj],
@@ -3314,8 +3319,8 @@ mod tests {
         // the rewriter here it must pass through — otherwise we would
         // be enabling a code path upstream explicitly disallows.
         let rw = make_rewriter();
-        let obj = OpRef(0);
-        let idx = OpRef(1);
+        let obj = OpRef::ref_op(0);
+        let idx = OpRef::int_op(1);
         let ops = vec![Op::with_descr(
             OpCode::GetarrayitemRawR,
             &[obj, idx],
@@ -3339,8 +3344,8 @@ mod tests {
     #[test]
     fn test_setfield_gc_int_no_wb() {
         let rw = make_rewriter();
-        let obj = OpRef(0);
-        let val = OpRef(1);
+        let obj = OpRef::ref_op(0);
+        let val = OpRef::ref_op(1);
         let ops = vec![Op::with_descr(
             OpCode::SetfieldGc,
             &[obj, val],
@@ -3425,8 +3430,8 @@ mod tests {
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
             // skip the tid header store (ofs=0, value=type_id, itemsize=4).
-            .filter(|o| consts.get(&o.args[2].0).copied() == Some(0))
-            .map(|o| consts[&o.args[1].0])
+            .filter(|o| consts.get(&o.args[2].raw()).copied() == Some(0))
+            .map(|o| consts[&o.args[1].raw()])
             .collect();
         seen_offsets.sort();
         assert_eq!(
@@ -3447,12 +3452,12 @@ mod tests {
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
         let val = OpRef::from_const(100);
         let mut constants = HashMap::new();
-        constants.insert(val.0, 0x1234);
+        constants.insert(val.raw(), 0x1234);
         let ops = vec![
             Op::with_descr(OpCode::New, &[], descr),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef(0), val],
+                &[OpRef::ref_op(0), val],
                 ref_field_descr_ref_at(24),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -3463,8 +3468,8 @@ mod tests {
         let null_offsets: Vec<i64> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
-            .filter(|o| consts.get(&o.args[2].0).copied() == Some(0))
-            .map(|o| consts[&o.args[1].0])
+            .filter(|o| consts.get(&o.args[2].raw()).copied() == Some(0))
+            .map(|o| consts[&o.args[1].raw()])
             .collect();
         assert_eq!(
             null_offsets,
@@ -3479,8 +3484,8 @@ mod tests {
     fn test_passthrough() {
         let rw = make_rewriter();
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(2)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]),
             Op::new(OpCode::Jump, &[]),
         ];
 
@@ -3518,14 +3523,14 @@ mod tests {
         // rewrite.py:893-895: combined size = round_up(24+8) + round_up(32+8) = 32 + 40 = 72
         let header = crate::header::GcHeader::SIZE as usize;
         let expected_size = round_up(24 + header) as i64 + round_up(32 + header) as i64;
-        assert_eq!(constants[&malloc.args[0].0], expected_size);
+        assert_eq!(constants[&malloc.args[0].raw()], expected_size);
 
         let incr = result
             .iter()
             .find(|o| o.opcode == OpCode::NurseryPtrIncrement)
             .unwrap();
         // rewrite.py:898: ConstInt(previous_size) = round_up(24 + GcHeader::SIZE) = 32
-        assert_eq!(constants[&incr.args[1].0], round_up(24 + header) as i64);
+        assert_eq!(constants[&incr.args[1].raw()], round_up(24 + header) as i64);
 
         // Both should have tid initialisation.
         let tid_stores: Vec<_> = result
@@ -3533,8 +3538,8 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GcStore)
             .collect();
         assert_eq!(tid_stores.len(), 2);
-        assert_eq!(constants[&tid_stores[0].args[2].0], 1); // first type_id
-        assert_eq!(constants[&tid_stores[1].args[2].0], 2); // second type_id
+        assert_eq!(constants[&tid_stores[0].args[2].raw()], 1); // first type_id
+        assert_eq!(constants[&tid_stores[1].args[2].raw()], 2); // second type_id
     }
 
     // ── Test 7: A collecting operation between two NEWs prevents batching ──
@@ -3544,7 +3549,7 @@ mod tests {
         let rw = make_rewriter();
         let ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr(24, 1)),
-            Op::new(OpCode::CallN, &[OpRef(99)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(99)]),
             Op::with_descr(OpCode::New, &[], size_descr(24, 2)),
         ];
 
@@ -3564,9 +3569,9 @@ mod tests {
     #[test]
     fn test_wb_not_duplicated() {
         let rw = make_rewriter();
-        let obj = OpRef(0);
-        let val1 = OpRef(1);
-        let val2 = OpRef(2);
+        let obj = OpRef::ref_op(0);
+        let val1 = OpRef::ref_op(1);
+        let val2 = OpRef::ref_op(2);
         let ops = vec![
             Op::with_descr(OpCode::SetfieldGc, &[obj, val1], ref_field_descr()),
             Op::with_descr(OpCode::SetfieldGc, &[obj, val2], ref_field_descr()),
@@ -3607,7 +3612,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 1)),
             Op::with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef(0), OpRef(99)], // arg(0) = pos of the alloc = 0
+                &[OpRef::ref_op(0), OpRef::ref_op(99)], // arg(0) = pos of the alloc = 0
                 ref_field_descr(),
             ),
         ];
@@ -3615,9 +3620,9 @@ mod tests {
         let result2 = rw.rewrite_for_gc(&ops2);
 
         // The CallMallocNursery result at pos=0 is in wb_applied,
-        // so the SetfieldGc at arg(0)=OpRef(0) should NOT get a WB.
+        // so the SetfieldGc at arg(0)=OpRef::ref_op(0) should NOT get a WB.
         // Expected: CallMallocNursery, GcStore(tid), SetfieldGc
-        // No CondCallGcWb because OpRef(0) was remembered.
+        // No CondCallGcWb because OpRef::ref_op(0) was remembered.
         let wb_count = result2
             .iter()
             .filter(|o| o.opcode == OpCode::CondCallGcWb)
@@ -3643,10 +3648,10 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::CallMallocNursery);
         assert_eq!(result[1].opcode, OpCode::GcStore);
         let tid_ref = result[1].args[2];
-        assert_eq!(constants[&tid_ref.0], 3);
+        assert_eq!(constants[&tid_ref.raw()], 3);
         assert_eq!(result[2].opcode, OpCode::GcStore);
         let vtable_ref = result[2].args[2];
-        assert_eq!(constants[&vtable_ref.0], 0xDEAD_i64);
+        assert_eq!(constants[&vtable_ref.raw()], 0xDEAD_i64);
     }
 
     // ── Test 11: SETARRAYITEM_GC with Ref — no card marking → regular WB ──
@@ -3667,9 +3672,9 @@ mod tests {
         // GC_STORE_INDEXED itself is forwarded and emitted only after
         // the WB via `emit_maybe_forwarded`.
         let rw = make_rewriter();
-        let obj = OpRef(0);
-        let idx = OpRef(1);
-        let val = OpRef(2);
+        let obj = OpRef::ref_op(0);
+        let idx = OpRef::int_op(1);
+        let val = OpRef::ref_op(2);
         let ops = vec![Op::with_descr(
             OpCode::SetarrayitemGc,
             &[obj, idx, val],
@@ -3690,12 +3695,12 @@ mod tests {
     #[test]
     fn test_collecting_op_clears_wb() {
         let rw = make_rewriter();
-        let obj = OpRef(0);
-        let val = OpRef(1);
+        let obj = OpRef::ref_op(0);
+        let val = OpRef::ref_op(1);
         let ops = vec![
             Op::with_descr(OpCode::SetfieldGc, &[obj, val], ref_field_descr()),
             // This call can collect, clearing the WB set.
-            Op::new(OpCode::CallN, &[OpRef(99)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(99)]),
             Op::with_descr(OpCode::SetfieldGc, &[obj, val], ref_field_descr()),
         ];
 
@@ -3715,7 +3720,7 @@ mod tests {
         let ops = vec![
             mk_op_with_descr(OpCode::New, &[], 2, size_descr(24, 1)),
             mk_op_with_descr(OpCode::New, &[], 3, size_descr(16, 2)),
-            mk_op(OpCode::Finish, &[OpRef(3)], 4),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], 4),
         ];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -3730,10 +3735,10 @@ mod tests {
             .unwrap();
         let finish = result.last().unwrap();
 
-        assert_eq!(first_alloc.pos, OpRef(2));
-        assert_eq!(second_alloc.pos, OpRef(3));
+        assert_eq!(first_alloc.pos, OpRef::ref_op(2));
+        assert_eq!(second_alloc.pos, OpRef::ref_op(3));
         assert_eq!(finish.opcode, OpCode::Finish);
-        assert_eq!(finish.args[0], OpRef(3));
+        assert_eq!(finish.args[0], OpRef::ref_op(3));
         assert!(
             result
                 .iter()
@@ -3753,10 +3758,14 @@ mod tests {
         // shortcut.
         let rw = make_rewriter();
         let once = vec![
-            mk_op(OpCode::CondCallGcWbArray, &[OpRef(5), OpRef(1)], 7),
+            mk_op(
+                OpCode::CondCallGcWbArray,
+                &[OpRef::ref_op(5), OpRef::int_op(1)],
+                7,
+            ),
             mk_op_with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(5), OpRef(1), OpRef(6)],
+                &[OpRef::ref_op(5), OpRef::int_op(1), OpRef::ref_op(6)],
                 8,
                 array_descr_ref(),
             ),
@@ -3800,10 +3809,10 @@ mod tests {
         // rewrite the guard's failargs to reference the SAME_AS_I output.
         let rw = make_rewriter();
 
-        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef(0), OpRef(1)]);
-        int_lt.pos = OpRef(2);
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(2)]);
-        guard.store_final_boxes(vec![OpRef(0), OpRef(2), OpRef(1)]);
+        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        int_lt.pos = OpRef::int_op(2);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
+        guard.store_final_boxes(vec![OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(1)]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -3828,7 +3837,7 @@ mod tests {
         assert!(lt_idx < guard_idx, "GuardTrue must follow the comparison");
 
         // The guard's failargs must now reference the SAME_AS_I output
-        // at the position where OpRef(2) (the IntLt result) used to appear.
+        // at the position where OpRef::ref_op(2) (the IntLt result) used to appear.
         let same_pos = result[same_idx].pos;
         let guard_fa = result[guard_idx]
             .fail_args
@@ -3836,8 +3845,8 @@ mod tests {
             .expect("guard keeps failargs");
         assert_eq!(
             guard_fa.as_slice(),
-            &[OpRef(0), same_pos, OpRef(1)],
-            "OpRef(2) → SAME_AS_I substitution"
+            &[OpRef::int_op(0), same_pos, OpRef::int_op(1)],
+            "OpRef::ref_op(2) → SAME_AS_I substitution"
         );
     }
 
@@ -3845,10 +3854,10 @@ mod tests {
     fn test_comparison_guard_false_hoists_with_one_constant() {
         // GUARD_FALSE: rewrite.py:463 `value = int(opnum == GUARD_FALSE)` ⇒ 1.
         let rw = make_rewriter();
-        let mut int_eq = Op::new(OpCode::IntEq, &[OpRef(0), OpRef(1)]);
-        int_eq.pos = OpRef(2);
-        let mut guard = Op::new(OpCode::GuardFalse, &[OpRef(2)]);
-        guard.store_final_boxes(vec![OpRef(2)]);
+        let mut int_eq = Op::new(OpCode::IntEq, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        int_eq.pos = OpRef::int_op(2);
+        let mut guard = Op::new(OpCode::GuardFalse, &[OpRef::int_op(2)]);
+        guard.store_final_boxes(vec![OpRef::int_op(2)]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
@@ -3859,7 +3868,8 @@ mod tests {
             .expect("SAME_AS_I must be emitted for GUARD_FALSE merge");
         let const_ref = same.args[0];
         assert_eq!(
-            consts[&const_ref.0], 1,
+            consts[&const_ref.raw()],
+            1,
             "GUARD_FALSE hoists SAME_AS_I(1) per rewrite.py:463",
         );
     }
@@ -3871,7 +3881,7 @@ mod tests {
         // copy_and_change.
         let rw = make_rewriter();
         let mut guard = Op::new(OpCode::GuardAlwaysFails, &[]);
-        guard.store_final_boxes(vec![OpRef(10), OpRef(11)]);
+        guard.store_final_boxes(vec![OpRef::int_op(10), OpRef::int_op(11)]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
         let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
@@ -3890,15 +3900,17 @@ mod tests {
             .expect("GuardValue replaces GuardAlwaysFails");
         assert_eq!(gv.args[0], same.pos);
         assert_eq!(
-            consts[&gv.args[1].0], 1,
+            consts[&gv.args[1].raw()],
+            1,
             "GuardValue checks against ConstInt(1)",
         );
         assert_eq!(
-            consts[&same.args[0].0], 0,
+            consts[&same.args[0].raw()],
+            0,
             "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
         );
         let gv_fa = gv.fail_args.as_ref().expect("GuardValue inherits failargs");
-        assert_eq!(gv_fa.as_slice(), &[OpRef(10), OpRef(11)]);
+        assert_eq!(gv_fa.as_slice(), &[OpRef::int_op(10), OpRef::int_op(11)]);
     }
 
     #[test]
@@ -3906,11 +3918,11 @@ mod tests {
         // Guard that does NOT test the previous op's result: merge does
         // not fire, no SAME_AS_I is emitted.
         let rw = make_rewriter();
-        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef(0), OpRef(1)]);
-        int_lt.pos = OpRef(2);
-        // GuardTrue reads some unrelated OpRef(5), not OpRef(2).
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(5)]);
-        guard.store_final_boxes(vec![OpRef(0), OpRef(1)]);
+        let mut int_lt = Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        int_lt.pos = OpRef::int_op(2);
+        // GuardTrue reads some unrelated OpRef::ref_op(5), not OpRef::ref_op(2).
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(5)]);
+        guard.store_final_boxes(vec![OpRef::int_op(0), OpRef::int_op(1)]);
         let ops = vec![int_lt, guard, Op::new(OpCode::Finish, &[])];
 
         let result = rw.rewrite_for_gc(&ops);
@@ -3942,25 +3954,29 @@ mod tests {
         // path (rewrite.py:521) that actually emits ZERO_ARRAY.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
-        new_array.pos = OpRef(0);
+        let mut new_array = Op::with_descr(
+            OpCode::NewArrayClear,
+            &[OpRef::int_op(3)],
+            array_descr_int(),
+        );
+        new_array.pos = OpRef::ref_op(0);
         let constants = const_pool(&[(3, 3), (10, 0), (11, 1), (12, 2)]);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(10), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(11), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(11), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(12), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(12), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -3975,7 +3991,11 @@ mod tests {
             .filter(|o| o.opcode == OpCode::ZeroArray)
             .collect();
         assert_eq!(zeros.len(), 1, "ZERO_ARRAY stays in place per parity");
-        assert_eq!(out_consts[&zeros[0].args[2].0], 0, "byte length must be 0");
+        assert_eq!(
+            out_consts[&zeros[0].args[2].raw()],
+            0,
+            "byte length must be 0"
+        );
     }
 
     #[test]
@@ -3985,20 +4005,24 @@ mod tests {
         // Index OpRefs 10/11 are ConstInt 0/1 per rewrite.py:514-518.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(4)], array_descr_int());
-        new_array.pos = OpRef(0);
+        let mut new_array = Op::with_descr(
+            OpCode::NewArrayClear,
+            &[OpRef::int_op(4)],
+            array_descr_int(),
+        );
+        new_array.pos = OpRef::ref_op(0);
         let constants = const_pool(&[(4, 4), (10, 0), (11, 1)]);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(10), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(11), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(11), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -4013,10 +4037,10 @@ mod tests {
         assert_eq!(zeros.len(), 1, "should emit exactly one ZERO_ARRAY");
         // item_size = 4 (array_descr_int), so start_items=2 → 8 bytes,
         // length_items=2 → 8 bytes.
-        assert_eq!(out_consts[&zeros[0].args[1].0], 8, "byte start");
-        assert_eq!(out_consts[&zeros[0].args[2].0], 8, "byte length");
-        assert_eq!(out_consts[&zeros[0].args[3].0], 1, "scale arg(3) is 1");
-        assert_eq!(out_consts[&zeros[0].args[4].0], 1, "scale arg(4) is 1");
+        assert_eq!(out_consts[&zeros[0].args[1].raw()], 8, "byte start");
+        assert_eq!(out_consts[&zeros[0].args[2].raw()], 8, "byte length");
+        assert_eq!(out_consts[&zeros[0].args[3].raw()], 1, "scale arg(3) is 1");
+        assert_eq!(out_consts[&zeros[0].args[4].raw()], 1, "scale arg(4) is 1");
     }
 
     #[test]
@@ -4024,13 +4048,17 @@ mod tests {
         // Guard forces pending zero flush even if no indices were SET.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(3)], array_descr_int());
-        new_array.pos = OpRef(0);
+        let mut new_array = Op::with_descr(
+            OpCode::NewArrayClear,
+            &[OpRef::int_op(3)],
+            array_descr_int(),
+        );
+        new_array.pos = OpRef::ref_op(0);
         let constants = const_pool(&[(3, 3)]);
 
         let ops = vec![
             new_array,
-            Op::new(OpCode::GuardTrue, &[OpRef(50)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(50)]),
             Op::new(OpCode::Finish, &[]),
         ];
 
@@ -4051,8 +4079,8 @@ mod tests {
             .find(|o| o.opcode == OpCode::ZeroArray)
             .unwrap();
         // No SETs, length=3 items × 4 bytes/item = 12 bytes.
-        assert_eq!(out_consts[&zero.args[1].0], 0, "byte start");
-        assert_eq!(out_consts[&zero.args[2].0], 12, "byte length");
+        assert_eq!(out_consts[&zero.args[1].raw()], 0, "byte start");
+        assert_eq!(out_consts[&zero.args[2].raw()], 12, "byte length");
     }
 
     #[test]
@@ -4064,25 +4092,29 @@ mod tests {
         // Index OpRefs 10/12/14 hold ConstInt 0/2/4 per rewrite.py:514-518.
         let mut rw = make_rewriter();
         rw.malloc_zero_filled = false;
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[OpRef(5)], array_descr_int());
-        new_array.pos = OpRef(0);
+        let mut new_array = Op::with_descr(
+            OpCode::NewArrayClear,
+            &[OpRef::int_op(5)],
+            array_descr_int(),
+        );
+        new_array.pos = OpRef::ref_op(0);
         let constants = const_pool(&[(5, 5), (10, 0), (12, 2), (14, 4)]);
 
         let ops = vec![
             new_array,
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(10), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(10), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(12), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(12), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(14), OpRef(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(14), OpRef::int_op(100)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -4096,16 +4128,17 @@ mod tests {
             .collect();
         assert_eq!(zeros.len(), 1, "rewrite.py:719 emits one ZERO_ARRAY");
         // start_items=1 → 4 bytes, length_items=3 → 12 bytes.
-        assert_eq!(out_consts[&zeros[0].args[1].0], 4, "byte start");
-        assert_eq!(out_consts[&zeros[0].args[2].0], 12, "byte length");
+        assert_eq!(out_consts[&zeros[0].args[1].raw()], 4, "byte start");
+        assert_eq!(out_consts[&zeros[0].args[2].raw()], 12, "byte length");
     }
 
     #[test]
     fn test_pending_zero_no_clear() {
         // Plain NEW_ARRAY (not CLEAR) should NOT produce any ZERO_ARRAY.
         let rw = make_rewriter();
-        let mut new_array = Op::with_descr(OpCode::NewArray, &[OpRef(3)], array_descr_int());
-        new_array.pos = OpRef(0);
+        let mut new_array =
+            Op::with_descr(OpCode::NewArray, &[OpRef::int_op(3)], array_descr_int());
+        new_array.pos = OpRef::ref_op(0);
 
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
@@ -4185,17 +4218,17 @@ mod tests {
         // not yet ported in pyre).
         for &num_elem in &[10_i64, 200_i64] {
             let rw = make_rewriter_with_cards();
-            let len_ref = OpRef(10_000);
+            let len_ref = OpRef::int_op(10_000);
             let mut constants = HashMap::new();
             constants.insert(10_000, num_elem);
             let mut new_array =
                 Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
-            new_array.pos = OpRef(0);
+            new_array.pos = OpRef::ref_op(0);
             let ops = vec![
                 new_array,
                 Op::with_descr(
                     OpCode::SetarrayitemGc,
-                    &[OpRef(0), OpRef(1), OpRef(2)],
+                    &[OpRef::ref_op(0), OpRef::int_op(1), OpRef::ref_op(2)],
                     array_descr_ref(),
                 ),
                 Op::new(OpCode::Finish, &[]),
@@ -4228,7 +4261,7 @@ mod tests {
         let ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(1), OpRef(2)],
+                &[OpRef::ref_op(0), OpRef::int_op(1), OpRef::ref_op(2)],
                 array_descr_ref(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -4248,7 +4281,7 @@ mod tests {
         let ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(1), OpRef(2)],
+                &[OpRef::ref_op(0), OpRef::int_op(1), OpRef::ref_op(2)],
                 array_descr_int(),
             ),
             Op::new(OpCode::Finish, &[]),
@@ -4311,11 +4344,11 @@ mod tests {
     fn test_rewrite_copystrcontents() {
         let rw = make_rewriter();
         // [p0, p1, i0, i1, i_len]
-        let p0 = OpRef(0);
-        let p1 = OpRef(1);
-        let i0 = OpRef(2);
-        let i1 = OpRef(3);
-        let i_len = OpRef(4);
+        let p0 = OpRef::ref_op(0);
+        let p1 = OpRef::ref_op(1);
+        let i0 = OpRef::int_op(2);
+        let i1 = OpRef::int_op(3);
+        let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copystrcontent,
             &[p0, p1, i0, i1, i_len],
@@ -4334,14 +4367,14 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::LoadEffectiveAddress);
         assert_eq!(result[0].arg(0), p0);
         assert_eq!(result[0].arg(1), i0);
-        assert_eq!(constants[&result[0].arg(2).0], 16);
-        assert_eq!(constants[&result[0].arg(3).0], 0);
+        assert_eq!(constants[&result[0].arg(2).raw()], 16);
+        assert_eq!(constants[&result[0].arg(3).raw()], 0);
         // i_dst = load_effective_address(p1, i1, 16, 0)
         assert_eq!(result[1].opcode, OpCode::LoadEffectiveAddress);
         assert_eq!(result[1].arg(0), p1);
         assert_eq!(result[1].arg(1), i1);
-        assert_eq!(constants[&result[1].arg(2).0], 16);
-        assert_eq!(constants[&result[1].arg(3).0], 0);
+        assert_eq!(constants[&result[1].arg(2).raw()], 16);
+        assert_eq!(constants[&result[1].arg(3).raw()], 0);
         // call_n(memcpy_fn, i_dst, i_src, i_len)
         assert_eq!(result[2].opcode, OpCode::CallN);
         assert_eq!(result[2].arg(1), result[1].pos); // dst
@@ -4354,11 +4387,11 @@ mod tests {
     #[test]
     fn test_rewrite_copyunicodecontents_dynamic_length() {
         let rw = make_rewriter();
-        let p0 = OpRef(0);
-        let p1 = OpRef(1);
-        let i0 = OpRef(2);
-        let i1 = OpRef(3);
-        let i_len = OpRef(4);
+        let p0 = OpRef::ref_op(0);
+        let p1 = OpRef::ref_op(1);
+        let i0 = OpRef::int_op(2);
+        let i1 = OpRef::int_op(3);
+        let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copyunicodecontent,
             &[p0, p1, i0, i1, i_len],
@@ -4371,12 +4404,12 @@ mod tests {
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].opcode, OpCode::LoadEffectiveAddress);
         // basesize=16, shift=2 (itemsize=4 → itemscale=2)
-        assert_eq!(constants[&result[0].arg(2).0], 16);
-        assert_eq!(constants[&result[0].arg(3).0], 2);
+        assert_eq!(constants[&result[0].arg(2).raw()], 16);
+        assert_eq!(constants[&result[0].arg(3).raw()], 2);
         assert_eq!(result[1].opcode, OpCode::LoadEffectiveAddress);
         assert_eq!(result[2].opcode, OpCode::IntLshift);
         assert_eq!(result[2].arg(0), i_len);
-        assert_eq!(constants[&result[2].arg(1).0], 2);
+        assert_eq!(constants[&result[2].arg(1).raw()], 2);
         assert_eq!(result[3].opcode, OpCode::CallN);
         assert_eq!(result[3].arg(3), result[2].pos);
     }
@@ -4389,11 +4422,11 @@ mod tests {
     fn test_rewrite_copystrcontents_without_load_effective_address() {
         let mut rw = make_rewriter();
         rw.supports_load_effective_address = false;
-        let p0 = OpRef(0);
-        let p1 = OpRef(1);
-        let i0 = OpRef(2);
-        let i1 = OpRef(3);
-        let i_len = OpRef(4);
+        let p0 = OpRef::ref_op(0);
+        let p1 = OpRef::ref_op(1);
+        let i0 = OpRef::int_op(2);
+        let i1 = OpRef::int_op(3);
+        let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copystrcontent,
             &[p0, p1, i0, i1, i_len],
@@ -4414,13 +4447,13 @@ mod tests {
         assert_eq!(result[0].arg(1), i0);
         assert_eq!(result[1].opcode, OpCode::IntAdd);
         assert_eq!(result[1].arg(0), result[0].pos);
-        assert_eq!(constants[&result[1].arg(1).0], 16); // str_basesize - 1
+        assert_eq!(constants[&result[1].arg(1).raw()], 16); // str_basesize - 1
         assert_eq!(result[2].opcode, OpCode::IntAdd);
         assert_eq!(result[2].arg(0), p1);
         assert_eq!(result[2].arg(1), i1);
         assert_eq!(result[3].opcode, OpCode::IntAdd);
         assert_eq!(result[3].arg(0), result[2].pos);
-        assert_eq!(constants[&result[3].arg(1).0], 16);
+        assert_eq!(constants[&result[3].arg(1).raw()], 16);
         assert_eq!(result[4].opcode, OpCode::CallN);
         assert_eq!(result[4].arg(1), result[3].pos); // dst
         assert_eq!(result[4].arg(2), result[1].pos); // src
@@ -4436,11 +4469,11 @@ mod tests {
     fn test_rewrite_copyunicodecontents_without_load_effective_address() {
         let mut rw = make_rewriter();
         rw.supports_load_effective_address = false;
-        let p0 = OpRef(0);
-        let p1 = OpRef(1);
-        let i0 = OpRef(2);
-        let i1 = OpRef(3);
-        let i_len = OpRef(4);
+        let p0 = OpRef::ref_op(0);
+        let p1 = OpRef::ref_op(1);
+        let i0 = OpRef::int_op(2);
+        let i1 = OpRef::int_op(3);
+        let i_len = OpRef::int_op(4);
         let ops = vec![Op::with_descr(
             OpCode::Copyunicodecontent,
             &[p0, p1, i0, i1, i_len],
@@ -4461,25 +4494,25 @@ mod tests {
         assert_eq!(result.len(), 8);
         assert_eq!(result[0].opcode, OpCode::IntLshift);
         assert_eq!(result[0].arg(0), i0);
-        assert_eq!(constants[&result[0].arg(1).0], 2);
+        assert_eq!(constants[&result[0].arg(1).raw()], 2);
         assert_eq!(result[1].opcode, OpCode::IntAdd);
         assert_eq!(result[1].arg(0), p0);
         assert_eq!(result[1].arg(1), result[0].pos);
         assert_eq!(result[2].opcode, OpCode::IntAdd);
         assert_eq!(result[2].arg(0), result[1].pos);
-        assert_eq!(constants[&result[2].arg(1).0], 16);
+        assert_eq!(constants[&result[2].arg(1).raw()], 16);
         assert_eq!(result[3].opcode, OpCode::IntLshift);
         assert_eq!(result[3].arg(0), i1);
-        assert_eq!(constants[&result[3].arg(1).0], 2);
+        assert_eq!(constants[&result[3].arg(1).raw()], 2);
         assert_eq!(result[4].opcode, OpCode::IntAdd);
         assert_eq!(result[4].arg(0), p1);
         assert_eq!(result[4].arg(1), result[3].pos);
         assert_eq!(result[5].opcode, OpCode::IntAdd);
         assert_eq!(result[5].arg(0), result[4].pos);
-        assert_eq!(constants[&result[5].arg(1).0], 16);
+        assert_eq!(constants[&result[5].arg(1).raw()], 16);
         assert_eq!(result[6].opcode, OpCode::IntLshift);
         assert_eq!(result[6].arg(0), i_len);
-        assert_eq!(constants[&result[6].arg(1).0], 2);
+        assert_eq!(constants[&result[6].arg(1).raw()], 2);
         assert_eq!(result[7].opcode, OpCode::CallN);
         assert_eq!(result[7].arg(1), result[5].pos); // dst
         assert_eq!(result[7].arg(2), result[2].pos); // src

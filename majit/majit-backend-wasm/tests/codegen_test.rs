@@ -35,8 +35,8 @@ fn test_empty_trace() {
         tp: Type::Int,
     }];
     let ops = vec![{
-        let mut op = Op::new(OpCode::Finish, &[OpRef(0)]);
-        op.fail_args = Some(smallvec![OpRef(0)]);
+        let mut op = Op::new(OpCode::Finish, &[OpRef::from_raw(0)]);
+        op.fail_args = Some(smallvec![OpRef::from_raw(0)]);
         op
     }];
     let constants = HashMap::new();
@@ -72,16 +72,32 @@ fn test_int_add_loop() {
     let const_1 = OpRef::from_const(0);
     let const_100 = OpRef::from_const(1);
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(0).0, 1i64);
-    constants.insert(OpRef::from_const(1).0, 100i64);
+    constants.insert(OpRef::from_const(0).raw(), 1i64);
+    constants.insert(OpRef::from_const(1).raw(), 100i64);
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
-        make_op(OpCode::IntAdd, &[OpRef(1), OpRef(0)], OpRef(2)), // sum + i
-        make_op(OpCode::IntAdd, &[OpRef(0), const_1], OpRef(3)),  // i + 1
-        make_op(OpCode::IntLt, &[OpRef(3), const_100], OpRef(4)), // i+1 < 100
-        make_guard(OpCode::GuardTrue, &[OpRef(4)], &[OpRef(3), OpRef(2)]),
-        Op::new(OpCode::Jump, &[OpRef(3), OpRef(2)]),
+        Op::new(OpCode::Label, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(1), OpRef::from_raw(0)],
+            OpRef::from_raw(2),
+        ), // sum + i
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::from_raw(0), const_1],
+            OpRef::from_raw(3),
+        ), // i + 1
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::from_raw(3), const_100],
+            OpRef::from_raw(4),
+        ), // i+1 < 100
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::from_raw(4)],
+            &[OpRef::from_raw(3), OpRef::from_raw(2)],
+        ),
+        Op::new(OpCode::Jump, &[OpRef::from_raw(3), OpRef::from_raw(2)]),
     ];
 
     let (bytes, guards) = codegen::build_wasm_module(
@@ -112,16 +128,36 @@ fn test_float_ops() {
     ];
 
     let ops = vec![
-        make_op(OpCode::FloatAdd, &[OpRef(0), OpRef(1)], OpRef(2)),
-        make_op(OpCode::FloatSub, &[OpRef(0), OpRef(1)], OpRef(3)),
-        make_op(OpCode::FloatMul, &[OpRef(2), OpRef(3)], OpRef(4)),
-        make_op(OpCode::FloatTrueDiv, &[OpRef(4), OpRef(0)], OpRef(5)),
-        make_op(OpCode::FloatNeg, &[OpRef(5)], OpRef(6)),
-        make_op(OpCode::FloatAbs, &[OpRef(6)], OpRef(7)),
-        make_op(OpCode::FloatLt, &[OpRef(0), OpRef(1)], OpRef(8)),
+        make_op(
+            OpCode::FloatAdd,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            OpRef::from_raw(2),
+        ),
+        make_op(
+            OpCode::FloatSub,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            OpRef::from_raw(3),
+        ),
+        make_op(
+            OpCode::FloatMul,
+            &[OpRef::from_raw(2), OpRef::from_raw(3)],
+            OpRef::from_raw(4),
+        ),
+        make_op(
+            OpCode::FloatTrueDiv,
+            &[OpRef::from_raw(4), OpRef::from_raw(0)],
+            OpRef::from_raw(5),
+        ),
+        make_op(OpCode::FloatNeg, &[OpRef::from_raw(5)], OpRef::from_raw(6)),
+        make_op(OpCode::FloatAbs, &[OpRef::from_raw(6)], OpRef::from_raw(7)),
+        make_op(
+            OpCode::FloatLt,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            OpRef::from_raw(8),
+        ),
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef(7)]);
-            op.fail_args = Some(smallvec![OpRef(7)]);
+            let mut op = Op::new(OpCode::Finish, &[OpRef::from_raw(7)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(7)]);
             op
         },
     ];
@@ -149,13 +185,20 @@ fn test_call_generates_import() {
 
     let func_ptr = OpRef::from_const(0);
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(0).0, 42i64); // fake func_ptr
+    constants.insert(OpRef::from_const(0).raw(), 42i64); // fake func_ptr
 
-    let ops = vec![make_op(OpCode::CallI, &[func_ptr, OpRef(0)], OpRef(1)), {
-        let mut op = Op::new(OpCode::Finish, &[OpRef(1)]);
-        op.fail_args = Some(smallvec![OpRef(1)]);
-        op
-    }];
+    let ops = vec![
+        make_op(
+            OpCode::CallI,
+            &[func_ptr, OpRef::from_raw(0)],
+            OpRef::from_raw(1),
+        ),
+        {
+            let mut op = Op::new(OpCode::Finish, &[OpRef::from_raw(1)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(1)]);
+            op
+        },
+    ];
 
     let (bytes, guards) = codegen::build_wasm_module(
         &inputargs,
@@ -200,30 +243,50 @@ fn test_guard_types() {
     ];
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0), OpRef(1)]),
+        Op::new(OpCode::Label, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         // GuardTrue
-        make_guard(OpCode::GuardTrue, &[OpRef(0)], &[OpRef(0), OpRef(1)]),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::from_raw(0)],
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+        ),
         // GuardFalse
-        make_guard(OpCode::GuardFalse, &[OpRef(1)], &[OpRef(0), OpRef(1)]),
+        make_guard(
+            OpCode::GuardFalse,
+            &[OpRef::from_raw(1)],
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+        ),
         // GuardValue
-        make_guard(OpCode::GuardValue, &[OpRef(0), OpRef(1)], &[OpRef(0)]),
+        make_guard(
+            OpCode::GuardValue,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::from_raw(0)],
+        ),
         // GuardNonnull
-        make_guard(OpCode::GuardNonnull, &[OpRef(0)], &[OpRef(0)]),
+        make_guard(
+            OpCode::GuardNonnull,
+            &[OpRef::from_raw(0)],
+            &[OpRef::from_raw(0)],
+        ),
         // GuardIsnull
-        make_guard(OpCode::GuardIsnull, &[OpRef(1)], &[OpRef(1)]),
+        make_guard(
+            OpCode::GuardIsnull,
+            &[OpRef::from_raw(1)],
+            &[OpRef::from_raw(1)],
+        ),
         // GuardNoOverflow (0 args)
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef(0)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(0)]);
             op
         },
         // GuardNotInvalidated (0 args, always pass)
         {
             let mut op = Op::new(OpCode::GuardNotInvalidated, &[]);
-            op.fail_args = Some(smallvec![OpRef(0)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(0)]);
             op
         },
-        Op::new(OpCode::Jump, &[OpRef(0), OpRef(1)]),
+        Op::new(OpCode::Jump, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
     ];
 
     let constants = HashMap::new();
@@ -255,16 +318,16 @@ fn test_guard_gc_type_uses_immediate_typeid() {
 
     // OpRef::from_const(0) holds the immediate typeid 0x42
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(0).0, 0x42_i64);
+    constants.insert(OpRef::from_const(0).raw(), 0x42_i64);
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0)]),
+        Op::new(OpCode::Label, &[OpRef::from_raw(0)]),
         make_guard(
             OpCode::GuardGcType,
-            &[OpRef(0), OpRef::from_const(0)],
-            &[OpRef(0)],
+            &[OpRef::from_raw(0), OpRef::from_const(0)],
+            &[OpRef::from_raw(0)],
         ),
-        Op::new(OpCode::Jump, &[OpRef(0)]),
+        Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
     ];
 
     let (bytes, guards) = codegen::build_wasm_module(
@@ -318,9 +381,13 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
     }];
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0)]),
-        make_guard(OpCode::GuardIsObject, &[OpRef(0)], &[OpRef(0)]),
-        Op::new(OpCode::Jump, &[OpRef(0)]),
+        Op::new(OpCode::Label, &[OpRef::from_raw(0)]),
+        make_guard(
+            OpCode::GuardIsObject,
+            &[OpRef::from_raw(0)],
+            &[OpRef::from_raw(0)],
+        ),
+        Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
     ];
 
     let constants = HashMap::new();
@@ -350,18 +417,18 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
         tp: Type::Int,
     }];
 
-    let class_constant = OpRef(10_000);
+    let class_constant = OpRef::from_raw(10_000);
     let mut constants = HashMap::new();
     constants.insert(10_000, 0xCAFEi64);
 
     let ops = vec![
-        Op::new(OpCode::Label, &[OpRef(0)]),
+        Op::new(OpCode::Label, &[OpRef::from_raw(0)]),
         make_guard(
             OpCode::GuardSubclass,
-            &[OpRef(0), class_constant],
-            &[OpRef(0)],
+            &[OpRef::from_raw(0), class_constant],
+            &[OpRef::from_raw(0)],
         ),
-        Op::new(OpCode::Jump, &[OpRef(0)]),
+        Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
     ];
 
     let mut info = enabled_guard_gc_type_info();
@@ -397,18 +464,34 @@ fn test_sameas_and_conversions() {
     }];
 
     let ops = vec![
-        make_op(OpCode::SameAsI, &[OpRef(0)], OpRef(1)),
-        make_op(OpCode::CastIntToFloat, &[OpRef(0)], OpRef(2)),
-        make_op(OpCode::CastFloatToInt, &[OpRef(2)], OpRef(3)),
-        make_op(OpCode::CastIntToPtr, &[OpRef(0)], OpRef(4)),
-        make_op(OpCode::CastPtrToInt, &[OpRef(4)], OpRef(5)),
-        make_op(OpCode::IntNeg, &[OpRef(0)], OpRef(6)),
-        make_op(OpCode::IntInvert, &[OpRef(0)], OpRef(7)),
-        make_op(OpCode::IntIsTrue, &[OpRef(0)], OpRef(8)),
-        make_op(OpCode::IntIsZero, &[OpRef(0)], OpRef(9)),
+        make_op(OpCode::SameAsI, &[OpRef::from_raw(0)], OpRef::from_raw(1)),
+        make_op(
+            OpCode::CastIntToFloat,
+            &[OpRef::from_raw(0)],
+            OpRef::from_raw(2),
+        ),
+        make_op(
+            OpCode::CastFloatToInt,
+            &[OpRef::from_raw(2)],
+            OpRef::from_raw(3),
+        ),
+        make_op(
+            OpCode::CastIntToPtr,
+            &[OpRef::from_raw(0)],
+            OpRef::from_raw(4),
+        ),
+        make_op(
+            OpCode::CastPtrToInt,
+            &[OpRef::from_raw(4)],
+            OpRef::from_raw(5),
+        ),
+        make_op(OpCode::IntNeg, &[OpRef::from_raw(0)], OpRef::from_raw(6)),
+        make_op(OpCode::IntInvert, &[OpRef::from_raw(0)], OpRef::from_raw(7)),
+        make_op(OpCode::IntIsTrue, &[OpRef::from_raw(0)], OpRef::from_raw(8)),
+        make_op(OpCode::IntIsZero, &[OpRef::from_raw(0)], OpRef::from_raw(9)),
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef(9)]);
-            op.fail_args = Some(smallvec![OpRef(9)]);
+            let mut op = Op::new(OpCode::Finish, &[OpRef::from_raw(9)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(9)]);
             op
         },
     ];
@@ -440,21 +523,29 @@ fn test_overflow_ops() {
     ];
 
     let ops = vec![
-        make_op(OpCode::IntAddOvf, &[OpRef(0), OpRef(1)], OpRef(2)),
+        make_op(
+            OpCode::IntAddOvf,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            OpRef::from_raw(2),
+        ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef(2)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(2)]);
             op
         },
-        make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], OpRef(3)),
+        make_op(
+            OpCode::IntSubOvf,
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            OpRef::from_raw(3),
+        ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef(3)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(3)]);
             op
         },
         {
-            let mut op = Op::new(OpCode::Finish, &[OpRef(2)]);
-            op.fail_args = Some(smallvec![OpRef(2)]);
+            let mut op = Op::new(OpCode::Finish, &[OpRef::from_raw(2)]);
+            op.fail_args = Some(smallvec![OpRef::from_raw(2)]);
             op
         },
     ];

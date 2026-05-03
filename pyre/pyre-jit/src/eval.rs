@@ -6086,7 +6086,12 @@ mod tests {
 
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);
-            let local = OpRef(0);
+            let local = match symbolic_type {
+                Type::Int => OpRef::input_arg_int(0),
+                Type::Float => OpRef::input_arg_float(0),
+                Type::Ref => OpRef::input_arg_ref(0),
+                Type::Void => OpRef::from_raw(0),
+            };
             let frame_ref = ctx.const_ref(frame_ptr as i64);
             let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
             let mut sym = PyreSym::from_test_state(TestSymState {
@@ -6166,7 +6171,7 @@ mod tests {
         );
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let obj = OpRef(0);
+        let obj = OpRef::input_arg_ref(0);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
         let mut sym = PyreSym::from_test_state(TestSymState {
@@ -6233,7 +6238,7 @@ mod tests {
         );
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let int_obj = OpRef(0);
+        let int_obj = OpRef::input_arg_ref(0);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
         let mut sym = PyreSym::from_test_state(TestSymState {
@@ -6323,8 +6328,8 @@ mod tests {
 
         let run_case = |record_branch_guard: bool| {
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
-            let lower_stack = OpRef(0);
-            let truth = OpRef(1);
+            let lower_stack = OpRef::input_arg_ref(0);
+            let truth = OpRef::input_arg_int(1);
             let frame_ref = ctx.const_ref(frame_ptr as i64);
             let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
             let mut sym = PyreSym::from_test_state(TestSymState {
@@ -6412,7 +6417,7 @@ mod tests {
             assert!(
                 active_boxes.iter().any(|b| matches!(
                     b,
-                    SnapshotTagged::Box(li, _) if *li == lower_stack.0
+                    SnapshotTagged::Box(li, _) if *li == lower_stack.raw()
                 )),
                 "pre-pop snapshot must capture lower stack slot: {:?}",
                 active_boxes
@@ -6420,7 +6425,7 @@ mod tests {
             assert!(
                 active_boxes.iter().any(|b| matches!(
                     b,
-                    SnapshotTagged::Box(ti, _) if *ti == truth.0
+                    SnapshotTagged::Box(ti, _) if *ti == truth.raw()
                 )),
                 "pre-pop snapshot must capture truth slot: {:?}",
                 active_boxes
@@ -6467,8 +6472,8 @@ mod tests {
         );
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
-        let lower_stack = OpRef(0);
-        let truth = OpRef(1);
+        let lower_stack = OpRef::input_arg_ref(0);
+        let truth = OpRef::input_arg_int(1);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
         let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
         let mut sym = PyreSym::from_test_state(TestSymState {
@@ -6542,7 +6547,7 @@ mod tests {
         assert!(
             active_boxes.iter().any(|b| matches!(
                 b,
-                SnapshotTagged::Box(li, _) if *li == lower_stack.0
+                SnapshotTagged::Box(li, _) if *li == lower_stack.raw()
             )),
             "mixed-bank guard must capture lower stack slot: {:?}",
             active_boxes
@@ -6550,7 +6555,7 @@ mod tests {
         assert!(
             active_boxes.iter().any(|b| matches!(
                 b,
-                SnapshotTagged::Box(ti, _) if *ti == truth.0
+                SnapshotTagged::Box(ti, _) if *ti == truth.raw()
             )),
             "mixed-bank guard must capture truth slot: {:?}",
             active_boxes
@@ -6639,8 +6644,8 @@ mod tests {
         let frame_ptr = (&*frame) as *const PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
-        let key = OpRef(0);
-        let len = OpRef(1);
+        let key = OpRef::input_arg_int(0);
+        let len = OpRef::input_arg_int(1);
         let mut sym = PyreSym::from_test_state(single_local_test_state(
             &mut ctx,
             &frame,
@@ -6698,8 +6703,8 @@ mod tests {
         let frame_ptr = (&*frame) as *const PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
-        let value = OpRef(0);
-        let callable = OpRef(1);
+        let value = OpRef::input_arg_ref(0);
+        let callable = OpRef::input_arg_ref(1);
         let mut sym = PyreSym::from_test_state(single_local_test_state(
             &mut ctx,
             &frame,
@@ -6724,7 +6729,7 @@ mod tests {
         let mut saw_len_field = false;
         let mut saw_new = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::New {
@@ -6770,8 +6775,8 @@ mod tests {
         let frame_ptr = (&*frame) as *const PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
-        let list = OpRef(0);
-        let key = OpRef(1);
+        let list = OpRef::input_arg_ref(0);
+        let key = OpRef::input_arg_int(1);
         let mut sym = PyreSym::from_test_state(single_local_test_state(
             &mut ctx,
             &frame,
@@ -6791,7 +6796,7 @@ mod tests {
         let mut saw_raw_field = false;
         let mut saw_raw_array = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             match op.opcode {
@@ -6833,8 +6838,13 @@ mod tests {
             let frame_ptr = (&*frame) as *const PyFrame as usize;
 
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
-            let list = OpRef(0);
-            let value = OpRef(1);
+            let list = OpRef::input_arg_ref(0);
+            let value = match symbolic_value_type {
+                Type::Int => OpRef::input_arg_int(1),
+                Type::Float => OpRef::input_arg_float(1),
+                Type::Ref => OpRef::input_arg_ref(1),
+                Type::Void => OpRef::from_raw(1),
+            };
             let mut sym = PyreSym::from_test_state(single_local_test_state(
                 &mut ctx,
                 &frame,
@@ -6856,7 +6866,7 @@ mod tests {
             let mut saw_call = false;
             let mut saw_new = false;
             for pos in 2..(2 + recorder.num_ops() as u32) {
-                let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                     continue;
                 };
                 if matches!(
@@ -6941,7 +6951,7 @@ mod tests {
         let frame_ptr = (&*frame) as *const PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let iter = OpRef(0);
+        let iter = OpRef::input_arg_ref(0);
         let mut sym = PyreSym::from_test_state(single_local_test_state(
             &mut ctx,
             &frame,
@@ -6968,7 +6978,7 @@ mod tests {
         let mut saw_new = false;
         let mut saw_optional_guard = false;
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
                 continue;
             };
             match op.opcode {

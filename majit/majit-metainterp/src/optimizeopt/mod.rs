@@ -484,7 +484,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // optimizer.py:432: make_constant → Forwarded::Const terminal.
         // resume.py:204: isinstance(box, Const)
         if matches!(
-            self.ctx.forwarded.get(opref.0 as usize),
+            self.ctx.forwarded.get(opref.raw() as usize),
             Some(crate::optimizeopt::info::Forwarded::Const(_))
         ) {
             return true;
@@ -499,7 +499,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
         // optimizer.py:432: make_constant → Forwarded::Const — check first.
         if let Some(crate::optimizeopt::info::Forwarded::Const(val)) =
-            self.ctx.forwarded.get(opref.0 as usize)
+            self.ctx.forwarded.get(opref.raw() as usize)
         {
             let (raw, tp) = match val {
                 Value::Int(v) => (*v, majit_ir::Type::Int),
@@ -510,13 +510,17 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             let tp = self
                 .ctx
                 .constant_types_for_numbering
-                .get(&opref.0)
+                .get(&opref.raw())
                 .copied()
                 .unwrap_or(tp);
             return (raw, tp);
         }
         // RPython ConstPtr parity: check numbering type overrides first.
-        let type_override = self.ctx.constant_types_for_numbering.get(&opref.0).copied();
+        let type_override = self
+            .ctx
+            .constant_types_for_numbering
+            .get(&opref.raw())
+            .copied();
         match self.ctx.get_constant(opref) {
             Some(Value::Int(v)) => (*v, type_override.unwrap_or(majit_ir::Type::Int)),
             Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
@@ -556,7 +560,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // ops, prev-phase carry, inputarg types, transformed trace result
         // types) seeded in `Optimizer::make_ctx`. Removed in Slice 0.5
         // once writers feed Op.type_ exclusively.
-        if let Some(&tp) = self.ctx.value_types.get(&opref.0) {
+        if let Some(&tp) = self.ctx.value_types.get(&opref.raw()) {
             if tp != majit_ir::Type::Void {
                 return tp;
             }
@@ -1112,7 +1116,7 @@ impl OptContext {
             "register_value_type: Void has no box value (opref={:?})",
             opref,
         );
-        if let Some(&existing) = self.value_types.get(&opref.0) {
+        if let Some(&existing) = self.value_types.get(&opref.raw()) {
             debug_assert_eq!(
                 existing, tp,
                 "register_value_type: OpRef {:?} retyped from {:?} to {:?} \
@@ -1137,7 +1141,7 @@ impl OptContext {
                 producer.type_, tp, opref, producer.opcode,
             );
         }
-        self.value_types.insert(opref.0, tp);
+        self.value_types.insert(opref.raw(), tp);
     }
 
     pub fn new(estimated_ops: usize) -> Self {
@@ -1292,9 +1296,12 @@ impl OptContext {
         self.reserve_pos()
     }
 
-    /// Allocate a fresh OpRef in the constant namespace.
-    pub(crate) fn reserve_const_ref(&mut self) -> OpRef {
-        let opref = OpRef::from_const(self.next_const_idx);
+    /// Allocate a fresh OpRef in the constant namespace, tagged with the
+    /// constant's type so the variant matches RPython's
+    /// ConstInt/ConstFloat/ConstPtr split (history.py:220/261/307,
+    /// opencoder.py:321-333 `_untag` direct dispatch).
+    pub(crate) fn reserve_const_ref(&mut self, tp: Type) -> OpRef {
+        let opref = OpRef::const_typed(self.next_const_idx, tp);
         self.next_const_idx += 1;
         opref
     }
@@ -1439,7 +1446,7 @@ impl OptContext {
         if resolved.is_constant() {
             return;
         }
-        let idx = resolved.0 as usize;
+        let idx = resolved.raw() as usize;
         if let Some(Forwarded::Info(PtrInfo::Str(si))) = self.forwarded.get_mut(idx) {
             si.lgtop = Some(lgtop);
         }
@@ -1454,7 +1461,7 @@ impl OptContext {
         if resolved.is_constant() {
             return None;
         }
-        let idx = resolved.0 as usize;
+        let idx = resolved.raw() as usize;
         if let Some(Forwarded::Info(PtrInfo::Str(si))) = self.forwarded.get_mut(idx) {
             // vstring.py:65-70
             if si.lenbound.is_none() {
@@ -1486,11 +1493,11 @@ impl OptContext {
             self.next_pos += 1;
         }
         debug_assert!(
-            !OpRef(self.next_pos).is_constant(),
+            !OpRef::from_raw(self.next_pos).is_constant(),
             "reserve_pos overflowed into constant namespace: {}",
             self.next_pos
         );
-        let pos_ref = OpRef(self.next_pos);
+        let pos_ref = OpRef::from_raw(self.next_pos);
         self.next_pos += 1;
         pos_ref
     }
@@ -1550,7 +1557,7 @@ impl OptContext {
                  live in a disjoint range [p2_high_water..) (Commit D1).",
                 op.pos,
             );
-            self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
         }
         let pos_ref = op.pos;
         // RPython parity: emit() does NOT clear forwarding.
@@ -1620,7 +1627,7 @@ impl OptContext {
         if op.pos.is_none() {
             op.pos = self.reserve_pos();
         } else {
-            self.next_pos = self.next_pos.max(op.pos.0.saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
         }
         let pos_ref = op.pos;
         // Slice 0.5: queued ops carry their intrinsic `op.type_` (Slice
@@ -1998,7 +2005,7 @@ impl OptContext {
             // imported replay uses a distinct `resolved` OpRef, so preserve
             // the replay result type on first force when the import path did
             // not already seed `value_types` (e.g. focused unit fixtures).
-            self.value_types.entry(result.0).or_insert(result_type);
+            self.value_types.entry(result.raw()).or_insert(result_type);
             // unroll.py:34-37: potential_extra_ops[op] = preamble_op
             if !is_constant {
                 // unroll.py:35-36: invented_name → get_box_replacement(op)
@@ -2084,7 +2091,7 @@ impl OptContext {
         }
         let snapshot_forwarded = |ctx: &Self, arg: OpRef| -> Option<ForwardedInfo> {
             let replaced = ctx.get_box_replacement(arg);
-            let idx = replaced.0 as usize;
+            let idx = replaced.raw() as usize;
             if idx >= ctx.forwarded.len() {
                 return None;
             }
@@ -2107,7 +2114,7 @@ impl OptContext {
         // OpRefs, matching RPython where ConstInt/ConstPtr are created inline.
         let mut arg_guards = Vec::new();
         let mut alloc_const = |value: Value| -> OpRef {
-            let pos = self.reserve_const_ref();
+            let pos = self.reserve_const_ref(value.get_type());
             self.seed_constant(pos, value);
             pos
         };
@@ -2347,7 +2354,7 @@ impl OptContext {
     /// unroll.py:49: item.set_forwarded(None)
     fn clear_forwarded(&mut self, opref: OpRef) {
         use crate::optimizeopt::info::Forwarded;
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         if idx < self.forwarded.len() {
             self.forwarded[idx] = Forwarded::None;
         }
@@ -2418,7 +2425,7 @@ impl OptContext {
                 let mut loop_constants: HashMap<u32, i64> = self
                     .const_pool
                     .iter()
-                    .map(|(&i, val)| (OpRef::from_const(i).0, value_to_raw(val)))
+                    .map(|(&i, val)| (OpRef::from_const(i).raw(), value_to_raw(val)))
                     .collect();
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
@@ -2441,7 +2448,7 @@ impl OptContext {
                 let mut loop_constant_types = self.constant_types_for_numbering.clone();
                 for (&i, val) in &self.const_pool {
                     loop_constant_types
-                        .entry(OpRef::from_const(i).0)
+                        .entry(OpRef::from_const(i).raw())
                         .or_insert(value_to_type(val));
                 }
                 for (idx, slot) in self.constants.iter().enumerate() {
@@ -2524,7 +2531,7 @@ impl OptContext {
             }
         }
         use crate::optimizeopt::info::Forwarded;
-        let idx = old.0 as usize;
+        let idx = old.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -2577,7 +2584,7 @@ impl OptContext {
     pub fn get_box_replacement(&self, mut opref: OpRef) -> OpRef {
         use crate::optimizeopt::info::Forwarded;
         loop {
-            let idx = opref.0 as usize;
+            let idx = opref.raw() as usize;
             if idx >= self.forwarded.len() {
                 return opref;
             }
@@ -2591,7 +2598,7 @@ impl OptContext {
     /// resoperation.py: op.get_forwarded() is not None — check if OpRef
     /// has any forwarding entry (Op, Info, IntBound, Const).
     pub fn has_forwarding(&self, opref: OpRef) -> bool {
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         if idx >= self.forwarded.len() {
             return false;
         }
@@ -2604,7 +2611,7 @@ impl OptContext {
     /// True only when opref has a positional redirect (Forwarded::Op).
     /// Info/Const/IntBound are terminal metadata, not import_state redirects.
     pub fn has_op_forwarding(&self, opref: OpRef) -> bool {
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         if idx >= self.forwarded.len() {
             return false;
         }
@@ -2640,7 +2647,7 @@ impl OptContext {
             }
             self.const_pool.insert(opref.const_index(), value);
         } else {
-            let idx = opref.0 as usize;
+            let idx = opref.raw() as usize;
             if idx >= self.constants.len() {
                 self.constants.resize(idx + 1, None);
             }
@@ -2688,7 +2695,7 @@ impl OptContext {
         if replaced.is_constant() {
             return None;
         }
-        let idx = replaced.0 as usize;
+        let idx = replaced.raw() as usize;
         if idx < self.forwarded.len() {
             if let Forwarded::IntBound(b) = &self.forwarded[idx] {
                 return Some(b.clone());
@@ -2723,7 +2730,7 @@ impl OptContext {
         if replaced.is_constant() {
             return crate::optimizeopt::intutils::IntBound::unbounded();
         }
-        let idx = replaced.0 as usize;
+        let idx = replaced.raw() as usize;
         if idx < self.forwarded.len() {
             match &self.forwarded[idx] {
                 // optimizer.py:106-107: isinstance(fw, IntBound) → return fw
@@ -2765,7 +2772,7 @@ impl OptContext {
         if replaced.is_constant() || self.get_constant(replaced).is_some() {
             return;
         }
-        let idx = replaced.0 as usize;
+        let idx = replaced.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -2825,7 +2832,7 @@ impl OptContext {
             let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
             return f(&mut tmp);
         }
-        let idx = replaced.0 as usize;
+        let idx = replaced.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -2859,7 +2866,7 @@ impl OptContext {
         // IntBound and the constant is Int, validate contains() + make_eq_const().
         // RPython checks ONE authoritative source: box._forwarded.
         if let Value::Int(intval) = value {
-            let ridx = replaced.0 as usize;
+            let ridx = replaced.raw() as usize;
             if ridx < self.forwarded.len() {
                 if let Forwarded::IntBound(bound) = &mut self.forwarded[ridx] {
                     if !bound.contains(intval as i64) {
@@ -2875,7 +2882,7 @@ impl OptContext {
         // optimizer.py:427: if box.is_constant(): return
         if replaced.is_constant()
             || matches!(
-                self.forwarded.get(replaced.0 as usize),
+                self.forwarded.get(replaced.raw() as usize),
                 Some(Forwarded::Const(_))
             )
         {
@@ -2888,7 +2895,7 @@ impl OptContext {
             self.copy_fields_to_const(replaced, gcref);
         }
         // Store in constants array for get_constant() callers.
-        let idx = replaced.0 as usize;
+        let idx = replaced.raw() as usize;
         if idx >= self.constants.len() {
             self.constants.resize(idx + 1, None);
         }
@@ -2928,7 +2935,7 @@ impl OptContext {
         use crate::optimizeopt::info::{
             ArrayPtrInfo, FieldEntry, Forwarded, PtrInfo, StructPtrInfo,
         };
-        let Some(Forwarded::Info(info)) = self.forwarded.get(source.0 as usize) else {
+        let Some(Forwarded::Info(info)) = self.forwarded.get(source.raw() as usize) else {
             return;
         };
         let key = gcref.as_usize();
@@ -3049,7 +3056,7 @@ impl OptContext {
     /// override, PtrInfo::Constant, and constant pool.
     /// Returns None if opref is not a constant.
     pub fn getconst(&self, opref: OpRef) -> Option<(i64, majit_ir::Type)> {
-        let type_override = self.constant_types_for_numbering.get(&opref.0).copied();
+        let type_override = self.constant_types_for_numbering.get(&opref.raw()).copied();
         // Check constant pool (through replacement chain).
         if let Some(val) = self.get_constant(opref) {
             let (raw, tp) = match val {
@@ -3063,7 +3070,7 @@ impl OptContext {
         // Check raw constants (before replacement).
         if let Some(val) = self
             .constants
-            .get(opref.0 as usize)
+            .get(opref.raw() as usize)
             .and_then(|v| v.as_ref())
         {
             let (raw, tp) = match val {
@@ -3089,11 +3096,11 @@ impl OptContext {
         }
         // Check Forwarded::Const first (constant-folded operations)
         if let Some(crate::optimizeopt::info::Forwarded::Const(val)) =
-            self.forwarded.get(opref.0 as usize)
+            self.forwarded.get(opref.raw() as usize)
         {
             return Some(val);
         }
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         self.constants.get(idx).and_then(|v| v.as_ref())
     }
 
@@ -3569,7 +3576,7 @@ impl OptContext {
                     return majit_ir::Type::Ref;
                 }
                 livebox_types
-                    .get(&opref.0)
+                    .get(&opref.raw())
                     .copied()
                     .unwrap_or(majit_ir::Type::Ref)
             })
@@ -3675,19 +3682,19 @@ impl OptContext {
     /// out early when the input is already a constant OpRef
     /// (`is_constant()` true), which would silently drop the new entry.
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
-        let pos = self.reserve_const_ref();
+        let pos = self.reserve_const_ref(Type::Int);
         self.seed_constant(pos, Value::Int(value));
         pos
     }
 
     pub fn make_constant_ref(&mut self, value: GcRef) -> OpRef {
-        let pos = self.reserve_const_ref();
+        let pos = self.reserve_const_ref(Type::Ref);
         self.seed_constant(pos, Value::Ref(value));
         pos
     }
 
     pub fn make_constant_float(&mut self, value: f64) -> OpRef {
-        let pos = self.reserve_const_ref();
+        let pos = self.reserve_const_ref(Type::Float);
         self.seed_constant(pos, Value::Float(value));
         pos
     }
@@ -3911,7 +3918,7 @@ impl OptContext {
     pub fn get_ptr_info(&self, opref: OpRef) -> Option<&PtrInfo> {
         use crate::optimizeopt::info::Forwarded;
         let r = self.get_box_replacement(opref);
-        match self.forwarded.get(r.0 as usize)? {
+        match self.forwarded.get(r.raw() as usize)? {
             Forwarded::Info(info) => Some(info),
             _ => None,
         }
@@ -3960,7 +3967,7 @@ impl OptContext {
             // entry it must agree with the intrinsic. Disagreement = bug
             // the side-table has been masking; surface during dev.
             #[cfg(debug_assertions)]
-            if let Some(&table_tp) = self.value_types.get(&resolved.0) {
+            if let Some(&table_tp) = self.value_types.get(&resolved.raw()) {
                 debug_assert_eq!(
                     tp, table_tp,
                     "opref_type: Op.type_ ({:?}) disagrees with \
@@ -3975,7 +3982,7 @@ impl OptContext {
         //    by passes that synthesize an aliased OpRef). Removed in
         //    Slice 0.5 once all writers route through Op intrinsics or
         //    the dedicated `inputarg_types` source below.
-        if let Some(&tp) = self.value_types.get(&resolved.0) {
+        if let Some(&tp) = self.value_types.get(&resolved.raw()) {
             return Some(tp);
         }
         // 4. Inputarg slot (recorder-side `InputArg{Int,Ref,Float}.tp`,
@@ -4018,7 +4025,7 @@ impl OptContext {
         if opref.is_none() || opref.is_constant() {
             return None;
         }
-        let raw = opref.0;
+        let raw = opref.raw();
         let ni = self.num_inputs as usize;
         let idx = if raw >= self.inputarg_base && (raw - self.inputarg_base) < self.num_inputs {
             (raw - self.inputarg_base) as usize
@@ -4063,6 +4070,63 @@ impl OptContext {
                 self.get_box_replacement(opref),
             )
         })
+    }
+
+    /// Transitional: classify an [`OpRef`] into the [`AbstractValue`]
+    /// variant that matches its RPython class.
+    ///
+    /// RPython's `AbstractValue` carries `type` and class identity
+    /// (Const/InputArg/ResOp + i/r/f) intrinsically on the Python
+    /// object. In pyre, [`OpRef`] is a numeric handle and the type
+    /// information lives in side tables (constant pool, `value_types`,
+    /// `get_op_result_type`); this method composes those into the
+    /// canonical [`AbstractValue`] shape so callers can match on
+    /// RPython class identity directly.
+    ///
+    /// Phase 1 of the OpRef → AbstractValue migration ships this as a
+    /// non-breaking addition. Subsequent phases migrate construction
+    /// sites to thread typed values through the call graph; the final
+    /// phase replaces the [`OpRef`] tuple struct with an enum that IS
+    /// [`AbstractValue`], at which point this method becomes
+    /// unnecessary.
+    ///
+    /// Returns [`AbstractValue::None`] for [`OpRef::NONE`] and for
+    /// OpRefs whose type cannot be resolved (a bookkeeping bug, but
+    /// here treated as "unknown" rather than panicking — strict
+    /// `expect()` callers should consult `opref_type` directly first).
+    pub fn abstract_value(&self, opref: OpRef) -> majit_ir::AbstractValue {
+        use majit_ir::{AbstractValue, Type};
+        if opref.is_none() {
+            return AbstractValue::None;
+        }
+        let resolved = self.get_box_replacement(opref);
+        // Const family: constant-namespace OpRefs.
+        if resolved.is_constant() {
+            let idx = resolved.const_index();
+            return match self.get_constant(resolved).map(|v| v.get_type()) {
+                Some(Type::Int) => AbstractValue::ConstInt(idx),
+                Some(Type::Float) => AbstractValue::ConstFloat(idx),
+                Some(Type::Ref) => AbstractValue::ConstPtr(idx),
+                _ => AbstractValue::None,
+            };
+        }
+        let raw = resolved.raw();
+        let ty = self.opref_type(resolved);
+        // resoperation.py:719 AbstractInputArg parity: positions in the
+        // [inputarg_base, inputarg_base + num_inputs) range are
+        // InputArg{Int,Float,Ref}; everything else is an emitted
+        // AbstractResOp result.
+        let is_input_arg =
+            raw >= self.inputarg_base && raw < self.inputarg_base.saturating_add(self.num_inputs);
+        match (ty, is_input_arg) {
+            (Some(Type::Int), true) => AbstractValue::InputArgInt(raw),
+            (Some(Type::Float), true) => AbstractValue::InputArgFloat(raw),
+            (Some(Type::Ref), true) => AbstractValue::InputArgRef(raw),
+            (Some(Type::Int), false) => AbstractValue::IntOp(raw),
+            (Some(Type::Float), false) => AbstractValue::FloatOp(raw),
+            (Some(Type::Ref), false) => AbstractValue::RefOp(raw),
+            _ => AbstractValue::None,
+        }
     }
 
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
@@ -4113,8 +4177,10 @@ impl OptContext {
         // The `Type::Ref` override is majit's raw-pointer marker on the
         // 'i'-typed constant pool entry — see opref_type docs.
         if let Some(Value::Int(bits)) = self.get_constant(resolved) {
-            if let Some(majit_ir::Type::Ref) =
-                self.constant_types_for_numbering.get(&resolved.0).copied()
+            if let Some(majit_ir::Type::Ref) = self
+                .constant_types_for_numbering
+                .get(&resolved.raw())
+                .copied()
             {
                 return Some(std::borrow::Cow::Owned(PtrInfo::Constant(majit_ir::GcRef(
                     *bits as usize,
@@ -4279,7 +4345,7 @@ impl OptContext {
     pub fn get_ptr_info_mut(&mut self, opref: OpRef) -> Option<&mut PtrInfo> {
         use crate::optimizeopt::info::Forwarded;
         let r = self.get_box_replacement(opref);
-        match self.forwarded.get_mut(r.0 as usize)? {
+        match self.forwarded.get_mut(r.raw() as usize)? {
             Forwarded::Info(info) => Some(info),
             _ => None,
         }
@@ -4293,7 +4359,7 @@ impl OptContext {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -4313,7 +4379,7 @@ impl OptContext {
         if terminal.is_constant() {
             return;
         }
-        let idx = terminal.0 as usize;
+        let idx = terminal.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -4696,7 +4762,7 @@ impl OptContext {
             // optimizer.py:469: return opinfo. The immutable borrow above
             // ends at the `if let` brace, freeing `self.forwarded[idx]`
             // for the mutable re-borrow below.
-            let idx = arg0.0 as usize;
+            let idx = arg0.raw() as usize;
             let info = match &mut self.forwarded[idx] {
                 Forwarded::Info(info) => info,
                 other => unreachable!(
@@ -4818,7 +4884,7 @@ impl OptContext {
         // optimizer.py:497: opinfo.last_guard_pos = last_guard_pos
         new_info.set_last_guard_pos(last_guard_pos);
         // optimizer.py:498: arg0.set_forwarded(opinfo)
-        let idx = arg0.0 as usize;
+        let idx = arg0.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -4874,7 +4940,7 @@ impl OptContext {
     pub fn take_ptr_info(&mut self, opref: OpRef) -> Option<PtrInfo> {
         use crate::optimizeopt::info::Forwarded;
         let r = self.get_box_replacement(opref);
-        let slot = self.forwarded.get_mut(r.0 as usize)?;
+        let slot = self.forwarded.get_mut(r.raw() as usize)?;
         match slot {
             Forwarded::Info(_) => {
                 let old = std::mem::replace(slot, Forwarded::None);
@@ -4892,7 +4958,7 @@ impl OptContext {
             return;
         }
         use crate::optimizeopt::info::Forwarded;
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -4910,7 +4976,7 @@ impl OptContext {
     /// Check if an opref has been replaced (forwarded).
     pub fn is_replaced(&self, opref: OpRef) -> bool {
         use crate::optimizeopt::info::Forwarded;
-        let idx = opref.0 as usize;
+        let idx = opref.raw() as usize;
         if idx < self.forwarded.len() {
             matches!(self.forwarded[idx], Forwarded::Op(_))
         } else {
@@ -5135,7 +5201,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_returns_constant_for_value_ref() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_000);
+        let opref = OpRef::from_raw(10_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         match ctx.getptrinfo(opref) {
             Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0xdead_beef),
@@ -5150,9 +5216,10 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_returns_constant_for_int_with_ref_override() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_001);
+        let opref = OpRef::from_raw(10_001);
         ctx.seed_constant(opref, Value::Int(0x1234_5678));
-        ctx.constant_types_for_numbering.insert(opref.0, Type::Ref);
+        ctx.constant_types_for_numbering
+            .insert(opref.raw(), Type::Ref);
         match ctx.getptrinfo(opref) {
             Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0x1234_5678),
             other => panic!("expected ConstPtrInfo(0x12345678), got {other:?}"),
@@ -5166,7 +5233,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_skips_int_without_ref_override() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_002);
+        let opref = OpRef::from_raw(10_002);
         ctx.seed_constant(opref, Value::Int(42));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.getptrinfo(opref).is_none());
@@ -5186,9 +5253,10 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_null_int_constant_with_ref_override_is_constant_null() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_003);
+        let opref = OpRef::from_raw(10_003);
         ctx.seed_constant(opref, Value::Int(0));
-        ctx.constant_types_for_numbering.insert(opref.0, Type::Ref);
+        ctx.constant_types_for_numbering
+            .insert(opref.raw(), Type::Ref);
         match ctx.getptrinfo(opref) {
             Some(Cow::Owned(PtrInfo::Constant(g))) => assert_eq!(g.0, 0),
             other => panic!("expected ConstPtrInfo(NULL), got {other:?}"),
@@ -5205,7 +5273,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn getptrinfo_int_zero_without_ref_override_is_none() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_009);
+        let opref = OpRef::from_raw(10_009);
         ctx.seed_constant(opref, Value::Int(0));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.getptrinfo(opref).is_none());
@@ -5219,7 +5287,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn const_info_mut_returns_same_slot_for_value_ref() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_004);
+        let opref = OpRef::from_raw(10_004);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xa5a5_a5a5)));
         // First lookup: install Instance via the Vacant entry path,
         // then mark a known class so the second lookup observes it.
@@ -5251,12 +5319,13 @@ mod constant_ptr_info_tests {
     #[test]
     fn const_info_mut_shares_slot_between_ref_and_tagged_int() {
         let mut ctx = OptContext::new(0);
-        let ref_op = OpRef(10_005);
-        let int_op = OpRef(10_006);
+        let ref_op = OpRef::from_raw(10_005);
+        let int_op = OpRef::from_raw(10_006);
         let addr: usize = 0xfeed_face;
         ctx.seed_constant(ref_op, Value::Ref(GcRef(addr)));
         ctx.seed_constant(int_op, Value::Int(addr as i64));
-        ctx.constant_types_for_numbering.insert(int_op.0, Type::Ref);
+        ctx.constant_types_for_numbering
+            .insert(int_op.raw(), Type::Ref);
 
         // Mutate via the Ref-typed constant.
         {
@@ -5291,7 +5360,7 @@ mod constant_ptr_info_tests {
     fn const_info_mut_raises_on_null_value_ref_constant() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = OptContext::new(0);
-            let ref_null = OpRef(10_007);
+            let ref_null = OpRef::from_raw(10_007);
             ctx.seed_constant(ref_null, Value::Ref(GcRef(0)));
             let _ = ctx.get_const_info_mut(ref_null, None);
         }));
@@ -5309,10 +5378,10 @@ mod constant_ptr_info_tests {
     fn const_info_mut_raises_on_null_typed_int_constant() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = OptContext::new(0);
-            let int_null = OpRef(10_008);
+            let int_null = OpRef::from_raw(10_008);
             ctx.seed_constant(int_null, Value::Int(0));
             ctx.constant_types_for_numbering
-                .insert(int_null.0, Type::Ref);
+                .insert(int_null.raw(), Type::Ref);
             let _ = ctx.get_const_info_mut(int_null, None);
         }));
         let err = result.expect_err("expected InvalidLoop panic");
@@ -5329,7 +5398,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn const_info_mut_returns_none_for_plain_int_zero() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_010);
+        let opref = OpRef::from_raw(10_010);
         ctx.seed_constant(opref, Value::Int(0));
         // No constant_types_for_numbering entry → no Ref override.
         assert!(ctx.get_const_info_mut(opref, None).is_none());
@@ -5342,8 +5411,8 @@ mod constant_ptr_info_tests {
     #[test]
     fn is_raw_ptr_accepts_virtual_raw_slice() {
         let mut ctx = OptContext::new(0);
-        let parent = OpRef(10_010);
-        let slice = OpRef(10_011);
+        let parent = OpRef::from_raw(10_010);
+        let slice = OpRef::from_raw(10_011);
 
         ctx.set_ptr_info(
             parent,
@@ -5379,7 +5448,7 @@ mod constant_ptr_info_tests {
     #[test]
     fn make_nonnull_str_initializes_ptr_variant() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(10_012);
+        let opref = OpRef::from_raw(10_012);
 
         ctx.make_nonnull_str(opref, 0);
 
@@ -5488,8 +5557,8 @@ mod ensure_ptr_info_arg0_tests {
 
     fn field_op_with_parent(parent: DescrRef) -> Op {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], descr);
-        op.pos = OpRef(1);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], descr);
+        op.pos = OpRef::from_raw(1);
         op
     }
 
@@ -5498,8 +5567,8 @@ mod ensure_ptr_info_arg0_tests {
             index: 7,
             is_object: false,
         });
-        let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef(0)], descr);
-        op.pos = OpRef(1);
+        let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::from_raw(0)], descr);
+        op.pos = OpRef::from_raw(1);
         op
     }
 
@@ -5508,7 +5577,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_ref() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0xdead_beef)));
+        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xdead_beef)));
         let op = field_op_with_parent(struct_parent_descr());
         let info = ctx.ensure_ptr_info_arg0(&op);
         match info {
@@ -5525,7 +5594,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_int() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.seed_constant(OpRef(0), Value::Int(1));
+        ctx.seed_constant(OpRef::from_raw(0), Value::Int(1));
         let op = field_op_with_parent(struct_parent_descr());
         let info = ctx.ensure_ptr_info_arg0(&op);
         assert!(matches!(info, EnsuredPtrInfo::Constant { .. }));
@@ -5539,7 +5608,7 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_constant_string_returns_exact_length_via_resolver() {
         use std::sync::Arc;
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0xC0FE)));
+        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xC0FE)));
         // Resolver pretends every constant has byte-string length 5 in
         // mode_string and unicode length 7 in mode_unicode.
         ctx.string_length_resolver = Some(Arc::new(|gcref: GcRef, mode: u8| {
@@ -5555,8 +5624,8 @@ mod ensure_ptr_info_arg0_tests {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef(0)], descr);
-            op.pos = OpRef(1);
+            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::from_raw(0)], descr);
+            op.pos = OpRef::from_raw(1);
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -5578,14 +5647,14 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_constant_string_falls_back_to_nonnegative_without_resolver() {
         use std::sync::Arc;
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0x1234)));
+        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0x1234)));
         let op = {
             let descr: DescrRef = Arc::new(TestSizeDescr {
                 index: 1,
                 is_object: false,
             });
-            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef(0)], descr);
-            op.pos = OpRef(1);
+            let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::from_raw(0)], descr);
+            op.pos = OpRef::from_raw(1);
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -5653,7 +5722,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_constant_arraylen_returns_nonnegative() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.seed_constant(OpRef(0), Value::Ref(GcRef(0xfeed)));
+        ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xfeed)));
         let op = array_op();
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let bound = info
@@ -5704,7 +5773,7 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_upgrades_nonnull_to_struct() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
         // Pre-install a NonNullPtrInfo with a specific last_guard_pos.
-        ctx.set_ptr_info(OpRef(0), PtrInfo::NonNull { last_guard_pos: 7 });
+        ctx.set_ptr_info(OpRef::from_raw(0), PtrInfo::NonNull { last_guard_pos: 7 });
         let _parent = struct_parent_descr();
         let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -5725,7 +5794,7 @@ mod ensure_ptr_info_arg0_tests {
     fn ensure_ptr_info_arg0_does_not_overwrite_existing_instance() {
         let mut ctx = OptContext::with_num_inputs(4, 1);
         ctx.set_ptr_info(
-            OpRef(0),
+            OpRef::from_raw(0),
             PtrInfo::instance(Some(instance_parent_descr()), Some(GcRef(0xc0de))),
         );
         let op = field_op_with_parent(struct_parent_descr());
@@ -5853,7 +5922,7 @@ mod intbound_invariant_tests {
     #[should_panic]
     fn getintbound_rejects_non_int_boxes() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(20_000);
+        let opref = OpRef::from_raw(20_000);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xdead_beef)));
         let _ = ctx.getintbound(opref);
     }
@@ -5862,7 +5931,7 @@ mod intbound_invariant_tests {
     #[should_panic]
     fn setintbound_rejects_non_int_boxes() {
         let mut ctx = OptContext::new(0);
-        let opref = OpRef(20_001);
+        let opref = OpRef::from_raw(20_001);
         ctx.seed_constant(opref, Value::Ref(GcRef(0xcafe_babe)));
         ctx.setintbound(opref, &IntBound::nonnegative());
     }
@@ -5877,30 +5946,33 @@ mod imported_short_preamble_fallback_tests {
     fn force_op_from_preamble_replays_pop_without_builder_lookup() {
         let mut ctx = OptContext::with_num_inputs(16, 2);
         ctx.initialize_imported_short_preamble_builder(
-            &[OpRef(0), OpRef(1)],
-            &[OpRef(7), OpRef(8)],
+            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::from_raw(7), OpRef::from_raw(8)],
             &[],
         );
 
-        let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef(7), OpRef(8)]);
-        replay_op.pos = OpRef(14);
+        let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(7), OpRef::from_raw(8)]);
+        replay_op.pos = OpRef::from_raw(14);
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef(14),
-            resolved: OpRef(41),
+            op: OpRef::from_raw(14),
+            resolved: OpRef::from_raw(41),
             invented_name: false,
             preamble_op: replay_op,
         };
 
         let forced = ctx.force_op_from_preamble_op(&pop);
-        assert_eq!(forced, OpRef(41));
+        assert_eq!(forced, OpRef::from_raw(41));
 
         let sp = ctx
             .build_imported_short_preamble()
             .expect("imported short preamble builder should exist");
         assert_eq!(sp.ops.len(), 1);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
-        assert_eq!(sp.ops[0].op.args.as_slice(), &[OpRef(7), OpRef(8)]);
-        assert_eq!(sp.ops[0].op.pos, OpRef(14));
+        assert_eq!(
+            sp.ops[0].op.args.as_slice(),
+            &[OpRef::from_raw(7), OpRef::from_raw(8)]
+        );
+        assert_eq!(sp.ops[0].op.pos, OpRef::from_raw(14));
     }
 }
 
@@ -5949,8 +6021,8 @@ mod opt_box_env_tests {
     #[test]
     fn opt_box_env_is_virtual_ref_follows_box_replacement() {
         let mut ctx = OptContext::with_num_inputs(16, 0);
-        let source = OpRef(12);
-        let target = OpRef(21);
+        let source = OpRef::from_raw(12);
+        let target = OpRef::from_raw(21);
         ctx.replace_op(source, target);
         ctx.set_ptr_info(
             target,

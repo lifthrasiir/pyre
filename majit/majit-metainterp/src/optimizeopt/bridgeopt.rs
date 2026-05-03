@@ -84,38 +84,38 @@ impl BridgeKnowledge {
         //          num_classes, (opref, class_ptr)*, num_bounds, (opref, lo, hi)*]
         buf.extend_from_slice(&(self.known_constants.len() as u32).to_le_bytes());
         for (&opref, &value) in &self.known_constants {
-            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&opref.raw().to_le_bytes());
             buf.extend_from_slice(&value.to_le_bytes());
         }
         buf.extend_from_slice(&(self.known_nonnull.len() as u32).to_le_bytes());
         for opref in &self.known_nonnull {
-            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&opref.raw().to_le_bytes());
         }
         buf.extend_from_slice(&(self.known_classes.len() as u32).to_le_bytes());
         for (&opref, &class) in &self.known_classes {
-            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&opref.raw().to_le_bytes());
             buf.extend_from_slice(&(class.0 as u64).to_le_bytes());
         }
         buf.extend_from_slice(&(self.known_bounds.len() as u32).to_le_bytes());
         for (&opref, &(lo, hi)) in &self.known_bounds {
-            buf.extend_from_slice(&opref.0.to_le_bytes());
+            buf.extend_from_slice(&opref.raw().to_le_bytes());
             buf.extend_from_slice(&lo.to_le_bytes());
             buf.extend_from_slice(&hi.to_le_bytes());
         }
         // Serialize known_fields
         buf.extend_from_slice(&(self.known_fields.len() as u32).to_le_bytes());
         for (&(obj, field_idx), &value) in &self.known_fields {
-            buf.extend_from_slice(&obj.0.to_le_bytes());
+            buf.extend_from_slice(&obj.raw().to_le_bytes());
             buf.extend_from_slice(&field_idx.to_le_bytes());
-            buf.extend_from_slice(&value.0.to_le_bytes());
+            buf.extend_from_slice(&value.raw().to_le_bytes());
         }
         // Serialize known_arrayitems
         buf.extend_from_slice(&(self.known_arrayitems.len() as u32).to_le_bytes());
         for (&(array, index, descr_idx), &value) in &self.known_arrayitems {
-            buf.extend_from_slice(&array.0.to_le_bytes());
+            buf.extend_from_slice(&array.raw().to_le_bytes());
             buf.extend_from_slice(&index.to_le_bytes());
             buf.extend_from_slice(&descr_idx.to_le_bytes());
-            buf.extend_from_slice(&value.0.to_le_bytes());
+            buf.extend_from_slice(&value.raw().to_le_bytes());
         }
         buf
     }
@@ -135,7 +135,7 @@ impl BridgeKnowledge {
             if pos + 12 > buf.len() {
                 return None;
             }
-            let opref = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
             pos += 4;
             let value = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
             pos += 8;
@@ -151,7 +151,7 @@ impl BridgeKnowledge {
             if pos + 4 > buf.len() {
                 return None;
             }
-            let opref = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
             pos += 4;
             k.known_nonnull.push(opref);
         }
@@ -165,7 +165,7 @@ impl BridgeKnowledge {
             if pos + 12 > buf.len() {
                 return None;
             }
-            let opref = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
             pos += 4;
             let class_val = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
             pos += 8;
@@ -181,7 +181,7 @@ impl BridgeKnowledge {
             if pos + 20 > buf.len() {
                 return None;
             }
-            let opref = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
             pos += 4;
             let lo = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
             pos += 8;
@@ -198,11 +198,11 @@ impl BridgeKnowledge {
                 if pos + 12 > buf.len() {
                     break;
                 }
-                let obj = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+                let obj = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
                 pos += 4;
                 let field_idx = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
                 pos += 4;
-                let value = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+                let value = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
                 pos += 4;
                 k.known_fields.insert((obj, field_idx), value);
             }
@@ -216,13 +216,13 @@ impl BridgeKnowledge {
                 if pos + 20 > buf.len() {
                     break;
                 }
-                let array = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+                let array = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
                 pos += 4;
                 let index = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
                 pos += 8;
                 let descr_idx = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
                 pos += 4;
-                let value = OpRef(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
+                let value = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
                 pos += 4;
                 k.known_arrayitems.insert((array, index, descr_idx), value);
             }
@@ -467,7 +467,7 @@ pub fn tag_box(opref: OpRef, liveboxes: &[OpRef]) -> u16 {
         ((pos as u16) << 2) | (TAGBOX as u16)
     } else {
         // Assume constant — encode as TAGINT with the raw value
-        ((opref.0 as u16) << 2) | (TAGINT as u16)
+        ((opref.raw() as u16) << 2) | (TAGINT as u16)
     }
 }
 
@@ -478,7 +478,7 @@ pub fn decode_box(tagged: u16, liveboxes: &[OpRef]) -> OpRef {
     let num = (tagged >> 2) as usize;
     match tag {
         TAGBOX => liveboxes.get(num).copied().unwrap_or(OpRef::NONE),
-        TAGINT => OpRef(num as u32),
+        TAGINT => OpRef::from_raw(num as u32),
         TAGCONST => OpRef::NONE, // constant pool lookup needed
         _ => OpRef::NONE,
     }
@@ -491,16 +491,16 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
         }
     }
 
     #[test]
     fn test_bridgeopt_removes_guard_nonnull_with_knowledge() {
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_nonnull.push(OpRef(100));
+        knowledge.known_nonnull.push(OpRef::from_raw(100));
 
-        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef(100)])];
+        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -519,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_bridgeopt_keeps_guard_nonnull_without_knowledge() {
-        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef(100)])];
+        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -542,9 +542,14 @@ mod tests {
     #[test]
     fn test_bridgeopt_removes_guard_class_with_knowledge() {
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_classes.insert(OpRef(100), GcRef::NULL);
+        knowledge
+            .known_classes
+            .insert(OpRef::from_raw(100), GcRef::NULL);
 
-        let mut ops = vec![Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(200)])];
+        let mut ops = vec![Op::new(
+            OpCode::GuardClass,
+            &[OpRef::from_raw(100), OpRef::from_raw(200)],
+        )];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -565,15 +570,15 @@ mod tests {
 
     #[test]
     fn test_bounds_guard_elimination_int_lt() {
-        // known_bounds for OpRef(100) = (0, 50), constant 100
-        // v0 = IntLt(OpRef(100), const_200), GuardTrue(v0)
+        // known_bounds for OpRef::from_raw(100) = (0, 50), constant 100
+        // v0 = IntLt(OpRef::from_raw(100), const_200), GuardTrue(v0)
         // Since 50 < 100, the guard is always true → remove.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (0, 50));
+        knowledge.known_bounds.insert(OpRef::from_raw(100), (0, 50));
 
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(200)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -590,14 +595,16 @@ mod tests {
 
     #[test]
     fn test_bounds_guard_not_eliminated_int_lt() {
-        // known_bounds for OpRef(100) = (0, 200), constant 100
+        // known_bounds for OpRef::from_raw(100) = (0, 200), constant 100
         // Since 200 >= 100, cannot prove IntLt always true → keep guard.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (0, 200));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(100), (0, 200));
 
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(200)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -616,16 +623,20 @@ mod tests {
 
     #[test]
     fn test_bounds_guard_elimination_int_ge() {
-        // known_bounds for OpRef(100) = (50, 200)
-        // known_bounds for OpRef(101) = (10, 50)
+        // known_bounds for OpRef::from_raw(100) = (50, 200)
+        // known_bounds for OpRef::from_raw(101) = (10, 50)
         // IntGe(100, 101): a.lower(50) >= b.upper(50) → always true → remove.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (50, 200));
-        knowledge.known_bounds.insert(OpRef(101), (10, 50));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(100), (50, 200));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(101), (10, 50));
 
         let mut ops = vec![
-            Op::new(OpCode::IntGe, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntGe, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -643,16 +654,18 @@ mod tests {
 
     #[test]
     fn test_bounds_guard_elimination_int_le() {
-        // known_bounds for OpRef(100) = (0, 30)
-        // known_bounds for OpRef(101) = (30, 100)
+        // known_bounds for OpRef::from_raw(100) = (0, 30)
+        // known_bounds for OpRef::from_raw(101) = (30, 100)
         // IntLe(100, 101): a.upper(30) <= b.lower(30) → always true → remove.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (0, 30));
-        knowledge.known_bounds.insert(OpRef(101), (30, 100));
+        knowledge.known_bounds.insert(OpRef::from_raw(100), (0, 30));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(101), (30, 100));
 
         let mut ops = vec![
-            Op::new(OpCode::IntLe, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntLe, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -670,16 +683,20 @@ mod tests {
 
     #[test]
     fn test_bounds_guard_elimination_int_gt() {
-        // known_bounds for OpRef(100) = (80, 200)
-        // known_bounds for OpRef(101) = (10, 50)
+        // known_bounds for OpRef::from_raw(100) = (80, 200)
+        // known_bounds for OpRef::from_raw(101) = (10, 50)
         // IntGt(100, 101): a.lower(80) > b.upper(50) → always true → remove.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (80, 200));
-        knowledge.known_bounds.insert(OpRef(101), (10, 50));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(100), (80, 200));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(101), (10, 50));
 
         let mut ops = vec![
-            Op::new(OpCode::IntGt, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntGt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -698,15 +715,19 @@ mod tests {
     #[test]
     fn test_bounds_guard_false_elimination() {
         // GuardFalse(IntLt(a, b)) means a >= b.
-        // known_bounds for OpRef(100) = (80, 200), OpRef(101) = (10, 50)
+        // known_bounds for OpRef::from_raw(100) = (80, 200), OpRef::from_raw(101) = (10, 50)
         // IntLt false means a >= b: a.lower(80) >= b.upper(50) → always false → remove.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (80, 200));
-        knowledge.known_bounds.insert(OpRef(101), (10, 50));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(100), (80, 200));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(101), (10, 50));
 
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]),
+            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -725,15 +746,19 @@ mod tests {
     #[test]
     fn test_bounds_guard_false_not_eliminated() {
         // GuardFalse(IntLt(a, b)) means a >= b.
-        // known_bounds for OpRef(100) = (0, 200), OpRef(101) = (10, 50)
+        // known_bounds for OpRef::from_raw(100) = (0, 200), OpRef::from_raw(101) = (10, 50)
         // a.lower(0) < b.upper(50), so cannot prove a >= b → keep guard.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (0, 200));
-        knowledge.known_bounds.insert(OpRef(101), (10, 50));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(100), (0, 200));
+        knowledge
+            .known_bounds
+            .insert(OpRef::from_raw(101), (10, 50));
 
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]),
+            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -752,15 +777,15 @@ mod tests {
 
     #[test]
     fn test_bounds_guard_with_one_constant_operand() {
-        // OpRef(100) has known bounds (0, 50), OpRef(200) is a constant 100.
+        // OpRef::from_raw(100) has known bounds (0, 50), OpRef::from_raw(200) is a constant 100.
         // IntLt(100, 200): a.upper(50) < b_const(100) → always true → remove.
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef(100), (0, 50));
-        knowledge.known_constants.insert(OpRef(200), 100);
+        knowledge.known_bounds.insert(OpRef::from_raw(100), (0, 50));
+        knowledge.known_constants.insert(OpRef::from_raw(200), 100);
 
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(200)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -784,8 +809,8 @@ mod tests {
     fn test_bounds_guard_no_bounds_info() {
         // No bounds info for either operand → guard kept.
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
+            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -809,16 +834,19 @@ mod tests {
     #[test]
     fn test_bridgeopt_guard_value_with_known_constant() {
         let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_constants.insert(OpRef(100), 42);
+        knowledge.known_constants.insert(OpRef::from_raw(100), 42);
 
-        let mut ops = vec![Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)])];
+        let mut ops = vec![Op::new(
+            OpCode::GuardValue,
+            &[OpRef::from_raw(100), OpRef::from_raw(200)],
+        )];
         assign_positions(&mut ops);
 
         let bridge = OptBridgeOpt::with_knowledge(knowledge);
         // Pre-populate constants
         let mut ctx = OptContext::new(ops.len());
         bridge.apply_knowledge(&mut ctx);
-        ctx.make_constant(OpRef(200), Value::Int(42));
+        ctx.make_constant(OpRef::from_raw(200), Value::Int(42));
 
         // Manual optimization to test with pre-populated constants
         let mut pass = OptBridgeOpt::new();
@@ -840,20 +868,20 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_roundtrip() {
         let mut k = BridgeKnowledge::new();
-        k.known_constants.insert(OpRef(10), 42);
-        k.known_constants.insert(OpRef(20), -1);
-        k.known_nonnull.push(OpRef(30));
-        k.known_classes.insert(OpRef(40), GcRef(0x1000));
-        k.known_bounds.insert(OpRef(50), (0, 100));
-        k.add_known_field(OpRef(60), 5, OpRef(70));
-        k.add_known_arrayitem(OpRef(80), 3, 7, OpRef(90));
+        k.known_constants.insert(OpRef::from_raw(10), 42);
+        k.known_constants.insert(OpRef::from_raw(20), -1);
+        k.known_nonnull.push(OpRef::from_raw(30));
+        k.known_classes.insert(OpRef::from_raw(40), GcRef(0x1000));
+        k.known_bounds.insert(OpRef::from_raw(50), (0, 100));
+        k.add_known_field(OpRef::from_raw(60), 5, OpRef::from_raw(70));
+        k.add_known_arrayitem(OpRef::from_raw(80), 3, 7, OpRef::from_raw(90));
 
         let serialized = k.serialize();
         let deserialized = BridgeKnowledge::deserialize(&serialized).unwrap();
 
         assert_eq!(deserialized.known_constants.len(), 2);
-        assert_eq!(deserialized.known_constants[&OpRef(10)], 42);
-        assert_eq!(deserialized.known_constants[&OpRef(20)], -1);
+        assert_eq!(deserialized.known_constants[&OpRef::from_raw(10)], 42);
+        assert_eq!(deserialized.known_constants[&OpRef::from_raw(20)], -1);
         assert_eq!(deserialized.known_nonnull.len(), 1);
         assert_eq!(deserialized.known_classes.len(), 1);
         assert_eq!(deserialized.known_bounds.len(), 1);
@@ -913,7 +941,7 @@ pub fn serialize_optimizer_knowledge(
     let available_boxes: std::collections::HashMap<OpRef, ()> = liveboxes
         .iter()
         .filter_map(|opt| *opt)
-        .filter(|opref| numb_state.liveboxes.contains_key(opref.0))
+        .filter(|opref| numb_state.liveboxes.contains_key(opref.raw()))
         .map(|opref| (opref, ()))
         .collect();
 
@@ -938,7 +966,7 @@ pub fn serialize_optimizer_knowledge(
         if let Some(opref) = livebox {
             let livebox_tp = numb_state
                 .livebox_types
-                .get(&opref.0)
+                .get(&opref.raw())
                 .copied()
                 .unwrap_or_else(|| env.get_type(*opref));
             if livebox_tp != majit_ir::Type::Ref {

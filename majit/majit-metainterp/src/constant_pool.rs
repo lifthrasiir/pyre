@@ -83,13 +83,15 @@ impl ConstantPool {
                     .copied();
                 match tp {
                     Some(Type::Ref) | Some(Type::Float) => continue,
-                    _ => return OpRef(idx),
+                    // history.py:220 ConstInt — `get_or_insert` is the
+                    // Int-only entry point (pool always tags Int below).
+                    _ => return OpRef::ConstInt(idx),
                 }
             }
         }
-        let opref = OpRef::from_const(self.next_const_idx);
+        let opref = OpRef::const_int(self.next_const_idx);
         self.next_const_idx += 1;
-        self.constants.insert(opref.0, value);
+        self.constants.insert(opref.raw(), value);
         // Box.type immutability (history.py:361 ConstInt): a ConstInt Box
         // always reports `op.type == 'i'`. Record the type explicitly so
         // `constant_type(opref)` returns `Some(Int)` instead of `None`;
@@ -98,7 +100,7 @@ impl ConstantPool {
         // retag this ConstInt as Ref when it lands in a Ref-declared array
         // slot, and the bridge optimizer then panics in `getintbound` once
         // the bridge reseeds `const_pool` with `Value::Ref(GcRef(small_int))`.
-        self.constant_types.insert(opref.0, Type::Int);
+        self.constant_types.insert(opref.raw(), Type::Int);
         opref
     }
 
@@ -121,21 +123,29 @@ impl ConstantPool {
                 let pool_tp = self.constant_types.get(&idx).copied();
                 let override_tp = self.numbering_type_overrides.get(&idx).copied();
                 let existing_tp = pool_tp.or(override_tp);
+                // history.py:220/261/307 — ConstInt/ConstFloat/ConstPtr
+                // each pin `type = 'i'/'f'/'r'` at construction.
+                let typed = match tp {
+                    Type::Int => OpRef::ConstInt(idx),
+                    Type::Float => OpRef::ConstFloat(idx),
+                    Type::Ref => OpRef::ConstPtr(idx),
+                    Type::Void => panic!("Void constants are not supported"),
+                };
                 match existing_tp {
-                    Some(existing) if existing == tp => return OpRef(idx),
-                    None if tp == Type::Int => return OpRef(idx),
+                    Some(existing) if existing == tp => return typed,
+                    None if tp == Type::Int => return typed,
                     _ => continue,
                 }
             }
         }
-        let opref = OpRef::from_const(self.next_const_idx);
+        let opref = OpRef::const_typed(self.next_const_idx, tp);
         self.next_const_idx += 1;
-        self.constants.insert(opref.0, value);
-        self.constant_types.insert(opref.0, tp);
+        self.constants.insert(opref.raw(), value);
+        self.constant_types.insert(opref.raw(), tp);
         // Root non-null Ref constants on shadow stack.
         if tp == Type::Ref && value != 0 {
             let ss_idx = shadow_stack::push(GcRef(value as usize));
-            self.rooted_refs.push((opref.0, ss_idx));
+            self.rooted_refs.push((opref.raw(), ss_idx));
         }
         opref
     }
@@ -144,38 +154,39 @@ impl ConstantPool {
     /// The constant stays Int-typed (optimizer sees Value::Int), but
     /// the referenced object won't be freed by GC.
     pub fn root_int_as_ref(&mut self, opref: OpRef) {
-        if let Some(&value) = self.constants.get(&opref.0) {
+        if let Some(&value) = self.constants.get(&opref.raw()) {
             if value != 0 {
                 let ss_idx = shadow_stack::push(GcRef(value as usize));
-                self.rooted_refs.push((opref.0, ss_idx));
+                self.rooted_refs.push((opref.raw(), ss_idx));
             }
         }
     }
 
     /// Get the type of a constant, if recorded.
     pub fn constant_type(&self, opref: OpRef) -> Option<Type> {
-        self.constant_types.get(&opref.0).copied()
+        self.constant_types.get(&opref.raw()).copied()
     }
 
     /// pyjitpl.py:3572 executor.constant_from_op(a) parity:
     /// return the typed Value for a constant OpRef, or None if
     /// the OpRef is not a known constant.
     pub fn get_value(&self, opref: OpRef) -> Option<majit_ir::Value> {
-        let &raw = self.constants.get(&opref.0)?;
+        let &raw = self.constants.get(&opref.raw())?;
         // history.py:220/261/307: ConstInt/Float/Ptr Box.type is pinned at
         // construction. `get_or_insert*` always inserts into both
         // `constants` and `constant_types`, so a constant present in
         // `constants` MUST also be present in `constant_types`.
         let tp = self
             .constant_types
-            .get(&opref.0)
+            .get(&opref.raw())
             .copied()
             .unwrap_or_else(|| {
                 panic!(
                     "constant_types missing entry for constant OpRef({}) (raw={}) \
                  though `constants` has it: get_or_insert / get_or_insert_typed \
                  must populate both maps in lockstep",
-                    opref.0, raw
+                    opref.raw(),
+                    raw
                 )
             });
         Some(match tp {
@@ -194,7 +205,7 @@ impl ConstantPool {
         // Store in numbering_type_overrides only — NOT constant_types.
         // This type info is for resume data (consumer switchover) only,
         // NOT for Cranelift backend (which would trigger GC root tracking).
-        self.numbering_type_overrides.insert(opref.0, tp);
+        self.numbering_type_overrides.insert(opref.raw(), tp);
     }
 
     /// Update HashMap from shadow stack — GC may have moved Ref objects.

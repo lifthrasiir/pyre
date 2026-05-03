@@ -265,7 +265,7 @@ impl CachedField {
         let mut i = 0;
         while i < self.cached_structs.len() {
             let obj = self.cached_structs[i];
-            if vb_get(unescaped, obj.0) {
+            if vb_get(unescaped, obj.raw()) {
                 i += 1;
             } else {
                 self.cached_structs.swap_remove(i);
@@ -576,7 +576,7 @@ impl ArrayCachedItem {
         let mut i = 0;
         while i < self.cached_structs.len() {
             let obj = self.cached_structs[i];
-            if vb_get(unescaped, obj.0) {
+            if vb_get(unescaped, obj.raw()) {
                 i += 1;
             } else {
                 self.cached_structs.swap_remove(i);
@@ -804,7 +804,7 @@ impl OptHeap {
     /// heapcache.py:295-309 `_escape_box`: escape a box and transitively
     /// escape all its dependencies stored in `box._heapc_deps`.
     fn escape_box(&mut self, opref: OpRef) {
-        vb_unset(&mut self.unescaped, opref.0);
+        vb_unset(&mut self.unescaped, opref.raw());
         if let Some(deps) = self.heapc_deps.remove(&opref) {
             for dep in deps {
                 self.escape_box(dep);
@@ -816,7 +816,7 @@ impl OptHeap {
     /// into a container, append to `_get_deps(box)` if both are
     /// unescaped; otherwise escape the value immediately.
     fn escape_from_write(&mut self, container: OpRef, value: OpRef) {
-        if vb_get(&self.unescaped, container.0) && vb_get(&self.unescaped, value.0) {
+        if vb_get(&self.unescaped, container.raw()) && vb_get(&self.unescaped, value.raw()) {
             self.heapc_deps.entry(container).or_default().push(value);
         } else if !value.is_none() {
             self.escape_box(value);
@@ -1294,14 +1294,14 @@ impl OptHeap {
                 .cached_structs
                 .iter()
                 .copied()
-                .filter(|obj| !vb_get(&unescaped_snapshot, obj.0))
+                .filter(|obj| !vb_get(&unescaped_snapshot, obj.raw()))
                 .collect();
             // Drop the escaped entries from cached_structs and clear the
             // matching PtrInfo / const_infos slot.
             self.cached_fields[pos]
                 .2
                 .cached_structs
-                .retain(|obj| vb_get(&unescaped_snapshot, obj.0));
+                .retain(|obj| vb_get(&unescaped_snapshot, obj.raw()));
             for obj in escaped_opref {
                 let resolved = ctx.get_box_replacement(obj);
                 if let Some(info) = ctx.get_ptr_info_mut(resolved) {
@@ -1333,7 +1333,7 @@ impl OptHeap {
                         cai.cached_structs
                             .iter()
                             .copied()
-                            .filter(|obj| !vb_get(&unescaped_snapshot, obj.0))
+                            .filter(|obj| !vb_get(&unescaped_snapshot, obj.raw()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1342,7 +1342,7 @@ impl OptHeap {
                     .and_then(|s| s.const_indexes.get_mut(&index))
                 {
                     cai.cached_structs
-                        .retain(|obj| vb_get(&unescaped_snapshot, obj.0));
+                        .retain(|obj| vb_get(&unescaped_snapshot, obj.raw()));
                 }
                 let idx = if index >= 0 {
                     Some(index as usize)
@@ -1365,7 +1365,8 @@ impl OptHeap {
             // triple whose arrayinfo (first slot) has escaped.
             if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
                 if let Some(triples) = submap.cached_varindex_triples.as_mut() {
-                    triples.retain(|&(arrayinfo, _, _)| vb_get(&unescaped_snapshot, arrayinfo.0));
+                    triples
+                        .retain(|&(arrayinfo, _, _)| vb_get(&unescaped_snapshot, arrayinfo.raw()));
                     if triples.is_empty() {
                         submap.cached_varindex_triples = None;
                     }
@@ -1932,7 +1933,7 @@ impl OptHeap {
         // line-by-line port reuses the EnsuredPtrInfo handle for both
         // the nonnull bookkeeping and the field write.
         let struct_ref = ctx.get_box_replacement(op.arg(0));
-        vb_set(&mut self.known_nonnull, struct_ref.0);
+        vb_set(&mut self.known_nonnull, struct_ref.raw());
         self.cache_field(obj, descr);
         // Save immutable fields in the permanent cache — they survive all
         // invalidation because the value never changes.
@@ -2286,7 +2287,7 @@ impl OptHeap {
             //      `const_infos[gcref]` and regular arg0 through
             //      `ensure_ptr_info_arg0(op).as_mut().setitem(...)`.
             let array_ref = ctx.get_box_replacement(op.arg(0));
-            vb_set(&mut self.known_nonnull, array_ref.0);
+            vb_set(&mut self.known_nonnull, array_ref.raw());
             if const_index >= 0 {
                 let mut arrayinfo = ctx.ensure_ptr_info_arg0(op);
                 if let Some(mut bound) = arrayinfo.getlenbound(None) {
@@ -2317,7 +2318,7 @@ impl OptHeap {
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0))
-        vb_set(&mut self.known_nonnull, array_ref.0);
+        vb_set(&mut self.known_nonnull, array_ref.raw());
         ctx.make_nonnull(op.arg(0));
         OptimizationResult::Emit(op.clone())
     }
@@ -2489,9 +2490,9 @@ impl OptHeap {
         // Track allocations for aliasing analysis.
         // Allocated objects are always non-null.
         if opcode.is_malloc() {
-            vb_set(&mut self.seen_allocation, op.pos.0);
-            vb_set(&mut self.unescaped, op.pos.0);
-            vb_set(&mut self.known_nonnull, op.pos.0);
+            vb_set(&mut self.seen_allocation, op.pos.raw());
+            vb_set(&mut self.unescaped, op.pos.raw());
+            vb_set(&mut self.known_nonnull, op.pos.raw());
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -2505,7 +2506,7 @@ impl OptHeap {
         // exclusively by rewrite.py. Only track nullity for cache purposes.
         if opcode.is_guard() {
             if opcode == OpCode::GuardNonnull {
-                vb_set(&mut self.known_nonnull, op.arg(0).0);
+                vb_set(&mut self.known_nonnull, op.arg(0).raw());
             }
 
             // GuardClass / GuardNonnullClass imply non-null.
@@ -2513,7 +2514,7 @@ impl OptHeap {
             // may be NULL (rewrite.py:320 handles GUARD_VALUE(..., NULL)).
             match opcode {
                 OpCode::GuardClass | OpCode::GuardNonnullClass => {
-                    vb_set(&mut self.known_nonnull, op.arg(0).0);
+                    vb_set(&mut self.known_nonnull, op.arg(0).raw());
                 }
                 _ => {}
             }
@@ -2669,9 +2670,9 @@ impl OptHeap {
 
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                vb_set(&mut self.seen_allocation, op.pos.0);
-                vb_set(&mut self.unescaped, op.pos.0);
-                vb_set(&mut self.known_nonnull, op.pos.0);
+                vb_set(&mut self.seen_allocation, op.pos.raw());
+                vb_set(&mut self.unescaped, op.pos.raw());
+                vb_set(&mut self.known_nonnull, op.pos.raw());
                 OptimizationResult::PassOn
             }
 
@@ -2876,7 +2877,7 @@ impl OptHeap {
             | OpCode::GcLoadIndexedF => {
                 self.force_all_lazy_setfields(ctx.current_pass_idx, ctx);
                 self.force_all_lazy_setarrayitems(ctx.current_pass_idx, ctx);
-                vb_set(&mut self.known_nonnull, op.arg(0).0);
+                vb_set(&mut self.known_nonnull, op.arg(0).raw());
                 OptimizationResult::Emit(op.clone())
             }
 
@@ -3512,8 +3513,8 @@ mod tests {
         );
 
         let mut heap = OptHeap::new();
-        heap.cache_field(OpRef(0), &descr_a);
-        heap.cache_field(OpRef(0), &descr_b);
+        heap.cache_field(OpRef::from_raw(0), &descr_a);
+        heap.cache_field(OpRef::from_raw(0), &descr_b);
 
         assert_eq!(heap.cached_fields.len(), 2);
     }
@@ -3583,7 +3584,7 @@ mod tests {
     /// on a missing donor.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(i as u32);
+            op.pos = OpRef::from_raw(i as u32);
             if op.opcode.is_guard() && op.descr.is_none() {
                 op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
@@ -3593,7 +3594,7 @@ mod tests {
     /// Run a single OptHeap pass over the given ops.
     ///
     /// Uses num_inputs=1024 so that high-numbered OpRef values used as
-    /// input arguments in tests (e.g. OpRef(100), OpRef(500)) are treated
+    /// input arguments in tests (e.g. OpRef::from_raw(100), OpRef::from_raw(500)) are treated
     /// as valid defined positions by the optimizer's undefined-ref filter.
     ///
     /// In production every recorded Box carries its intrinsic type via
@@ -3637,12 +3638,16 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=d0)   <- should be eliminated, replaced by i1
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             // Terminate trace so lazy set is forced.
             Op::new(OpCode::Jump, &[]),
         ];
-        // OpRef(101) is the Int value stored into the Int-typed field; the
+        // OpRef::from_raw(101) is the Int value stored into the Int-typed field; the
         // cache replays it as the GetfieldGcI result.
         let result = run_heap_opt_typed(&mut ops, &[101]);
 
@@ -3661,19 +3666,22 @@ mod tests {
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
-            OpRef(0),
+            OpRef::from_raw(0),
             &d,
-            OpRef(100),
-            OpRef(1),
+            OpRef::from_raw(100),
+            OpRef::from_raw(1),
             OpCode::GetfieldGcI,
         );
 
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
-        op.pos = OpRef(2);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d);
+        op.pos = OpRef::from_raw(2);
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(1)
+        );
     }
 
     /// After consuming an imported short field, a cache invalidation followed
@@ -3689,27 +3697,30 @@ mod tests {
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
-            OpRef(0),
+            OpRef::from_raw(0),
             &d_head,
-            OpRef(100),
-            OpRef(1),
+            OpRef::from_raw(100),
+            OpRef::from_raw(1),
             OpCode::GetfieldGcR,
         );
 
         // First getfield on head: consumes the import, caches the value.
-        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], d_head.clone());
-        op1.pos = OpRef(2);
+        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(0)], d_head.clone());
+        op1.pos = OpRef::from_raw(2);
         let result1 = heap.optimize_getfield(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef(2)), OpRef(1));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(2)),
+            OpRef::from_raw(1)
+        );
 
         // A call invalidates all mutable field caches.
         heap.clean_caches(&mut ctx);
 
         // Second getfield on head after invalidation: must NOT return the
         // stale preamble value.  The import was consumed, so it should emit.
-        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef(0)], d_head.clone());
-        op2.pos = OpRef(3);
+        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(0)], d_head.clone());
+        op2.pos = OpRef::from_raw(3);
         let result2 = heap.optimize_getfield(&op2, &mut ctx);
         assert!(
             matches!(result2, OptimizationResult::Emit(_)),
@@ -3722,14 +3733,17 @@ mod tests {
         let d = immutable_descr(77);
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.make_constant(OpRef(0), majit_ir::Value::Int(1));
+        ctx.make_constant(OpRef::from_raw(0), majit_ir::Value::Int(1));
 
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d);
-        op.pos = OpRef(1);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d);
+        op.pos = OpRef::from_raw(1);
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
-        assert_eq!(ctx.get_box_replacement(OpRef(1)), OpRef(1));
+        assert_eq!(
+            ctx.get_box_replacement(OpRef::from_raw(1)),
+            OpRef::from_raw(1)
+        );
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
@@ -3740,8 +3754,8 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=d0)   <- eliminated, reuse i1
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -3760,8 +3774,16 @@ mod tests {
         // setfield_gc(p0, i2, descr=d0)   <- first is dead
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(102)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(102)],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -3781,9 +3803,13 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=d0)   <- cache invalidated by call, must emit
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d.clone(),
+            ),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -3807,10 +3833,18 @@ mod tests {
         // i4 = getfield_gc_i(p1, descr=d0)   <- cached from second lazy_set (i2)
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(200), OpRef(201)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(200)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(200), OpRef::from_raw(201)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(200)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt_typed(&mut ops, &[101, 201]);
@@ -3837,14 +3871,18 @@ mod tests {
         // i2 = getarrayitem_gc_i(p0, i_idx, descr=d0)   <- eliminated
         // We need i_idx to be a known constant.
         let d = descr(0);
-        let idx = OpRef(50);
+        let idx = OpRef::from_raw(50);
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(100), idx, OpRef(101)],
+                &[OpRef::from_raw(100), idx, OpRef::from_raw(101)],
                 d.clone(),
             ),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -3886,13 +3924,17 @@ mod tests {
     #[test]
     fn test_getarrayitem_postprocess_updates_ptr_info() {
         let d = descr(0);
-        let idx = OpRef(50);
-        let mut op = Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone());
-        op.pos = OpRef(200);
+        let idx = OpRef::from_raw(50);
+        let mut op = Op::with_descr(
+            OpCode::GetarrayitemGcI,
+            &[OpRef::from_raw(100), idx],
+            d.clone(),
+        );
+        op.pos = OpRef::from_raw(200);
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d, 8, false));
+        ctx.set_ptr_info(OpRef::from_raw(100), PtrInfo::virtual_array(d, 8, false));
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -3900,10 +3942,10 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
         assert_eq!(
-            ctx.get_ptr_info(OpRef(100))
+            ctx.get_ptr_info(OpRef::from_raw(100))
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
-            Some(OpRef(200))
+            Some(OpRef::from_raw(200))
         );
     }
 
@@ -3915,16 +3957,19 @@ mod tests {
         // subsequent getarrayitem on the same (array, index) reads
         // the value back via getfield_from_cache's _lazy_set check.
         let d = descr(0);
-        let idx = OpRef(50);
+        let idx = OpRef::from_raw(50);
         let op = Op::with_descr(
             OpCode::SetarrayitemGc,
-            &[OpRef(100), idx, OpRef(101)],
+            &[OpRef::from_raw(100), idx, OpRef::from_raw(101)],
             d.clone(),
         );
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
-        ctx.set_ptr_info(OpRef(100), PtrInfo::virtual_array(d.clone(), 8, false));
+        ctx.set_ptr_info(
+            OpRef::from_raw(100),
+            PtrInfo::virtual_array(d.clone(), 8, false),
+        );
 
         let mut pass = OptHeap::new();
         pass.setup();
@@ -3944,10 +3989,10 @@ mod tests {
         // becomes the rhs value via put_field_back_to_info.
         pass.flush(&mut ctx);
         assert_eq!(
-            ctx.get_ptr_info(OpRef(100))
+            ctx.get_ptr_info(OpRef::from_raw(100))
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
-            Some(OpRef(101))
+            Some(OpRef::from_raw(101))
         );
     }
 
@@ -3960,12 +4005,16 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=d0) <- still cached (guards don't invalidate)
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::new(OpCode::GuardTrue, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d.clone(),
+            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
-        // OpRef(101) is the Int setfield value + guard condition OpRef(200)
+        // OpRef::from_raw(101) is the Int setfield value + guard condition OpRef::from_raw(200)
         // stays as Ref (guards accept Ref-typed "any non-null" predicates
         // in this harness).
         let result = run_heap_opt_typed(&mut ops, &[101]);
@@ -4008,8 +4057,12 @@ mod tests {
         let d0 = descr(0);
         let d1 = descr(1);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d0),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d0,
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d1),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4031,9 +4084,13 @@ mod tests {
         let d0 = descr(0);
         let d1 = descr(1);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0.clone()),
-            Op::with_descr(OpCode::SetfieldRaw, &[OpRef(200), OpRef(201)], d1),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0.clone()),
+            Op::with_descr(
+                OpCode::SetfieldRaw,
+                &[OpRef::from_raw(200), OpRef::from_raw(201)],
+                d1,
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4053,9 +4110,13 @@ mod tests {
         // setfield_gc(p0, i1, descr=d0)   <- writing back the same value, redundant
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             // pos=0 will be the GETFIELD result; setfield writes it back
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(0)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4075,9 +4136,9 @@ mod tests {
         // i3 = getfield_gc_i(p0, descr=d0)  <- still cached
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(0)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4095,8 +4156,8 @@ mod tests {
     fn test_getfield_ref_cached() {
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4110,8 +4171,8 @@ mod tests {
     fn test_getfield_float_cached() {
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcF, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcF, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcF, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcF, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4126,16 +4187,16 @@ mod tests {
     #[test]
     fn test_setarrayitem_write_after_write() {
         let d = descr(0);
-        let idx = OpRef(50);
+        let idx = OpRef::from_raw(50);
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(100), idx, OpRef(101)],
+                &[OpRef::from_raw(100), idx, OpRef::from_raw(101)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(100), idx, OpRef(102)],
+                &[OpRef::from_raw(100), idx, OpRef::from_raw(102)],
                 d.clone(),
             ),
             Op::new(OpCode::Jump, &[]),
@@ -4181,9 +4242,9 @@ mod tests {
     fn test_overflow_ops_dont_invalidate() {
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::IntAddOvf, &[OpRef(0), OpRef(0)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::IntAddOvf, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4202,10 +4263,18 @@ mod tests {
         let d0 = descr(0);
         let d1 = descr(1);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d0.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(102)], d1.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d0.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(102)],
+                d1.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d1.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt_typed(&mut ops, &[101, 102]);
@@ -4228,9 +4297,9 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=immutable_d0) <- still cached (immutable)
         let d = immutable_descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4251,9 +4320,9 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=mutable_d0) <- re-emitted (mutable, invalidated)
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4278,11 +4347,19 @@ mod tests {
         let d_immut = immutable_descr(0);
         let d_mut = descr(1);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_immut.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_mut.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_immut.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d_mut.clone()),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[OpRef::from_raw(100)],
+                d_immut.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d_mut.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[OpRef::from_raw(100)],
+                d_immut.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d_mut.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4305,8 +4382,8 @@ mod tests {
         // read-after-read caching that survives side effects.
         let d = immutable_descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4323,9 +4400,9 @@ mod tests {
     fn test_immutable_field_ref_survives_call() {
         let d = immutable_descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcR, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4340,9 +4417,9 @@ mod tests {
     fn test_immutable_field_float_survives_call() {
         let d = immutable_descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcF, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcF, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcF, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcF, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4358,23 +4435,23 @@ mod tests {
         let descr =
             majit_ir::make_field_descr(55, 8, majit_ir::Type::Ref, majit_ir::ArrayFlag::Pointer);
         let mut pass = OptHeap::new();
-        pass.cache_field(OpRef(100), &descr);
+        pass.cache_field(OpRef::from_raw(100), &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef(100),
-            OpRef(101),
+            OpRef::from_raw(100),
+            OpRef::from_raw(101),
         ]);
         // Register input args so produce_arg can resolve them.
-        sb.add_short_input_arg(OpRef(100), majit_ir::Type::Int);
-        sb.add_short_input_arg(OpRef(101), majit_ir::Type::Int);
+        sb.add_short_input_arg(OpRef::from_raw(100), majit_ir::Type::Int);
+        sb.add_short_input_arg(OpRef::from_raw(101), majit_ir::Type::Int);
         let mut ctx = crate::optimizeopt::OptContext::new(256);
         // Seed PtrInfo._fields[idx] with the cached value so the
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;
-        ctx.set_ptr_info(OpRef(100), PtrInfo::instance(None, None));
-        ctx.get_ptr_info_mut(OpRef(100))
+        ctx.set_ptr_info(OpRef::from_raw(100), PtrInfo::instance(None, None));
+        ctx.get_ptr_info_mut(OpRef::from_raw(100))
             .unwrap()
-            .setfield(descr.index(), OpRef(101));
+            .setfield(descr.index(), OpRef::from_raw(101));
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let produced = sb.produced_ops();
 
@@ -4393,10 +4470,10 @@ mod tests {
     fn test_immutable_field_survives_multiple_calls() {
         let d = immutable_descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::new(OpCode::CallN, &[OpRef(201)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(201)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4415,11 +4492,11 @@ mod tests {
     fn test_immutable_field_different_objects() {
         let d = immutable_descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(200)], d.clone()),
-            Op::new(OpCode::CallN, &[OpRef(300)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()), // cached
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(200)], d.clone()), // cached
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(200)], d.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(300)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()), // cached
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(200)], d.clone()), // cached
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4446,9 +4523,13 @@ mod tests {
         // i2 = getfield_gc_i(p0, descr=d0) <- must re-emit (might have been clobbered)
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(200), OpRef(20)], d.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(200), OpRef::from_raw(20)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4478,9 +4559,17 @@ mod tests {
         let d = descr(0);
         let mut ops = vec![
             Op::new(OpCode::New, &[]), // pos=0 -> p0
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::with_descr(OpCode::CallN, &[OpRef(200)], plain_call_descr(100)),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[OpRef::from_raw(200)],
+                plain_call_descr(100),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4510,9 +4599,13 @@ mod tests {
         let d = descr(0);
         let mut ops = vec![
             Op::new(OpCode::New, &[]), // pos=0 -> p0
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::with_descr(OpCode::CallN, &[OpRef(0)], plain_call_descr(100)), // pass p0 to call
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                d.clone(),
+            ),
+            Op::with_descr(OpCode::CallN, &[OpRef::from_raw(0)], plain_call_descr(100)), // pass p0 to call
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4543,10 +4636,18 @@ mod tests {
         let mut ops = vec![
             Op::new(OpCode::New, &[]), // pos=0 -> p0
             Op::new(OpCode::New, &[]), // pos=1 -> p1
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d0.clone()), // p0.f0 = i10
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(1), OpRef(0)], d1.clone()), // p1.f1 = p0 (p0 escapes)
-            Op::with_descr(OpCode::CallN, &[OpRef(1)], plain_call_descr(100)), // call(p1) (p1 escapes)
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d0.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                d0.clone(),
+            ), // p0.f0 = i10
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(1), OpRef::from_raw(0)],
+                d1.clone(),
+            ), // p1.f1 = p0 (p0 escapes)
+            Op::with_descr(OpCode::CallN, &[OpRef::from_raw(1)], plain_call_descr(100)), // call(p1) (p1 escapes)
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d0.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4573,9 +4674,13 @@ mod tests {
         let d0 = descr(0);
         let d1 = descr(1);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(200), OpRef(20)], d0.clone()),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()), // different field
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d1.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(200), OpRef::from_raw(20)],
+                d0.clone(),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d1.clone()), // different field
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4600,16 +4705,24 @@ mod tests {
         // heap.py:557-558: check_write_descr_array → force_lazy_setarrayitem_submap(can_cache=False)
         // PyPy does a full invalidate on write, regardless of escape status.
         let d = descr(0);
-        let idx = OpRef(50);
+        let idx = OpRef::from_raw(50);
         let mut ops = vec![
-            Op::new(OpCode::NewArray, &[OpRef(5)]), // pos=0 -> p0
+            Op::new(OpCode::NewArray, &[OpRef::from_raw(5)]), // pos=0 -> p0
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(0), idx, OpRef(10)],
+                &[OpRef::from_raw(0), idx, OpRef::from_raw(10)],
                 d.clone(),
             ),
-            Op::with_descr(OpCode::CallN, &[OpRef(200)], plain_call_descr(100)),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(0), idx], d.clone()),
+            Op::with_descr(
+                OpCode::CallN,
+                &[OpRef::from_raw(200)],
+                plain_call_descr(100),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(0), idx],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -4667,10 +4780,22 @@ mod tests {
         let d = descr(0);
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(10)], d.clone()),
-            Op::with_descr(OpCode::CallN, &[OpRef(200)], plain_call_descr(100)),
-            Op::with_descr(OpCode::CallN, &[OpRef(201)], plain_call_descr(101)),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(0)], d.clone()),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(0), OpRef::from_raw(10)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[OpRef::from_raw(200)],
+                plain_call_descr(100),
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[OpRef::from_raw(201)],
+                plain_call_descr(101),
+            ),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4697,7 +4822,7 @@ mod tests {
         // guard_nonnull(p0)   <- redundant, allocation is always non-null
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4719,8 +4844,8 @@ mod tests {
         // guard_nonnull(p0)
         // guard_nonnull(p0)   <- redundant
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4739,8 +4864,11 @@ mod tests {
         // guard_class(p0, cls)  <- implies non-null
         // guard_nonnull(p0)     <- redundant
         let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4761,7 +4889,7 @@ mod tests {
     fn test_guard_nonnull_unknown_not_removed() {
         // guard_nonnull(p0)  <- first time seeing p0, must keep
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4782,8 +4910,8 @@ mod tests {
         // guard_nonnull(p0)    <- still redundant (allocation is always non-null)
         let mut ops = vec![
             Op::new(OpCode::New, &[]),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4806,9 +4934,9 @@ mod tests {
         // call_n(some_func)   <- invalidates guard-derived nonnull
         // guard_nonnull(p0)   <- must re-emit
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4830,8 +4958,11 @@ mod tests {
         // guard_nonnull_class(p0, cls) <- implies non-null
         // guard_nonnull(p0)            <- redundant
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnullClass, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(
+                OpCode::GuardNonnullClass,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4853,8 +4984,11 @@ mod tests {
         // guard_value(p0, c) <- implies non-null
         // guard_nonnull(p0)  <- redundant
         let mut ops = vec![
-            Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(101)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(
+                OpCode::GuardValue,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4875,7 +5009,7 @@ mod tests {
     fn test_guard_nonnull_after_new_with_vtable() {
         let mut ops = vec![
             Op::new(OpCode::NewWithVtable, &[]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4895,8 +5029,8 @@ mod tests {
     #[test]
     fn test_guard_nonnull_after_new_array() {
         let mut ops = vec![
-            Op::new(OpCode::NewArray, &[OpRef(5)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
+            Op::new(OpCode::NewArray, &[OpRef::from_raw(5)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -4971,10 +5105,10 @@ mod tests {
             },
         );
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0.clone()),
-            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0.clone()),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef::from_raw(200)], call_d),
             Op::new(OpCode::GuardNotForced, &[]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5001,10 +5135,10 @@ mod tests {
             },
         );
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0.clone()),
-            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0.clone()),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef::from_raw(200)], call_d),
             Op::new(OpCode::GuardNotForced, &[]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d0),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d0),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5031,7 +5165,7 @@ mod tests {
         );
         let mut ops = vec![
             Op::new(OpCode::GuardNotInvalidated, &[]),
-            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef::from_raw(200)], call_d),
             Op::new(OpCode::GuardNotForced, &[]),
             Op::new(OpCode::GuardNotInvalidated, &[]),
             Op::new(OpCode::Jump, &[]),
@@ -5051,7 +5185,7 @@ mod tests {
     #[test]
     fn test_call_may_force_keeps_unaffected_variable_index_array_cache() {
         let d0 = descr(0);
-        let idx = OpRef(50);
+        let idx = OpRef::from_raw(50);
         let call_d = call_descr(
             73,
             EffectInfo {
@@ -5061,10 +5195,14 @@ mod tests {
             },
         );
         let mut ops = vec![
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0.clone()),
-            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx],
+                d0.clone(),
+            ),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef::from_raw(200)], call_d),
             Op::new(OpCode::GuardNotForced, &[]),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef::from_raw(100), idx], d0),
             Op::new(OpCode::Jump, &[]),
         ];
         let mut ctx = OptContext::new(ops.len() + 64);
@@ -5110,7 +5248,7 @@ mod tests {
     #[test]
     fn test_call_may_force_invalidates_written_variable_index_array_cache() {
         let d0 = descr(0);
-        let idx = OpRef(50);
+        let idx = OpRef::from_raw(50);
         let call_d = call_descr(
             74,
             EffectInfo {
@@ -5120,10 +5258,14 @@ mod tests {
             },
         );
         let mut ops = vec![
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0.clone()),
-            Op::with_descr(OpCode::CallMayForceN, &[OpRef(200)], call_d),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx],
+                d0.clone(),
+            ),
+            Op::with_descr(OpCode::CallMayForceN, &[OpRef::from_raw(200)], call_d),
             Op::new(OpCode::GuardNotForced, &[]),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d0),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef::from_raw(100), idx], d0),
             Op::new(OpCode::Jump, &[]),
         ];
         let mut ctx = OptContext::new(ops.len() + 64);
@@ -5172,7 +5314,7 @@ mod tests {
 
     #[test]
     fn test_arraycopy_only_invalidates_dest_range() {
-        // p_src = OpRef(100), p_dst = OpRef(200)
+        // p_src = OpRef::from_raw(100), p_dst = OpRef::from_raw(200)
         // setarrayitem_gc(p_dst, idx=0, val=i10)   <- cache dest[0]
         // setarrayitem_gc(p_dst, idx=5, val=i11)   <- cache dest[5]
         // call_n(arraycopy_func, p_src, p_dst, src_start=0, dst_start=2, length=3)
@@ -5181,32 +5323,32 @@ mod tests {
         // getarrayitem_gc_i(p_dst, idx=5)           <- still cached
         let d = descr(0);
         let ac_d = arraycopy_descr(50);
-        let idx0 = OpRef(60);
-        let idx5 = OpRef(61);
-        let dst_start_ref = OpRef(62);
-        let length_ref = OpRef(63);
-        let src_start_ref = OpRef(64);
+        let idx0 = OpRef::from_raw(60);
+        let idx5 = OpRef::from_raw(61);
+        let dst_start_ref = OpRef::from_raw(62);
+        let length_ref = OpRef::from_raw(63);
+        let src_start_ref = OpRef::from_raw(64);
 
         let mut ops = vec![
             // pos=0: setarrayitem_gc(dst, idx=0, val)
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(200), idx0, OpRef(10)],
+                &[OpRef::from_raw(200), idx0, OpRef::from_raw(10)],
                 d.clone(),
             ),
             // pos=1: setarrayitem_gc(dst, idx=5, val)
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(200), idx5, OpRef(11)],
+                &[OpRef::from_raw(200), idx5, OpRef::from_raw(11)],
                 d.clone(),
             ),
             // pos=2: call_n(func, src, dst, src_start, dst_start, length)
             Op::with_descr(
                 OpCode::CallN,
                 &[
-                    OpRef(300),
-                    OpRef(100),
-                    OpRef(200),
+                    OpRef::from_raw(300),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
                     src_start_ref,
                     dst_start_ref,
                     length_ref,
@@ -5214,9 +5356,17 @@ mod tests {
                 ac_d,
             ),
             // pos=3: getarrayitem_gc_i(dst, idx=0)
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx0], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(200), idx0],
+                d.clone(),
+            ),
             // pos=4: getarrayitem_gc_i(dst, idx=5)
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx5], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(200), idx5],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5275,30 +5425,34 @@ mod tests {
         // getarrayitem_gc_i(p_dst, idx=0)   <- must re-emit
         let d = descr(0);
         let ac_d = arraycopy_descr(50);
-        let idx0 = OpRef(60);
-        let dst_start_ref = OpRef(62);
-        let length_ref = OpRef(63); // NOT constant
-        let src_start_ref = OpRef(64);
+        let idx0 = OpRef::from_raw(60);
+        let dst_start_ref = OpRef::from_raw(62);
+        let length_ref = OpRef::from_raw(63); // NOT constant
+        let src_start_ref = OpRef::from_raw(64);
 
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(200), idx0, OpRef(10)],
+                &[OpRef::from_raw(200), idx0, OpRef::from_raw(10)],
                 d.clone(),
             ),
             Op::with_descr(
                 OpCode::CallN,
                 &[
-                    OpRef(300),
-                    OpRef(100),
-                    OpRef(200),
+                    OpRef::from_raw(300),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
                     src_start_ref,
                     dst_start_ref,
                     length_ref,
                 ],
                 ac_d,
             ),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx0], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(200), idx0],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5350,26 +5504,34 @@ mod tests {
     fn test_arraycopy_invalidates_dest_variable_index_cache() {
         let d = descr(0);
         let ac_d = arraycopy_descr(50);
-        let idx = OpRef(60);
-        let dst_start_ref = OpRef(62);
-        let length_ref = OpRef(63);
-        let src_start_ref = OpRef(64);
+        let idx = OpRef::from_raw(60);
+        let dst_start_ref = OpRef::from_raw(62);
+        let length_ref = OpRef::from_raw(63);
+        let src_start_ref = OpRef::from_raw(64);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(200), idx],
+                d.clone(),
+            ),
             Op::with_descr(
                 OpCode::CallN,
                 &[
-                    OpRef(300),
-                    OpRef(100),
-                    OpRef(200),
+                    OpRef::from_raw(300),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
                     src_start_ref,
                     dst_start_ref,
                     length_ref,
                 ],
                 ac_d,
             ),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(200), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(200), idx],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5419,26 +5581,34 @@ mod tests {
     fn test_arraycopy_keeps_other_array_variable_index_cache() {
         let d = descr(0);
         let ac_d = arraycopy_descr(50);
-        let idx = OpRef(60);
-        let dst_start_ref = OpRef(62);
-        let length_ref = OpRef(63);
-        let src_start_ref = OpRef(64);
+        let idx = OpRef::from_raw(60);
+        let dst_start_ref = OpRef::from_raw(62);
+        let length_ref = OpRef::from_raw(63);
+        let src_start_ref = OpRef::from_raw(64);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(400), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(400), idx],
+                d.clone(),
+            ),
             Op::with_descr(
                 OpCode::CallN,
                 &[
-                    OpRef(300),
-                    OpRef(100),
-                    OpRef(200),
+                    OpRef::from_raw(300),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
                     src_start_ref,
                     dst_start_ref,
                     length_ref,
                 ],
                 ac_d,
             ),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(400), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(400), idx],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5489,31 +5659,35 @@ mod tests {
         let field_d = descr(0);
         let array_d = descr(1);
         let ac_d = arraycopy_descr(50);
-        let idx0 = OpRef(60);
-        let dst_start_ref = OpRef(62);
-        let length_ref = OpRef(63);
-        let src_start_ref = OpRef(64);
+        let idx0 = OpRef::from_raw(60);
+        let dst_start_ref = OpRef::from_raw(62);
+        let length_ref = OpRef::from_raw(63);
+        let src_start_ref = OpRef::from_raw(64);
 
         let mut ops = vec![
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(500)], field_d.clone()),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[OpRef::from_raw(500)],
+                field_d.clone(),
+            ),
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(200), idx0, OpRef(10)],
+                &[OpRef::from_raw(200), idx0, OpRef::from_raw(10)],
                 array_d.clone(),
             ),
             Op::with_descr(
                 OpCode::CallN,
                 &[
-                    OpRef(300),
-                    OpRef(100),
-                    OpRef(200),
+                    OpRef::from_raw(300),
+                    OpRef::from_raw(100),
+                    OpRef::from_raw(200),
                     src_start_ref,
                     dst_start_ref,
                     length_ref,
                 ],
                 ac_d,
             ),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(500)], field_d),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(500)], field_d),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5571,8 +5745,15 @@ mod tests {
         // The SETFIELD must be emitted before the GC_LOAD.
         let d = descr(0);
         let mut ops = vec![
-            Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::new(OpCode::GcLoadI, &[OpRef(200), OpRef(8), OpRef(4)]),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                d.clone(),
+            ),
+            Op::new(
+                OpCode::GcLoadI,
+                &[OpRef::from_raw(200), OpRef::from_raw(8), OpRef::from_raw(4)],
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5591,8 +5772,11 @@ mod tests {
         // i1 = gc_load_i(p0, offset, size)  <- dereferences p0, so p0 is nonnull
         // guard_nonnull(p0)                  <- redundant
         let mut ops = vec![
-            Op::new(OpCode::GcLoadI, &[OpRef(100), OpRef(8), OpRef(4)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
+            Op::new(
+                OpCode::GcLoadI,
+                &[OpRef::from_raw(100), OpRef::from_raw(8), OpRef::from_raw(4)],
+            ),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5618,10 +5802,10 @@ mod tests {
         let d0 = descr(0);
         let d1 = descr(1);
         let mut ops = vec![
-            Op::with_descr(OpCode::QuasiimmutField, &[OpRef(100)], d0),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
-            Op::new(OpCode::CallN, &[OpRef(200)]),
-            Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d1.clone()),
+            Op::with_descr(OpCode::QuasiimmutField, &[OpRef::from_raw(100)], d0),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d1.clone()),
+            Op::new(OpCode::CallN, &[OpRef::from_raw(200)]),
+            Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(100)], d1.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);
@@ -5679,14 +5863,18 @@ mod tests {
         // setarrayitem_gc(p0, idx, val, descr=byte_array)
         // i2 = getarrayitem_gc_i(p0, idx, descr=byte_array)  <- eliminated
         let d = byte_array_descr(50);
-        let idx = OpRef(60);
+        let idx = OpRef::from_raw(60);
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(100), idx, OpRef(101)],
+                &[OpRef::from_raw(100), idx, OpRef::from_raw(101)],
                 d.clone(),
             ),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5733,15 +5921,19 @@ mod tests {
         // setarrayitem_gc(p0, idx=5, val, descr=byte_array)
         // i2 = getarrayitem_gc_i(p0, idx=6, descr=byte_array)  <- NOT cached (different index)
         let d = byte_array_descr(50);
-        let idx5 = OpRef(60);
-        let idx6 = OpRef(61);
+        let idx5 = OpRef::from_raw(60);
+        let idx6 = OpRef::from_raw(61);
         let mut ops = vec![
             Op::with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef(100), idx5, OpRef(101)],
+                &[OpRef::from_raw(100), idx5, OpRef::from_raw(101)],
                 d.clone(),
             ),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx6], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx6],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5789,10 +5981,18 @@ mod tests {
         // i1 = getarrayitem_gc_i(p0, idx=3, descr=byte_array)
         // i2 = getarrayitem_gc_i(p0, idx=3, descr=byte_array)  <- eliminated (same read)
         let d = byte_array_descr(50);
-        let idx = OpRef(60);
+        let idx = OpRef::from_raw(60);
         let mut ops = vec![
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
-            Op::with_descr(OpCode::GetarrayitemGcI, &[OpRef(100), idx], d.clone()),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[OpRef::from_raw(100), idx],
+                d.clone(),
+            ),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops);
@@ -5845,12 +6045,12 @@ mod tests {
         let d = descr(42);
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[OpRef(100)]);
+                let mut op = Op::new(OpCode::ArraylenGc, &[OpRef::from_raw(100)]);
                 op.descr = Some(d.clone());
                 op
             },
             {
-                let mut op = Op::new(OpCode::ArraylenGc, &[OpRef(100)]);
+                let mut op = Op::new(OpCode::ArraylenGc, &[OpRef::from_raw(100)]);
                 op.descr = Some(d);
                 op
             },
@@ -5886,8 +6086,8 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(64, 4, 0, 4);
 
         let arr_descr = descr(50);
-        let op1 = OpRef(0);
-        let op2 = OpRef(1);
+        let op1 = OpRef::from_raw(0);
+        let op2 = OpRef::from_raw(1);
 
         let const_10 = ctx.emit_constant_int(10);
         let const_20 = ctx.emit_constant_int(20);

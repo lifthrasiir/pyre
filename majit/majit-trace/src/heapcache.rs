@@ -14,7 +14,7 @@ fn vb_insert(v: &mut Vec<bool>, opref: OpRef) {
     if opref.is_constant() {
         return;
     }
-    let i = opref.0 as usize;
+    let i = opref.raw() as usize;
     if i >= v.len() {
         v.resize(i + 1, false);
     }
@@ -25,7 +25,7 @@ fn vb_remove(v: &mut Vec<bool>, opref: &OpRef) -> bool {
     if opref.is_constant() {
         return false;
     }
-    let i = opref.0 as usize;
+    let i = opref.raw() as usize;
     if i < v.len() && v[i] {
         v[i] = false;
         true
@@ -173,10 +173,18 @@ impl CacheEntry {
     }
 
     pub fn _invalidate_unescaped(&mut self, unescaped: &[bool]) {
-        self.cache_anything
-            .retain(|box_ref, _| unescaped.get(box_ref.0 as usize).copied().unwrap_or(false));
-        self.cache_seen_allocation
-            .retain(|box_ref, _| unescaped.get(box_ref.0 as usize).copied().unwrap_or(false));
+        self.cache_anything.retain(|box_ref, _| {
+            unescaped
+                .get(box_ref.raw() as usize)
+                .copied()
+                .unwrap_or(false)
+        });
+        self.cache_seen_allocation.retain(|box_ref, _| {
+            unescaped
+                .get(box_ref.raw() as usize)
+                .copied()
+                .unwrap_or(false)
+        });
         if let Some(seen) = &mut self.quasiimmut_seen {
             seen.clear();
         }
@@ -351,7 +359,7 @@ impl HeapCache {
             return opref;
         }
         self.replaced_with_const
-            .get(opref.0 as usize)
+            .get(opref.raw() as usize)
             .and_then(|v| *v)
             .unwrap_or(opref)
     }
@@ -360,14 +368,17 @@ impl HeapCache {
         if opref.is_constant() {
             return 0;
         }
-        self.heapc_flags.get(opref.0 as usize).copied().unwrap_or(0)
+        self.heapc_flags
+            .get(opref.raw() as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn set_flags_for_ref(&mut self, opref: OpRef, flags: u32) {
         if opref.is_constant() {
             return;
         }
-        let i = opref.0 as usize;
+        let i = opref.raw() as usize;
         if i >= self.heapc_flags.len() {
             self.heapc_flags.resize(i + 1, 0);
         }
@@ -442,7 +453,7 @@ impl HeapCache {
                 vb_insert(&mut self.seen_allocation, opref);
             }
             HF_KNOWN_CLASS => {
-                let i = opref.0 as usize;
+                let i = opref.raw() as usize;
                 if i >= self.known_class.len() {
                     self.known_class.resize(i + 1, None);
                 }
@@ -451,7 +462,7 @@ impl HeapCache {
                 }
             }
             HF_KNOWN_NULLITY => {
-                let i = opref.0 as usize;
+                let i = opref.raw() as usize;
                 if i >= self.known_nullity.len() {
                     self.known_nullity.resize(i + 1, 0);
                 }
@@ -492,7 +503,7 @@ impl HeapCache {
             }
             HF_KNOWN_NULLITY => {
                 {
-                    let _i = opref.0 as usize;
+                    let _i = opref.raw() as usize;
                     if _i < self.known_nullity.len() {
                         self.known_nullity[_i] = 0;
                     }
@@ -500,7 +511,7 @@ impl HeapCache {
             }
             HF_KNOWN_CLASS => {
                 {
-                    let _i = opref.0 as usize;
+                    let _i = opref.raw() as usize;
                     if _i < self.known_class.len() {
                         self.known_class[_i] = None;
                     }
@@ -513,7 +524,7 @@ impl HeapCache {
     /// RPython-compatible alias.
     pub fn _get_deps(&mut self, opref: OpRef) -> &mut Vec<Option<OpRef>> {
         self.update_version(opref);
-        let i = opref.0 as usize;
+        let i = opref.raw() as usize;
         if i >= self.heapc_deps.len() {
             self.heapc_deps.resize_with(i + 1, || None);
         }
@@ -577,7 +588,7 @@ impl HeapCache {
         // _check_flag query stays consistent.
         self._remove_flag(opref, HF_LIKELY_VIRTUAL);
         self._remove_flag(opref, HF_IS_UNESCAPED);
-        let i = opref.0 as usize;
+        let i = opref.raw() as usize;
         let deps = self.heapc_deps.get_mut(i).and_then(Option::take);
         if let Some(deps) = deps {
             if self.test_head_version(opref) {
@@ -679,7 +690,7 @@ impl HeapCache {
                     return true;
                 }
                 // Keep entries for unescaped objects (no aliasing possible)
-                let i = cached_obj.0 as usize;
+                let i = cached_obj.raw() as usize;
                 let f = flags_snapshot.get(i).copied().unwrap_or(0);
                 Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
             });
@@ -708,7 +719,7 @@ impl HeapCache {
         let head_version = self.head_version;
         let flags_snapshot: Vec<u32> = self.heapc_flags.clone();
         let still_unescaped = |obj: OpRef| -> bool {
-            let i = obj.0 as usize;
+            let i = obj.raw() as usize;
             let f = flags_snapshot.get(i).copied().unwrap_or(0);
             Self::versioned_or(f, head_version) && (f as u8) & HF_IS_UNESCAPED != 0
         };
@@ -716,7 +727,7 @@ impl HeapCache {
         // heapcache.py:542-552: iterate cached_arrayitems and invalidate
         // per-CacheEntry entries whose box is no longer unescaped.
         let unescaped: Vec<bool> = (0..flags_snapshot.len())
-            .map(|i| still_unescaped(OpRef(i as u32)))
+            .map(|i| still_unescaped(OpRef::ref_op(i as u32)))
             .collect();
         for caches in self.heap_array_cache.values_mut() {
             for cache in caches.values_mut() {
@@ -822,7 +833,7 @@ impl HeapCache {
     ///
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
         if !old.is_constant() && new.is_constant() {
-            let i = old.0 as usize;
+            let i = old.raw() as usize;
             if i >= self.replaced_with_const.len() {
                 self.replaced_with_const.resize(i + 1, None);
             }
@@ -846,7 +857,7 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
-        let i = opref.0 as usize;
+        let i = opref.raw() as usize;
         if i >= self.known_class.len() {
             self.known_class.resize(i + 1, None);
         }
@@ -881,7 +892,7 @@ impl HeapCache {
         if !self._check_flag(opref, HF_KNOWN_CLASS) {
             return None;
         }
-        self.known_class.get(opref.0 as usize).and_then(|v| *v)
+        self.known_class.get(opref.raw() as usize).and_then(|v| *v)
     }
 
     /// heapcache.py:493-494 is_unescaped.
@@ -951,7 +962,7 @@ impl HeapCache {
         if opcode == OpCode::GuardClass || opcode == OpCode::GuardNonnullClass {
             if args.len() >= 2 {
                 if let Some(class_val) = args.get(1) {
-                    self.class_now_known(args[0], GcRef(class_val.0 as usize));
+                    self.class_now_known(args[0], GcRef(class_val.raw() as usize));
                 }
             }
             self.nullity_now_known(args[0], true);
@@ -1394,7 +1405,7 @@ impl HeapCache {
         index: OpRef,
         descr_index: u32,
     ) -> Option<&mut CacheEntry> {
-        let index = index.0;
+        let index = index.raw();
         Some(
             self.heap_array_cache
                 .entry(descr_index)
@@ -1417,7 +1428,7 @@ impl HeapCache {
         if !index.is_constant() {
             return None;
         }
-        let entry = self.heap_array_cache.get(&descr)?.get(&index.0)?;
+        let entry = self.heap_array_cache.get(&descr)?.get(&index.raw())?;
         let seen_alloc = self.saw_allocation(array);
         let opref = entry._getdict(seen_alloc).get(&array).copied()?;
         Some(self.maybe_replace_with_const(opref))
@@ -1442,7 +1453,7 @@ impl HeapCache {
             .heap_array_cache
             .entry(descr)
             .or_default()
-            .entry(index.0)
+            .entry(index.raw())
             .or_insert_with(CacheEntry::new);
         entry._clear_cache_on_write(seen_alloc);
         entry._getdict_mut(seen_alloc).insert(array, value);
@@ -1470,7 +1481,7 @@ impl HeapCache {
             .heap_array_cache
             .entry(descr)
             .or_default()
-            .entry(index.0)
+            .entry(index.raw())
             .or_insert_with(CacheEntry::new);
         entry._getdict_mut(seen_alloc).insert(array, value);
     }
@@ -1515,7 +1526,7 @@ impl HeapCache {
         if opref.is_constant() {
             return;
         }
-        let i = opref.0 as usize;
+        let i = opref.raw() as usize;
         if i >= self.known_nullity.len() {
             self.known_nullity.resize(i + 1, 0);
         }
@@ -1548,7 +1559,7 @@ impl HeapCache {
             return None;
         }
         self.known_nullity
-            .get(opref.0 as usize)
+            .get(opref.raw() as usize)
             .and_then(|v| if *v == 0 { None } else { Some(*v == 1) })
     }
 
@@ -1572,7 +1583,7 @@ impl HeapCache {
             return None;
         }
         self.heapc_deps
-            .get(array.0 as usize)
+            .get(array.raw() as usize)
             .and_then(|deps| deps.as_ref())
             .and_then(|deps| deps.first().copied().flatten())
             .map(|opref| self.maybe_replace_with_const(opref))
@@ -1808,7 +1819,7 @@ impl HeapCache {
 
     /// RPython-compatible alias kept for existing codepaths.
     pub fn _remove_deps_for_box(&mut self, opref: OpRef) {
-        let i = opref.0 as usize;
+        let i = opref.raw() as usize;
         if i < self.heapc_deps.len() {
             self.heapc_deps[i] = None;
         }
@@ -1828,9 +1839,9 @@ mod tests {
     #[test]
     fn test_field_cache_basic() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(0);
+        let obj = OpRef::ref_op(0);
         let field = 1;
-        let val = OpRef(2);
+        let val = OpRef::ref_op(2);
 
         assert_eq!(cache.getfield_cached(obj, field), None);
 
@@ -1841,82 +1852,85 @@ mod tests {
     #[test]
     fn test_field_cache_overwrite() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(0);
+        let obj = OpRef::ref_op(0);
         let field = 1;
 
-        cache.getfield_now_known(obj, field, OpRef(10));
-        assert_eq!(cache.getfield_cached(obj, field), Some(OpRef(10)));
+        cache.getfield_now_known(obj, field, OpRef::ref_op(10));
+        assert_eq!(cache.getfield_cached(obj, field), Some(OpRef::ref_op(10)));
 
-        cache.getfield_now_known(obj, field, OpRef(20));
-        assert_eq!(cache.getfield_cached(obj, field), Some(OpRef(20)));
+        cache.getfield_now_known(obj, field, OpRef::ref_op(20));
+        assert_eq!(cache.getfield_cached(obj, field), Some(OpRef::ref_op(20)));
     }
 
     #[test]
     fn test_setfield_aliasing() {
         let mut cache = HeapCache::new();
-        let obj_a = OpRef(0);
-        let obj_b = OpRef(1);
+        let obj_a = OpRef::ref_op(0);
+        let obj_b = OpRef::ref_op(1);
         let field = 5;
 
         // Both objects have a known field value
-        cache.getfield_now_known(obj_a, field, OpRef(10));
-        cache.getfield_now_known(obj_b, field, OpRef(20));
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10));
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20));
 
         // Writing to obj_a (which is NOT unescaped) should invalidate
         // obj_b's field cache for the same field (potential aliasing).
-        cache.setfield_cached(obj_a, field, OpRef(30));
-        assert_eq!(cache.getfield_cached(obj_a, field), Some(OpRef(30)));
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30));
+        assert_eq!(cache.getfield_cached(obj_a, field), Some(OpRef::ref_op(30)));
         assert_eq!(cache.getfield_cached(obj_b, field), None); // invalidated
     }
 
     #[test]
     fn test_setfield_no_aliasing_for_unescaped() {
         let mut cache = HeapCache::new();
-        let obj_a = OpRef(0);
-        let obj_b = OpRef(1);
+        let obj_a = OpRef::ref_op(0);
+        let obj_b = OpRef::ref_op(1);
         let field = 5;
 
         // obj_a is a newly allocated object
         cache.new_object(obj_a);
-        cache.getfield_now_known(obj_a, field, OpRef(10));
-        cache.getfield_now_known(obj_b, field, OpRef(20));
+        cache.getfield_now_known(obj_a, field, OpRef::ref_op(10));
+        cache.getfield_now_known(obj_b, field, OpRef::ref_op(20));
 
         // Writing to obj_a (unescaped) does NOT cause aliasing invalidation
-        cache.setfield_cached(obj_a, field, OpRef(30));
-        assert_eq!(cache.getfield_cached(obj_a, field), Some(OpRef(30)));
-        assert_eq!(cache.getfield_cached(obj_b, field), Some(OpRef(20))); // preserved
+        cache.setfield_cached(obj_a, field, OpRef::ref_op(30));
+        assert_eq!(cache.getfield_cached(obj_a, field), Some(OpRef::ref_op(30)));
+        assert_eq!(cache.getfield_cached(obj_b, field), Some(OpRef::ref_op(20))); // preserved
     }
 
     #[test]
     fn test_invalidate_caches() {
         let mut cache = HeapCache::new();
-        cache.getfield_now_known(OpRef(0), 1, OpRef(10));
-        cache.getfield_now_known(OpRef(1), 2, OpRef(20));
+        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10));
+        cache.getfield_now_known(OpRef::ref_op(1), 2, OpRef::ref_op(20));
 
         cache.invalidate_all_caches();
-        assert_eq!(cache.getfield_cached(OpRef(0), 1), None);
-        assert_eq!(cache.getfield_cached(OpRef(1), 2), None);
+        assert_eq!(cache.getfield_cached(OpRef::ref_op(0), 1), None);
+        assert_eq!(cache.getfield_cached(OpRef::ref_op(1), 2), None);
     }
 
     #[test]
     fn test_invalidate_caches_for_escaped() {
         let mut cache = HeapCache::new();
-        let escaped_obj = OpRef(0);
-        let unescaped_obj = OpRef(1);
+        let escaped_obj = OpRef::ref_op(0);
+        let unescaped_obj = OpRef::ref_op(1);
 
         cache.new_object(unescaped_obj);
-        cache.getfield_now_known(escaped_obj, 1, OpRef(10));
-        cache.getfield_now_known(unescaped_obj, 1, OpRef(20));
+        cache.getfield_now_known(escaped_obj, 1, OpRef::ref_op(10));
+        cache.getfield_now_known(unescaped_obj, 1, OpRef::ref_op(20));
 
         cache.invalidate_caches_for_escaped();
         assert_eq!(cache.getfield_cached(escaped_obj, 1), None);
-        assert_eq!(cache.getfield_cached(unescaped_obj, 1), Some(OpRef(20)));
+        assert_eq!(
+            cache.getfield_cached(unescaped_obj, 1),
+            Some(OpRef::ref_op(20))
+        );
     }
 
     #[test]
     fn test_new_object() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(5);
+        let obj = OpRef::ref_op(5);
 
         assert!(!cache.is_unescaped(obj));
         assert!(!cache.saw_allocation(obj));
@@ -1929,7 +1943,7 @@ mod tests {
     #[test]
     fn test_mark_escaped() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(5);
+        let obj = OpRef::ref_op(5);
 
         cache.new_object(obj);
         assert!(cache.is_unescaped(obj));
@@ -1943,7 +1957,7 @@ mod tests {
     #[test]
     fn test_known_class() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(0);
+        let obj = OpRef::ref_op(0);
         let cls = GcRef(0x1000);
 
         assert!(!cache.is_class_known(obj));
@@ -1957,7 +1971,7 @@ mod tests {
     #[test]
     fn test_notify_op_malloc() {
         let mut cache = HeapCache::new();
-        let result = OpRef(3);
+        let result = OpRef::ref_op(3);
 
         cache.notify_op(OpCode::New, &[], result);
         assert!(cache.is_unescaped(result));
@@ -1967,36 +1981,36 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut cache = HeapCache::new();
-        cache.new_object(OpRef(0));
-        cache.class_now_known(OpRef(0), GcRef(0x1000));
-        cache.getfield_now_known(OpRef(0), 1, OpRef(10));
+        cache.new_object(OpRef::ref_op(0));
+        cache.class_now_known(OpRef::ref_op(0), GcRef(0x1000));
+        cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10));
 
         cache.reset();
-        assert!(!cache.is_unescaped(OpRef(0)));
-        assert!(!cache.is_class_known(OpRef(0)));
-        assert_eq!(cache.getfield_cached(OpRef(0), 1), None);
+        assert!(!cache.is_unescaped(OpRef::ref_op(0)));
+        assert!(!cache.is_class_known(OpRef::ref_op(0)));
+        assert_eq!(cache.getfield_cached(OpRef::ref_op(0), 1), None);
     }
 
     #[test]
     fn test_different_fields_independent() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(0);
+        let obj = OpRef::ref_op(0);
 
-        cache.getfield_now_known(obj, 1, OpRef(10));
-        cache.getfield_now_known(obj, 2, OpRef(20));
+        cache.getfield_now_known(obj, 1, OpRef::ref_op(10));
+        cache.getfield_now_known(obj, 2, OpRef::ref_op(20));
 
         // Writing field 1 should not affect field 2
-        cache.setfield_cached(obj, 1, OpRef(30));
-        assert_eq!(cache.getfield_cached(obj, 1), Some(OpRef(30)));
-        assert_eq!(cache.getfield_cached(obj, 2), Some(OpRef(20)));
+        cache.setfield_cached(obj, 1, OpRef::ref_op(30));
+        assert_eq!(cache.getfield_cached(obj, 1), Some(OpRef::ref_op(30)));
+        assert_eq!(cache.getfield_cached(obj, 2), Some(OpRef::ref_op(20)));
     }
 
     #[test]
     fn test_recursive_escape() {
         let mut cache = HeapCache::new();
-        let container = OpRef(0);
-        let value = OpRef(1);
-        let inner = OpRef(2);
+        let container = OpRef::ref_op(0);
+        let value = OpRef::ref_op(1);
+        let inner = OpRef::ref_op(2);
 
         cache.new_object(container);
         cache.new_object(value);
@@ -2022,7 +2036,7 @@ mod tests {
     #[test]
     fn test_nullity_tracking() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(10);
+        let obj = OpRef::ref_op(10);
 
         assert_eq!(cache.is_nullity_known(obj, |_| None), None);
         cache.nullity_now_known(obj, true);
@@ -2035,20 +2049,20 @@ mod tests {
     #[test]
     fn test_arraylen_caching() {
         let mut cache = HeapCache::new();
-        let arr = OpRef(5);
+        let arr = OpRef::ref_op(5);
 
         assert_eq!(cache.arraylen(arr), None);
-        cache.arraylen_now_known(arr, OpRef(100));
-        assert_eq!(cache.arraylen(arr), Some(OpRef(100)));
+        cache.arraylen_now_known(arr, OpRef::int_op(100));
+        assert_eq!(cache.arraylen(arr), Some(OpRef::int_op(100)));
     }
 
     #[test]
     fn test_arraylen_reset_keep_likely_virtuals_invalidates_length() {
         let mut cache = HeapCache::new();
-        let arr = OpRef(5);
+        let arr = OpRef::ref_op(5);
 
-        cache.arraylen_now_known(arr, OpRef(100));
-        assert_eq!(cache.arraylen(arr), Some(OpRef(100)));
+        cache.arraylen_now_known(arr, OpRef::int_op(100));
+        assert_eq!(cache.arraylen(arr), Some(OpRef::int_op(100)));
 
         cache.reset_keep_likely_virtuals();
         assert_eq!(cache.arraylen(arr), None);
@@ -2057,7 +2071,7 @@ mod tests {
     #[test]
     fn test_replace_box_marks_old_as_const() {
         let mut cache = HeapCache::new();
-        let old = OpRef(5);
+        let old = OpRef::ref_op(5);
         let new = OpRef::from_const(0);
 
         cache.arraylen_now_known(old, old);
@@ -2069,7 +2083,7 @@ mod tests {
     #[test]
     fn test_likely_virtual() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(3);
+        let obj = OpRef::ref_op(3);
 
         assert!(!cache.is_likely_virtual(obj));
         cache.new_object(obj);
@@ -2087,7 +2101,7 @@ mod tests {
     #[test]
     fn test_guard_tracking_in_notify_op() {
         let mut cache = HeapCache::new();
-        let obj = OpRef(10);
+        let obj = OpRef::ref_op(10);
 
         // GUARD_NONNULL makes nullity known
         cache.notify_op(OpCode::GuardNonnull, &[obj], OpRef::NONE);

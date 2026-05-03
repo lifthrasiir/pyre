@@ -107,7 +107,7 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn get(&self, key: u32) -> Option<i16> {
-        let opref = majit_ir::OpRef(key);
+        let opref = majit_ir::OpRef::from_raw(key);
         let (vec, idx) = if opref.is_constant() {
             (&self.constants, opref.const_index() as usize)
         } else {
@@ -123,7 +123,7 @@ impl LiveboxMap {
 
     #[inline(always)]
     pub fn insert(&mut self, key: u32, value: i16) {
-        let opref = majit_ir::OpRef(key);
+        let opref = majit_ir::OpRef::from_raw(key);
         let (vec, idx) = if opref.is_constant() {
             (&mut self.constants, opref.const_index() as usize)
         } else {
@@ -152,7 +152,7 @@ impl LiveboxMap {
                     .iter()
                     .enumerate()
                     .filter(|(_, v)| **v != LIVEBOX_ABSENT)
-                    .map(|(i, v)| (majit_ir::OpRef::from_const(i as u32).0, *v)),
+                    .map(|(i, v)| (majit_ir::OpRef::from_const(i as u32).raw(), *v)),
             )
     }
 }
@@ -360,31 +360,34 @@ impl SimpleBoxEnv {
 
 impl BoxEnv for SimpleBoxEnv {
     fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
-        self.replacements.get(&opref.0).copied().unwrap_or(opref)
+        self.replacements
+            .get(&opref.raw())
+            .copied()
+            .unwrap_or(opref)
     }
     fn is_const(&self, opref: majit_ir::OpRef) -> bool {
-        self.constants.contains_key(&opref.0)
+        self.constants.contains_key(&opref.raw())
     }
     fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
         self.constants
-            .get(&opref.0)
+            .get(&opref.raw())
             .copied()
             .unwrap_or((0, majit_ir::Type::Int))
     }
     fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
         self.types
-            .get(&opref.0)
+            .get(&opref.raw())
             .copied()
             .unwrap_or(majit_ir::Type::Int)
     }
     fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool {
-        self.virtuals.contains(&opref.0)
+        self.virtuals.contains(&opref.raw())
     }
     fn is_virtual_raw(&self, opref: majit_ir::OpRef) -> bool {
-        self.virtuals.contains(&opref.0)
+        self.virtuals.contains(&opref.raw())
     }
     fn get_virtual_fields(&self, opref: majit_ir::OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
-        self.virtual_fields.get(&opref.0).cloned()
+        self.virtual_fields.get(&opref.raw()).cloned()
     }
 }
 
@@ -3352,12 +3355,12 @@ impl ResumeDataLoopMemo {
             // resume.py:268: boxes[-num - 1] = box
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
-                boxes[idx] = box_id.0;
+                boxes[idx] = box_id.raw();
             }
             return num;
         }
         // resume.py:270-271: boxes.append(box); num = -len(boxes)
-        boxes.push(box_id.0);
+        boxes.push(box_id.raw());
         let num = -(boxes.len() as i32);
         self.cached_boxes.insert(box_id, num);
         num
@@ -3369,11 +3372,11 @@ impl ResumeDataLoopMemo {
         if let Some(&num) = self.cached_boxes.get(&box_id) {
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
-                boxes[idx] = Some(box_id.0);
+                boxes[idx] = Some(box_id.raw());
             }
             return num;
         }
-        boxes.push(Some(box_id.0));
+        boxes.push(Some(box_id.raw()));
         let num = -(boxes.len() as i32);
         self.cached_boxes.insert(box_id, num);
         num
@@ -3436,8 +3439,8 @@ impl ResumeDataLoopMemo {
         // resume.py:370-374 register_box: constants are handled by
         // _gettagged (TAGCONST/TAGINT) and don't need livebox slots.
         let is_c = env.is_const(opref);
-        let in_env = liveboxes_from_env.contains_key(opref.0);
-        let in_new = new_liveboxes.contains_key(opref.0);
+        let in_env = liveboxes_from_env.contains_key(opref.raw());
+        let in_new = new_liveboxes.contains_key(opref.raw());
         if is_c || in_env || in_new {
             return;
         }
@@ -3452,8 +3455,8 @@ impl ResumeDataLoopMemo {
         } else {
             UNASSIGNED
         };
-        new_liveboxes.insert(opref.0, t);
-        new_liveboxes_order.push(opref.0);
+        new_liveboxes.insert(opref.raw(), t);
+        new_liveboxes_order.push(opref.raw());
     }
 
     /// resume.py:454-509 `_number_virtuals(liveboxes, num_env_virtuals)`.
@@ -3492,7 +3495,8 @@ impl ResumeDataLoopMemo {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
                 // resume.py:472-473: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
-                let index = self.assign_number_to_box_opt(OpRef(opref_id), &mut new_boxes_list);
+                let index =
+                    self.assign_number_to_box_opt(OpRef::from_raw(opref_id), &mut new_boxes_list);
                 if let Ok(t) = tag(index, TAGBOX) {
                     new_liveboxes.insert(opref_id, t);
                 }
@@ -3501,7 +3505,7 @@ impl ResumeDataLoopMemo {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
                     // resume.py:479-480: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
-                    let index = self.assign_number_to_virtual(OpRef(opref_id));
+                    let index = self.assign_number_to_virtual(OpRef::from_raw(opref_id));
                     if let Ok(t) = tag(index, TAGVIRTUAL) {
                         new_liveboxes.insert(opref_id, t);
                     }
@@ -3511,7 +3515,7 @@ impl ResumeDataLoopMemo {
         // resume.py:483-484: new_liveboxes.reverse(); liveboxes.extend(new_liveboxes)
         new_boxes_list.reverse();
         for box_id in &new_boxes_list {
-            liveboxes.push(box_id.map(majit_ir::OpRef));
+            liveboxes.push(box_id.map(majit_ir::OpRef::from_raw));
         }
         let nholes = new_boxes_list.len() - count;
 
@@ -3570,10 +3574,10 @@ impl ResumeDataLoopMemo {
                                 let (val, tp) = env.get_const(opref);
                                 return self.getconst(val, tp);
                             }
-                            if let Some(t) = numb_state.liveboxes.get(opref.0) {
+                            if let Some(t) = numb_state.liveboxes.get(opref.raw()) {
                                 return t;
                             }
-                            if let Some(t) = new_liveboxes.get(opref.0) {
+                            if let Some(t) = new_liveboxes.get(opref.raw()) {
                                 if tagged_eq(t, UNASSIGNED) {
                                     if let Some(&num) = self.cached_boxes.get(&opref) {
                                         return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
@@ -3589,11 +3593,13 @@ impl ResumeDataLoopMemo {
                             UNASSIGNED
                         })
                         .collect();
-                    let reused =
-                        env.virtual_info_would_be_reused(majit_ir::OpRef(opref_id), &fieldnums);
+                    let reused = env.virtual_info_would_be_reused(
+                        majit_ir::OpRef::from_raw(opref_id),
+                        &fieldnums,
+                    );
                     // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
                     if let Some(rd_virt) =
-                        env.make_virtual_info(majit_ir::OpRef(opref_id), fieldnums)
+                        env.make_virtual_info(majit_ir::OpRef::from_raw(opref_id), fieldnums)
                     {
                         if reused {
                             // resume.py:504-505: cached `_cached_vinfo` reused.
@@ -3712,10 +3718,10 @@ impl ResumeDataLoopMemo {
             return self.getconst(val, tp);
         }
         // resume.py:566-567: liveboxes_from_env → existing tag
-        if let Some(tagged) = liveboxes_from_env.get(opref.0) {
+        if let Some(tagged) = liveboxes_from_env.get(opref.raw()) {
             return tagged;
         }
-        if let Some(tagged) = new_liveboxes.get(opref.0) {
+        if let Some(tagged) = new_liveboxes.get(opref.raw()) {
             // Resolve UNASSIGNED to real cached number
             if tagged_eq(tagged, UNASSIGNED) {
                 if let Some(&num) = self.cached_boxes.get(&opref) {
@@ -3769,7 +3775,7 @@ impl ResumeDataLoopMemo {
                 continue;
             }
             // resume.py:206-208: liveboxes
-            if let Some(tagged) = numb_state.liveboxes.get(opref.0) {
+            if let Some(tagged) = numb_state.liveboxes.get(opref.raw()) {
                 numb_state.append_short(tagged);
                 continue;
             }
@@ -3787,12 +3793,12 @@ impl ResumeDataLoopMemo {
                 // RPython Box.type parity: capture type alongside TAGBOX
                 // assignment. This is the equivalent of Box.type being
                 // intrinsic — the type is determined once at numbering time.
-                numb_state.livebox_types.insert(opref.0, box_type);
+                numb_state.livebox_types.insert(opref.raw(), box_type);
                 let t = tag(numb_state.num_boxes, TAGBOX)?;
                 numb_state.num_boxes += 1;
                 t
             };
-            numb_state.liveboxes.insert(opref.0, tagged);
+            numb_state.liveboxes.insert(opref.raw(), tagged);
             numb_state.append_short(tagged);
         }
         Ok(())
@@ -3947,7 +3953,7 @@ impl ResumeDataLoopMemo {
             let (i, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
                 if (i as usize) < liveboxes.len() {
-                    liveboxes[i as usize] = Some(majit_ir::OpRef(opref_id));
+                    liveboxes[i as usize] = Some(majit_ir::OpRef::from_raw(opref_id));
                 }
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
@@ -3966,7 +3972,7 @@ impl ResumeDataLoopMemo {
             if virtual_fields.contains_key(&opref_id) {
                 continue; // already_seen_virtual
             }
-            let vf_result = env.get_virtual_fields(majit_ir::OpRef(opref_id));
+            let vf_result = env.get_virtual_fields(majit_ir::OpRef::from_raw(opref_id));
             if let Some(vf) = vf_result {
                 // resume.py:362-368: register_virtual_fields
                 for &field_opref in &vf.field_oprefs {
@@ -3981,17 +3987,17 @@ impl ResumeDataLoopMemo {
                     // If field is a virtual, add to worklist for recursive processing
                     let resolved = env.get_box_replacement(field_opref);
                     if !resolved.is_none()
-                        && !virtual_fields.contains_key(&resolved.0)
+                        && !virtual_fields.contains_key(&resolved.raw())
                         && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
                     {
                         // Assign TAGVIRTUAL to nested virtual
-                        if numb_state.liveboxes.get(resolved.0).is_none()
-                            && new_liveboxes.get(resolved.0).is_none()
+                        if numb_state.liveboxes.get(resolved.raw()).is_none()
+                            && new_liveboxes.get(resolved.raw()).is_none()
                         {
-                            new_liveboxes.insert(resolved.0, UNASSIGNEDVIRTUAL);
-                            new_liveboxes_order.push(resolved.0);
+                            new_liveboxes.insert(resolved.raw(), UNASSIGNEDVIRTUAL);
+                            new_liveboxes_order.push(resolved.raw());
                         }
-                        virtual_worklist.push(resolved.0);
+                        virtual_worklist.push(resolved.raw());
                     }
                 }
                 virtual_fields.insert(opref_id, vf);
@@ -4031,19 +4037,19 @@ impl ResumeDataLoopMemo {
                     // Nested virtual discovery (same as main worklist above)
                     let resolved = env.get_box_replacement(field_opref);
                     if !resolved.is_none()
-                        && !virtual_fields.contains_key(&resolved.0)
+                        && !virtual_fields.contains_key(&resolved.raw())
                         && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
                     {
-                        if numb_state.liveboxes.get(resolved.0).is_none()
-                            && new_liveboxes.get(resolved.0).is_none()
+                        if numb_state.liveboxes.get(resolved.raw()).is_none()
+                            && new_liveboxes.get(resolved.raw()).is_none()
                         {
-                            new_liveboxes.insert(resolved.0, UNASSIGNEDVIRTUAL);
-                            new_liveboxes_order.push(resolved.0);
+                            new_liveboxes.insert(resolved.raw(), UNASSIGNEDVIRTUAL);
+                            new_liveboxes_order.push(resolved.raw());
                         }
-                        virtual_worklist.push(resolved.0);
+                        virtual_worklist.push(resolved.raw());
                     }
                 }
-                virtual_fields.insert(fieldbox.0, vf);
+                virtual_fields.insert(fieldbox.raw(), vf);
             }
         }
 
@@ -4056,7 +4062,7 @@ impl ResumeDataLoopMemo {
             if virtual_fields.contains_key(&opref_id) {
                 continue;
             }
-            if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef(opref_id)) {
+            if let Some(vf) = env.get_virtual_fields(majit_ir::OpRef::from_raw(opref_id)) {
                 for &field_opref in &vf.field_oprefs {
                     self.register_box(
                         field_opref,
@@ -4067,16 +4073,16 @@ impl ResumeDataLoopMemo {
                     );
                     let resolved = env.get_box_replacement(field_opref);
                     if !resolved.is_none()
-                        && !virtual_fields.contains_key(&resolved.0)
+                        && !virtual_fields.contains_key(&resolved.raw())
                         && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
                     {
-                        if numb_state.liveboxes.get(resolved.0).is_none()
-                            && new_liveboxes.get(resolved.0).is_none()
+                        if numb_state.liveboxes.get(resolved.raw()).is_none()
+                            && new_liveboxes.get(resolved.raw()).is_none()
                         {
-                            new_liveboxes.insert(resolved.0, UNASSIGNEDVIRTUAL);
-                            new_liveboxes_order.push(resolved.0);
+                            new_liveboxes.insert(resolved.raw(), UNASSIGNEDVIRTUAL);
+                            new_liveboxes_order.push(resolved.raw());
                         }
-                        virtual_worklist.push(resolved.0);
+                        virtual_worklist.push(resolved.raw());
                     }
                 }
                 virtual_fields.insert(opref_id, vf);
@@ -4137,8 +4143,8 @@ impl ResumeDataLoopMemo {
         // discovered during virtual field walking.
         let mut all_livebox_types = numb_state.livebox_types;
         for &opref in &ordered_liveboxes {
-            if !opref.is_none() && !all_livebox_types.contains_key(&opref.0) {
-                all_livebox_types.insert(opref.0, env.get_type(opref));
+            if !opref.is_none() && !all_livebox_types.contains_key(&opref.raw()) {
+                all_livebox_types.insert(opref.raw(), env.get_type(opref));
             }
         }
         (
@@ -4539,8 +4545,12 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
-        let snapshot = Snapshot::single_frame(0, 8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
+            .insert(OpRef::from_const(1).raw(), (42i64, majit_ir::Type::Int));
+        let snapshot = Snapshot::single_frame(
+            0,
+            8,
+            vec![OpRef::from_const(1), OpRef::from_raw(1), OpRef::from_raw(2)],
+        );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
@@ -4561,11 +4571,11 @@ mod tests {
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
-        // items[7] = OpRef(1) tagged as TAGBOX(0) — first live box
+        // items[7] = OpRef::from_raw(1) tagged as TAGBOX(0) — first live box
         let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[8] = OpRef(2) tagged as TAGBOX(1) — second live box
+        // items[8] = OpRef::from_raw(2) tagged as TAGBOX(1) — second live box
         let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
@@ -4577,8 +4587,12 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
-        let snapshot = Snapshot::single_frame(0, 8, vec![OpRef::from_const(1), OpRef(1), OpRef(2)]);
+            .insert(OpRef::from_const(1).raw(), (42i64, majit_ir::Type::Int));
+        let snapshot = Snapshot::single_frame(
+            0,
+            8,
+            vec![OpRef::from_const(1), OpRef::from_raw(1), OpRef::from_raw(2)],
+        );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
         numb_state.writer.patch(1, numb_state.num_boxes);
@@ -4610,9 +4624,13 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.virtuals.insert(2); // OpRef(2) is virtual (Ref type)
+        env.virtuals.insert(2); // OpRef::from_raw(2) is virtual (Ref type)
         env.types.insert(2, majit_ir::Type::Ref);
-        let snapshot = Snapshot::single_frame(0, 10, vec![OpRef(1), OpRef(2), OpRef(3)]);
+        let snapshot = Snapshot::single_frame(
+            0,
+            10,
+            vec![OpRef::from_raw(1), OpRef::from_raw(2), OpRef::from_raw(3)],
+        );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: finish() patches with len(newboxes) which is num_boxes
         // (not liveboxes which includes virtuals).
@@ -4622,7 +4640,7 @@ mod tests {
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
             rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None);
-        assert_eq!(num_failargs, 2); // OpRef(1) and OpRef(3) are boxes
+        assert_eq!(num_failargs, 2); // OpRef::from_raw(1) and OpRef::from_raw(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(
             rebuilt_frames[0].values[0],
@@ -4642,20 +4660,24 @@ mod tests {
         let mut env = SimpleBoxEnv::new();
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
-        let snapshot = Snapshot::single_frame(0, 10, vec![OpRef(1), OpRef(2), OpRef(3)]);
+        let snapshot = Snapshot::single_frame(
+            0,
+            10,
+            vec![OpRef::from_raw(1), OpRef::from_raw(2), OpRef::from_raw(3)],
+        );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
-        // items[6] = OpRef(1) → TAGBOX(0)
+        // items[6] = OpRef::from_raw(1) → TAGBOX(0)
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[7] = OpRef(2) → TAGVIRTUAL(0)
+        // items[7] = OpRef::from_raw(2) → TAGVIRTUAL(0)
         let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
-        // items[8] = OpRef(3) → TAGBOX(1)
+        // items[8] = OpRef::from_raw(3) → TAGBOX(1)
         let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
@@ -4667,7 +4689,7 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(0).0, (99i64, majit_ir::Type::Int));
+            .insert(OpRef::from_const(0).raw(), (99i64, majit_ir::Type::Int));
 
         let snapshot = Snapshot {
             vable_array: vec![],
@@ -4676,12 +4698,12 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef(1).into(), OpRef::from_const(0).into()],
+                    boxes: vec![OpRef::from_raw(1).into(), OpRef::from_const(0).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
                     pc: 20,
-                    boxes: vec![OpRef(2).into(), OpRef(3).into()],
+                    boxes: vec![OpRef::from_raw(2).into(), OpRef::from_raw(3).into()],
                 },
             ],
         };
@@ -4732,23 +4754,28 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(1).0, (42i64, majit_ir::Type::Int));
+            .insert(OpRef::from_const(1).raw(), (42i64, majit_ir::Type::Int));
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
 
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::from_const(1), OpRef(1), OpRef(2), OpRef(3)],
+            vec![
+                OpRef::from_const(1),
+                OpRef::from_raw(1),
+                OpRef::from_raw(2),
+                OpRef::from_raw(3),
+            ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None);
 
-        // liveboxes should contain only TAGBOX entries: OpRef(1) and OpRef(3)
+        // liveboxes should contain only TAGBOX entries: OpRef::from_raw(1) and OpRef::from_raw(3)
         assert_eq!(liveboxes.len(), 2);
-        assert_eq!(liveboxes[0], OpRef(1)); // box #0
-        assert_eq!(liveboxes[1], OpRef(3)); // box #1
+        assert_eq!(liveboxes[0], OpRef::from_raw(1)); // box #0
+        assert_eq!(liveboxes[1], OpRef::from_raw(3)); // box #1
 
         // rd_numb should be valid
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
@@ -4783,12 +4810,12 @@ mod tests {
         let snapshot = Snapshot {
             // pyjitpl.py:3302-3306 parity: payload slots first,
             // virtualizable identity (`virtualizable_boxes[-1]`) last.
-            vable_array: vec![OpRef(1).into(), OpRef(7).into()],
+            vable_array: vec![OpRef::from_raw(1).into(), OpRef::from_raw(7).into()],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                boxes: vec![OpRef(1).into()],
+                boxes: vec![OpRef::from_raw(1).into()],
             }],
         };
 

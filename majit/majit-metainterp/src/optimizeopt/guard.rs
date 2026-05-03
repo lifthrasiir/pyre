@@ -1003,7 +1003,7 @@ mod tests {
     /// a missing donor.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef(base + i as u32);
+            op.pos = OpRef::from_raw(base + i as u32);
             if op.opcode.is_guard() && op.descr.is_none() {
                 op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
@@ -1023,9 +1023,9 @@ mod tests {
     #[test]
     fn test_duplicate_guard_true_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // duplicate
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1041,8 +1041,8 @@ mod tests {
     #[test]
     fn test_duplicate_guard_false_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]), // duplicate
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1057,8 +1057,8 @@ mod tests {
     #[test]
     fn test_duplicate_guard_nonnull_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(5)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(5)]), // duplicate
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(5)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(5)]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1070,8 +1070,14 @@ mod tests {
     #[test]
     fn test_duplicate_guard_value_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardValue, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardValue, &[OpRef(0), OpRef(1)]), // duplicate
+            Op::new(
+                OpCode::GuardValue,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            Op::new(
+                OpCode::GuardValue,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1083,8 +1089,14 @@ mod tests {
     #[test]
     fn test_duplicate_guard_class_removed() {
         let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(1)]), // duplicate
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1097,8 +1109,8 @@ mod tests {
     #[test]
     fn test_different_guard_args_kept() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]), // different arg
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]), // different arg
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1113,8 +1125,8 @@ mod tests {
     #[test]
     fn test_different_guard_opcodes_kept() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef(0)]), // different opcode
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]), // different opcode
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1131,9 +1143,9 @@ mod tests {
     #[test]
     fn test_guard_order_preserved() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(2)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(2)]),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1151,8 +1163,8 @@ mod tests {
         // guard_true(v) implies v is truthy/nonnull,
         // so a later guard_nonnull(v) is redundant.
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]), // subsumed
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1166,8 +1178,8 @@ mod tests {
         // guard_nonnull(v) implies v is truthy,
         // so a later guard_true(v) is subsumed.
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // subsumed
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1181,8 +1193,11 @@ mod tests {
         // guard_class(v, cls) implies v is nonnull,
         // so a later guard_nonnull(v) is subsumed.
         let mut ops = vec![
-            Op::new(OpCode::GuardClass, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(0)]), // subsumed
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1195,8 +1210,11 @@ mod tests {
     fn test_guard_true_after_guard_nonnull_class_removed() {
         // guard_nonnull_class(v, cls) implies v is nonnull/truthy.
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnullClass, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // subsumed
+            Op::new(
+                OpCode::GuardNonnullClass,
+                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // subsumed
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1209,8 +1227,8 @@ mod tests {
     fn test_guard_strengthening_different_values_not_subsumed() {
         // guard_true(v0) does NOT subsume guard_nonnull(v1).
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef(1)]), // different value
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(1)]), // different value
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1224,8 +1242,8 @@ mod tests {
     fn test_consecutive_guards_without_descr_no_crash() {
         // Two consecutive guards without descriptors should not crash.
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1238,8 +1256,8 @@ mod tests {
     #[test]
     fn test_non_guard_ops_pass_through() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1252,10 +1270,10 @@ mod tests {
     #[test]
     fn test_guards_interleaved_with_ops() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // duplicate, removed
-            Op::new(OpCode::IntSub, &[OpRef(0), OpRef(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // duplicate, removed
+            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1269,9 +1287,9 @@ mod tests {
     #[test]
     fn test_three_duplicate_guards() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // duplicate
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // duplicate
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // duplicate
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // duplicate
         ];
         assign_positions(&mut ops, 100);
         let result = run_guard_pass(&ops);
@@ -1286,9 +1304,9 @@ mod tests {
     #[test]
     fn test_guard_strengthen_pass_removes_duplicate() {
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef(0), OpRef(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]),
-            Op::new(OpCode::GuardTrue, &[OpRef(0)]), // should be removed
+            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]), // should be removed
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 100);
@@ -1334,12 +1352,19 @@ mod tests {
     #[test]
     fn test_overflow_guards_preserved_in_full_pipeline() {
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef(1)]),
-            Op::new(OpCode::IntSubOvf, &[OpRef(0), OpRef(2)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]),
+            Op::new(OpCode::IntSubOvf, &[OpRef::from_raw(0), OpRef::from_raw(2)]),
             Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)]),
+            Op::new(OpCode::IntMulOvf, &[OpRef::from_raw(2), OpRef::from_raw(1)]),
             Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(OpCode::Jump, &[OpRef(101), OpRef(101), OpRef(103)]),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    OpRef::from_raw(101),
+                    OpRef::from_raw(101),
+                    OpRef::from_raw(103),
+                ],
+            ),
         ];
         assign_positions(&mut ops, 100);
 
@@ -1359,8 +1384,8 @@ mod tests {
             .filter(|o| o.opcode == OpCode::GuardNoOverflow)
             .count();
 
-        // With intbounds postprocess_GUARD_TRUE, OpRef(1) becomes known
-        // constant 1 after GuardTrue(OpRef(1)). IntMulOvf(x, 1) cannot
+        // With intbounds postprocess_GUARD_TRUE, OpRef::from_raw(1) becomes known
+        // constant 1 after GuardTrue(OpRef::from_raw(1)). IntMulOvf(x, 1) cannot
         // overflow → second GuardNoOverflow is removed. This matches
         // RPython intbounds.py:52-58 _postprocess_guard_true_false_value.
         assert_eq!(
@@ -1374,10 +1399,19 @@ mod tests {
         // GUARD_NONNULL(v) then GUARD_CLASS(v, cls) already seen
         // → later GUARD_NONNULL_CLASS(v, cls) is subsumed.
         let mut ops = vec![
-            Op::new(OpCode::GuardNonnull, &[OpRef(100)]),
-            Op::new(OpCode::GuardClass, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::GuardNonnullClass, &[OpRef(100), OpRef(200)]),
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)]),
+            Op::new(
+                OpCode::GuardClass,
+                &[OpRef::from_raw(100), OpRef::from_raw(200)],
+            ),
+            Op::new(
+                OpCode::GuardNonnullClass,
+                &[OpRef::from_raw(100), OpRef::from_raw(200)],
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
         ];
         assign_positions(&mut ops, 0);
         let result = run_guard_pass(&ops);
@@ -1394,15 +1428,21 @@ mod tests {
         // GUARD_VALUE(v, 1) → GUARD_TRUE(v) via rewrite pass.
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::GuardValue, &[OpRef(100), OpRef(200)]);
-                op.pos = OpRef(0);
+                let mut op = Op::new(
+                    OpCode::GuardValue,
+                    &[OpRef::from_raw(100), OpRef::from_raw(200)],
+                );
+                op.pos = OpRef::from_raw(0);
                 op
             },
-            Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            ),
         ];
-        ops[1].pos = OpRef(1);
+        ops[1].pos = OpRef::from_raw(1);
 
-        // Pre-seed constant 1 for OpRef(200)
+        // Pre-seed constant 1 for OpRef::from_raw(200)
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
