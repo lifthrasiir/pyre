@@ -1093,7 +1093,7 @@ impl OptString {
         // Clone Arc to avoid borrow conflict with ctx
         let cic = ctx.callinfocollection.clone()?;
         let &(ref calldescr, func_addr) = cic.callinfo_for_oopspec(oopspec)?;
-        let func_const = ctx.alloc_op_position();
+        let func_const = ctx.alloc_op_position_typed(majit_ir::Type::Int);
         ctx.make_constant(func_const, Value::Int(func_addr as i64));
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);

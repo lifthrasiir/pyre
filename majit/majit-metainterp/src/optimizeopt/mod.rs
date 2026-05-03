@@ -539,18 +539,33 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_type(&self, opref: OpRef) -> majit_ir::Type {
-        // Check constant type first (history.py:220 ConstInt.type parity).
+        // RPython parity: resume.py:201 calls `box = box.get_box_replacement()`
+        // before any Const / type judgement. Same-type invariant on
+        // `replace_op` makes this usually equivalent to reading `opref`
+        // directly, but doing replacement first matches upstream order
+        // and is robust against forwarding chains.
+        let resolved = self.ctx.get_box_replacement(opref);
+        // Phase 1-5 OpRef enum carries box.type in the variant tag for
+        // typed positions; reading the tag on the resolved box is the
+        // line-by-line equivalent of upstream `box.type`
+        // (resoperation.py:29 / history.py:220). Untyped/None fall
+        // through to the legacy chain during the Slice 0.5 transition.
+        if let Some(tp) = resolved.ty() {
+            if tp != majit_ir::Type::Void {
+                return tp;
+            }
+        }
+        // Constant type (history.py:220 ConstInt.type parity).
         // The `constant_types_for_numbering` override is a raw-pointer
         // marker on `'i'`-typed Boxes (RPython `getrawptrinfo` ConstInt
         // path); it does NOT change `box.type` from `'i'` to `'r'`, so
         // we never read it here as a type source.  This matches
         // `OptContext::opref_type`'s documented invariant.
-        if let Some(val) = self.ctx.get_constant(opref) {
+        if let Some(val) = self.ctx.get_constant(resolved) {
             return val.get_type();
         }
         // Producing op intrinsic type (resoperation.py:1693
         // `opclasses[opnum].type` parity).
-        let resolved = self.ctx.get_box_replacement(opref);
         if let Some(op) = self.ctx.op_at(resolved) {
             if op.type_ != majit_ir::Type::Void {
                 return op.type_;
@@ -560,7 +575,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // ops, prev-phase carry, inputarg types, transformed trace result
         // types) seeded in `Optimizer::make_ctx`. Removed in Slice 0.5
         // once writers feed Op.type_ exclusively.
-        if let Some(&tp) = self.ctx.value_types.get(&opref.raw()) {
+        if let Some(&tp) = self.ctx.value_types.get(&resolved.raw()) {
             if tp != majit_ir::Type::Void {
                 return tp;
             }
@@ -574,7 +589,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             return tp;
         }
         // PtrInfo presence → Ref type (for non-emitted ops like input args)
-        if self.ctx.get_ptr_info(opref).is_some() {
+        if self.ctx.get_ptr_info(resolved).is_some() {
             return majit_ir::Type::Ref;
         }
         majit_ir::Type::Int
@@ -1116,6 +1131,23 @@ impl OptContext {
             "register_value_type: Void has no box value (opref={:?})",
             opref,
         );
+        // Slice 0.5: when `opref` already encodes its type via the Phase
+        // 1-5 OpRef enum variant tag (resoperation.py:29 AbstractValue.type
+        // parity), the side-table write is redundant — readers consult
+        // `opref.ty()` at priority 0 in `opref_type` /
+        // `OptBoxEnv::get_type`. Verify the variant-tag and registered
+        // `tp` agree (debug-only) and skip the HashMap write so producers
+        // that allocate typed positions never grow `value_types`.
+        if let Some(variant_tp) = opref.ty() {
+            debug_assert_eq!(
+                variant_tp, tp,
+                "register_value_type: OpRef variant tag ({:?}) disagrees \
+                 with registered tp ({:?}) at {:?} — fix the producer \
+                 (typed factory mismatch with op.result_type())",
+                variant_tp, tp, opref,
+            );
+            return;
+        }
         if let Some(&existing) = self.value_types.get(&opref.raw()) {
             debug_assert_eq!(
                 existing, tp,
@@ -1296,6 +1328,16 @@ impl OptContext {
         self.reserve_pos()
     }
 
+    /// Allocate a fresh OpRef position with the producer's result type
+    /// stamped on the variant tag (Slice 0.5 follow-up). Mirrors
+    /// `alloc_op_position` for callers that already know `box.type` —
+    /// the resulting OpRef is recognized at priority 0 by `opref_type` /
+    /// `OptBoxEnv::get_type`, and `register_value_type` no longer needs
+    /// to grow the side-table for these positions.
+    pub fn alloc_op_position_typed(&mut self, tp: majit_ir::Type) -> OpRef {
+        self.reserve_pos_typed(tp)
+    }
+
     /// Allocate a fresh OpRef in the constant namespace, tagged with the
     /// constant's type so the variant matches RPython's
     /// ConstInt/ConstFloat/ConstPtr split (history.py:220/261/307,
@@ -1319,7 +1361,7 @@ impl OptContext {
     /// Emit a boxed integer constant through the optimizer pipeline and return
     /// the resulting OpRef.
     pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
-        let pos_ref = self.reserve_pos();
+        let pos_ref = self.reserve_pos_typed(Type::Int);
         let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
         op.pos = pos_ref;
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -1330,7 +1372,7 @@ impl OptContext {
     /// Emit a boxed reference constant through the optimizer pipeline and
     /// return the resulting OpRef.
     pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
-        let pos_ref = self.reserve_pos();
+        let pos_ref = self.reserve_pos_typed(Type::Ref);
         let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
         op.pos = pos_ref;
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -1341,7 +1383,7 @@ impl OptContext {
     /// Emit a boxed float constant through the optimizer pipeline and return
     /// the resulting OpRef.
     pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
-        let pos_ref = self.reserve_pos();
+        let pos_ref = self.reserve_pos_typed(Type::Float);
         let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
         op.pos = pos_ref;
         let opref = self.emit_extra(self.current_pass_idx, op);
@@ -1478,10 +1520,25 @@ impl OptContext {
     }
 
     pub(crate) fn reserve_pos(&mut self) -> OpRef {
-        // opencoder.py:271 _index parity: floor at the iteration's inputarg
-        // base + num_inputs + emitted-op count, so reserve_pos never returns
-        // an OpRef inside the inputarg slice or below the parent trace's
-        // high water mark when called from a Phase 2 / bridge OptContext.
+        OpRef::from_raw(self.allocate_next_pos_raw())
+    }
+
+    /// Slice 0.5 follow-up: typed `reserve_pos`. Same allocation arithmetic
+    /// as `reserve_pos`, but tags the resulting OpRef with the producer's
+    /// result type so the Phase 1-5 variant tag (resoperation.py:29
+    /// AbstractValue.type parity) is set at allocation time. Readers consult
+    /// `opref.ty()` at priority 0 in `opref_type` / `OptBoxEnv::get_type`,
+    /// so typed positions never grow `value_types`.
+    pub(crate) fn reserve_pos_typed(&mut self, tp: majit_ir::Type) -> OpRef {
+        OpRef::op_typed(self.allocate_next_pos_raw(), tp)
+    }
+
+    /// opencoder.py:271 `_index` parity: floor at the iteration's inputarg
+    /// base + num_inputs + emitted-op count, so a freshly allocated raw
+    /// position never lands inside the inputarg slice or below the parent
+    /// trace's high water mark when called from a Phase 2 / bridge
+    /// OptContext.
+    fn allocate_next_pos_raw(&mut self) -> u32 {
         self.next_pos = self
             .next_pos
             .max(self.inputarg_base + self.num_inputs + self.new_operations.len() as u32);
@@ -1497,9 +1554,9 @@ impl OptContext {
             "reserve_pos overflowed into constant namespace: {}",
             self.next_pos
         );
-        let pos_ref = OpRef::from_raw(self.next_pos);
+        let raw = self.next_pos;
         self.next_pos += 1;
-        pos_ref
+        raw
     }
 
     /// Emit an operation to the output.
@@ -1508,7 +1565,11 @@ impl OptContext {
     /// so the backend's variable numbering stays consistent.
     pub fn emit(&mut self, mut op: Op) -> OpRef {
         if op.pos.is_none() || op.pos.is_constant() {
-            op.pos = self.reserve_pos();
+            // Slice 0.5 follow-up: tag the freshly allocated position with
+            // the producer op's result type so the variant-tag readers
+            // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
+            // (resoperation.py:1693 `opclasses[opnum].type` parity).
+            op.pos = self.reserve_pos_typed(op.result_type());
         } else {
             // Step 2 Commit D1/D2 invariants (Box identity plan, Step 7):
             //
@@ -1625,7 +1686,8 @@ impl OptContext {
     /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
     pub fn emit_extra(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
         if op.pos.is_none() {
-            op.pos = self.reserve_pos();
+            // Slice 0.5 follow-up: typed allocation, same rationale as `emit`.
+            op.pos = self.reserve_pos_typed(op.result_type());
         } else {
             self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
         }
@@ -1694,14 +1756,33 @@ impl OptContext {
                 .find_map(|entry| (entry.source == source).then_some(entry.result))
         };
 
-        let mut resolve_result = |result: &ExportedShortResult, this: &mut Self| match result {
+        let mut resolve_result = |result: &ExportedShortResult,
+                                  tp: majit_ir::Type,
+                                  this: &mut Self| match result {
             ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
             ExportedShortResult::Temporary(index) => {
                 if *index >= temporary_results.len() {
                     temporary_results.resize(index + 1, None);
                 }
                 let slot = &mut temporary_results[*index];
-                Some(*slot.get_or_insert_with(|| this.alloc_op_position()))
+                if let Some(existing) = *slot {
+                    // RPython box.type immutability (history.py:220): a
+                    // short-preamble result Box is reused across producers
+                    // with the same type. If the cached OpRef carries a
+                    // variant tag, it must match `tp`.
+                    debug_assert!(
+                        existing.ty().map_or(true, |t| t == tp),
+                        "ExportedShortResult::Temporary({}) reused with type {:?}; original variant tag {:?}",
+                        index,
+                        tp,
+                        existing.ty(),
+                    );
+                    Some(existing)
+                } else {
+                    let opref = this.alloc_op_position_typed(tp);
+                    *slot = Some(opref);
+                    Some(opref)
+                }
             }
         };
 
@@ -1741,7 +1822,7 @@ impl OptContext {
                     same_as_source,
                 } => {
                     let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, self))
+                        .or_else(|| resolve_result(result, opcode.result_type(), self))
                     else {
                         return false;
                     };
@@ -1755,7 +1836,7 @@ impl OptContext {
                             ExportedShortArg::Const { source, value } => {
                                 let opref =
                                     imported_constants.entry(*source).or_insert_with(|| {
-                                        let opref = self.alloc_op_position();
+                                        let opref = self.alloc_op_position_typed(value.get_type());
                                         self.make_constant(opref, value.clone());
                                         opref
                                     });
@@ -1792,7 +1873,7 @@ impl OptContext {
                     same_as_source,
                 } => {
                     let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, self))
+                        .or_else(|| resolve_result(result, *result_type, self))
                     else {
                         return false;
                     };
@@ -1800,7 +1881,7 @@ impl OptContext {
                         ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
                         ExportedShortArg::Const { source, value } => {
                             let opref = imported_constants.entry(*source).or_insert_with(|| {
-                                let opref = self.alloc_op_position();
+                                let opref = self.alloc_op_position_typed(value.get_type());
                                 self.make_constant(opref, value.clone());
                                 opref
                             });
@@ -1843,7 +1924,7 @@ impl OptContext {
                     same_as_source,
                 } => {
                     let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, self))
+                        .or_else(|| resolve_result(result, *result_type, self))
                     else {
                         return false;
                     };
@@ -1854,7 +1935,7 @@ impl OptContext {
                         ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
                         ExportedShortArg::Const { source, value } => {
                             let opref = imported_constants.entry(*source).or_insert_with(|| {
-                                let opref = self.alloc_op_position();
+                                let opref = self.alloc_op_position_typed(value.get_type());
                                 self.make_constant(opref, value.clone());
                                 opref
                             });
@@ -1872,7 +1953,7 @@ impl OptContext {
                         majit_ir::Type::Void => return false,
                     };
                     let index_opref = {
-                        let opref = self.alloc_op_position();
+                        let opref = self.alloc_op_position_typed(majit_ir::Type::Int);
                         self.make_constant(opref, majit_ir::Value::Int(*index));
                         opref
                     };
@@ -1900,7 +1981,7 @@ impl OptContext {
                     same_as_source,
                 } => {
                     let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, self))
+                        .or_else(|| resolve_result(result, *result_type, self))
                     else {
                         return false;
                     };
@@ -1911,7 +1992,7 @@ impl OptContext {
                     // for zero-arg calls today). Synthesize the func_ptr
                     // constant from the serialized value.
                     let func_opref = {
-                        let opref = self.alloc_op_position();
+                        let opref = self.alloc_op_position_typed(majit_ir::Type::Int);
                         self.make_constant(opref, majit_ir::Value::Int(*func_ptr));
                         opref
                     };
@@ -3951,6 +4032,30 @@ impl OptContext {
     /// assumptions about it.
     pub fn opref_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         let resolved = self.get_box_replacement(opref);
+        // 0. RPython `AbstractValue.type` (resoperation.py:29) parity. The
+        //    Phase 1-5 OpRef enum encodes `box.type` directly in the variant
+        //    tag (`ConstInt`/`InputArgInt`/`IntOp` → Int, etc.), so reading
+        //    the tag is the line-by-line equivalent of upstream `box.type`.
+        //    `Untyped(_)` and `None` return `None` here and fall through to
+        //    the legacy chain (Slice 0.5 in-progress: producers that still
+        //    allocate `Untyped` positions are being migrated to typed
+        //    factories so this becomes the only path).
+        if let Some(tp) = resolved.ty() {
+            // Slice 0.5 dual-source check: when `value_types` carries an
+            // entry for a typed-variant OpRef it MUST agree with the
+            // variant tag. Surface any divergence so we can fix the
+            // producer, not paper over with a side-table read.
+            #[cfg(debug_assertions)]
+            if let Some(&table_tp) = self.value_types.get(&resolved.raw()) {
+                debug_assert_eq!(
+                    tp, table_tp,
+                    "opref_type: OpRef variant ({:?}) disagrees with \
+                     value_types entry ({:?}) for {:?}",
+                    tp, table_tp, resolved,
+                );
+            }
+            return Some(tp);
+        }
         // 1. Seeded constant — read the intrinsic Rust shape (history.py:220
         //    `ConstInt.type = INT` parity).
         //    The constant_types_for_numbering override is intentionally

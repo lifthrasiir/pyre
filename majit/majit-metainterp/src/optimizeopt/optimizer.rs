@@ -367,7 +367,30 @@ impl Optimizer {
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        let opref = ctx.alloc_op_position();
+        // virtualstate.py:655-683 make_inputargs parity: each VSI leaf
+        // realizes a Box whose `box.type` matches the variant. Tag the
+        // OpRef variant tag at allocation time so `opref.ty()` resolves
+        // priority-0 in `opref_type` / `OptBoxEnv::get_type`.
+        use crate::optimizeopt::virtualstate::VirtualStateInfo;
+        let tp = match info {
+            VirtualStateInfo::Constant(value) => value.get_type(),
+            VirtualStateInfo::Virtual { .. }
+            | VirtualStateInfo::VArray { .. }
+            | VirtualStateInfo::VStruct { .. }
+            | VirtualStateInfo::VArrayStruct { .. }
+            | VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull => majit_ir::Type::Ref,
+            // info.py:386 RawBufferPtrInfo — raw malloc pointer carried
+            // as Int (no GC tracking).
+            VirtualStateInfo::VirtualRawBuffer { .. } => majit_ir::Type::Int,
+            VirtualStateInfo::IntBounded(_) => majit_ir::Type::Int,
+            VirtualStateInfo::Unknown(tp) => *tp,
+        };
+        let opref = if tp == majit_ir::Type::Void {
+            ctx.alloc_op_position()
+        } else {
+            ctx.alloc_op_position_typed(tp)
+        };
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!("[jit] import_virtual_state_value {opref:?} <= {info:?}");
         }
@@ -737,7 +760,7 @@ impl Optimizer {
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
-            op.pos = ctx.reserve_pos();
+            op.pos = ctx.reserve_pos_typed(tp);
             let fresh = op.pos;
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
             // SAME_AS_*.type parity); the immediate push below makes
@@ -851,13 +874,12 @@ impl Optimizer {
                 fields,
                 field_descrs,
             } => {
-                let opref = ctx.alloc_op_position();
                 // unroll.py:454 Box carries its type. Virtual heads are
                 // Ref-typed. PtrInfo presence alone cannot stand in for
                 // box.type because PtrInfo can also describe int-typed
                 // raw pointers (info.py:865 RawBufferPtrInfo +
                 // getrawptrinfo()).
-                ctx.register_value_type(opref, majit_ir::Type::Ref);
+                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
                 let imported_fields: Vec<(u32, OpRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -901,10 +923,9 @@ impl Optimizer {
                 opref
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
-                let opref = ctx.alloc_op_position();
                 // unroll.py:454 Box carries its type. VArray heads are
                 // Ref-typed.
-                ctx.register_value_type(opref, majit_ir::Type::Ref);
+                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
@@ -936,10 +957,9 @@ impl Optimizer {
                 fields,
                 field_descrs,
             } => {
-                let opref = ctx.alloc_op_position();
                 // unroll.py:454 Box carries its type. VStruct heads are
                 // Ref-typed.
-                ctx.register_value_type(opref, majit_ir::Type::Ref);
+                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -974,10 +994,9 @@ impl Optimizer {
                 fielddescrs,
                 element_fields,
             } => {
-                let opref = ctx.alloc_op_position();
                 // unroll.py:454 Box carries its type. VArrayStruct heads
                 // are Ref-typed.
-                ctx.register_value_type(opref, majit_ir::Type::Ref);
+                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
                     .map(|fields| {
@@ -1018,7 +1037,8 @@ impl Optimizer {
                 entries,
                 descrs,
             } => {
-                let opref = ctx.alloc_op_position();
+                // info.py:386 RawBufferPtrInfo — raw malloc pointer, Int.
+                let opref = ctx.alloc_op_position_typed(majit_ir::Type::Int);
                 let mut offsets = Vec::with_capacity(entries.len());
                 let mut lengths = Vec::with_capacity(entries.len());
                 let mut values = Vec::with_capacity(entries.len());
@@ -2033,10 +2053,23 @@ impl Optimizer {
                     // Cross-slot collision: target is another slot's source.
                     // Allocate fresh to avoid forwarding overwrite.
                     if target != source && source_set.contains(&target) {
-                        let fresh = ctx.alloc_op_position();
-                        if let Some(tp) = ctx.opref_type(source) {
-                            ctx.register_value_type(fresh, tp);
-                        }
+                        // The alias inherits `box.type` from `source`; tag the
+                        // OpRef variant when known so `opref_type` priority 0
+                        // resolves it. RPython Box always carries `box.type`
+                        // (history.py:220), so a None here would mean the
+                        // source slot has no resolvable type — impossible
+                        // under upstream invariants.
+                        let fresh = match ctx.opref_type(source) {
+                            Some(tp) => ctx.alloc_op_position_typed(tp),
+                            None => {
+                                debug_assert!(
+                                    false,
+                                    "cross-slot collision: source {:?} has no resolvable box.type (RPython invariant violated)",
+                                    source,
+                                );
+                                ctx.alloc_op_position()
+                            }
+                        };
                         ctx.replace_op(source, fresh);
                         fresh
                     } else {
@@ -2351,7 +2384,7 @@ impl Optimizer {
                         .opref_type(orig)
                         .expect("propagate_from_pass_range SameAs: source OpRef missing Box.type");
                     let same_as = OpCode::same_as_for_type(arg_type);
-                    let fresh = ctx.alloc_op_position();
+                    let fresh = ctx.alloc_op_position_typed(arg_type);
                     let mut op = Op::new(same_as, &[orig]);
                     op.pos = fresh;
                     // unroll.py:146 + compile.py:327 parity: accumulate the
@@ -2361,18 +2394,32 @@ impl Optimizer {
                     // past the already-sent terminal JUMP and force the
                     // loop-tail relocation workaround below.
                     extra_same_as_aliases.push(op);
-                    ctx.register_value_type(fresh, arg_type);
                     if let Some(info) = ctx.get_ptr_info(orig).cloned() {
                         let fresh_info = match info {
                             crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
                                 for field in &mut vinfo.fields {
                                     let orig_field = field.1;
-                                    let ff = ctx.alloc_op_position();
+                                    // RPython Box type parity: the alias inherits
+                                    // `box.type` from the original field; tag the
+                                    // fresh OpRef variant accordingly so it
+                                    // resolves through `opref.ty()` priority 0.
+                                    // RPython Box always carries `box.type`
+                                    // (history.py:220), so a None here would
+                                    // mean an emitted virtual-field producer
+                                    // has no resolvable type — impossible
+                                    // under upstream invariants.
+                                    let ff = match ctx.opref_type(orig_field) {
+                                        Some(tp) => ctx.alloc_op_position_typed(tp),
+                                        None => {
+                                            debug_assert!(
+                                                false,
+                                                "virtual-field alias: orig_field {:?} has no resolvable box.type (RPython invariant violated)",
+                                                orig_field,
+                                            );
+                                            ctx.alloc_op_position()
+                                        }
+                                    };
                                     ctx.replace_op(ff, orig_field);
-                                    // RPython Box type parity: copy type
-                                    if let Some(tp) = ctx.opref_type(orig_field) {
-                                        ctx.register_value_type(ff, tp);
-                                    }
                                     field.1 = ff;
                                 }
                                 crate::optimizeopt::info::PtrInfo::Virtual(vinfo)

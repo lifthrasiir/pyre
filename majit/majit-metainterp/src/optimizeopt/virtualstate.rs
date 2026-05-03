@@ -904,13 +904,24 @@ impl VirtualState {
 
     /// Rc::as_ptr dedup wrapper for `count_forced_boxes_for_entry`,
     /// mirroring `enum_forced_boxes_recurse`.
+    ///
+    /// virtualstate.py:111-116 `enum()` returns without touching
+    /// `self.position` when `position != -1`; pyre must preserve any
+    /// real OpRef the caller already wrote into `visited` (e.g. from
+    /// `import_virtual_state_from_label_args_recurse`). A blind
+    /// `insert(.., NONE)` would overwrite that real OpRef before the
+    /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
         visited: &mut std::collections::HashMap<usize, OpRef>,
     ) -> usize {
+        use std::collections::hash_map::Entry;
         let key = Rc::as_ptr(rc) as usize;
-        if visited.insert(key, OpRef::NONE).is_some() {
-            return 0;
+        match visited.entry(key) {
+            Entry::Occupied(_) => return 0,
+            Entry::Vacant(e) => {
+                e.insert(OpRef::NONE);
+            }
         }
         Self::count_forced_boxes_for_entry(rc, visited)
     }

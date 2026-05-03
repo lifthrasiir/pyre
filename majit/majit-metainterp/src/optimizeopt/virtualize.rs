@@ -730,7 +730,7 @@ impl OptVirtualize {
                         _ => None,
                     };
                     if let Some(vtable) = vtable {
-                        let const_pos = ctx.alloc_op_position();
+                        let const_pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
                         ctx.make_constant(const_pos, Value::Int(vtable as i64));
                         ctx.replace_op(op.pos, const_pos);
                         return OptimizationResult::Remove;

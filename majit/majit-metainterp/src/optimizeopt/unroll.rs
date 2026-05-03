@@ -83,7 +83,9 @@ pub struct UnrollOptimizer {
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
     pub snapshot_vable_boxes: SnapshotBoxes,
-    /// Per-guard virtualref boxes from tracing-time snapshots.
+    /// Per-guard virtualref boxes from tracing-time snapshots
+    /// (resume.py:243-247 vref_array — _number_boxes consumes them
+    /// after the virtualizable array).
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
@@ -3062,7 +3064,7 @@ impl OptUnroll {
                         }
                     }
                 }
-                let new_ref = ctx.alloc_op_position();
+                let new_ref = ctx.alloc_op_position_typed(new_op.result_type());
                 new_op.pos = new_ref;
                 // unroll.py:412-414: mapping[sop] = op; i += 1; send_extra_operation(op)
                 // RPython sets mapping BEFORE send_extra_operation.
@@ -3532,6 +3534,7 @@ impl OptUnroll {
             short_args: &[OpRef],
             temporary_results: &mut Vec<Option<OpRef>>,
             ctx: &mut OptContext,
+            tp: majit_ir::Type,
         ) -> Option<OpRef> {
             match result {
                 ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
@@ -3545,7 +3548,24 @@ impl OptUnroll {
                         temporary_results.resize(index + 1, None);
                     }
                     let slot = &mut temporary_results[*index];
-                    Some(*slot.get_or_insert_with(|| ctx.alloc_op_position()))
+                    if let Some(existing) = *slot {
+                        // RPython box.type immutability (history.py:220): a
+                        // short-preamble result Box is reused across producers
+                        // with the same type. If the cached OpRef carries a
+                        // variant tag, it must match `tp`.
+                        debug_assert!(
+                            existing.ty().map_or(true, |t| t == tp),
+                            "ExportedShortResult::Temporary({}) reused with type {:?}; original variant tag {:?}",
+                            index,
+                            tp,
+                            existing.ty(),
+                        );
+                        Some(existing)
+                    } else {
+                        let opref = ctx.alloc_op_position_typed(tp);
+                        *slot = Some(opref);
+                        Some(opref)
+                    }
                 }
             }
         }
@@ -3576,6 +3596,7 @@ impl OptUnroll {
                         short_args,
                         &mut temporary_results,
                         ctx,
+                        opcode.result_type(),
                     ) else {
                         continue;
                     };
@@ -3616,8 +3637,6 @@ impl OptUnroll {
                     if invented_name {
                         ctx.replace_op(source, result_opref);
                     }
-                    // Register type for the new OpRef (RPython Box.type parity).
-                    ctx.register_value_type(result_opref, opcode.result_type());
                     let args = args
                         .iter()
                         .map(|arg| match arg {
@@ -3712,10 +3731,9 @@ impl OptUnroll {
                         short_args,
                         &mut temporary_results,
                         ctx,
+                        result_type,
                     );
-                    let value = ctx.alloc_op_position();
-                    // Register type for the new OpRef (RPython Box.type parity).
-                    ctx.register_value_type(value, result_type);
+                    let value = ctx.alloc_op_position_typed(result_type);
                     ctx.replace_op(source, value);
                     // shortpreamble.py:75-78: fielddescr.get_index()
                     let descr_idx = descr.index();
@@ -3820,10 +3838,9 @@ impl OptUnroll {
                         short_args,
                         &mut temporary_results,
                         ctx,
+                        result_type,
                     );
-                    let value = ctx.alloc_op_position();
-                    // Register type for the new OpRef (RPython Box.type parity).
-                    ctx.register_value_type(value, result_type);
+                    let value = ctx.alloc_op_position_typed(result_type);
                     ctx.replace_op(source, value);
                     // shortpreamble.py:72,84 parity: canonicalize obj through
                     // get_box_replacement so the key matches heap.py lookup
@@ -3896,10 +3913,10 @@ impl OptUnroll {
                         short_args,
                         &mut temporary_results,
                         ctx,
+                        result_type,
                     ) else {
                         continue;
                     };
-                    ctx.register_value_type(value, result_type);
                     ctx.replace_op(source, value);
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources
@@ -4826,9 +4843,14 @@ impl OptUnroll {
     /// itself uniformly at `emit()` / `emit_extra()` /
     /// `propagate_from_pass_range`.
     fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> HashMap<OpRef, OpRef> {
-        // First pass: reserve peeled-iteration positions.
-        let peeled_positions: Vec<OpRef> =
-            (0..self.buffer.len()).map(|_| ctx.reserve_pos()).collect();
+        // First pass: reserve peeled-iteration positions, tagged with each
+        // source op's result type (Slice 0.5 follow-up — `OpRef.ty()`
+        // matches RPython's `box.type` at allocation time).
+        let peeled_positions: Vec<OpRef> = self
+            .buffer
+            .iter()
+            .map(|op| ctx.reserve_pos_typed(op.result_type()))
+            .collect();
         let mut ref_map: HashMap<OpRef, OpRef> = HashMap::new();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos, new_pos);
@@ -4864,14 +4886,17 @@ impl OptUnroll {
 
         // Emit Label between peeled and original body.
         // The Label's args match the Jump's args, forming the loop header.
-        let label_pos = ctx.reserve_pos();
+        let label_pos = ctx.reserve_pos_typed(OpCode::Label.result_type());
         let mut label_op = Op::new(OpCode::Label, &jump_op.args);
         label_op.pos = label_pos;
         ctx.emit(label_op);
 
-        // Reserve body positions and build the body ref_map.
-        let body_positions: Vec<OpRef> =
-            (0..self.buffer.len()).map(|_| ctx.reserve_pos()).collect();
+        // Reserve body positions, tagged per source op (Slice 0.5 follow-up).
+        let body_positions: Vec<OpRef> = self
+            .buffer
+            .iter()
+            .map(|op| ctx.reserve_pos_typed(op.result_type()))
+            .collect();
         let mut orig_ref_map: HashMap<OpRef, OpRef> = HashMap::new();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             orig_ref_map.insert(op.pos, new_pos);
@@ -4999,8 +5024,8 @@ impl Optimization for OptUnroll {
             }
             // Reserve the Jump's own position so it lands above any
             // inputarg range and above every body op allocated by
-            // peel_iteration.
-            jump.pos = ctx.reserve_pos();
+            // peel_iteration. Jump is Void-typed.
+            jump.pos = ctx.reserve_pos_typed(jump.result_type());
             return OptimizationResult::Emit(jump);
         }
 

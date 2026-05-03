@@ -1752,7 +1752,7 @@ impl OptHeap {
         if descr.is_always_pure() {
             if ctx.get_constant_box(op.arg(0)).is_some() {
                 if let Some(value) = ctx.constant_fold(&op) {
-                    let const_pos = ctx.alloc_op_position();
+                    let const_pos = ctx.alloc_op_position_typed(value.get_type());
                     ctx.make_constant(const_pos, value);
                     ctx.replace_op(op.pos, const_pos);
                     return OptimizationResult::Remove;
@@ -1958,7 +1958,7 @@ impl OptHeap {
         if is_vable_ref {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
-            let cmp_pos = ctx.alloc_op_position();
+            let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
             let mut cmp_op = Op::new(OpCode::IntNe, &[op.pos, zero_ref]);
             cmp_op.pos = cmp_pos;
             ctx.emit(cmp_op);
