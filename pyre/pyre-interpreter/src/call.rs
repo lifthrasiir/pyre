@@ -87,6 +87,33 @@ pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
 }
 
+// ── JIT parameter injection ──────────────────────────────────────
+//
+// `pypy/interpreter/executioncontext.py:296-298 settrace` invokes
+// `jit.set_param(None, 'trace_limit', 10000)` on the global default
+// jitdriver to widen the trace budget while a tracefunc is installed.
+// pyre-interpreter cannot import pyre-jit (its lower-layer crate), so
+// the JIT side registers a hook at boot that pyre-interpreter calls
+// through.  Mirrors the `EVAL_OVERRIDE` pattern above.
+type SetJitParamFn = fn(name: &str, value: i64);
+static SET_JIT_PARAM_HOOK: OnceLock<SetJitParamFn> = OnceLock::new();
+
+/// Register the hook that forwards `set_jit_param` calls into the JIT
+/// runtime's `WarmState::set_param`. Called by pyre-jit at startup.
+pub fn register_set_jit_param_hook(f: SetJitParamFn) {
+    let _ = SET_JIT_PARAM_HOOK.set(f);
+}
+
+/// `rlib/jit.py:818 jit.set_param(driver=None, name, value)` analogue.
+/// No-op when pyre-jit has not registered the hook (e.g. JIT-disabled
+/// builds or boot-time callers that fire before the first `eval_with_jit`
+/// invocation).
+pub fn set_jit_param(name: &str, value: i64) {
+    if let Some(hook) = SET_JIT_PARAM_HOOK.get() {
+        hook(name, value);
+    }
+}
+
 thread_local! {
     static FORCE_PLAIN_EVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Last known valid execution context — for call_user_function_with_args.

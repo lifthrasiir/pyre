@@ -735,6 +735,10 @@ impl ExecutionContext {
             self.w_tracefunc = pyre_object::PY_NULL;
         } else {
             self.force_all_frames(false);
+            // executioncontext.py:296-298 — increase the JIT's
+            // trace_limit when a tracefunc is installed; tracing
+            // generates a ton of extra ops per bytecode.
+            crate::call::set_jit_param("trace_limit", 10000);
         }
     }
 

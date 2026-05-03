@@ -1863,6 +1863,17 @@ pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
     eval_with_jit_inner(frame)
 }
 
+/// Hook target for `pyre_interpreter::call::set_jit_param`. Routes
+/// `executioncontext.py:296-298 jit.set_param(None, name, value)` calls
+/// from `ExecutionContext::settrace` into the live `WarmState`.
+fn set_jit_param_via_warmstate(name: &str, value: i64) {
+    let (driver, _) = driver_pair();
+    driver
+        .meta_interp_mut()
+        .warm_state_mut()
+        .set_param(name, value);
+}
+
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1870,6 +1881,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
         return pyre_interpreter::eval::eval_frame_plain(frame);
     }
     pyre_interpreter::call::register_eval_override(eval_with_jit);
+    pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     #[cfg(not(target_arch = "wasm32"))]
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
