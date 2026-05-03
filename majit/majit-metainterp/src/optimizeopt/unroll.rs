@@ -1406,9 +1406,25 @@ pub struct ExportedState {
     /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
     /// union of these three cases.
     pub exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
-    /// RPython unroll.py: short_boxes exported from the preamble.
-    /// Kept in a compact form that phase 2 can translate back into imported
-    /// heap cache facts.
+    /// PRE-EXISTING-ADAPTATION (Phase B B2 epic, Task #60): pyre-only
+    /// serialized form of `exported_short_boxes` with explicit
+    /// Slot/Const/Produced classification of args + Slot/Temporary
+    /// classification of results. RPython has no equivalent — Box identity
+    /// makes the classification implicit at consume-time.
+    ///
+    /// Convergence path: rewrite `import_short_preamble_ops` (~400 lines,
+    /// 4-way Pure/HeapField/HeapArrayItem/LoopInvariant enum dispatch) to
+    /// iterate `short_boxes` and recover classification at the consumer:
+    ///   - Slot/Const/Produced for args: `arg ∈ short_inputargs` /
+    ///     `arg.is_constant()` / `produced_results` lookup
+    ///   - Slot/Temporary for result: `entry.op.pos ∈ end_args` positional
+    ///     lookup vs `ctx.alloc_op_position()` fresh
+    ///
+    /// Blocker: Temporary case fires 3-47 times per bench (probe data:
+    /// fib_loop=3, nbody=11, fannkuch=47, spectral_norm=34, nested_loop=7).
+    /// Pre-allocating Temporary OpRefs at export time would require
+    /// reserving Phase 2 namespace slots from Phase 1 ctx — needs disjoint
+    /// namespace coordination across phases.
     pub exported_short_ops: Vec<ExportedShortOp>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
@@ -4072,6 +4088,73 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
     ctx
 }
 
+/// RPython compile.py:327 + shortpreamble.py:436-439 `extra_same_as` parity.
+///
+/// `shortpreamble.py PureOp/HeapOp.produce_op` emits a SameAs (or the original
+/// op) before the loop label so the body's reference to the imported result
+/// OpRef has a defining op. The `imported_short_aliases` loop in the caller
+/// only handles compound alternates (`invented_name=true`); single
+/// non-invented imported short ops (a Pure GetfieldGcPureI on a non-constant
+/// object, a HeapField, …) record their `(result, source)` mapping in
+/// `imported_short_sources` instead and never reach the alias emission.
+/// Without an extra SameAs they leave Phase 2 body ops with an undefined
+/// fresh OpRef (e.g. `v56 = i.intval`) that the body use-before-def loop
+/// later promotes into the loop label, producing an undefined Cranelift
+/// Variable on the head's fall-through into the body label.
+///
+/// Mirror RPython by emitting `SameAs(source)` at `pos=result` for every
+/// non-invented entry whose source is a real (preamble-defined) OpRef.
+/// Constant sources are skipped: the body sees them via the constants pool,
+/// not via SSA. Entries already produced by the alias loop or by the
+/// preamble itself are skipped to avoid duplicate definitions.
+///
+/// Phase B B2 epic convergence path (Task #60): once `imported_short_sources`
+/// is fully replaced by typed records (`imported_short_pure_ops` for Pure +
+/// per-kind structs for Heap/LoopInvariant), this helper's signature switches
+/// to consume those typed records directly. The body's RPython parity is
+/// then fully reachable without the untyped `(result, source)` Vec.
+fn emit_extra_same_as_for_imports(
+    result: &mut Vec<Op>,
+    imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
+    imported_short_sources: &[crate::optimizeopt::ImportedShortSource],
+    ctx: &crate::optimizeopt::OptContext,
+) {
+    let mut already_defined: std::collections::HashSet<OpRef> =
+        imported_short_aliases.iter().map(|a| a.result).collect();
+    for op in result.iter() {
+        if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
+            already_defined.insert(op.pos);
+        }
+    }
+    for entry in imported_short_sources.iter() {
+        if entry.result.is_none() || entry.result.is_constant() {
+            continue;
+        }
+        if already_defined.contains(&entry.result) {
+            continue;
+        }
+        if entry.source.is_none() || entry.source.is_constant() {
+            continue;
+        }
+        // Skip when source already equals the result (no-op SameAs).
+        if entry.source == entry.result {
+            already_defined.insert(entry.result);
+            continue;
+        }
+        // history.py:802-809 record_same_as(box) reads box.type directly;
+        // pyre's analogue is ctx.opref_type (constant → value_types → op
+        // result type). A failure to resolve is a bookkeeping bug.
+        let same_as_opcode = OpCode::same_as_for_type(
+            ctx.opref_type(entry.source)
+                .expect("assemble_peeled_trace: source OpRef missing Box.type from OptContext"),
+        );
+        let mut op = Op::new(same_as_opcode, &[entry.source]);
+        op.pos = entry.result;
+        result.push(op);
+        already_defined.insert(entry.result);
+    }
+}
+
 fn assemble_peeled_trace_with_jump_args(
     p1_ops: &[Op],
     p2_ops: &[Op],
@@ -4178,61 +4261,12 @@ fn assemble_peeled_trace_with_jump_args(
         result.push(op);
     }
 
-    // RPython compile.py:327 extra_same_as parity for non-invented imports.
-    // shortpreamble.py PureOp/HeapOp.produce_op emits a SameAs (or the
-    // original op) before the loop label so the body's reference to the
-    // imported result OpRef has a defining op. The `imported_short_aliases`
-    // loop above only handles compound alternates (`invented_name=true`);
-    // single non-invented imported short ops (a Pure GetfieldGcPureI on a
-    // non-constant object, a HeapField, …) record their `(result, source)`
-    // mapping in `imported_short_sources` instead and never reach the alias
-    // emission. Without an extra SameAs they leave Phase 2 body ops with an
-    // undefined fresh OpRef (e.g. v56 = i.intval) that the body
-    // use-before-def loop later promotes into the loop label, producing
-    // an undefined Cranelift Variable on the head's fall-through into the
-    // body label.
-    //
-    // Mirror RPython by emitting `SameAs(source)` at `pos=result` for every
-    // non-invented entry whose source is a real (preamble-defined) OpRef.
-    // Constant sources are skipped: the body sees them via the constants
-    // pool, not via SSA. Entries already produced by the alias loop or by
-    // the preamble itself are skipped to avoid duplicate definitions.
-    {
-        let mut already_defined: std::collections::HashSet<OpRef> =
-            imported_short_aliases.iter().map(|a| a.result).collect();
-        for op in &result {
-            if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
-                already_defined.insert(op.pos);
-            }
-        }
-        for entry in imported_short_sources.iter() {
-            if entry.result.is_none() || entry.result.is_constant() {
-                continue;
-            }
-            if already_defined.contains(&entry.result) {
-                continue;
-            }
-            if entry.source.is_none() || entry.source.is_constant() {
-                continue;
-            }
-            // Skip when source already equals the result (no-op SameAs).
-            if entry.source == entry.result {
-                already_defined.insert(entry.result);
-                continue;
-            }
-            // history.py:802-809 record_same_as(box) reads box.type directly;
-            // pyre's analogue is ctx.opref_type (constant → value_types → op
-            // result type). A failure to resolve is a bookkeeping bug.
-            let same_as_opcode = OpCode::same_as_for_type(
-                ctx.opref_type(entry.source)
-                    .expect("assemble_peeled_trace: source OpRef missing Box.type from OptContext"),
-            );
-            let mut op = Op::new(same_as_opcode, &[entry.source]);
-            op.pos = entry.result;
-            result.push(op);
-            already_defined.insert(entry.result);
-        }
-    }
+    emit_extra_same_as_for_imports(
+        &mut result,
+        imported_short_aliases,
+        imported_short_sources,
+        ctx,
+    );
 
     // Label position
     let label_pos = next_free_pos(max_pos);
@@ -4263,10 +4297,13 @@ fn assemble_peeled_trace_with_jump_args(
     // For extra args not defined in the preamble (Phase 2-only OpRefs),
     // emit a SameAs op mapping them from their preamble source so the
     // Cranelift fall-through can resolve them.
-    let short_source_map: HashMap<OpRef, OpRef> = imported_short_sources
-        .iter()
-        .map(|s| (s.result, s.source))
-        .collect();
+    // shortpreamble.py:436-439 extra_same_as parity: imported short ops
+    // (Pure GetfieldGcPureI on non-constant object, HeapField, …) define
+    // body OpRefs at pos=entry.result before the loop label. The downstream
+    // available-before-label check (line 4567) only needs the *set* of
+    // result OpRefs — the source field is unused at this site.
+    let imported_short_results: std::collections::HashSet<OpRef> =
+        imported_short_sources.iter().map(|s| s.result).collect();
     // Advance max_pos past every position already in use before allocating
     // fresh SameAs positions. In RPython, Box identity prevents collisions;
     // in the flat OpRef model, the assembly-allocated SameAs position must
@@ -4530,7 +4567,7 @@ fn assemble_peeled_trace_with_jump_args(
                     let available_before_label = visible_before_label.contains(&arg)
                         || visible_before_label.contains(&resolved_arg)
                         || seen_body_defs.contains(&arg)
-                        || short_source_map.contains_key(&arg);
+                        || imported_short_results.contains(&arg);
                     if available_before_label {
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);

@@ -104,7 +104,26 @@ pub struct Optimizer {
     /// RPython unroll.py: import_state — exported facts to re-apply onto the
     /// next optimizer instance before phase 2 body optimization starts.
     pub imported_loop_state: Option<crate::optimizeopt::unroll::ExportedState>,
-    /// Original preamble result boxes for imported short-box results.
+    /// PRE-EXISTING-ADAPTATION (Phase B B2 epic, Task #60): per-import
+    /// (result, source) pair tracking. RPython recovers the equivalent
+    /// via Box identity — at import, the same Box object is reused so
+    /// `produced_op = self.short_boxes[box]` works directly. Pyre's flat
+    /// OpRef model needs the explicit reverse map: `imported_short_source(result)
+    /// -> source` (mod.rs:1948), used by `force_op_from_preamble` and
+    /// `force_box_inline` to look up the producer-side `ProducedShortOp`.
+    ///
+    /// Forwarding chain captures source→result for HeapField/HeapArrayItem/
+    /// LoopInvariant + Pure-invented_name (all call ctx.replace_op). Pure
+    /// non-invented does NOT register replace_op (avoids body GuardTrue
+    /// stale-boolean — see `import_short_preamble_ops` Pure branch comment).
+    /// So the residual is Pure non-invented entries; reverse-map fallback
+    /// at consumer sites would need to handle them.
+    ///
+    /// Convergence path: pre-allocate Temporary OpRefs at export-time in a
+    /// reserved slice of the import-side Phase 2 namespace (requires
+    /// disjoint-namespace coordination across phases). Then result_opref
+    /// is fixed at export, no fresh allocation at import, and the reverse
+    /// map becomes derivable.
     pub imported_short_sources: Vec<crate::optimizeopt::ImportedShortSource>,
     /// Invented SameAs aliases imported from short-preamble export/import.
     pub imported_short_aliases: Vec<crate::optimizeopt::ImportedShortAlias>,
