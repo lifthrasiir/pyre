@@ -1477,6 +1477,37 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
     issubtype_w(w_obj, base_exc)
 }
 
+/// pypy/interpreter/baseobjspace.py:1364-1365 `exception_is_valid_class_w`.
+///
+///   def exception_is_valid_class_w(self, w_cls):
+///       return self.issubtype_w(w_cls, self.w_BaseException)
+///
+/// Like `exception_is_valid_obj_as_class_w` but skips the
+/// `isinstance_w(w_cls, w_type)` precheck — the caller already knows
+/// `w_cls` is a class object.
+pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
+    let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
+        return false;
+    };
+    issubtype_w(w_cls, base_exc)
+}
+
+/// pypy/interpreter/baseobjspace.py:1367-1368 `exception_getclass`.
+///
+///   def exception_getclass(self, w_obj):
+///       return self.type(w_obj)
+pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
+    crate::typedef::r#type(w_obj).unwrap_or(pyre_object::PY_NULL)
+}
+
+/// pypy/interpreter/baseobjspace.py:1370-1371 `exception_issubclass_w`.
+///
+///   def exception_issubclass_w(self, w_cls1, w_cls2):
+///       return self.issubtype_w(w_cls1, w_cls2)
+pub unsafe fn exception_issubclass_w(w_cls1: PyObjectRef, w_cls2: PyObjectRef) -> bool {
+    unsafe { issubtype_w(w_cls1, w_cls2) }
+}
+
 /// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:399
 /// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
 /// fast path, then forward `__pow__` and reverse `__rpow__` with the

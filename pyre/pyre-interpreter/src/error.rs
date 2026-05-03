@@ -47,7 +47,18 @@ impl OperationError {
     ///                 else:
     ///                     w_value = space.call_function(w_type, w_value)
     ///                 w_type = self._exception_getclass(space, w_value)
-    ///         # ... traceback handling
+    ///         if self._application_traceback:
+    ///             from pypy.interpreter.pytraceback import PyTraceback
+    ///             from pypy.module.exceptions.interp_exceptions import W_BaseException
+    ///             tb = self._application_traceback
+    ///             if (isinstance(w_value, W_BaseException) and
+    ///                 isinstance(tb, PyTraceback)):
+    ///                 # traceback hasn't escaped yet
+    ///                 w_value.w_traceback = tb
+    ///             else:
+    ///                 # traceback has escaped
+    ///                 space.setattr(w_value, space.newtext("__traceback__"),
+    ///                               self.get_w_traceback(space))
     ///     else:
     ///         w_inst = w_type
     ///         w_instclass = self._exception_getclass(space, w_inst)
@@ -61,44 +72,51 @@ impl OperationError {
     /// ```
     ///
     /// Mutates `self` to install the normalized `(w_type, w_value)` and
-    /// returns the new `w_value`.  Traceback handling
-    /// (error.py:225-236) is skipped — pyre has no `W_BaseException
-    /// .w_traceback` slot yet.
+    /// returns the new `w_value`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: the W_BaseException fast path
+    /// (error.py:228-232 `w_value.w_traceback = tb`) requires the
+    /// `w_traceback` slot to be present on `W_ExceptionObject`
+    /// (`pyre-object/excobject.rs` carries only `kind` + `message`
+    /// today).  The PyPy W_BaseException expansion epic is the
+    /// prerequisite; until it lands, the fallback `space.setattr(w_value,
+    /// "__traceback__", tb)` path covers both branches semantically —
+    /// PyPy's two arms differ only in optimisation.
     pub fn normalize_exception(&mut self, space: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        let _ = space;
         let mut w_type = self.w_type;
-        let mut w_value = self.w_value;
+        let mut w_value = self.get_w_value(space);
         unsafe {
             if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_type) {
                 if w_value.is_null() || w_value == pyre_object::w_none() {
-                    // (Class, None) → call Class()
+                    // error.py:208-210 (Class, None): instantiate Class()
                     w_value = crate::baseobjspace::call_function(w_type, &[]);
                     if w_value.is_null() {
-                        // Constructor raised — surface stash.
                         return Err(crate::call::take_call_error()
                             .unwrap_or_else(|| PyError::type_error("constructor failed")));
                     }
                     w_type = self._exception_getclass(w_value)?;
                 } else {
-                    let w_valuetype =
-                        crate::typedef::r#type(w_value).unwrap_or(pyre_object::PY_NULL);
+                    // error.py:212 w_valuetype = space.exception_getclass(w_value)
+                    let w_valuetype = crate::baseobjspace::exception_getclass(w_value);
                     if !w_valuetype.is_null()
-                        && crate::baseobjspace::issubtype_w(w_valuetype, w_type)
+                        && crate::baseobjspace::exception_issubclass_w(w_valuetype, w_type)
                     {
-                        // (Class, inst) where inst : Class → (inst.__class__, inst)
+                        // error.py:213-215 (Class, inst): use inst's exact class
                         w_type = w_valuetype;
-                    } else if pyre_object::is_tuple(w_value) {
-                        // (Class, tuple) → Class(*tuple)
-                        let items = pyre_object::w_tuple_items_copy_as_vec(w_value);
-                        w_value = crate::baseobjspace::call_function(w_type, &items);
-                        if w_value.is_null() {
-                            return Err(crate::call::take_call_error()
-                                .unwrap_or_else(|| PyError::type_error("constructor failed")));
-                        }
-                        w_type = self._exception_getclass(w_value)?;
                     } else {
-                        // (Class, x) → Class(x)
-                        w_value = crate::baseobjspace::call_function(w_type, &[w_value]);
+                        // error.py:217 if space.isinstance_w(w_value, space.w_tuple):
+                        let w_tuple_cls =
+                            crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
+                        if !w_tuple_cls.is_null()
+                            && crate::baseobjspace::isinstance_w(w_value, w_tuple_cls)
+                        {
+                            // error.py:218-220 (Class, tuple): Class(*tuple)
+                            let items = pyre_object::w_tuple_items_copy_as_vec(w_value);
+                            w_value = crate::baseobjspace::call_function(w_type, &items);
+                        } else {
+                            // error.py:221-223 (Class, x): Class(x)
+                            w_value = crate::baseobjspace::call_function(w_type, &[w_value]);
+                        }
                         if w_value.is_null() {
                             return Err(crate::call::take_call_error()
                                 .unwrap_or_else(|| PyError::type_error("constructor failed")));
@@ -106,8 +124,20 @@ impl OperationError {
                         w_type = self._exception_getclass(w_value)?;
                     }
                 }
+                // error.py:225-236 traceback attach.
+                if let Some(tb) = self._application_traceback {
+                    // PRE-EXISTING-ADAPTATION (see method docstring): the
+                    // W_BaseException-typed fast path is unreachable until
+                    // pyre grows the `w_traceback` slot on
+                    // `W_ExceptionObject`.  Until then both arms fall through
+                    // to the generic setattr escape (error.py:235-236), which
+                    // PyPy uses unconditionally for any non-W_BaseException
+                    // value.  No semantic loss — only the slot-write
+                    // optimisation is deferred.
+                    let _ = crate::baseobjspace::setattr(w_value, "__traceback__", tb);
+                }
             } else {
-                // (inst, None) — `raise inst`
+                // error.py:238-245 (inst, None) — `raise inst`
                 let w_inst = w_type;
                 let w_instclass = self._exception_getclass(w_inst)?;
                 if !w_value.is_null() && w_value != pyre_object::w_none() {
@@ -124,12 +154,18 @@ impl OperationError {
         Ok(w_value)
     }
 
-    /// error.py:251-257 `_exception_getclass(space, w_inst, what="exceptions")`.
+    /// pypy/interpreter/error.py:251-257 `_exception_getclass(space, w_inst, what="exceptions")`.
+    ///
+    /// ```python
+    /// def _exception_getclass(self, space, w_inst, what="exceptions"):
+    ///     w_type = space.exception_getclass(w_inst)
+    ///     if not space.exception_is_valid_class_w(w_type):
+    ///         raise oefmt(space.w_TypeError, ...)
+    ///     return w_type
+    /// ```
     fn _exception_getclass(&self, w_inst: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        let w_type = crate::typedef::r#type(w_inst).unwrap_or(pyre_object::PY_NULL);
-        if w_type.is_null()
-            || !unsafe { crate::baseobjspace::exception_is_valid_obj_as_class_w(w_type) }
-        {
+        let w_type = crate::baseobjspace::exception_getclass(w_inst);
+        if w_type.is_null() || !unsafe { crate::baseobjspace::exception_is_valid_class_w(w_type) } {
             return Err(PyError::type_error(
                 "exceptions must derive from BaseException",
             ));

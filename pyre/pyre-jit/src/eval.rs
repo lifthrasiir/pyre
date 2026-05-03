@@ -10,6 +10,7 @@
 use crate::jit::state::{PyreEnv, PyreJitState};
 use crate::jit::trace::trace_bytecode;
 use pyre_interpreter::PyExecutionContext;
+use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
     PyResult, StepResult, decode_instruction_for_dispatch, execute_opcode_step,

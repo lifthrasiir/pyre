@@ -96,12 +96,25 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
     w_a
 }
 
-/// Allocate a new W_CodeObject wrapping an opaque code pointer.
+/// pypy/interpreter/pycode.py:107-147 `PyCode.__init__`
+/// (`hidden_applevel` field assignment, line 147).
+///
+/// ```python
+/// def __init__(self, space, ..., hidden_applevel=False, magic=default_magic):
+///     ...
+///     self.hidden_applevel = hidden_applevel
+/// ```
+///
+/// `w_code_new(code_ptr)` is the `hidden_applevel=False` default
+/// shorthand; callers who need the flag set (mirroring PyPy's
+/// `BuiltinCode` (gateway.py:743) / `ApplevelClass`
+/// (gateway.py:1355) / `_continuation` entrypoint dummy
+/// (interp_continuation.py:195)) construct via this entry point.
 ///
 /// # Safety
 /// `code_ptr` must be a valid pointer to a `CodeObject` obtained
 /// via `Box::into_raw`.
-pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
+pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     let obj = Box::new(W_CodeObject {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
@@ -109,15 +122,48 @@ pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
         },
         code_ptr,
         w_globals: std::ptr::null_mut(),
-        hidden_applevel: false,
+        hidden_applevel,
     });
     Box::into_raw(obj) as PyObjectRef
+}
+
+/// pypy/interpreter/pycode.py:107-147 `PyCode.__init__` shorthand —
+/// equivalent to PyPy `hidden_applevel=False` default
+/// (pycode.py:111).  Most user-level pycode constructions take this
+/// path; only the gateway / continuation / `__pypy__.hidden_applevel`
+/// surfaces flip the flag to `True`.
+///
+/// # Safety
+/// `code_ptr` must be a valid pointer to a `CodeObject` obtained
+/// via `Box::into_raw`.
+pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
+    w_code_new_with_hidden_applevel(code_ptr, false)
 }
 
 /// Box a cloned compiler code object into a heap Python code wrapper.
 pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
     w_code_new(code_ptr)
+}
+
+/// pypy/module/__pypy__/interp_magic.py:79
+/// `func.getcode().hidden_applevel = True` — explicit setter for the
+/// `__pypy__.hidden_applevel(func)` builtin marker, plus the
+/// `_continuation.entrypoint_pycode.hidden_applevel = True`
+/// hand-edit (interp_continuation.py:195).  PyPy mutates the field
+/// directly; pyre wraps the raw write because the field is private
+/// to this module.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject`.
+#[inline]
+pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool) {
+    if obj.is_null() {
+        return;
+    }
+    unsafe {
+        (*(obj as *mut W_CodeObject)).hidden_applevel = hidden_applevel;
+    }
 }
 
 /// Extract the opaque code pointer from a known W_CodeObject.
