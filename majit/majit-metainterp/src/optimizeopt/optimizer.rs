@@ -124,7 +124,7 @@ pub struct Optimizer {
     /// disjoint-namespace coordination across phases). Then result_opref
     /// is fixed at export, no fresh allocation at import, and the reverse
     /// map becomes derivable.
-    pub imported_short_sources: Vec<crate::optimizeopt::ImportedShortSource>,
+    pub imported_short_sources: Vec<(OpRef, OpRef)>,
     /// Invented SameAs aliases imported from short-preamble export/import.
     pub imported_short_aliases: Vec<crate::optimizeopt::ImportedShortAlias>,
     /// Builder-derived short preamble actually used by phase 2.
@@ -592,7 +592,7 @@ impl Optimizer {
         }
     }
 
-    fn install_imported_virtuals(&self, ctx: &mut OptContext) {
+    pub(crate) fn install_imported_virtuals(&self, ctx: &mut OptContext) {
         // virtualstate.py:655-670 make_inputargs + 627-634 _enum parity:
         // label_args are laid out by recursive _enum traversal where each
         // NotVirtualStateInfo leaf gets a position_in_notvirtuals slot.
@@ -2077,8 +2077,9 @@ impl Optimizer {
                     }
                 })
                 .collect();
-            // unroll.py:493-494: label_args = virtual_state.make_inputargs(targetargs, optimizer)
-            let label_args = crate::optimizeopt::unroll::import_state(
+            // unroll.py:479-504 import_state: forwarding + make_inputargs
+            // + install_imported_virtuals + ShortPreambleBuilder/produce_op.
+            let _label_args = crate::optimizeopt::unroll::import_state_full(
                 &targetargs,
                 exported_state,
                 self,
@@ -2093,11 +2094,7 @@ impl Optimizer {
                         &sa[base..]
                     );
                 }
-            }
-            self.imported_label_args = Some(label_args.clone());
-            if !self.imported_virtuals.is_empty() {
-                self.install_imported_virtuals(&mut ctx);
-                if crate::optimizeopt::majit_log_enabled() {
+                if !self.imported_virtuals.is_empty() {
                     let upper = ctx.inputarg_base + ctx.num_inputs;
                     for raw in ctx.inputarg_base..upper {
                         let raw = OpRef::from_raw(raw);
@@ -2108,12 +2105,6 @@ impl Optimizer {
                     }
                 }
             }
-            crate::optimizeopt::unroll::import_short_preamble_state(
-                &targetargs,
-                &label_args,
-                exported_state,
-                &mut ctx,
-            );
         }
         // Restore the temporarily-taken imported_loop_state.
         self.imported_loop_state = imported_loop_state_taken;

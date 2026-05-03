@@ -192,12 +192,6 @@ pub struct ImportedShortAlias {
     pub same_as_opcode: OpCode,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ImportedShortSource {
-    pub result: OpRef,
-    pub source: OpRef,
-}
-
 /// optimizer.py:787-789: constant_fold — allocate an immutable object at
 /// compile time when all fields are constants. The callback receives the
 /// SizeDescr size_bytes, and returns a raw pointer (GcRef) to freshly
@@ -274,18 +268,17 @@ pub struct OptContext {
     /// RPython shortpreamble.py / pure.py: imported pure-operation results from
     /// the preamble. Phase 2 uses these as cross-iteration CSE facts.
     pub imported_short_pure_ops: Vec<ImportedShortPureOp>,
-    /// RPython shortpreamble.py: invented SameAs names preserved from exported
-    /// short boxes. Phase 2 can later re-materialize these aliases when
-    /// building the short preamble for bridges.
-    pub imported_short_aliases: Vec<ImportedShortAlias>,
     /// (base_len, short_args): virtual field values start at base_len
     /// within short_args. Used by install_imported_virtuals.
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
     /// Original preamble result box for each imported short-box result.
     /// This preserves RPython PreambleOp.op identity so phase 2 assembly
     /// can remap any surviving synthetic imported boxes back to the
-    /// corresponding preamble value.
-    pub imported_short_sources: Vec<ImportedShortSource>,
+    /// corresponding preamble value.  Stored as `Vec<(result, source)>`
+    /// so iteration order matches RPython `shortpreamble.py:246` short
+    /// preamble production order (OrderedDict-style insertion order);
+    /// reverse lookup is an O(n) scan.
+    pub imported_short_sources: Vec<(OpRef, OpRef)>,
     /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
@@ -1191,7 +1184,6 @@ impl OptContext {
             pending_mark_last_guard: None,
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
-            imported_short_aliases: Vec::new(),
             imported_virtual_args: None,
             imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
@@ -1273,7 +1265,6 @@ impl OptContext {
             pending_mark_last_guard: None,
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
-            imported_short_aliases: Vec::new(),
             imported_virtual_args: None,
             imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
@@ -1734,62 +1725,85 @@ impl OptContext {
         self.imported_short_preamble_used.clear();
     }
 
-    pub fn initialize_imported_short_preamble_builder_from_exported_ops(
+    /// Phase B.4.a: shortpreamble.py:409-430 ShortPreambleBuilder constructor parity.
+    ///
+    /// Reads `exported_state.short_boxes` (RPython `ExportedState.short_boxes`)
+    /// directly, classifying each `ProducedShortOp.preamble_op.args` as
+    /// Slot/Const/Produced at consume time and rebuilding the
+    /// `ShortPreambleBuilder` keyed by Phase 2 OpRefs.
+    ///
+    /// Replaces the legacy `_from_exported_ops` function which read the
+    /// `Vec<ExportedShortOp>` enum-serialization path. The new path
+    /// matches RPython literally — no intermediate enum, polymorphism via
+    /// `produce_op`-side data on `ProducedShortOp` itself.
+    ///
+    /// The Phase-2 result OpRef for each entry is read from `result_map`,
+    /// computed before this constructor just as RPython already has the
+    /// target `Box` identities before `ProducedShortOp.produce_op` runs.
+    /// Args are resolved via local `produced_results` (source pos →
+    /// resolved OpRef) and the caller-owned `imported_constants` map
+    /// (source const OpRef → seeded fresh slot), which is reused by the
+    /// following produce-op loop.
+    pub fn initialize_imported_short_preamble_builder_from_short_boxes(
         &mut self,
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
-        exported_short_ops: &[crate::optimizeopt::unroll::ExportedShortOp],
+        short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
+        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        result_map: &HashMap<OpRef, OpRef>,
+        mut imported_constants: &mut HashMap<OpRef, OpRef>,
+        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) -> bool {
         use crate::optimizeopt::shortpreamble::{
             PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
         };
-        use crate::optimizeopt::unroll::{ExportedShortArg, ExportedShortOp, ExportedShortResult};
 
-        let mut produced: Vec<(OpRef, ProducedShortOp)> =
-            Vec::with_capacity(exported_short_ops.len());
-        let mut produced_results: Vec<OpRef> = Vec::with_capacity(exported_short_ops.len());
-        let mut temporary_results: Vec<Option<OpRef>> = Vec::new();
-        let mut imported_constants: HashMap<OpRef, OpRef> = HashMap::new();
-        let imported_result_for_source = |source: OpRef, this: &Self| {
-            this.imported_short_sources
-                .iter()
-                .find_map(|entry| (entry.source == source).then_some(entry.result))
-        };
-
-        let mut resolve_result = |result: &ExportedShortResult,
-                                  tp: majit_ir::Type,
-                                  this: &mut Self| match result {
-            ExportedShortResult::Slot(slot) => short_args.get(*slot).copied(),
-            ExportedShortResult::Temporary(index) => {
-                if *index >= temporary_results.len() {
-                    temporary_results.resize(index + 1, None);
-                }
-                let slot = &mut temporary_results[*index];
-                if let Some(existing) = *slot {
-                    // RPython box.type immutability (history.py:220): a
-                    // short-preamble result Box is reused across producers
-                    // with the same type. If the cached OpRef carries a
-                    // variant tag, it must match `tp`.
-                    debug_assert!(
-                        existing.ty().map_or(true, |t| t == tp),
-                        "ExportedShortResult::Temporary({}) reused with type {:?}; original variant tag {:?}",
-                        index,
-                        tp,
-                        existing.ty(),
-                    );
-                    Some(existing)
-                } else {
-                    let opref = this.alloc_op_position_typed(tp);
-                    *slot = Some(opref);
-                    Some(opref)
-                }
+        // shortpreamble.py:414-426 ShortPreambleBuilder.__init__ parity:
+        //
+        //   for produced_op in short_boxes:
+        //       op = produced_op.short_op.res
+        //       preamble_op = produced_op.preamble_op
+        //       if isinstance(op, Const):
+        //           info = optimizer.getinfo(op)
+        //       else:
+        //           info = exported_infos.get(op, None)
+        //           if info is None:
+        //               info = empty_info
+        //       preamble_op.set_forwarded(info)
+        //
+        // RPython sets `_forwarded = info` on each `preamble_op` so a
+        // later `use_box` (≡ majit `force_op_from_preamble_op`) reads
+        // the info via `get_forwarded()` and routes it through
+        // `setinfo_from_preamble(box, info, None)` + `info.make_guards`.
+        //
+        // majit's `force_op_from_preamble_op` reads the equivalent via
+        // `self.get_ptr_info(preamble_source)`; without this pre-seed,
+        // info from `exported_infos` for sources outside
+        // `next_iteration_args` (Pure / Heap / LoopInvariant short-op
+        // sources) never reaches the use_box path.
+        //
+        // Guard against clobbering existing forwarding (set by an
+        // earlier `replace_op` from `import_state` for sources that
+        // happen to coincide with `next_iteration_args`): only seed
+        // when no PtrInfo and no replacement op are recorded yet.
+        for (source, _produced_op) in short_boxes {
+            if source.is_constant() {
+                continue;
             }
-        };
+            if self.get_ptr_info(*source).is_some() || self.is_replaced(*source) {
+                continue;
+            }
+            if let Some(crate::optimizeopt::info::OpInfo::Ptr(pinfo)) = exported_infos.get(source) {
+                self.set_ptr_info(*source, pinfo.clone());
+            }
+        }
 
+        let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
+        let mut produced_results: HashMap<OpRef, OpRef> = HashMap::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
-        // opcode is a Call get rewritten to the CallPure* equivalent so the
-        // short preamble can replay the cached call without re-executing
-        // arbitrary side effects.
+        // opcode is a Call get rewritten to the CallPure* equivalent so
+        // the short preamble can replay the cached call without
+        // re-executing arbitrary side effects.
         let pure_call_opcode = |op: OpCode| -> OpCode {
             match op {
                 OpCode::CallI => OpCode::CallPureI,
@@ -1810,207 +1824,172 @@ impl OptContext {
                 majit_ir::Type::Void => OpCode::CallLoopinvariantN,
             }
         };
-        for entry in exported_short_ops {
-            match entry {
-                ExportedShortOp::Pure {
-                    source,
-                    opcode,
-                    descr,
-                    args,
-                    result,
-                    invented_name,
-                    same_as_source,
-                } => {
-                    let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, opcode.result_type(), self))
-                    else {
-                        return false;
-                    };
-                    let mut resolved_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        let resolved = match arg {
-                            ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
-                            ExportedShortArg::Produced(index) => {
-                                produced_results.get(*index).copied()
-                            }
-                            ExportedShortArg::Const { source, value } => {
-                                let opref =
-                                    imported_constants.entry(*source).or_insert_with(|| {
-                                        let opref = self.alloc_op_position_typed(value.get_type());
-                                        self.make_constant(opref, value.clone());
-                                        opref
-                                    });
-                                Some(*opref)
-                            }
-                        };
-                        let Some(resolved) = resolved else {
+        // shortpreamble.py:283 `ShortBoxes.produce_arg` — classify an arg
+        // through the shared classifier, then collapse the Slot/Const/
+        // Produced variants down to the Phase-2 OpRef the builder needs.
+        // Sharing the classifier with `ProducedShortOp::produce_op` (which
+        // also dispatches via `classify_short_arg`) keeps the two consume
+        // sites locked to a single rule, mirroring RPython's single
+        // `produce_arg` path.
+        let resolve_arg = |arg: OpRef,
+                           ctx: &mut Self,
+                           produced_results: &HashMap<OpRef, OpRef>,
+                           imported_constants: &mut HashMap<OpRef, OpRef>|
+         -> Option<OpRef> {
+            crate::optimizeopt::shortpreamble::classify_short_arg(
+                ctx,
+                arg,
+                short_inputargs,
+                short_args,
+                produced_results,
+                imported_constants,
+                short_box_const_values,
+            )
+            .map(|cls| match cls {
+                crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
+                crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
+            })
+        };
+
+        for (source, produced_op) in short_boxes {
+            // Some ProducedShortOps (PreambleOpKind::Heap with non-getfield /
+            // non-getarrayitem opcodes, or other non-emitting entries) have
+            // no Phase-2 result. They are no-ops for the imported builder.
+            let result_opref = match result_map.get(source).copied() {
+                Some(r) => r,
+                None => continue,
+            };
+            match produced_op.kind {
+                PreambleOpKind::Pure => {
+                    let mut resolved_args = Vec::with_capacity(produced_op.preamble_op.args.len());
+                    for &arg in &produced_op.preamble_op.args {
+                        let Some(resolved) =
+                            resolve_arg(arg, self, &produced_results, &mut imported_constants)
+                        else {
                             return false;
                         };
                         resolved_args.push(resolved);
                     }
-                    let mut op = Op::new(pure_call_opcode(*opcode), &resolved_args);
+                    let mut op = Op::new(
+                        pure_call_opcode(produced_op.preamble_op.opcode),
+                        &resolved_args,
+                    );
                     op.pos = result_opref;
-                    op.descr = descr.clone();
-                    let produced_op = ProducedShortOp {
+                    op.descr = produced_op.preamble_op.descr.clone();
+                    let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         preamble_op: op,
-                        invented_name: *invented_name,
-                        same_as_source: *same_as_source,
+                        invented_name: produced_op.invented_name,
+                        same_as_source: produced_op.same_as_source,
                     };
-                    produced.push((*source, produced_op.clone()));
+                    produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
-                        produced.push((result_opref, produced_op));
+                        produced.push((result_opref, new_pop));
                     }
-                    produced_results.push(result_opref);
+                    produced_results.insert(*source, result_opref);
                 }
-                ExportedShortOp::HeapField {
-                    source,
-                    object,
-                    descr,
-                    result_type,
-                    result,
-                    invented_name,
-                    same_as_source,
-                } => {
-                    let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, *result_type, self))
+                PreambleOpKind::Heap => {
+                    let result_type = produced_op.preamble_op.result_type();
+                    let descr = match produced_op.preamble_op.descr.clone() {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    let object_arg = produced_op.preamble_op.arg(0);
+                    let Some(obj) =
+                        resolve_arg(object_arg, self, &produced_results, &mut imported_constants)
                     else {
                         return false;
                     };
-                    let obj = match object {
-                        ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
-                        ExportedShortArg::Const { source, value } => {
-                            let opref = imported_constants.entry(*source).or_insert_with(|| {
-                                let opref = self.alloc_op_position_typed(value.get_type());
-                                self.make_constant(opref, value.clone());
-                                opref
-                            });
-                            Some(*opref)
+                    let new_pop = match produced_op.preamble_op.opcode {
+                        OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
+                            let opcode = match result_type {
+                                majit_ir::Type::Int => OpCode::GetfieldGcI,
+                                majit_ir::Type::Ref => OpCode::GetfieldGcR,
+                                majit_ir::Type::Float => OpCode::GetfieldGcF,
+                                majit_ir::Type::Void => return false,
+                            };
+                            let mut op = Op::new(opcode, &[obj]);
+                            op.pos = result_opref;
+                            op.descr = Some(descr);
+                            ProducedShortOp {
+                                kind: PreambleOpKind::Heap,
+                                preamble_op: op,
+                                invented_name: produced_op.invented_name,
+                                same_as_source: produced_op.same_as_source,
+                            }
                         }
-                        ExportedShortArg::Produced(_) => None,
-                    };
-                    let Some(obj) = obj else {
-                        return false;
-                    };
-                    let opcode = match result_type {
-                        majit_ir::Type::Int => OpCode::GetfieldGcI,
-                        majit_ir::Type::Ref => OpCode::GetfieldGcR,
-                        majit_ir::Type::Float => OpCode::GetfieldGcF,
-                        majit_ir::Type::Void => return false,
-                    };
-                    let mut op = Op::new(opcode, &[obj]);
-                    op.pos = result_opref;
-                    op.descr = Some(descr.clone());
-                    let produced_op = ProducedShortOp {
-                        kind: PreambleOpKind::Heap,
-                        preamble_op: op,
-                        invented_name: *invented_name,
-                        same_as_source: *same_as_source,
-                    };
-                    produced.push((*source, produced_op.clone()));
-                    if *source != result_opref {
-                        produced.push((result_opref, produced_op));
-                    }
-                    produced_results.push(result_opref);
-                }
-                ExportedShortOp::HeapArrayItem {
-                    source,
-                    object,
-                    descr,
-                    index,
-                    result_type,
-                    result,
-                    invented_name,
-                    same_as_source,
-                } => {
-                    let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, *result_type, self))
-                    else {
-                        return false;
-                    };
-                    // shortpreamble.py:128 sb.produce_arg() parity: all args
-                    // (including const base objects) go through the same
-                    // import-local constant path so the builder tracks them.
-                    let obj = match object {
-                        ExportedShortArg::Slot(slot) => short_args.get(*slot).copied(),
-                        ExportedShortArg::Const { source, value } => {
-                            let opref = imported_constants.entry(*source).or_insert_with(|| {
-                                let opref = self.alloc_op_position_typed(value.get_type());
-                                self.make_constant(opref, value.clone());
-                                opref
-                            });
-                            Some(*opref)
+                        OpCode::GetarrayitemGcI
+                        | OpCode::GetarrayitemGcR
+                        | OpCode::GetarrayitemGcF => {
+                            let opcode = match result_type {
+                                majit_ir::Type::Int => OpCode::GetarrayitemGcI,
+                                majit_ir::Type::Ref => OpCode::GetarrayitemGcR,
+                                majit_ir::Type::Float => OpCode::GetarrayitemGcF,
+                                majit_ir::Type::Void => return false,
+                            };
+                            // shortpreamble.py:81 `g.getarg(1).getint()`:
+                            // pull the integer VALUE through the shared
+                            // `classify_short_arg` rule, which checks
+                            // `short_box_const_values` (producer snapshot)
+                            // first then the consumer ctx const pool.
+                            // `OpRef::raw()` is a tagged trace position —
+                            // not the constant integer value.
+                            let index_arg = produced_op.preamble_op.arg(1);
+                            let index_opref = match resolve_arg(
+                                index_arg,
+                                self,
+                                &produced_results,
+                                imported_constants,
+                            ) {
+                                Some(r) => r,
+                                None => return false,
+                            };
+                            let mut op = Op::new(opcode, &[obj, index_opref]);
+                            op.pos = result_opref;
+                            op.descr = Some(descr);
+                            ProducedShortOp {
+                                kind: PreambleOpKind::Heap,
+                                preamble_op: op,
+                                invented_name: produced_op.invented_name,
+                                same_as_source: produced_op.same_as_source,
+                            }
                         }
-                        ExportedShortArg::Produced(_) => None,
+                        _ => continue,
                     };
-                    let Some(obj) = obj else {
-                        return false;
-                    };
-                    let opcode = match result_type {
-                        majit_ir::Type::Int => OpCode::GetarrayitemGcI,
-                        majit_ir::Type::Ref => OpCode::GetarrayitemGcR,
-                        majit_ir::Type::Float => OpCode::GetarrayitemGcF,
-                        majit_ir::Type::Void => return false,
-                    };
-                    let index_opref = {
-                        let opref = self.alloc_op_position_typed(majit_ir::Type::Int);
-                        self.make_constant(opref, majit_ir::Value::Int(*index));
-                        opref
-                    };
-                    let mut op = Op::new(opcode, &[obj, index_opref]);
-                    op.pos = result_opref;
-                    op.descr = Some(descr.clone());
-                    let produced_op = ProducedShortOp {
-                        kind: PreambleOpKind::Heap,
-                        preamble_op: op,
-                        invented_name: *invented_name,
-                        same_as_source: *same_as_source,
-                    };
-                    produced.push((*source, produced_op.clone()));
+                    produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
-                        produced.push((result_opref, produced_op));
+                        produced.push((result_opref, new_pop));
                     }
-                    produced_results.push(result_opref);
+                    produced_results.insert(*source, result_opref);
                 }
-                ExportedShortOp::LoopInvariant {
-                    source,
-                    func_ptr,
-                    result_type,
-                    result,
-                    invented_name,
-                    same_as_source,
-                } => {
-                    let Some(result_opref) = imported_result_for_source(*source, self)
-                        .or_else(|| resolve_result(result, *result_type, self))
-                    else {
+                PreambleOpKind::LoopInvariant => {
+                    let result_type = produced_op.preamble_op.result_type();
+                    let Some(func_opref) = resolve_arg(
+                        produced_op.preamble_op.arg(0),
+                        self,
+                        &produced_results,
+                        imported_constants,
+                    ) else {
                         return false;
                     };
-                    // shortpreamble.py LoopInvariantOp replays the call with
-                    // its original func_ptr argument. The serialization only
-                    // carries the func ptr — the call had no other args
-                    // (collect_exported_short_ops only emits LoopInvariant
-                    // for zero-arg calls today). Synthesize the func_ptr
-                    // constant from the serialized value.
-                    let func_opref = {
-                        let opref = self.alloc_op_position_typed(majit_ir::Type::Int);
-                        self.make_constant(opref, majit_ir::Value::Int(*func_ptr));
-                        opref
-                    };
-                    let opcode = loop_invariant_opcode(*result_type);
-                    let mut op = Op::new(opcode, &[func_opref]);
+                    if self.get_constant_int(func_opref).is_none() {
+                        return false;
+                    }
+                    let mut op = Op::new(loop_invariant_opcode(result_type), &[func_opref]);
                     op.pos = result_opref;
-                    let produced_op = ProducedShortOp {
+                    let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         preamble_op: op,
-                        invented_name: *invented_name,
-                        same_as_source: *same_as_source,
+                        invented_name: produced_op.invented_name,
+                        same_as_source: produced_op.same_as_source,
                     };
-                    produced.push((*source, produced_op.clone()));
+                    produced.push((*source, new_pop.clone()));
                     if *source != result_opref {
-                        produced.push((result_opref, produced_op));
+                        produced.push((result_opref, new_pop));
                     }
-                    produced_results.push(result_opref);
+                    produced_results.insert(*source, result_opref);
                 }
+                PreambleOpKind::InputArg | PreambleOpKind::Guard => {}
             }
         }
 
@@ -2018,9 +1997,6 @@ impl OptContext {
         for (&const_idx, _) in &self.const_pool {
             builder.note_known_constant(OpRef::from_const(const_idx));
         }
-        // Imported constants are bridge-local stand-ins for RPython Const
-        // objects; make them available to produce_arg() just like const_pool
-        // entries instead of leaving trace-local source OpRefs in short ops.
         for &opref in imported_constants.values() {
             builder.note_known_constant(opref);
         }
@@ -2029,14 +2005,10 @@ impl OptContext {
         true
     }
 
-    pub fn note_imported_short_use(&mut self, result: OpRef) {
-        let _ = self.force_op_from_preamble(result);
-    }
-
     pub(crate) fn imported_short_source(&self, result: OpRef) -> OpRef {
         self.imported_short_sources
             .iter()
-            .find_map(|entry| (entry.result == result).then_some(entry.source))
+            .find_map(|(r, s)| (*r == result).then_some(*s))
             .unwrap_or(result)
     }
 
@@ -2110,39 +2082,6 @@ impl OptContext {
         // distinct OpRefs. Phase 2 operations reference `result`, so
         // returning it is structurally equivalent to RPython's `return op`.
         result
-    }
-
-    /// Backward compat: force_op_from_preamble by OpRef lookup.
-    /// unroll.py:26-39: force_op_from_preamble(preamble_op)
-    ///
-    /// Backward compat wrapper: builds PreambleOp from OpRef lookup.
-    /// RPython receives a PreambleOp directly; this path looks up
-    /// the produced_short_op to reconstruct it.
-    pub fn force_op_from_preamble(&mut self, result: OpRef) -> OpRef {
-        let preamble_source = self.imported_short_source(result);
-        let produced = self
-            .imported_short_preamble_builder
-            .as_ref()
-            .and_then(|b| b.produced_short_op(preamble_source))
-            .or_else(|| {
-                self.active_short_preamble_producer
-                    .as_ref()
-                    .and_then(|b| b.produced_short_op(preamble_source))
-            });
-        // unroll.py:27: isinstance(preamble_op, PreambleOp) — RPython
-        // always receives PreambleOp directly. All callers with a
-        // PreambleOp should use force_op_from_preamble_op() instead.
-        let produced = produced.expect(
-            "force_op_from_preamble: produced_short_op not found — \
-             caller should use force_op_from_preamble_op(&PreambleOp)",
-        );
-        let pop = crate::optimizeopt::info::PreambleOp {
-            op: preamble_source,
-            resolved: result,
-            invented_name: produced.invented_name,
-            preamble_op: produced.preamble_op,
-        };
-        self.force_op_from_preamble_op(&pop)
     }
 
     /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
