@@ -3522,24 +3522,24 @@ impl TraceCtx {
         self.call_loopinvariant_impl(func_ptr, args, arg_types, Type::Float)
     }
 
-    /// pyjitpl.py:2081-2104: loop-invariant call with heapcache caching.
-    /// Pure-like: does NOT invalidate caches. Result cached by (descr, arg0).
+    /// pyjitpl.py:2081-2104: emit a loop-invariant CALL_LOOPINVARIANT_*
+    /// with the heapcache lookup/store envelope.
     ///
-    /// Cache key parity: `heapcache.py:629-634
-    /// call_loopinvariant_known_result` matches by descr identity AND
-    /// `allboxes[0].getint()`.  In `pyjitpl.py:2002 _build_allboxes(funcbox,
-    /// argboxes, descr)` the slot 0 of `allboxes` is the funcbox, so
-    /// `allboxes[0].getint() == funcbox.getint()` — the function
-    /// pointer's raw integer address.  In our typed-helper world
-    /// `func_ptr` *is* the funcbox's int counterpart (no Python wrapper
-    /// indirection), so `arg0_int = func_ptr as i64` is the upstream
-    /// equivalent.  `descr_index = func_ref.0` substitutes for descr
-    /// identity: `ConstantPool::get_or_insert` interns by value so
-    /// `func_ref.0` is stable per-callee within the trace, matching the
-    /// "same callee → same descr identity" precondition that holds at
-    /// every typed-helper call site (each `BC_CALL_LOOPINVARIANT_*` site
-    /// emits one `func_ptr` constant + one `make_call_descr_for_opcode`
-    /// fresh descr per call signature).
+    /// `heapcache.py:629-639 call_loopinvariant_known_result` /
+    /// `call_loopinvariant_now_known` keys the slot by descr **object
+    /// identity** (`if self.loop_invariant_descr is not descr: return
+    /// None`) and `allboxes[0].getint()`.  `MetaCallDescr` is interned
+    /// through `GcCache._cache_call`'s local equivalent, so
+    /// `descr.index()` returns a stable per-instance `heapcache_index`
+    /// that supplies the `is`-equivalent identity key.  `func_ptr as
+    /// i64` is the typed-helper analogue of `funcbox.getint()`
+    /// (`pyjitpl.py:2002 _build_allboxes`'s slot 0).
+    ///
+    /// An earlier revision used `signature_hash(arg_types, ret_type)`
+    /// as a structural surrogate.  That hash violated `is` semantics
+    /// (collision + same-signature over-merge across distinct upstream
+    /// descrs) and was removed once the interned `MetaCallDescr`
+    /// landed.
     fn call_loopinvariant_impl(
         &mut self,
         func_ptr: *const (),

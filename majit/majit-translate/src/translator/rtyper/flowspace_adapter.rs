@@ -533,6 +533,8 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
         OpKind::GuardValue { .. } => "GuardValue",
+        OpKind::BinOp { .. } => "BinOp",
+        OpKind::UnaryOp { .. } => "UnaryOp",
         OpKind::VableForce { .. } => "VableForce",
         // Catch-all for variants pyre may add without bumping this
         // table — surfaces as `<unknown>` in the fail-loud message

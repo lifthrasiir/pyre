@@ -1576,10 +1576,39 @@ impl MIFrame {
             if s.bridge_local_oprefs.is_some() {
                 // Bridge trace: OpRef::NONE means this local is a constant
                 // or virtual from resume data, not a missing vable slot.
-                // Read from the concrete frame via array getitem.
+                // Read from the concrete frame via the locals_cells_stack_w
+                // array.  RPython `virtualizable.py:85-99 read_boxes` does the
+                // array-field access in two steps:
+                //
+                //   for _, fieldname in unroll_array_fields:
+                //       lst = getattr(virtualizable, fieldname)   # :94
+                //       for i in range(len(lst)):
+                //           boxes.append(wrap(cpu, lst[i], ...))  # :96
+                //
+                // Step 1 (`getattr`) yields the array pointer; step 2
+                // (`lst[i]`) is the indexed read.  pyre currently emits
+                // step 1 as `OpCode::GetfieldRawI` via
+                // `state.rs:frame_locals_cells_stack_array`.  The
+                // upstream-orthodox emission is `GETFIELD_GC_R` because
+                // `pyframe_locals_cells_stack_descr` is field 0 of
+                // `PYFRAME_DESCR_GROUP` with `field_type = Type::Ref`
+                // on a `PYFRAME_GC_TYPE_ID`-typed PyFrame.  The
+                // cranelift backend's GC-barrier coverage for the
+                // PYFRAME_DESCR_GROUP read path is incomplete — a
+                // direct swap to `GetfieldGcR` SIGABRTs in
+                // fib_recursive — so the swap is gated on bringing
+                // that barrier support up first (separate parity
+                // epic).  Step 2 (`lst[i]`) is `GETARRAYITEM_GC_R`
+                // indexed off the array.  `trace_array_getitem_value`
+                // uses `pyobject_gcarray_descr` (`base_size =
+                // FIXED_ARRAY_ITEMS_OFFSET`) and so requires the array
+                // base, not the virtualizable (PyFrame*) pointer.
+                // Emit `frame_locals_cells_stack_array` to materialise
+                // the array OpRef before indexing.
                 let frame_ref = s.frame;
+                let array_ref = crate::state::frame_locals_cells_stack_array(ctx, frame_ref);
                 let idx_const = ctx.const_int(idx as i64);
-                s.registers_r[idx] = trace_array_getitem_value(ctx, frame_ref, idx_const);
+                s.registers_r[idx] = trace_array_getitem_value(ctx, array_ref, idx_const);
             } else {
                 // Active vable owner whose registers_r[idx] is NONE cannot
                 // exist: init_symbolic (state.rs:2618-2619) seeds
