@@ -70,11 +70,20 @@ pub struct SnapshotFrame {
     pub boxes: Vec<SnapshotTagged>,
 }
 
-/// opencoder.py tag parity: tagged reference to a box value.
+/// opencoder.py:603 trace-snapshot encode parity: tagged reference to a
+/// live value at a recorder snapshot site.  The recorder only sees Box
+/// (live in deadframe fail_args) and Const (compile-time constant)
+/// payloads; TAGVIRTUAL belongs to the resume-numbering layer
+/// (resume.py:_number_boxes) and is synthesized later from
+/// PtrInfo::is_virtual on the live Box's OpRef.  Keeping a `Virtual`
+/// variant here would let a virtual index reach
+/// `translate_trace_iter_opref`'s _cache as a Box position, silently
+/// remapping it (recorder.rs has no Box at that integer).  The variant
+/// is therefore intentionally absent — adding a virtual-tagged source
+/// requires a dedicated resume enum, not this snapshot type.
 ///
 /// TAGBOX(n)    → value lives in fail_args[n] (deadframe slot n)
 /// TAGCONST(v)  → compile-time constant (i64 value)
-/// TAGVIRTUAL(n)→ virtual object index n (materialized on resume)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotTagged {
     /// Value from deadframe fail_args slot.
@@ -86,8 +95,6 @@ pub enum SnapshotTagged {
     /// RPython resume.py:157: Const boxes carry their type (INT/REF/FLOAT)
     /// for correct TAGINT/TAGCONST encoding in rd_numb.
     Const(i64, majit_ir::Type),
-    /// Virtual object to be materialized.
-    Virtual(u32),
 }
 
 #[derive(Clone)]

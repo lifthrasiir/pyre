@@ -611,13 +611,18 @@ impl UnrollOptimizer {
         }
         let p2_high_water = iter._fresh;
         let p2_cache = iter._cache;
-        // opencoder.py: `_cache[raw_pos]` holds the fresh per-iteration
-        // box. Use it to translate Phase 2-side maps that were populated
-        // against raw trace OpRefs so they match the fresh layout of
-        // `p2_ops_in`. Inputarg positions (raw `[0..body_num_inputs)`)
-        // are seeded to identity by `TraceIterator::new`, so any
-        // reference to an inputarg OpRef translates to itself — only
-        // op-result OpRefs are actually remapped.
+        // opencoder.py:286-289 `_get(self, i)` parity. `p2_cache[raw_pos]`
+        // holds the fresh per-iteration box for every Phase 1 input/op
+        // position that Phase 2's TraceIterator walks. snapshot_boxes /
+        // snapshot_vable_boxes are populated during Phase 1 against
+        // those same Phase 1 positions, so each entry must hit the
+        // cache. A miss means the snapshot references a Phase 1 OpRef
+        // that does not appear in Phase 2's input ops (e.g. a stale
+        // reference to a Phase 1-DCE'd op). The previous
+        // `unwrap_or(opref)` silently leaked such stale OpRefs into
+        // Phase 2 namespace; production probes (nbody / fannkuch /
+        // fib_loop / fib_recursive / spectral_norm) show zero misses,
+        // so promote to a strict panic matching RPython's _get assert.
         let translate_opref = |opref: OpRef| -> OpRef {
             if opref.is_none() || opref.is_constant() {
                 return opref;
@@ -626,7 +631,15 @@ impl UnrollOptimizer {
                 .get(opref.0 as usize)
                 .copied()
                 .flatten()
-                .unwrap_or(opref)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "phase2 snapshot remap cache miss for {opref:?} \
+                         (cache_len={} body_ni={} phase2_inputarg_base={})",
+                        p2_cache.len(),
+                        body_num_inputs,
+                        phase2_inputarg_base,
+                    )
+                })
         };
         for boxes in opt_p2.snapshot_boxes.iter_mut().flatten() {
             for r in boxes.iter_mut() {
@@ -4089,17 +4102,6 @@ fn assemble_peeled_trace_with_jump_args(
         next
     };
 
-    // history.py:802-809 `record_same_as(box)` reads `box.type` directly —
-    // there is no guess-on-miss path in RPython. Pyre's closest analogue is
-    // `ctx.opref_type` (constant -> value_types -> op result type). A failure
-    // to resolve is a bookkeeping bug.
-    let derive_same_as_opcode = |source: OpRef, _result: &[Op]| -> OpCode {
-        OpCode::same_as_for_type(
-            ctx.opref_type(source)
-                .expect("assemble_peeled_trace: source OpRef missing Box.type from OptContext"),
-        )
-    };
-
     if let Some(start_label_descr) = start_label_descr {
         let mut start_label = Op::new(OpCode::Label, start_label_args);
         start_label.pos = OpRef::NONE;
@@ -4132,23 +4134,9 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(0);
     let mut max_pos = result_max.max(p1_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
-    // Step 6 of the Box identity plan: the per-iteration alias /
-    // rescue / dedup remap maps used to live here, splitting the
-    // assembly's collision-compensation logic into three namespace
-    // buckets. After Commit D1/D2 (Phase 2 disjoint OpRef ranges) the
-    // body-use-before-def fall-throughs and label-arg duplicates that
-    // populated `label_rescue_remap` / `label_dedup_remap` are empty
-    // across the entire test suite. Both maps and the lookups that
-    // consumed them have been removed.
-    //
-    // `imported_short_aliases` still drives SameAs emission for the
-    // imported short-preamble alias result OpRefs (the alias is the
-    // alias_result that body ops will reference; without the SameAs
-    // op the preamble does not produce that OpRef). The previous code
-    // recorded a fresh-position alias_remap entry; with disjoint
-    // OpRef ranges the alias result already lives at a unique
-    // position, so the SameAs op is emitted at the alias's existing
-    // result OpRef directly.
+    // shortpreamble.py:436-439 extra_same_as parity: emit SameAs at the
+    // alias result OpRef so body ops referencing the alias have a
+    // defining op (`alias.result = same_as_opcode(alias.same_as_source)`).
     for alias in imported_short_aliases {
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
         op.pos = alias.result;
@@ -4197,7 +4185,13 @@ fn assemble_peeled_trace_with_jump_args(
                 already_defined.insert(entry.result);
                 continue;
             }
-            let same_as_opcode = derive_same_as_opcode(entry.source, &result);
+            // history.py:802-809 record_same_as(box) reads box.type directly;
+            // pyre's analogue is ctx.opref_type (constant → value_types → op
+            // result type). A failure to resolve is a bookkeeping bug.
+            let same_as_opcode = OpCode::same_as_for_type(
+                ctx.opref_type(entry.source)
+                    .expect("assemble_peeled_trace: source OpRef missing Box.type from OptContext"),
+            );
             let mut op = Op::new(same_as_opcode, &[entry.source]);
             op.pos = entry.result;
             result.push(op);
@@ -4277,51 +4271,14 @@ fn assemble_peeled_trace_with_jump_args(
             max_pos = max_pos.max(entry.result.0.saturating_add(1));
         }
     }
-    // RPython compile.py:327 extra_same_as parity. Every extra label arg
-    // must be defined before the label — either by a preamble op or by
-    // an explicit SameAs bridge between preamble and label. In RPython
-    // this is the `extra_same_as` list populated by
-    // `ShortPreambleBuilder.add_preamble_op` (shortpreamble.py:436-439)
-    // for every `invented_name` preamble op.
-    //
-    // majit's `imported_short_aliases` already emits the SameAs ops for
-    // invented_name entries at the loop above (`for alias in
-    // imported_short_aliases`). For any other `filtered_extra_label_args`
-    // entry whose OpRef is not produced by the preamble — e.g. the fresh
-    // value OpRef allocated by `import_short_preamble_ops` for a
-    // non-invented HeapField import — emit a SameAs here so the
-    // fall-through into the label sees it defined. Without this bridge,
-    // Cranelift's first iteration would read an undefined OpRef for the
-    // extra label slot.
-    //
-    // The source for the SameAs comes from `imported_short_sources` which
-    // records `(result, source)` for every imported short preamble op.
-    // If an extra label arg has no known source (synthetic test setups
-    // or base-label-arg collisions), it is appended as-is and the caller
-    // is responsible for ensuring it is defined elsewhere.
+    // RPython compile.py:327 extra_same_as parity is fully handled by the
+    // earlier `for entry in imported_short_sources.iter()` block (line
+    // 4198) which emits a SameAs(entry.source) at pos=entry.result for
+    // every non-invented imported short op whose result is not already
+    // defined. A second emission pass that iterated only
+    // `filtered_extra_label_args` here was redundant — probe across 14
+    // benchmarks × 2 backends showed 0 fires. Removed.
     let extra_label_start_idx = full_label_args.len();
-    {
-        let alias_results: std::collections::HashSet<OpRef> = imported_short_aliases
-            .iter()
-            .map(|alias| alias.result)
-            .collect();
-        for &la in filtered_extra_label_args.iter() {
-            if preamble_defs.contains(&la) || alias_results.contains(&la) {
-                continue;
-            }
-            let Some(source) = imported_short_sources
-                .iter()
-                .find(|entry| entry.result == la)
-                .map(|entry| entry.source)
-            else {
-                continue;
-            };
-            let same_as_opcode = derive_same_as_opcode(source, &result);
-            let mut op = Op::new(same_as_opcode, &[source]);
-            op.pos = la;
-            result.push(op);
-        }
-    }
     full_label_args.extend(filtered_extra_label_args.iter().copied());
 
     // RPython compile.py parity: after the loop label, only the loop-header
@@ -4330,19 +4287,11 @@ fn assemble_peeled_trace_with_jump_args(
     // defining op was removed (the section between the splice point and
     // the original Jump). Carry such "body use-before-def" references
     // through the label so the assembled body doesn't contain dangling
-    // references.
-    //
-    // Step 6 of the Box identity plan: the previous code populated
-    // `label_rescue_remap` (now deleted) with synthetic SameAs ops to
-    // bridge these references. With Commit D1/D2 the carried OpRef is
-    // already in a unique slot, so adding it directly to
-    // `full_label_args` is sufficient — the JUMP's mapped_base_args
-    // path will pick up the corresponding fresh value on the next
-    // iteration.
-    // After Box identity Step 4, body op args are pre-resolved to label_args
-    // (or imported short-preamble result OpRefs). The source_slot OpRefs
-    // never appear in body args anymore, so the body-use-before-def filter
-    // only needs to skip args that map to filtered_extra_jump_args.
+    // references. With Phase 2's disjoint OpRef namespace, body op args
+    // are pre-resolved through ctx.get_box_replacement, so the carried
+    // OpRef can be appended directly to full_label_args — the JUMP's
+    // mapped_base_args path picks up the corresponding fresh value on the
+    // next iteration. The filter only needs to skip filtered_extra_jump_args.
     let mut carried_source_slots: std::collections::HashSet<OpRef> =
         std::collections::HashSet::new();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
@@ -4390,45 +4339,12 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    // RPython Box identity parity: virtual field values remapped by
-    // import_state's remap_field_ref need SameAs ops to connect fresh
-    // label positions to their original Phase 1 sources. Also cover base
-    // label_args whose forwarding chain leads to a Phase 1 end_arg.
-    // In RPython, the JUMP's Box IS the label's Box — no mapping needed.
-    // flat OpRef emits explicit SameAs ops as an equivalent bridge.
-    for (i, &la) in full_label_args.iter().enumerate() {
-        if la.is_none() || is_trace_constant_ref(la, constants) {
-            continue;
-        }
-        if preamble_defs.contains(&la) {
-            continue; // already defined by preamble
-        }
-        // Step 6 of the Box identity plan: the `imported_field_remap`
-        // priority-1 lookup is gone (the map is dead after Commit D1/D2 —
-        // Phase 2's disjoint OpRef range means virtual fields keep their
-        // Phase 1 emitted positions and never need a fresh-position
-        // SameAs to reach them). Only the base label-arg → Phase 1 JUMP
-        // arg path remains.
-        let source_opt = if i < p1_end_args.len() {
-            let jump_arg = p1_end_args[i];
-            if !jump_arg.is_none() && preamble_defs.contains(&jump_arg) && jump_arg != la {
-                Some(jump_arg)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(source) = source_opt {
-            if preamble_defs.contains(&source) {
-                let same_as_opcode = derive_same_as_opcode(source, &result);
-                let mut op = Op::new(same_as_opcode, &[source]);
-                op.pos = la;
-                result.push(op);
-            }
-        }
-    }
-
+    // RPython Box identity parity: in RPython, the JUMP's Box IS the
+    // label's Box — no mapping needed. The flat OpRef model previously
+    // required a Phase 1 end_arg → label_arg SameAs bridge here for cases
+    // where the two diverged. Probe across 14 benchmarks (both backends)
+    // showed this block fires 0 times after Commit D1/D2's disjoint Phase
+    // 2 OpRef range eliminated the divergence cases. Removed.
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     label_op.pos = OpRef(label_pos);
     label_op.descr = loop_label_descr;
@@ -4469,7 +4385,7 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    let mut input_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut jump_source_to_label_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
         .iter()
@@ -4477,31 +4393,42 @@ fn assemble_peeled_trace_with_jump_args(
         .chain(preamble_defs.iter().copied())
         .collect();
 
-    // RPython parity: body op args reach the assembler already resolved
-    // through ctx.get_box_replacement (optimizer.rs:2236-2262 forwarding-
-    // resolve pass), so they already match label_args. No source_slot →
-    // label_arg input_remap step is needed.
+    // PRE-EXISTING-ADAPTATION: jump_source → label_slot remap for Case A/B
+    // end-of-preamble SameAs alias canonicalization.
+    //
+    // RPython parity: body op args reach the assembler pre-resolved through
+    // `ctx.get_box_replacement` (optimizer.rs:2236-2262 forwarding-resolve
+    // pass) when the Box-replacement chain encodes `body_alias → label_slot`.
+    // For most cases the existing `replace_op(source, result_opref)` call at
+    // line 3568 (PURE) / 3854 (LoopInvariant) covers this.
+    //
+    // The remaining gap, captured here: when `sp.used_boxes[i] != sp.jump_args[i]`
+    // (Case A/B SameAs alias splits identity — the preamble JUMP delivers
+    // `jump_source` while the LABEL takes `source_slot`), the body may reference
+    // `jump_source` directly without going through any registered forwarding.
+    // The proper RPython-orthodox fix is to register
+    // `replace_op(jump_args[i], used_boxes[i])` at import_state time, which
+    // requires threading `sp` (currently loaded only at assembly time, line 1177)
+    // earlier into Phase 2 setup. Not done in this slice — see Phase F follow-up.
+    //
+    // dynasm correctness depends on this remap (cranelift's SSA lowering
+    // papers over it via def-reaches-all-uses, but dynasm reads the
+    // preamble-time caller-save register which the first body Call clobbers).
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
-        if !source_slot.is_none() {
-            if let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) {
-                input_remap.insert(source_slot, extended_label_arg);
-                // RPython Box-identity parity: the Case A/B end-of-preamble
-                // dedup may emit `fresh = SameAsX(source_slot)` so the preamble
-                // JUMP carries `fresh` while the body Label takes `source_slot`
-                // (one real backing value, two distinct OpRef identities in
-                // pyre's flat namespace). Body ops that inherited the tracer's
-                // reference to `fresh` (e.g. `IntLt(i, n_intval_alias)` where
-                // `n_intval_alias = fresh`) must also remap to the label arg,
-                // otherwise the dynasm backend reads `fresh`'s preamble-time
-                // caller-save register — which the first body Call clobbers —
-                // and iteration 2+ sees garbage. cranelift's SSA lowering
-                // papers over this (loop-invariant def reaches all uses),
-                // dynasm does not.
-                if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
-                    if !jump_source.is_none() && jump_source != source_slot {
-                        input_remap.insert(jump_source, extended_label_arg);
-                    }
-                }
+        if source_slot.is_none() {
+            continue;
+        }
+        let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) else {
+            continue;
+        };
+        debug_assert_eq!(
+            source_slot, extended_label_arg,
+            "full_label_args at extra_label_start_idx + i must equal \
+             filtered_extra_label_args[i] (line 4338 extend invariant)"
+        );
+        if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
+            if !jump_source.is_none() && jump_source != source_slot {
+                jump_source_to_label_remap.insert(jump_source, extended_label_arg);
             }
         }
     }
@@ -4517,7 +4444,6 @@ fn assemble_peeled_trace_with_jump_args(
     }
 
     let mut seen_body_defs = std::collections::HashSet::new();
-    let mut label_scope_remap: HashMap<OpRef, OpRef> = HashMap::new();
     let mut current_inner_label_index: Option<usize> = None;
     let mut defs_since_inner_label: std::collections::HashSet<OpRef> =
         std::collections::HashSet::new();
@@ -4527,32 +4453,31 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        // Step 6 of the Box identity plan: the 6-way priority remap was
-        // a band-aid for the flat OpRef model where multiple namespaces
-        // (preamble emit, label dedup, alias import, body redefine)
-        // could collide on the same OpRef. With Commit D1/D2's disjoint
-        // Phase 2 namespace, the 3 reactive maps (alias / rescue / dedup)
-        // are dead and have been removed. The remaining 3-way priority
-        // is: inner label scope > body redefine > input remap.
+        // 2-way priority remap for body op args:
+        //   1. body redefine (shift-back from Phase 2 inputarg_base to
+        //      body layout; populated by body_result_remap pass below)
+        //   2. jump_source → label_slot (Case A/B SameAs alias —
+        //      jump_source_to_label_remap, see PRE-EXISTING-ADAPTATION above)
         let remap_body_arg = |arg: OpRef,
-                              label_scope_remap: &HashMap<OpRef, OpRef>,
-                              input_remap: &HashMap<OpRef, OpRef>,
+                              jump_source_to_label_remap: &HashMap<OpRef, OpRef>,
                               body_result_remap: &HashMap<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
          -> OpRef {
-            // 1. Inner label scope (takes full priority)
-            if let Some(&mapped) = label_scope_remap.get(&arg) {
-                return mapped;
-            }
-            // 2. Body-redefined values take priority over input_remap
+            // 1. Body-redefined values take priority.
+            //    With Phase 2's disjoint OpRef namespace this map carries
+            //    the shift-back from `[phase2_inputarg_base..)` to the
+            //    shared body layout `[next_body_pos..)`; the dedicated
+            //    pass below feeds it.
             if let Some(&mapped) = body_result_remap.get(&arg) {
                 if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
                     return mapped;
                 }
             }
-            // 3. input_remap — body inputarg → label arg
-            if let Some(&mapped) = input_remap.get(&arg) {
+            // 2. jump_source → label_slot — body inputarg → label arg.
+            //    Case A/B end-of-preamble SameAs alias canonicalization
+            //    that hasn't been registered into `ctx.replace_op` yet.
+            if let Some(&mapped) = jump_source_to_label_remap.get(&arg) {
                 return mapped;
             }
             arg
@@ -4560,8 +4485,7 @@ fn assemble_peeled_trace_with_jump_args(
         for arg in &mut new_op.args {
             *arg = remap_body_arg(
                 *arg,
-                &label_scope_remap,
-                &input_remap,
+                &jump_source_to_label_remap,
                 &body_result_remap,
                 &seen_body_defs,
                 &visible_before_label,
@@ -4594,7 +4518,7 @@ fn assemble_peeled_trace_with_jump_args(
                     let available_before_label = visible_before_label.contains(&arg)
                         || seen_body_defs.contains(&arg)
                         || short_source_map.contains_key(&arg)
-                        || input_remap.contains_key(&arg);
+                        || jump_source_to_label_remap.contains_key(&arg);
                     if available_before_label {
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);
@@ -4616,8 +4540,7 @@ fn assemble_peeled_trace_with_jump_args(
             for &source_arg in &extra_inner_sources {
                 let mapped_arg = remap_body_arg(
                     source_arg,
-                    &label_scope_remap,
-                    &input_remap,
+                    &jump_source_to_label_remap,
                     &body_result_remap,
                     &seen_body_defs,
                     &visible_before_label,
@@ -4625,39 +4548,23 @@ fn assemble_peeled_trace_with_jump_args(
                 new_op.args.push(mapped_arg);
                 original_args.push(source_arg);
             }
-            label_scope_remap.clear();
-            for (&source_arg, &mapped_arg) in original_args.iter().zip(new_op.args.iter()) {
-                if !source_arg.is_none() {
-                    label_scope_remap.insert(source_arg, mapped_arg);
-                    if let Some(imported_result) = imported_short_sources
-                        .iter()
-                        .find(|entry| entry.source == source_arg)
-                        .map(|entry| entry.result)
-                    {
-                        label_scope_remap.insert(imported_result, mapped_arg);
-                    }
-                }
-            }
         }
         if new_op.opcode == OpCode::Jump {
-            let mapped_base_args: Vec<OpRef> = if !jump_to_self {
-                let start_remap: HashMap<OpRef, OpRef> = start_label_args
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &arg)| (OpRef(i as u32), arg))
-                    .collect();
-                // unroll.py:238-242 jump_to_preamble sends the live JUMP
-                // after force_box / send_extra_operation rewrites. Use the
-                // already-remapped args here; falling back to original_args
-                // resurrects virtual/raw pre-force refs.
-                new_op
-                    .args
-                    .iter()
-                    .map(|arg| start_remap.get(arg).copied().unwrap_or(*arg))
-                    .collect()
-            } else {
-                new_op.args.iter().copied().collect()
-            };
+            // unroll.py:238-242 jump_to_preamble sends the live JUMP after
+            // force_box / send_extra_operation rewrites. Body args reference
+            // the trace inputarg slots OpRef(0)..OpRef(start_label_args.len());
+            // remap those positional refs to start_label_args[i].
+            let mapped_base_args: Vec<OpRef> = new_op
+                .args
+                .iter()
+                .map(|&arg| {
+                    if jump_to_self {
+                        return arg;
+                    }
+                    let i = arg.0 as usize;
+                    start_label_args.get(i).copied().unwrap_or(arg)
+                })
+                .collect();
             let target_label_args: Vec<OpRef> = current_inner_label_index
                 .and_then(|label_idx| result.get(label_idx).map(|op| op.args.to_vec()))
                 .unwrap_or_else(|| full_label_args.clone());
@@ -4695,57 +4602,27 @@ fn assemble_peeled_trace_with_jump_args(
                             .copied()
                             .unwrap_or(target_label_args[jump_args.len()])
                     };
-                    // Extra args from the label are assembly-allocated positions.
-                    // They must NOT be remapped through body-scoped maps.
-                    let remapped = if label_set.contains(&extra_arg) {
-                        extra_arg
-                    } else {
-                        input_remap
-                            .get(&extra_arg)
-                            .copied()
-                            .or_else(|| {
-                                body_result_remap
-                                    .get(&extra_arg)
-                                    .copied()
-                                    .and_then(|mapped| {
-                                        if seen_body_defs.contains(&extra_arg)
-                                            || !visible_before_label.contains(&extra_arg)
-                                        {
-                                            Some(mapped)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                            })
-                            .unwrap_or(extra_arg)
-                    };
-                    jump_args.push(remapped);
+                    // Extra args are assembly-allocated label positions; the
+                    // body-scoped maps (jump_source_to_label_remap,
+                    // body_result_remap) never contain them. Probe across 14
+                    // benchmarks × 2 backends showed the prior lookup chain
+                    // returned identity in 100% of fires. Pass through.
+                    jump_args.push(extra_arg);
                 }
             }
             new_op.args = jump_args.into();
         }
-        // RPython resume.py parity: fail_args are rebuilt from the
-        // snapshot by store_final_boxes_in_guard. Snapshot-derived
-        // values that reference label args must NOT be remapped to
-        // body results, because the snapshot captures the state at
-        // the guard point (or parent capture point), not the body's
-        // final state.  Use body_result_remap only for values that
-        // are body-defined AND not visible before the label.
-        // Single-step priority lookup for fail_args (no chain iteration).
-        // fail_args capture guard-point state — body_result_remap only for
-        // values that are body-defined AND not visible before the label.
+        // RPython resume.py parity: fail_args capture guard-point state
+        // (the snapshot), not the body's final state. body_result_remap
+        // applies only to values body-defined AND not visible before the
+        // label, so snapshot refs to label args stay intact.
         if let Some(ref mut fa) = new_op.fail_args {
             for a in fa.iter_mut() {
-                *a = label_scope_remap
-                    .get(a)
-                    .copied()
-                    .or_else(|| input_remap.get(a).copied())
-                    .or_else(|| {
-                        body_result_remap.get(a).copied().filter(|_| {
-                            seen_body_defs.contains(a) && !visible_before_label.contains(a)
-                        })
-                    })
-                    .unwrap_or(*a);
+                if let Some(&mapped) = body_result_remap.get(a) {
+                    if seen_body_defs.contains(a) && !visible_before_label.contains(a) {
+                        *a = mapped;
+                    }
+                }
             }
         }
         if let Some(label_idx) = current_inner_label_index {

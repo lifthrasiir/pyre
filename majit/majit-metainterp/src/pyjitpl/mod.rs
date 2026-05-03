@@ -267,28 +267,18 @@ fn snapshot_map_from_trace_snapshots(
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
-    // opencoder.py:603 _encode: Box/Virtual → Box identity, Const → pool
-    // OpRef. RPython keeps `box.type` on the Box object; preserve the
-    // recorder's SnapshotTagged type on the snapshot entry instead of
-    // recovering it later from an OpRef-keyed side table.
+    // opencoder.py:603 _encode: trace snapshot recorder only emits Box
+    // (live deadframe slot) and Const (compile-time pool) payloads.
+    // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
+    // and is synthesized later from PtrInfo::is_virtual on the live
+    // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see
+    // recorder.rs:73 docstring) so this match is exhaustive over the
+    // two recorder-side cases.
     let mut tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
         match t {
             crate::recorder::SnapshotTagged::Box(n, tp) => {
                 SnapshotBox::typed(majit_ir::OpRef(*n), *tp)
             }
-            // recorder.rs:73 `SnapshotTagged::Virtual(n)` carries a virtual
-            // object index, NOT a Box position. Wrapping it as
-            // `SnapshotBox::typed(OpRef(n), Ref)` would still leak the
-            // virtual id wherever downstream treats `SnapshotBox.opref` as
-            // a Box position (e.g. `translate_trace_iter_opref` cache
-            // lookup). No recorder site currently constructs `Virtual`; if
-            // one is added, the encoder must route TAGVIRTUAL through
-            // resume.py:_number_boxes / opencoder.py:603.
-            crate::recorder::SnapshotTagged::Virtual(n) => panic!(
-                "snapshot_map_from_trace_snapshots: SnapshotTagged::Virtual({n}) \
-                 cannot be flattened as a Box-position OpRef; \
-                 add a TAGVIRTUAL handling path (resume.py:_number_boxes parity)"
-            ),
             crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
                 // Register in pool so is_const → true, get_const → (0, Ref),
