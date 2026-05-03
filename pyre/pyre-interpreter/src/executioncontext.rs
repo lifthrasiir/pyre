@@ -452,7 +452,7 @@ impl Drop for DictStorage {
     }
 }
 
-const TICK_COUNTER_STEP: usize = 100;
+pub const TICK_COUNTER_STEP: usize = 100;
 
 #[derive(Debug, Default)]
 pub struct WRootFinalizerQueue;

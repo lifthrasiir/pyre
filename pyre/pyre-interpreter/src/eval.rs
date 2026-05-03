@@ -590,6 +590,25 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
 
         let pc = next_instr;
         frame.last_instr = pc as isize;
+        // pypy/interpreter/pyopcode.py:170-176 dispatch_bytecode parity:
+        //   self.last_instr = intmask(next_instr)
+        //   if jit.we_are_jitted():
+        //       ec.bytecode_only_trace(self)
+        //   else:
+        //       ec.bytecode_trace(self)
+        // pyre's interpreter path (this fn) takes the non-jitted branch
+        // — bytecode_trace fires bytecode_only_trace then decrements
+        // the ticker. Gated upstream on `w_tracefunc.is_null()` so the
+        // no-tracer hot path is a single null-check + ticker decrement.
+        let ec = frame.execution_context as *mut crate::PyExecutionContext;
+        if !ec.is_null() {
+            unsafe {
+                (*ec).bytecode_trace(
+                    frame as *mut PyFrame,
+                    crate::executioncontext::TICK_COUNTER_STEP,
+                )?
+            };
+        }
         let (opcode_pc, instruction, op_arg) = decode_instruction_for_dispatch(code, pc)?;
         let fallthrough = opcode_pc + 1;
         match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
