@@ -4088,6 +4088,24 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
     ctx
 }
 
+/// shortpreamble.py:436-439 alias-side `extra_same_as` emission.
+///
+/// Compound alternates (`invented_name=true`) record their SameAs source in
+/// `imported_short_aliases`. Emit one `SameAs(alias.same_as_source)` op at
+/// `pos=alias.result` per entry so the body's reference to the alias result
+/// has a defining op. Symmetric with `emit_extra_same_as_for_imports`,
+/// which handles the non-invented case via `imported_short_sources`.
+fn emit_alias_same_as_for_imports(
+    result: &mut Vec<Op>,
+    imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
+) {
+    for alias in imported_short_aliases {
+        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
+        op.pos = alias.result;
+        result.push(op);
+    }
+}
+
 /// RPython compile.py:327 + shortpreamble.py:436-439 `extra_same_as` parity.
 ///
 /// `shortpreamble.py PureOp/HeapOp.produce_op` emits a SameAs (or the original
@@ -4113,14 +4131,18 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
 /// per-kind structs for Heap/LoopInvariant), this helper's signature switches
 /// to consume those typed records directly. The body's RPython parity is
 /// then fully reachable without the untyped `(result, source)` Vec.
+///
+/// Caller contract: every alias-emitted SameAs op (one per
+/// `imported_short_aliases` entry) is already in `result` by the time this
+/// helper runs. Those ops are non-Void and non-Jump, so the `result.iter()`
+/// scan below picks up their `pos` values automatically — no separate alias
+/// seed is needed here.
 fn emit_extra_same_as_for_imports(
     result: &mut Vec<Op>,
-    imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
     imported_short_sources: &[crate::optimizeopt::ImportedShortSource],
     ctx: &crate::optimizeopt::OptContext,
 ) {
-    let mut already_defined: std::collections::HashSet<OpRef> =
-        imported_short_aliases.iter().map(|a| a.result).collect();
+    let mut already_defined: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
     for op in result.iter() {
         if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
             already_defined.insert(op.pos);
@@ -4252,21 +4274,8 @@ fn assemble_peeled_trace_with_jump_args(
         .unwrap_or(0);
     let mut max_pos = result_max.max(p1_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
-    // shortpreamble.py:436-439 extra_same_as parity: emit SameAs at the
-    // alias result OpRef so body ops referencing the alias have a
-    // defining op (`alias.result = same_as_opcode(alias.same_as_source)`).
-    for alias in imported_short_aliases {
-        let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
-        op.pos = alias.result;
-        result.push(op);
-    }
-
-    emit_extra_same_as_for_imports(
-        &mut result,
-        imported_short_aliases,
-        imported_short_sources,
-        ctx,
-    );
+    emit_alias_same_as_for_imports(&mut result, imported_short_aliases);
+    emit_extra_same_as_for_imports(&mut result, imported_short_sources, ctx);
 
     // Label position
     let label_pos = next_free_pos(max_pos);
@@ -4338,9 +4347,9 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
     }
-    for entry in imported_short_sources.iter() {
-        if is_trace_runtime_ref(entry.result, constants) {
-            max_pos = max_pos.max(entry.result.raw().saturating_add(1));
+    for &result_ref in imported_short_results.iter() {
+        if is_trace_runtime_ref(result_ref, constants) {
+            max_pos = max_pos.max(result_ref.raw().saturating_add(1));
         }
     }
     // RPython compile.py:327 extra_same_as parity is fully handled by the
