@@ -166,6 +166,30 @@ fn build_jitcode_for_op(asm: &mut Assembler, program: &[u8], pc: usize, op: u8) 
 
 // ── Tests ──────────────────────────────────────────────────────────
 
+/// Mirror the production install ordering from
+/// `codegen_state.rs::install_canonical_liveness`:
+/// 1. `set_canonical_liveness_triple` stages the canonical triple lazily.
+/// 2. `__prebuild_jitcode_liveness_*` writes the per-marker triples first
+///    (so they occupy the head of `all_liveness`).
+/// 3. `ensure_canonical_liveness_offset` registers the canonical triple
+///    at the tail — matching RPython `assembler.assemble` where per-marker
+///    `-live-` entries occupy the early offsets and pyre's canonical entry
+///    is a leading-dummy affordance bound after the IR walk.
+///
+/// The earlier shape here ran `_register_liveness_offset(canonical, …)`
+/// up front, which (a) forced canonical to offset 0 — the very layout the
+/// deferred-canonical patcher was introduced to remove — and (b) skipped
+/// the `set_canonical_liveness_triple` staging step entirely, so the
+/// `finalize_liveness` path the test was meant to validate ran against an
+/// uninitialised triple slot.  The new helper drives the same call sequence
+/// production goes through, so each test below validates the actual install
+/// order rather than a synthesised one.
+fn install_canonical_for_test(asm: &mut Assembler, canonical: &[u8]) {
+    asm.set_canonical_liveness_triple(canonical.to_vec(), Vec::new(), Vec::new());
+    __prebuild_jitcode_liveness_polymorphic_mainloop(asm);
+    let _ = asm.ensure_canonical_liveness_offset();
+}
+
 #[test]
 fn prebuild_registers_more_than_canonical_entry() {
     // Drive the macro-emitted prebuild against a fresh Assembler. With four
@@ -174,20 +198,20 @@ fn prebuild_registers_more_than_canonical_entry() {
     // canonical `[0,1,2,3]` entry — otherwise the per-pc walker collapsed
     // every arm onto the canonical set (B.2 walker regression).
     let mut asm = Assembler::new();
-    // Mirror `install_canonical_liveness`'s order: canonical entry first,
-    // then per-arm triples via the macro-emitted prebuild.
     let canonical: Vec<u8> = (0..4u8).collect();
-    let canonical_offset = asm._register_liveness_offset(&canonical, &[], &[]);
-    assert_eq!(canonical_offset, 0, "canonical sits at offset 0");
-    let canonical_len = asm.all_liveness().len();
+    // Stage the canonical triple lazily — production's
+    // `install_canonical_liveness` does not register it up front; the
+    // prebuild's per-marker triples land first.
+    asm.set_canonical_liveness_triple(canonical.clone(), Vec::new(), Vec::new());
+    let pre_prebuild_len = asm.all_liveness().len();
 
     __prebuild_jitcode_liveness_polymorphic_mainloop(&mut asm);
 
     let post_prebuild_len = asm.all_liveness().len();
     assert!(
-        post_prebuild_len > canonical_len,
-        "prebuild must register at least one non-canonical triple \
-         (canonical_len={canonical_len}, post_prebuild_len={post_prebuild_len})"
+        post_prebuild_len > pre_prebuild_len,
+        "prebuild must register at least one per-marker triple \
+         (pre_prebuild_len={pre_prebuild_len}, post_prebuild_len={post_prebuild_len})"
     );
 }
 
@@ -200,15 +224,9 @@ fn factory_does_not_grow_asm_after_prebuild() {
     // (e.g., missing emit-site coverage) would surface as growth here.
     let mut asm = Assembler::new();
     let canonical: Vec<u8> = (0..4u8).collect();
-    // Stage the canonical triple so deferred-canonical patching in
-    // `finalize_liveness` can resolve via
-    // `ensure_canonical_liveness_offset` — `live_placeholder()` no longer
-    // back-patches to a hard-coded offset 0.
-    asm.set_canonical_liveness_triple(canonical.clone(), Vec::new(), Vec::new());
-    let _ = asm._register_liveness_offset(&canonical, &[], &[]);
-    __prebuild_jitcode_liveness_polymorphic_mainloop(&mut asm);
+    install_canonical_for_test(&mut asm, &canonical);
 
-    let post_prebuild_len = asm.all_liveness().len();
+    let post_install_len = asm.all_liveness().len();
 
     let program = [OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD, OP_END];
     for &op in &[OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD] {
@@ -217,8 +235,8 @@ fn factory_does_not_grow_asm_after_prebuild() {
 
     assert_eq!(
         asm.all_liveness().len(),
-        post_prebuild_len,
-        "factory finalize_liveness must not grow all_liveness post-prebuild"
+        post_install_len,
+        "factory finalize_liveness must not grow all_liveness post-install"
     );
 }
 
@@ -231,12 +249,7 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
     // fire.
     let mut asm = Assembler::new();
     let canonical: Vec<u8> = (0..4u8).collect();
-    // Stage the canonical triple before any `live_placeholder()` runs so
-    // the deferred-canonical patcher (`finalize_liveness` →
-    // `ensure_canonical_liveness_offset`) can resolve.
-    asm.set_canonical_liveness_triple(canonical.clone(), Vec::new(), Vec::new());
-    let _ = asm._register_liveness_offset(&canonical, &[], &[]);
-    __prebuild_jitcode_liveness_polymorphic_mainloop(&mut asm);
+    install_canonical_for_test(&mut asm, &canonical);
 
     let program = [OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD, OP_END];
 

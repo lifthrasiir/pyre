@@ -2,7 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::ItemFn;
+use syn::{Block, Expr, ExprBlock, ExprMatch, ItemFn, Stmt};
 
 use super::JitInterpConfig;
 use super::classify::{ArmPattern, classify_arms};
@@ -20,11 +20,25 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             .to_compile_error();
     };
 
-    // jtransform.py:596 rewrite_op_hint — detect hint_promote() calls in
-    // pre-dispatch code.  When present, the trace function emits GUARD_VALUE
-    // before each arm's JitCode (pyjitpl.py:1916 implement_guard_value).
-    let has_pre_dispatch_promote = has_promote_before_match(&func.block);
-    let promote_preamble = quote! {}; // arm preamble not used; promote goes in trace fn
+    // jtransform.py:596 rewrite_op_hint — detect every `hint(x, promote=
+    // True)` (`x = promote(x)`, `let x = promote(x)`, `promote(x)`)
+    // statement that lexically dominates the dispatch match.
+    //
+    // RPython rewrites each occurrence to `-live-` + `<kind>_guard_value(x)`
+    // (jtransform.py:611-612) at the original CFG position; the codewriter
+    // then emits those ops into every JitCode reached from that position.
+    // Pyre's per-arm `JitCodeBuilder` builds each arm's JitCode
+    // independently, so to preserve the semantics we splice the collected
+    // promote `Stmt`s onto the head of each Lowerable arm's body and let
+    // the existing `lower_promote_call` lowerer (`jitcode_lower.rs:3360`)
+    // emit `-live-` + `<kind>_guard_value` per arm.
+    //
+    // The collector stops at the dispatch match — promotes that lexically
+    // appear AFTER the match in the same containing block do NOT dominate
+    // the match (they execute after each iteration's match completes), so
+    // hoisting them into every arm would be a parity regression vs
+    // RPython's CFG-position-bound rewrite.
+    let pre_dispatch_promotes = collect_pre_dispatch_promote_stmts(&func.block, match_expr);
 
     let lowerer_config = LowererConfig::new(
         &config.io_shims,
@@ -49,7 +63,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // (asserted in `__trace_*` below).
     let generated_arms: Vec<_> = classified
         .iter()
-        .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &promote_preamble))
+        .map(|arm| generate_jitcode_arm(arm, &lowerer_config, &pre_dispatch_promotes))
         .collect();
     let jitcode_arms = generated_arms.iter().map(|(arm, _)| arm);
     let liveness_prebuilds = generated_arms.iter().map(|(_, prebuild)| prebuild);
@@ -82,7 +96,6 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         }
     };
 
-    let _ = has_pre_dispatch_promote;
     let trace_fn_body = quote! {
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #trace_fn_name(
@@ -197,18 +210,31 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 fn generate_jitcode_arm(
     arm: &super::classify::ClassifiedArm,
     config: &LowererConfig,
-    promote_preamble: &TokenStream,
+    pre_dispatch_promotes: &[Stmt],
 ) -> (TokenStream, TokenStream) {
     let pat = &arm.pat;
     let mut liveness_prebuild = quote! {};
     let build = match &arm.pattern {
         ArmPattern::Lowerable => {
+            // RPython jtransform.py:596 / pyjitpl.py:1916: each
+            // pre-dispatch `x = promote(x)` rewrites to an
+            // `int_guard_value(x)` op emitted into every reached JitCode.
+            // Pyre's lowerer treats `state.field = promote(state.field)`
+            // structurally — `lower_promote_call` (jitcode_lower.rs:3346)
+            // emits the appropriate `<kind>_guard_value` and
+            // `assign_to_state_field` writes the promoted value back —
+            // so prepending the original promote `Stmt`s onto each arm's
+            // body yields the per-arm guard_value emission RPython produces.
+            let body_with_promote =
+                prepend_pre_dispatch_promotes(&arm.original_body, pre_dispatch_promotes);
+            let body_for_lowering: &Expr = body_with_promote.as_ref().unwrap_or(&arm.original_body);
+
             // Try config-aware lowering first, fall back to basic lowering
             let code = jitcode_lower::try_generate_jitcode_body_with_config_parts(
                 config,
-                &arm.original_body,
+                body_for_lowering,
             )
-            .or_else(|| jitcode_lower::try_generate_jitcode_body_parts(&arm.original_body, None));
+            .or_else(|| jitcode_lower::try_generate_jitcode_body_parts(body_for_lowering, None));
 
             match code {
                 // RPython `assembler.py:146-158` emits a `live/<offset>`
@@ -239,7 +265,6 @@ fn generate_jitcode_arm(
                     quote! {
                         let mut __builder = majit_metainterp::JitCodeBuilder::new();
                         let _live_offset_patch = __builder.live_placeholder();
-                        #promote_preamble
                         #body
                         __builder.finalize_liveness(__asm);
                         Some(__builder.finish())
@@ -339,51 +364,197 @@ fn find_match_in_expr(expr: &syn::Expr) -> Option<&syn::ExprMatch> {
     }
 }
 
-/// Detect whether the function body contains `promote()` calls before
-/// the dispatch match.  Returns `true` as a literal for codegen.
+/// Collect every promote `Stmt` from `block` that lexically *dominates*
+/// `target_match` (i.e., lies on every CFG path leading to the match).
 ///
-/// RPython: jtransform.py:596 — `hint(x, promote=True)` becomes
-/// `int_guard_value(x)`.  When detected, the trace function emits
-/// GUARD_VALUE via `int_guard_value` before each arm's JitCode.
-fn has_promote_before_match(block: &syn::Block) -> bool {
+/// Three promote forms are recognised, mirroring RPython
+/// `jtransform.py:596 rewrite_op_hint`'s `hint(x, promote=True)` shape
+/// in any statement context:
+/// 1. `x = promote(x)` (`Stmt::Expr(Expr::Assign(...), _)`)
+/// 2. `let x = promote(x)` / `let x = promote(y)`
+///    (`Stmt::Local` with init = promote call)
+/// 3. `promote(x);` / `promote(x)` (`Stmt::Expr(Expr::Call(...), _)`)
+///
+/// Collection stops at the stmt whose subtree contains `target_match`:
+/// after the match dispatches, control flow re-enters via the loop
+/// back-edge — promotes appearing AFTER the match in the same enclosing
+/// block run BEFORE the next iteration's match but AFTER this iteration's
+/// arm body.  RPython binds each `hint_promote` rewrite to its source
+/// CFG position, so hoisting a post-match promote into every arm body
+/// would synthesise guard_value ops at a position they never appear at
+/// upstream — a parity regression over main.
+fn collect_pre_dispatch_promote_stmts(block: &syn::Block, target_match: &ExprMatch) -> Vec<Stmt> {
     let mut promotes = Vec::new();
-    collect_promote_stmts(&block.stmts, &mut promotes);
-    !promotes.is_empty()
+    collect_promotes_until_match(&block.stmts, target_match, &mut promotes);
+    promotes
 }
 
-/// Collect variable names from `x = promote(x)` patterns in statements.
-fn collect_promote_stmts(stmts: &[syn::Stmt], promotes: &mut Vec<String>) {
+/// Walk `stmts` lexically; for each stmt either recurse into its
+/// match-containing subtree (and STOP — anything after that dominates
+/// the next loop iteration's match, not this iteration's), or scan the
+/// stmt locally for promote forms.  Does not recurse into while/loop
+/// bodies that don't contain `target_match` — their bodies don't run on
+/// every path to the match.
+fn collect_promotes_until_match(
+    stmts: &[Stmt],
+    target_match: &ExprMatch,
+    promotes: &mut Vec<Stmt>,
+) {
     for stmt in stmts {
-        match stmt {
-            syn::Stmt::Expr(syn::Expr::While(w), _) => {
-                collect_promote_stmts(&w.body.stmts, promotes);
-            }
-            syn::Stmt::Expr(syn::Expr::Loop(l), _) => {
-                collect_promote_stmts(&l.body.stmts, promotes);
-            }
-            syn::Stmt::Expr(syn::Expr::Assign(assign), _) => {
-                if let Some(name) = extract_promote_assign(assign) {
-                    promotes.push(name);
-                }
-            }
-            _ => {}
+        if stmt_contains_match(stmt, target_match) {
+            recurse_into_match_containing_stmt(stmt, target_match, promotes);
+            return;
         }
+        scan_stmt_for_promote(stmt, promotes);
     }
 }
 
-/// Check if `expr` is `x = promote(x)` (or legacy `hint_promote(x)`) and return
-/// the variable name.
-fn extract_promote_assign(assign: &syn::ExprAssign) -> Option<String> {
-    let syn::Expr::Call(call) = &*assign.right else {
-        return None;
+/// Recurse INTO a stmt that contains `target_match`, walking the nested
+/// block that holds the match so promotes lexically before the match
+/// within that block are still collected.
+fn recurse_into_match_containing_stmt(
+    stmt: &Stmt,
+    target_match: &ExprMatch,
+    promotes: &mut Vec<Stmt>,
+) {
+    let inner_block = match stmt {
+        Stmt::Expr(expr, _) => expr_inner_match_block(expr, target_match),
+        Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .and_then(|init| expr_inner_match_block(&init.expr, target_match)),
+        _ => None,
     };
-    if !is_promote_call_path(&call.func) {
+    if let Some(stmts) = inner_block {
+        collect_promotes_until_match(stmts, target_match, promotes);
+    }
+}
+
+/// Find the inner `&[Stmt]` block of `expr` that holds `target_match`.
+/// Returns the stmts of the `while`/`loop`/`block`/`if`-branch that
+/// transitively contains the match, so the caller can recurse and
+/// collect promotes lexically preceding the match within it.
+fn expr_inner_match_block<'e>(expr: &'e Expr, target_match: &ExprMatch) -> Option<&'e [Stmt]> {
+    match expr {
+        Expr::Match(m) if std::ptr::eq(m, target_match) => Some(&[]),
+        Expr::While(w) if block_contains_match(&w.body, target_match) => Some(&w.body.stmts),
+        Expr::Loop(l) if block_contains_match(&l.body, target_match) => Some(&l.body.stmts),
+        Expr::Block(b) if block_contains_match(&b.block, target_match) => Some(&b.block.stmts),
+        Expr::If(i) => {
+            if block_contains_match(&i.then_branch, target_match) {
+                Some(&i.then_branch.stmts)
+            } else if let Some((_, else_expr)) = &i.else_branch {
+                expr_inner_match_block(else_expr, target_match)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `true` iff `stmt`'s expression subtree contains `target_match`.
+fn stmt_contains_match(stmt: &Stmt, target_match: &ExprMatch) -> bool {
+    match stmt {
+        Stmt::Expr(expr, _) => expr_contains_match(expr, target_match),
+        Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .map(|init| expr_contains_match(&init.expr, target_match))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn block_contains_match(block: &Block, target_match: &ExprMatch) -> bool {
+    block
+        .stmts
+        .iter()
+        .any(|s| stmt_contains_match(s, target_match))
+}
+
+fn expr_contains_match(expr: &Expr, target_match: &ExprMatch) -> bool {
+    match expr {
+        Expr::Match(m) => std::ptr::eq(m, target_match),
+        Expr::While(w) => block_contains_match(&w.body, target_match),
+        Expr::Loop(l) => block_contains_match(&l.body, target_match),
+        Expr::Block(b) => block_contains_match(&b.block, target_match),
+        Expr::If(i) => {
+            block_contains_match(&i.then_branch, target_match)
+                || i.else_branch
+                    .as_ref()
+                    .map(|(_, e)| expr_contains_match(e, target_match))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Scan a single stmt locally (no recursion) for any of the three
+/// promote forms and push if matched.
+fn scan_stmt_for_promote(stmt: &Stmt, promotes: &mut Vec<Stmt>) {
+    match stmt {
+        // Form 1: `x = promote(x);`
+        Stmt::Expr(Expr::Assign(assign), _) => {
+            if is_promote_assign_rhs(assign) {
+                promotes.push(stmt.clone());
+            }
+        }
+        // Form 2: `let x = promote(x);`
+        Stmt::Local(local) => {
+            if local
+                .init
+                .as_ref()
+                .map(|init| is_promote_call_expr(&init.expr))
+                .unwrap_or(false)
+            {
+                promotes.push(stmt.clone());
+            }
+        }
+        // Form 3: `promote(x);` / `promote(x)`
+        Stmt::Expr(expr, _) => {
+            if is_promote_call_expr(expr) {
+                promotes.push(stmt.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_promote_assign_rhs(assign: &syn::ExprAssign) -> bool {
+    is_promote_call_expr(&assign.right)
+}
+
+fn is_promote_call_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call(call) if is_promote_call_path(&call.func))
+}
+
+/// Build a synthetic `Expr::Block` whose body is `pre_dispatch_promotes`
+/// followed by the original arm body's stmts.  Returns `None` when there
+/// are no promote stmts to splice (caller falls back to `&arm.original_body`
+/// directly to avoid an unnecessary clone).
+fn prepend_pre_dispatch_promotes(
+    original_body: &Expr,
+    pre_dispatch_promotes: &[Stmt],
+) -> Option<Expr> {
+    if pre_dispatch_promotes.is_empty() {
         return None;
     }
-    let syn::Expr::Path(lhs_path) = &*assign.left else {
-        return None;
+    let original_stmts = match original_body {
+        Expr::Block(b) => b.block.stmts.clone(),
+        other => vec![Stmt::Expr(other.clone(), None)],
     };
-    Some(lhs_path.path.get_ident()?.to_string())
+    let mut stmts = Vec::with_capacity(pre_dispatch_promotes.len() + original_stmts.len());
+    stmts.extend(pre_dispatch_promotes.iter().cloned());
+    stmts.extend(original_stmts);
+    Some(Expr::Block(ExprBlock {
+        attrs: Vec::new(),
+        label: None,
+        block: Block {
+            brace_token: Default::default(),
+            stmts,
+        },
+    }))
 }
 
 /// Check if a call expression's function path is a promote call.

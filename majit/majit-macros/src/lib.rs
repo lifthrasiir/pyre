@@ -298,43 +298,52 @@ fn helper_policy_tokens_for_fn(
     trace_target_name: Option<&Ident>,
     concrete_target_name: Option<&Ident>,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let unsupported = quote! { (0u8, std::ptr::null(), std::ptr::null(), std::ptr::null()) };
+    let unsupported = quote! {
+        (0u8, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null())
+    };
     let (Some(trace_target_name), Some(concrete_target_name)) =
         (trace_target_name, concrete_target_name)
     else {
         return Ok(unsupported);
     };
+    // 5-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild).
+    // `prebuild` is the per-helper liveness prebuild fn pointer or null
+    // for non-Inline helpers (these have no per-marker triples to register).
+    // Only `#[jit_inline]` emits a real prebuild fn at `lib.rs:1330`; every
+    // other helper attribute that flows through here advertises null and
+    // the parent `#[jit_interp]` lowerer's inferred-policy site
+    // (`jitcode_lower.rs::CallPolicySpec::Infer`) skips the call.
     match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => Ok(match attr_name {
             "dont_look_inside" => quote! {
-                (1u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (1u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_may_force" => quote! {
-                (9u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (9u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_release_gil" => quote! {
-                (13u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (13u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_loop_invariant" => quote! {
-                (17u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (17u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
         HelperCallKind::Int => Ok(match attr_name {
             "elidable" => quote! {
-                (3u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (3u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "dont_look_inside" => quote! {
-                (2u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (2u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_may_force" => quote! {
-                (10u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (10u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_release_gil" => quote! {
-                (14u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (14u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_loop_invariant" => quote! {
-                (18u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (18u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
@@ -345,7 +354,7 @@ fn helper_policy_tokens_for_fn(
             // not advertise a value-call policy code here.
             "elidable" | "dont_look_inside" | "jit_may_force" | "jit_release_gil"
             | "jit_loop_invariant" => quote! {
-                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
@@ -355,7 +364,7 @@ fn helper_policy_tokens_for_fn(
             // lowering cannot model the static float result bank.
             "elidable" | "dont_look_inside" | "jit_may_force" | "jit_release_gil"
             | "jit_loop_invariant" => quote! {
-                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const ())
+                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
@@ -370,7 +379,7 @@ fn emit_helper_policy_fn(
     let helper_name = helper_policy_fn_name(path)?;
     Ok(quote! {
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> (u8, *const (), *const (), *const ()) {
+        pub(crate) fn #helper_name() -> (u8, *const (), *const (), *const (), *const ()) {
             #body
         }
     })
@@ -1244,8 +1253,10 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
+    let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
     let helper_body = helper.body;
+    let helper_liveness_prebuild = helper.liveness_prebuild;
     let return_reg = helper.return_reg;
     let helper_return = match helper.return_kind {
         InlineReturnKind::Int => quote! { __builder.int_return(#return_reg); },
@@ -1314,13 +1325,31 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             __builder.finish()
         }
 
+        // RPython `pyjitpl.py:2255 finish_setup` order: pre-register
+        // the helper's per-marker `-live-` triples into the driver-
+        // shared `Assembler` at install time so the trace-time
+        // `__builder.finalize_liveness(__asm)` above only dedups
+        // (does not grow `all_liveness` past the snapshot taken by
+        // `JitDriver::install_canonical_liveness`). Called from each
+        // parent `__prebuild_jitcode_liveness_*` that statically
+        // resolves an inline-call to this helper (see
+        // `jitcode_lower::inline_prebuild_path`).
+        #[allow(non_snake_case, unused_variables, unused_mut)]
         #[doc(hidden)]
-        pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const ()) {
+        pub(crate) fn #helper_prebuild_name(
+            __asm: &mut majit_metainterp::Assembler,
+        ) {
+            #helper_liveness_prebuild
+        }
+
+        #[doc(hidden)]
+        pub(crate) fn #policy_name() -> (u8, *const (), *const (), *const (), *const ()) {
             (
                 #inferred_policy_code,
                 #inferred_inline_builder,
                 std::ptr::null(),
                 std::ptr::null(),
+                #helper_prebuild_name as *const (),
             )
         }
     };
@@ -1764,7 +1793,7 @@ fn impl_addr_expr(h: &DiscoveredHelper) -> proc_macro2::TokenStream {
         let policy_fn = format_ident!("__majit_call_policy_{}", fn_name);
         return quote! {
             {
-                let (_, _inline_builder, __trace_target, __concrete_target) = #policy_fn();
+                let (_, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_fn();
                 let __trace_target = if __trace_target.is_null() {
                     if __concrete_target.is_null() {
                         #fn_name as *const ()

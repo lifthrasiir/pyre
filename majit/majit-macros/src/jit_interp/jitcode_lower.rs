@@ -86,6 +86,16 @@ pub(crate) struct InlineHelperJitCode {
     pub body: TokenStream,
     pub return_reg: u16,
     pub return_kind: InlineReturnKind,
+    /// Helper-side per-marker liveness prebuild tokens. Threaded into the
+    /// parent's `__prebuild_jitcode_liveness_*` so RPython
+    /// `pyjitpl.py:2255 finish_setup`'s "all `-live-` entries land in
+    /// `asm.all_liveness` before the snapshot" invariant is preserved
+    /// when the helper is invoked at trace time. Without this thread, the
+    /// helper's `JitCodeBuilder::finalize_liveness(asm)` at trace time
+    /// would register triples the snapshot didn't see, growing
+    /// `staticdata.liveness_info` past the install-time freeze and
+    /// tripping the `__trace_*` snapshot-invariant assertion.
+    pub liveness_prebuild: TokenStream,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1699,6 +1709,18 @@ impl<'c> Lowerer<'c> {
     }
 
     fn lower_expr_stmt(&mut self, expr: &Expr) -> Option<()> {
+        // jtransform.py:596 rewrite_op_hint — `hint(x, promote=True)` in
+        // statement context.  Routes both `x = promote(x)` (plain local
+        // re-assignment, no state-write to trigger
+        // `lower_state_field_write`'s RHS recursion) and bare
+        // `promote(x);` through `lower_promote_call`, which emits the
+        // `-live-` + `<kind>_guard_value` pair.  Without this site the
+        // statement-form promote would silently no-op when the
+        // config-aware fall-through later observes `stmt_modifies_jit_
+        // state(stmt) == false`.
+        if let Some(()) = self.lower_promote_stmt(expr) {
+            return Some(());
+        }
         // State field writes (register/tape machines).
         if let Some(()) = self.lower_state_field_write(expr) {
             return Some(());
@@ -1964,7 +1986,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -2005,7 +2027,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -2117,7 +2139,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, throwaway_reg)],
                         ),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -2149,7 +2171,7 @@ impl<'c> Lowerer<'c> {
                 self.emit_op(
                     OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                     quote! {
-                        let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                        let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                         let __trace_target = if __trace_target.is_null() {
                             #func as *const ()
                         } else {
@@ -3341,10 +3363,62 @@ impl<'c> Lowerer<'c> {
         }
     }
 
-    /// Lower `promote(x)` → emit `int_guard_value(x_reg)`, return x binding.
+    /// Statement-context lowering for `hint(x, promote=True)`:
     ///
-    /// RPython: `hint(x, promote=True)` → `int_guard_value(x)` (jtransform.py:612).
-    /// Blackhole: no-op. Tracing: emits GUARD_VALUE to specialize on current value.
+    /// - `x = promote(x);` (plain local re-assignment — `lower_state_
+    ///   field_write` falls through because LHS isn't a `state.foo` field;
+    ///   without this site `stmt_modifies_jit_state` returns false and
+    ///   `lower_stmt`'s config-aware fallback silently consumes the stmt
+    ///   without emitting the guard).
+    /// - `promote(x);` (bare statement-form — same fall-through path as
+    ///   plain assign).
+    ///
+    /// In both forms the actual guard emission is delegated to
+    /// `lower_promote_call` via `lower_value_expr` so the resulting op
+    /// shape (`-live-` + `<kind>_guard_value`) is identical to the
+    /// value-context lowering.  The local binding map already holds
+    /// `x → reg`; promote-on-self leaves it unchanged.
+    fn lower_promote_stmt(&mut self, expr: &Expr) -> Option<()> {
+        match expr {
+            Expr::Assign(assign) => {
+                let Expr::Path(_) = &*assign.left else {
+                    return None;
+                };
+                let Expr::Call(call) = &*assign.right else {
+                    return None;
+                };
+                if !is_promote_call_path(&call.func) {
+                    return None;
+                }
+                self.lower_value_expr(&assign.right)?;
+                Some(())
+            }
+            Expr::Call(call) => {
+                if !is_promote_call_path(&call.func) {
+                    return None;
+                }
+                self.lower_value_expr(expr)?;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower `promote(x)` → emit `-live-` + `<kind>_guard_value(x_reg)`,
+    /// return x binding.
+    ///
+    /// RPython: `hint(x, promote=True)` rewrites to a `-live-` marker
+    /// (jtransform.py:611) immediately followed by `int_guard_value(x)`
+    /// (jtransform.py:612).  The leading `-live-` pins the per-marker
+    /// liveness triple at the source position so the resume protocol can
+    /// rebuild the live frame state if the guard fails.  Without this
+    /// pair, the snapshot path falls back to the canonical "everything-
+    /// alive" entry — correct for blackhole resume but a per-marker
+    /// liveness parity loss vs RPython.
+    ///
+    /// Blackhole: no-op (the live marker is metadata, the guard a no-op
+    /// at non-trace time).  Tracing: emits GUARD_VALUE to specialize on
+    /// current value with the per-pc live set saved into all_liveness.
     ///
     /// Recognizes: `promote(x)`, `hint_promote(x)`, `jit::promote(x)`.
     fn lower_promote_call(&mut self, call: &ExprCall) -> Option<Binding> {
@@ -3356,6 +3430,15 @@ impl<'c> Lowerer<'c> {
         }
         let binding = self.lower_value_expr(&call.args[0])?;
         let reg = binding.reg;
+        // jtransform.py:611 — emit `-live-` before the guard op so the
+        // codewriter's per-marker liveness analysis records the alive
+        // set at this CFG position.  `live_placeholder_with_triple` will
+        // patch the BC_LIVE 2-byte slot to the dedup'd offset at
+        // `finalize_liveness` time.
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { __builder.live_placeholder(); },
+        );
         match binding.kind {
             BindingKind::Int => {
                 self.emit_op(
@@ -3627,7 +3710,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            let (__policy, _inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                             if __trace_target.is_null() && __concrete_target.is_null() {
                                 panic!("wrapped helper policy requires generated call-target wrappers");
                             }
@@ -3651,9 +3734,22 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::InlineFloat => {
                     result_kind = binding_kind_for_inline_policy(kind).unwrap();
                     let builder_path = inline_builder_path(&call.func)?;
+                    let prebuild_path = inline_prebuild_path(&call.func)?;
                     let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    // RPython `pyjitpl.py:2255 finish_setup` order: the
+                    // helper's per-marker `-live-` triples must land in
+                    // `asm.all_liveness` before the parent's
+                    // `JitDriver::install_canonical_liveness` snapshot.
+                    // Queue the helper's `__majit_inline_jitcode_<name>_
+                    // prebuild(__asm)` call into the parent's prebuild
+                    // accumulator; `liveness_prebuild_tokens` will splice
+                    // it ahead of the parent arm's own
+                    // `__asm._register_liveness_offset` calls.
+                    self.inline_liveness_prebuild.push(quote! {
+                        #prebuild_path(__asm);
+                    });
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::InlineCall,
@@ -3681,6 +3777,43 @@ impl<'c> Lowerer<'c> {
                 let unsupported = self.inference_failure_tokens(
                     "inferred helper policy only supports int-return value calls here; use an explicit inline_ref/inline_float or *_ref_wrapped/*_float_wrapped policy",
                 );
+                // RPython `pyjitpl.py:2255 finish_setup` order: the
+                // helper's per-marker `-live-` triples must land in
+                // `asm.all_liveness` before the parent's
+                // `JitDriver::install_canonical_liveness` snapshot.
+                //
+                // The inferred-policy path resolves the helper at runtime
+                // (`__policy == 4u8` → Inline build), so we cannot
+                // statically know whether the helper carries a real
+                // prebuild fn or none at all (residual / elidable /
+                // may-force / etc. helpers have no per-marker triples).
+                // The 5th element of the helper's
+                // `__majit_call_policy_<name>()` tuple
+                // (`emit_helper_policy_fn`) carries the prebuild fn
+                // pointer for `#[jit_inline]` helpers and `null` for
+                // every other helper attribute that flows through here.
+                // At parent-install time we read the pointer and
+                // dispatch: non-null → transmute & call → registers the
+                // helper's per-marker triples; null → skip.  Avoids a
+                // stub fn generation in non-Inline helper macros (some
+                // are reachable from crates that don't depend on
+                // `majit_metainterp`, so a stub referencing
+                // `&mut Assembler` would fail to compile).
+                let policy_path_for_prebuild = helper_policy_path(&call.func)?;
+                self.inline_liveness_prebuild.push(quote! {
+                    {
+                        let (_, _, _, _, __prebuild_ptr) = #policy_path_for_prebuild();
+                        if !__prebuild_ptr.is_null() {
+                            // SAFETY: `#[jit_inline]` (`lib.rs:1330`) is
+                            // the only emitter of a non-null prebuild
+                            // pointer, and it always points to a fn with
+                            // signature `fn(&mut Assembler)`.
+                            let __prebuild_fn: fn(&mut majit_metainterp::Assembler) =
+                                unsafe { std::mem::transmute(__prebuild_ptr) };
+                            __prebuild_fn(__asm);
+                        }
+                    }
+                });
                 let __arg_regs: Vec<Register> =
                     arg_bindings.iter().map(Register::from_binding).collect();
                 if let Some(_arg_regs) = int_arg_regs {
@@ -3696,7 +3829,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::int(reg)],
                         ),
                         quote! {
-                            let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
                                 #func as *const ()
                             } else {
@@ -3759,7 +3892,7 @@ impl<'c> Lowerer<'c> {
                             vec![Register::int(reg)],
                         ),
                         quote! {
-                            let (__policy, __inline_builder, __trace_target, __concrete_target) = #policy_path();
+                            let (__policy, __inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
                             let __trace_target = if __trace_target.is_null() {
                                 #func as *const ()
                             } else {
@@ -4352,6 +4485,23 @@ fn inline_builder_path(expr: &Expr) -> Option<Path> {
     Some(path)
 }
 
+/// Construct the path of the per-helper liveness prebuild fn that
+/// `#[jit_inline]` generates alongside `_with_asm`. The parent
+/// `#[jit_interp]` calls this from its
+/// `__prebuild_jitcode_liveness_*` so the helper's per-marker
+/// triples land in `asm.all_liveness` before
+/// `metainterp_sd.liveness_info` snapshot, matching RPython
+/// `pyjitpl.py:2255 finish_setup` order.
+fn inline_prebuild_path(expr: &Expr) -> Option<Path> {
+    let Expr::Path(ExprPath { path, .. }) = expr else {
+        return None;
+    };
+    let mut path = path.clone();
+    let last = path.segments.last_mut()?;
+    last.ident = format_ident!("__majit_inline_jitcode_{}_prebuild", last.ident);
+    Some(path)
+}
+
 fn binding_kind_for_inline_policy(kind: crate::jit_interp::CallPolicyKind) -> Option<BindingKind> {
     match kind {
         crate::jit_interp::CallPolicyKind::InlineInt => Some(BindingKind::Int),
@@ -4509,6 +4659,8 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
     rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
     maybe_dump_liveness(&helper_name, &lowerer.op_metadata);
+    let liveness_prebuild =
+        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
     let statements = lowerer.statements;
     Ok(Some(InlineHelperJitCode {
         body: quote! {
@@ -4516,6 +4668,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         },
         return_reg: binding.reg,
         return_kind,
+        liveness_prebuild,
     }))
 }
 

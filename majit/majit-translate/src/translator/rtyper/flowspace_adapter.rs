@@ -445,59 +445,6 @@ pub fn translate_op(
         | OpKind::GuardValue { .. }
         | OpKind::VableForce { .. } => Ok(Vec::new()),
 
-        // ─── Skipped: post-rtyper jtransform-emitted variants ───
-        // RPython's jtransform pass (`rpython/jit/codewriter/jtransform.py`)
-        // runs *after* the rtyper has already lowered every high-level op.
-        // The variants below correspond to opcodes jtransform synthesises
-        // on top of an already-rtyped graph, so they cannot legitimately
-        // appear at the rtyper input. Pyre's IR shares one `OpKind` enum
-        // across both pre- and post-rtyper stages for storage convenience;
-        // the flowspace adapter sees the rtyper input shape and treats
-        // these variants as opaque pass-throughs (no SSA result the
-        // downstream flowspace consumer would query). A regression that
-        // routes one of these through the adapter from the front-end side
-        // is caught by the SSA-result-undefined invariant downstream
-        // rather than masquerading as a broken rtype dispatch here.
-        //
-        // Vable family (`getfield_vable_*` / `setfield_vable_*` / etc.)
-        // — `jtransform.py:651-927` rewrites virtualizable accesses
-        // post-rtype.
-        OpKind::VableFieldRead { .. }
-        | OpKind::VableFieldWrite { .. }
-        | OpKind::VableArrayRead { .. }
-        | OpKind::VableArrayWrite { .. } => Ok(Vec::new()),
-        // Call effect classification (CallElidable / CallResidual /
-        // CallMayForce) — `jtransform.py:414-435 rewrite_call()` splits
-        // args into three ListOfKind and emits these specialised opnames.
-        OpKind::CallElidable { .. } | OpKind::CallResidual { .. } | OpKind::CallMayForce { .. } => {
-            Ok(Vec::new())
-        }
-        // Call kind classification — `jtransform.py:473-482` /
-        // `:522-534` for inline_call_* / recursive_call_*.
-        OpKind::InlineCall { .. } | OpKind::RecursiveCall { .. } => Ok(Vec::new()),
-        // JIT builtin ops (`jtransform.py:1731-1743`):
-        // `jit_debug` / `*_assert_green` / `current_trace_length` /
-        // `*_isconstant` / `*_isvirtual`.
-        OpKind::JitDebug { .. }
-        | OpKind::AssertGreen { .. }
-        | OpKind::CurrentTraceLength
-        | OpKind::IsConstant { .. }
-        | OpKind::IsVirtual { .. } => Ok(Vec::new()),
-        // Conditional call ops (`jtransform.py:1665-1688`):
-        // `conditional_call_*_v` / `conditional_call_value_*_*`.
-        OpKind::ConditionalCall { .. } | OpKind::ConditionalCallValue { .. } => Ok(Vec::new()),
-        // Pure-call result hint (`jtransform.py:292-313`) and quasi-
-        // immutable record (`jtransform.py:901-903`).
-        OpKind::RecordKnownResult { .. } | OpKind::RecordQuasiImmutField { .. } => Ok(Vec::new()),
-        // Liveness marker / JIT driver markers — `jtransform.py:469,481,533`,
-        // `jtransform.py:1690-1718`.
-        OpKind::Live | OpKind::JitMergePoint { .. } | OpKind::LoopHeader { .. } => Ok(Vec::new()),
-        // Pyre-only abort marker emitted by the front-end when an
-        // untranslatable form is encountered. Carries no SSA result the
-        // rtyper would consume; downstream blackhole resume handles it
-        // (see `blackhole.rs::handler_abort_marker_pyre`).
-        OpKind::Abort { .. } => Ok(Vec::new()),
-
         // ─── Pre-rtyper opname normalization ───
         // `binary_op_name` (`front/ast.rs:3227-3258`) emits Rust-side
         // names (`bitand`, `bitor`, `bitxor`, `add_assign`, ...).
@@ -773,43 +720,33 @@ pub fn translate_op(
             }
         }
 
-        // ─── Slice 1b: IndirectCall port ───
+        // ─── Pyre-internal: IndirectCall ───
         // RPython `rpython/rtyper/rpbc.py:216-217`:
         // ```python
         // vlist.append(hop.inputconst(Void, row_of_graphs.values()))
         // v = hop.genop('indirect_call', vlist, resulttype=rresult)
         // ```
-        // Trailing `c_graphs` Constant of type Void carries the candidate
-        // graph list. Pyre stores the graphs as `Option<Vec<CallPath>>` and
-        // packages each segment list as a `ConstValue::List` of byte-string
-        // qualnames so the rtyper sees the same Void-typed list shape.
-        OpKind::IndirectCall {
-            funcptr,
-            args,
-            graphs,
-            ..
-        } => {
-            let funcptr_hl = lookup_operand(value_map, *funcptr)?;
-            let arg_hls: Result<Vec<_>, _> =
-                args.iter().map(|v| lookup_operand(value_map, *v)).collect();
-            let arg_hls = arg_hls?;
-            let result = resolve_result_hlvalue(op, value_map)?;
-            let graphs_const = match graphs {
-                Some(paths) => {
-                    let elements: Vec<ConstValue> = paths
-                        .iter()
-                        .map(|p| ConstValue::byte_str(p.segments.join("::")))
-                        .collect();
-                    ConstValue::List(elements)
-                }
-                None => ConstValue::List(Vec::new()),
-            };
-            let mut call_args = Vec::with_capacity(arg_hls.len() + 2);
-            call_args.push(funcptr_hl);
-            call_args.extend(arg_hls);
-            call_args.push(Hlvalue::Constant(Constant::new(graphs_const)));
-            Ok(vec![FlowspaceOp::new("indirect_call", call_args, result)])
-        }
+        // The trailing `c_graphs` Constant must carry actual graph
+        // identities — pyre's parity emits `ConstValue::Graphs(Vec<usize>)`
+        // via `GraphKey::of(&g.graph).as_usize()` (see
+        // `translator/rtyper/rpbc.rs:1481-1490`). The flowspace adapter
+        // doesn't have access to the graph registry that resolves
+        // `CallPath` segments to `Rc<RefCell<FunctionGraph>>` references,
+        // so it cannot construct a faithful `ConstValue::Graphs`. A
+        // synthetic `ConstValue::List(byte_str(qualname))` would silently
+        // drop indirect-call analysis (`graphanalyze.rs:333` falls back
+        // to `top_result()` for any non-Graphs ConstValue), so fail-loud
+        // is the parity-correct behaviour: `IndirectCall` must be lowered
+        // by `rpbc.rs` (the rtyper-equivalent layer that owns the graph
+        // registry) before reaching the flowspace adapter.
+        OpKind::IndirectCall { .. } => Err(TyperError::message(format!(
+            "translate_op: IndirectCall at result={:?} must be lowered to \
+             a flowspace `indirect_call` op with `ConstValue::Graphs(Vec<\
+             usize>)` candidate-graph keys by `rpbc.rs:1481-1490` before \
+             reaching the adapter; synthesising a `ConstValue::List` here \
+             would break `graphanalyze.rs:333` indirect-call analysis",
+            op.result
+        ))),
 
         // ─── Pyre-internal: VtableMethodPtr ───
         // PRE-EXISTING-ADAPTATION of `rclass.py:371-377 getclsfield()`.
@@ -827,20 +764,49 @@ pub fn translate_op(
             op.result
         ))),
 
-        // ─── Slice 1b followups: deferred per-variant ports ───
-        // No remaining variants — every `OpKind` either has an explicit
-        // arm above or is intentionally fail-loud (Indirect / VtableMethod).
-        // The catch-all stays as defence-in-depth for future enum
-        // additions: a new variant added to `model::OpKind` without a
-        // matching arm here surfaces immediately as a fail-loud anchor
-        // for the Slice 4 dual-gate tests.
-        other => Err(TyperError::message(format!(
-            "translate_op: OpKind variant `{}` not yet ported \
-             (Slice 1b followup pending) — reachable from legacy graph \
-             at result={:?}",
-            opkind_variant_name(other),
-            op.result,
-        ))),
+        // ─── Stage-invariant fail-loud catch-all ───
+        // No remaining variants reach here legitimately: every legitimate
+        // pre-rtyper input shape has an explicit arm above, every
+        // post-rtyper jtransform-emitted variant is enumerated in
+        // `post_rtyper_jtransform_variant_name` and short-circuits with
+        // a stage-mismatch message before this fall-through, and every
+        // pyre-internal rtyper-cutover variant (`IndirectCall`,
+        // `VtableMethodPtr`) has its own targeted fail-loud arm.  Hitting
+        // this catch-all means a brand-new `OpKind` was added without
+        // updating either the explicit translate arm OR the variant-name
+        // table — fail-loud with a clear pointer at where the missing
+        // arm should land.
+        other => {
+            let variant = opkind_variant_name(other);
+            if let Some(stage_msg) = post_rtyper_jtransform_variant_name(other) {
+                Err(TyperError::message(format!(
+                    "translate_op: post-rtyper jtransform variant `{stage_msg}` \
+                     reached the flowspace adapter at result={:?}.  RPython \
+                     `rpython/jit/codewriter/jtransform.py` runs *after* the \
+                     rtyper has lowered every high-level op, so this variant \
+                     must NEVER appear at the rtyper input.  Source of the \
+                     leak is upstream — check `rpbc.rs` / `rclass.rs` / the \
+                     pre-rtyper graph builder for an emit site that should \
+                     have produced a pre-rtyper shape (e.g. `FieldRead` / \
+                     `ArrayRead` / `Call`) instead of `{variant}`.",
+                    op.result,
+                )))
+            } else {
+                Err(TyperError::message(format!(
+                    "translate_op: OpKind variant `{variant}` has no \
+                     translate arm and no stage-invariant classification.  \
+                     A new pyre-internal variant was added to \
+                     `model::OpKind` without updating \
+                     `flowspace_adapter::translate_op` or \
+                     `opkind_variant_name`.  Add an explicit translate arm \
+                     above (lower to flowspace) or, if the variant is \
+                     post-rtyper-only, list it in \
+                     `post_rtyper_jtransform_variant_name` so the \
+                     stage-mismatch message fires.  result={:?}",
+                    op.result,
+                )))
+            }
+        }
     }
 }
 
@@ -862,14 +828,74 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
         OpKind::GuardValue { .. } => "GuardValue",
+        OpKind::VtableMethodPtr { .. } => "VtableMethodPtr",
+        OpKind::IndirectCall { .. } => "IndirectCall",
         OpKind::BinOp { .. } => "BinOp",
         OpKind::UnaryOp { .. } => "UnaryOp",
         OpKind::VableForce { .. } => "VableForce",
+        OpKind::VableFieldRead { .. } => "VableFieldRead",
+        OpKind::VableFieldWrite { .. } => "VableFieldWrite",
+        OpKind::VableArrayRead { .. } => "VableArrayRead",
+        OpKind::VableArrayWrite { .. } => "VableArrayWrite",
+        OpKind::CallElidable { .. } => "CallElidable",
+        OpKind::CallResidual { .. } => "CallResidual",
+        OpKind::CallMayForce { .. } => "CallMayForce",
+        OpKind::InlineCall { .. } => "InlineCall",
+        OpKind::RecursiveCall { .. } => "RecursiveCall",
+        OpKind::JitDebug { .. } => "JitDebug",
+        OpKind::AssertGreen { .. } => "AssertGreen",
+        OpKind::CurrentTraceLength => "CurrentTraceLength",
+        OpKind::IsConstant { .. } => "IsConstant",
+        OpKind::IsVirtual { .. } => "IsVirtual",
+        OpKind::ConditionalCall { .. } => "ConditionalCall",
+        OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
+        OpKind::RecordKnownResult { .. } => "RecordKnownResult",
+        OpKind::RecordQuasiImmutField { .. } => "RecordQuasiImmutField",
+        OpKind::Live => "Live",
+        OpKind::JitMergePoint { .. } => "JitMergePoint",
+        OpKind::LoopHeader { .. } => "LoopHeader",
+        OpKind::Abort { .. } => "Abort",
         // Catch-all for variants pyre may add without bumping this
         // table — surfaces as `<unknown>` in the fail-loud message
-        // rather than a misleading variant tag.
+        // rather than a misleading variant tag.  The catch-all message
+        // (above) instructs the reader to extend this table.
         _ => "<unknown OpKind variant>",
     }
+}
+
+/// Identify whether `kind` is a post-rtyper jtransform-emitted variant
+/// (i.e., emitted by `rpython/jit/codewriter/jtransform.py` AFTER the
+/// rtyper has lowered every high-level op).  These variants must NEVER
+/// reach the flowspace adapter — a leak indicates the upstream pre-
+/// rtyper graph builder (or pyre's `rpbc.rs` / `rclass.rs`) emitted the
+/// post-rtyper shape directly instead of routing through the rtyper-
+/// equivalent lowering step.  Returns `Some(name)` for fail-loud messages.
+fn post_rtyper_jtransform_variant_name(kind: &OpKind) -> Option<&'static str> {
+    Some(match kind {
+        OpKind::VableFieldRead { .. } => "VableFieldRead (jtransform.py:651-927)",
+        OpKind::VableFieldWrite { .. } => "VableFieldWrite (jtransform.py:651-927)",
+        OpKind::VableArrayRead { .. } => "VableArrayRead (jtransform.py:651-927)",
+        OpKind::VableArrayWrite { .. } => "VableArrayWrite (jtransform.py:651-927)",
+        OpKind::CallElidable { .. } => "CallElidable (jtransform.py:414-435 rewrite_call)",
+        OpKind::CallResidual { .. } => "CallResidual (jtransform.py:414-435 rewrite_call)",
+        OpKind::CallMayForce { .. } => "CallMayForce (jtransform.py:414-435 rewrite_call)",
+        OpKind::InlineCall { .. } => "InlineCall (jtransform.py:473-482)",
+        OpKind::RecursiveCall { .. } => "RecursiveCall (jtransform.py:522-534)",
+        OpKind::JitDebug { .. } => "JitDebug (jtransform.py:1731-1743)",
+        OpKind::AssertGreen { .. } => "AssertGreen (jtransform.py:1731-1743)",
+        OpKind::CurrentTraceLength => "CurrentTraceLength (jtransform.py:1731-1743)",
+        OpKind::IsConstant { .. } => "IsConstant (jtransform.py:1731-1743)",
+        OpKind::IsVirtual { .. } => "IsVirtual (jtransform.py:1731-1743)",
+        OpKind::ConditionalCall { .. } => "ConditionalCall (jtransform.py:1665-1688)",
+        OpKind::ConditionalCallValue { .. } => "ConditionalCallValue (jtransform.py:1665-1688)",
+        OpKind::RecordKnownResult { .. } => "RecordKnownResult (jtransform.py:292-313)",
+        OpKind::RecordQuasiImmutField { .. } => "RecordQuasiImmutField (jtransform.py:901-903)",
+        OpKind::Live => "Live (jtransform.py:469,481,533)",
+        OpKind::JitMergePoint { .. } => "JitMergePoint (jtransform.py:1690-1718)",
+        OpKind::LoopHeader { .. } => "LoopHeader (jtransform.py:1690-1718)",
+        OpKind::Abort { .. } => "Abort (pyre-only abort marker)",
+        _ => return None,
+    })
 }
 
 /// Output of [`function_graph_to_flowspace`] — the assembled
@@ -1865,14 +1891,19 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_indirect_call_lowers_to_indirect_call_op() {
-        // OpKind::IndirectCall → `indirect_call(funcptr, args...,
-        // graphs_const)` per `rpbc.py:216-217`. Trailing Constant
-        // wraps the candidate-graph list (Void-typed in upstream).
+    fn translate_op_indirect_call_surfaces_rpbc_invariant() {
+        // OpKind::IndirectCall must be lowered by `rpbc.rs:1481-1490`
+        // (the rtyper-equivalent layer that owns the graph registry
+        // and can resolve CallPath → ConstValue::Graphs(Vec<usize>))
+        // before reaching the flowspace adapter. Synthesising
+        // `ConstValue::List(byte_str)` here would break
+        // `graphanalyze.rs:333` indirect-call analysis (any non-Graphs
+        // ConstValue falls back to `top_result()`); fail-loud is the
+        // parity-correct behaviour.
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
-        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new())); // funcptr
-        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new())); // arg
-        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new())); // result
+        value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::IndirectCall {
@@ -1882,15 +1913,13 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map).expect("IndirectCall arm must lower");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(translated[0].opname, "indirect_call");
-        // funcptr + arg + graphs_const = 3 args
-        assert_eq!(translated[0].args.len(), 3);
-        let Hlvalue::Constant(ref graphs_const) = translated[0].args[2] else {
-            panic!("trailing graphs arg must be Constant");
-        };
-        assert!(matches!(graphs_const.value, ConstValue::List(ref lst) if lst.is_empty()));
+        let err = translate_op(&op, &value_map)
+            .expect_err("IndirectCall must surface rpbc.rs invariant break");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("IndirectCall") && msg.contains("rpbc.rs"),
+            "fail-loud must cite IndirectCall + rpbc.rs:1481, got: {msg}"
+        );
     }
 
     #[test]

@@ -137,7 +137,7 @@ fn jit_inline_mixed_identity_generates_dense_per_kind_jitcode() {
 
 #[test]
 fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
-    let (ref_policy, ref_builder, _, _) = __majit_call_policy_inline_ref_identity();
+    let (ref_policy, ref_builder, _, _, _) = __majit_call_policy_inline_ref_identity();
     assert_eq!(
         ref_policy, 0u8,
         "ref-return inline helper should not claim inferred inline_int parity"
@@ -147,7 +147,7 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
         "ref-return inline helper should not expose inferred inline builder"
     );
 
-    let (float_policy, float_builder, _, _) = __majit_call_policy_inline_float_identity();
+    let (float_policy, float_builder, _, _, _) = __majit_call_policy_inline_float_identity();
     assert_eq!(
         float_policy, 0u8,
         "float-return inline helper should not claim inferred inline_int parity"
@@ -157,7 +157,7 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
         "float-return inline helper should not expose inferred inline builder"
     );
 
-    let (int_policy, int_builder, _, _) = __majit_call_policy_inline_mixed_int_identity();
+    let (int_policy, int_builder, _, _, _) = __majit_call_policy_inline_mixed_int_identity();
     assert_eq!(
         int_policy, 4u8,
         "int-return inline helper should keep inferred inline policy"
@@ -170,7 +170,7 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
 
 #[test]
 fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_policy() {
-    let (ref_policy, ref_inline_builder, ref_trace_target, ref_concrete_target) =
+    let (ref_policy, ref_inline_builder, ref_trace_target, ref_concrete_target, _) =
         __majit_call_policy_wrapped_ref_identity();
     assert_eq!(
         ref_policy, 0u8,
@@ -185,7 +185,7 @@ fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_poli
         "explicit wrapped ref policy still needs trace/concrete targets"
     );
 
-    let (float_policy, float_inline_builder, float_trace_target, float_concrete_target) =
+    let (float_policy, float_inline_builder, float_trace_target, float_concrete_target, _) =
         __majit_call_policy_wrapped_float_identity();
     assert_eq!(
         float_policy, 0u8,
@@ -200,7 +200,7 @@ fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_poli
         "explicit wrapped float policy still needs trace/concrete targets"
     );
 
-    let (int_policy, int_inline_builder, int_trace_target, int_concrete_target) =
+    let (int_policy, int_inline_builder, int_trace_target, int_concrete_target, _) =
         __majit_call_policy_wrapped_int_identity();
     assert_eq!(
         int_policy, 2u8,
