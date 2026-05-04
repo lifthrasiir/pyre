@@ -10,6 +10,7 @@ pub mod call;
 pub mod codewriter;
 pub mod flatten;
 pub mod format;
+pub mod insns;
 pub mod jitcode;
 pub mod jtransform;
 pub mod liveness;

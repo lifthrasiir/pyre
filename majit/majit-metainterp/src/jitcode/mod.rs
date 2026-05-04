@@ -5,526 +5,55 @@ pub use majit_translate::jitcode::{
     BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, JitCode as CanonicalJitCode,
 };
 
-pub(crate) const BC_LOOP_HEADER: u8 = 12;
-pub(crate) const BC_ABORT: u8 = 13;
-pub(crate) const BC_ABORT_PERMANENT: u8 = 14;
-/// RPython `blackhole.py:962` `bhimpl_unreachable()` raises
-/// `AssertionError("unreachable")`. Distinct from `BC_ABORT_PERMANENT`
-/// which permits the interpreter to take over via
-/// `DispatchError::RaiseException`.
-pub(crate) const BC_UNREACHABLE: u8 = 19;
-/// RPython `blackhole.py:913` aliases `bhimpl_goto_if_not_int_is_true`
-/// to `bhimpl_goto_if_not`, whose body takes the branch iff the int
-/// register is zero/false (`goto_if_not_int_is_true/iL`).
-pub(crate) const BC_GOTO_IF_NOT_INT_IS_TRUE: u8 = 15;
-pub(crate) const BC_JUMP: u8 = 16;
-pub(crate) const BC_INLINE_CALL: u8 = 17;
-// slot 18 (formerly BC_RESIDUAL_CALL_VOID) freed by Slice 1c —
-// pyre-call-family-canonical-migration.md retired the legacy
-// `(fn_ptr_idx:u16, num_args:u16, [(kind:u8, reg:u16)]...)` payload in
-// favour of canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` (=159..=161).
-pub(crate) const BC_MOVE_I: u8 = 21;
-pub(crate) const BC_CALL_INT: u8 = 22;
-pub(crate) const BC_CALL_PURE_INT: u8 = 23;
-// Ref-typed bytecodes
-pub(crate) const BC_MOVE_R: u8 = 27;
-pub(crate) const BC_CALL_REF: u8 = 28;
-pub(crate) const BC_CALL_PURE_REF: u8 = 29;
-// Float-typed bytecodes
-pub(crate) const BC_MOVE_F: u8 = 33;
-pub(crate) const BC_CALL_FLOAT: u8 = 34;
-pub(crate) const BC_CALL_PURE_FLOAT: u8 = 35;
-pub(crate) const BC_CALL_MAY_FORCE_INT: u8 = 38;
-pub(crate) const BC_CALL_MAY_FORCE_REF: u8 = 39;
-pub(crate) const BC_CALL_MAY_FORCE_FLOAT: u8 = 40;
-// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed by Slice 1c — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family carries the may_force
-// policy on `calldescr.extra_info` (RPython `effectinfo.py:201
-// EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`), not via a separate opcode.
-pub(crate) const BC_CALL_RELEASE_GIL_INT: u8 = 42;
-// BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
-// resoperation.py:1243-1244 (`# no such thing`) excludes
-// CALL_RELEASE_GIL_R from the upstream opcode table.
-pub(crate) const BC_CALL_RELEASE_GIL_FLOAT: u8 = 44;
-// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed by Slice 1c — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family marks release_gil
-// via `EffectInfo.call_release_gil_target` (RPython
-// `effectinfo.py:255 is_call_release_gil`), not a separate opcode.
-pub(crate) const BC_CALL_LOOPINVARIANT_INT: u8 = 46;
-pub(crate) const BC_CALL_LOOPINVARIANT_REF: u8 = 47;
-pub(crate) const BC_CALL_LOOPINVARIANT_FLOAT: u8 = 48;
-// slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed by Slice 1c — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family carries
-// `EF_LOOPINVARIANT` on `calldescr.extra_info` (RPython
-// `effectinfo.py:202 EF_LOOPINVARIANT`), not a separate opcode.
-pub(crate) const BC_CALL_ASSEMBLER_INT: u8 = 50;
-pub(crate) const BC_CALL_ASSEMBLER_REF: u8 = 51;
-pub(crate) const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;
-pub(crate) const BC_CALL_ASSEMBLER_VOID: u8 = 53;
-pub(crate) const BC_LOAD_STATE_FIELD: u8 = 56;
-pub(crate) const BC_STORE_STATE_FIELD: u8 = 57;
-pub(crate) const BC_LOAD_STATE_ARRAY: u8 = 58;
-pub(crate) const BC_STORE_STATE_ARRAY: u8 = 59;
-pub(crate) const BC_LOAD_STATE_VARRAY: u8 = 60;
-pub(crate) const BC_STORE_STATE_VARRAY: u8 = 61;
-pub(crate) const BC_GETFIELD_VABLE_I: u8 = 62;
-pub(crate) const BC_GETFIELD_VABLE_R: u8 = 63;
-pub(crate) const BC_GETFIELD_VABLE_F: u8 = 64;
-pub(crate) const BC_SETFIELD_VABLE_I: u8 = 65;
-pub(crate) const BC_SETFIELD_VABLE_R: u8 = 66;
-pub(crate) const BC_SETFIELD_VABLE_F: u8 = 67;
-pub(crate) const BC_GETARRAYITEM_VABLE_I: u8 = 68;
-pub(crate) const BC_GETARRAYITEM_VABLE_R: u8 = 69;
-pub(crate) const BC_GETARRAYITEM_VABLE_F: u8 = 70;
-pub(crate) const BC_SETARRAYITEM_VABLE_I: u8 = 71;
-pub(crate) const BC_SETARRAYITEM_VABLE_R: u8 = 72;
-pub(crate) const BC_SETARRAYITEM_VABLE_F: u8 = 73;
-pub(crate) const BC_ARRAYLEN_VABLE: u8 = 74;
-pub(crate) const BC_HINT_FORCE_VIRTUALIZABLE: u8 = 75;
-/// RPython bhimpl_ref_return: callee returns a ref value.
-pub const BC_REF_RETURN: u8 = 76;
-/// blackhole.py bhimpl_raise: raise an exception from a ref register.
-pub(crate) const BC_RAISE: u8 = 77;
-/// blackhole.py bhimpl_reraise: re-raise exception_last_value.
-pub(crate) const BC_RERAISE: u8 = 78;
-// RPython jtransform.py:1685 — conditional_call_ir_v
-pub(crate) const BC_COND_CALL_VOID: u8 = 79;
-// RPython jtransform.py:1687 — conditional_call_value_ir_i / conditional_call_value_ir_r
-pub(crate) const BC_COND_CALL_VALUE_INT: u8 = 80;
-pub(crate) const BC_COND_CALL_VALUE_REF: u8 = 81;
-// RPython jtransform.py:292 — record_known_result_i_ir_v / record_known_result_r_ir_v
-pub(crate) const BC_RECORD_KNOWN_RESULT_INT: u8 = 82;
-pub(crate) const BC_RECORD_KNOWN_RESULT_REF: u8 = 83;
-/// pyjitpl.py opimpl_int_guard_value: promote int to constant via GUARD_VALUE.
-pub(crate) const BC_INT_GUARD_VALUE: u8 = 84;
-/// pyjitpl.py opimpl_ref_guard_value: promote ref to constant via GUARD_VALUE.
-pub(crate) const BC_REF_GUARD_VALUE: u8 = 85;
-/// pyjitpl.py opimpl_float_guard_value: promote float to constant via GUARD_VALUE.
-pub(crate) const BC_FLOAT_GUARD_VALUE: u8 = 86;
-/// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
-/// `iIRFIRF` form: jdindex byte is a `registers_i` pool slot index
-/// (assembler.py:106-107 emit_const default path when `allow_short=False`
-/// or value > 127).
-pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
-/// `cIRFIRF` form of `bhimpl_jit_merge_point` selected by
-/// assembler.py:312 `USE_C_FORM` membership when jdindex fits in
-/// `signed i8` (`-128..=127`). The jdindex byte is the raw signed
-/// value (assembler.py:99-107 emit_const short branch +
-/// blackhole.py:121-123 `argcode == 'c'` handler reads `signedord`).
-pub(crate) const BC_JIT_MERGE_POINT_C: u8 = 131;
-pub const BC_LIVE: u8 = 88;
-pub const BC_CATCH_EXCEPTION: u8 = 89;
-pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
-/// RPython blackhole.py:987 `last_exception/>i`.
-pub(crate) const BC_LAST_EXCEPTION: u8 = 129;
-/// RPython blackhole.py:976-985 `goto_if_exception_mismatch/iL`.
-pub(crate) const BC_GOTO_IF_EXCEPTION_MISMATCH: u8 = 130;
-/// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
-pub const BC_RVMPROF_CODE: u8 = 91;
+// `BC_*` constants and `MAX_HOST_CALL_ARITY` were moved to
+// `majit_translate::insns` in slice #86c (Task #86). They live with
+// the canonical RPython-parity types (`JitCode` / `BhDescr` /
+// `BhCallDescr` / `enumerate_vars`) per
+// `epic_e_task86_canonical_home_design_2026_05_04.md`. These
+// re-exports keep all in-crate and external consumers working
+// without an import-path sweep — that sweep is slice #86e.
+pub use majit_translate::insns::{
+    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_CALL_ASSEMBLER_FLOAT,
+    BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID, BC_CALL_FLOAT,
+    BC_CALL_INT, BC_CALL_LOOPINVARIANT_FLOAT, BC_CALL_LOOPINVARIANT_INT, BC_CALL_LOOPINVARIANT_REF,
+    BC_CALL_MAY_FORCE_FLOAT, BC_CALL_MAY_FORCE_INT, BC_CALL_MAY_FORCE_REF, BC_CALL_PURE_FLOAT,
+    BC_CALL_PURE_INT, BC_CALL_PURE_REF, BC_CALL_REF, BC_CALL_RELEASE_GIL_FLOAT,
+    BC_CALL_RELEASE_GIL_INT, BC_CATCH_EXCEPTION, BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF,
+    BC_COND_CALL_VOID, BC_FLOAT_ABS, BC_FLOAT_ADD, BC_FLOAT_GUARD_VALUE, BC_FLOAT_MUL,
+    BC_FLOAT_NEG, BC_FLOAT_POP, BC_FLOAT_PUSH, BC_FLOAT_RETURN, BC_FLOAT_SUB, BC_FLOAT_TRUEDIV,
+    BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I, BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F,
+    BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R, BC_GOTO_IF_EXCEPTION_MISMATCH,
+    BC_GOTO_IF_NOT_FLOAT_EQ, BC_GOTO_IF_NOT_FLOAT_GE, BC_GOTO_IF_NOT_FLOAT_GT,
+    BC_GOTO_IF_NOT_FLOAT_LE, BC_GOTO_IF_NOT_FLOAT_LT, BC_GOTO_IF_NOT_FLOAT_NE,
+    BC_GOTO_IF_NOT_INT_EQ, BC_GOTO_IF_NOT_INT_GE, BC_GOTO_IF_NOT_INT_GT,
+    BC_GOTO_IF_NOT_INT_IS_TRUE, BC_GOTO_IF_NOT_INT_IS_ZERO, BC_GOTO_IF_NOT_INT_LE,
+    BC_GOTO_IF_NOT_INT_LT, BC_GOTO_IF_NOT_INT_NE, BC_GOTO_IF_NOT_PTR_EQ, BC_GOTO_IF_NOT_PTR_ISZERO,
+    BC_GOTO_IF_NOT_PTR_NE, BC_GOTO_IF_NOT_PTR_NONZERO, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL,
+    BC_INSTANCE_PTR_EQ, BC_INSTANCE_PTR_NE, BC_INT_ADD, BC_INT_AND, BC_INT_EQ, BC_INT_FLOORDIV,
+    BC_INT_GE, BC_INT_GT, BC_INT_GUARD_VALUE, BC_INT_INVERT, BC_INT_LE, BC_INT_LSHIFT, BC_INT_LT,
+    BC_INT_MOD, BC_INT_MUL, BC_INT_NE, BC_INT_NEG, BC_INT_OR, BC_INT_POP, BC_INT_PUSH,
+    BC_INT_RETURN, BC_INT_RSHIFT, BC_INT_SUB, BC_INT_XOR, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C,
+    BC_JUMP, BC_LAST_EXC_VALUE, BC_LAST_EXCEPTION, BC_LIVE, BC_LOAD_STATE_ARRAY,
+    BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY, BC_LOOP_HEADER, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R,
+    BC_PTR_EQ, BC_PTR_ISZERO, BC_PTR_NE, BC_PTR_NONZERO, BC_RAISE, BC_RECORD_KNOWN_RESULT_INT,
+    BC_RECORD_KNOWN_RESULT_REF, BC_REF_GUARD_VALUE, BC_REF_POP, BC_REF_PUSH, BC_REF_RETURN,
+    BC_RERAISE, BC_RESIDUAL_CALL_IR_I, BC_RESIDUAL_CALL_IR_R, BC_RESIDUAL_CALL_IR_V,
+    BC_RESIDUAL_CALL_IRF_F, BC_RESIDUAL_CALL_IRF_I, BC_RESIDUAL_CALL_IRF_R, BC_RESIDUAL_CALL_IRF_V,
+    BC_RESIDUAL_CALL_R_I, BC_RESIDUAL_CALL_R_R, BC_RESIDUAL_CALL_R_V, BC_RVMPROF_CODE,
+    BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I, BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F,
+    BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R, BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD,
+    BC_STORE_STATE_VARRAY, BC_UINT_GE, BC_UINT_GT, BC_UINT_LE, BC_UINT_LT, BC_UINT_MUL_HIGH,
+    BC_UINT_RSHIFT, BC_UNREACHABLE, BC_VOID_RETURN, MAX_HOST_CALL_ARITY,
+};
 
-// RPython jtransform.py:196 `optimize_goto_if_not` fuses
-// `v = int_lt(x, y); exitswitch = v` into
-// `exitswitch = ('int_lt', x, y)`, emitted by flatten.py:247-250 as
-// the jitcode op `goto_if_not_int_lt`. blackhole.py:864-944 consumes
-// the fused form with dedicated bhimpls.
-//
-// majit currently reserves one `BC_GOTO_IF_NOT_*` per RPython opname
-// variant; the 'c' short-const argcode (assembler.py:312 `USE_C_FORM`)
-// is not yet supported in the pyre JitCodeBuilder so only the canonical
-// `iiL` / `ffL` / `rrL` forms get a BC_* allocation here.
-pub(crate) const BC_GOTO_IF_NOT_INT_LT: u8 = 92;
-pub(crate) const BC_GOTO_IF_NOT_INT_LE: u8 = 93;
-pub(crate) const BC_GOTO_IF_NOT_INT_EQ: u8 = 94;
-pub(crate) const BC_GOTO_IF_NOT_INT_NE: u8 = 95;
-pub(crate) const BC_GOTO_IF_NOT_INT_GT: u8 = 96;
-pub(crate) const BC_GOTO_IF_NOT_INT_GE: u8 = 97;
-pub(crate) const BC_GOTO_IF_NOT_FLOAT_LT: u8 = 98;
-pub(crate) const BC_GOTO_IF_NOT_FLOAT_LE: u8 = 99;
-pub(crate) const BC_GOTO_IF_NOT_FLOAT_EQ: u8 = 100;
-pub(crate) const BC_GOTO_IF_NOT_FLOAT_NE: u8 = 101;
-pub(crate) const BC_GOTO_IF_NOT_FLOAT_GT: u8 = 102;
-pub(crate) const BC_GOTO_IF_NOT_FLOAT_GE: u8 = 103;
-pub(crate) const BC_GOTO_IF_NOT_PTR_EQ: u8 = 104;
-pub(crate) const BC_GOTO_IF_NOT_PTR_NE: u8 = 105;
-// blackhole.py:916-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`:
-// take target iff `a != 0`. jtransform.py:1212 `_rewrite_equality`
-// folds `int_eq(x, 0)` into `int_is_zero(x)`; flatten.py:247 then
-// specialises the bool exitswitch into `goto_if_not_int_is_zero/iL`.
-pub(crate) const BC_GOTO_IF_NOT_INT_IS_ZERO: u8 = 106;
+// `insn_byte` and `wellknown_bh_insns` were moved to
+// `majit_translate::insns` in slice #86d (Task #86). Re-exports keep
+// internal callers (`jitcode::assembler::JitCodeBuilder`) and external
+// callers (`pyre/pyre-jit/src/jit/assembler.rs`) resolving unchanged
+// — the import-path sweep is slice #86e.
+pub(crate) use majit_translate::insns::insn_byte;
 
-// blackhole.py:661-679 bhimpl_int_push / bhimpl_ref_push /
-// bhimpl_float_push and matching pops — one-slot scratch for the
-// cycle-break path emitted by flatten.py:326-332 `insert_renamings`.
-pub(crate) const BC_INT_PUSH: u8 = 107;
-pub(crate) const BC_REF_PUSH: u8 = 108;
-pub(crate) const BC_FLOAT_PUSH: u8 = 109;
-pub(crate) const BC_INT_POP: u8 = 110;
-pub(crate) const BC_REF_POP: u8 = 111;
-pub(crate) const BC_FLOAT_POP: u8 = 112;
-
-pub(crate) const BC_INT_ADD: u8 = 113;
-pub(crate) const BC_INT_SUB: u8 = 114;
-pub(crate) const BC_INT_MUL: u8 = 115;
-pub(crate) const BC_INT_FLOORDIV: u8 = 116;
-pub(crate) const BC_INT_MOD: u8 = 117;
-pub(crate) const BC_INT_AND: u8 = 118;
-pub(crate) const BC_INT_OR: u8 = 119;
-pub(crate) const BC_INT_XOR: u8 = 120;
-pub(crate) const BC_INT_LSHIFT: u8 = 121;
-pub(crate) const BC_INT_RSHIFT: u8 = 122;
-pub(crate) const BC_INT_EQ: u8 = 123;
-pub(crate) const BC_INT_NE: u8 = 124;
-pub(crate) const BC_INT_LT: u8 = 125;
-pub(crate) const BC_INT_LE: u8 = 126;
-pub(crate) const BC_INT_GT: u8 = 127;
-pub(crate) const BC_INT_GE: u8 = 128;
-pub(crate) const BC_INT_NEG: u8 = 132;
-pub(crate) const BC_FLOAT_ADD: u8 = 133;
-pub(crate) const BC_FLOAT_SUB: u8 = 134;
-pub(crate) const BC_FLOAT_MUL: u8 = 135;
-pub(crate) const BC_FLOAT_TRUEDIV: u8 = 136;
-pub(crate) const BC_FLOAT_NEG: u8 = 139;
-pub(crate) const BC_FLOAT_ABS: u8 = 140;
-pub(crate) const BC_INT_INVERT: u8 = 141;
-pub(crate) const BC_UINT_RSHIFT: u8 = 142;
-pub(crate) const BC_UINT_MUL_HIGH: u8 = 143;
-pub(crate) const BC_UINT_LT: u8 = 144;
-pub(crate) const BC_UINT_LE: u8 = 145;
-pub(crate) const BC_UINT_GT: u8 = 146;
-pub(crate) const BC_UINT_GE: u8 = 147;
-// Ref/nullity primitives — RPython `blackhole.py:584-610`
-// `bhimpl_{ptr_eq,ptr_ne,ptr_iszero,ptr_nonzero,instance_ptr_eq,instance_ptr_ne}`.
-pub(crate) const BC_PTR_EQ: u8 = 151;
-pub(crate) const BC_PTR_NE: u8 = 152;
-pub(crate) const BC_INSTANCE_PTR_EQ: u8 = 153;
-pub(crate) const BC_INSTANCE_PTR_NE: u8 = 154;
-pub(crate) const BC_PTR_ISZERO: u8 = 155;
-pub(crate) const BC_PTR_NONZERO: u8 = 156;
-// Unary ptr nullity exitswitch specialisations — `blackhole.py:937-944`
-// `bhimpl_goto_if_not_ptr_{iszero,nonzero}`.
-pub(crate) const BC_GOTO_IF_NOT_PTR_ISZERO: u8 = 157;
-pub(crate) const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
-// canonical residual_call_*_v opcodes — RPython `blackhole.py:1240-1255`
-// `bhimpl_residual_call_{r,ir,irf}_v`. Distinct opcodes per argcode shape so
-// `setup_insns` (`blackhole.rs:3241`) keeps its 1:1 opcode→key invariant.
-// Slice 0 of `pyre-call-family-canonical-migration.md` reserves these slots
-// in the 159-255 free range; emit-site migration lives in Slice 1.
-pub(crate) const BC_RESIDUAL_CALL_R_V: u8 = 159;
-pub(crate) const BC_RESIDUAL_CALL_IR_V: u8 = 160;
-pub(crate) const BC_RESIDUAL_CALL_IRF_V: u8 = 161;
-// canonical residual_call_*_{i,r,f} opcodes — RPython
-// `blackhole.py:1228-1252` `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`.
-// Slice 4 Slice 0 of `pyre-call-family-canonical-migration.md` reserves
-// the non-void result slots; emit-site migration lives in subsequent
-// Slice 4 sub-slices. Policy variants (may_force / release_gil /
-// loopinvariant) reuse these same opcodes and differentiate via
-// `EffectInfo` exactly as Slice 2 unified the void family
-// (`effectinfo.py:255 is_call_release_gil`,
-// `effectinfo.py:169-181 effectinfo_from_writeanalyze`).
-//
-// `R_F` / `IR_F` are intentionally absent — RPython
-// `resoperation.py:1238-1244` only defines `CALL_F` for the `irf` form.
-// `R_R` / `IR_R` mirror `assembler.py:60` accepted shapes; the
-// `_R` variant of `release_gil` is excluded by
-// `resoperation.py:1243-1244 # no such thing`.
-pub(crate) const BC_RESIDUAL_CALL_R_I: u8 = 162;
-pub(crate) const BC_RESIDUAL_CALL_IR_I: u8 = 163;
-pub(crate) const BC_RESIDUAL_CALL_IRF_I: u8 = 164;
-pub(crate) const BC_RESIDUAL_CALL_R_R: u8 = 165;
-pub(crate) const BC_RESIDUAL_CALL_IR_R: u8 = 166;
-pub(crate) const BC_RESIDUAL_CALL_IRF_R: u8 = 167;
-pub(crate) const BC_RESIDUAL_CALL_IRF_F: u8 = 168;
-// Typed return opcodes — RPython `blackhole.py:841-862`
-// `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
-// pyre's portal return is REF (see BC_REF_RETURN) but the insns map
-// still needs every upstream return flavour so
-// `pyjitpl.py:2240-2243` `setup_insns` fields do not fall back to
-// `u8::MAX` sentinels.
-pub const BC_INT_RETURN: u8 = 148;
-pub const BC_FLOAT_RETURN: u8 = 149;
-pub const BC_VOID_RETURN: u8 = 150;
-
-pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
-
-/// Lookup a bytecode opcode by its `opname/argcodes` key.
-///
-/// RPython `assembler.py:220-222`:
-/// ```text
-/// key = opname + '/' + ''.join(argcodes)
-/// num = self.insns.setdefault(key, len(self.insns))
-/// self.code[startposition] = chr(num)
-/// ```
-///
-/// majit currently pre-populates the dict from `wellknown_bh_insns` so
-/// numbers match the hardcoded `BC_*` constants consumed by the
-/// blackhole dispatch. Once dispatch becomes table-driven the
-/// pre-population will drop and numbers will be allocated in emission
-/// order exactly like RPython.
-///
-/// Panics if `key` is not registered — mirrors the `assert 0 <= num <=
-/// 0xFF` behaviour RPython relies on at the assembler layer.
-pub(crate) fn insn_byte(key: &str) -> u8 {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<std::collections::HashMap<&'static str, u8>> = OnceLock::new();
-    let table = TABLE.get_or_init(wellknown_bh_insns);
-    *table
-        .get(key)
-        .unwrap_or_else(|| panic!("insn_byte: unregistered insns key {key:?}"))
-}
-
-/// Fixed majit blackhole opcode-name table.
-///
-/// RPython's `Assembler.insns` is a dense dict grown by
-/// `Assembler.write_insn()` in emission order. majit's current runtime
-/// `JitCodeBuilder` still emits fixed `BC_*` numbers, so this helper is an
-/// adapter table rather than a line-by-line port of `assembler.py`.
-/// Downstream consumers use it only for `insns.get('...', -1)`-style opcode
-/// cache fields and for wiring handlers against majit's fixed bytecodes.
-///
-/// The `argcodes` alphabet follows `assembler.py:162-196`:
-///   `i` int reg, `r` ref reg, `f` float reg, `c` short-const int,
-///   `I/R/F` constant-pool int/ref/float, `L` label, `d` descr,
-///   `N` `ListOfKind` (mixed-kind literal list).
-pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
-    let mut m = std::collections::HashMap::new();
-
-    // pyjitpl.py:2236-2243 — fields `setup_insns` probes explicitly.
-    m.insert("live/", BC_LIVE);
-    m.insert("catch_exception/L", BC_CATCH_EXCEPTION);
-    m.insert("rvmprof_code/ii", BC_RVMPROF_CODE);
-    // pyjitpl.py:2240-2243 typed return accessors:
-    //   op_int_return / op_ref_return / op_float_return / op_void_return
-    // pyre's portal result type is REF so `ref_return/r` is the only
-    // one produced by the current emitter, but the other three must be
-    // registered so `setup_insns` does not fall back to `u8::MAX` for
-    // them.
-    m.insert("int_return/i", BC_INT_RETURN);
-    m.insert("ref_return/r", BC_REF_RETURN);
-    m.insert("float_return/f", BC_FLOAT_RETURN);
-    m.insert("void_return/", BC_VOID_RETURN);
-
-    // pyre-only tracer termination markers. RPython's tracing bails out via
-    // exceptions (`SwitchToBlackhole`, `ContinueRunningNormally`), but pyre's
-    // borrow-checker forbids unwinding through the trace loop, so the
-    // JitCodeMachine signals abort via explicit opcodes instead. No RPython
-    // counterpart; keys kept pyre-local (no `>`-return marker).
-    m.insert("abort/", BC_ABORT);
-    m.insert("abort_permanent/", BC_ABORT_PERMANENT);
-    // RPython blackhole.py:962 `bhimpl_unreachable()` raises
-    // `AssertionError("unreachable")`. Distinct opcode from
-    // `abort_permanent/` so the interpreter fallback path cannot be taken.
-    m.insert("unreachable/", BC_UNREACHABLE);
-
-    // pyre-only virtualizable state-field / state-array / state-varray
-    // machine. No RPython counterpart — RPython expresses frame-local
-    // field access via the canonical `{get,set}field_vable_*` family
-    // that routes through an explicit vable pointer register. pyre's
-    // SSA codewriter instead models the virtualizable as a set of
-    // "state slots" that are loaded/stored through dedicated jitcode
-    // opcodes before the vable pool is plumbed through; the emit sites
-    // are in `majit-macros/src/jit_interp/jitcode_lower.rs`.
-    //
-    // Argcodes: `d` = state-slot index (emitted as u16), `i` = int
-    // register (u16). Array variants carry an extra `i` for the index
-    // register before the destination/source slot.
-    m.insert("load_state_field/di", BC_LOAD_STATE_FIELD);
-    m.insert("store_state_field/di", BC_STORE_STATE_FIELD);
-    m.insert("load_state_array/dii", BC_LOAD_STATE_ARRAY);
-    m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
-    m.insert("load_state_varray/dii", BC_LOAD_STATE_VARRAY);
-    m.insert("store_state_varray/dii", BC_STORE_STATE_VARRAY);
-
-    // Virtualizable operations — RPython canonical argcode shapes from
-    // blackhole.py:1374-1409 and :1446-1495.  The legacy helper-side
-    // `JitCodeBuilder::vable_*` methods still emit their old compact
-    // payloads for the state-field macro path; Pyre's SSA assembler uses
-    // the `*_with_base` methods that match these keys byte-for-byte.
-    m.insert("getfield_vable_i/rd>i", BC_GETFIELD_VABLE_I);
-    m.insert("getfield_vable_r/rd>r", BC_GETFIELD_VABLE_R);
-    m.insert("getfield_vable_f/rd>f", BC_GETFIELD_VABLE_F);
-    m.insert("setfield_vable_i/rid", BC_SETFIELD_VABLE_I);
-    m.insert("setfield_vable_r/rrd", BC_SETFIELD_VABLE_R);
-    m.insert("setfield_vable_f/rfd", BC_SETFIELD_VABLE_F);
-    m.insert("getarrayitem_vable_i/ridd>i", BC_GETARRAYITEM_VABLE_I);
-    m.insert("getarrayitem_vable_r/ridd>r", BC_GETARRAYITEM_VABLE_R);
-    m.insert("getarrayitem_vable_f/ridd>f", BC_GETARRAYITEM_VABLE_F);
-    m.insert("setarrayitem_vable_i/riidd", BC_SETARRAYITEM_VABLE_I);
-    m.insert("setarrayitem_vable_r/rirdd", BC_SETARRAYITEM_VABLE_R);
-    m.insert("setarrayitem_vable_f/rifdd", BC_SETARRAYITEM_VABLE_F);
-    m.insert("arraylen_vable/rdd>i", BC_ARRAYLEN_VABLE);
-    m.insert("hint_force_virtualizable/r", BC_HINT_FORCE_VIRTUALIZABLE);
-
-    // Control flow / structural markers that actually emit.
-    // pyjitpl.py:2237 `op_goto = insns.get('goto/L', -1)` and
-    // blackhole.py:950 `bhimpl_goto(target): return target` — the
-    // canonical key is `goto/L`.
-    m.insert("goto/L", BC_JUMP);
-    // loop_header takes a single int constant operand (the jitdriver index).
-    // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
-    // SpaceOperation('loop_header', [c_index], None); blackhole.py:1063
-    // bhimpl_loop_header(jdindex) is @arguments("i").
-    m.insert("loop_header/i", BC_LOOP_HEADER);
-    m.insert("raise/r", BC_RAISE);
-    m.insert("reraise/", BC_RERAISE);
-    // blackhole.py:987 `@arguments("self", returns="i") bhimpl_last_exception`
-    // yields canonical key `last_exception/>i`.
-    m.insert("last_exception/>i", BC_LAST_EXCEPTION);
-    m.insert(
-        "goto_if_exception_mismatch/iL",
-        BC_GOTO_IF_EXCEPTION_MISMATCH,
-    );
-    // flatten.py:347 emits `last_exc_value, '->', reg`, so
-    // assembler.py grows the canonical key `last_exc_value/>r`.
-    m.insert("last_exc_value/>r", BC_LAST_EXC_VALUE);
-    // assembler.py:163,181-220 builds the canonical key from the full
-    // 7-arg shape (`jdindex + I/R/F + I/R/F`). assembler.py:312 places
-    // `jit_merge_point` in `USE_C_FORM`, so the jdindex argcode is `c`
-    // when the value fits in a signed byte and `i` (constants-pool
-    // slot index) otherwise. Both forms reach the same
-    // `bhimpl_jit_merge_point` (blackhole.py:1066) because the
-    // `@arguments("i", ...)` decoder dispatches on the runtime argcode
-    // (blackhole.py:113-123 `argtype == 'i'` branch).
-    m.insert("jit_merge_point/cIRFIRF", BC_JIT_MERGE_POINT_C);
-    m.insert("jit_merge_point/iIRFIRF", BC_JIT_MERGE_POINT);
-    // RPython `blackhole.py:1240-1255` `bhimpl_residual_call_{r,ir,irf}_v`.
-    // Slice 1c of `pyre-call-family-canonical-migration.md` retired the
-    // legacy `BC_RESIDUAL_CALL_VOID` (=18) byte layout in favour of the
-    // canonical `iRd / iIRd / iIRFd` argcode triple; the freed slot is
-    // documented at the const-table site above.
-    m.insert("residual_call_r_v/iRd", BC_RESIDUAL_CALL_R_V);
-    m.insert("residual_call_ir_v/iIRd", BC_RESIDUAL_CALL_IR_V);
-    m.insert("residual_call_irf_v/iIRFd", BC_RESIDUAL_CALL_IRF_V);
-    // RPython `blackhole.py:1228-1252` `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`.
-    // Slice 4 Slice 0 of `pyre-call-family-canonical-migration.md` reserves
-    // these canonical keys; the canonical handlers are already wired
-    // (`blackhole.rs:7010-7018 wire_bhimpl_handlers`). Emit-site migration
-    // lives in subsequent Slice 4 sub-slices. RPython
-    // `resoperation.py:1238-1244` excludes `_R` for `release_gil` and
-    // `_F` for `r_*` / `ir_*`; only the shapes below have valid canonical
-    // counterparts.
-    m.insert("residual_call_r_i/iRd>i", BC_RESIDUAL_CALL_R_I);
-    m.insert("residual_call_ir_i/iIRd>i", BC_RESIDUAL_CALL_IR_I);
-    m.insert("residual_call_irf_i/iIRFd>i", BC_RESIDUAL_CALL_IRF_I);
-    m.insert("residual_call_r_r/iRd>r", BC_RESIDUAL_CALL_R_R);
-    m.insert("residual_call_ir_r/iIRd>r", BC_RESIDUAL_CALL_IR_R);
-    m.insert("residual_call_irf_r/iIRFd>r", BC_RESIDUAL_CALL_IRF_R);
-    m.insert("residual_call_irf_f/iIRFd>f", BC_RESIDUAL_CALL_IRF_F);
-    // jtransform.py:292-313 / 1672-1688 conditional/known-result family
-    // intentionally omitted. The helper-side `BC_COND_CALL_*` /
-    // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags
-    // in a flat payload, which is not line-by-line compatible with the
-    // canonical `iiIRd` / `riIRd>r` argcode layout. The translator-owned
-    // codewriter pipeline emits the real canonical keys when it actually
-    // assembles those operations.
-    // blackhole.py:1278-1319 inline-call family intentionally omitted.
-    // The helper-side `BC_INLINE_CALL` adapter in majit-metainterp uses a
-    // typed arg + caller-destination payload that is not line-by-line compatible
-    // with canonical `inline_call_*` argcodes. The real RPython-shape
-    // `inline_call_*` keys come from the translator/codewriter pipeline
-    // when they are actually emitted; pre-registering them here would make
-    // `wellknown_bh_insns()` claim a bytecode contract this runtime does
-    // not truthfully expose.
-
-    // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
-    // Argcodes follow assembler.py:162-196: two registers + label.
-    m.insert("goto_if_not_int_lt/iiL", BC_GOTO_IF_NOT_INT_LT);
-    m.insert("goto_if_not_int_le/iiL", BC_GOTO_IF_NOT_INT_LE);
-    m.insert("goto_if_not_int_eq/iiL", BC_GOTO_IF_NOT_INT_EQ);
-    m.insert("goto_if_not_int_ne/iiL", BC_GOTO_IF_NOT_INT_NE);
-    m.insert("goto_if_not_int_gt/iiL", BC_GOTO_IF_NOT_INT_GT);
-    m.insert("goto_if_not_int_ge/iiL", BC_GOTO_IF_NOT_INT_GE);
-    m.insert("goto_if_not_float_lt/ffL", BC_GOTO_IF_NOT_FLOAT_LT);
-    m.insert("goto_if_not_float_le/ffL", BC_GOTO_IF_NOT_FLOAT_LE);
-    m.insert("goto_if_not_float_eq/ffL", BC_GOTO_IF_NOT_FLOAT_EQ);
-    m.insert("goto_if_not_float_ne/ffL", BC_GOTO_IF_NOT_FLOAT_NE);
-    m.insert("goto_if_not_float_gt/ffL", BC_GOTO_IF_NOT_FLOAT_GT);
-    m.insert("goto_if_not_float_ge/ffL", BC_GOTO_IF_NOT_FLOAT_GE);
-    m.insert("goto_if_not_ptr_eq/rrL", BC_GOTO_IF_NOT_PTR_EQ);
-    m.insert("goto_if_not_ptr_ne/rrL", BC_GOTO_IF_NOT_PTR_NE);
-    m.insert("goto_if_not_ptr_iszero/rL", BC_GOTO_IF_NOT_PTR_ISZERO);
-    m.insert("goto_if_not_ptr_nonzero/rL", BC_GOTO_IF_NOT_PTR_NONZERO);
-    m.insert("goto_if_not_int_is_zero/iL", BC_GOTO_IF_NOT_INT_IS_ZERO);
-
-    // flatten.py:326-332 `insert_renamings` cycle-break push/pop pairs.
-    // Argcodes follow assembler.py:162-196 / blackhole.py:661-679:
-    // push takes one register source (`i`/`r`/`f`), pop writes one
-    // register destination (`>i`/`>r`/`>f`).
-    m.insert("int_push/i", BC_INT_PUSH);
-    m.insert("ref_push/r", BC_REF_PUSH);
-    m.insert("float_push/f", BC_FLOAT_PUSH);
-    m.insert("int_pop/>i", BC_INT_POP);
-    m.insert("ref_pop/>r", BC_REF_POP);
-    m.insert("float_pop/>f", BC_FLOAT_POP);
-
-    m.insert("int_add/ii>i", BC_INT_ADD);
-    m.insert("int_sub/ii>i", BC_INT_SUB);
-    m.insert("int_mul/ii>i", BC_INT_MUL);
-    m.insert("int_floordiv/ii>i", BC_INT_FLOORDIV);
-    m.insert("int_mod/ii>i", BC_INT_MOD);
-    m.insert("int_and/ii>i", BC_INT_AND);
-    m.insert("int_or/ii>i", BC_INT_OR);
-    m.insert("int_xor/ii>i", BC_INT_XOR);
-    m.insert("int_lshift/ii>i", BC_INT_LSHIFT);
-    m.insert("int_rshift/ii>i", BC_INT_RSHIFT);
-    m.insert("int_eq/ii>i", BC_INT_EQ);
-    m.insert("int_ne/ii>i", BC_INT_NE);
-    m.insert("int_lt/ii>i", BC_INT_LT);
-    m.insert("int_le/ii>i", BC_INT_LE);
-    m.insert("int_gt/ii>i", BC_INT_GT);
-    m.insert("int_ge/ii>i", BC_INT_GE);
-    m.insert("int_neg/i>i", BC_INT_NEG);
-    m.insert("int_invert/i>i", BC_INT_INVERT);
-    m.insert("uint_rshift/ii>i", BC_UINT_RSHIFT);
-    m.insert("uint_mul_high/ii>i", BC_UINT_MUL_HIGH);
-    m.insert("uint_lt/ii>i", BC_UINT_LT);
-    m.insert("uint_le/ii>i", BC_UINT_LE);
-    m.insert("uint_gt/ii>i", BC_UINT_GT);
-    m.insert("uint_ge/ii>i", BC_UINT_GE);
-    // Ref/nullity primitives — `blackhole.py:584-610`.
-    m.insert("ptr_eq/rr>i", BC_PTR_EQ);
-    m.insert("ptr_ne/rr>i", BC_PTR_NE);
-    m.insert("instance_ptr_eq/rr>i", BC_INSTANCE_PTR_EQ);
-    m.insert("instance_ptr_ne/rr>i", BC_INSTANCE_PTR_NE);
-    m.insert("ptr_iszero/r>i", BC_PTR_ISZERO);
-    m.insert("ptr_nonzero/r>i", BC_PTR_NONZERO);
-    // Per-opname float primitives — `blackhole.py:696-723`
-    // `bhimpl_float_{add,sub,mul,truediv,neg,abs}`.
-    m.insert("float_add/ff>f", BC_FLOAT_ADD);
-    m.insert("float_sub/ff>f", BC_FLOAT_SUB);
-    m.insert("float_mul/ff>f", BC_FLOAT_MUL);
-    m.insert("float_truediv/ff>f", BC_FLOAT_TRUEDIV);
-    m.insert("float_neg/f>f", BC_FLOAT_NEG);
-    m.insert("float_abs/f>f", BC_FLOAT_ABS);
-
-    // Typed register copy — `blackhole.py:638-646`
-    // `bhimpl_{int,ref,float}_copy`. `@arguments("i"|"r"|"f",
-    // returns="i"|"r"|"f")` yields canonical keys
-    // `{int,ref,float}_copy/X>X`. pyre's `move_{i,r,f}` emitters route
-    // through these bytes; flatten.py:326-332 `insert_renamings` is the
-    // main RPython producer of `int_copy` ops (cycle-break renamings),
-    // which pyre's super-inst expansion also re-uses.
-    m.insert("int_copy/i>i", BC_MOVE_I);
-    m.insert("ref_copy/r>r", BC_MOVE_R);
-    m.insert("float_copy/f>f", BC_MOVE_F);
-
-    // Guard-value promotions — `blackhole.py:648-656`
-    // `bhimpl_{int,ref,float}_guard_value`. Body is a no-op on the
-    // blackhole side; `pyjitpl.py:1512-1515`
-    // `opimpl_{int,ref,float}_guard_value` = `_opimpl_guard_value`
-    // emits GUARD_VALUE during tracing to promote the operand.
-    m.insert("int_guard_value/i", BC_INT_GUARD_VALUE);
-    m.insert("ref_guard_value/r", BC_REF_GUARD_VALUE);
-    m.insert("float_guard_value/f", BC_FLOAT_GUARD_VALUE);
-
-    // Truthy-exitswitch branch — `flatten.py:245` emits the canonical
-    // `goto_if_not/iL`; `blackhole.py:913`
-    // `bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not` adds the
-    // specialised alias. Both keys map to the same fixed runtime byte.
-    m.insert("goto_if_not/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
-    m.insert("goto_if_not_int_is_true/iL", BC_GOTO_IF_NOT_INT_IS_TRUE);
-
-    m
-}
+pub use majit_translate::insns::{pyre_extension_insns, wellknown_bh_insns};
 
 /// GC liveness metadata at a specific bytecode PC.
 ///
@@ -1095,6 +624,51 @@ mod tests {
             insns.get("residual_call_irf_v/iIRFd"),
             Some(&BC_RESIDUAL_CALL_IRF_V),
         );
+    }
+
+    /// Tasks #94c (abort/*) and #94b' (state_*) quarantine the 8 pyre-
+    /// only keys arising from Rust adaptations into
+    /// `pyre_extension_insns()`. `wellknown_bh_insns()` becomes a strict
+    /// subset of RPython's canonical opname universe. `insn_byte` merges
+    /// both tables so build-time `write_insn(...)` callers continue to
+    /// resolve unchanged.
+    #[test]
+    fn pyre_extension_insns_quarantines_pyre_only_keys_out_of_wellknown() {
+        let wellknown = wellknown_bh_insns();
+        let extension = pyre_extension_insns();
+
+        let pairs = [
+            // Borrow-checker abort signals.
+            ("abort/", BC_ABORT),
+            ("abort_permanent/", BC_ABORT_PERMANENT),
+            // Proc-macro JIT-machine state addressing.
+            ("load_state_field/di", BC_LOAD_STATE_FIELD),
+            ("store_state_field/di", BC_STORE_STATE_FIELD),
+            ("load_state_array/dii", BC_LOAD_STATE_ARRAY),
+            ("store_state_array/dii", BC_STORE_STATE_ARRAY),
+            ("load_state_varray/dii", BC_LOAD_STATE_VARRAY),
+            ("store_state_varray/dii", BC_STORE_STATE_VARRAY),
+        ];
+
+        for (key, expected_byte) in pairs {
+            assert!(
+                !wellknown.contains_key(key),
+                "{key} must be quarantined in pyre_extension_insns(), not \
+                 wellknown_bh_insns()",
+            );
+            assert_eq!(
+                extension.get(key),
+                Some(&expected_byte),
+                "{key} must be present in pyre_extension_insns() with the \
+                 fixed BC_* byte",
+            );
+            assert_eq!(
+                majit_translate::insns::insn_byte(key),
+                expected_byte,
+                "insn_byte must resolve {key} via the merged extension+\
+                 wellknown table",
+            );
+        }
     }
 
     #[test]

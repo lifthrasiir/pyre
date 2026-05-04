@@ -369,6 +369,175 @@ fn mirror_vable_static_to_boxes(
     }
 }
 
+/// Write a Ref-boxed value to the symbolic operand stack at depth
+/// offset `stack_idx`. Centralizes the dual-shadow update that
+/// `push_typed_value`, `finishframe_exception`'s exception/lasti push,
+/// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
+/// inline-call setup all duplicated:
+///
+/// - `registers_r[reg_idx]` — the unified register file (currently
+///   semantic-indexed `reg_idx == nlocals + stack_idx`; Step 2.2 will
+///   flip to color-indexed via `metadata.stack_slot_color_map[stack_idx]`
+///   when the trace owns the virtualizable shadow).
+/// - `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` —
+///   `locals_cells_stack_w` heap mirror, ALWAYS semantic-indexed
+///   (`pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable`).
+/// - `symbolic_stack_types[stack_idx]` set to `Type::Ref` (every slot
+///   of `locals_cells_stack_w` is W_Root per
+///   `virtualizable.py:86-98 read_boxes`).
+/// - `concrete_stack[stack_idx]` set to `concrete` for Box-identity
+///   tracking.
+///
+/// Caller is responsible for:
+/// - Wrapping Int/Float values via `wrapint` / `wrapfloat` BEFORE
+///   calling so `boxed` is always Ref-typed.
+/// - Advancing `valuestackdepth` (push) or leaving it (positional
+///   write into an existing slot).
+/// - Emitting the separate `_opimpl_setfield_vable_i(vsd, depth±1)`
+///   IR op via `mirror_vable_static_to_boxes` when the operation
+///   logically advances the frame's vsd field (push / pop).
+pub(crate) fn write_stack_slot(
+    sym: &mut PyreSym,
+    ctx: &mut TraceCtx,
+    stack_idx: usize,
+    boxed: OpRef,
+    concrete: ConcreteValue,
+) {
+    let semantic_idx = sym.nlocals + stack_idx;
+    // Step 2.2 stub: reg_idx == semantic_idx today. After every stack
+    // writer call site routes through this helper, the body will flip
+    // to `stack_slot_color_map[stack_idx]` for owns_shadow traces in
+    // a single atomic edit. Until then, every site that previously
+    // wrote `registers_r[nlocals + stack_idx]` directly must use this
+    // helper so the eventual flip is bench-bisectable.
+    let reg_idx = semantic_idx;
+    if reg_idx >= sym.registers_r.len() {
+        sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
+    }
+    sym.registers_r[reg_idx] = boxed;
+    if stack_idx >= sym.symbolic_stack_types.len() {
+        sym.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
+    }
+    sym.symbolic_stack_types[stack_idx] = Type::Ref;
+    if stack_idx >= sym.concrete_stack.len() {
+        sym.concrete_stack
+            .resize(stack_idx + 1, ConcreteValue::Null);
+    }
+    sym.concrete_stack[stack_idx] = concrete;
+    if sym.owns_virtualizable_shadow() {
+        let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx;
+        // pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable: a Ref/Null
+        // concrete carries a real W_Root heap pointer; update both
+        // halves of the shadow. Int/Float concrete means pyre's lazy
+        // wrapint/wrapfloat emitted a NewWithVtable OpRef without
+        // allocating yet — update only the OpRef half so
+        // synchronize_virtualizable keeps writing the existing W_Root.
+        match concrete.to_ir_ref_value() {
+            Some(v) => {
+                ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
+            }
+            None => {
+                ctx.set_virtualizable_box_at(flat_idx, boxed);
+            }
+        }
+    }
+}
+
+/// Read the symbolic OpRef at depth offset `stack_idx`, with lazy
+/// heap-fill from `locals_cells_stack_w` when the slot is empty.
+/// Symmetric counterpart of `write_stack_slot`.
+///
+/// Currently reads `registers_r[reg_idx]` with `reg_idx ==
+/// nlocals + stack_idx` (semantic). Step 2.2 will flip `reg_idx` to
+/// `stack_slot_color_map[stack_idx]` for owns_shadow traces in a
+/// single atomic edit, paired with the write helper's flip.
+///
+/// On NONE-fill, the IR `getarrayitem` op uses the SEMANTIC array
+/// index (`locals_cells_stack_w[nlocals + stack_idx]`) — the heap
+/// layout the array descr describes — while the destination slot
+/// `reg_idx` is the JIT register-file slot subsequent reads
+/// consult.
+///
+/// `init_symbolic` (state.rs:2785) leaves
+/// `locals_cells_stack_array_ref = OpRef::NONE` for active-owner
+/// traces because their locals come from `OpRef::input_arg_ref` and
+/// stack writes route through the vable shadow, so the lazy-fill
+/// path is normally unused.  In the rare case it does fire (e.g.
+/// `pop_value` / `swap_stack_slots` reading a stack slot whose
+/// `registers_r` entry was never written), emit the
+/// `getfield_raw` for the array base on demand and cache it on the
+/// sym so subsequent fills reuse the same op.  Without this guard,
+/// `trace_array_getitem_value(NONE, idx)` would record a malformed
+/// `GetarrayitemGcR` with a NONE base operand.
+pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
+    let semantic_idx = sym.nlocals + stack_idx;
+    let reg_idx = semantic_idx;
+    if reg_idx >= sym.registers_r.len() {
+        sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
+    }
+    if sym.registers_r[reg_idx] == OpRef::NONE {
+        if sym.locals_cells_stack_array_ref == OpRef::NONE {
+            sym.locals_cells_stack_array_ref = frame_locals_cells_stack_array(ctx, sym.frame);
+        }
+        let idx_const = ctx.const_int(semantic_idx as i64);
+        sym.registers_r[reg_idx] =
+            trace_array_getitem_value(ctx, sym.locals_cells_stack_array_ref, idx_const);
+    }
+    sym.registers_r[reg_idx]
+}
+
+/// Swap two operand-stack slots — third member of the
+/// `read_stack_slot` / `write_stack_slot` family. Pre-fills both
+/// slots through `read_stack_slot`, swaps the registers_r entries,
+/// `symbolic_stack_types`, `concrete_stack`, and the vable shadow's
+/// `(OpRef, Value)` pairs atomically.
+///
+/// `virtualizable_boxes` is the single source of truth for the frame's
+/// Ref array (opencoder.py:718); reading each half via
+/// `concrete_of_opref` separately would drop non-const Box identity
+/// into the sentinel fallback, hence the `virtualizable_entry_at`
+/// pair-read+pair-write.
+///
+/// Step 2.2 will flip `reg_top` / `reg_other` to colors here in the
+/// same atomic edit that flips `read_stack_slot` / `write_stack_slot`.
+pub(crate) fn swap_stack_slots(
+    sym: &mut PyreSym,
+    ctx: &mut TraceCtx,
+    top_idx: usize,
+    other_idx: usize,
+) {
+    let _ = read_stack_slot(sym, ctx, top_idx);
+    let _ = read_stack_slot(sym, ctx, other_idx);
+    let semantic_top = sym.nlocals + top_idx;
+    let semantic_other = sym.nlocals + other_idx;
+    let reg_top = semantic_top;
+    let reg_other = semantic_other;
+    if reg_top != reg_other {
+        sym.registers_r.swap(reg_top, reg_other);
+    }
+    if top_idx < sym.symbolic_stack_types.len() && other_idx < sym.symbolic_stack_types.len() {
+        sym.symbolic_stack_types.swap(top_idx, other_idx);
+    }
+    if top_idx < sym.concrete_stack.len() && other_idx < sym.concrete_stack.len() {
+        sym.concrete_stack.swap(top_idx, other_idx);
+    }
+    if sym.owns_virtualizable_shadow() {
+        let flat_top = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_top;
+        let flat_other = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_other;
+        if let (Some((op_top, val_top)), Some((op_other, val_other))) = (
+            ctx.virtualizable_entry_at(flat_top),
+            ctx.virtualizable_entry_at(flat_other),
+        ) {
+            ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
+            ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
+        } else {
+            panic!(
+                "swap_stack_slots: missing virtualizable_boxes entries for stack slots {top_idx} and {other_idx}"
+            );
+        }
+    }
+}
+
 impl MIFrame {
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         let exec_ctx = self.sym().concrete_execution_context;
@@ -617,9 +786,62 @@ impl MIFrame {
 
     #[inline]
     fn capture_pre_opcode_state(&mut self) {
+        // SAFETY: `self.ctx` is initialized at MIFrame construction and
+        // outlives this call (TraceCtx is pinned for the tracing
+        // session). `&self.ctx` borrow is independent of the `&self.sym`
+        // borrow we take below — both come from raw pointers stored on
+        // self, not nested borrows.
+        let ctx: &TraceCtx = unsafe { &*self.ctx };
+        // portal-bridge keeps `s.valuestackdepth` at its initial seed
+        // because residual-call paths bypass `push_typed_value` /
+        // `pop_value` (`portal_bridge_vable_vsd` doc at line 2053-2074).
+        // Consult metadata at `self.orgpc` so the shadow snapshot covers
+        // the actual live extent at the current opcode, not the stale
+        // symbolic counter.
+        let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
         let s = self.sym();
-        let prefix_len = s.valuestackdepth.min(s.registers_r.len());
-        self.pre_opcode_registers_r = Some(s.registers_r[..prefix_len].to_vec());
+        let owns_shadow = s.owns_virtualizable_shadow();
+        let nlocals = s.nlocals;
+        // pyjitpl.py:2954-2965 parity: snapshot the
+        // `virtualizable_boxes[NUM_VABLE_SCALARS + i]` view of locals
+        // and stack tail. The shadow is RPython's single source of truth
+        // for `locals_cells_stack_w`; both halves are mirrored by
+        // `push_typed_value` / `store_local_value` for every trace that
+        // satisfies `owns_virtualizable_shadow()` (loop portal +
+        // bridges with seeded `bridge_local_oprefs`). Non-owner traces
+        // keep the legacy semantic registers_r snapshot.
+        //
+        // Prefix length: when reading from the shadow, use the full
+        // `valuestackdepth` — the shadow covers the entire `nlocals +
+        // co_stacksize` frame array regardless of `registers_r`
+        // occupancy, and capping at `registers_r.len()` would silently
+        // drop live shadow slots once `registers_r` lags behind the
+        // operand stack.  The `registers_r` fallback path keeps the
+        // length cap because reading past `registers_r.len()` panics.
+        let prefix_len = if owns_shadow {
+            portal_vsd.unwrap_or(s.valuestackdepth)
+        } else {
+            s.valuestackdepth.min(s.registers_r.len())
+        };
+        if owns_shadow && prefix_len >= nlocals {
+            let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            let mut snapshot = Vec::with_capacity(prefix_len);
+            for i in 0..nlocals {
+                snapshot.push(
+                    ctx.virtualizable_box_at(nvs + i)
+                        .expect("capture_pre_opcode_state: missing virtualizable local box"),
+                );
+            }
+            for d in 0..(prefix_len - nlocals) {
+                snapshot.push(
+                    ctx.virtualizable_box_at(nvs + nlocals + d)
+                        .expect("capture_pre_opcode_state: missing virtualizable stack box"),
+                );
+            }
+            self.pre_opcode_registers_r = Some(snapshot);
+        } else {
+            self.pre_opcode_registers_r = Some(s.registers_r[..prefix_len].to_vec());
+        }
     }
 
     #[inline]
@@ -781,9 +1003,20 @@ impl MIFrame {
                 }
             }
         };
+        // portal-bridge has stale `s.valuestackdepth` (residual-call paths
+        // bypass push/pop — see `portal_bridge_vable_vsd` doc); consult
+        // metadata at `live_pc` so the shadow gate's `live_max` reflects
+        // the actual pyframe stack depth at the resume point. live_pc is
+        // either `orgpc` (the standard get_list_of_active_boxes path) or
+        // `fallthrough_pc` (in_a_call / after_residual_call), per RPython
+        // pyjitpl.py:194-198 — pre_opcode_registers_r is captured at orgpc
+        // and would mis-size live_max for the fallthrough_pc resume.
+        let portal_live_vsd = self.portal_bridge_vable_vsd(live_pc).map(|d| d as usize);
         let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map, is_portal_bridge) = {
             let s = self.sym();
-            let valid_stack_only = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+            let valid_stack_only = if let Some(vsd) = portal_live_vsd {
+                vsd.saturating_sub(s.nlocals)
+            } else if let Some(ref pre_r) = self.pre_opcode_registers_r {
                 pre_r.len().saturating_sub(s.nlocals)
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
@@ -838,22 +1071,64 @@ impl MIFrame {
                     s.registers_r.resize(slot_idx + 1, OpRef::NONE);
                 }
             }
-            let cur = self
-                .sym()
-                .registers_r
-                .get(slot_idx)
-                .copied()
-                .unwrap_or(OpRef::NONE);
-            if cur == OpRef::NONE {
+            // pyjitpl.py:177 + :223 parity (`get_list_of_active_boxes`
+            // → `LivenessIterator` reads `self.registers_r[index]`
+            // directly).  Pyre's `pre_opcode_registers_r` is a pyre-only
+            // mid-opcode guard recovery snapshot — when present and the
+            // snapshot slot is non-NONE it is the authoritative pre-
+            // opcode view, otherwise we fall back to the live read.
+            //
+            // Live source: the virtualizable shadow when the trace owns
+            // it (loop portal OR bridge with seeded
+            // `bridge_local_oprefs`) and the slot is a live frame slot
+            // (`slot_idx < valuestackdepth`); otherwise the unified
+            // `registers_r` register file.  The shadow covers the full
+            // `nlocals + co_stacksize` frame array; non-owner traces
+            // (inline-callee scaffolding before the inline path takes
+            // over) keep the legacy semantic registers_r path.
+            //
+            // If the live read is NONE, lazy-load via
+            // `MIFrame::load_local_value` (which writes the loaded
+            // OpRef into `registers_r[slot_idx]` for non-active traces
+            // and returns the shadow value for active-owner traces),
+            // then re-read so `semantic_value` uses the freshly loaded
+            // OpRef — matching main's pattern of reading from
+            // `registers_r` after the lazy-load side effect.
+            // Live max: portal-bridge frames keep `sym.valuestackdepth`
+            // at the initial seed because residual-call paths bypass
+            // `push_typed_value` / `pop_value` (see `portal_bridge_
+            // vable_vsd` doc at line 2043-2063 for the full rationale).
+            // Use the locally-derived `nlocals + valid_stack_only` —
+            // computed above from `pre_opcode_registers_r.len()` for
+            // portal-bridge or `sym.valuestackdepth` otherwise — so the
+            // shadow-vs-registers_r gate matches the metadata-driven
+            // live extent rather than the stale symbolic counter.
+            let live_max = nlocals + valid_stack_only;
+            let read_live = |this: &MIFrame, ctx: &TraceCtx| -> OpRef {
+                let s = this.sym();
+                if s.owns_virtualizable_shadow() && slot_idx < live_max {
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    ctx.virtualizable_box_at(nvs + slot_idx)
+                        .expect("get_list_of_active_boxes: missing virtualizable shadow box")
+                } else {
+                    s.registers_r.get(slot_idx).copied().unwrap_or(OpRef::NONE)
+                }
+            };
+            let live_value_pre = read_live(self, ctx);
+            if live_value_pre == OpRef::NONE {
                 let _ = MIFrame::load_local_value(self, ctx, slot_idx);
             }
+            let live_value = if live_value_pre == OpRef::NONE {
+                read_live(self, ctx)
+            } else {
+                live_value_pre
+            };
             let semantic_value = self
                 .pre_opcode_registers_r
                 .as_ref()
                 .and_then(|pre_r| pre_r.get(slot_idx).copied())
                 .filter(|value| !value.is_none())
-                .or_else(|| self.sym().registers_r.get(slot_idx).copied())
-                .unwrap_or(OpRef::NONE);
+                .unwrap_or(live_value);
             let bank_value = match bank {
                 LiveBank::Ref => {
                     self.materialize_fail_arg_slot(ctx, semantic_value, Type::Ref, slot_idx)
@@ -1170,31 +1445,17 @@ impl MIFrame {
         if value.is_none() {
             return Type::Ref;
         }
-        // Match RPython Box.type semantics: the type is an intrinsic property
-        // of the Box (history.py:220,262,308). Prefer the register-file slot
-        // type because symbolic entries for function-entry traces / bridge
-        // recovery carry the typed-local view. `registers_r` is the unified
-        // abstract register file: `[..nlocals]` are locals, matched against
-        // `symbolic_local_types`; `[nlocals..nlocals+stack_only]` are the
-        // stack tail, matched against `symbolic_stack_types`. Falls back to
-        // the recorder's inputarg/constant/op.result_type() when the OpRef
-        // does not appear in the register file.
-        let sym = self.sym();
-        let nlocals = sym.nlocals;
-        let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
-        let reg_len = sym.registers_r.len();
-        if let Some(idx) = sym.registers_r.iter().position(|&slot| slot == value) {
-            if idx < nlocals {
-                if let Some(&tp) = sym.symbolic_local_types.get(idx) {
-                    return tp;
-                }
-            } else if idx < nlocals + stack_only && idx < reg_len {
-                let stack_idx = idx - nlocals;
-                if let Some(&tp) = sym.symbolic_stack_types.get(stack_idx) {
-                    return tp;
-                }
-            }
-        }
+        // history.py:220 ConstInt.type / 262 ConstPtr.type / 308
+        // ResOperation.type parity: a Box's type is an intrinsic
+        // property of the Box itself, not a property of the slot it
+        // happens to occupy. `ctx.get_opref_type` resolves the type
+        // from the OpRef's producing op (constant kind, recorded
+        // result_type, or `Forwarded::Info(PtrInfo)` for virtualized
+        // Phase 1 heads — see the PtrInfo fallback at
+        // optimizeopt/mod.rs:3995). Position-based scans of
+        // `registers_r` / `virtualizable_boxes` were a pyre-only
+        // adaptation that papered over earlier `get_opref_type` gaps;
+        // those gaps are closed at the source now.
         let ctx_ref: &TraceCtx = unsafe { &*self.ctx };
         ctx_ref.get_opref_type(value).unwrap_or(Type::Ref)
     }
@@ -1219,85 +1480,38 @@ impl MIFrame {
             Type::Float => wrapfloat(ctx, value),
             _ => value,
         };
-        let (has_vable, reg_idx, new_vsd) = {
-            let s = self.sym_mut();
-            let stack_idx = s.valuestackdepth.saturating_sub(s.nlocals);
-            let reg_idx = s.nlocals + stack_idx;
-            if reg_idx >= s.registers_r.len() {
-                s.registers_r.resize(reg_idx + 1, OpRef::NONE);
-            }
-            s.registers_r[reg_idx] = boxed;
-            if stack_idx >= s.symbolic_stack_types.len() {
-                s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
-            }
-            s.symbolic_stack_types[stack_idx] = Type::Ref;
-            if stack_idx >= s.concrete_stack.len() {
-                s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
-            }
-            s.concrete_stack[stack_idx] = concrete;
-            s.valuestackdepth += 1;
-            let new_vsd = s.valuestackdepth;
-            (s.owns_virtualizable_shadow(), reg_idx, new_vsd)
+        let stack_idx = {
+            let s = self.sym();
+            s.valuestackdepth.saturating_sub(s.nlocals)
         };
-        // pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
-        //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
-        // The symbolic stack slice of `locals_cells_stack_w` must stay in
-        // lock-step with the virtualizable_boxes shadow — the shadow is
-        // the single source of truth for `list_of_boxes_virtualizable`
-        // (opencoder.py:718 `_list_of_boxes_virtualizable` parity). Stack
-        // pushes mirror into the same flat layout that
-        // `store_local_value` uses for locals: slot `reg_idx` →
-        // `NUM_VABLE_SCALARS + reg_idx` in virtualizable_boxes.
-        //
-        // `concrete` is the caller's Box concrete (RPython valuebox). Ref /
-        // Null concrete carries a real W_Root heap pointer, so update both
-        // halves of the shadow. Int / Float concrete means pyre's lazy
-        // `wrapint` / `wrapfloat` emitted a `NewWithVtable` OpRef without
-        // allocating a W_IntObject / W_FloatObject yet — there is no heap
-        // pointer to flush. Update only the OpRef half in that case so
-        // `synchronize_virtualizable` keeps writing whatever valid W_Root
-        // the PyFrame slot already held (virtualizable.py:101
-        // `write_boxes` parity: every slot must be a real W_Root).
-        if has_vable {
-            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_idx;
-            // Phase 0.5 probe-D — `MAJIT_PROBE_BRIDGE` gated. Captures
-            // every push_typed_value that targets a virtualizable shadow
-            // slot, so we can correlate the panic at
-            // `set_virtualizable_entry_at: index N out of range for N
-            // slots` with the symbolic state that produced it. Logging
-            // every push instead of only the panicking one is intentional:
-            // we need to see whether `valuestackdepth` was already at
-            // `nlocals + max_stackdepth` (Phase 0.4 hypothesis) when the
-            // failing push fired or whether it climbed there during the
-            // bridge re-trace.
+        write_stack_slot(self.sym_mut(), ctx, stack_idx, boxed, concrete);
+        let (owns_shadow, new_vsd) = {
+            let s = self.sym_mut();
+            s.valuestackdepth += 1;
+            (s.owns_virtualizable_shadow(), s.valuestackdepth)
+        };
+        if owns_shadow {
+            // Phase 0.5 probe-D — `MAJIT_PROBE_BRIDGE` gated. See git
+            // archaeology for context; logged for parity with the
+            // pre-helper push path.
             if std::env::var_os("MAJIT_PROBE_BRIDGE").is_some() {
-                let s = self.sym_mut();
+                let s = self.sym();
+                let semantic_idx = s.nlocals + stack_idx;
                 eprintln!(
                     "[probe-D][push_typed_value] valuestackdepth={} nlocals={} \
-                     reg_idx={} flat_idx={} vable_boxes_len={:?}",
+                     stack_idx={} semantic_idx={} flat_idx={} vable_boxes_len={:?}",
                     s.valuestackdepth,
                     s.nlocals,
-                    reg_idx,
-                    flat_idx,
+                    stack_idx,
+                    semantic_idx,
+                    crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx,
                     ctx.virtualizable_boxes_len(),
                 );
             }
-            match concrete.to_ir_ref_value() {
-                Some(v) => {
-                    ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
-                }
-                None => {
-                    ctx.set_virtualizable_box_at(flat_idx, boxed);
-                }
-            }
-            // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Slice 2,
-            // Task #114). Each `setarrayitem_vable` advances the frame's
-            // valuestackdepth by one (`pyframe.pushvalue`); upstream emits a
-            // following `setfield_vable_i(virtualizable, vsd_descr, depth+1)`
-            // through the metainterp's vable shadow.  Mirror the same advance
-            // here so `s.vable_valuestackdepth` and the shadow's vsd scalar
-            // slot stay current between flushes instead of lagging behind
-            // until the next `flush_to_frame_for_guard` heap re-seed.
+            // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Task
+            // #114). Every `setarrayitem_vable` advances `valuestackdepth`
+            // by one; upstream emits a following
+            // `setfield_vable_i(virtualizable, vsd_descr, depth+1)`.
             let vsd_op = ctx.const_int(new_vsd as i64);
             self.sym_mut().vable_valuestackdepth = vsd_op;
             mirror_vable_static_to_boxes(
@@ -1320,67 +1534,22 @@ impl MIFrame {
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
-        let (value, has_vable, owns_vable, reg_idx, new_vsd) = {
-            let s = self.sym_mut();
-            let nlocals = s.nlocals;
+        let (stack_idx, semantic_idx) = {
+            let s = self.sym();
             let stack_idx = s
                 .valuestackdepth
-                .checked_sub(nlocals + 1)
+                .checked_sub(s.nlocals + 1)
                 .ok_or_else(|| pyre_interpreter::stack_underflow_error("trace opcode"))?;
-            let reg_idx = nlocals + stack_idx;
-            if reg_idx >= s.registers_r.len() {
-                s.registers_r.resize(reg_idx + 1, OpRef::NONE);
-            }
-            if s.registers_r[reg_idx] == OpRef::NONE {
-                let abs_idx = reg_idx;
-                let idx_const = ctx.const_int(abs_idx as i64);
-                s.registers_r[reg_idx] =
-                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-            }
-            let value = s.registers_r[reg_idx];
+            (stack_idx, s.nlocals + stack_idx)
+        };
+        let value = read_stack_slot(self.sym_mut(), ctx, stack_idx);
+        let (is_active, owns_vable, new_vsd) = {
+            let s = self.sym_mut();
             s.valuestackdepth -= 1;
-            let new_vsd = s.valuestackdepth;
-            // Task #136 partial: gating on `is_active_vable_owner`
-            // intentionally does NOT cover bridges here. Unlike the other
-            // four mirror sites (push_typed_value / swap_values /
-            // store_local_value / finishframe_exception, all flipped to
-            // `owns_virtualizable_shadow()`), clearing the bridge shadow
-            // to NULL on every pop triggers a severe perf regression on
-            // fib_recursive (~50x slowdown: 0.88s → 47s; answer remains
-            // correct).
-            //
-            // Root cause (Task #138 probe): the pop-clear writes
-            // `const_ref(PY_NULL)` into the vable shadow. When a bridge
-            // subsequently inherits that shadow state and its IR
-            // references the cleared slot (e.g. a later `SetfieldGc`
-            // whose base operand resolves to the shadow entry), the
-            // bridge optimizer's `ConstPtrInfo._get_info` rejects the
-            // null constant with `InvalidLoop("null constant base
-            // pointer")` (optimizeopt/mod.rs:4021, info.py:720-721
-            // parity). Every bridge attempt aborts the same way, so
-            // guard failures fall through to the blackhole and immediately
-            // re-attempt compilation — trace-abort storm (~1.5k
-            // InvalidLoops + 92k aborted trace attempts on
-            // fib_recursive in 20s, from MAJIT_LOG + MAJIT_STATS
-            // probe).
-            //
-            // Upstream `pyframe.py:411 popvalue_maybe_none` clears the
-            // popped slot to `None` without this consequence, because
-            // RPython's virtualizable layout does NOT include the
-            // Python stack — the shadow has no stack-pop story. pyre's
-            // stack-in-vable PRE-EXISTING-ADAPTATION puts the popped
-            // slots in a structure the bridge optimizer reads as heap
-            // bases, so the None-clear pattern does not translate.
-            // Resolving this requires either removing the stack from
-            // the vable shadow (multi-session) or teaching the bridge
-            // optimizer to recognise cleared-stack-slot sentinels
-            // separately from real null heap bases.
             (
-                value,
                 s.is_active_vable_owner,
                 s.owns_virtualizable_shadow(),
-                reg_idx,
-                new_vsd,
+                s.valuestackdepth,
             )
         };
         // pyframe.py:411-417 `popvalue_maybe_none` parity: the popped slot
@@ -1390,8 +1559,38 @@ impl MIFrame {
         // `virtualizable_boxes`. Mirror the clear into the shadow so
         // subsequent snapshots do not pick up a stale pushed OpRef above
         // the current stack depth.
-        if has_vable {
-            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_idx;
+        //
+        // Task #136 partial: gating on `is_active_vable_owner`
+        // intentionally does NOT cover bridges here. Unlike the other
+        // four mirror sites (push_typed_value / swap_values /
+        // store_local_value / finishframe_exception, all flipped to
+        // `owns_virtualizable_shadow()`), clearing the bridge shadow
+        // to NULL on every pop triggers a severe perf regression on
+        // fib_recursive (~50x slowdown: 0.88s → 47s; answer remains
+        // correct).  Root cause (Task #138 probe): the pop-clear writes
+        // `const_ref(PY_NULL)` into the vable shadow.  When a bridge
+        // subsequently inherits that shadow state and its IR
+        // references the cleared slot (e.g. a later `SetfieldGc` whose
+        // base operand resolves to the shadow entry), the bridge
+        // optimizer's `ConstPtrInfo._get_info` rejects the null
+        // constant with `InvalidLoop("null constant base pointer")`
+        // (optimizeopt/mod.rs:4021, info.py:720-721 parity).  Every
+        // bridge attempt aborts the same way, so guard failures fall
+        // through to the blackhole and immediately re-attempt
+        // compilation — trace-abort storm.
+        //
+        // Upstream `pyframe.py:411 popvalue_maybe_none` clears without
+        // this consequence because RPython's virtualizable layout does
+        // NOT include the Python stack — the shadow has no stack-pop
+        // story.  pyre's stack-in-vable PRE-EXISTING-ADAPTATION puts
+        // the popped slots in a structure the bridge optimizer reads
+        // as heap bases, so the None-clear pattern does not translate.
+        // Resolving this requires either removing the stack from the
+        // vable shadow (multi-session) or teaching the bridge
+        // optimizer to recognise cleared-stack-slot sentinels
+        // separately from real null heap bases.
+        if is_active {
+            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + semantic_idx;
             let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
             let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
             ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
@@ -1401,8 +1600,8 @@ impl MIFrame {
         // of the same sequence that clears the array slot; upstream emits a
         // `setfield_vable_i(virtualizable, vsd_descr, depth-1)` after the
         // setarrayitem_vable_r clear.  The bridge NULL-base issue
-        // (Task #136 comment above) is specific to writing a const_ref(NULL)
-        // into a Ref-typed array slot; vsd is an Int scalar, so the bridge
+        // above is specific to writing a `const_ref(NULL)` into a
+        // Ref-typed array slot; vsd is an Int scalar, so the bridge
         // optimizer is unaffected and the gate stays at
         // `owns_virtualizable_shadow()` to keep parity with
         // `push_typed_value`.
@@ -1424,24 +1623,13 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         depth: usize,
     ) -> Result<OpRef, PyError> {
-        let s = self.sym_mut();
-        let nlocals = s.nlocals;
-        let stack_idx = s
-            .valuestackdepth
-            .checked_sub(nlocals + depth + 1)
-            .ok_or_else(|| pyre_interpreter::stack_underflow_error("trace peek"))?;
-        let reg_idx = nlocals + stack_idx;
-        if reg_idx >= s.registers_r.len() {
-            s.registers_r.resize(reg_idx + 1, OpRef::NONE);
-        }
-        if s.registers_r[reg_idx] == OpRef::NONE {
-            let abs_idx = reg_idx;
-            let idx_const = ctx.const_int(abs_idx as i64);
-            s.registers_r[reg_idx] =
-                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-        }
-        let value = s.registers_r[reg_idx];
-        Ok(value)
+        let stack_idx = {
+            let s = self.sym();
+            s.valuestackdepth
+                .checked_sub(s.nlocals + depth + 1)
+                .ok_or_else(|| pyre_interpreter::stack_underflow_error("trace peek"))?
+        };
+        Ok(read_stack_slot(self.sym_mut(), ctx, stack_idx))
     }
 
     fn push_call_replay_stack(
@@ -1473,58 +1661,15 @@ impl MIFrame {
     }
 
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
-        let (has_vable, reg_top, reg_other) = {
-            let s = self.sym_mut();
+        let (top_idx, other_idx) = {
+            let s = self.sym();
             let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
             if depth == 0 || stack_only < depth {
                 return Err(PyError::type_error("stack underflow during trace swap"));
             }
-            let top_idx = stack_only - 1;
-            let other_idx = stack_only - depth;
-            let nlocals = s.nlocals;
-            let reg_top = nlocals + top_idx;
-            let reg_other = nlocals + other_idx;
-            let needed = reg_top.max(reg_other) + 1;
-            if s.registers_r.len() < needed {
-                s.registers_r.resize(needed, OpRef::NONE);
-            }
-            if s.registers_r[reg_top] == OpRef::NONE {
-                let idx_const = ctx.const_int(reg_top as i64);
-                s.registers_r[reg_top] =
-                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-            }
-            if s.registers_r[reg_other] == OpRef::NONE {
-                let idx_const = ctx.const_int(reg_other as i64);
-                s.registers_r[reg_other] =
-                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-            }
-            s.registers_r.swap(reg_top, reg_other);
-            if top_idx < s.symbolic_stack_types.len() && other_idx < s.symbolic_stack_types.len() {
-                s.symbolic_stack_types.swap(top_idx, other_idx);
-            }
-            // MIFrame Box tracking: swap concrete values too
-            if top_idx < s.concrete_stack.len() && other_idx < s.concrete_stack.len() {
-                s.concrete_stack.swap(top_idx, other_idx);
-            }
-            (s.owns_virtualizable_shadow(), reg_top, reg_other)
+            (stack_only - 1, stack_only - depth)
         };
-        // `virtualizable_boxes` is the single source of truth for the
-        // frame's Ref array (opencoder.py:718). SWAP rewrites two slots
-        // of `locals_cells_stack_w`, so swap the (OpRef, concrete) pairs
-        // atomically via `virtualizable_entry_at`; reading each half
-        // separately and reconstructing concrete via `concrete_of_opref`
-        // would drop non-const Box identity into the sentinel fallback.
-        if has_vable {
-            let flat_top = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_top;
-            let flat_other = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_other;
-            if let (Some((op_top, val_top)), Some((op_other, val_other))) = (
-                ctx.virtualizable_entry_at(flat_top),
-                ctx.virtualizable_entry_at(flat_other),
-            ) {
-                ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
-                ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
-            }
-        }
+        swap_stack_slots(self.sym_mut(), ctx, top_idx, other_idx);
         Ok(())
     }
 
@@ -1561,11 +1706,13 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            // Sync registers_r with the vable read so downstream
-            // consumers that still consult the cache-field directly
-            // (close_loop_args_at until Phase B migrates it) see the
-            // same OpRef.
-            s.registers_r[idx] = op;
+            // Step 2.2 prerequisite: do NOT write registers_r[idx] = op.
+            // After Step 2.2 routes stack pushes to color-indexed slots
+            // (which may be coalesced with a local color), this sync
+            // line OVERWRITES a freshly-pushed stack value. Path C
+            // readers (Slices 1-6) all consult vable shadow first for
+            // active vable owner traces, so the registers_r mirror is
+            // no longer required for downstream consumers.
             return Ok(op);
         }
         let s = self.sym_mut();
@@ -2491,6 +2638,11 @@ impl MIFrame {
                         .valuestackdepth
                         .saturating_sub(self.sym().nlocals)
             });
+        // portal-bridge keeps `s.valuestackdepth` at its initial seed
+        // (see `portal_bridge_vable_vsd` doc); consult metadata at the
+        // current pc so `stack_only` reflects the actual JUMP-source
+        // stack depth instead of the stale symbolic counter.
+        let portal_vsd = self.portal_bridge_vable_vsd(self.orgpc).map(|d| d as usize);
         let (
             frame,
             execution_context,
@@ -2508,7 +2660,9 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let nlocals = s.nlocals;
-            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
+            let stack_only = portal_vsd
+                .unwrap_or(s.valuestackdepth)
+                .saturating_sub(s.nlocals);
             // virtualizable.py:86-98 `read_boxes` + pyjitpl.py:2954-2965
             // `reached_loop_header`: `virtualizable_boxes` length is the
             // target vable array capacity (`nlocals + ncells + co_stacksize`),
@@ -2521,15 +2675,60 @@ impl MIFrame {
             // virtualizable_boxes tail.
             let reg_len = s.registers_r.len();
             let target_stack_capacity = target_array_capacity.saturating_sub(nlocals);
-            let locals_len = nlocals.min(reg_len);
-            let live_stack_len = stack_only.min(reg_len.saturating_sub(locals_len));
-            let stack_slice_start = locals_len;
-            let stack_slice_end = stack_slice_start + live_stack_len;
-            let mut stack_vec = s.registers_r[stack_slice_start..stack_slice_end].to_vec();
-            stack_vec.resize(target_stack_capacity, OpRef::NONE);
             let mut stack_types_vec =
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec();
             stack_types_vec.resize(target_stack_capacity, Type::Ref);
+            // pyjitpl.py:2954-2965 `reached_loop_header` parity: read
+            // both locals and stack values from the virtualizable shadow
+            // (`virtualizable_boxes[NUM_VABLE_SCALARS + i]`). The shadow
+            // is RPython's single source of truth for the
+            // `locals_cells_stack_w` view; `push_typed_value` /
+            // `store_local_value` mirror every write into it for traces
+            // that satisfy `owns_virtualizable_shadow()` (the loop
+            // portal AND every bridge that seeded its own
+            // `bridge_local_oprefs`). Non-owner traces (rare —
+            // inline-callee scaffolding before the inline path takes
+            // over) keep the legacy semantic registers_r read.
+            //
+            // Shadow path bounds: virtualizable_boxes is sized to
+            // `target_array_capacity` (NUM_VABLE_SCALARS + nlocals +
+            // co_stacksize) at vable init, so `stack_only.min(
+            // target_stack_capacity)` is the correct live-prefix
+            // length; the legacy `reg_len.saturating_sub(locals_len)`
+            // cap silently dropped OpRefs once the operand stack
+            // overgrew the registers_r slice (RPython
+            // `reached_loop_header` carries the full
+            // `virtualizable_boxes[:-1]` regardless of register-file
+            // occupancy).  The non-shadow registers_r read keeps the
+            // reg_len cap because reading past `registers_r.len()`
+            // panics there.
+            let (locals_vec, mut stack_vec) = if s.owns_virtualizable_shadow() {
+                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                let shadow_stack_len = stack_only.min(target_stack_capacity);
+                let locals_vec: Vec<OpRef> = (0..nlocals)
+                    .map(|i| {
+                        ctx.virtualizable_box_at(nvs + i)
+                            .expect("close_loop_args_at: missing virtualizable local box")
+                    })
+                    .collect();
+                let stack_vec: Vec<OpRef> = (0..shadow_stack_len)
+                    .map(|d| {
+                        ctx.virtualizable_box_at(nvs + nlocals + d)
+                            .expect("close_loop_args_at: missing virtualizable stack box")
+                    })
+                    .collect();
+                (locals_vec, stack_vec)
+            } else {
+                let locals_len = nlocals.min(reg_len);
+                let live_stack_len = stack_only.min(reg_len.saturating_sub(locals_len));
+                let stack_slice_start = locals_len;
+                let stack_slice_end = stack_slice_start + live_stack_len;
+                (
+                    s.registers_r[..locals_len].to_vec(),
+                    s.registers_r[stack_slice_start..stack_slice_end].to_vec(),
+                )
+            };
+            stack_vec.resize(target_stack_capacity, OpRef::NONE);
             (
                 s.frame,
                 s.execution_context,
@@ -2540,7 +2739,7 @@ impl MIFrame {
                 s.vable_lastblock,
                 s.vable_w_globals,
                 nlocals,
-                s.registers_r[..locals_len].to_vec(),
+                locals_vec,
                 stack_vec,
                 s.symbolic_local_types.clone(),
                 stack_types_vec,
@@ -5829,83 +6028,75 @@ impl MIFrame {
             let ncells = code.cellvars.len() + code.freevars.len();
             let nlocals = self.sym().nlocals;
             let target_stack_len = ncells + handler_depth;
-            let (has_vable, old_vsd, new_vsd, lasti_reg_idx, exc_reg_idx) = {
+            let (has_vable, old_vsd, post_truncate_vsd) = {
                 let s = self.sym_mut();
                 let old_vsd = s.valuestackdepth;
                 s.symbolic_stack_types.truncate(target_stack_len);
                 s.concrete_stack.truncate(target_stack_len);
                 s.valuestackdepth = nlocals + target_stack_len;
-                // Unified register file: the stack tail lives in
-                // `registers_r[nlocals..]`. Truncate and re-push in
-                // lockstep with `symbolic_stack_types` / `concrete_stack`.
                 if s.registers_r.len() > nlocals + target_stack_len {
                     s.registers_r.truncate(nlocals + target_stack_len);
                 }
-                let lasti_reg_idx = if entry.push_lasti {
-                    let idx = s.registers_r.len();
-                    s.symbolic_stack_types.push(Type::Ref);
-                    s.concrete_stack
-                        .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
-                    s.valuestackdepth += 1;
-                    s.registers_r.push(OpRef::NONE);
-                    Some(idx)
-                } else {
-                    None
-                };
-                let exc_reg_idx = s.registers_r.len();
-                s.symbolic_stack_types.push(Type::Ref);
-                s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
-                s.valuestackdepth += 1;
-                s.registers_r.push(exc_opref);
-                (
-                    s.owns_virtualizable_shadow(),
-                    old_vsd,
-                    s.valuestackdepth,
-                    lasti_reg_idx,
-                    exc_reg_idx,
-                )
+                (s.owns_virtualizable_shadow(), old_vsd, s.valuestackdepth)
             };
             // opencoder.py:718 `_list_of_boxes_virtualizable` parity: the
             // snapshot reads only `virtualizable_boxes`, so the unwind
             // must also mirror onto the shadow. Clear truncated slots to
-            // PY_NULL (pyframe.py:411 popvalue_maybe_none) and write the
-            // push_lasti / exc_box slots to match registers_r.
-            if has_vable {
+            // PY_NULL (pyframe.py:411 popvalue_maybe_none) BEFORE pushing
+            // lasti / exc so the subsequent `write_stack_slot` shadow set
+            // for exc is the last write.
+            let static_offset = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            if has_vable && old_vsd > post_truncate_vsd {
                 let null_opref =
                     self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::PY_NULL as i64));
                 let null_value =
                     majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
-                let static_offset = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                // Clear shadow slots that were above new_vsd up to old_vsd.
-                let lo = new_vsd.min(old_vsd);
-                let hi = new_vsd.max(old_vsd);
                 self.with_ctx(|_this, ctx| {
-                    for reg_idx in lo..hi {
+                    for reg_idx in post_truncate_vsd..old_vsd {
                         let flat_idx = static_offset + reg_idx;
                         ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
                     }
-                    if let Some(idx) = lasti_reg_idx {
-                        // registers_r stored OpRef::NONE for the lasti
-                        // slot; mirror that as PY_NULL shadow. The
-                        // concrete int is not tracked here because the
-                        // caller pushed a ConcreteValue::Ref directly
-                        // without an OpRef.
-                        let flat_idx = static_offset + idx;
-                        ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
-                    }
-                    let flat_idx = static_offset + exc_reg_idx;
-                    let exc_concrete = majit_ir::Value::Ref(majit_ir::GcRef(exc_obj as usize));
-                    ctx.set_virtualizable_entry_at(flat_idx, exc_opref, exc_concrete);
                 });
             }
+            let lasti_obj = if entry.push_lasti {
+                // Python 3.11 exception-table adaptation: `push_lasti`
+                // pushes a real W_Int object onto `locals_cells_stack_w`.
+                // Mirror it through the same stack/vable helper as every
+                // other W_Root push so guard/resume snapshots see the
+                // object in `virtualizable_boxes`, not a PY_NULL lazy-fill
+                // placeholder.
+                let lasti_obj = pyre_object::w_int_new(pc as i64);
+                let lasti_opref = self.with_ctx(|_this, ctx| ctx.const_ref(lasti_obj as i64));
+                self.with_ctx(|this, ctx| {
+                    let s = this.sym_mut();
+                    let stack_idx = s.valuestackdepth - s.nlocals;
+                    write_stack_slot(
+                        s,
+                        ctx,
+                        stack_idx,
+                        lasti_opref,
+                        ConcreteValue::Ref(lasti_obj),
+                    );
+                    this.sym_mut().valuestackdepth += 1;
+                });
+                Some(lasti_obj)
+            } else {
+                None
+            };
+            self.with_ctx(|this, ctx| {
+                let s = this.sym_mut();
+                let stack_idx = s.valuestackdepth - s.nlocals;
+                write_stack_slot(s, ctx, stack_idx, exc_opref, ConcreteValue::Ref(exc_obj));
+                this.sym_mut().valuestackdepth += 1;
+            });
             // Sync concrete frame.
             let frame = unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::PyFrame) };
             let target_depth = frame.nlocals() + frame.ncells() + handler_depth;
             while frame.valuestackdepth > target_depth {
                 frame.pop();
             }
-            if entry.push_lasti {
-                frame.push(pyre_object::w_int_new(pc as i64));
+            if let Some(lasti_obj) = lasti_obj {
+                frame.push(lasti_obj);
             }
             frame.push(exc_obj);
             // pyjitpl.py:2518: frame.pc = target; raise ChangeFrame

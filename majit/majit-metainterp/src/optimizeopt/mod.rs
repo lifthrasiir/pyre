@@ -4037,6 +4037,34 @@ impl OptContext {
         if let Some(tp) = self.inputarg_type(resolved) {
             return Some(tp);
         }
+        // 5. PtrInfo-derived type (history.py:220 box.type parity for
+        //    virtual heads across phase boundaries). Phase 1 virtualizes
+        //    NewWithVtable / New / NewArray etc. by returning
+        //    `OptimizationResult::Remove` from the relevant `optimize_*`
+        //    method (virtualize.py:208-225) — the op never lands in
+        //    `new_operations` and is therefore absent from
+        //    `phase1_emit_ops`. Phase 2 imports the virtual head's
+        //    `PtrInfo` via `setinfo_from_preamble` (unroll.py:55-64) but
+        //    starts with a fresh `value_types` map, so the prior four
+        //    sources all miss. RPython preserves the type intrinsically
+        //    on the Box object; pyre recovers it from the PtrInfo variant
+        //    because every variant maps to a unique RPython box type.
+        //    Ref-typed: Virtual / VirtualArray / VirtualStruct /
+        //    VirtualArrayStruct / Array / Struct / Instance / Constant /
+        //    NonNull / Virtualizable / Str (RPython instances of
+        //    AbstractStructPtrInfo / ArrayPtrInfo / StrPtrInfo carry 'r').
+        //    Int-typed: VirtualRawBuffer / VirtualRawSlice
+        //    (info.py:865 RawBufferPtrInfo + getrawptrinfo() — these
+        //    describe raw pointers stored in 'i' Boxes).
+        if let Some(crate::optimizeopt::info::Forwarded::Info(info)) =
+            self.forwarded.get(resolved.raw() as usize)
+        {
+            return Some(match info {
+                crate::optimizeopt::info::PtrInfo::VirtualRawBuffer(_)
+                | crate::optimizeopt::info::PtrInfo::VirtualRawSlice(_) => majit_ir::Type::Int,
+                _ => majit_ir::Type::Ref,
+            });
+        }
         None
     }
 

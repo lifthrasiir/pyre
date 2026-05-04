@@ -9,7 +9,9 @@ use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 use pyre_interpreter::bytecode::Instruction;
 
-use super::state::{ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState};
+use super::state::{
+    ConcreteValue, MIFrame, PendingInlineFrame, PyreSym, ResumeFrameState, wrapfloat, wrapint,
+};
 
 /// RPython MIFrame (pyjitpl.py:65) — per-frame tracing state.
 pub struct MetaInterpFrame {
@@ -473,47 +475,28 @@ impl PyreMetaInterp {
         let parent_sym = unsafe { &mut *parent.sym };
 
         if let Some(result_idx) = popped.caller_result_stack_idx {
-            // Update the unified register file. Stack slots live at
-            // `registers_r[nlocals + stack_idx]`; re-derive the abs
-            // index and write the call result there.
-            let parent_nlocals = parent_sym.nlocals;
-            let abs_idx = parent_nlocals + result_idx;
-            if abs_idx >= parent_sym.registers_r.len() {
-                parent_sym.registers_r.resize(abs_idx + 1, OpRef::NONE);
-            }
-            parent_sym.registers_r[abs_idx] = result_opref;
-            if result_idx >= parent_sym.symbolic_stack_types.len() {
-                parent_sym
-                    .symbolic_stack_types
-                    .resize(result_idx + 1, Type::Ref);
-            }
-            parent_sym.symbolic_stack_types[result_idx] = result_type;
-
-            // Update concrete stack. history.py:307 ConstPtr.getref_base
-            // parity: a Ref-typed return value carries the raw GCREF —
-            // the JIT never eagerly unboxes W_IntObject / W_FloatObject
-            // at shadow-set time. For Int/Float-typed results we extract
-            // the scalar because the opcode's signature said so.
-            let cv = match result_type {
-                Type::Int => ConcreteValue::from_pyobj(concrete_result),
-                Type::Float => ConcreteValue::from_pyobj(concrete_result),
-                Type::Ref => {
-                    if concrete_result.is_null() {
-                        ConcreteValue::Null
-                    } else {
-                        ConcreteValue::Ref(concrete_result)
-                    }
+            // pyjitpl.py:258-275 `make_result_of_lastop` dispatches on
+            // `resultbox.type`. Pyre's Python operand stack is a W_Root
+            // array (`virtualizable.py:86-98`), so scalar results are
+            // explicitly boxed before the parent stack slot is updated.
+            let boxed = match result_type {
+                Type::Int => wrapint(ctx, result_opref),
+                Type::Float => wrapfloat(ctx, result_opref),
+                Type::Ref => result_opref,
+                Type::Void => {
+                    debug_assert!(
+                        false,
+                        "void inline return cannot write caller_result_stack_idx"
+                    );
+                    return;
                 }
-                Type::Void => ConcreteValue::Null,
             };
-            if result_idx < parent_sym.concrete_stack.len() {
-                parent_sym.concrete_stack[result_idx] = cv;
+            let cv = if concrete_result.is_null() {
+                ConcreteValue::Null
             } else {
-                parent_sym
-                    .concrete_stack
-                    .resize(result_idx + 1, ConcreteValue::Null);
-                parent_sym.concrete_stack[result_idx] = cv;
-            }
+                ConcreteValue::Ref(concrete_result)
+            };
+            super::trace_opcode::write_stack_slot(parent_sym, ctx, result_idx, boxed, cv);
         }
 
         // Keep concrete stack in sync only for inline parents.
@@ -644,27 +627,78 @@ impl PyreMetaInterp {
                 let ncells = code.cellvars.len() + code.freevars.len();
                 let nlocals = sym.nlocals;
                 let target_stack_len = ncells + handler_depth;
+                let post_truncate_vsd = nlocals + target_stack_len;
+                let owns_shadow = sym.owns_virtualizable_shadow();
+                let old_vsd = sym.valuestackdepth;
 
                 sym.symbolic_stack_types.truncate(target_stack_len);
                 sym.concrete_stack.truncate(target_stack_len);
-                sym.valuestackdepth = nlocals + target_stack_len;
+                sym.valuestackdepth = post_truncate_vsd;
                 // Unified register file: truncate the stack tail of
                 // `registers_r` in lockstep with the types / concrete
                 // mirrors.
-                if sym.registers_r.len() > nlocals + target_stack_len {
-                    sym.registers_r.truncate(nlocals + target_stack_len);
+                if sym.registers_r.len() > post_truncate_vsd {
+                    sym.registers_r.truncate(post_truncate_vsd);
                 }
-                if entry.push_lasti {
-                    sym.symbolic_stack_types.push(Type::Ref);
-                    sym.concrete_stack
-                        .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
+
+                // opencoder.py:718 `_list_of_boxes_virtualizable`
+                // parity, mirroring `trace_opcode::finishframe_exception`
+                // (single-frame): the snapshot reads only
+                // `virtualizable_boxes`, so the unwind must also clear
+                // the truncated stack slots in the shadow to PY_NULL
+                // (pyframe.py:411 `popvalue_maybe_none`).  When the
+                // handler frame owns the shadow (loop portal frame
+                // catching an exception raised in an inlined callee
+                // that has just been popped, or any bridge with seeded
+                // `bridge_local_oprefs`), this clear matches the
+                // single-frame path so the subsequent
+                // `write_stack_slot` exc push is the last write to its
+                // slot.  If the handler frame does NOT own the shadow
+                // (rare — non-portal frame deep in an inline chain),
+                // the legacy `registers_r`-only unwind suffices.
+                let static_offset = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                if owns_shadow && old_vsd > post_truncate_vsd {
+                    let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
+                    let null_value =
+                        majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
+                    for reg_idx in post_truncate_vsd..old_vsd {
+                        let flat_idx = static_offset + reg_idx;
+                        ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+                    }
+                }
+
+                let lasti_obj = if entry.push_lasti {
+                    // Python 3.11 exception-table adaptation: `push_lasti`
+                    // pushes a real W_Int object onto `locals_cells_stack_w`.
+                    // Route it through the common stack/vable mirror so the
+                    // handler frame's `virtualizable_boxes` snapshot matches
+                    // the concrete PyFrame stack.
+                    let lasti_obj = pyre_object::w_int_new(pc as i64);
+                    let lasti_opref = ctx.const_ref(lasti_obj as i64);
+                    let stack_idx = sym.valuestackdepth - sym.nlocals;
+                    super::trace_opcode::write_stack_slot(
+                        sym,
+                        ctx,
+                        stack_idx,
+                        lasti_opref,
+                        ConcreteValue::Ref(lasti_obj),
+                    );
                     sym.valuestackdepth += 1;
-                    sym.registers_r.push(OpRef::NONE);
+                    Some(lasti_obj)
+                } else {
+                    None
+                };
+                {
+                    let stack_idx = sym.valuestackdepth - sym.nlocals;
+                    super::trace_opcode::write_stack_slot(
+                        sym,
+                        ctx,
+                        stack_idx,
+                        exc_opref,
+                        ConcreteValue::Ref(exc_obj),
+                    );
+                    sym.valuestackdepth += 1;
                 }
-                sym.symbolic_stack_types.push(Type::Ref);
-                sym.concrete_stack.push(ConcreteValue::Ref(exc_obj));
-                sym.valuestackdepth += 1;
-                sym.registers_r.push(exc_opref);
                 sym.pending_next_instr = Some(handler_pc);
 
                 // Sync concrete frame
@@ -673,8 +707,8 @@ impl PyreMetaInterp {
                     while cf.valuestackdepth > target_depth {
                         cf.pop();
                     }
-                    if entry.push_lasti {
-                        cf.push(pyre_object::w_int_new(pc as i64));
+                    if let Some(lasti_obj) = lasti_obj {
+                        cf.push(lasti_obj);
                     }
                     cf.push(exc_obj);
                     cf.set_last_instr_from_next_instr(handler_pc);
