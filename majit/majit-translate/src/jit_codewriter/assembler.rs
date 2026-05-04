@@ -112,6 +112,19 @@ pub struct Assembler {
     /// table now plays the same role: the kind decided at build time
     /// must match the regalloc class that holds the coloring.
     current_value_kinds: Option<HashMap<ValueId, RegKind>>,
+    /// Next byte to assign for a translator-only key whose opname is
+    /// not registered in the canonical `insns::insn_byte_opt` table
+    /// (e.g. `inline_call_*/dR>X` per `insns.rs:425-436`'s
+    /// pre-registration omission).  Initialised lazily to
+    /// `CANONICAL_BYTE_CEILING` (one past the highest fixed `BC_*`)
+    /// inside [`Self::get_opnum`] so the dynamic byte range stays
+    /// disjoint from canonical assignments.  Stored as `u16` so the
+    /// last assignable byte (255) can be consumed before the next call
+    /// trips the `< 256` overflow assert — matching RPython
+    /// `setdefault(key, len(self.insns))` which permits the full
+    /// 0..=255 range (`assembler.py:220-222`, `blackhole.py len(insns)
+    /// <= 256`).
+    next_dynamic_byte: Option<u16>,
 }
 
 impl Assembler {
@@ -134,6 +147,7 @@ impl Assembler {
             current_graph_name: None,
             current_flatop_debug: None,
             current_value_kinds: None,
+            next_dynamic_byte: None,
         }
     }
 
@@ -1636,21 +1650,92 @@ impl Assembler {
     }
 
     /// RPython: opcode key → opcode number.
-    /// RPython assembler.py:220-222: key = opname + '/' + argcodes.
-    /// `setdefault(key, len(self.insns))` in Python silently grows past
-    /// 255; pyre's bytecode dispatcher reads the opnum as a single byte,
-    /// so going past 255 would silently wrap and alias two distinct
-    /// opcodes onto one. Strict assert surfaces the overflow at the first
-    /// new-opcode registration instead of as a baffling dispatch bug.
+    /// RPython `assembler.py:220-222`:
+    /// ```text
+    /// key = opname + '/' + ''.join(argcodes)
+    /// num = self.insns.setdefault(key, len(self.insns))
+    /// ```
+    ///
+    /// Pyre routes through the canonical
+    /// [`crate::insns::insn_byte_opt`] table whenever the key is one of
+    /// the BH-runtime-shared opnames so `Assembler` and
+    /// `JitCodeBuilder::write_insn` agree on the byte assigned to the
+    /// same opname (otherwise the same `code` byte could decode to
+    /// different opnames depending on which producer wrote it — see
+    /// `jitcode_dispatch.rs:5734-5743` for the exact risk shape).
+    ///
+    /// PRE-EXISTING-ADAPTATION (`insns.rs` module doc): pyre serialises
+    /// `opcode_jitcodes.bin` at build time and the runtime decoder
+    /// reads those bytes verbatim, so opcode bytes must stay stable
+    /// across build/runtime.  Canonical keys carry a fixed `BC_*`
+    /// pinning to satisfy that adaptation; routing canonical keys here
+    /// through the same table preserves the pinning instead of
+    /// silently re-numbering them.
+    ///
+    /// Translator-pipeline-only keys (e.g. `inline_call_*/dR>X` per
+    /// `insns.rs:425-436`'s pre-registration omission note) are
+    /// intentionally absent from the canonical table because their
+    /// runtime payload differs from the BH-side `BC_INLINE_CALL`
+    /// adapter; for those keys this falls through to RPython's
+    /// `setdefault(key, len(self.insns))` dynamic allocation, matching
+    /// upstream literally.
+    ///
+    /// `setdefault` in Python silently grows past 255; pyre's bytecode
+    /// dispatcher reads the opnum as a single byte, so going past 255
+    /// would silently wrap and alias two distinct opcodes onto one.
+    /// Strict assert surfaces the overflow at the first new-opcode
+    /// registration instead of as a baffling dispatch bug.
+    ///
+    /// Dynamic-fallback note: RPython uses `len(self.insns)` as the next
+    /// byte because every key participates in the same monotonic
+    /// numbering.  Pyre's canonical-routing splits the byte space —
+    /// canonical keys land at fixed `BC_*` values inside `0..=168`,
+    /// translator-only keys must come AFTER that range or two distinct
+    /// keys could end up at the same byte.  The first dynamic insertion
+    /// therefore starts at `CANONICAL_BYTE_CEILING` rather than at
+    /// `len(self.insns)`, and increments per insertion to mirror
+    /// RPython's monotonic semantics inside the dynamic-only sub-range.
     fn get_opnum(&mut self, key: &str) -> u8 {
-        let next = self.insns.len();
+        if let Some(num) = crate::insns::insn_byte_opt(key) {
+            self.insns.insert(key.to_string(), num);
+            return num;
+        }
+        if let Some(&existing) = self.insns.get(key) {
+            return existing;
+        }
+        // First byte past every fixed canonical `BC_*` (currently the
+        // max canonical byte is 168 — BC_RESIDUAL_CALL_IRF_F).  Bumping
+        // the canonical table forward is allowed; this constant just
+        // needs to stay one past the highest canonical byte.
+        const CANONICAL_BYTE_CEILING: u16 = 169;
+        let next_dynamic = self.next_dynamic_byte.unwrap_or(CANONICAL_BYTE_CEILING);
+        // RPython `assembler.py:220-222 setdefault(key, len(self.insns))`
+        // permits the full 0..=255 range (blackhole.py keeps
+        // `len(insns) <= 256`).  Surface the overflow only when there
+        // is no slot left to assign — bumping past 255 BEFORE the
+        // assignment would forbid the last legal byte.
         assert!(
-            next < 256,
+            next_dynamic < 256,
             "opcode table grew past 256 entries when registering `{key}`; \
              a 1-byte opcode dispatcher cannot encode more"
         );
-        let next = next as u8;
-        *self.insns.entry(key.to_string()).or_insert(next)
+        let assigned = next_dynamic as u8;
+        assert!(
+            (assigned as u16) >= CANONICAL_BYTE_CEILING,
+            "next_dynamic_byte regressed below CANONICAL_BYTE_CEILING for `{key}`; \
+             a translator-only key would collide with a canonical BC_*"
+        );
+        assert!(
+            !self.insns.values().any(|&v| v == assigned),
+            "dynamic byte {assigned} for `{key}` collides with a previously \
+             assigned opcode; canonical and dynamic ranges must be disjoint"
+        );
+        // Saturate at 256 — the next call's `< 256` assert above
+        // surfaces the overflow at the FIRST unassignable registration
+        // rather than during this (still-valid) one.
+        self.next_dynamic_byte = Some(next_dynamic + 1);
+        self.insns.insert(key.to_string(), assigned);
+        assigned
     }
 
     /// Resolve `(register_index, kind)` for a `ValueId`.
@@ -3101,6 +3186,31 @@ mod tests {
             },
         );
         regallocs
+    }
+
+    #[test]
+    fn get_opnum_assigns_byte_255_before_overflow_panic() {
+        // RPython parity: `assembler.py:220-222 setdefault(key, len(self.insns))`
+        // permits the full 0..=255 range; `blackhole.py` keeps
+        // `len(insns) <= 256`. Earlier this file's get_opnum bumped the
+        // dynamic counter BEFORE the assignment via `checked_add(1)`,
+        // which made byte 255 unassignable (the bump from 255 → 256
+        // tripped the overflow expect first). This regression test
+        // pins the full-range parity: the last legal slot must be
+        // assignable, the next call past it panics.
+        let mut asm = Assembler::new();
+        // Seed the counter at 254 so we exercise the 254 → 255 → panic
+        // boundary without registering 169..=253 first.
+        asm.next_dynamic_byte = Some(254);
+        assert_eq!(asm.get_opnum("translator_only_test/254"), 254u8);
+        assert_eq!(asm.get_opnum("translator_only_test/255"), 255u8);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            asm.get_opnum("translator_only_test/256");
+        }));
+        assert!(
+            panic_result.is_err(),
+            "registering a 257th opcode must panic — the 1-byte dispatcher cannot encode it"
+        );
     }
 
     #[test]

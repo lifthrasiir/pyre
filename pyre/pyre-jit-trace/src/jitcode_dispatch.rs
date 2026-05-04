@@ -39,7 +39,7 @@
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through (Walker fix F: alias-clearing — when obj is escaped, retain only unescaped-object cache entries for this field_index, mirroring RPython `FieldUpdater.setfield → do_write_with_aliasing`). RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (Task #85 territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
 //! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (Task #85). |
-//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (multi-session epic) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). Still missing relative to `do_residual_call`: `vable_and_vrefs_before/after_residual_call` virtualizable bookkeeping (`pyjitpl.py:2055-2080`), `heapcache.invalidate_caches_varargs` for write effects (`pyjitpl.py:2042`), `OS_NOT_IN_TRACE` early return via `do_not_in_trace_call` (`pyjitpl.py:2003-2006 + 3683-3697`) — pyre's `effect_info_for_call_flavor` stub never sets `oopspecindex` (see `flatten.rs:431` audit table) so the dead path is unreachable today, `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990`), KEEPALIVE for vablebox, and `num_live` accounting on the guards (`pyjitpl.py:2082 → capture_resumedata(after_residual_call=True)`). Convergence: Phase D-3 + dedicated multi-session port (depends on `majit-translate` analyzer trio). |
+//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (deferred slices for `direct_assembler_call` + `capture_resumedata`) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`; (3) vable IR bookkeeping (`pyjitpl.py:2055-2080`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap mutations on `vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`) and the after-call helpers (`pyjitpl.py:3337-3366`) stay on the trait-driven leg (`state.rs MIFrame::vable_and_vrefs_before_residual_call`, `trace_opcode.rs:2193-2349`) since the walker can't observe a force without executing the callee. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py:2042 + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (`flatten.rs:431`), making it dead until producers land. Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `OS_JIT_FORCE_VIRTUAL` short-circuit (stricter-than-PyPy fail-loud — needs OpRef→concrete-pointer resolver), `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py:2078-2082 → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
 //! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
 //! | `raise/r`           | PRE-EXISTING-ADAPTATION (Walker fix H deferred) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the symbolic walker can't derive `cls_of_box(exc)` without runtime access to the box. Convergence path: Walker fix A (production `dispatch_via_miframe` wiring) supplies the MIFrame.cls_of_box resolver; only then can walker emit the guard. |
@@ -506,6 +506,20 @@ pub enum DispatchError {
     /// instead of faking either the normal return or
     /// `SwitchToBlackhole`.
     NotInTraceRequiresConcreteExecution { pc: usize },
+    /// `OS_JIT_FORCE_VIRTUAL` would short-circuit `do_residual_call`
+    /// before recording `CALL_MAY_FORCE_*` (`pyjitpl.py:2011-2014 →
+    /// 2153-2172 _do_jit_force_virtual`). The short-circuit needs a
+    /// concrete `vref_ptr` for arbitrary Ref OpRefs to determine
+    /// `isstandard_int` at trace time — walker only knows
+    /// `concrete_vable_ptr`, not the concrete value behind every Ref
+    /// OpRef. Surfacing this as an error prevents silently recording
+    /// `CALL_MAY_FORCE_*` for an op the live tracer would have folded
+    /// to `vref_box` / `standard_box` / None. Production reach today:
+    /// `OopSpecIndex::JitForceVirtual` is set only by
+    /// `jtransform.rs:1903 jit.force_virtual` lowering, which our
+    /// benchmarks don't trigger; this guard is fail-loud against future
+    /// silent NEW-DEVIATIONs.
+    JitForceVirtualRequiresConcreteResolver { pc: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -1061,6 +1075,14 @@ pub fn dispatch_via_miframe(
     // SAFETY: both pointers were initialized at MIFrame
     // construction time and outlive this call (TraceCtx and
     // PyreSym are pinned by the surrounding tracing session).
+    // `&mut sym` is held only for the post-walk
+    // `last_exc_box`/`class_of_last_exc_is_const` writeback below;
+    // during the walk itself we re-borrow only specific sym fields
+    // (`registers_*`) into the `WalkContext` slices — the walker no
+    // longer takes a fresh `&mut PyreSym` inside any helper, so there
+    // is no Stacked-Borrows aliasing between WalkContext's slice
+    // borrows and a parallel sym reborrow (parity #2 — the prior
+    // `miframe_sym: Option<*mut PyreSym>` field has been removed).
     let trace_ctx = unsafe { &mut *ctx_ptr };
     let sym = unsafe { &mut *sym_ptr };
 
@@ -1694,6 +1716,30 @@ fn select_residual_call_opcode(
                 OpCode::CallMayForceI,
                 OpCode::CallLoopinvariantI,
             ),
+            // `_irf_f/iIRFd>f` (`pyjitpl.py:1354 opimpl_residual_call_irf_f =
+            // _opimpl_residual_call3`, `blackhole.py:1250 bhimpl_residual_call_irf_f`).
+            // `resoperation.py:1462 Type::Float => CallF`. The `_r_f` /
+            // `_ir_f` shapes do not exist upstream — the only float-result
+            // residual_call variant routes through the `iIRFd` arglist.
+            'f' => (
+                OpCode::CallF,
+                OpCode::CallPureF,
+                OpCode::CallMayForceF,
+                OpCode::CallLoopinvariantF,
+            ),
+            // `_*_v/iRd|iIRd|iIRFd` void variants (`pyjitpl.py:1348
+            // opimpl_residual_call_r_v = _opimpl_residual_call1`,
+            // `:1351 opimpl_residual_call_ir_v = _opimpl_residual_call2`,
+            // `:1355 opimpl_residual_call_irf_v = _opimpl_residual_call3`,
+            // `blackhole.py:1245/1248/1253 bhimpl_residual_call_*_v`).
+            // `resoperation.py:1463 Type::Void => CallN`. No dst writeback;
+            // `write_residual_call_result_to_dst` no-ops on 'v'.
+            'v' => (
+                OpCode::CallN,
+                OpCode::CallPureN,
+                OpCode::CallMayForceN,
+                OpCode::CallLoopinvariantN,
+            ),
             _ => panic!("{caller}: unsupported dst_bank '{dst_bank}'"),
         };
     if ei.check_forces_virtual_or_virtualizable() {
@@ -1954,6 +2000,136 @@ fn do_not_in_trace_call_result(
     Ok(None)
 }
 
+/// STRICTER-THAN-PYPY guard for `OS_JIT_FORCE_VIRTUAL`.
+///
+/// PyPy `pyjitpl.py:2011-2014` short-circuits `do_residual_call` via
+/// `_do_jit_force_virtual` (`pyjitpl.py:2153-2172`):
+///
+/// ```text
+/// def _do_jit_force_virtual(self, allboxes):
+///     if (self.jitdriver_sd.virtualizable_info is None and
+///         self.jitdriver_sd.greenfield_info is None):
+///         return None
+///     if len(allboxes) == 2:
+///         [vrefbox] = allboxes[1:]
+///         standard_box = self.virtualizable_boxes[-1].getref_base()
+///         if standard_box != vrefbox.getref_base():    # concrete pointer compare
+///             return None
+///         return self.virtualizable_boxes[-1]
+///     ...
+/// ```
+///
+/// PyPy returns one of `vref_box` / `standard_box` / `None`; on the
+/// `None` fall-through it records the normal `CALL_MAY_FORCE_*`.  The
+/// walker CANNOT reproduce this faithfully because the comparison
+/// `standard_box.getref_base() != vrefbox.getref_base()` requires a
+/// concrete `*mut PyObject` for the `vrefbox` Ref OpRef; pyre's
+/// symbolic walker only carries `concrete_vable_ptr` for the active
+/// virtualizable, not a per-OpRef → concrete-pointer map.
+///
+/// Choices considered:
+///  1. Silent fall-through (always record `CALL_MAY_FORCE_*`) — would
+///     silently emit IR on a path PyPy folds away whenever the vref
+///     IS the standard virtualizable.  Trace divergence with no diff
+///     report; rejected.
+///  2. OpRef-equality short-circuit (`if vrefbox_opref == standard_box_opref:
+///     short-circuit; else fall through`) — sufficient for the same-OpRef
+///     case but UNSOUND for the different-OpRef-same-concrete-pointer case
+///     (walker would record `CALL_MAY_FORCE_*` while PyPy folds; mismatch
+///     vs. live tracer's IR).  Rejected.
+///  3. Fail-loud (current).  STRICTER than PyPy: walker stops with a
+///     typed error rather than emit divergent IR.  Surface area: under
+///     `MAJIT_SHADOW_WALKER=1` shadow validation, the panic at
+///     `shadow_walker.rs:287-292` immediately flags any producer that
+///     starts emitting `OopSpecIndex::JitForceVirtual`.
+///
+/// Convergence path back to 1:1 PyPy parity: an OpRef → concrete-pointer
+/// resolver (X-2 epic).  When that lands the guard becomes a real
+/// `_do_jit_force_virtual()` body that returns `Some(vref_opref)` /
+/// `Some(standard_opref)` / `None` and threads through the dispatcher
+/// like the release-gil short-circuit does today.
+///
+/// Production reach today: zero — `OopSpecIndex::JitForceVirtual` is
+/// set only by `jtransform.rs:1903 jit.force_virtual` lowering, which
+/// our benchmarks don't reach.  The guard is fail-loud futureproofing
+/// for the day a producer (e.g. an explicit `jit.force_virtual` callee
+/// from `pyre_interpreter`) lights up the path.
+#[inline]
+fn do_jit_force_virtual_guard(ei: &majit_ir::EffectInfo, pc: usize) -> Result<(), DispatchError> {
+    if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
+        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
+    }
+    Ok(())
+}
+
+/// IR-recording portion of `pyjitpl.py:3327-3335
+/// vable_and_vrefs_before_residual_call`.  Records
+/// `FORCE_TOKEN + SETFIELD_GC(vable_token_descr)` whenever the
+/// jitdriver has a standard virtualizable registered for the current
+/// frame.  RPython structure:
+///
+/// ```text
+/// def vable_and_vrefs_before_residual_call(self):
+///     self.vrefs_before_residual_call()                # heap mutation
+///     vinfo = self.jitdriver_sd.virtualizable_info
+///     if vinfo is not None:
+///         virtualizable_box = self.virtualizable_boxes[-1]
+///         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+///         vinfo.tracing_before_residual_call(virtualizable) # heap mutation
+///         force_token = self.history.record0(rop.FORCE_TOKEN, ...)  # IR
+///         self.history.record2(rop.SETFIELD_GC, ..., descr=...)     # IR
+/// ```
+///
+/// PRE-EXISTING-ADAPTATION: in pyre, the IR-recording role and the
+/// runtime heap-mutation role are split.  The trait-driven path
+/// (`state.rs MIFrame::vable_and_vrefs_before_residual_call`,
+/// `trace_opcode.rs:2193-2229`) ALREADY performs the heap mutations
+/// (`vinfo.tracing_before_residual_call(virtualizable)`,
+/// `vrefinfo.tracing_before_residual_call(vref)`) at the live call
+/// site — that's where the callee actually executes and observes the
+/// token.  Walker is the symbolic shadow validator under
+/// `MAJIT_SHADOW_WALKER=1`: it runs ahead of the trait dispatch, its
+/// IR is rolled back via `cut_trace`, and then the trait dispatch
+/// runs and emits the "real" IR.  Walker therefore records ONLY the
+/// IR portion that the trait dispatch will record on the no-force
+/// path; the heap-mutation portion stays on the trait side so the
+/// `*token_ptr == 0` assertion in `tracing_before_residual_call`
+/// holds when the trait path runs.
+///
+/// `vrefs_before_residual_call` (`pyjitpl.py:3317-3326`) is omitted
+/// entirely — it has zero IR ops, only heap mutations on
+/// `vrefinfo.tracing_before_residual_call`.
+///
+/// `vrefs_after_residual_call` and `vable_after_residual_call`
+/// (`pyjitpl.py:3337-3366`) are omitted entirely — they observe
+/// whether the callee forced a vref/vable by reading the heap token,
+/// and only emit IR on detected forces (`VIRTUAL_REF_FINISH`,
+/// `SwitchToBlackhole(ABORT_ESCAPE)`).  The walker never executes
+/// the callee, so it cannot observe a force; pretending to run the
+/// after-helpers would be a no-op heap set/clear pair masquerading
+/// as parity.  On forced calls the trait-dispatch leg aborts via
+/// `PyError::runtime_error("ABORT_ESCAPE: ...")` before its IR diff
+/// runs, so walker under-recording on those paths is harmless.
+fn walker_vable_and_vrefs_before_residual_call(ctx: &mut TraceCtx) {
+    // pyjitpl.py:3326-3327: vinfo = self.jitdriver_sd.virtualizable_info;
+    //                       if vinfo is not None:
+    let Some(vable_ref) = ctx.standard_virtualizable_box() else {
+        return;
+    };
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    // pyjitpl.py:3332-3335: force_token + SETFIELD_GC vable_token_descr
+    let force_token = ctx.force_token();
+    ctx.vable_setfield_descr(vable_ref, force_token, info.token_field_descr());
+}
+
+/// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].
+/// Kept as a thin pass-through so the dispatcher call sites stay
+/// readable; collapses to direct `walker_*` once the dispatchers
+/// inline.
+fn maybe_walker_vable_and_vrefs_before_residual_call(ctx: &mut WalkContext<'_, '_>) {
+    walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
+}
+
 /// Write a residual_call's recorded result OpRef into the dst register
 /// chosen by `dst_bank`. Centralizes the result writeback so the
 /// dispatchers can perform it BEFORE recording the
@@ -2010,6 +2186,12 @@ fn write_residual_call_result_to_dst(
                 })?;
             *slot = result;
         }
+        // Void variants (`pyjitpl.py:1348/1351/1355 opimpl_residual_call_*_v`):
+        // the operand layout has no `>X` dst byte and no register slot to
+        // populate. The cached / recorded OpRef is dropped on the floor
+        // upstream too (the `_call*` body discards the call result for
+        // void).
+        'v' => {}
         _ => unreachable!("dst_bank validated by caller"),
     }
     Ok(())
@@ -2025,6 +2207,17 @@ fn direct_call_release_gil(
     pc: usize,
     caller: &'static str,
 ) -> Result<(), DispatchError> {
+    // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
+    // release-gil is unconditionally a forces sub-case
+    // (`pyjitpl.py:2063` sits inside the forces-virtual-or-virtualizable
+    // branch), so no `emit_guard_not_forced` gate is needed here.
+    // RPython's pre-call vrefs heap mutation
+    // (`pyjitpl.py:3318-3322 vrefs_before_residual_call`) and the
+    // after-call helpers (`pyjitpl.py:3337-3366`) both sit on the
+    // trait-driven leg in pyre — see
+    // [`walker_vable_and_vrefs_before_residual_call`] for the
+    // walker-vs-trait split rationale.
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx);
     // pyjitpl.py:3675: realfuncaddr, saveerr = effectinfo.call_release_gil_target
     let (realfuncaddr, saveerr) = ei.call_release_gil_target;
     // pyjitpl.py:3676-3677: funcbox/savebox ConstInt
@@ -2086,7 +2279,14 @@ fn direct_call_release_gil(
     // pyjitpl.py:2079 GUARD_NOT_FORCED — unconditional on the outer
     // forces-virtual-or-virtualizable branch (the release-gil sub-case
     // is inside that branch, so the guard fires regardless of which
-    // sub-branch ran).
+    // sub-branch ran).  Walker omits the
+    // `vable_after_residual_call(funcbox)` short-circuit
+    // (`pyjitpl.py:2078`) entirely because it has no concrete callee
+    // execution to observe a force from — the trait-dispatch leg
+    // detects the force at `state.rs MIFrame::vable_after_residual_call`
+    // (`trace_opcode.rs:2237-2263`) and aborts via
+    // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
+    // diff would run.
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     // pyjitpl.py:2082 handle_possible_exception — emits
     // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.
@@ -2121,11 +2321,17 @@ fn direct_call_release_gil(
 /// kind-keyed opcode tables.
 ///
 /// `dst_bank` selects where the call's result lands:
-/// * `'r'`: caller's `registers_r[dst]` — Ref-typed `Call*` family.
-/// * `'i'`: caller's `registers_i[dst]` — Int-typed `Call*` family.
-/// (Float not currently emitted by codewriter; convergence with the
-/// dispatch-table-codegen renderer would land alongside `_r_f` if /
-/// when it appears.)
+/// * `'r'`: caller's `registers_r[dst]` — Ref-typed `Call*` family
+///   (`_r_r/iRd>r`, `pyjitpl.py:1347 opimpl_residual_call_r_r`).
+/// * `'i'`: caller's `registers_i[dst]` — Int-typed `Call*` family
+///   (`_r_i/iRd>i`, `pyjitpl.py:1346 opimpl_residual_call_r_i`).
+/// * `'v'`: void return — operand layout drops the trailing `>X` byte and
+///   the writeback no-ops (`_r_v/iRd`, `pyjitpl.py:1348
+///   opimpl_residual_call_r_v`, `blackhole.py:1245 bhimpl_residual_call_r_v`).
+/// (`'f'` is intentionally absent: RPython does not exec-generate
+/// `opimpl_residual_call_r_f`. The only float-result residual_call
+/// shape is `_irf_f/iIRFd>f`, dispatched by
+/// [`dispatch_residual_call_iIRFd_kind`].)
 ///
 /// PRE-EXISTING-ADAPTATION: walker selects the IR opcode by EffectInfo
 /// branch (`CallMayForce*` for forces, `CallLoopinvariant*` for
@@ -2151,27 +2357,58 @@ fn direct_call_release_gil(
 /// `CALL_MAY_FORCE_*`, equivalent because `select_residual_call_opcode`
 /// returns `CallMayForce*` for the forces classification).  Release-gil
 /// helper invalidates with `CALL_MAY_FORCE_*` matching
-/// `pyjitpl.py:2072`'s `opnum1`. The `OS_NOT_IN_TRACE` check fires up
-/// front via [`do_not_in_trace_call_result`] — unreachable today (no
-/// producer populates `oopspecindex`) but fail-loud against future
-/// silent NEW-DEVIATIONs once `majit-translate` analyzers land. Still
-/// missing relative to upstream `do_residual_call`:
-///   - `vable_and_vrefs_before/after_residual_call` virtualizable
-///     bookkeeping (`pyjitpl.py:2055-2080`).
-///   - `OS_NOT_IN_TRACE` abort-to-blackhole convergence via `do_not_in_trace_call`
-///     (`pyjitpl.py:2003-2006 + 3683-3697`) — the dead path is
-///     unreachable today because `effect_info_for_call_flavor` stub
-///     never sets `oopspecindex` (see `flatten.rs:431` audit table).
-///   - `direct_libffi_call` / `direct_assembler_call` specialization
-///     (`pyjitpl.py:1908-1990`).
-///   - KEEPALIVE for vablebox (`pyjitpl.py:2080-2081`).
-///   - Full `capture_resumedata(after_residual_call=True)` liveness on the
-///     guards (`pyjitpl.py:2078-2082 → capture_resumedata`). Walker guards
-///     stay at `rd_resume_position=-1`; without the MIFrame liveness /
-///     framestack walk the only honest snapshot is none.
+/// `pyjitpl.py:2072`'s `opnum1`. The pre-call vable IR bookkeeping
+/// (`pyjitpl.py:2017 vable_and_vrefs_before_residual_call`, IR-only
+/// portion: FORCE_TOKEN + SETFIELD_GC) is wired via
+/// [`maybe_walker_vable_and_vrefs_before_residual_call`].  The
+/// after-call helpers (`pyjitpl.py:3337-3366
+/// vrefs_after_residual_call` / `vable_after_residual_call`) and the
+/// runtime heap mutations on `tracing_before_residual_call` stay on
+/// the trait-driven leg in pyre — see
+/// [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
+/// split rationale.  The `OS_NOT_IN_TRACE` check fires up front via
+/// [`do_not_in_trace_call_result`] — fail-loud guard against future
+/// silent NEW-DEVIATIONs once the `majit-translate` analyzer trio
+/// populates `oopspecindex`.
 ///
-/// All of the above need MIFrame state pyre-jit-trace doesn't yet
-/// expose.
+/// Still missing relative to upstream `do_residual_call`, all blocked
+/// on infrastructure absent from pyre-jit-trace today:
+///   - `OS_JIT_FORCE_VIRTUAL` short-circuit (`pyjitpl.py:2011-2014 → 2153-2172
+///     _do_jit_force_virtual`) — STRICTER-THAN-PYPY: walker stops with
+///     `DispatchError::JitForceVirtualRequiresConcreteResolver` instead
+///     of returning `vref_box` / `standard_box` / `None`.  Resolution
+///     requires a concrete `vref_ptr` resolver for arbitrary Ref OpRefs
+///     to determine `isstandard_int` at trace time; walker only knows
+///     `concrete_vable_ptr`, not the concrete value of every Ref OpRef.
+///     Production reach today is zero (no producer sets the index;
+///     `jtransform.rs:1903 jit.force_virtual` lowering is the only path),
+///     so the guard is fail-loud futureproofing.
+///   - Trait-leg-only: `vrefs_after_residual_call` / `vable_after_residual_call`
+///     observe runtime forces by reading the heap token after the
+///     callee runs.  Walker is symbolic-only, so it cannot detect
+///     forces; the trait dispatch (`state.rs MIFrame::vable_after_residual_call`,
+///     `trace_opcode.rs:2237-2263`) detects + aborts via
+///     `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
+///     diff would run.
+///   - `direct_libffi_call` (`pyjitpl.py:3622-3667`) — pyre's live
+///     tracer also returns `None` from this helper unless a
+///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
+///     (`majit-metainterp/src/pyjitpl/mod.rs:11487-11491` defers to
+///     direct_call_release_gil/may_force, which is the same fall-through
+///     the walker already takes).
+///   - `direct_assembler_call` (`pyjitpl.py:3589-3609`) + KEEPALIVE
+///     (`pyjitpl.py:2080-2081`) — only fire when `assembler_call=True`
+///     in `do_residual_call`. Walker's residual_call dispatchers are
+///     never called with `assembler_call=True`; the parallel
+///     `inline_call_*/dR>X` family routes through
+///     [`dispatch_inline_call_dr_kind`] instead. Adding the path would
+///     require the codewriter to emit a new `assembler_call` shape, not
+///     a walker-side change.
+///   - `num_live`-aware `capture_resumedata(after_residual_call=True)`
+///     liveness on the guards (`pyjitpl.py:2078-2082 → 2586`). Walker
+///     guards stay at `rd_resume_position=-1`; without the MIFrame
+///     liveness / framestack walk the only honest snapshot is none.
+///     Convergence: capture_resumedata wire-up epic (multi-session).
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
@@ -2195,7 +2432,16 @@ fn dispatch_residual_call_iRd_kind(
             descr_index,
         })?;
     let descr_key = descr.index();
-    let dst = code[op.pc + 1 + descr_offset + 2] as usize;
+    // Void shape `_r_v/iRd` (`pyjitpl.py:1348 opimpl_residual_call_r_v =
+    // _opimpl_residual_call1`) has no trailing `>X` dst byte. The
+    // result OpRef is discarded by `write_residual_call_result_to_dst`'s
+    // `'v'` arm, so `dst` is irrelevant on the void path; reading the
+    // byte would walk past the operand list.
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.pc + 1 + descr_offset + 2] as usize
+    };
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
@@ -2207,6 +2453,11 @@ fn dispatch_residual_call_iRd_kind(
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
         return Ok((outcome, op.next_pc));
     }
+    // pyjitpl.py:2011-2014 OS_JIT_FORCE_VIRTUAL fail-loud — walker
+    // can't reproduce `_do_jit_force_virtual` without a concrete
+    // `vref_ptr` resolver; surface a typed error rather than silently
+    // recording `CALL_MAY_FORCE_*`.
+    do_jit_force_virtual_guard(ei, op.pc)?;
 
     // pyjitpl.py:2063 forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
@@ -2236,6 +2487,18 @@ fn dispatch_residual_call_iRd_kind(
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
 
+        // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` — fires
+        // unconditionally on the forces branch.  Records FORCE_TOKEN +
+        // SETFIELD_GC IR for the active virtualizable; the runtime heap
+        // mutations on `vinfo.tracing_before_residual_call` and
+        // `vrefinfo.tracing_before_residual_call` (`pyjitpl.py:3318-3330`)
+        // sit on the trait-driven leg only — see
+        // [`walker_vable_and_vrefs_before_residual_call`] docstring for
+        // the IR-vs-heap split rationale.
+        if emit_guard_not_forced {
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+        }
+
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
@@ -2263,6 +2526,13 @@ fn dispatch_residual_call_iRd_kind(
         write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
         // pyjitpl.py:2079 `metainterp.generate_guard(rop.GUARD_NOT_FORCED)`
         // — unconditionally on the forces-virtual-or-virtualizable branch.
+        // Walker omits the `vable_after_residual_call(funcbox)`
+        // short-circuit (`pyjitpl.py:2078`) entirely — the trait-dispatch
+        // leg detects vable escape via
+        // `state.rs MIFrame::vable_after_residual_call`
+        // (`trace_opcode.rs:2237-2263`) and aborts to blackhole through
+        // `PyError::runtime_error("ABORT_ESCAPE: ...")` before walker IR
+        // diff would run.
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
         }
@@ -2314,16 +2584,21 @@ fn dispatch_residual_call_iRd_kind(
 /// recorded call op (`pyjitpl.py:2659 _record_helper_varargs`); the
 /// release-gil helper invalidates with `CALL_MAY_FORCE_*` per
 /// `pyjitpl.py:2072`. `OS_NOT_IN_TRACE` is fail-loud-guarded up front
-/// via [`do_not_in_trace_call_result`] (matches `iRd_kind`). Still
-/// PRE-EXISTING-ADAPTATION: vable bookkeeping
-/// (`vable_and_vrefs_before/after_residual_call`), `OS_NOT_IN_TRACE`
-/// abort-to-blackhole convergence (unreachable until
-/// `effect_info_for_call_flavor` plumbs `oopspecindex`),
-/// libffi / assembler specialization, KEEPALIVE
-/// for vablebox, and `num_live`-aware
-/// `capture_resumedata(after_residual_call=True)` on the guards.
-/// Convergence: the broader `capture_resumedata` wire-up epic +
-/// `majit-translate` analyzer trio (see `flatten.rs:431` audit table).
+/// via [`do_not_in_trace_call_result`] (matches `iRd_kind`). Pre-call
+/// vable IR bookkeeping (`vable_and_vrefs_before_residual_call`
+/// IR-only portion at `pyjitpl.py:3327-3335`: FORCE_TOKEN +
+/// SETFIELD_GC) is wired identically to `iRd_kind` via
+/// [`maybe_walker_vable_and_vrefs_before_residual_call`]; the runtime
+/// heap mutations and the after-call helpers stay on the
+/// trait-driven leg.
+///
+/// Still missing relative to upstream — same set as `iRd_kind` and
+/// blocked on the same infrastructure: `OS_JIT_FORCE_VIRTUAL`
+/// short-circuit, `direct_libffi_call` / `direct_assembler_call`
+/// specialization, KEEPALIVE for vablebox, `num_live`-aware
+/// `capture_resumedata(after_residual_call=True)` on the guards. See
+/// `dispatch_residual_call_iRd_kind`'s docstring for the per-item
+/// blocking rationale.
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iIRd_kind(
     code: &[u8],
@@ -2344,7 +2619,14 @@ fn dispatch_residual_call_iIRd_kind(
             descr_index,
         })?;
     let descr_key = descr.index();
-    let dst = code[op.pc + 1 + descr_offset + 2] as usize;
+    // Void shape `_ir_v/iIRd` (`pyjitpl.py:1351 opimpl_residual_call_ir_v =
+    // _opimpl_residual_call2`) has no `>X` dst byte; see
+    // `dispatch_residual_call_iRd_kind` for the void operand-layout note.
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.pc + 1 + descr_offset + 2] as usize
+    };
 
     // Flat argboxes = i_args ++ r_args (`boxes2` argcode order).
     // Parallel argbox_types stamps each entry with its source bank so
@@ -2363,6 +2645,9 @@ fn dispatch_residual_call_iIRd_kind(
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
         return Ok((outcome, op.next_pc));
     }
+    // pyjitpl.py:2011-2014 OS_JIT_FORCE_VIRTUAL fail-loud — see
+    // `dispatch_residual_call_iRd_kind` for the rationale.
+    do_jit_force_virtual_guard(ei, op.pc)?;
 
     // pyjitpl.py:2063 forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
@@ -2384,6 +2669,15 @@ fn dispatch_residual_call_iIRd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
+
+        // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
+        // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
+        // and the after-call helpers stay on the trait-driven leg.
+        // See `dispatch_residual_call_iRd_kind` for the upstream-citation
+        // walkthrough.
+        if emit_guard_not_forced {
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+        }
 
         let recorded = ctx
             .trace_ctx
@@ -2455,7 +2749,14 @@ fn dispatch_residual_call_iIRFd_kind(
             descr_index,
         })?;
     let descr_key = descr.index();
-    let dst = code[op.pc + 1 + descr_offset + 2] as usize;
+    // Void shape `_irf_v/iIRFd` (`pyjitpl.py:1355 opimpl_residual_call_irf_v =
+    // _opimpl_residual_call3`) has no `>X` dst byte; see
+    // `dispatch_residual_call_iRd_kind` for the void operand-layout note.
+    let dst = if dst_bank == 'v' {
+        0
+    } else {
+        code[op.pc + 1 + descr_offset + 2] as usize
+    };
 
     // Flat argboxes = i_args ++ r_args ++ f_args (`boxes3` argcode order).
     let mut argboxes: Vec<OpRef> = Vec::with_capacity(i_args.len() + r_args.len() + f_args.len());
@@ -2473,6 +2774,9 @@ fn dispatch_residual_call_iIRFd_kind(
     if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
         return Ok((outcome, op.next_pc));
     }
+    // pyjitpl.py:2011-2014 OS_JIT_FORCE_VIRTUAL fail-loud — see
+    // `dispatch_residual_call_iRd_kind` for the rationale.
+    do_jit_force_virtual_guard(ei, op.pc)?;
 
     if ei.is_call_release_gil() {
         direct_call_release_gil(
@@ -2490,6 +2794,15 @@ fn dispatch_residual_call_iIRFd_kind(
     } else {
         let (call_opcode, can_raise, emit_guard_not_forced) =
             select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRFd_kind");
+
+        // pyjitpl.py:2017 `vable_and_vrefs_before_residual_call` —
+        // records FORCE_TOKEN + SETFIELD_GC IR; runtime heap mutations
+        // and the after-call helpers stay on the trait-driven leg.
+        // See `dispatch_residual_call_iRd_kind` for the upstream-citation
+        // walkthrough.
+        if emit_guard_not_forced {
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx);
+        }
 
         let recorded = ctx
             .trace_ctx
@@ -3081,6 +3394,21 @@ fn handle(
         "residual_call_irf_r/iIRFd>r" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'r'),
         "residual_call_irf_i/iIRFd>i" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'i'),
         "residual_call_irf_f/iIRFd>f" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'f'),
+        // `_*_v/iRd|iIRd|iIRFd` void variants — `_opimpl_residual_call*`
+        // bodies discard the call result for void return kinds
+        // (`pyjitpl.py:1348 opimpl_residual_call_r_v = _opimpl_residual_call1`,
+        // `:1351 opimpl_residual_call_ir_v = _opimpl_residual_call2`,
+        // `:1355 opimpl_residual_call_irf_v = _opimpl_residual_call3`;
+        // `blackhole.py:1245/1248/1253 bhimpl_residual_call_*_v`).
+        // EffectInfo classification + guard emission match the result-typed
+        // siblings; only the operand layout drops the `>X` dst byte and
+        // the writeback no-ops via `write_residual_call_result_to_dst`'s
+        // `'v'` arm. `select_residual_call_opcode`'s `'v'` arm maps to the
+        // `CallN` / `CallPureN` / `CallMayForceN` / `CallLoopinvariantN`
+        // family per `resoperation.py:1463 Type::Void => CallN`.
+        "residual_call_r_v/iRd" => dispatch_residual_call_iRd_kind(code, op, ctx, 'v'),
+        "residual_call_ir_v/iIRd" => dispatch_residual_call_iIRd_kind(code, op, ctx, 'v'),
+        "residual_call_irf_v/iIRFd" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'v'),
         // RPython parity: `pyjitpl.py:279-292` exec-generated
         // `opimpl_int_*` for binary arithmetic ops — each handler reads
         // two `i`-coded register operands and dispatches
@@ -6541,6 +6869,28 @@ mod tests {
         make_call_descr(idx, vec![], Type::Ref, extra)
     }
 
+    /// Convenience: builds a `_r_r`-shape CallDescr with both
+    /// `extraeffect` and `oopspecindex` populated, for tests that need
+    /// to drive `do_jit_force_virtual_guard` / future oopspec-keyed
+    /// guards.
+    fn call_descr_with_oopspec(
+        idx: u32,
+        extra: majit_ir::ExtraEffect,
+        oopspec: majit_ir::OopSpecIndex,
+    ) -> DescrRef {
+        let mut effect = majit_ir::EffectInfo::default();
+        effect.extraeffect = extra;
+        effect.oopspecindex = oopspec;
+        std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
+            idx,
+            vec![],
+            Type::Ref,
+            false,
+            std::mem::size_of::<usize>(),
+            effect,
+        ))
+    }
+
     #[test]
     fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         // RPython parity: `do_residual_call` (pyjitpl.py:2111-2118) reads
@@ -6586,6 +6936,96 @@ mod tests {
             last.opcode,
             majit_ir::OpCode::CallPureR,
             "EF_ELIDABLE_CANNOT_RAISE must rewrite to CALL_PURE_R",
+        );
+    }
+
+    #[test]
+    fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
+        // RPython parity: `pyjitpl.py:2003-2005` routes
+        // `OS_NOT_IN_TRACE` residual calls through `do_not_in_trace_call`
+        // which executes the callee concretely and aborts to blackhole
+        // only if it raises (`pyjitpl.py:3683-3697`). The walker has no
+        // concrete executor, so it must surface a typed error rather
+        // than recording either the normal-return or
+        // SwitchToBlackhole shape.
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_r_r/iRd>r")
+            .expect("`residual_call_r_r/iRd>r` must be in insns table");
+        let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 1);
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let not_in_trace_descr = call_descr_with_oopspec(
+            43,
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::NotInTrace,
+        );
+        let descr_pool = vec![not_in_trace_descr];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
+        assert_eq!(
+            err,
+            DispatchError::NotInTraceRequiresConcreteExecution { pc: 0 },
+        );
+    }
+
+    #[test]
+    fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
+        // RPython parity: `pyjitpl.py:2011-2014` short-circuits
+        // `do_residual_call` via `_do_jit_force_virtual` when
+        // `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`.  The
+        // walker can't reproduce that short-circuit (needs concrete
+        // `vref_ptr` resolver); fail-loud error keeps the path from
+        // silently recording `CALL_MAY_FORCE_*` instead.
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_r_r/iRd>r")
+            .expect("`residual_call_r_r/iRd>r` must be in insns table");
+        let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 1);
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let force_virtual_descr = call_descr_with_oopspec(
+            42,
+            majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+            majit_ir::OopSpecIndex::JitForceVirtual,
+        );
+        let descr_pool = vec![force_virtual_descr];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err =
+            step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
+        assert_eq!(
+            err,
+            DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 },
         );
     }
 

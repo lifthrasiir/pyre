@@ -3622,8 +3622,30 @@ impl BlackholeInterpBuilder {
     /// incrementally as Phase D progresses.
     pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
         assert!(insns.len() <= 256, "too many instructions!");
-        // RPython blackhole.py:68-71: build reverse table
-        self._insns = vec![String::new(); insns.len()];
+        // RPython blackhole.py:68-71: build reverse table.
+        //
+        // PRE-EXISTING-ADAPTATION: RPython sizes `_insns` by `len(insns)`
+        // because every opname is dynamically numbered `0..len-1`
+        // (`Assembler.insns.setdefault(key, len(self.insns))`), so the
+        // length and the maximum byte coincide.  Pyre's canonical-routing
+        // (`majit-translate::insns::insn_byte_opt`) pins canonical keys
+        // to fixed `BC_*` bytes (sparse, up to 168) and pushes
+        // translator-only keys past `CANONICAL_BYTE_CEILING`, so the
+        // byte space is sparse and `len(insns) < max_byte + 1`.  Size
+        // the reverse table by `max_byte + 1` instead so a byte read at
+        // dispatch time does not index past the end.  Empty slots in
+        // the gaps stay as `String::new()` and surface as the
+        // unwired-handler placeholder if dispatched against — same
+        // behaviour RPython relies on for unregistered opcodes.
+        // Empty `insns` → empty reverse table (RPython parity:
+        // `[None] * len(insns)` with `len == 0`).  Non-empty → size to
+        // `max_byte + 1` so a byte read at dispatch time does not
+        // index past the end.
+        let table_len = match insns.values().copied().max() {
+            Some(max_byte) => (max_byte as usize) + 1,
+            None => 0,
+        };
+        self._insns = vec![String::new(); table_len];
         for (key, &value) in insns {
             assert!(
                 self._insns[value as usize].is_empty(),

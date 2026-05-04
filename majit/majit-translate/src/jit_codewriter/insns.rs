@@ -276,6 +276,24 @@ pub const MAX_HOST_CALL_ARITY: usize = 16;
 /// Panics if `key` is not registered — mirrors the `assert 0 <= num <=
 /// 0xFF` behaviour RPython relies on at the assembler layer.
 pub fn insn_byte(key: &str) -> u8 {
+    insn_byte_opt(key).unwrap_or_else(|| panic!("insn_byte: unregistered insns key {key:?}"))
+}
+
+/// Non-panicking lookup against the merged
+/// `wellknown_bh_insns()` + `pyre_extension_insns()` table.  Returns
+/// `None` for keys that are intentionally left out of the canonical
+/// table — notably the translator-pipeline-only `inline_call_*/dR>X`
+/// family (see this module's pre-registration omission note at
+/// `wellknown_bh_insns()` for rationale).
+///
+/// Build-time `JitCodeBuilder::write_insn` consumers must always
+/// resolve to a canonical byte and use [`insn_byte`].  The
+/// translator-pipeline assembler (`Assembler::get_opnum`) consults
+/// this opt variant so it can preserve canonical-byte parity with the
+/// BH runtime for shared keys while still falling through to RPython's
+/// `setdefault(key, len(self.insns))` allocation for translator-only
+/// keys.
+pub fn insn_byte_opt(key: &str) -> Option<u8> {
     use std::sync::OnceLock;
     static TABLE: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
@@ -297,9 +315,7 @@ pub fn insn_byte(key: &str) -> u8 {
         }
         merged
     });
-    *table
-        .get(key)
-        .unwrap_or_else(|| panic!("insn_byte: unregistered insns key {key:?}"))
+    table.get(key).copied()
 }
 
 /// Fixed majit blackhole opcode-name table.
