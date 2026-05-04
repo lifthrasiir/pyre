@@ -529,23 +529,17 @@ impl OptPure {
             if entry.args.len() != op.args.len() {
                 continue;
             }
-            let imported_replay = entry.pop.resolved != entry.pop.op;
-            // pure.py:62: box0.same_box(get_box_replacement(op.getarg(0)))
+            // pure.py:62 lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
+            // Both stored and query are walked through the forwarding chain
+            // (the caller already walks the query at lookup; the stored arg
+            // is walked here line-by-line per pure.py:62, :72-73).
             let args_match = entry
                 .args
                 .iter()
                 .zip(op.args.iter())
                 .all(|(&stored, &query)| {
-                    let s = if imported_replay {
-                        stored
-                    } else {
-                        ctx.get_box_replacement(stored)
-                    };
-                    let q = if imported_replay {
-                        query
-                    } else {
-                        ctx.get_box_replacement(query)
-                    };
+                    let s = ctx.get_box_replacement(stored);
+                    let q = ctx.get_box_replacement(query);
                     if s == q {
                         return true;
                     }
@@ -1108,32 +1102,58 @@ impl Optimization for OptPure {
                 }
             }
             // pure.py:204-210: iterate extra_call_pure entries.
-            for entry in &self.extra_call_pure {
-                let (entry_opcode, entry_args, entry_descr_identity, entry_result) = match entry {
-                    ExtraCallPureEntry::Direct { key, result } => {
-                        (key.opcode, key.args.clone(), key.descr_identity, *result)
+            //   if isinstance(old_op, PreambleOp):
+            //       old_op = self.optimizer.force_op_from_preamble(old_op)
+            //       self.extra_call_pure[i] = old_op
+            // Force runs after the match so use_box / potential_extra_ops /
+            // forwarded-info side effects are tied to the actual fuse, and
+            // the entry is rewritten so subsequent matches reuse the forced
+            // result without re-forcing.
+            let mut matched: Option<(usize, Option<PreambleOp>)> = None;
+            for (i, entry) in self.extra_call_pure.iter().enumerate() {
+                let (entry_opcode, entry_args, entry_descr_identity, pop) = match entry {
+                    ExtraCallPureEntry::Direct { key, .. } => {
+                        (key.opcode, &key.args, key.descr_identity, None)
                     }
-                    ExtraCallPureEntry::Preamble { key, pop } => (
-                        key.opcode,
-                        key.args.clone(),
-                        key.descr_identity,
-                        pop.resolved,
-                    ),
+                    ExtraCallPureEntry::Preamble { key, pop } => {
+                        (key.opcode, &key.args, key.descr_identity, Some(pop.clone()))
+                    }
                 };
                 if Self::optimize_call_pure_old(
                     op,
                     entry_opcode,
-                    &entry_args,
+                    entry_args,
                     entry_descr_identity,
                     op_descr_identity,
                     start_index,
                     ctx,
                 ) {
-                    let cached_ref = ctx.get_box_replacement(entry_result);
-                    ctx.replace_op(op.pos, cached_ref);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove;
+                    matched = Some((i, pop));
+                    break;
                 }
+            }
+            if let Some((i, pop)) = matched {
+                let entry_result = if let Some(pop) = pop {
+                    let forced = ctx.force_op_from_preamble_op(&pop);
+                    let key = match &self.extra_call_pure[i] {
+                        ExtraCallPureEntry::Preamble { key, .. } => key.clone(),
+                        _ => unreachable!("matched index must still hold the Preamble entry"),
+                    };
+                    self.extra_call_pure[i] = ExtraCallPureEntry::Direct {
+                        key,
+                        result: forced,
+                    };
+                    forced
+                } else {
+                    match &self.extra_call_pure[i] {
+                        ExtraCallPureEntry::Direct { result, .. } => *result,
+                        _ => unreachable!("non-preamble matched index must be Direct"),
+                    }
+                };
+                let cached_ref = ctx.get_box_replacement(entry_result);
+                ctx.replace_op(op.pos, cached_ref);
+                self.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
@@ -1285,7 +1305,6 @@ mod tests {
                 source,
                 crate::optimizeopt::info::PreambleOp {
                     op: source,
-                    resolved: source,
                     invented_name: false,
                     preamble_op: {
                         let mut same_as = Op::new(OpCode::SameAsI, &[source]);

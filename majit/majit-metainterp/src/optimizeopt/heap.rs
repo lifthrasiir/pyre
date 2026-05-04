@@ -1808,9 +1808,13 @@ impl OptHeap {
                     // heap.py:182-186: isinstance(res, PreambleOp)
                     match entry {
                         crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                            // heap.py:185-186: force_op_from_preamble, setfield
-                            let cached = pop.resolved;
-                            ctx.force_op_from_preamble_op(&pop);
+                            // heap.py:185-186:
+                            //     res = optheap.optimizer.force_op_from_preamble(res)
+                            //     opinfo.setfield(descr, None, res, optheap=optheap)
+                            // Force first (use_box / potential_extra_ops side
+                            // effects) and store the returned `preamble_op.op`,
+                            // then walk forwarding for the body replace.
+                            let cached = ctx.force_op_from_preamble_op(&pop);
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(descr).register_info(obj);
                             let cached = ctx.get_box_replacement(cached);
@@ -1885,8 +1889,8 @@ impl OptHeap {
             if let Some(entry) = cf._getfield(obj, descr, field_idx, ctx) {
                 match entry {
                     crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                        let cached = pop.resolved;
-                        ctx.force_op_from_preamble_op(&pop);
+                        // heap.py:185-186 force-then-setfield (see above).
+                        let cached = ctx.force_op_from_preamble_op(&pop);
                         ctx.structinfo_setfield(op, field_idx, cached);
                         self.field_cache(descr).register_info(obj);
                         let cached = ctx.get_box_replacement(cached);
@@ -2010,10 +2014,15 @@ impl OptHeap {
             } else if let Some(entry) = cf._getfield(obj, descr, field_idx, ctx) {
                 match entry {
                     crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        // heap.py:84-101 do_setfield:
+                        //   cached_field = self._getfield(.., true_force=False)
+                        //     → cached_seen = pop.op (no force)
+                        //   if cached_field.same_box(arg1):
+                        //     self._getfield(.., true_force=True)
+                        //     → force, store forced result
                         let cached_seen = ctx.get_box_replacement(pop.op);
                         if cached_seen == new_value {
-                            let cached = pop.resolved;
-                            ctx.force_op_from_preamble_op(&pop);
+                            let cached = ctx.force_op_from_preamble_op(&pop);
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(descr).register_info(obj);
                             return OptimizationResult::Remove;
@@ -2080,10 +2089,11 @@ impl OptHeap {
             {
                 match entry {
                     crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        // heap.py:84-101 do_setfield (post force_lazy_set
+                        // recheck) — see comment at the pre-force site above.
                         let cached_seen = ctx.get_box_replacement(pop.op);
                         if cached_seen == new_value {
-                            let cached = pop.resolved;
-                            ctx.force_op_from_preamble_op(&pop);
+                            let cached = ctx.force_op_from_preamble_op(&pop);
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(descr).register_info(obj);
                             self.field_cache(descr).lazy_set = None;
@@ -2169,8 +2179,10 @@ impl OptHeap {
                     if let Some(entry) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
                         match entry {
                             crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                                let cached = pop.resolved;
-                                ctx.force_op_from_preamble_op(&pop);
+                                // heap.py:243-249 ArrayCachedItem._getfield:
+                                //   res = optheap.optimizer.force_op_from_preamble(res)
+                                //   opinfo.setitem(descr, index, None, res, optheap=optheap)
+                                let cached = ctx.force_op_from_preamble_op(&pop);
                                 self.arrayitem_cache(descr, const_index)
                                     .register_info(array);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2228,8 +2240,8 @@ impl OptHeap {
                         .and_then(|info| info.take_preamble_item(const_index as usize))
                 });
             if let Some(pop) = pop {
-                let cached = pop.resolved;
-                ctx.force_op_from_preamble_op(&pop);
+                // heap.py:243-249 force-then-setitem (see above).
+                let cached = ctx.force_op_from_preamble_op(&pop);
                 self.arrayitem_cache(descr, const_index)
                     .register_info(array);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2244,8 +2256,8 @@ impl OptHeap {
                 if let Some(entry) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
                     match entry {
                         crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                            let cached = pop.resolved;
-                            ctx.force_op_from_preamble_op(&pop);
+                            // heap.py:243-249 force-then-setitem (see above).
+                            let cached = ctx.force_op_from_preamble_op(&pop);
                             self.arrayitem_cache(descr, const_index)
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2381,10 +2393,12 @@ impl OptHeap {
             } else if let Some(entry) = cai._getfield(array, op.descr.as_ref().unwrap(), ctx) {
                 match entry {
                     crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        // heap.py:84-101 do_setfield (shared with arrays):
+                        // peek with true_force=False → cached_seen, on
+                        // same_box force and store the forced result.
                         let cached_seen = ctx.get_box_replacement(pop.op);
                         if cached_seen == new_value {
-                            let cached = pop.resolved;
-                            ctx.force_op_from_preamble_op(&pop);
+                            let cached = ctx.force_op_from_preamble_op(&pop);
                             self.arrayitem_cache(descr, const_index)
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -2442,10 +2456,11 @@ impl OptHeap {
             {
                 match entry {
                     crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
+                        // heap.py:84-101 do_setfield (post force_lazy_set
+                        // recheck) — see comment at the pre-force site above.
                         let cached_seen = ctx.get_box_replacement(pop.op);
                         if cached_seen == new_value {
-                            let cached = pop.resolved;
-                            ctx.force_op_from_preamble_op(&pop);
+                            let cached = ctx.force_op_from_preamble_op(&pop);
                             self.arrayitem_cache(descr, const_index)
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
@@ -3548,11 +3563,11 @@ mod tests {
             OptHeap::field_slot_index(descr),
             PreambleOp {
                 op: source,
-                resolved,
                 invented_name: false,
                 preamble_op,
             },
         );
+        let _ = resolved;
         heap.import_cached_fields(&[(object, descr.clone(), resolved)], ctx);
     }
 

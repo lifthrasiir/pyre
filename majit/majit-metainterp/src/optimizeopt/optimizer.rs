@@ -104,27 +104,6 @@ pub struct Optimizer {
     /// RPython unroll.py: import_state — exported facts to re-apply onto the
     /// next optimizer instance before phase 2 body optimization starts.
     pub imported_loop_state: Option<crate::optimizeopt::unroll::ExportedState>,
-    /// PRE-EXISTING-ADAPTATION (Phase B B2 epic, Task #60): per-import
-    /// (result, source) pair tracking. RPython recovers the equivalent
-    /// via Box identity — at import, the same Box object is reused so
-    /// `produced_op = self.short_boxes[box]` works directly. Pyre's flat
-    /// OpRef model needs the explicit reverse map: `imported_short_source(result)
-    /// -> source` (mod.rs:1948), used by `force_op_from_preamble` and
-    /// `force_box_inline` to look up the producer-side `ProducedShortOp`.
-    ///
-    /// Forwarding chain captures source→result for HeapField/HeapArrayItem/
-    /// LoopInvariant + Pure-invented_name (all call ctx.replace_op). Pure
-    /// non-invented does NOT register replace_op (avoids body GuardTrue
-    /// stale-boolean — see `import_short_preamble_ops` Pure branch comment).
-    /// So the residual is Pure non-invented entries; reverse-map fallback
-    /// at consumer sites would need to handle them.
-    ///
-    /// Convergence path: pre-allocate Temporary OpRefs at export-time in a
-    /// reserved slice of the import-side Phase 2 namespace (requires
-    /// disjoint-namespace coordination across phases). Then result_opref
-    /// is fixed at export, no fresh allocation at import, and the reverse
-    /// map becomes derivable.
-    pub imported_short_sources: Vec<(OpRef, OpRef)>,
     /// Invented SameAs aliases imported from short-preamble export/import.
     pub imported_short_aliases: Vec<crate::optimizeopt::ImportedShortAlias>,
     /// Builder-derived short preamble actually used by phase 2.
@@ -1115,7 +1094,6 @@ impl Optimizer {
             runtime_boxes: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
-            imported_short_sources: Vec::new(),
             imported_short_aliases: Vec::new(),
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
@@ -1394,41 +1372,17 @@ impl Optimizer {
     /// optimizer.py:345-364: force_box — force a virtual to be materialized.
     /// Also pops from potential_extra_ops (optimizer.py:351-359).
     ///
-    /// majit source/result split: RPython uses a single Box identity, so a
-    /// single `potential_extra_ops.pop(op)` always finds the entry. majit
-    /// separates preamble source and imported result, so we must try three
-    /// keys: resolved, opref, and imported_short_source(opref).
-    /// Mirrors force_box_inline (mod.rs) contract.
+    /// Path B (B.6.7) routes body refs through Phase 1 source directly, so
+    /// the prior reverse-lookup (`imported_short_source`) 3rd key is no
+    /// longer needed. Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         // optimizer.py:346: op = get_box_replacement(op)
-        let preamble_source = ctx.imported_short_source(opref);
         let resolved = ctx.get_box_replacement(opref);
         // optimizer.py:351-359: potential_extra_ops.pop(op)
         // → sb.add_preamble_op(preamble_op)
-        // Try three keys to account for the source/result split:
         let tracked = ctx
             .take_potential_extra_op(resolved)
-            .or_else(|| ctx.take_potential_extra_op(opref))
-            .or_else(|| {
-                (preamble_source != resolved && preamble_source != opref)
-                    .then(|| ctx.take_potential_extra_op(preamble_source))
-                    .flatten()
-            });
-        if std::env::var_os("MAJIT_LOG").is_some()
-            && (opref == majit_ir::OpRef::from_raw(83)
-                || resolved == majit_ir::OpRef::from_raw(83)
-                || preamble_source == majit_ir::OpRef::from_raw(16)
-                || tracked
-                    .as_ref()
-                    .is_some_and(|pop| pop.op == majit_ir::OpRef::from_raw(16)))
-        {
-            eprintln!(
-                "[jit] force_box_pop opref={opref:?} resolved={resolved:?} preamble_source={preamble_source:?} tracked={:?}",
-                tracked
-                    .as_ref()
-                    .map(|pop| (pop.op, pop.resolved, pop.invented_name))
-            );
-        }
+            .or_else(|| ctx.take_potential_extra_op(opref));
         if let Some(preamble_op) = tracked {
             let resolved_for_pop = ctx.get_box_replacement(preamble_op.op);
             if let Some(builder) = ctx.active_short_preamble_producer_mut() {
@@ -2273,7 +2227,6 @@ impl Optimizer {
         // Transfer exported virtual state from context to optimizer
         // RPython BasicLoopInfo: quasi_immutable_deps collected during optimization
         self.quasi_immutable_deps = std::mem::take(&mut ctx.quasi_immutable_deps);
-        self.imported_short_sources = std::mem::take(&mut ctx.imported_short_sources);
         self.imported_short_aliases = ctx.used_imported_short_aliases();
         self.imported_short_preamble = ctx.build_imported_short_preamble();
         self.imported_short_preamble_builder = ctx.imported_short_preamble_builder.clone();
@@ -5453,7 +5406,6 @@ mod tests {
             OpRef::from_raw(14),
             crate::optimizeopt::info::PreambleOp {
                 op: OpRef::from_raw(14),
-                resolved: OpRef::from_raw(14),
                 invented_name: false,
                 preamble_op: {
                     let mut op =

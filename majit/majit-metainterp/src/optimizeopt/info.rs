@@ -55,12 +55,12 @@ impl Default for Forwarded {
 /// same `fields` / `items` vectors.
 #[derive(Clone, Debug)]
 pub struct PreambleOp {
-    /// Phase 1 result box — RPython: PreambleOp.op (aka HeapOp.res)
+    /// RPython `PreambleOp.op` — the carried Box (= `self.res` from the
+    /// short_op). For non-invented entries this is the body-visible
+    /// OpRef directly; for invented entries (CompoundOp alternates)
+    /// `op` forwards to the carried Box via `replace_op(source, op)`
+    /// so `get_box_replacement(op)` reaches the body-visible OpRef.
     pub op: OpRef,
-    /// Fresh Phase 2 OpRef with distinct identity from label_args.
-    /// Returned by force_op_from_preamble as the resolved field value.
-    /// (Rust equivalent of RPython's Phase 1 Box identity isolation.)
-    pub resolved: OpRef,
     /// RPython: PreambleOp.invented_name
     pub invented_name: bool,
     /// RPython: PreambleOp.preamble_op — the actual replay operation
@@ -3405,7 +3405,6 @@ mod tests {
         replay.pos = OpRef::from_raw(88);
         let pop = PreambleOp {
             op: OpRef::from_raw(88),
-            resolved: OpRef::from_raw(99),
             invented_name: false,
             preamble_op: replay,
         };
@@ -3417,7 +3416,7 @@ mod tests {
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");
-        assert_eq!(recovered.resolved, OpRef::from_raw(99));
+        assert_eq!(recovered.op, OpRef::from_raw(88));
         // After take_preamble_item, slot is Value(NONE)
         assert_eq!(
             info.getitem(1).and_then(|e| e.as_opref()),
@@ -3432,7 +3431,6 @@ mod tests {
         let replay = Op::new(OpCode::GetfieldGcI, &[OpRef::from_raw(10)]);
         let pop = PreambleOp {
             op: OpRef::from_raw(88),
-            resolved: OpRef::from_raw(99),
             invented_name: false,
             preamble_op: replay,
         };

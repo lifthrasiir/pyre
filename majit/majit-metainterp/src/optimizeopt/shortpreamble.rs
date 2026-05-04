@@ -367,14 +367,16 @@ impl PreambleOp {
         let preamble_op = match &self.kind {
             PreambleOpKind::InputArg | PreambleOpKind::Guard => self.op.clone(),
             PreambleOpKind::Heap => {
-                let args = self
-                    .op
-                    .args
-                    .iter()
-                    .map(|&arg| sb.produce_arg(arg))
-                    .collect::<Option<Vec<_>>>()?;
                 let mut op = self.op.clone();
-                op.args = args.into_iter().collect();
+                let preamble_arg = sb.produce_arg(self.op.arg(0))?;
+                if self.op.opcode.is_getfield() {
+                    op.args = vec![preamble_arg].into();
+                } else {
+                    // shortpreamble.py:99-102: GETARRAYITEM keeps the
+                    // original constant index; only the array/base arg goes
+                    // through produce_arg().
+                    op.args = vec![preamble_arg, self.op.arg(1)].into();
+                }
                 op
             }
             PreambleOpKind::Pure => {
@@ -1045,7 +1047,7 @@ impl ShortInputArg {
     /// For input args, the preamble_op is just forwarded.
     pub fn add_op_to_short(&self) -> ProducedShortOp {
         ProducedShortOp {
-            kind: PreambleOpKind::Pure,
+            kind: PreambleOpKind::InputArg,
             preamble_op: self.preamble_op.clone(),
             invented_name: false,
             same_as_source: None,
@@ -1200,6 +1202,7 @@ impl ProducedShortOp {
                 OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => self
                     .produce_heap_array_item(
                         ctx,
+                        exported_infos,
                         short_inputargs,
                         short_args,
                         result_map,
@@ -1221,7 +1224,14 @@ impl ProducedShortOp {
             // shortpreamble.py:233-234 ShortInputArg.produce_op asserts
             // `not invented_name` and otherwise does nothing; the source pos
             // is already in `short_inputargs`, no Phase 2 OpRef to record.
-            PreambleOpKind::InputArg | PreambleOpKind::Guard => return None,
+            PreambleOpKind::InputArg => {
+                debug_assert!(
+                    !self.invented_name,
+                    "shortpreamble.py:234: ShortInputArg cannot have invented_name"
+                );
+                return None;
+            }
+            PreambleOpKind::Guard => return None,
         };
         produced_results.insert(self.preamble_op.pos, result);
         Some(result)
@@ -1244,11 +1254,33 @@ impl ProducedShortOp {
         // `ProducedShortOp.produce_op` runs.
         let result_opref = *result_map.get(&source)?;
         let opcode = self.preamble_op.opcode;
-        // shortpreamble.py:116-120: only `invented_name=True` calls
-        // `op.set_forwarded(self.res)`. Non-invented re-uses self.res
-        // directly without forwarding (see comment in legacy path,
-        // unroll.rs:3611-3615 — non-invented forwarding routes body
-        // GuardTrue through stale Phase 1 boolean).
+        // shortpreamble.py:116-120 line-by-line:
+        //
+        //   if invented_name:
+        //       op = self.orig_op.copy_and_change(self.orig_op.getopnum())
+        //       op.set_forwarded(self.res)
+        //   else:
+        //       op = self.res
+        //
+        // PyPy's `self.res` for the invented arm is `new_name` — the alt
+        // SAME_AS Box created by `add_op_to_short` at shortpreamble.py:327.
+        // It is a fresh body-Box that gets emitted into the trace via
+        // `add_preamble_op` and lives at its own (alt-specific) position.
+        // The transient `op = orig_op.copy(...)` is the PreambleOp wrapper:
+        // `op.set_forwarded(self.res)` routes body refs from the wrapper
+        // straight to the alt's body slot.
+        //
+        // pyre's flat-OpRef analog allocates the wrapper at `source` (the
+        // synthetic alias from the compound-dedup pass at
+        // shortpreamble.rs:478-491) and the alt body slot at `result_opref`
+        // (= `result_map[source]`, the body-visible OpRef this alt's
+        // imported Pure / SAME_AS will live at). Forward `source ->
+        // result_opref` so body refs after `force_op_from_preamble`
+        // resolve to the alt's own body identity, NOT to the canonical
+        // (`same_as_source`) — collapsing both alt and canonical onto the
+        // canonical's body ref erases PyPy's invented-name Box identity
+        // and corrupts the SAME_AS in `extra_same_as`.
+        // Non-invented re-uses self.res directly without forwarding.
         if self.invented_name {
             ctx.replace_op(source, result_opref);
         }
@@ -1284,7 +1316,6 @@ impl ProducedShortOp {
                 source,
                 self.invented_name,
             ));
-        ctx.imported_short_sources.push((result_opref, source));
         // shortpreamble.py:432-440 add_preamble_op + 437-438 extra_same_as:
         // RPython collects the SameAs op into `short_preamble_producer.extra_same_as`
         // lazily at use-box time (force_op_from_preamble path).  majit's
@@ -1292,7 +1323,17 @@ impl ProducedShortOp {
         // from `imported_short_preamble_builder.extra_same_as()` at the same
         // phase boundary, so an eager `imported_short_aliases.push` here
         // would be a NEW-DEVIATION dual write.
-        Some(result_opref)
+        //
+        // Path B parity (B.6.7): Heap/Array/LoopInvariant produce_* return
+        // `source` so successor short-op dependency args resolve through
+        // `produced_results` to Phase 1 source-namespace (matching body
+        // refs after `force_op_from_preamble_op` returns `preamble_source`).
+        // produce_pure follows the same convention for consistency — the
+        // body-visible `result_opref` is still registered (Box.type, the
+        // ImportedShortPureOp `result` field) but is no longer the value
+        // that successor entries see via produced_results.
+        let _ = result_opref;
+        Some(source)
     }
 
     /// shortpreamble.py:62-79 HeapOp.produce_op (getfield case)
@@ -1327,9 +1368,16 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::OpRef(r) => r,
             crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
         };
-        let value = *result_map.get(&source)?;
-        ctx.register_value_type(value, result_type);
-        ctx.replace_op(source, value);
+        // Cat-2.2 alignment: forward `source -> result_opref` so body refs
+        // after `force_op_from_preamble_op` resolve to the body-visible
+        // OpRef without relying on the use-before-def assembly adaptation.
+        // PyPy `HeapOp.produce_op` stores `PreambleOp(op=self.res,
+        // preamble_op, invented_name)` in field cache; self.res is the
+        // canonical body Box (Box identity makes it body-visible). pyre's
+        // flat-OpRef analog uses `result_opref = result_map[source]` as the
+        // body-visible slot.
+        let result_opref = *result_map.get(&source)?;
+        let _ = result_type;
         let descr_idx = descr.index();
         let obj_resolved = ctx.get_box_replacement(obj);
         // shortpreamble.py:66-68: if g.getarg(0) in exported_infos:
@@ -1340,10 +1388,17 @@ impl ProducedShortOp {
         }
         let mut getfield_op = Op::new(OpCode::getfield_for_type(result_type), &[obj_resolved]);
         getfield_op.descr = Some(descr.clone());
-        getfield_op.pos = source;
+        // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
+        // result_opref because `replace_op(source, result_opref)` installed
+        // below clobbers source's slot. Seed info at result_opref's slot
+        // (set_preamble_forwarded_info via replay_pos) so
+        // `take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos)`
+        // reads it back. PyPy `preamble_op.set_forwarded(info)` lives on a
+        // distinct Op object, so this slot juggling is the pyre adaptation
+        // of that Box-identity invariant.
+        getfield_op.pos = result_opref;
         let pop = crate::optimizeopt::info::PreambleOp {
             op: source,
-            resolved: value,
             invented_name: self.invented_name,
             preamble_op: getfield_op.clone(),
         };
@@ -1364,16 +1419,20 @@ impl ProducedShortOp {
             );
             info.set_preamble_field(descr_idx, pop.clone());
         }
-        ctx.imported_short_sources.push((value, source));
+        // Cat-2.2 alignment: forward `source -> result_opref` after the
+        // PtrInfo / const-info side tables have been seeded (so the seeds
+        // see the unforwarded source key consistent with `pop.op = source`).
+        ctx.replace_op(source, result_opref);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
-        Some(value)
+        Some(source)
     }
 
     /// shortpreamble.py:80-85 HeapOp.produce_op (getarrayitem case)
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
+        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &HashMap<OpRef, OpRef>,
@@ -1417,20 +1476,32 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
         };
-        let value = *result_map.get(&source)?;
-        ctx.register_value_type(value, result_type);
-        ctx.replace_op(source, value);
+        // Cat-2.2 alignment: symmetric to produce_heap_field. Forward
+        // `source -> result_opref` so body refs after
+        // `force_op_from_preamble_op` resolve to the body-visible OpRef
+        // without relying on the use-before-def assembly adaptation.
+        let result_opref = *result_map.get(&source)?;
+        let _ = result_type;
         let obj_resolved = ctx.get_box_replacement(obj);
+        // shortpreamble.py:68-71 applies to both getfield and
+        // getarrayitem: if the base object has exported info, import it
+        // before ensuring heap/array PtrInfo.
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(pinfo)) = exported_infos.get(&object_arg)
+        {
+            ctx.setinfo_from_preamble(obj_resolved, pinfo, Some(exported_infos));
+        }
         let index_const = ctx.make_constant_int(index);
         let mut getarrayitem_op = Op::new(
             OpCode::getarrayitem_for_type(result_type),
             &[obj_resolved, index_const],
         );
         getarrayitem_op.descr = Some(descr.clone());
-        getarrayitem_op.pos = source;
+        // Cat-2.2 dual-slot rule (mod.rs:1817 replay_pos): replay.pos =
+        // result_opref. See produce_heap_field for the Box-identity-vs-flat-OpRef
+        // adaptation rationale.
+        getarrayitem_op.pos = result_opref;
         let pop = crate::optimizeopt::info::PreambleOp {
             op: source,
-            resolved: value,
             invented_name: self.invented_name,
             preamble_op: getarrayitem_op.clone(),
         };
@@ -1455,10 +1526,12 @@ impl ProducedShortOp {
                 }
             }
         }
-        ctx.imported_short_sources.push((value, source));
+        // Cat-2.2 alignment: forward `source -> result_opref` after the
+        // const-info / ArrayPtrInfo side tables have been seeded.
+        ctx.replace_op(source, result_opref);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
-        Some(value)
+        Some(source)
     }
 
     /// shortpreamble.py:152-159 LoopInvariantOp.produce_op
@@ -1491,14 +1564,23 @@ impl ProducedShortOp {
             crate::optimizeopt::ImportedShortPureArg::Const(majit_ir::Value::Int(v), _) => v,
             _ => return None,
         };
-        let value = *result_map.get(&source)?;
-        ctx.register_value_type(value, result_type);
-        ctx.replace_op(source, value);
-        ctx.imported_loop_invariant_results.insert(func_ptr, value);
-        ctx.imported_short_sources.push((value, source));
+        // Cat-2.2 alignment probe: forward `source -> result_opref` so body
+        // refs after `force_op_from_preamble_op` resolve to the body-visible
+        // OpRef without relying on the use-before-def assembly adaptation.
+        // PyPy `LoopInvariantOp.produce_op` stores `PreambleOp(op=self.res,
+        // preamble_op, invented_name)` in `loop_invariant_results`; self.res
+        // is the canonical body Box. pyre's flat-OpRef analog uses
+        // `result_opref = result_map[source]` as the body-visible slot and
+        // installs the `source -> result_opref` forwarding here so the
+        // consumer at `rewrite.rs:2809` resolves source to result_opref via
+        // get_box_replacement uniformly.
+        let result_opref = *result_map.get(&source)?;
+        let _ = result_type;
+        ctx.replace_op(source, result_opref);
+        ctx.imported_loop_invariant_results.insert(func_ptr, source);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
-        Some(value)
+        Some(source)
     }
 }
 
@@ -1513,6 +1595,16 @@ struct AbstractShortPreambleBuilderState {
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
     known_constants: HashSet<OpRef>,
+    /// B.6.4 canonical dedup for `record_imported_preamble_use`.
+    /// `produced_short_boxes` is a dual-key map (source key + result_opref
+    /// key both pointing at the same `ProducedShortOp`), so the source vs.
+    /// body-visible distinction is not enough — RPython's Box identity
+    /// makes one Box equal one slot regardless of how it is reached. The
+    /// canonical key is `replay_op.pos` (a stable proxy for `self.res`):
+    /// dedup here prevents two different lookup keys from pushing the
+    /// same RPython Box twice into `used_boxes` /
+    /// `short_preamble_jump` / `extra_same_as`.
+    recorded_canonical_results: HashSet<OpRef>,
 }
 
 impl AbstractShortPreambleBuilderState {
@@ -1533,6 +1625,9 @@ impl AbstractShortPreambleBuilderState {
         invented_name: bool,
         same_as_source: Option<OpRef>,
     ) {
+        if !self.recorded_canonical_results.insert(replay_op.pos) {
+            return;
+        }
         if invented_name {
             let source = same_as_source.unwrap_or(op);
             let mut same_as = Op::new(OpCode::same_as_for_type(replay_op.result_type()), &[source]);
@@ -1982,6 +2077,13 @@ pub struct ExtendedShortPreambleBuilder {
     pub target_token: u64,
     /// RPython parity: remap Phase 1 preamble OpRefs → current inputarg OpRefs.
     phase1_to_inputarg: HashMap<OpRef, OpRef>,
+    /// B.6.4 canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
+    /// `AbstractShortPreambleBuilderState.recorded_canonical_results` —
+    /// `produced_short_boxes` carries dual entries (source-key plus
+    /// result_opref-key) for the same RPython Box, so per-key dedup
+    /// (`label_args` etc.) cannot catch a second add via the alternate
+    /// key. RPython's Box identity collapses both paths to one entry.
+    recorded_canonical_results: HashSet<OpRef>,
 }
 
 impl ExtendedShortPreambleBuilder {
@@ -2000,6 +2102,7 @@ impl ExtendedShortPreambleBuilder {
             short_jump_args: Vec::new(),
             target_token,
             phase1_to_inputarg: HashMap::new(),
+            recorded_canonical_results: HashSet::new(),
         }
     }
 
@@ -2206,8 +2309,11 @@ impl ExtendedShortPreambleBuilder {
             self.add_tracked_preamble_op(resolved_op, &produced);
         } else {
             // shortpreamble.py:465-476: same pattern via replay_op.
-            let op = resolved_op;
             let replay_op = &preamble_op.preamble_op;
+            if !self.recorded_canonical_results.insert(replay_op.pos) {
+                return;
+            }
+            let op = resolved_op;
             if preamble_op.invented_name {
                 let source = preamble_op.op;
                 let mut same_as =
@@ -2224,6 +2330,9 @@ impl ExtendedShortPreambleBuilder {
     /// shortpreamble.py:471-477: add_preamble_op (internal)
     pub fn add_tracked_preamble_op(&mut self, result: OpRef, produced: &ProducedShortOp) {
         let current_result = produced.preamble_op.pos;
+        if !self.recorded_canonical_results.insert(current_result) {
+            return;
+        }
         if produced.invented_name {
             let source = produced.same_as_source.unwrap_or(result);
             let mut op = Op::new(
@@ -3334,7 +3443,6 @@ mod tests {
         replay_op.pos = OpRef::from_raw(14);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::from_raw(14),
-            resolved: OpRef::from_raw(41),
             invented_name: true,
             preamble_op: replay_op,
         };
@@ -3359,7 +3467,6 @@ mod tests {
         replay_op.pos = OpRef::from_raw(14);
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::from_raw(14),
-            resolved: OpRef::from_raw(41),
             invented_name: true,
             preamble_op: replay_op,
         };

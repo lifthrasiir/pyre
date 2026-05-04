@@ -784,7 +784,6 @@ impl UnrollOptimizer {
 
         // ── unroll.py:140-175: finalize + jump_to_existing_trace ──
         let imported_short_aliases = opt_p2.imported_short_aliases.clone();
-        let imported_short_sources = opt_p2.imported_short_sources.clone();
         // finalize_short_preamble: create TargetToken for this loop version
         // RPython parity: short preamble ops reference constant OpRefs from
         // the loop's constant pool. Pass consts_p1 so the ShortPreamble
@@ -882,6 +881,63 @@ impl UnrollOptimizer {
                     ) {
                         for arg in args {
                             if !arg.is_none() {
+                                let _ = opt_p2.force_box(arg, &mut final_ctx);
+                            }
+                        }
+                    }
+                }
+                // PRE-EXISTING-ADAPTATION (B.6.5): RPython's
+                // `force_op_from_preamble` (unroll.py:26-39) only seeds
+                // `potential_extra_ops`. The orthodox path that fills
+                // `used_boxes` / `short_preamble_jump` / `extra_same_as`
+                // is `force_box -> potential_extra_ops.pop ->
+                // add_preamble_op` (shortpreamble.py:432-440), which
+                // RPython runs in `optimize_op` whenever a body op
+                // forces an imported Box. RPython's Box identity then
+                // keeps that Box live across the loop boundary
+                // implicitly.
+                //
+                // majit's disjoint Phase 1 / Phase 2 OpRef namespaces
+                // strip the Box-identity transparency. Body ops that
+                // CSE-replace through `force_op_from_preamble_op` and
+                // never trigger `force_box` leave their imported entry
+                // in `potential_extra_ops`, so the LABEL is not
+                // extended with the corresponding `used_box`. To
+                // recover orthodox shape, walk body args + fail_args
+                // in body-occurrence order before
+                // `build_imported_short_preamble` and call the
+                // orthodox `force_box` for every body OpRef that has a
+                // pending `potential_extra_ops` entry. `force_box`
+                // routes through `add_preamble_op_from_pop`
+                // (optimizer.rs `force_box`), so used_boxes /
+                // short_preamble_jump / extra_same_as fill via the
+                // canonical RPython path.
+                {
+                    let mut visited_force: std::collections::HashSet<OpRef> =
+                        std::collections::HashSet::new();
+                    for op in p2_ops.iter() {
+                        if op.opcode == OpCode::Jump {
+                            // The terminal jump's args are already
+                            // run through `force_box_for_end_of_preamble`
+                            // (unroll.py:126-127) above.
+                            continue;
+                        }
+                        let arg_iter = op
+                            .args
+                            .iter()
+                            .copied()
+                            .chain(op.fail_args.iter().flatten().copied());
+                        for arg in arg_iter {
+                            if !is_trace_runtime_ref(arg, &consts_p2) {
+                                continue;
+                            }
+                            if !visited_force.insert(arg) {
+                                continue;
+                            }
+                            let resolved = final_ctx.get_box_replacement(arg);
+                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
+                                || final_ctx.potential_extra_ops.contains_key(&resolved);
+                            if needs_force {
                                 let _ = opt_p2.force_box(arg, &mut final_ctx);
                             }
                         }
@@ -1269,7 +1325,6 @@ impl UnrollOptimizer {
             phase2_inputarg_base,
             jump_to_self,
             &imported_short_aliases,
-            &imported_short_sources,
             &consts_p2,
             self.target_tokens
                 .first()
@@ -1498,6 +1553,8 @@ enum ExportedGcRefField {
     VirtualStateVirtualClass(usize),
     /// virtual_state.state[index] = Constant(Value::Ref)
     VirtualStateConstantRef(usize),
+    /// short_box_const_values[OpRef] = Value::Ref(...)
+    ShortBoxConstValue(OpRef),
 }
 
 impl ExportedState {
@@ -1721,6 +1778,19 @@ impl ExportedState {
                 _ => {}
             }
         }
+        // RPython Const boxes are GC-traced objects. The Rust producer-side
+        // const snapshot must therefore root any Ref payload it carries.
+        let mut const_keys: Vec<OpRef> = self.short_box_const_values.keys().copied().collect();
+        const_keys.sort_by_key(|k| k.raw());
+        for key in const_keys {
+            if let Some(Value::Ref(gcref)) = self.short_box_const_values.get(&key)
+                && !gcref.is_null()
+            {
+                let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                self.rooted_refs
+                    .push((key, ExportedGcRefField::ShortBoxConstValue(key), ss_idx));
+            }
+        }
     }
 
     /// Update GcRef values from shadow stack — GC may have moved objects.
@@ -1813,6 +1883,11 @@ impl ExportedState {
                             Value::Ref(updated),
                         ));
                         virtual_state_dirty = true;
+                    }
+                }
+                ExportedGcRefField::ShortBoxConstValue(source) => {
+                    if let Some(value) = self.short_box_const_values.get_mut(source) {
+                        *value = Value::Ref(updated);
                     }
                 }
             }
@@ -2130,6 +2205,36 @@ impl OptUnroll {
         let mut short_args = label_args.to_vec();
         short_args.extend(virtuals);
         let exported_short_boxes = ctx.exported_short_boxes.clone();
+        // unroll.py:466-473 line-by-line:
+        //
+        //   sb = ShortBoxes()
+        //   short_boxes = sb.create_short_boxes(self.optimizer,
+        //       renamed_inputargs, label_args + virtuals)
+        //   short_inputargs = sb.create_short_inputargs(label_args + virtuals)
+        //   for produced_op in short_boxes:
+        //       op = produced_op.short_op.res
+        //       if not isinstance(op, Const):
+        //           self._expand_info(op, infos)
+        //
+        // RPython expands info from the post-`create_short_boxes` list (the
+        // same `short_boxes` that survives into `ExportedState.short_boxes`).
+        // pyre's analog is `produced_short_boxes_from_exported_boxes` (which
+        // applies the GuardOverflow filter and label-arg → short-inputarg
+        // rename); iterating the raw `exported_short_boxes` here would
+        // expand info for entries (e.g. standalone `GuardOverflow`) that
+        // PyPy never carries into `short_boxes`, polluting the dict.
+        let short_boxes_for_info =
+            crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
+                &label_args,
+                &short_args,
+                &exported_short_boxes,
+            );
+        for (_, produced_op) in &short_boxes_for_info {
+            let op = produced_op.preamble_op.pos;
+            if !op.is_constant() {
+                self.expand_info(op, ctx, exported_int_bounds, &mut infos);
+            }
+        }
 
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
@@ -3104,8 +3209,12 @@ impl OptUnroll {
         //   for produced_op in exported_state.short_boxes:
         //       produced_op.produce_op(self, exported_state.exported_infos)
         //
-        // `produced_results` accumulates `source pos -> resolved Phase 2 OpRef`
-        // so successor entries can resolve `Produced` arg classifications.
+        // `produced_results` accumulates `source pos -> replay identity` so
+        // successor entries can resolve `Produced` arg classifications. After
+        // Path B (B.6.7) the producer-side `produce_*` methods return
+        // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
+        // value is the body-visible OpRef per `replay_pos` in
+        // `initialize_imported_short_preamble_builder_from_short_boxes`.
         let mut produced_results: HashMap<OpRef, OpRef> = HashMap::new();
         for (_, produced) in &exported_state.short_boxes {
             let produced_result = produced.produce_op(
@@ -3380,7 +3489,6 @@ fn assemble_peeled_trace(
     body_num_inputs: usize,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    imported_short_sources: &[(OpRef, OpRef)],
     constants: &std::collections::HashMap<u32, i64>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
@@ -3397,7 +3505,6 @@ fn assemble_peeled_trace(
         0, // inputarg_base — tests/simple cases use shared namespace
         jump_to_self,
         imported_short_aliases,
-        imported_short_sources,
         constants,
         start_label_descr,
         loop_label_descr,
@@ -3425,8 +3532,7 @@ fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -
 /// Compound alternates (`invented_name=true`) record their SameAs source in
 /// `imported_short_aliases`. Emit one `SameAs(alias.same_as_source)` op at
 /// `pos=alias.result` per entry so the body's reference to the alias result
-/// has a defining op. Symmetric with `emit_extra_same_as_for_imports`,
-/// which handles the non-invented case via `imported_short_sources`.
+/// has a defining op.
 fn emit_alias_same_as_for_imports(
     result: &mut Vec<Op>,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
@@ -3435,77 +3541,6 @@ fn emit_alias_same_as_for_imports(
         let mut op = Op::new(alias.same_as_opcode, &[alias.same_as_source]);
         op.pos = alias.result;
         result.push(op);
-    }
-}
-
-/// RPython compile.py:327 + shortpreamble.py:436-439 `extra_same_as` parity.
-///
-/// `shortpreamble.py PureOp/HeapOp.produce_op` emits a SameAs (or the original
-/// op) before the loop label so the body's reference to the imported result
-/// OpRef has a defining op. The `imported_short_aliases` loop in the caller
-/// only handles compound alternates (`invented_name=true`); single
-/// non-invented imported short ops (a Pure GetfieldGcPureI on a non-constant
-/// object, a HeapField, …) record their `(result, source)` mapping in
-/// `imported_short_sources` instead and never reach the alias emission.
-/// Without an extra SameAs they leave Phase 2 body ops with an undefined
-/// fresh OpRef (e.g. `v56 = i.intval`) that the body use-before-def loop
-/// later promotes into the loop label, producing an undefined Cranelift
-/// Variable on the head's fall-through into the body label.
-///
-/// Mirror RPython by emitting `SameAs(source)` at `pos=result` for every
-/// non-invented entry whose source is a real (preamble-defined) OpRef.
-/// Constant sources are skipped: the body sees them via the constants pool,
-/// not via SSA. Entries already produced by the alias loop or by the
-/// preamble itself are skipped to avoid duplicate definitions.
-///
-/// Phase B B2 epic convergence path (Task #60): once `imported_short_sources`
-/// is fully replaced by typed records (`imported_short_pure_ops` for Pure +
-/// per-kind structs for Heap/LoopInvariant), this helper's signature switches
-/// to consume those typed records directly. The body's RPython parity is
-/// then fully reachable without the untyped `(result, source)` Vec.
-///
-/// Caller contract: every alias-emitted SameAs op (one per
-/// `imported_short_aliases` entry) is already in `result` by the time this
-/// helper runs. Those ops are non-Void and non-Jump, so the `result.iter()`
-/// scan below picks up their `pos` values automatically — no separate alias
-/// seed is needed here.
-fn emit_extra_same_as_for_imports(
-    result: &mut Vec<Op>,
-    imported_short_sources: &[(OpRef, OpRef)],
-    ctx: &crate::optimizeopt::OptContext,
-) {
-    let mut already_defined: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-    for op in result.iter() {
-        if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
-            already_defined.insert(op.pos);
-        }
-    }
-    for &(entry_result, entry_source) in imported_short_sources.iter() {
-        if entry_result.is_none() || entry_result.is_constant() {
-            continue;
-        }
-        if already_defined.contains(&entry_result) {
-            continue;
-        }
-        if entry_source.is_none() || entry_source.is_constant() {
-            continue;
-        }
-        // Skip when source already equals the result (no-op SameAs).
-        if entry_source == entry_result {
-            already_defined.insert(entry_result);
-            continue;
-        }
-        // history.py:802-809 record_same_as(box) reads box.type directly;
-        // pyre's analogue is ctx.opref_type (constant → value_types → op
-        // result type). A failure to resolve is a bookkeeping bug.
-        let same_as_opcode = OpCode::same_as_for_type(
-            ctx.opref_type(entry_source)
-                .expect("assemble_peeled_trace: source OpRef missing Box.type from OptContext"),
-        );
-        let mut op = Op::new(same_as_opcode, &[entry_source]);
-        op.pos = entry_result;
-        result.push(op);
-        already_defined.insert(entry_result);
     }
 }
 
@@ -3520,7 +3555,6 @@ fn assemble_peeled_trace_with_jump_args(
     inputarg_base: u32,
     jump_to_self: bool,
     imported_short_aliases: &[crate::optimizeopt::ImportedShortAlias],
-    imported_short_sources: &[(OpRef, OpRef)],
     constants: &std::collections::HashMap<u32, i64>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
@@ -3607,7 +3641,6 @@ fn assemble_peeled_trace_with_jump_args(
     let mut max_pos = result_max.max(p1_all_max);
     max_pos = next_free_pos(max_pos.saturating_add(1));
     emit_alias_same_as_for_imports(&mut result, imported_short_aliases);
-    emit_extra_same_as_for_imports(&mut result, imported_short_sources, ctx);
 
     // Label position
     let label_pos = next_free_pos(max_pos);
@@ -3635,23 +3668,13 @@ fn assemble_peeled_trace_with_jump_args(
     // determines which extra values the loop header needs; virtual
     // remnants have already been filtered by the caller.
     //
-    // For extra args not defined in the preamble (Phase 2-only OpRefs),
-    // emit a SameAs op mapping them from their preamble source so the
-    // Cranelift fall-through can resolve them.
-    // shortpreamble.py:436-439 extra_same_as parity: imported short ops
-    // (Pure GetfieldGcPureI on non-constant object, HeapField, …) define
-    // body OpRefs at pos=entry.result before the loop label. The downstream
-    // available-before-label check (line 4567) only needs the *set* of
-    // result OpRefs — the source field is unused at this site.
-    let imported_short_results: std::collections::HashSet<OpRef> =
-        imported_short_sources.iter().map(|(r, _)| *r).collect();
     // Advance max_pos past every position already in use before allocating
     // fresh SameAs positions. In RPython, Box identity prevents collisions;
     // in the flat OpRef model, the assembly-allocated SameAs position must
-    // not overlap base label_args, filtered_extra_label_args, p2_ops
-    // positions/args/fail_args, or imported_short_sources.result fresh
-    // slots — each of those may be referenced by the body. A single
-    // colliding OpRef aliases two distinct values and corrupts the loop.
+    // not overlap base label_args, filtered_extra_label_args, or p2_ops
+    // positions/args/fail_args — each of those may be referenced by the
+    // body. A single colliding OpRef aliases two distinct values and
+    // corrupts the loop.
     for &la in &full_label_args {
         if is_trace_runtime_ref(la, constants) {
             max_pos = max_pos.max(la.raw().saturating_add(1));
@@ -3679,18 +3702,6 @@ fn assemble_peeled_trace_with_jump_args(
             }
         }
     }
-    for &result_ref in imported_short_results.iter() {
-        if is_trace_runtime_ref(result_ref, constants) {
-            max_pos = max_pos.max(result_ref.raw().saturating_add(1));
-        }
-    }
-    // RPython compile.py:327 extra_same_as parity is fully handled by the
-    // earlier `for entry in imported_short_sources.iter()` block (line
-    // 4198) which emits a SameAs(entry.source) at pos=entry.result for
-    // every non-invented imported short op whose result is not already
-    // defined. A second emission pass that iterated only
-    // `filtered_extra_label_args` here was redundant — probe across 14
-    // benchmarks × 2 backends showed 0 fires. Removed.
     let extra_label_start_idx = full_label_args.len();
     full_label_args.extend(filtered_extra_label_args.iter().copied());
 
@@ -3783,8 +3794,7 @@ fn assemble_peeled_trace_with_jump_args(
     // RPython's distinct Box identities prevent an imported short-preamble
     // replay result from colliding with a freshly emitted body result. In
     // majit's flat OpRef model we must keep the body allocator above every
-    // position already emitted into `result`, including the non-invented
-    // imported_short_sources SameAs bridges inserted before the loop label.
+    // position already emitted into `result`.
     let max_p2_pos = p2_ops
         .iter()
         .map(|op| op.pos.raw())
@@ -3907,8 +3917,7 @@ fn assemble_peeled_trace_with_jump_args(
                     let resolved_arg = ctx.get_box_replacement(arg);
                     let available_before_label = visible_before_label.contains(&arg)
                         || visible_before_label.contains(&resolved_arg)
-                        || seen_body_defs.contains(&arg)
-                        || imported_short_results.contains(&arg);
+                        || seen_body_defs.contains(&arg);
                     if available_before_label {
                         extra_inner_set.insert(arg);
                         extra_inner_sources.push(arg);
@@ -5137,9 +5146,8 @@ mod tests {
             .and_then(|info| info.take_preamble_field(0));
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
-        assert_eq!(pop.op, OpRef::from_raw(11)); // Phase 1 source
-        assert_ne!(pop.resolved, OpRef::from_raw(10)); // fresh, not label_arg
-        assert_ne!(pop.resolved, OpRef::from_raw(11));
+        assert_eq!(pop.op, OpRef::from_raw(11)); // Phase 1 source — pop.op
+        // forwards via replace_op to the body-visible OpRef.
         drop(parent);
     }
 
@@ -5277,15 +5285,23 @@ mod tests {
 
         import_short_preamble_state(&[OpRef::from_raw(0)], &[phase2_result], &exported, &mut ctx);
 
+        // Path B (B.6.7-loopinv): imported_loop_invariant_results stores the
+        // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
+        let _ = phase2_result;
         assert_eq!(
             ctx.imported_loop_invariant_results.get(&func_ptr),
-            Some(&phase2_result)
+            Some(&source)
         );
-        assert_eq!(ctx.imported_short_sources, vec![(phase2_result, source)]);
     }
 
+    /// B.6.3 invariant: `force_op_from_preamble_op` follows RPython
+    /// `unroll.py:26-39` line-by-line. It calls `use_box` (updates
+    /// `self.short`) and seeds `potential_extra_ops`. It does NOT touch
+    /// `used_boxes` / `short_preamble_jump`. Those grow only via the
+    /// orthodox `force_box` → `potential_extra_ops.pop` →
+    /// `add_preamble_op` (`shortpreamble.py:432-440`) path.
     #[test]
-    fn test_force_op_from_preamble_only_adds_jump_box_after_force_box() {
+    fn test_force_op_from_preamble_orthodox_does_not_record_used_boxes() {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(10, 3);
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
@@ -5315,26 +5331,51 @@ mod tests {
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::from_raw(20),
-            resolved: OpRef::from_raw(20),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
         assert_eq!(forced, OpRef::from_raw(20));
 
+        // RPython `unroll.py:32` `use_box` populates `self.short`.
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.ops.len(), 1);
+        // RPython `unroll.py:34-37` seeds `potential_extra_ops` so a later
+        // `force_box` will run `add_preamble_op` (shortpreamble.py:432-440).
+        assert!(
+            ctx.potential_extra_ops.contains_key(&OpRef::from_raw(20)),
+            "force_op_from_preamble_op must seed potential_extra_ops"
+        );
+        // RPython parity: `force_op_from_preamble` does NOT call
+        // `add_preamble_op`. `used_boxes` / `short_preamble_jump` /
+        // `extra_same_as` stay empty until `force_box` pops the entry.
         assert!(sp.used_boxes.is_empty());
+        assert!(sp.jump_args.is_empty());
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(OpRef::from_raw(20), &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
+        // After force_box: orthodox `add_preamble_op` (shortpreamble.py:432-440)
+        // populated all three lists in lock-step.
         assert_eq!(sp.used_boxes, vec![OpRef::from_raw(20)]);
+        assert_eq!(sp.jump_args, vec![OpRef::from_raw(20)]);
+        assert!(
+            !ctx.potential_extra_ops.contains_key(&OpRef::from_raw(20)),
+            "force_box must consume the potential_extra_ops entry"
+        );
     }
 
+    /// B.6.3 invariant (Heap variant): same orthodox boundary as the Pure
+    /// case, with the producer's `replace_op(source, value)` forwarding
+    /// installed (`shortpreamble.rs::produce_heap_field`).
+    /// `force_op_from_preamble_op` returns `preamble_source` (RPython
+    /// `unroll.py:38 return preamble_op.op` ≡ `self.res`); the producer's
+    /// `get_box_replacement(source)` lookup is consumed inside `force_box`
+    /// (`shortpreamble.py:436 op = preamble_op.op.get_box_replacement()`)
+    /// when it runs `add_preamble_op`.
     #[test]
-    fn test_force_op_from_preamble_maps_imported_result_back_to_preamble_source() {
+    fn test_force_op_from_preamble_returns_source_for_heap_variant() {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(32, 4);
         ctx.initialize_imported_short_preamble_builder(
             &[
@@ -5365,35 +5406,54 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        ctx.imported_short_sources
-            .push((OpRef::from_raw(14), OpRef::from_raw(19)));
-
         let produced = ctx
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
             .produced_short_op(OpRef::from_raw(19))
             .unwrap();
+        // Path B (B.6.7-heap-field): produce_heap_field no longer installs
+        // replace_op, but the test still walks the get_box_replacement
+        // chain inside force_box's add_preamble_op, so install a manual
+        // forwarding to the body-visible OpRef to exercise that path.
+        ctx.replace_op(OpRef::from_raw(19), OpRef::from_raw(14));
         let pop = crate::optimizeopt::info::PreambleOp {
             op: OpRef::from_raw(19),
-            resolved: OpRef::from_raw(14),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
-        assert_eq!(forced, OpRef::from_raw(14));
+        // RPython `unroll.py:38 return preamble_op.op` ≡ self.res.
+        // pyre's Phase 1 source IS self.res for the imported short box.
+        assert_eq!(forced, OpRef::from_raw(19));
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.ops.len(), 1);
+        // RPython parity: orthodox boundary — used_boxes / jump_args stay
+        // empty until force_box runs add_preamble_op.
         assert!(sp.used_boxes.is_empty());
         assert!(sp.jump_args.is_empty());
+        // `force_op_from_preamble_op` keys potential_extra_ops by
+        // `preamble_source` (non-invented) per `unroll.py:34-37`.
+        assert!(
+            ctx.potential_extra_ops.contains_key(&OpRef::from_raw(19)),
+            "force_op_from_preamble_op must seed potential_extra_ops by source"
+        );
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let _ = optimizer.force_box(forced, &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
-        assert_eq!(sp.used_boxes, vec![OpRef::from_raw(19)]);
+        // shortpreamble.py:436 `op = preamble_op.op.get_box_replacement()`.
+        // pop.op=19 forwards to body-visible 14 via the producer's replace_op,
+        // so used_boxes carries the resolved body-visible OpRef while
+        // jump_args carries the unresolved Phase 1 source.
+        assert_eq!(sp.used_boxes, vec![OpRef::from_raw(14)]);
         assert_eq!(sp.jump_args, vec![OpRef::from_raw(19)]);
+        assert!(
+            !ctx.potential_extra_ops.contains_key(&OpRef::from_raw(19)),
+            "force_box must consume the potential_extra_ops entry"
+        );
     }
 
     #[test]
@@ -5477,7 +5537,6 @@ mod tests {
                 same_as_source: OpRef::from_raw(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -5526,7 +5585,6 @@ mod tests {
             &[],
             1,
             true,
-            &[],
             &[],
             &constants,
             None,
@@ -5593,7 +5651,6 @@ mod tests {
             1,
             true,
             &[],
-            &[],
             &constants,
             None,
             None,
@@ -5642,7 +5699,6 @@ mod tests {
                 same_as_source: OpRef::from_raw(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -5711,7 +5767,6 @@ mod tests {
             0,
             true,
             &[],
-            &[],
             &constants,
             None,
             None,
@@ -5779,7 +5834,6 @@ mod tests {
                 same_as_source: OpRef::from_raw(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &[],
             &std::collections::HashMap::new(),
             None,
             None,
@@ -5830,7 +5884,6 @@ mod tests {
             &[],
             1,
             true,
-            &[],
             &[],
             &constants,
             None,
@@ -5893,7 +5946,6 @@ mod tests {
             5,
             false,
             &[],
-            &[],
             &std::collections::HashMap::new(),
             Some(start_descr),
             None,
@@ -5943,7 +5995,6 @@ mod tests {
             &[],
             2,
             false,
-            &[],
             &[],
             &std::collections::HashMap::new(),
             Some(start_descr),
@@ -5995,7 +6046,6 @@ mod tests {
             &[],
             1,
             false,
-            &[],
             &[],
             &constants,
             Some(start_descr),
@@ -6049,7 +6099,6 @@ mod tests {
             1,
             true,
             &[],
-            &[],
             &constants,
             None,
             None,
@@ -6086,7 +6135,6 @@ mod tests {
             &[const_extra, OpRef::from_raw(8)],
             1,
             true,
-            &[],
             &[],
             &constants,
             None,
@@ -6131,7 +6179,6 @@ mod tests {
             6,
             true,
             &[],
-            &[],
             &constants,
             None,
             None,
@@ -6149,89 +6196,6 @@ mod tests {
             combined[2].args.as_slice(),
             &[OpRef::from_raw(200), OpRef::from_raw(300)]
         );
-    }
-
-    #[test]
-    fn test_assemble_peeled_trace_keeps_body_results_distinct_from_imported_short_sources() {
-        let p1_ops = vec![
-            {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-                op.pos = OpRef::from_raw(3);
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::IntGt, &[OpRef::from_raw(2), OpRef::from_raw(3)]);
-                op.pos = OpRef::from_raw(4);
-                op
-            },
-        ];
-        let p2_ops = vec![
-            {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(3), OpRef::from_raw(1)]);
-                op.pos = OpRef::from_raw(10);
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::IntGt, &[OpRef::from_raw(2), OpRef::from_raw(10)]);
-                op.pos = OpRef::from_raw(11);
-                op
-            },
-            {
-                let mut op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(11)]);
-                op.fail_args =
-                    Some(vec![OpRef::from_raw(10), OpRef::from_raw(1), OpRef::from_raw(2)].into());
-                op
-            },
-            Op::new(
-                OpCode::Jump,
-                &[OpRef::from_raw(10), OpRef::from_raw(1), OpRef::from_raw(2)],
-            ),
-        ];
-        let imported_short_sources = vec![(OpRef::from_raw(14), OpRef::from_raw(4))];
-
-        let combined = assemble_peeled_trace(
-            &p1_ops,
-            &p2_ops,
-            &[OpRef::from_raw(3), OpRef::from_raw(1), OpRef::from_raw(2)],
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
-            &[],
-            3,
-            true,
-            &[],
-            &imported_short_sources,
-            &std::collections::HashMap::new(),
-            None,
-            None,
-        );
-
-        let imported_same_as = combined
-            .iter()
-            .find(|op| op.pos == OpRef::from_raw(14))
-            .expect("imported short source same_as");
-        assert_eq!(imported_same_as.opcode, OpCode::SameAsI);
-        assert_eq!(imported_same_as.args.as_slice(), &[OpRef::from_raw(4)]);
-
-        let body_add = combined
-            .iter()
-            .find(|op| {
-                op.opcode == OpCode::IntAdd
-                    && op.args.as_slice() == [OpRef::from_raw(3), OpRef::from_raw(1)]
-            })
-            .expect("body add");
-        let body_compare = combined
-            .iter()
-            .find(|op| {
-                op.opcode == OpCode::IntGt
-                    && op.args.as_slice() == [OpRef::from_raw(2), body_add.pos]
-            })
-            .expect("body compare must survive with fresh body result pos");
-        assert_ne!(body_compare.pos, OpRef::from_raw(14));
-
-        let body_guard = combined
-            .iter()
-            .find(|op| op.opcode == OpCode::GuardTrue && op.args.as_slice() == [body_compare.pos])
-            .expect("body guard must use fresh body compare result");
-        assert_eq!(body_guard.args.as_slice(), &[body_compare.pos]);
     }
 
     #[test]

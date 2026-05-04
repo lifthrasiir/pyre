@@ -2806,17 +2806,24 @@ impl Optimization for OptRewrite {
                     // RPython: LoopInvariantOp.produce_op stores PreambleOp
                     // in loop_invariant_results during import. Transfer from
                     // ctx.imported_loop_invariant_results on first access.
-                    if let Some(&imported) = ctx.imported_loop_invariant_results.get(&func_val) {
+                    if let Some(&source) = ctx.imported_loop_invariant_results.get(&func_val) {
                         if !self.loop_invariant_results.contains_key(&func_val) {
-                            // RPython shortpreamble.py:158-159
-                            let source = ctx.imported_short_source(imported);
+                            // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
+                            // `produce_loop_invariant` installs
+                            // `replace_op(source, result_opref)`, so source's
+                            // slot now holds `Forwarded::Op(result_opref)`.
+                            // Build the synthetic SameAsI replay at
+                            // `result_opref` (= get_box_replacement(source))
+                            // so `take_preamble_forwarded_opinfo` reads the
+                            // info seeded at result_opref's slot per the
+                            // dual-slot rule (mod.rs:1817 replay_pos).
+                            let replay_pos = ctx.get_box_replacement(source);
                             let mut replay = Op::new(OpCode::SameAsI, &[source]);
-                            replay.pos = source;
+                            replay.pos = replay_pos;
                             self.loop_invariant_results.insert(
                                 func_val,
                                 LoopInvariantEntry::Preamble(PreambleOp {
                                     op: source,
-                                    resolved: imported,
                                     invented_name: false,
                                     preamble_op: replay,
                                 }),
@@ -3033,7 +3040,7 @@ impl Optimization for OptRewrite {
             .iter()
             .filter_map(|(&func_ptr, entry)| match entry {
                 LoopInvariantEntry::Direct(r) => Some((func_ptr, *r)),
-                LoopInvariantEntry::Preamble(pop) => Some((func_ptr, pop.resolved)),
+                LoopInvariantEntry::Preamble(pop) => Some((func_ptr, pop.op)),
             })
             .collect()
     }

@@ -159,16 +159,53 @@ impl ImportedShortPureOp {
             })
             .collect();
         let mut replay = majit_ir::Op::new(opcode, &replay_args);
-        replay.pos = source;
+        // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct
+        // RPython Op objects:
+        //
+        //   * `op` — the alt identifier. For invented_name it is
+        //     `self.orig_op.copy_and_change(...).set_forwarded(self.res)`,
+        //     a freshly-allocated Op with its own `_forwarded` slot.
+        //   * `preamble_op` — the replay Op passed in from `add_op_to_short`.
+        //     Its `_forwarded` slot is seeded with the exported info by
+        //     `ShortPreambleBuilder.__init__` (shortpreamble.py:425).
+        //
+        // The two `_forwarded` slots live on two different RPython Op
+        // objects, so `op.set_forwarded(self.res)` and
+        // `preamble_op.set_forwarded(info)` never collide.
+        //
+        // pyre's flat-OpRef model has only one slot per OpRef. To preserve
+        // PyPy parity we must allocate TWO different OpRefs for the two
+        // identities when they would collide:
+        //
+        //   * non-invented Pure: `op = self.res`. PyPy does NOT install a
+        //     forwarding on `op`, so the slot at `source` is free to hold
+        //     `info`. We can leave `replay.pos = source` — both objects
+        //     point at one slot, which is allowed because only `info`
+        //     occupies it.
+        //   * invented Pure: PyPy installs `op.set_forwarded(self.res)` on
+        //     the alt. In pyre, `produce_pure` calls
+        //     `replace_op(source, canonical)` (shortpreamble.rs:1279) which
+        //     overwrites `forwarded[source]` with `Forwarded::Op(canonical)`.
+        //     If `replay.pos` also pointed at `source`, the alt's
+        //     replacement chain and the replay's info would share one slot
+        //     and the info would be lost. We move `replay.pos` to the
+        //     pre-allocated body-visible OpRef (`result`) so it has its
+        //     own slot.
+        replay.pos = if invented_name { result } else { source };
         replay.descr = descr.clone();
+        // shortpreamble.py:116-120: pop.op = self.orig_op.copy_and_change(...)
+        // for invented (the alt identifier) or self.res for non-invented.
+        // pyre's `source` IS the alt identifier for invented (the synthetic
+        // alias allocated by the compound-dedup pass at
+        // shortpreamble.rs:478-491) and IS self.res for non-invented.
+        let pop_op = source;
         ImportedShortPureOp {
             opcode,
             descr,
             args,
             result,
             pop: crate::optimizeopt::info::PreambleOp {
-                op: source,
-                resolved: result,
+                op: pop_op,
                 invented_name,
                 preamble_op: replay,
             },
@@ -271,14 +308,6 @@ pub struct OptContext {
     /// (base_len, short_args): virtual field values start at base_len
     /// within short_args. Used by install_imported_virtuals.
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
-    /// Original preamble result box for each imported short-box result.
-    /// This preserves RPython PreambleOp.op identity so phase 2 assembly
-    /// can remap any surviving synthetic imported boxes back to the
-    /// corresponding preamble value.  Stored as `Vec<(result, source)>`
-    /// so iteration order matches RPython `shortpreamble.py:246` short
-    /// preamble production order (OrderedDict-style insertion order);
-    /// reverse lookup is an O(n) scan.
-    pub imported_short_sources: Vec<(OpRef, OpRef)>,
     /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
     /// results keyed by constant function pointer.
     pub imported_loop_invariant_results: HashMap<i64, OpRef>,
@@ -1185,7 +1214,6 @@ impl OptContext {
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
-            imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             const_infos: HashMap::new(),
@@ -1266,7 +1294,6 @@ impl OptContext {
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
-            imported_short_sources: Vec::new(),
             imported_loop_invariant_results: HashMap::new(),
             imported_short_preamble_builder: None,
             const_infos: HashMap::new(),
@@ -1785,16 +1812,54 @@ impl OptContext {
         // Guard against clobbering existing forwarding (set by an
         // earlier `replace_op` from `import_state` for sources that
         // happen to coincide with `next_iteration_args`): only seed
-        // when no PtrInfo and no replacement op are recorded yet.
-        for (source, _produced_op) in short_boxes {
-            if source.is_constant() {
-                continue;
+        // when no forwarding is recorded yet.
+        //
+        // Replay slot rule, matching `ImportedShortPureOp::new` (mod.rs:194)
+        // and the producer-side `pop.preamble_op.pos` written by
+        // `produce_pure` / `produce_heap_field` / `produce_heap_array_item` /
+        // `produce_loop_invariant` in shortpreamble.rs.
+        //
+        // The rule reduces to: `replay slot = result_opref` iff the producer
+        // installs `replace_op(source, result_opref)`, otherwise `source`.
+        // PyPy `shortpreamble.py:401, 414` calls `preamble_op.set_forwarded(info)`
+        // on the replay Op object — distinct from `PreambleOp.op = self.res`.
+        // pyre's flat-OpRef model collapses the two onto one slot per OpRef,
+        // so when `replace_op` is installed at `source`, the replay's
+        // `_forwarded` slot must be moved to `result_opref` to avoid the
+        // `Forwarded::Op(...)` chain clobbering the seeded info.
+        //
+        //   * invented Pure → result_opref. `produce_pure` installs
+        //     `replace_op(source, result_opref)` (Fix #3).
+        //   * Heap (field + array) → result_opref. `produce_heap_field` /
+        //     `produce_heap_array_item` install `replace_op` (Cat-2.2 B/C).
+        //   * LoopInvariant → result_opref. `produce_loop_invariant` installs
+        //     `replace_op` (Cat-2.2 A); the synthetic `SameAsI` replay built
+        //     by `optimize_CALL_LOOPINVARIANT_*` in `rewrite.rs` writes
+        //     `replay.pos = ctx.get_box_replacement(source)` to land on the
+        //     same slot.
+        //   * non-invented Pure → source. PyPy `shortpreamble.py:120 op = self.res`
+        //     with no forwarding installed; pyre keeps source's slot free for
+        //     the seeded info.
+        //
+        // The same rule drives `seed_at` (`set_preamble_forwarded_info`),
+        // the BUILDER's `replay.pos`, and the builder-side `produced_results`
+        // dependency map so all four sources of replay identity stay in
+        // lockstep with PyPy `shortpreamble.py:414-426` (`__init__`).
+        let replay_pos = |source: OpRef, produced_op: &ProducedShortOp| -> OpRef {
+            let installs_replace_op = match produced_op.kind {
+                PreambleOpKind::Pure => produced_op.invented_name,
+                PreambleOpKind::Heap | PreambleOpKind::LoopInvariant => true,
+                PreambleOpKind::InputArg | PreambleOpKind::Guard => false,
+            };
+            if installs_replace_op {
+                *result_map.get(&source).unwrap_or(&source)
+            } else {
+                source
             }
-            if self.get_ptr_info(*source).is_some() || self.is_replaced(*source) {
-                continue;
-            }
-            if let Some(crate::optimizeopt::info::OpInfo::Ptr(pinfo)) = exported_infos.get(source) {
-                self.set_ptr_info(*source, pinfo.clone());
+        };
+        for (source, produced_op) in short_boxes {
+            if let Some(info) = exported_infos.get(source) {
+                self.set_preamble_forwarded_info(replay_pos(*source, produced_op), info);
             }
         }
 
@@ -1874,7 +1939,7 @@ impl OptContext {
                         pure_call_opcode(produced_op.preamble_op.opcode),
                         &resolved_args,
                     );
-                    op.pos = result_opref;
+                    op.pos = replay_pos(*source, produced_op);
                     op.descr = produced_op.preamble_op.descr.clone();
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
@@ -1886,7 +1951,7 @@ impl OptContext {
                     if *source != result_opref {
                         produced.push((result_opref, new_pop));
                     }
-                    produced_results.insert(*source, result_opref);
+                    produced_results.insert(*source, replay_pos(*source, produced_op));
                 }
                 PreambleOpKind::Heap => {
                     let result_type = produced_op.preamble_op.result_type();
@@ -1909,7 +1974,7 @@ impl OptContext {
                                 majit_ir::Type::Void => return false,
                             };
                             let mut op = Op::new(opcode, &[obj]);
-                            op.pos = result_opref;
+                            op.pos = replay_pos(*source, produced_op);
                             op.descr = Some(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
@@ -1945,7 +2010,7 @@ impl OptContext {
                                 None => return false,
                             };
                             let mut op = Op::new(opcode, &[obj, index_opref]);
-                            op.pos = result_opref;
+                            op.pos = replay_pos(*source, produced_op);
                             op.descr = Some(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
@@ -1960,7 +2025,7 @@ impl OptContext {
                     if *source != result_opref {
                         produced.push((result_opref, new_pop));
                     }
-                    produced_results.insert(*source, result_opref);
+                    produced_results.insert(*source, replay_pos(*source, produced_op));
                 }
                 PreambleOpKind::LoopInvariant => {
                     let result_type = produced_op.preamble_op.result_type();
@@ -1976,7 +2041,7 @@ impl OptContext {
                         return false;
                     }
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_opref]);
-                    op.pos = result_opref;
+                    op.pos = replay_pos(*source, produced_op);
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         preamble_op: op,
@@ -1987,7 +2052,7 @@ impl OptContext {
                     if *source != result_opref {
                         produced.push((result_opref, new_pop));
                     }
-                    produced_results.insert(*source, result_opref);
+                    produced_results.insert(*source, replay_pos(*source, produced_op));
                 }
                 PreambleOpKind::InputArg | PreambleOpKind::Guard => {}
             }
@@ -2005,13 +2070,6 @@ impl OptContext {
         true
     }
 
-    pub(crate) fn imported_short_source(&self, result: OpRef) -> OpRef {
-        self.imported_short_sources
-            .iter()
-            .find_map(|(r, s)| (*r == result).then_some(*s))
-            .unwrap_or(result)
-    }
-
     /// unroll.py:26-39: force_op_from_preamble(preamble_op)
     ///
     /// RPython receives a PreambleOp with invented_name already set.
@@ -2021,7 +2079,14 @@ impl OptContext {
         preamble_op: &crate::optimizeopt::info::PreambleOp,
     ) -> OpRef {
         let preamble_source = preamble_op.op;
-        let result = preamble_op.resolved;
+        // RPython `return preamble_op.op` returns the carried Box. In majit,
+        // `pop.op` stores the Phase 1 source position; `replace_op(source,
+        // body_visible)` is called by the producer for invented Pure / Heap /
+        // LoopInvariant, so walking the forwarding chain reaches the
+        // body-visible OpRef. Non-invented Pure has no forwarding installed,
+        // so `get_box_replacement(source) == source` and the body references
+        // source directly (RPython parity for non-invented `op = self.res`).
+        let result = self.get_box_replacement(preamble_op.op);
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = self.get_constant(preamble_source).is_some();
         if self.imported_short_preamble_used.insert(preamble_source) {
@@ -2050,9 +2115,21 @@ impl OptContext {
             } else {
                 unreachable!("force_op_from_preamble_op: no short_preamble_producer");
             }
-            // shortpreamble.py:404: optimizer.setinfo_from_preamble(box, info, None)
-            if let Some(info) = self.get_ptr_info(preamble_source).cloned() {
-                self.setinfo_from_preamble(result, &info, None);
+            // shortpreamble.py:401-405: info = preamble_op.get_forwarded();
+            // preamble_op.set_forwarded(None);
+            // optimizer.setinfo_from_preamble(box, info, None)
+            //
+            // RPython reads `_forwarded` from the replay Op object
+            // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
+            // the alt for invented). pyre's flat-OpRef equivalent is
+            // `pop.preamble_op.pos` — the OpRef the replay Op was
+            // constructed at by `ImportedShortPureOp::new` (mod.rs:144).
+            // For invented Pure that OpRef differs from `pop.op` (the
+            // alt) so the alt's `replace_op(...)` chain at
+            // `forwarded[pop.op]` does not collide with the replay's
+            // info at `forwarded[pop.preamble_op.pos]`.
+            if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos) {
+                self.setinfo_from_preamble_item_option(result, &info, None);
             }
             // RPython PreambleOp carries Box.type intrinsically. majit's
             // imported replay uses a distinct `resolved` OpRef, so preserve
@@ -2076,12 +2153,19 @@ impl OptContext {
                 self.potential_extra_ops.insert(key, preamble_op.clone());
             }
         }
-        // unroll.py:38: return preamble_op.op
-        // RPython uses a single Box identity for Phase 1 and Phase 2.
-        // In majit, preamble_source (Phase 1) and result (Phase 2) are
-        // distinct OpRefs. Phase 2 operations reference `result`, so
-        // returning it is structurally equivalent to RPython's `return op`.
-        result
+        // unroll.py:38 `return preamble_op.op`. RPython's `preamble_op.op`
+        // equals `self.res` (shortpreamble.py:120 `op = self.res`); pyre's
+        // Phase 1 source IS `self.res` for the imported short box. Return
+        // it directly so non-invented Pure body references resolve through
+        // the Phase 1 OpRef. The use-before-def pass at LABEL emission
+        // (unroll.rs `assemble_peeled_trace_with_jump_args`) extends
+        // `LABEL.arglist` with that Phase 1 OpRef when the body actually
+        // uses it; the orthodox `force_box → potential_extra_ops.pop →
+        // add_preamble_op` path (shortpreamble.py:432-440) handles
+        // `used_boxes` / `short_preamble_jump` / `extra_same_as` for the
+        // imported short box.
+        let _ = result;
+        preamble_source
     }
 
     /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
@@ -2102,16 +2186,42 @@ impl OptContext {
             })
             .unwrap_or_default();
 
-        // Snapshot forwarded state per arg to avoid borrow conflicts during
-        // guard emission. `Forwarded::Info` carries PtrInfo; `Forwarded::IntBound`
-        // carries integer range info — both produce guards.
+        // shortpreamble.py:383-401 line-by-line:
+        //
+        //   for arg in preamble_op.getarglist():
+        //       if isinstance(arg, Const):
+        //           continue
+        //       if isinstance(arg, AbstractInputArg):
+        //           info = arg.get_forwarded()
+        //           if info is not None and info is not empty_info:
+        //               info.make_guards(arg, self.short, optimizer)
+        //       elif arg.get_forwarded() is None:
+        //           pass
+        //       else:
+        //           self.short.append(arg)
+        //           info = arg.get_forwarded()
+        //           if info is not empty_info:
+        //               info.make_guards(arg, self.short, optimizer)
+        //           arg.set_forwarded(None)
+        //
+        // RPython has three branches per arg:
+        //   * Const → skip (pyre: `OpRef::is_constant()`).
+        //   * AbstractInputArg with forwarded info → emit guards, do NOT
+        //     clear (info lives across iterations on input args).
+        //   * non-input non-Const with forwarded info → also append the
+        //     arg op to `self.short` (handled by the builder's `use_box`
+        //     dependency walk at shortpreamble.rs:1660-1688), emit
+        //     guards, AND clear the slot to prevent double-emission.
+        //
+        // pyre's `take_preamble_forwarded_opinfo` is the take-clear
+        // primitive matching `arg.set_forwarded(None)`. We use it for the
+        // non-input branch only; input args use the read-only snapshot.
         enum ForwardedInfo {
             Ptr(PtrInfo),
             Int(crate::optimizeopt::intutils::IntBound),
         }
         let snapshot_forwarded = |ctx: &Self, arg: OpRef| -> Option<ForwardedInfo> {
-            let replaced = ctx.get_box_replacement(arg);
-            let idx = replaced.raw() as usize;
+            let idx = arg.raw() as usize;
             if idx >= ctx.forwarded.len() {
                 return None;
             }
@@ -2121,16 +2231,44 @@ impl OptContext {
                 _ => None,
             }
         };
-        let arg_infos: Vec<(OpRef, ForwardedInfo)> = preamble_op
-            .args
-            .iter()
-            .filter(|arg| short_inputargs.contains(arg))
-            .filter_map(|&arg| snapshot_forwarded(self, arg).map(|info| (arg, info)))
-            .collect();
+        // Phase 1 (read-only): classify each arg per the PyPy three-branch
+        // shape and snapshot the info-bearing slot.
+        struct ArgEntry {
+            arg: OpRef,
+            info: ForwardedInfo,
+            is_input: bool,
+        }
+        let mut arg_entries: Vec<ArgEntry> = Vec::new();
+        for &arg in preamble_op.args.iter() {
+            // Branch 1: shortpreamble.py:384 `isinstance(arg, Const): continue`.
+            if arg.is_constant() || arg.is_none() {
+                continue;
+            }
+            let is_input = short_inputargs.contains(&arg);
+            if let Some(info) = snapshot_forwarded(self, arg) {
+                arg_entries.push(ArgEntry {
+                    arg,
+                    info,
+                    is_input,
+                });
+            }
+            // shortpreamble.py:391 `elif arg.get_forwarded() is None: pass`
+            // is the no-info branch; falling out of `snapshot_forwarded`
+            // returning None is the equivalent.
+        }
         let result_info: Option<(OpRef, ForwardedInfo)> =
             snapshot_forwarded(self, preamble_op.pos).map(|info| (preamble_op.pos, info));
 
-        // Now generate guards — alloc_const directly allocates constant
+        // Phase 2 (mutable): clear non-input arg slots — PyPy
+        // `arg.set_forwarded(None)` (shortpreamble.py:397). Branch 2 (input
+        // args) keeps its info; branch 3 (non-input) clears.
+        for entry in &arg_entries {
+            if !entry.is_input {
+                let _ = self.take_preamble_forwarded_opinfo(entry.arg);
+            }
+        }
+
+        // Phase 3: generate guards — alloc_const directly allocates constant
         // OpRefs, matching RPython where ConstInt/ConstPtr are created inline.
         let mut arg_guards = Vec::new();
         let mut alloc_const = |value: Value| -> OpRef {
@@ -2138,10 +2276,14 @@ impl OptContext {
             self.seed_constant(pos, value);
             pos
         };
-        for (arg, info) in &arg_infos {
-            match info {
-                ForwardedInfo::Ptr(p) => p.make_guards(*arg, &mut arg_guards, &mut alloc_const),
-                ForwardedInfo::Int(b) => b.make_guards(*arg, &mut arg_guards, &mut alloc_const),
+        for entry in &arg_entries {
+            match &entry.info {
+                ForwardedInfo::Ptr(p) => {
+                    p.make_guards(entry.arg, &mut arg_guards, &mut alloc_const)
+                }
+                ForwardedInfo::Int(b) => {
+                    b.make_guards(entry.arg, &mut arg_guards, &mut alloc_const)
+                }
             }
         }
         let mut result_guards = Vec::new();
@@ -2156,6 +2298,78 @@ impl OptContext {
             }
         }
         (arg_guards, result_guards)
+    }
+
+    /// shortpreamble.py:425 `preamble_op.set_forwarded(info)` for imported
+    /// short preamble ops. Store the same family of info values that RPython
+    /// stores in `_forwarded`, without transforming them through
+    /// `setinfo_from_preamble` yet.
+    fn set_preamble_forwarded_info(
+        &mut self,
+        source: OpRef,
+        info: &crate::optimizeopt::info::OpInfo,
+    ) {
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
+        if source.is_constant() || self.has_forwarding(source) {
+            return;
+        }
+        let idx = source.raw() as usize;
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        self.forwarded[idx] = match info {
+            OpInfo::Ptr(pinfo) => Forwarded::Info(pinfo.clone()),
+            OpInfo::IntBound(bound) => Forwarded::IntBound(bound.clone()),
+            OpInfo::FloatConst(value) => Forwarded::Const(Value::Float(*value)),
+            OpInfo::Constant(value) => Forwarded::Const(value.clone()),
+            OpInfo::Unknown => Forwarded::None,
+        };
+    }
+
+    /// shortpreamble.py:401-405 line-by-line:
+    ///
+    /// ```python
+    /// info = preamble_op.get_forwarded()
+    /// preamble_op.set_forwarded(None)
+    /// if optimizer is not None:
+    ///     optimizer.setinfo_from_preamble(box, info, None)
+    /// ```
+    ///
+    /// RPython reads `_forwarded` from the `preamble_op` Op object directly
+    /// — `get_box_replacement` is NOT applied to the slot. Box replacement
+    /// only matters for the `box` argument that subsequently receives the
+    /// info via `setinfo_from_preamble(box, info, None)`. Walking the
+    /// replacement chain on the source side would point at the body-visible
+    /// OpRef whose slot is empty (the seed at `forwarded[source]` was
+    /// installed by `set_preamble_forwarded_info`).
+    ///
+    /// `set_forwarded(None)` clears the slot so a second `use_box` for the
+    /// same preamble op never re-fires `info.make_guards`. In majit's flat
+    /// OpRef model the slot is shared with the Box→Box replacement chain
+    /// (`Forwarded::Op`), which other code follows via
+    /// `get_box_replacement`; clearing that variant would silently break
+    /// downstream replacement, so only the info-bearing variants
+    /// (Info / IntBound / Const) take + clear, matching PyPy's clear
+    /// semantics on the info-bearing branches.
+    fn take_preamble_forwarded_opinfo(
+        &mut self,
+        source: OpRef,
+    ) -> Option<crate::optimizeopt::info::OpInfo> {
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
+        let idx = source.raw() as usize;
+        let slot = self.forwarded.get_mut(idx)?;
+        match slot {
+            Forwarded::Info(_) | Forwarded::IntBound(_) | Forwarded::Const(_) => {
+                match std::mem::replace(slot, Forwarded::None) {
+                    Forwarded::Info(info) => Some(OpInfo::Ptr(info)),
+                    Forwarded::IntBound(bound) => Some(OpInfo::IntBound(bound)),
+                    Forwarded::Const(Value::Float(value)) => Some(OpInfo::FloatConst(value)),
+                    Forwarded::Const(value) => Some(OpInfo::Constant(value)),
+                    _ => unreachable!(),
+                }
+            }
+            Forwarded::None | Forwarded::Op(_) => None,
+        }
     }
 
     /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
@@ -2368,6 +2582,37 @@ impl OptContext {
                 "exported_infos must never contain OpInfo::Unknown; \
                  the absent-entry branch (clear_forwarded) handles that case"
             ),
+        }
+    }
+
+    fn setinfo_from_preamble_item_option(
+        &mut self,
+        op: OpRef,
+        preamble_info: &crate::optimizeopt::info::OpInfo,
+        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
+    ) {
+        use crate::optimizeopt::info::OpInfo;
+        let target = self.get_box_replacement(op);
+        if self.has_forwarding(target) || self.is_constant(target) {
+            return;
+        }
+        match preamble_info {
+            OpInfo::Ptr(ptr_info) => {
+                self.setinfo_from_preamble(target, ptr_info, exported_infos);
+            }
+            OpInfo::IntBound(bound) => {
+                let widened = bound.widen();
+                self.with_intbound_mut(target, |bm| {
+                    let _ = bm.intersect(&widened);
+                });
+            }
+            OpInfo::FloatConst(f) => {
+                self.make_constant(target, Value::Float(*f));
+            }
+            OpInfo::Constant(value) => {
+                self.make_constant(target, value.clone());
+            }
+            OpInfo::Unknown => {}
         }
     }
 
@@ -3326,19 +3571,15 @@ impl OptContext {
 
     /// optimizer.py:345-364 force_box — inline equivalent for
     /// emit_guard_operation's fail_arg forcing (optimizer.py:680-683).
-    /// Mirrors Optimizer.force_box contract: resolve imported short source,
-    /// handle tracked preamble ops, then force virtuals to concrete.
+    /// Mirrors Optimizer.force_box contract: handle tracked preamble ops,
+    /// then force virtuals to concrete. Path B (B.6.7) routes body refs
+    /// through Phase 1 source directly, so the prior reverse-lookup 3rd
+    /// key is no longer needed.
     fn force_box_inline(&mut self, opref: OpRef) -> OpRef {
-        let preamble_source = self.imported_short_source(opref);
         let resolved = self.get_box_replacement(opref);
         let tracked = self
             .take_potential_extra_op(resolved)
-            .or_else(|| self.take_potential_extra_op(opref))
-            .or_else(|| {
-                (preamble_source != resolved && preamble_source != opref)
-                    .then(|| self.take_potential_extra_op(preamble_source))
-                    .flatten()
-            });
+            .or_else(|| self.take_potential_extra_op(opref));
         if let Some(preamble_op) = tracked {
             let resolved_for_pop = self.get_box_replacement(preamble_op.op);
             if let Some(builder) = self.active_short_preamble_producer_mut() {
@@ -6025,9 +6266,11 @@ mod imported_short_preamble_fallback_tests {
 
         let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(7), OpRef::from_raw(8)]);
         replay_op.pos = OpRef::from_raw(14);
+        // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
+        // pop.op carries the body-visible OpRef directly (no forwarding chain
+        // installed for non-invented Pure).
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::from_raw(14),
-            resolved: OpRef::from_raw(41),
+            op: OpRef::from_raw(41),
             invented_name: false,
             preamble_op: replay_op,
         };
