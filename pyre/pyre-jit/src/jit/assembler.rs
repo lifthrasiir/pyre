@@ -1178,117 +1178,6 @@ fn dispatch_op(
                 .builder
                 .record_unary_f(dst, opcode, expect_reg(&args[0], Kind::Float));
         }
-        "call_void" | "residual_call_void" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let call_args = expect_call_args(&args[1..]);
-            state
-                .builder
-                .residual_call_void_canonical_via_target(fn_idx, &call_args);
-        }
-        "call_may_force_void" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let call_args = expect_call_args(&args[1..]);
-            state
-                .builder
-                .call_may_force_void_canonical_via_target(fn_idx, &call_args);
-        }
-        "call_release_gil_void" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let call_args = expect_call_args(&args[1..]);
-            state
-                .builder
-                .call_release_gil_void_canonical_via_target(fn_idx, &call_args);
-        }
-        "call_loopinvariant_void" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let call_args = expect_call_args(&args[1..]);
-            state
-                .builder
-                .call_loopinvariant_void_canonical_via_target(fn_idx, &call_args);
-        }
-        "call_assembler_void" => {
-            let target_idx = expect_small_u16(&args[0]);
-            let call_args = expect_call_args(&args[1..]);
-            state
-                .builder
-                .call_assembler_void_typed_args(target_idx, &call_args);
-        }
-        "call_int"
-        | "call_pure_int"
-        | "call_may_force_int"
-        | "call_release_gil_int"
-        | "call_loopinvariant_int"
-        | "call_assembler_int" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let dst = expect_result_reg(result, Kind::Int, "int call needs result");
-            let call_args = expect_call_args(&args[1..]);
-            match opname {
-                "call_int" => state.builder.call_int_typed(fn_idx, &call_args, dst),
-                "call_pure_int" => state.builder.call_pure_int_typed(fn_idx, &call_args, dst),
-                "call_may_force_int" => state
-                    .builder
-                    .call_may_force_int_typed(fn_idx, &call_args, dst),
-                "call_release_gil_int" => state
-                    .builder
-                    .call_release_gil_int_typed(fn_idx, &call_args, dst),
-                "call_loopinvariant_int" => state
-                    .builder
-                    .call_loopinvariant_int_typed(fn_idx, &call_args, dst),
-                _ => state
-                    .builder
-                    .call_assembler_int_typed(fn_idx, &call_args, dst),
-            }
-        }
-        "call_ref"
-        | "call_pure_ref"
-        | "call_may_force_ref"
-        | "call_loopinvariant_ref"
-        | "call_assembler_ref" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let dst = expect_result_reg(result, Kind::Ref, "ref call needs result");
-            let call_args = expect_call_args(&args[1..]);
-            match opname {
-                "call_ref" => state.builder.call_ref_typed(fn_idx, &call_args, dst),
-                "call_pure_ref" => state.builder.call_pure_ref_typed(fn_idx, &call_args, dst),
-                "call_may_force_ref" => state
-                    .builder
-                    .call_may_force_ref_typed(fn_idx, &call_args, dst),
-                // "call_release_gil_ref" intentionally rejected:
-                // resoperation.py:1243-1244 (`# no such thing`).
-                "call_loopinvariant_ref" => state
-                    .builder
-                    .call_loopinvariant_ref_typed(fn_idx, &call_args, dst),
-                _ => state
-                    .builder
-                    .call_assembler_ref_typed(fn_idx, &call_args, dst),
-            }
-        }
-        "call_float"
-        | "call_pure_float"
-        | "call_may_force_float"
-        | "call_release_gil_float"
-        | "call_loopinvariant_float"
-        | "call_assembler_float" => {
-            let fn_idx = expect_small_u16(&args[0]);
-            let dst = expect_result_reg(result, Kind::Float, "float call needs result");
-            let call_args = expect_call_args(&args[1..]);
-            match opname {
-                "call_float" => state.builder.call_float_typed(fn_idx, &call_args, dst),
-                "call_pure_float" => state.builder.call_pure_float_typed(fn_idx, &call_args, dst),
-                "call_may_force_float" => state
-                    .builder
-                    .call_may_force_float_typed(fn_idx, &call_args, dst),
-                "call_release_gil_float" => state
-                    .builder
-                    .call_release_gil_float_typed(fn_idx, &call_args, dst),
-                "call_loopinvariant_float" => state
-                    .builder
-                    .call_loopinvariant_float_typed(fn_idx, &call_args, dst),
-                _ => state
-                    .builder
-                    .call_assembler_float_typed(fn_idx, &call_args, dst),
-            }
-        }
         "conditional_call_ir_v" => {
             let fn_idx = expect_small_u16(&args[0]);
             let cond_reg = expect_reg(&args[1], Kind::Int);
@@ -1500,49 +1389,29 @@ fn dispatch_residual_call(
         return;
     }
 
+    // Slice 4 Slice 1c.1: the int / ref / float arms route through the
+    // canonical `residual_call_<kind>_canonical_via_target_with_effect_info`
+    // wrappers (jitcode/assembler.rs:2026 / 2067 / 2171), threading
+    // `stub.effect_info` end-to-end exactly like the void path at line
+    // 1495.  RPython `pyjitpl.py:1995-2068 do_residual_call` carries
+    // the same calldescr across every result kind via
+    // `record_nospec(opnum, ..., calldescr)`; pyre now matches that for
+    // i / r / f as well — the policy is encoded inside
+    // `stub.effect_info` (already shaped by `effect_info_for_call_flavor`
+    // at flatten.rs:485-633), and the canonical typed recording arms in
+    // pyjitpl/dispatch.rs read it back via
+    // `effectinfo.is_call_release_gil()` /
+    // `check_forces_virtual_or_virtualizable()` /
+    // `extraeffect == LoopInvariant`.
+    //
+    // Pure stays on the legacy `BC_CALL_PURE_*` bytecode shape because
+    // pyre pre-decides Pure at codewriter time and patches via
+    // `record_result_of_call_pure` after the trace records the plain
+    // CALL — aligning that to RPython's `pyjitpl.py:3553-3579`
+    // post-record patch model is a separate epic outside this slice's
+    // scope.  ReleaseGil + Ref panics per
+    // `resoperation.py:1243-1244 # no such thing`.
     match (dispatch_kind, reskind) {
-        (CallFlavor::Plain, ResKind::Int) => {
-            let dst = expect_result_reg(result, Kind::Int, "residual_call int needs result");
-            state.builder.call_int_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Plain, ResKind::Ref) => {
-            let dst = expect_result_reg(result, Kind::Ref, "residual_call ref needs result");
-            state.builder.call_ref_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::MayForce, ResKind::Int) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Int,
-                "residual_call may_force int needs result",
-            );
-            state
-                .builder
-                .call_may_force_int_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::MayForce, ResKind::Ref) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Ref,
-                "residual_call may_force ref needs result",
-            );
-            state
-                .builder
-                .call_may_force_ref_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Plain, ResKind::Float) => {
-            let dst = expect_result_reg(result, Kind::Float, "residual_call float needs result");
-            state.builder.call_float_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::MayForce, ResKind::Float) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Float,
-                "residual_call may_force float needs result",
-            );
-            state
-                .builder
-                .call_may_force_float_typed(fn_idx, &call_args, dst);
-        }
         (CallFlavor::Pure, ResKind::Int) => {
             let dst = expect_result_reg(result, Kind::Int, "residual_call pure int needs result");
             state.builder.call_pure_int_typed(fn_idx, &call_args, dst);
@@ -1555,16 +1424,6 @@ fn dispatch_residual_call(
             let dst =
                 expect_result_reg(result, Kind::Float, "residual_call pure float needs result");
             state.builder.call_pure_float_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::ReleaseGil, ResKind::Int) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Int,
-                "residual_call release_gil int needs result",
-            );
-            state
-                .builder
-                .call_release_gil_int_typed(fn_idx, &call_args, dst);
         }
         (CallFlavor::ReleaseGil, ResKind::Ref) => {
             // RPython `resoperation.py:1238 call_release_gil_for_descr`
@@ -1580,53 +1439,44 @@ fn dispatch_residual_call(
             // dispatcher / optimizer / backend can consume a
             // `CALL_RELEASE_GIL_R` op; emitting one is a NEW-DEVIATION
             // surface that pyre rejects at the codewriter layer.
-            // The `OpCode::CallReleaseGilR` enum variant has been
-            // removed from `majit-ir` per the upstream comment.
             panic!(
                 "dispatch_residual_call: ReleaseGil + ResKind::Ref has no upstream \
                  counterpart (resoperation.py:1243-1244 `# no such thing`); pyre \
                  must not emit CALL_RELEASE_GIL_R via the residual_call shape."
             );
         }
-        (CallFlavor::ReleaseGil, ResKind::Float) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Float,
-                "residual_call release_gil float needs result",
-            );
+        (_, ResKind::Int) => {
+            let dst = expect_result_reg(result, Kind::Int, "residual_call int needs result");
             state
                 .builder
-                .call_release_gil_float_typed(fn_idx, &call_args, dst);
+                .residual_call_int_canonical_via_target_with_effect_info(
+                    fn_idx,
+                    &call_args,
+                    dst,
+                    stub.effect_info.clone(),
+                );
         }
-        (CallFlavor::LoopInvariant, ResKind::Int) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Int,
-                "residual_call loopinvariant int needs result",
-            );
+        (_, ResKind::Ref) => {
+            let dst = expect_result_reg(result, Kind::Ref, "residual_call ref needs result");
             state
                 .builder
-                .call_loopinvariant_int_typed(fn_idx, &call_args, dst);
+                .residual_call_ref_canonical_via_target_with_effect_info(
+                    fn_idx,
+                    &call_args,
+                    dst,
+                    stub.effect_info.clone(),
+                );
         }
-        (CallFlavor::LoopInvariant, ResKind::Ref) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Ref,
-                "residual_call loopinvariant ref needs result",
-            );
+        (_, ResKind::Float) => {
+            let dst = expect_result_reg(result, Kind::Float, "residual_call float needs result");
             state
                 .builder
-                .call_loopinvariant_ref_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::LoopInvariant, ResKind::Float) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Float,
-                "residual_call loopinvariant float needs result",
-            );
-            state
-                .builder
-                .call_loopinvariant_float_typed(fn_idx, &call_args, dst);
+                .residual_call_float_canonical_via_target_with_effect_info(
+                    fn_idx,
+                    &call_args,
+                    dst,
+                    stub.effect_info.clone(),
+                );
         }
         (_, ResKind::Void) => unreachable!("void residual calls returned before policy dispatch"),
     }

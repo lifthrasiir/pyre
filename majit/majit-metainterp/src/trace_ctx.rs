@@ -447,12 +447,6 @@ impl TraceCtx {
         self.pending_guard_not_invalidated_pc = pc;
     }
 
-    /// heapcache.py: EF_RANDOM_EFFECTS — invalidate ALL caches including
-    /// unescaped objects. Used for operations with completely unknown effects.
-    pub fn invalidate_all_heap_caches(&mut self) {
-        self.heap_cache.invalidate_all_caches();
-    }
-
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
     /// is likely virtual (allocated during this trace and not escaped).
     pub fn is_likely_virtual(&self, obj: OpRef) -> bool {
@@ -3050,6 +3044,19 @@ impl TraceCtx {
     ///
     /// All type-specific call convenience methods delegate to this.
     /// `opcode` selects the call family (CallI/R/F/N, CallPureI/R/F/N, etc.).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython `pyjitpl.py:1995-2068
+    /// do_residual_call` threads the same `calldescr` (with full
+    /// `EffectInfo`) through every result type via `record_nospec`. This
+    /// helper instead derives a default `EffectInfo` per-opcode, losing
+    /// any `oopspecindex`, `read/write_descrs_*`, `can_invalidate`,
+    /// `can_collect`, `call_release_gil_target` set by the codewriter.
+    /// The void residual_call path already uses
+    /// `call_*_void_typed_with_effect` to preserve `EffectInfo`; the
+    /// non-void path will close this gap once Slice 4 of
+    /// `~/.claude/plans/pyre-call-family-canonical-migration.md`
+    /// migrates `BC_CALL_INT/REF/FLOAT × 5 policies + ASSEMBLER` to the
+    /// canonical residual_call encoding.
     pub fn call_typed(
         &mut self,
         opcode: OpCode,
@@ -3723,12 +3730,15 @@ impl TraceCtx {
         )
     }
 
-    /// Record a void-returning GIL-release call (CallReleaseGilN).
-    pub fn call_release_gil_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let arg_types = self.infer_arg_types(args);
-        self.call_release_gil_void_typed(func_ptr, args, &arg_types);
-    }
-
+    // call_release_gil_void / _typed intentionally absent:
+    // production void release-GIL calls are emitted via the canonical
+    // `JitCodeBuilder::call_release_gil_void_canonical_via_target`
+    // (jitcode/assembler.rs) which writes the upstream-shaped
+    // `[savebox, funcbox]+args` operand layout directly. The legacy
+    // `call_family_typed`-based void helper produced a `[func]+args`
+    // layout that did not match `cranelift::compiler.rs:9807`'s
+    // expectation, so it was removed once the only caller migrated.
+    //
     // call_release_gil_ref / _typed intentionally absent:
     // resoperation.py:1243-1244 (`# no such thing`) excludes
     // CALL_RELEASE_GIL_R from the upstream opcode table.
@@ -3749,21 +3759,6 @@ impl TraceCtx {
     pub fn call_loopinvariant_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_loopinvariant_float_typed(func_ptr, args, &arg_types)
-    }
-
-    pub fn call_release_gil_void_typed(
-        &mut self,
-        func_ptr: *const (),
-        args: &[OpRef],
-        arg_types: &[Type],
-    ) {
-        let _ = self.call_family_typed(
-            OpCode::call_release_gil_for_type(Type::Void),
-            func_ptr,
-            args,
-            arg_types,
-            Type::Void,
-        );
     }
 
     pub fn call_release_gil_int_typed(
@@ -3901,11 +3896,260 @@ impl TraceCtx {
         call_args.extend_from_slice(args);
         let result = self
             .recorder
-            .record_op_with_descr(opcode, &call_args, descr);
-        // Loop-invariant calls don't invalidate caches (like pure calls).
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2659 `_record_helper_varargs` parity (mirror
+        // `call_typed` at trace_ctx.rs:3083). Routes
+        // heapcache.invalidate_caches_varargs through the recorded
+        // CALL_LOOPINVARIANT_* so escape / clear_caches_varargs paths
+        // run exactly once per recorded op (heapcache.py:211).
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
         // Concrete resvalue is unknown to this legacy helper; pass 0.
         self.heap_cache
             .call_loopinvariant_cache(descr_index, arg0_int, result, 0);
+        result
+    }
+
+    // ── Slice 4 Slice 1c.0: typed (i/r/f) `_with_effect` recorders ──
+    //
+    // Mirrors the void-family `_with_effect` wrappers (call_*_void_typed_with_effect)
+    // for the int/ref/float result kinds.  Pyre's canonical typed
+    // residual_call recording arms (pyjitpl/dispatch.rs BC_RESIDUAL_CALL_*_{I,R,F})
+    // route through these helpers instead of the legacy `_typed`
+    // siblings that re-derive the EffectInfo from the opcode policy.
+    // RPython `pyjitpl.py:1995-2068 do_residual_call` threads the
+    // calldescr's EffectInfo through `record_nospec` for every result
+    // kind; pyre's void path already honours that — these wrappers
+    // close the i/r/f gap.
+
+    pub fn call_may_force_int_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.call_family_typed_with_effect(
+            OpCode::call_may_force_for_type(Type::Int),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+            effect_info,
+        )
+    }
+
+    pub fn call_may_force_ref_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.call_family_typed_with_effect(
+            OpCode::call_may_force_for_type(Type::Ref),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Ref,
+            effect_info,
+        )
+    }
+
+    pub fn call_may_force_float_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.call_family_typed_with_effect(
+            OpCode::call_may_force_for_type(Type::Float),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+            effect_info,
+        )
+    }
+
+    /// `pyjitpl.py:3671-3681 direct_call_release_gil` — Int result.
+    /// Routes through the shared `record_release_gil_typed_with_effect`
+    /// emitting `[savebox, realfuncaddr] + args` per the void sibling.
+    /// `resoperation.py:1243-1244 # no such thing` excludes the Ref
+    /// flavour, so no `_ref_typed_with_effect` counterpart exists.
+    pub fn call_release_gil_int_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.record_release_gil_typed_with_effect(
+            OpCode::call_release_gil_for_type(Type::Int),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+            effect_info,
+        )
+    }
+
+    pub fn call_release_gil_float_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.record_release_gil_typed_with_effect(
+            OpCode::call_release_gil_for_type(Type::Float),
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+            effect_info,
+        )
+    }
+
+    pub fn call_loopinvariant_int_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+        concrete_resvalue: i64,
+    ) -> OpRef {
+        self.call_loopinvariant_impl_with_effect(
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+            effect_info,
+            concrete_resvalue,
+        )
+    }
+
+    pub fn call_loopinvariant_ref_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+        concrete_resvalue: i64,
+    ) -> OpRef {
+        self.call_loopinvariant_impl_with_effect(
+            func_ptr,
+            args,
+            arg_types,
+            Type::Ref,
+            effect_info,
+            concrete_resvalue,
+        )
+    }
+
+    pub fn call_loopinvariant_float_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+        concrete_resvalue: i64,
+    ) -> OpRef {
+        self.call_loopinvariant_impl_with_effect(
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+            effect_info,
+            concrete_resvalue,
+        )
+    }
+
+    /// pyjitpl.py:2087-2090 parity: heapcache lookup-only for the
+    /// loop-invariant `_with_effect` family. Returns `Some((cached_opref,
+    /// cached_resvalue))` if `heapcache.call_loopinvariant_known_result`
+    /// (heapcache.py:629-634) has a hit, otherwise `None`.
+    ///
+    /// Callers use this to short-circuit BOTH the concrete C call and the
+    /// trace record on a hit — RPython does the lookup before
+    /// `execute_varargs` (`pyjitpl.py:2088 if res is not None: return res`)
+    /// and never executes the call when the cache returns a result.
+    pub fn call_loopinvariant_lookup_with_effect(
+        &self,
+        func_ptr: *const (),
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: &majit_ir::EffectInfo,
+    ) -> Option<(OpRef, i64)> {
+        let descr = crate::call_descr::make_call_descr_with_effect(
+            arg_types,
+            ret_type,
+            effect_info.clone(),
+        );
+        let descr_index = descr.index();
+        let arg0_int = func_ptr as usize as i64;
+        self.heap_cache
+            .call_loopinvariant_known_result(descr_index, arg0_int)
+    }
+
+    /// `call_loopinvariant_impl` variant preserving the caller-supplied
+    /// `EffectInfo`. Mirrors the heapcache lookup/store envelope of the
+    /// non-`_with_effect` sibling but produces the descr through
+    /// `make_call_descr_with_effect` so `oopspecindex`,
+    /// `read/write_descrs_*`, and `can_invalidate` survive into the
+    /// trace IR.
+    fn call_loopinvariant_impl_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+        concrete_resvalue: i64,
+    ) -> OpRef {
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let opcode = OpCode::call_loopinvariant_for_type(ret_type);
+        let descr =
+            crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
+        let descr_index = descr.index();
+        let arg0_int = func_ptr as usize as i64;
+        if let Some((cached, _resvalue)) = self
+            .heap_cache
+            .call_loopinvariant_lookup(descr_index, arg0_int)
+        {
+            return cached;
+        }
+        let mut call_args = vec![func_ref];
+        call_args.extend_from_slice(args);
+        let result = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2659 `_record_helper_varargs` parity (mirror
+        // `call_typed_with_effect` at trace_ctx.rs:3122). Routes
+        // heapcache.invalidate_caches_varargs through the recorded
+        // CALL_LOOPINVARIANT_* so escape / clear_caches_varargs paths
+        // run exactly once per recorded op — without this, the
+        // loop-invariant helper's record skipped mark_escaped_varargs
+        // (heapcache.py:211).
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
+        // pyjitpl.py:2109 call_loopinvariant_now_known(allboxes, descr, res):
+        // store the concrete result so the next iteration's
+        // `call_loopinvariant_known_result` returns it without re-executing
+        // the C call.
+        self.heap_cache
+            .call_loopinvariant_cache(descr_index, arg0_int, result, concrete_resvalue);
         result
     }
 

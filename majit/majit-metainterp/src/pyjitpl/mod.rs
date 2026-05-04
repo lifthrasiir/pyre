@@ -638,6 +638,21 @@ fn default_cls_of_box(raw_ref: i64) -> i64 {
     unsafe { *(raw_ref as *const usize) as i64 }
 }
 
+/// model.py:266-273 + RPython rclass.ll_issubclass default implementation.
+/// Uses the active backend's GC subclass range table, matching
+/// `rclass.py:1133-1137 ll_issubclass`.  The exact-match fallback is only
+/// for standalone fixtures that run without installed GC hooks.
+fn default_issubclass(typeptr: i64, bounding_class: i64) -> bool {
+    if let (Some((cls_min, cls_max)), Some((subcls_min, _))) = (
+        majit_gc::subclass_range(bounding_class as usize),
+        majit_gc::subclass_range(typeptr as usize),
+    ) {
+        cls_min <= subcls_min && subcls_min < cls_max
+    } else {
+        typeptr == bounding_class
+    }
+}
+
 /// pyjitpl.py:2908-2920 `MetaInterp._prepare_bridge_resumption` context.
 ///
 /// Bridge-origin descriptor carried from `start_retrace_from_guard`
@@ -780,6 +795,13 @@ pub struct MetaInterp<M: Clone> {
     /// Default: `Some(default_cls_of_box)` — reads typeptr at offset 0,
     /// matching backend/model.py:199-201.
     pub(crate) cls_of_box: Option<fn(i64) -> i64>,
+
+    /// model.py:266-273 + RPython `rclass.ll_issubclass` parity: callback
+    /// that decides whether `typeptr` is a subclass of `bounding_class`.
+    /// Default: `Some(default_issubclass)` — active GC subclass-range
+    /// lookup, matching `rclass.py:1133-1137 ll_issubclass`. Mirrors the
+    /// blackhole-side resolution at `blackhole.rs:7962-7966`.
+    pub(crate) issubclass: Option<fn(i64, i64) -> bool>,
 
     /// pyjitpl.py:2179 `self.metainterp.staticdata` — per-process
     /// static lookup tables (insns, descrs, indirectcalltargets,
@@ -1505,6 +1527,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_preamble_tokens: HashMap::new(),
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
+            issubclass: Some(default_issubclass),
             staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
             framestack: crate::pyjitpl::MIFrameStack::empty(),
             portal_call_depth: 0,
@@ -2352,6 +2375,13 @@ impl<M: Clone> MetaInterp<M> {
     /// The default reads the first word at offset 0 (typeptr).
     pub fn set_cls_of_box(&mut self, f: fn(i64) -> i64) {
         self.cls_of_box = Some(f);
+    }
+
+    /// model.py:266-273 + RPython `rclass.ll_issubclass` — override the
+    /// default subclass test.  The default reads the active GC subclass
+    /// range table, falling back to exact-match only in standalone fixtures.
+    pub fn set_issubclass(&mut self, f: fn(i64, i64) -> bool) {
+        self.issubclass = Some(f);
     }
 
     /// Set a callback for loop compilation events.
@@ -10525,6 +10555,8 @@ impl<M: Clone> MetaInterp<M> {
             ),
         );
         self.framestack.push(root_frame);
+        let cls_of_box = self.cls_of_box;
+        let issubclass = self.issubclass;
         let action = {
             // Split the &mut borrow so the trace context and framestack
             // can be passed to the machine simultaneously.  `tracing`
@@ -10542,6 +10574,8 @@ impl<M: Clone> MetaInterp<M> {
                 &[],
                 &[],
             );
+            machine.set_cls_of_box(cls_of_box);
+            machine.set_issubclass(issubclass);
             machine.run_to_end(ctx, sym, runtime)
         };
         // RPython's interpret loop drains framestack via popframe; pyre
@@ -16311,6 +16345,36 @@ mod tests {
         let mut op = Op::with_descr(opcode, args, descr);
         op.pos = OpRef::from_raw(pos);
         op
+    }
+
+    fn test_subclass_range(classptr: usize) -> Option<(i64, i64)> {
+        match classptr {
+            0x1000 => Some((10, 20)),
+            0x1100 => Some((12, 13)),
+            0x2000 => Some((30, 31)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn default_issubclass_uses_active_gc_subclass_ranges() {
+        struct ResetGcHooks;
+        impl Drop for ResetGcHooks {
+            fn drop(&mut self) {
+                majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks::default());
+            }
+        }
+
+        let _reset = ResetGcHooks;
+        majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
+            subclass_range: Some(test_subclass_range),
+            ..Default::default()
+        });
+
+        assert!(default_issubclass(0x1100, 0x1000));
+        assert!(!default_issubclass(0x1000, 0x1100));
+        assert!(!default_issubclass(0x2000, 0x1000));
+        assert!(default_issubclass(0xdead, 0xdead));
     }
 
     #[test]

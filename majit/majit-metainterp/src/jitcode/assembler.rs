@@ -1847,6 +1847,15 @@ impl JitCodeBuilder {
         fn_ptr_idx: u16,
         arg_regs: &[JitCallArg],
     ) {
+        // RPython `codewriter/call.py:249-251 getcalldescr`:
+        //   if loopinvariant:
+        //       assert not NON_VOID_ARGS, ("arguments not supported for "
+        //                                  "loop-invariant function!")
+        // Loop-invariant direct_call must take no non-void arguments.
+        assert!(
+            arg_regs.is_empty(),
+            "arguments not supported for loop-invariant function!",
+        );
         self.emit_canonical_call_void_via_target(
             (
                 jitcode::BC_RESIDUAL_CALL_R_V,
@@ -1907,6 +1916,540 @@ impl JitCodeBuilder {
         let calldescr_idx =
             self.emit_canonical_call_void(opcodes, concrete_ptr, arg_regs, calldescr);
         self.call_descr_to_call_target.insert(calldescr_idx, target);
+    }
+
+    /// Sibling of `emit_canonical_call_void` for the non-void result
+    /// shapes. RPython `blackhole.py:1228-1252`
+    /// `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`. The encoding mirrors
+    /// the void form with one trailing `dst:u8` byte appended after
+    /// the calldescr operand (consumed by handlers
+    /// `handler_residual_call_*_{i,r,f}` at `blackhole.rs:6611-6660` via
+    /// `code[p]`).
+    ///
+    /// Slice 4 Slice 0 of `pyre-call-family-canonical-migration.md`:
+    /// foundation. Slice 4 Slice 1a (`residual_call_*_canonical_*`
+    /// wrappers below) is the first non-dormant caller.
+    fn emit_canonical_call_typed(
+        &mut self,
+        opcodes: (u8, u8, u8),
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        dst: u16,
+        dst_kind: JitArgKind,
+    ) -> u16 {
+        let calldescr_idx = self.emit_canonical_call_void(opcodes, funcptr, args, calldescr);
+        // Result-bank touch + trailing dst byte (`>i` / `>r` / `>f`
+        // suffix in `wellknown_bh_insns` keys).
+        match dst_kind {
+            JitArgKind::Int => self.touch_reg(dst),
+            JitArgKind::Ref => self.touch_ref_reg(dst),
+            JitArgKind::Float => self.touch_float_reg(dst),
+        }
+        self.push_reg_u8(dst, "canonical residual_call_*_{i,r,f} dst");
+        calldescr_idx
+    }
+
+    /// Generic typed via_target body — sibling of
+    /// [`Self::emit_canonical_call_void_via_target`] threading `dst` /
+    /// `dst_kind` for the trailing result-bank byte.  Resolves the
+    /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materialises
+    /// `concrete_ptr` in the int constants pool, derives a typed
+    /// `BhCallDescr` from arg kinds + `result_type` + `effect_info`,
+    /// and records the pyre trace/concrete pointer bridge against the
+    /// emitted `d` operand.
+    #[allow(dead_code)]
+    fn emit_canonical_call_typed_via_target(
+        &mut self,
+        opcodes: (u8, u8, u8),
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        result_type: majit_ir::value::Type,
+        effect_info: majit_ir::descr::EffectInfo,
+        dst: u16,
+        dst_kind: JitArgKind,
+        helper_name: &'static str,
+    ) {
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => *target,
+            other => panic!(
+                "{helper_name}: descrs[{fn_ptr_idx}] expected \
+                 RuntimeBhDescr::Call, got {other:?}"
+            ),
+        };
+        let concrete_ptr = target.concrete_ptr as i64;
+        let arg_classes: String = arg_regs
+            .iter()
+            .map(|a| match a.kind {
+                JitArgKind::Int => 'i',
+                JitArgKind::Ref => 'r',
+                JitArgKind::Float => 'f',
+            })
+            .collect();
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            arg_classes,
+            result_type,
+            effect_info,
+        );
+        let calldescr_idx = self.emit_canonical_call_typed(
+            opcodes,
+            concrete_ptr,
+            arg_regs,
+            calldescr,
+            dst,
+            dst_kind,
+        );
+        self.call_descr_to_call_target.insert(calldescr_idx, target);
+    }
+
+    /// Slice 4 of `pyre-call-family-canonical-migration.md`: int-result
+    /// sibling of [`Self::residual_call_void_canonical_via_target`].
+    /// `bhimpl_residual_call_{r,ir,irf}_i` (`blackhole.py:1225-1247`)
+    /// dispatches via `cpu.bh_call_i` and writes the result into
+    /// `bh.registers_i[dst]`.
+    #[allow(dead_code)]
+    pub fn residual_call_int_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::DEFAULT_EFFECT_INFO,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn residual_call_int_canonical_via_target_with_effect_info(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+        effect_info: majit_ir::descr::EffectInfo,
+    ) {
+        self.emit_canonical_call_typed_via_target(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_I,
+                jitcode::BC_RESIDUAL_CALL_IR_I,
+                jitcode::BC_RESIDUAL_CALL_IRF_I,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            majit_ir::value::Type::Int,
+            effect_info,
+            dst,
+            JitArgKind::Int,
+            "residual_call_int_canonical_via_target",
+        );
+    }
+
+    /// Slice 4: ref-result sibling.  `bhimpl_residual_call_{r,ir,irf}_r`
+    /// (`blackhole.py:1228-1250`) dispatches via `cpu.bh_call_r`.
+    #[allow(dead_code)]
+    pub fn residual_call_ref_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_ref_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::DEFAULT_EFFECT_INFO,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn residual_call_ref_canonical_via_target_with_effect_info(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+        effect_info: majit_ir::descr::EffectInfo,
+    ) {
+        self.emit_canonical_call_typed_via_target(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_R,
+                jitcode::BC_RESIDUAL_CALL_IR_R,
+                jitcode::BC_RESIDUAL_CALL_IRF_R,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            majit_ir::value::Type::Ref,
+            effect_info,
+            dst,
+            JitArgKind::Ref,
+            "residual_call_ref_canonical_via_target",
+        );
+    }
+
+    /// Float-result emission body.  `bhimpl_residual_call_irf_f` is the
+    /// only float-result variant per `resoperation.py:1238-1248`, so
+    /// the opcode is fixed — but the handler at
+    /// `handler_residual_call_irf_f` (`blackhole.rs:6644`) always reads
+    /// `read_list_f` after `read_list_r`, so the layout MUST emit an
+    /// (empty-or-not) float list even when the call has no float args.
+    /// This differs from `emit_canonical_call_void`, which skips the
+    /// float-list bytes whenever `has_float == false` (a valid
+    /// optimisation for the `R_V` / `IR_V` variants but illegal for
+    /// `IRF_F`).
+    fn emit_canonical_call_typed_irf_f(
+        &mut self,
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        dst: u16,
+    ) -> u16 {
+        let mut int_regs: Vec<u16> = Vec::new();
+        let mut ref_regs: Vec<u16> = Vec::new();
+        let mut float_regs: Vec<u16> = Vec::new();
+        for &arg in args {
+            self.touch_call_arg(arg);
+            match arg.kind {
+                JitArgKind::Int => int_regs.push(arg.reg),
+                JitArgKind::Ref => ref_regs.push(arg.reg),
+                JitArgKind::Float => float_regs.push(arg.reg),
+            }
+        }
+        let funcptr_const_idx = self.add_const_i(funcptr);
+        let calldescr_idx = self.add_call_descr(calldescr);
+
+        self.start_instr(jitcode::BC_RESIDUAL_CALL_IRF_F);
+        let funcptr_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((funcptr_offset, ConstKind::Int, funcptr_const_idx));
+
+        // IRF mandates all three (count, regs) pairs, even if a list
+        // is empty.  Layout matches `read_list_i` / `_r` / `_f` in the
+        // canonical handler.
+        for (regs, label) in [
+            (&int_regs, "canonical residual_call_irf_f int arg"),
+            (&ref_regs, "canonical residual_call_irf_f ref arg"),
+            (&float_regs, "canonical residual_call_irf_f float arg"),
+        ] {
+            assert!(
+                regs.len() <= u8::MAX as usize,
+                "canonical residual_call_irf_f arg count {} overflows u8",
+                regs.len()
+            );
+            self.push_u8(regs.len() as u8);
+            for &reg in regs {
+                self.push_reg_u8(reg, label);
+            }
+        }
+        self.push_u16(calldescr_idx);
+        self.touch_float_reg(dst);
+        self.push_reg_u8(dst, "canonical residual_call_irf_f dst");
+        calldescr_idx
+    }
+
+    /// Slice 4: float-result sibling.  Always uses `IRF_F` per
+    /// `resoperation.py:1238-1248` ("no such thing" `R_F` / `IR_F`)
+    /// and goes through [`Self::emit_canonical_call_typed_irf_f`] so
+    /// the F list count byte is always present.
+    #[allow(dead_code)]
+    pub fn residual_call_float_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_float_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::DEFAULT_EFFECT_INFO,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn residual_call_float_canonical_via_target_with_effect_info(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+        effect_info: majit_ir::descr::EffectInfo,
+    ) {
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(target)) => *target,
+            other => panic!(
+                "residual_call_float_canonical_via_target: descrs[{fn_ptr_idx}] \
+                 expected RuntimeBhDescr::Call, got {other:?}"
+            ),
+        };
+        let concrete_ptr = target.concrete_ptr as i64;
+        let arg_classes: String = arg_regs
+            .iter()
+            .map(|a| match a.kind {
+                JitArgKind::Int => 'i',
+                JitArgKind::Ref => 'r',
+                JitArgKind::Float => 'f',
+            })
+            .collect();
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            arg_classes,
+            majit_ir::value::Type::Float,
+            effect_info,
+        );
+        let calldescr_idx =
+            self.emit_canonical_call_typed_irf_f(concrete_ptr, arg_regs, calldescr, dst);
+        self.call_descr_to_call_target.insert(calldescr_idx, target);
+    }
+
+    // ── Slice 4 Slice 1b: typed policy variants (dormant) ──
+    //
+    // Mirrors the void-family policy wrappers at lines 1772-1878.  Each
+    // call_<policy>_<result>_canonical_via_target seeds the appropriate
+    // EffectInfo and routes through the typed `_with_effect_info` body
+    // (which selects the right `R_X / IR_X / IRF_X` opcode triple per
+    // result kind).  RPython has no separate bytecode for these
+    // policies — the policy is carried by `calldescr.extra_info`,
+    // matching `pyjitpl.py do_residual_call`.
+
+    /// Emit a canonical `residual_call_*_i` whose calldescr carries
+    /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
+    #[allow(dead_code)]
+    pub fn call_may_force_int_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+        );
+    }
+
+    /// Emit a canonical `residual_call_*_i` whose calldescr carries the
+    /// release-gil marker.  See void sibling at line 1801 for the
+    /// `(asm_helper_addr, saveerr) = (1, 0)` PRE-EXISTING-ADAPTATION.
+    #[allow(dead_code)]
+    pub fn call_release_gil_int_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
+                can_invalidate: true,
+                call_release_gil_target: (1, 0),
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+        );
+    }
+
+    /// Emit a canonical `residual_call_*_i` whose calldescr carries
+    /// `EF_LOOPINVARIANT`.  RPython `codewriter/call.py:249-251
+    /// getcalldescr` rejects loop-invariant calls with non-void args.
+    #[allow(dead_code)]
+    pub fn call_loopinvariant_int_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        assert!(
+            arg_regs.is_empty(),
+            "arguments not supported for loop-invariant function!",
+        );
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::LoopInvariant,
+                ..majit_ir::descr::EffectInfo::default()
+            },
+        );
+    }
+
+    /// Ref-result sibling of [`Self::call_may_force_int_canonical_via_target`].
+    #[allow(dead_code)]
+    pub fn call_may_force_ref_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_ref_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+        );
+    }
+
+    /// Ref-result sibling of [`Self::call_loopinvariant_int_canonical_via_target`].
+    #[allow(dead_code)]
+    pub fn call_loopinvariant_ref_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        assert!(
+            arg_regs.is_empty(),
+            "arguments not supported for loop-invariant function!",
+        );
+        self.residual_call_ref_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::LoopInvariant,
+                ..majit_ir::descr::EffectInfo::default()
+            },
+        );
+    }
+
+    /// Float-result sibling of [`Self::call_may_force_int_canonical_via_target`].
+    #[allow(dead_code)]
+    pub fn call_may_force_float_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_float_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+        );
+    }
+
+    /// Float-result sibling of [`Self::call_release_gil_int_canonical_via_target`].
+    #[allow(dead_code)]
+    pub fn call_release_gil_float_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_float_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
+                can_invalidate: true,
+                call_release_gil_target: (1, 0),
+                ..crate::call_descr::DEFAULT_EFFECT_INFO
+            },
+        );
+    }
+
+    /// Float-result sibling of [`Self::call_loopinvariant_int_canonical_via_target`].
+    #[allow(dead_code)]
+    pub fn call_loopinvariant_float_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        assert!(
+            arg_regs.is_empty(),
+            "arguments not supported for loop-invariant function!",
+        );
+        self.residual_call_float_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            majit_ir::descr::EffectInfo {
+                extraeffect: majit_ir::descr::ExtraEffect::LoopInvariant,
+                ..majit_ir::descr::EffectInfo::default()
+            },
+        );
+    }
+
+    /// Slice 4: low-level int-result direct entry — sibling of
+    /// [`Self::residual_call_void_canonical_typed_args`].  Skips the
+    /// `JitCallTarget` resolution and registers a self-bridging
+    /// `(funcptr, funcptr)` pair (mirrors void at line 1645).
+    #[allow(dead_code)]
+    pub fn residual_call_int_canonical_typed_args(
+        &mut self,
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        dst: u16,
+    ) {
+        let calldescr_idx = self.emit_canonical_call_typed(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_I,
+                jitcode::BC_RESIDUAL_CALL_IR_I,
+                jitcode::BC_RESIDUAL_CALL_IRF_I,
+            ),
+            funcptr,
+            args,
+            calldescr,
+            dst,
+            JitArgKind::Int,
+        );
+        let funcptr = funcptr as *const ();
+        self.call_descr_to_call_target
+            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
+    }
+
+    #[allow(dead_code)]
+    pub fn residual_call_ref_canonical_typed_args(
+        &mut self,
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        dst: u16,
+    ) {
+        let calldescr_idx = self.emit_canonical_call_typed(
+            (
+                jitcode::BC_RESIDUAL_CALL_R_R,
+                jitcode::BC_RESIDUAL_CALL_IR_R,
+                jitcode::BC_RESIDUAL_CALL_IRF_R,
+            ),
+            funcptr,
+            args,
+            calldescr,
+            dst,
+            JitArgKind::Ref,
+        );
+        let funcptr = funcptr as *const ();
+        self.call_descr_to_call_target
+            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
+    }
+
+    #[allow(dead_code)]
+    pub fn residual_call_float_canonical_typed_args(
+        &mut self,
+        funcptr: i64,
+        args: &[JitCallArg],
+        calldescr: majit_translate::jit_codewriter::jitcode::BhCallDescr,
+        dst: u16,
+    ) {
+        let calldescr_idx = self.emit_canonical_call_typed_irf_f(funcptr, args, calldescr, dst);
+        let funcptr = funcptr as *const ();
+        self.call_descr_to_call_target
+            .insert(calldescr_idx, JitCallTarget::new(funcptr, funcptr));
     }
 
     pub fn call_assembler_void_args(&mut self, target_idx: u16, arg_regs: &[u16]) {
@@ -3292,6 +3835,95 @@ mod tests {
             entry.as_bh_descr().unwrap().as_calldescr().arg_classes,
             "ir"
         );
+    }
+
+    #[test]
+    fn residual_call_int_canonical_emits_irf_with_dst_for_mixed_kinds() {
+        // Slice 4 Slice 1a — `residual_call_int_canonical_typed_args`
+        // writes the same byte layout as the void IRF case, plus a
+        // trailing `dst:u8` byte (`>i` suffix in `wellknown_bh_insns`).
+        let mut builder = JitCodeBuilder::new();
+        builder.touch_call_arg(JitCallArg::int(2));
+        builder.touch_call_arg(JitCallArg::reference(3));
+        builder.touch_call_arg(JitCallArg::float(1));
+        builder.touch_reg(7); // dst slot
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            "irf".to_string(),
+            majit_ir::value::Type::Int,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let start = builder.current_pos();
+        builder.residual_call_int_canonical_typed_args(
+            0xDEAD_BEEFi64,
+            &[
+                JitCallArg::int(2),
+                JitCallArg::reference(3),
+                JitCallArg::float(1),
+            ],
+            calldescr,
+            7,
+        );
+        let jitcode = builder.finish();
+        // Opcode + funcptr_reg + countI + regI + countR + regR + countF
+        // + regF + descr×2 + dst = 11 bytes.
+        let bytes = &jitcode.code[start..start + 11];
+        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IRF_I);
+        assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
+        assert_eq!(bytes[2], 1); // countI
+        assert_eq!(bytes[3], 2); // regI
+        assert_eq!(bytes[4], 1); // countR
+        assert_eq!(bytes[5], 3); // regR
+        assert_eq!(bytes[6], 1); // countF
+        assert_eq!(bytes[7], 1); // regF
+        let descr_idx = (bytes[8] as u16) | ((bytes[9] as u16) << 8);
+        assert_eq!(bytes[10], 7); // dst
+        let entry = &jitcode.exec.descrs[descr_idx as usize];
+        let cd = entry.as_bh_descr().unwrap().as_calldescr();
+        assert_eq!(cd.arg_classes, "irf");
+        assert_eq!(cd.result_type, 'i');
+    }
+
+    #[test]
+    fn residual_call_float_canonical_always_uses_irf_even_for_int_only_args() {
+        // Per `resoperation.py:1238-1248`, float-result residual_calls
+        // only have an IRF form — the R / IR shapes are "no such thing".
+        // `emit_canonical_call_typed_irf_f` therefore always emits all
+        // three (count, regs) pairs, even when a list is empty, so the
+        // canonical handler at `blackhole.rs:6644
+        // handler_residual_call_irf_f` can read `read_list_i` /
+        // `read_list_r` / `read_list_f` in sequence.
+        let mut builder = JitCodeBuilder::new();
+        builder.touch_call_arg(JitCallArg::int(2));
+        builder.touch_float_reg(4); // dst float slot
+        let calldescr = majit_translate::jit_codewriter::jitcode::BhCallDescr::from_signature(
+            "i".to_string(),
+            majit_ir::value::Type::Float,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let start = builder.current_pos();
+        builder.residual_call_float_canonical_typed_args(
+            0xCAFE_FACEi64,
+            &[JitCallArg::int(2)],
+            calldescr,
+            4,
+        );
+        let jitcode = builder.finish();
+        // Opcode(1) + funcptr_reg(1) + countI(1) + regI(1) + countR(1)
+        // + countF(1) + descr(2) + dst(1) = 9 bytes for an int-only
+        // float-returning call.
+        let bytes = &jitcode.code[start..start + 9];
+        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IRF_F);
+        assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
+        assert_eq!(bytes[2], 1); // countI
+        assert_eq!(bytes[3], 2); // regI
+        assert_eq!(bytes[4], 0); // countR — no ref args
+        assert_eq!(bytes[5], 0); // countF — no float args
+        let descr_idx = (bytes[6] as u16) | ((bytes[7] as u16) << 8);
+        assert_eq!(bytes[8], 4); // dst float reg
+        let entry = &jitcode.exec.descrs[descr_idx as usize];
+        let cd = entry.as_bh_descr().unwrap().as_calldescr();
+        assert_eq!(cd.arg_classes, "i");
+        assert_eq!(cd.result_type, 'f');
     }
 
     #[test]

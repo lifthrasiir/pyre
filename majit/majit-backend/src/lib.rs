@@ -12,6 +12,7 @@ use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
 pub mod call_stub;
 pub mod jitframe;
 pub mod llmodel;
+pub mod synthetic_cpu;
 
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
@@ -2233,8 +2234,24 @@ pub trait Backend: Send {
     }
     /// RPython rclass.ll_issubclass(typeptr, bounding_class).
     /// Returns true if `typeptr` is a subclass of `bounding_class`.
-    fn bh_issubclass(&self, _typeptr: i64, _bounding_class: i64) -> bool {
-        _typeptr == _bounding_class // default: exact match only
+    fn bh_issubclass(&self, typeptr: i64, bounding_class: i64) -> bool {
+        // rclass.py:1133-1137:
+        //   return int_between(cls.subclassrange_min,
+        //                      subcls.subclassrange_min,
+        //                      cls.subclassrange_max)
+        //
+        // Backends publish the same classptr -> subclassrange lookup via
+        // majit_gc::set_active_gc_guard_hooks when their GC descriptor is
+        // installed.  Keep exact-match behavior as the no-GC-hooks fallback
+        // for backend-only fixtures.
+        if let (Some((cls_min, cls_max)), Some((subcls_min, _))) = (
+            majit_gc::subclass_range(bounding_class as usize),
+            majit_gc::subclass_range(typeptr as usize),
+        ) {
+            cls_min <= subcls_min && subcls_min < cls_max
+        } else {
+            typeptr == bounding_class
+        }
     }
 
     /// model.py: setup_once() — called once when the backend is first used.

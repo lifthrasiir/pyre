@@ -212,6 +212,28 @@ pub(crate) const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
 pub(crate) const BC_RESIDUAL_CALL_R_V: u8 = 159;
 pub(crate) const BC_RESIDUAL_CALL_IR_V: u8 = 160;
 pub(crate) const BC_RESIDUAL_CALL_IRF_V: u8 = 161;
+// canonical residual_call_*_{i,r,f} opcodes — RPython
+// `blackhole.py:1228-1252` `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`.
+// Slice 4 Slice 0 of `pyre-call-family-canonical-migration.md` reserves
+// the non-void result slots; emit-site migration lives in subsequent
+// Slice 4 sub-slices. Policy variants (may_force / release_gil /
+// loopinvariant) reuse these same opcodes and differentiate via
+// `EffectInfo` exactly as Slice 2 unified the void family
+// (`effectinfo.py:255 is_call_release_gil`,
+// `effectinfo.py:169-181 effectinfo_from_writeanalyze`).
+//
+// `R_F` / `IR_F` are intentionally absent — RPython
+// `resoperation.py:1238-1244` only defines `CALL_F` for the `irf` form.
+// `R_R` / `IR_R` mirror `assembler.py:60` accepted shapes; the
+// `_R` variant of `release_gil` is excluded by
+// `resoperation.py:1243-1244 # no such thing`.
+pub(crate) const BC_RESIDUAL_CALL_R_I: u8 = 162;
+pub(crate) const BC_RESIDUAL_CALL_IR_I: u8 = 163;
+pub(crate) const BC_RESIDUAL_CALL_IRF_I: u8 = 164;
+pub(crate) const BC_RESIDUAL_CALL_R_R: u8 = 165;
+pub(crate) const BC_RESIDUAL_CALL_IR_R: u8 = 166;
+pub(crate) const BC_RESIDUAL_CALL_IRF_R: u8 = 167;
+pub(crate) const BC_RESIDUAL_CALL_IRF_F: u8 = 168;
 // Typed return opcodes — RPython `blackhole.py:841-862`
 // `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
 // pyre's portal return is REF (see BC_REF_RETURN) but the insns map
@@ -372,6 +394,21 @@ pub fn wellknown_bh_insns() -> std::collections::HashMap<&'static str, u8> {
     m.insert("residual_call_r_v/iRd", BC_RESIDUAL_CALL_R_V);
     m.insert("residual_call_ir_v/iIRd", BC_RESIDUAL_CALL_IR_V);
     m.insert("residual_call_irf_v/iIRFd", BC_RESIDUAL_CALL_IRF_V);
+    // RPython `blackhole.py:1228-1252` `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`.
+    // Slice 4 Slice 0 of `pyre-call-family-canonical-migration.md` reserves
+    // these canonical keys; the canonical handlers are already wired
+    // (`blackhole.rs:7010-7018 wire_bhimpl_handlers`). Emit-site migration
+    // lives in subsequent Slice 4 sub-slices. RPython
+    // `resoperation.py:1238-1244` excludes `_R` for `release_gil` and
+    // `_F` for `r_*` / `ir_*`; only the shapes below have valid canonical
+    // counterparts.
+    m.insert("residual_call_r_i/iRd>i", BC_RESIDUAL_CALL_R_I);
+    m.insert("residual_call_ir_i/iIRd>i", BC_RESIDUAL_CALL_IR_I);
+    m.insert("residual_call_irf_i/iIRFd>i", BC_RESIDUAL_CALL_IRF_I);
+    m.insert("residual_call_r_r/iRd>r", BC_RESIDUAL_CALL_R_R);
+    m.insert("residual_call_ir_r/iIRd>r", BC_RESIDUAL_CALL_IR_R);
+    m.insert("residual_call_irf_r/iIRFd>r", BC_RESIDUAL_CALL_IRF_R);
+    m.insert("residual_call_irf_f/iIRFd>f", BC_RESIDUAL_CALL_IRF_F);
     // jtransform.py:292-313 / 1672-1688 conditional/known-result family
     // intentionally omitted. The helper-side `BC_COND_CALL_*` /
     // `BC_RECORD_KNOWN_RESULT_*` adapters encode argc + per-arg kind tags

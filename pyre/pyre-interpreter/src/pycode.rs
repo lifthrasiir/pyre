@@ -42,7 +42,12 @@ pub struct W_CodeObject {
     pub code_ptr: *const (),
     /// PyPy: `PyCode.w_globals`.
     pub w_globals: *mut crate::DictStorage,
-    /// pycode.py:96 `self.hidden_applevel = hidden_applevel`.
+    /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
+    /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
+    /// app_main bridge code.  Pyre has no such call site yet, so this
+    /// is always `false` on currently constructed instances; the
+    /// field exists so that `frame.hide()` can read the canonical
+    /// `pyframe.py:521-522 return self.pycode.hidden_applevel`.
     pub hidden_applevel: bool,
 }
 
@@ -175,6 +180,22 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const W_CodeObject)).code_ptr }
 }
 
+/// PyPy: `PyCode.hidden_applevel` (`pycode.py:147`). Reads the field
+/// initialised by `w_code_new`.  `pyframe.py:521-522
+/// hide(self): return self.pycode.hidden_applevel` is the sole caller
+/// in the canonical interpreter; pyre routes through this accessor
+/// from `pyframe.rs::PyFrame::hide`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject`.
+#[inline]
+pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
+}
+
 /// PyPy: `PyCode.w_globals`.
 #[inline]
 pub unsafe fn w_code_get_w_globals(obj: PyObjectRef) -> *mut crate::DictStorage {
@@ -193,15 +214,6 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: *mut crate::Dict
     unsafe {
         (*(obj as *mut W_CodeObject)).w_globals = w_globals;
     }
-}
-
-/// PyPy: `PyCode.hidden_applevel`.
-#[inline]
-pub unsafe fn w_code_hidden_applevel(obj: PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    unsafe { (*(obj as *const W_CodeObject)).hidden_applevel }
 }
 
 /// PyPy: `PyCode.frame_stores_global(w_globals)`.

@@ -702,13 +702,6 @@ impl HeapCache {
         self.field_cache.insert((obj, field_index), value);
     }
 
-    /// heapcache.py: EF_RANDOM_EFFECTS path — invalidate ALL caches
-    /// including unescaped objects. Called for operations with unknown
-    /// effects that could modify any heap state.
-    pub fn invalidate_all_caches(&mut self) {
-        self.reset_keep_likely_virtuals();
-    }
-
     /// heapcache.py: invalidate_unescaped — clear cached values for
     /// escaped objects only. Unescaped (newly allocated) objects cannot
     /// be affected by external calls, so their caches are preserved.
@@ -1915,7 +1908,7 @@ mod tests {
         cache.getfield_now_known(OpRef::ref_op(0), 1, OpRef::ref_op(10));
         cache.getfield_now_known(OpRef::ref_op(1), 2, OpRef::ref_op(20));
 
-        cache.invalidate_all_caches();
+        cache.reset_keep_likely_virtuals();
         assert_eq!(cache.getfield_cached(OpRef::ref_op(0), 1), None);
         assert_eq!(cache.getfield_cached(OpRef::ref_op(1), 2), None);
     }

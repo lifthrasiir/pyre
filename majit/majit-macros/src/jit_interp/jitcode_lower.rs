@@ -1924,27 +1924,20 @@ impl<'c> Lowerer<'c> {
                 crate::jit_interp::CallPolicyKind::ResidualInt
                 | crate::jit_interp::CallPolicyKind::MayForceInt
                 | crate::jit_interp::CallPolicyKind::ReleaseGilInt
-                | crate::jit_interp::CallPolicyKind::LoopInvariantInt
-                | crate::jit_interp::CallPolicyKind::ElidableInt => {
+                | crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
                     let throwaway_reg = self.alloc_reg();
-                    let (untyped_call, typed_call) = match kind {
+                    let canonical_call = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualInt => {
-                            (quote! { call_int }, quote! { call_int_typed })
+                            quote! { residual_call_int_canonical_via_target }
                         }
-                        crate::jit_interp::CallPolicyKind::MayForceInt => (
-                            quote! { call_may_force_int },
-                            quote! { call_may_force_int_typed },
-                        ),
-                        crate::jit_interp::CallPolicyKind::ReleaseGilInt => (
-                            quote! { call_release_gil_int },
-                            quote! { call_release_gil_int_typed },
-                        ),
-                        crate::jit_interp::CallPolicyKind::LoopInvariantInt => (
-                            quote! { call_loopinvariant_int },
-                            quote! { call_loopinvariant_int_typed },
-                        ),
-                        crate::jit_interp::CallPolicyKind::ElidableInt => {
-                            (quote! { call_pure_int }, quote! { call_pure_int_typed })
+                        crate::jit_interp::CallPolicyKind::MayForceInt => {
+                            quote! { call_may_force_int_canonical_via_target }
+                        }
+                        crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
+                            quote! { call_release_gil_int_canonical_via_target }
+                        }
+                        crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
+                            quote! { call_loopinvariant_int_canonical_via_target }
                         }
                         _ => unreachable!(),
                     };
@@ -1957,7 +1950,11 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.#untyped_call(__fn_idx, &[#(#arg_regs),*], #throwaway_reg);
+                                __builder.#canonical_call(
+                                    __fn_idx,
+                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
+                                    #throwaway_reg,
+                                );
                             },
                         );
                     } else {
@@ -1972,7 +1969,41 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.#typed_call(__fn_idx, #typed_args, #throwaway_reg);
+                                __builder.#canonical_call(__fn_idx, #typed_args, #throwaway_reg);
+                            },
+                        );
+                    }
+                }
+                crate::jit_interp::CallPolicyKind::ElidableInt => {
+                    // Pure stays on legacy BC_CALL_PURE_INT (post-record patch
+                    // model alignment is a separate epic outside Slice 1c
+                    // scope).
+                    let throwaway_reg = self.alloc_reg();
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        self.emit_op(
+                            OpMeta::linear(
+                                OpKind::Call,
+                                Register::ints(&arg_regs),
+                                vec![Register::int(throwaway_reg)],
+                            ),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #throwaway_reg);
+                            },
+                        );
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        let __arg_regs: Vec<Register> =
+                            arg_bindings.iter().map(Register::from_binding).collect();
+                        self.emit_op(
+                            OpMeta::linear(
+                                OpKind::Call,
+                                __arg_regs,
+                                vec![Register::int(throwaway_reg)],
+                            ),
+                            quote! {
+                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg);
                             },
                         );
                     }
@@ -2087,43 +2118,43 @@ impl<'c> Lowerer<'c> {
                     };
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
-                            quote! { __builder.call_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
-                            quote! { __builder.call_may_force_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped => {
-                            quote! { __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped => {
-                            quote! { __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableIntWrapped => {
                             quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
-                            quote! { __builder.call_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
-                            quote! { __builder.call_may_force_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_may_force_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped => {
-                            quote! { __builder.call_loopinvariant_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_loopinvariant_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableRefWrapped => {
                             quote! { __builder.call_pure_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
-                            quote! { __builder.call_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.residual_call_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
-                            quote! { __builder.call_may_force_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_may_force_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped => {
-                            quote! { __builder.call_release_gil_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_release_gil_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped => {
-                            quote! { __builder.call_loopinvariant_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_loopinvariant_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
                             quote! { __builder.call_pure_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
@@ -3481,7 +3512,25 @@ impl<'c> Lowerer<'c> {
         let mut result_kind = BindingKind::Int;
         match policy {
             CallPolicySpec::Explicit(kind) => match kind {
-                crate::jit_interp::CallPolicyKind::ResidualInt => {
+                crate::jit_interp::CallPolicyKind::ResidualInt
+                | crate::jit_interp::CallPolicyKind::MayForceInt
+                | crate::jit_interp::CallPolicyKind::ReleaseGilInt
+                | crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
+                    let canonical_call = match kind {
+                        crate::jit_interp::CallPolicyKind::ResidualInt => {
+                            quote! { residual_call_int_canonical_via_target }
+                        }
+                        crate::jit_interp::CallPolicyKind::MayForceInt => {
+                            quote! { call_may_force_int_canonical_via_target }
+                        }
+                        crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
+                            quote! { call_release_gil_int_canonical_via_target }
+                        }
+                        crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
+                            quote! { call_loopinvariant_int_canonical_via_target }
+                        }
+                        _ => unreachable!(),
+                    };
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         self.emit_op(
                             OpMeta::linear(
@@ -3491,7 +3540,11 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_int(__fn_idx, &[#(#arg_regs),*], #reg);
+                                __builder.#canonical_call(
+                                    __fn_idx,
+                                    &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*],
+                                    #reg,
+                                );
                             },
                         );
                     } else {
@@ -3506,97 +3559,7 @@ impl<'c> Lowerer<'c> {
                             ),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_int_typed(__fn_idx, #typed_args, #reg);
-                            },
-                        );
-                    }
-                }
-                crate::jit_interp::CallPolicyKind::MayForceInt => {
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                Register::ints(&arg_regs),
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_may_force_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                __arg_regs,
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
-                            },
-                        );
-                    }
-                }
-                crate::jit_interp::CallPolicyKind::ReleaseGilInt => {
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                Register::ints(&arg_regs),
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_release_gil_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                __arg_regs,
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
-                            },
-                        );
-                    }
-                }
-                crate::jit_interp::CallPolicyKind::LoopInvariantInt => {
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                Register::ints(&arg_regs),
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_loopinvariant_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                __arg_regs,
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                                __builder.#canonical_call(__fn_idx, #typed_args, #reg);
                             },
                         );
                     }
@@ -3649,31 +3612,31 @@ impl<'c> Lowerer<'c> {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
-                            quote! { __builder.call_int_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
-                            quote! { __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped => {
-                            quote! { __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped => {
-                            quote! { __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableIntWrapped => {
                             quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
                             result_kind = BindingKind::Ref;
-                            quote! { __builder.call_ref_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
                             result_kind = BindingKind::Ref;
-                            quote! { __builder.call_may_force_ref_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_may_force_ref_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped => {
                             result_kind = BindingKind::Ref;
-                            quote! { __builder.call_loopinvariant_ref_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_loopinvariant_ref_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableRefWrapped => {
                             result_kind = BindingKind::Ref;
@@ -3681,19 +3644,19 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
                             result_kind = BindingKind::Float;
-                            quote! { __builder.call_float_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.residual_call_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
                             result_kind = BindingKind::Float;
-                            quote! { __builder.call_may_force_float_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_may_force_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped => {
                             result_kind = BindingKind::Float;
-                            quote! { __builder.call_release_gil_float_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_release_gil_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped => {
                             result_kind = BindingKind::Float;
-                            quote! { __builder.call_loopinvariant_float_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_loopinvariant_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
                             result_kind = BindingKind::Float;
@@ -3843,7 +3806,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                             match __policy {
                                 2u8 => {
-                                    __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 3u8 => {
                                     __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
@@ -3859,13 +3822,13 @@ impl<'c> Lowerer<'c> {
                                     #inline_call
                                 }
                                 10u8 => {
-                                    __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 14u8 => {
-                                    __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 18u8 => {
-                                    __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 _ => {
                                     #unsupported
@@ -3906,7 +3869,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                             match __policy {
                                 2u8 => {
-                                    __builder.call_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 3u8 => {
                                     __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
@@ -3922,13 +3885,13 @@ impl<'c> Lowerer<'c> {
                                 #inline_call
                             }
                             10u8 => {
-                                __builder.call_may_force_int_typed(__fn_idx, #typed_args, #reg);
+                                __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
                             14u8 => {
-                                __builder.call_release_gil_int_typed(__fn_idx, #typed_args, #reg);
+                                __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
                             18u8 => {
-                                __builder.call_loopinvariant_int_typed(__fn_idx, #typed_args, #reg);
+                                __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
                             _ => {
                                 #unsupported
