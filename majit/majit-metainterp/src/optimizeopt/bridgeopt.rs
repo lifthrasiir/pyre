@@ -1,689 +1,26 @@
-/// Bridge optimization pass.
-///
-/// Translated from rpython/jit/metainterp/optimizeopt/bridgeopt.py.
-///
-/// When compiling a bridge (alternative path from a failed guard), we know
-/// certain facts about values at the guard failure point — e.g., class is
-/// known from the guard that failed, values are bounded from loop analysis.
-///
-/// This pass imports that knowledge so guards in the bridge body can be
-/// removed or simplified.
-use std::collections::HashMap;
-
-use majit_ir::{GcRef, Op, OpCode, OpRef, Value};
-
-use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
-
-/// Known facts about values at bridge entry.
-#[derive(Clone, Debug)]
-pub struct BridgeKnowledge {
-    /// Values known to be specific constants.
-    pub known_constants: HashMap<OpRef, i64>,
-    /// Values known to be non-null.
-    pub known_nonnull: Vec<OpRef>,
-    /// Values with known class (from GuardClass).
-    pub known_classes: HashMap<OpRef, GcRef>,
-    /// Integer bounds: (opref, lower, upper).
-    pub known_bounds: HashMap<OpRef, (i64, i64)>,
-    /// bridgeopt.py: known heap field values.
-    /// (object_ref, field_descr_index) → value OpRef.
-    pub known_fields: HashMap<(OpRef, u32), OpRef>,
-    /// bridgeopt.py: known array item values.
-    /// (array_ref, index, descr_index) → value OpRef.
-    pub known_arrayitems: HashMap<(OpRef, i64, u32), OpRef>,
-}
-
-impl BridgeKnowledge {
-    pub fn new() -> Self {
-        BridgeKnowledge {
-            known_constants: HashMap::new(),
-            known_nonnull: Vec::new(),
-            known_classes: HashMap::new(),
-            known_bounds: HashMap::new(),
-            known_fields: HashMap::new(),
-            known_arrayitems: HashMap::new(),
-        }
-    }
-
-    /// Add a known field value.
-    pub fn add_known_field(&mut self, obj: OpRef, field_idx: u32, value: OpRef) {
-        self.known_fields.insert((obj, field_idx), value);
-    }
-
-    /// Add a known array item value.
-    pub fn add_known_arrayitem(&mut self, array: OpRef, index: i64, descr_idx: u32, value: OpRef) {
-        self.known_arrayitems
-            .insert((array, index, descr_idx), value);
-    }
-
-    /// Number of total known facts.
-    pub fn num_facts(&self) -> usize {
-        self.known_constants.len()
-            + self.known_nonnull.len()
-            + self.known_classes.len()
-            + self.known_bounds.len()
-            + self.known_fields.len()
-            + self.known_arrayitems.len()
-    }
-}
-
-impl Default for BridgeKnowledge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BridgeKnowledge {
-    /// Whether this knowledge has any useful facts.
-    pub fn is_empty(&self) -> bool {
-        self.known_constants.is_empty()
-            && self.known_nonnull.is_empty()
-            && self.known_classes.is_empty()
-            && self.known_bounds.is_empty()
-    }
-}
-
-/// The bridge optimization pass.
-pub struct OptBridgeOpt {
-    knowledge: BridgeKnowledge,
-    /// Maps OpRef to the Op that produced it, for looking up comparison ops
-    /// when processing GuardTrue/GuardFalse.
-    produced_by: HashMap<OpRef, Op>,
-}
-
-impl OptBridgeOpt {
-    pub fn new() -> Self {
-        OptBridgeOpt {
-            knowledge: BridgeKnowledge::new(),
-            produced_by: HashMap::new(),
-        }
-    }
-
-    /// Create a bridge optimizer with pre-existing knowledge.
-    pub fn with_knowledge(knowledge: BridgeKnowledge) -> Self {
-        OptBridgeOpt {
-            knowledge,
-            produced_by: HashMap::new(),
-        }
-    }
-
-    /// Get the effective bounds for an operand: either from known_bounds or
-    /// from a known constant (where lower == upper == constant value).
-    fn get_bounds(&self, opref: OpRef, ctx: &OptContext) -> Option<(i64, i64)> {
-        if let Some(&bounds) = self.knowledge.known_bounds.get(&opref) {
-            return Some(bounds);
-        }
-        if let Some(val) = ctx.get_constant_int(opref) {
-            return Some((val, val));
-        }
-        None
-    }
-
-    /// Check whether a comparison guard can be eliminated based on known bounds.
-    ///
-    /// For GuardTrue, the condition must be provably always true.
-    /// For GuardFalse, the negation of the condition must be provably always true.
-    fn can_eliminate_comparison_guard(
-        &self,
-        cond_op: &Op,
-        guard_true: bool,
-        ctx: &OptContext,
-    ) -> bool {
-        let cmp_opcode = cond_op.opcode;
-        let a = ctx.get_box_replacement(cond_op.arg(0));
-        let b = ctx.get_box_replacement(cond_op.arg(1));
-
-        let a_bounds = self.get_bounds(a, ctx);
-        let b_bounds = self.get_bounds(b, ctx);
-
-        let (a_lo, a_hi) = match a_bounds {
-            Some(bounds) => bounds,
-            None => return false,
-        };
-        let (b_lo, b_hi) = match b_bounds {
-            Some(bounds) => bounds,
-            None => return false,
-        };
-
-        if guard_true {
-            // Guard asserts the comparison is true.
-            match cmp_opcode {
-                OpCode::IntLt => a_hi < b_lo,
-                OpCode::IntLe => a_hi <= b_lo,
-                OpCode::IntGt => a_lo > b_hi,
-                OpCode::IntGe => a_lo >= b_hi,
-                // Unsigned comparisons: treat as unsigned, bounds still work.
-                OpCode::UintLt => (a_hi as u64) < (b_lo as u64),
-                OpCode::UintLe => (a_hi as u64) <= (b_lo as u64),
-                OpCode::UintGt => (a_lo as u64) > (b_hi as u64),
-                OpCode::UintGe => (a_lo as u64) >= (b_hi as u64),
-                _ => false,
-            }
-        } else {
-            match cmp_opcode {
-                OpCode::IntLt => a_lo >= b_hi,
-                OpCode::IntLe => a_lo > b_hi,
-                OpCode::IntGt => a_hi <= b_lo,
-                OpCode::IntGe => a_hi < b_lo,
-                OpCode::UintLt => (a_lo as u64) >= (b_hi as u64),
-                OpCode::UintLe => (a_lo as u64) > (b_hi as u64),
-                OpCode::UintGt => (a_hi as u64) <= (b_lo as u64),
-                OpCode::UintGe => (a_hi as u64) < (b_lo as u64),
-                _ => false,
-            }
-        }
-    }
-
-    /// bridgeopt.py: deserialize_optimizer_knowledge
-    /// Pre-populate the optimization context with all known facts.
-    pub fn apply_knowledge(&self, ctx: &mut OptContext) {
-        // bridgeopt.py: apply known constants
-        for (&opref, &value) in &self.knowledge.known_constants {
-            ctx.make_constant(opref, Value::Int(value));
-        }
-        // bridgeopt.py: apply known bounds — record as constants if single-value
-        for (&opref, &(lo, hi)) in &self.knowledge.known_bounds {
-            if lo == hi {
-                ctx.make_constant(opref, Value::Int(lo));
-            }
-        }
-    }
-
-    /// bridgeopt.py: number of known class entries (for bitfield size)
-    pub fn num_known_classes(&self) -> usize {
-        self.knowledge.known_classes.len()
-    }
-
-    /// bridgeopt.py: number of known heap fields (for serialize size)
-    pub fn num_known_fields(&self) -> usize {
-        self.knowledge.known_fields.len()
-    }
-
-    /// Get the knowledge for inspection.
-    pub fn knowledge(&self) -> &BridgeKnowledge {
-        &self.knowledge
-    }
-
-    /// Get mutable knowledge for building.
-    pub fn knowledge_mut(&mut self) -> &mut BridgeKnowledge {
-        &mut self.knowledge
-    }
-}
-
-impl Default for OptBridgeOpt {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Optimization for OptBridgeOpt {
-    fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // Track comparison operations so we can look them up from guards.
-        match op.opcode {
-            OpCode::IntLt
-            | OpCode::IntLe
-            | OpCode::IntGt
-            | OpCode::IntGe
-            | OpCode::UintLt
-            | OpCode::UintLe
-            | OpCode::UintGt
-            | OpCode::UintGe
-            | OpCode::IntEq
-            | OpCode::IntNe => {
-                self.produced_by.insert(op.pos, op.clone());
-            }
-            _ => {}
-        }
-
-        match op.opcode {
-            // If the guard value is already known as a constant,
-            // the guard is redundant.
-            OpCode::GuardValue => {
-                let obj = ctx.get_box_replacement(op.arg(0));
-                let expected = ctx.get_box_replacement(op.arg(1));
-                if let (Some(a), Some(b)) =
-                    (ctx.get_constant_int(obj), ctx.get_constant_int(expected))
-                {
-                    if a == b {
-                        return OptimizationResult::Remove;
-                    }
-                }
-                OptimizationResult::PassOn
-            }
-
-            // If we know the value is non-null from bridge knowledge,
-            // the guard is redundant.
-            OpCode::GuardNonnull => {
-                let obj = ctx.get_box_replacement(op.arg(0));
-                if self.knowledge.known_nonnull.contains(&obj) {
-                    return OptimizationResult::Remove;
-                }
-                OptimizationResult::PassOn
-            }
-
-            // If we know the class from bridge knowledge, class guard is redundant.
-            OpCode::GuardClass | OpCode::GuardNonnullClass => {
-                let obj = ctx.get_box_replacement(op.arg(0));
-                if self.knowledge.known_classes.contains_key(&obj) {
-                    return OptimizationResult::Remove;
-                }
-                OptimizationResult::PassOn
-            }
-
-            // Bounds-based guard elimination: if the comparison operands
-            // have known bounds that prove the guard always succeeds,
-            // the guard is redundant.
-            OpCode::GuardTrue | OpCode::GuardFalse => {
-                let cond_ref = ctx.get_box_replacement(op.arg(0));
-                if let Some(cond_op) = self.produced_by.get(&cond_ref) {
-                    let guard_true = op.opcode == OpCode::GuardTrue;
-                    if self.can_eliminate_comparison_guard(cond_op, guard_true, ctx) {
-                        return OptimizationResult::Remove;
-                    }
-                }
-                OptimizationResult::PassOn
-            }
-
-            _ => OptimizationResult::PassOn,
-        }
-    }
-
-    fn setup(&mut self) {}
-
-    fn name(&self) -> &'static str {
-        "bridgeopt"
-    }
-}
-
-// bridgeopt.py:34-50 TAGCONST / TAGINT / TAGBOX dispatch is exposed via
-// `crate::resume::decode_box` (see import at the deserialize call site
-// below). The full-fidelity decoder consults `rd_consts` for TAGCONST,
-// returning a typed `Const{Int,Float,Ptr}` Box that
-// `decoded_box_to_opref` then folds into the optimizer constant pool.
-// Earlier inline `tag_box` / `decode_box` stubs were never wired into
-// the deserialize path and have been removed.
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::optimizeopt::optimizer::Optimizer;
-
-    fn assign_positions(ops: &mut [Op]) {
-        for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::from_raw(i as u32);
-        }
-    }
-
-    #[test]
-    fn test_bridgeopt_removes_guard_nonnull_with_knowledge() {
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_nonnull.push(OpRef::from_raw(100));
-
-        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)])];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert!(
-            result.is_empty(),
-            "guard_nonnull should be removed when known nonnull"
-        );
-    }
-
-    #[test]
-    fn test_bridgeopt_keeps_guard_nonnull_without_knowledge() {
-        let mut ops = vec![Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(100)])];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::new()));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(
-            result.len(),
-            1,
-            "guard_nonnull should be kept without knowledge"
-        );
-    }
-
-    #[test]
-    fn test_bridgeopt_removes_guard_class_with_knowledge() {
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge
-            .known_classes
-            .insert(OpRef::from_raw(100), GcRef::NULL);
-
-        let mut ops = vec![Op::new(
-            OpCode::GuardClass,
-            &[OpRef::from_raw(100), OpRef::from_raw(200)],
-        )];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert!(
-            result.is_empty(),
-            "guard_class should be removed when class known"
-        );
-    }
-
-    // --- Bounds-based guard elimination tests ---
-
-    #[test]
-    fn test_bounds_guard_elimination_int_lt() {
-        // known_bounds for OpRef::from_raw(100) = (0, 50), constant 100
-        // v0 = IntLt(OpRef::from_raw(100), const_200), GuardTrue(v0)
-        // Since 50 < 100, the guard is always true → remove.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef::from_raw(100), (0, 50));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(200)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let mut constants = HashMap::new();
-        constants.insert(200, 100);
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
-
-        // IntLt remains, GuardTrue removed
-        assert_eq!(result.len(), 1, "GuardTrue should be removed");
-        assert_eq!(result[0].opcode, OpCode::IntLt);
-    }
-
-    #[test]
-    fn test_bounds_guard_not_eliminated_int_lt() {
-        // known_bounds for OpRef::from_raw(100) = (0, 200), constant 100
-        // Since 200 >= 100, cannot prove IntLt always true → keep guard.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(100), (0, 200));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(200)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let mut constants = HashMap::new();
-        constants.insert(200, 100);
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
-
-        assert_eq!(result.len(), 2, "GuardTrue should NOT be removed");
-        assert_eq!(result[0].opcode, OpCode::IntLt);
-        assert_eq!(result[1].opcode, OpCode::GuardTrue);
-    }
-
-    #[test]
-    fn test_bounds_guard_elimination_int_ge() {
-        // known_bounds for OpRef::from_raw(100) = (50, 200)
-        // known_bounds for OpRef::from_raw(101) = (10, 50)
-        // IntGe(100, 101): a.lower(50) >= b.upper(50) → always true → remove.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(100), (50, 200));
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(101), (10, 50));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntGe, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(result.len(), 1, "GuardTrue should be removed");
-        assert_eq!(result[0].opcode, OpCode::IntGe);
-    }
-
-    #[test]
-    fn test_bounds_guard_elimination_int_le() {
-        // known_bounds for OpRef::from_raw(100) = (0, 30)
-        // known_bounds for OpRef::from_raw(101) = (30, 100)
-        // IntLe(100, 101): a.upper(30) <= b.lower(30) → always true → remove.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef::from_raw(100), (0, 30));
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(101), (30, 100));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntLe, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(result.len(), 1, "GuardTrue should be removed");
-        assert_eq!(result[0].opcode, OpCode::IntLe);
-    }
-
-    #[test]
-    fn test_bounds_guard_elimination_int_gt() {
-        // known_bounds for OpRef::from_raw(100) = (80, 200)
-        // known_bounds for OpRef::from_raw(101) = (10, 50)
-        // IntGt(100, 101): a.lower(80) > b.upper(50) → always true → remove.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(100), (80, 200));
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(101), (10, 50));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntGt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(result.len(), 1, "GuardTrue should be removed");
-        assert_eq!(result[0].opcode, OpCode::IntGt);
-    }
-
-    #[test]
-    fn test_bounds_guard_false_elimination() {
-        // GuardFalse(IntLt(a, b)) means a >= b.
-        // known_bounds for OpRef::from_raw(100) = (80, 200), OpRef::from_raw(101) = (10, 50)
-        // IntLt false means a >= b: a.lower(80) >= b.upper(50) → always false → remove.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(100), (80, 200));
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(101), (10, 50));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(result.len(), 1, "GuardFalse should be removed");
-        assert_eq!(result[0].opcode, OpCode::IntLt);
-    }
-
-    #[test]
-    fn test_bounds_guard_false_not_eliminated() {
-        // GuardFalse(IntLt(a, b)) means a >= b.
-        // known_bounds for OpRef::from_raw(100) = (0, 200), OpRef::from_raw(101) = (10, 50)
-        // a.lower(0) < b.upper(50), so cannot prove a >= b → keep guard.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(100), (0, 200));
-        knowledge
-            .known_bounds
-            .insert(OpRef::from_raw(101), (10, 50));
-
-        let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::with_knowledge(knowledge)));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(result.len(), 2, "GuardFalse should NOT be removed");
-    }
-
-    #[test]
-    fn test_bounds_guard_with_one_constant_operand() {
-        // OpRef::from_raw(100) has known bounds (0, 50), OpRef::from_raw(200) is a constant 100.
-        // IntLt(100, 200): a.upper(50) < b_const(100) → always true → remove.
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_bounds.insert(OpRef::from_raw(100), (0, 50));
-        knowledge.known_constants.insert(OpRef::from_raw(200), 100);
-
-        let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(200)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let bridge = OptBridgeOpt::with_knowledge(knowledge);
-        let mut ctx = OptContext::new(ops.len());
-        bridge.apply_knowledge(&mut ctx);
-
-        let mut pass = OptBridgeOpt::with_knowledge(bridge.knowledge.clone());
-        // Process IntLt first so produced_by is populated.
-        let r1 = pass.propagate_forward(&ops[0], &mut ctx);
-        assert!(matches!(r1, OptimizationResult::PassOn));
-        // Now process GuardTrue.
-        let r2 = pass.propagate_forward(&ops[1], &mut ctx);
-        assert!(
-            matches!(r2, OptimizationResult::Remove),
-            "GuardTrue should be removed with one constant operand"
-        );
-    }
-
-    #[test]
-    fn test_bounds_guard_no_bounds_info() {
-        // No bounds info for either operand → guard kept.
-        let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(100), OpRef::from_raw(101)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-        ];
-        assign_positions(&mut ops);
-
-        let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(OptBridgeOpt::new()));
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let result = opt.optimize_with_constants_and_inputs(
-            &ops,
-            &mut std::collections::HashMap::new(),
-            1024,
-        );
-
-        assert_eq!(
-            result.len(),
-            2,
-            "Guard should be kept when no bounds info available"
-        );
-    }
-
-    #[test]
-    fn test_bridgeopt_guard_value_with_known_constant() {
-        let mut knowledge = BridgeKnowledge::new();
-        knowledge.known_constants.insert(OpRef::from_raw(100), 42);
-
-        let mut ops = vec![Op::new(
-            OpCode::GuardValue,
-            &[OpRef::from_raw(100), OpRef::from_raw(200)],
-        )];
-        assign_positions(&mut ops);
-
-        let bridge = OptBridgeOpt::with_knowledge(knowledge);
-        // Pre-populate constants
-        let mut ctx = OptContext::new(ops.len());
-        bridge.apply_knowledge(&mut ctx);
-        ctx.make_constant(OpRef::from_raw(200), Value::Int(42));
-
-        // Manual optimization to test with pre-populated constants
-        let mut pass = OptBridgeOpt::new();
-        let result = pass.propagate_forward(&ops[0], &mut ctx);
-        match result {
-            OptimizationResult::Remove => {} // expected
-            other => panic!(
-                "expected Remove, got {:?}",
-                match other {
-                    OptimizationResult::PassOn => "PassOn",
-                    OptimizationResult::Emit(_) => "Emit",
-                    OptimizationResult::Replace(_) => "Replace",
-                    _ => "other",
-                }
-            ),
-        }
-    }
-}
+//! Serializer / deserializer for bridge-side optimizer knowledge.
+//!
+//! Ports `rpython/jit/metainterp/optimizeopt/bridgeopt.py`:
+//!
+//! * `serialize_optimizer_knowledge` (bridgeopt.py:63-122) writes the
+//!   known-class bitfield + heap field/array triples + loopinvariant
+//!   call-result tuples onto a guard's `rd_numb` stream when finishing
+//!   resume data.
+//! * `deserialize_optimizer_knowledge` (bridgeopt.py:124-185) reads those
+//!   sections back at bridge-compile time and applies the facts directly
+//!   onto the bridge optimizer (`Optimizer::make_constant_class`,
+//!   `import_heap_knowledge`, `import_loopinvariant_knowledge`). RPython
+//!   has no separate "BridgeKnowledge" struct or per-guard pass — facts
+//!   are written into the standard optimizer state and consumed by the
+//!   existing OptIntBounds / OptHeap / OptVirtualize passes.
+//!
+//! `decoded_box_to_opref` is a small helper for folding a typed
+//! `Const{Int,Float,Ptr}` from `crate::resume::decode_box` back into the
+//! optimizer's constant pool.
+
+use majit_ir::OpRef;
+
+use crate::optimizeopt::OptContext;
 
 /// bridgeopt.py:124-185 deserialize_optimizer_knowledge.
 ///
@@ -751,7 +88,7 @@ pub fn serialize_optimizer_knowledge(
         if let Some(opref) = livebox {
             let livebox_tp = numb_state
                 .livebox_types
-                .get(&opref.raw())
+                .get(opref)
                 .copied()
                 .unwrap_or_else(|| env.get_type(*opref));
             if livebox_tp != majit_ir::Type::Ref {
@@ -765,14 +102,14 @@ pub fn serialize_optimizer_knowledge(
             }
             shifts += 1;
             if shifts == 6 {
-                numb_state.append_int(bitfield);
+                numb_state.append_int(bitfield as i64);
                 bitfield = 0;
                 shifts = 0;
             }
         }
     }
     if shifts > 0 {
-        numb_state.append_int(bitfield << (6 - shifts));
+        numb_state.append_int((bitfield << (6 - shifts)) as i64);
     }
 
     // bridgeopt.py:92-122: heap knowledge
@@ -794,11 +131,11 @@ pub fn serialize_optimizer_knowledge(
             obj_ok && val_ok
         })
         .collect();
-    numb_state.append_int(filtered_fields.len() as i32);
+    numb_state.append_int(filtered_fields.len() as i64);
     for (obj, descr_idx, val) in &filtered_fields {
         let obj_tag = memo._gettagged(*obj, env, &numb_state.liveboxes, new_liveboxes);
         numb_state.writer.append_short(obj_tag as i32);
-        numb_state.append_int(*descr_idx);
+        numb_state.append_int(*descr_idx as i64);
         let val_tag = memo._gettagged(*val, env, &numb_state.liveboxes, new_liveboxes);
         numb_state.writer.append_short(val_tag as i32);
     }
@@ -813,12 +150,16 @@ pub fn serialize_optimizer_knowledge(
             obj_ok && val_ok
         })
         .collect();
-    numb_state.append_int(filtered_arrayitems.len() as i32);
+    numb_state.append_int(filtered_arrayitems.len() as i64);
     for (obj, index, descr_idx, val) in &filtered_arrayitems {
         let obj_tag = memo._gettagged(*obj, env, &numb_state.liveboxes, new_liveboxes);
         numb_state.writer.append_short(obj_tag as i32);
-        numb_state.append_int(*index as i32);
-        numb_state.append_int(*descr_idx);
+        // bridgeopt.py:106 numb_state.append_int(index) — pass the original
+        // index unchanged; resumecode.py:90-93 enforces SHORT range on the
+        // i64 value, panicking instead of silently wrapping a too-large
+        // index into an i32.
+        numb_state.append_int(*index);
+        numb_state.append_int(*descr_idx as i64);
         let val_tag = memo._gettagged(*val, env, &numb_state.liveboxes, new_liveboxes);
         numb_state.writer.append_short(val_tag as i32);
     }
@@ -830,7 +171,7 @@ pub fn serialize_optimizer_knowledge(
         .copied()
         .filter(|&(_, result)| env.is_const(result) || available_boxes.contains_key(&result))
         .collect();
-    numb_state.append_int(filtered_loopinvariant.len() as i32);
+    numb_state.append_int(filtered_loopinvariant.len() as i64);
     for (const_ptr, result) in &filtered_loopinvariant {
         let const_tag = memo.getconst_int(*const_ptr);
         numb_state.writer.append_short(const_tag as i32);

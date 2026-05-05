@@ -53,18 +53,6 @@ impl PureOpKey {
             descr_identity: op.descr.as_ref().map(majit_ir::descr::descr_identity),
         }
     }
-
-    /// Build a key with swapped arguments (for commutative operations).
-    fn commuted(&self) -> Self {
-        debug_assert!(self.args.len() == 2);
-        let mut swapped = self.args.clone();
-        swapped.swap(0, 1);
-        PureOpKey {
-            opcode: self.opcode,
-            args: swapped,
-            descr_identity: self.descr_identity,
-        }
-    }
 }
 
 /// pure.py:213: known_result_call_pure entry.
@@ -110,18 +98,41 @@ impl RecentPureOps {
         }
     }
 
-    /// Look up a previously recorded result for the given key.
-    /// Linear scan matching pure.py:81-95 lookup().
-    fn lookup(&self, key: &PureOpKey) -> Option<OpRef> {
-        for entry in &self.lst {
-            let Some((k, result)) = entry else {
-                break; // None = no more entries
-            };
-            if k == key {
-                return Some(*result);
-            }
+    /// pure.py:81-95 lookup(self, optimizer, op, commutative=False).
+    ///
+    /// Dispatches to `lookup1` / `lookup2` by arg count; any other
+    /// numargs hits the upstream `assert False` because OptPure only
+    /// runs against ALWAYS_PURE ops with 1 or 2 args (`LOAD_EFFECTIVE_ADDRESS`
+    /// has 4 args but is emitted by `rewrite.py` after OptPure).
+    ///
+    /// `same_box(query, stored)` mirrors RPython's `box.same_box(other)`
+    /// (history.py:204-205, :244): identity for non-Const Boxes (the
+    /// caller is expected to apply `get_box_replacement` to both sides
+    /// first), value equality for Const subclasses. Without this hook,
+    /// raw `OpRef ==` would miss CSE for two distinct constant slots
+    /// holding the same value — a divergence introduced by variant-
+    /// aware OpRef Eq.
+    fn lookup<F: Fn(OpRef, OpRef) -> bool>(
+        &self,
+        key: &PureOpKey,
+        same_box: F,
+        commutative: bool,
+    ) -> Option<OpRef> {
+        match key.args.len() {
+            1 => self.lookup1(key.opcode, key.args[0], key.descr_identity, same_box),
+            2 => self.lookup2(
+                key.opcode,
+                key.args[0],
+                key.args[1],
+                key.descr_identity,
+                commutative,
+                same_box,
+            ),
+            _ => panic!(
+                "RecentPureOps::lookup: numargs must be 1 or 2, got {}",
+                key.args.len()
+            ),
         }
-        None
     }
 
     /// pure.py:57-65 lookup1(opt, box0, descr).
@@ -235,8 +246,13 @@ impl RecentPureOpTable {
         self.buckets[idx].as_mut()
     }
 
-    fn lookup(&self, key: &PureOpKey) -> Option<OpRef> {
-        self.bucket(key.opcode)?.lookup(key)
+    fn lookup<F: Fn(OpRef, OpRef) -> bool>(
+        &self,
+        key: &PureOpKey,
+        same_box: F,
+        commutative: bool,
+    ) -> Option<OpRef> {
+        self.bucket(key.opcode)?.lookup(key, same_box, commutative)
     }
 
     fn insert(&mut self, key: PureOpKey, result: OpRef) {
@@ -396,16 +412,37 @@ impl OptPure {
     }
 
     /// Try to find a cached result for this operation, considering commutativity.
-    fn lookup_pure(&self, key: &PureOpKey) -> Option<OpRef> {
-        if let Some(result) = self.cache.lookup(key) {
-            return Some(result);
-        }
-        // For commutative binary ops, also check with swapped arguments.
-        if key.args.len() == 2 && Self::is_commutative(key.opcode) {
-            let swapped = key.commuted();
-            return self.cache.lookup(&swapped);
-        }
-        None
+    ///
+    /// pure.py:81-95 `RecentPureOps.lookup` dispatches to `lookup1` /
+    /// `lookup2` so that arg comparison goes through `box.same_box`.
+    /// Pyre's typed OpRef Eq matches `same_box` for non-constants
+    /// (identity), but constants need value equality
+    /// (history.py:204-205): two distinct ConstInt slots with the same
+    /// value are `same_box` true even though `OpRef ==` is false.
+    fn lookup_pure(&self, key: &PureOpKey, ctx: &OptContext) -> Option<OpRef> {
+        let same_box = |query: OpRef, stored: OpRef| -> bool {
+            // pure.py:62 / :72-73 — both the currently looked-up op arg
+            // and the stored pure-op arg are walked through forwarding
+            // before same_box comparison.
+            let query = ctx.get_box_replacement(query);
+            let stored = ctx.get_box_replacement(stored);
+            if query == stored {
+                return true;
+            }
+            // history.py:204-205 Const.same_box → same_constant.
+            // OptContext::get_constant covers both namespaces:
+            // CONST_BIT (constant pool) and Forwarded::Const /
+            // op-namespace make_constant. Identical constant values
+            // count as same_box even when their OpRef slots differ.
+            match (ctx.get_constant(query), ctx.get_constant(stored)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+        // pure.py:88-93 — `commutative` is forwarded into `lookup2`,
+        // which checks both `(arg0, arg1)` and `(arg1, arg0)` orderings.
+        let commutative = Self::is_commutative(key.opcode);
+        self.cache.lookup(key, &same_box, commutative)
     }
 
     /// Record a pure operation in the CSE cache.
@@ -440,9 +477,9 @@ impl OptPure {
 
     /// Look up a previously recorded pure operation result.
     /// pure.py: get_pure_result(op)
-    pub fn get_pure_result(&self, op: &Op) -> Option<OpRef> {
+    pub fn get_pure_result(&self, op: &Op, ctx: &OptContext) -> Option<OpRef> {
         let key = PureOpKey::from_op(op);
-        self.lookup_pure(&key)
+        self.lookup_pure(&key, ctx)
     }
 
     /// pure.py:57-65 lookup1(opt, box0, descr).
@@ -959,7 +996,7 @@ impl Optimization for OptPure {
                 // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
                 // it only when the cached opnum matches our OVF opnum.
                 let key = PureOpKey::from_op(&postponed);
-                if let Some(cached_ref) = self.lookup_pure(&key) {
+                if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
                         let cached_ref = ctx.get_box_replacement(cached_ref);
                         ctx.replace_op(postponed.pos, cached_ref);
@@ -983,7 +1020,7 @@ impl Optimization for OptPure {
                         args: postponed.args.to_vec(),
                         descr_identity: None,
                     };
-                    if let Some(cached_ref) = self.lookup_pure(&non_ovf_key) {
+                    if let Some(cached_ref) = self.lookup_pure(&non_ovf_key, ctx) {
                         // _can_reuse_oldop(non_ovf, ovf=true) is false:
                         // skip even though the keys would otherwise match.
                         debug_assert!(!Self::_can_reuse_oldop(non_ovf, postponed.opcode, true));
@@ -1053,7 +1090,7 @@ impl Optimization for OptPure {
             let key = PureOpKey::from_op(op);
 
             // CSE: exact same operation already computed?
-            if let Some(cached_ref) = self.lookup_pure(&key) {
+            if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                 let cached_ref = ctx.get_box_replacement(cached_ref);
                 ctx.replace_op(op.pos, cached_ref);
                 self.last_emitted_was_removed = true;
@@ -2179,6 +2216,67 @@ mod tests {
         );
     }
 
+    /// pure.py:62 / :72-74 same_box semantics for constant args.
+    /// Two distinct ConstInt slots holding the same value must match
+    /// in pure cache lookup. RPython's history.py:204-205 / :244 say
+    /// `same_box(a, b) == same_constant(a, b)` for Const subclasses,
+    /// so cache hits are value-equality not OpRef identity.
+    #[test]
+    fn lookup_pure_matches_same_value_constants_across_slots() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::new(0);
+
+        // Two distinct ConstInt slots, same value (5).
+        let c5_a = ctx.make_constant_int(5);
+        let c5_b = ctx.make_constant_int(5);
+        assert_ne!(c5_a, c5_b, "make_constant_int must mint fresh slots");
+        assert_eq!(
+            ctx.get_constant(c5_a).copied(),
+            ctx.get_constant(c5_b).copied()
+        );
+
+        // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
+        let x = OpRef::int_op(7);
+        pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
+
+        let mut q = Op::new(OpCode::IntAdd, &[c5_b, x]);
+        q.pos = OpRef::from_raw(99);
+        assert_eq!(
+            pass.get_pure_result(&q, &ctx),
+            Some(OpRef::int_op(42)),
+            "lookup_pure must use same_box for constant args (history.py:204)"
+        );
+
+        // A non-constant slot mismatch must still miss.
+        let mut q_miss = Op::new(OpCode::IntAdd, &[c5_b, OpRef::int_op(8)]);
+        q_miss.pos = OpRef::from_raw(100);
+        assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
+    }
+
+    /// pure.py:81-93 applies get_box_replacement to the lookup-side op args
+    /// before comparing them with stored pure op args.
+    #[test]
+    fn lookup_pure_replaces_query_args_before_matching() {
+        let mut pass = OptPure::new();
+        let mut ctx = OptContext::new(0);
+
+        let query_arg = OpRef::int_op(7);
+        let canonical_arg = OpRef::int_op(8);
+        let other_arg = OpRef::int_op(9);
+        let result = OpRef::int_op(42);
+        ctx.replace_op(query_arg, canonical_arg);
+
+        pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
+
+        let mut q = Op::new(OpCode::IntAdd, &[query_arg, other_arg]);
+        q.pos = OpRef::int_op(99);
+        assert_eq!(
+            pass.get_pure_result(&q, &ctx),
+            Some(result),
+            "lookup_pure must apply get_box_replacement to query args"
+        );
+    }
+
     #[test]
     fn test_pure_and_pure_from_args() {
         let mut pass = OptPure::new();
@@ -2188,9 +2286,11 @@ mod tests {
         op.pos = OpRef::from_raw(0);
         pass.pure(&op);
 
+        let ctx = OptContext::new(0);
+
         // Should find it via get_pure_result
         let lookup_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_raw(20)]);
-        assert!(pass.get_pure_result(&lookup_op).is_some());
+        assert!(pass.get_pure_result(&lookup_op, &ctx).is_some());
 
         // pure_from_args
         pass.pure_from_args(
@@ -2200,7 +2300,7 @@ mod tests {
         );
         let mut lookup_mul = Op::new(OpCode::IntMul, &[OpRef::from_raw(30), OpRef::from_raw(40)]);
         lookup_mul.pos = OpRef::from_raw(99);
-        assert!(pass.get_pure_result(&lookup_mul).is_some());
+        assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
 
     #[test]

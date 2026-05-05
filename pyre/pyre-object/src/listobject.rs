@@ -230,9 +230,10 @@ impl W_ListObject {
 ///
 /// Accepts exact W_IntObject (not bool, not int subclass) or W_LongObject
 /// whose value fits in a machine-word integer. Shared with
-/// `specialisedtupleobject.py:172-175 makespecialisedtuple2`.
+/// `specialisedtupleobject.py:172-175 makespecialisedtuple2` and the JIT's
+/// `IntegerListStrategy` identity gate (state.rs:int_strategy_preserves_identity).
 #[inline]
-pub(crate) unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
+pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() {
         return false;
     }

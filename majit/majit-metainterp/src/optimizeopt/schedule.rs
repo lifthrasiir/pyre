@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use majit_ir::{Op, OpCode, OpRef};
+use majit_ir::{Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::dependency::DependencyGraph;
 
@@ -795,9 +795,12 @@ impl VecScheduleState {
         }
     }
 
-    /// Allocate a fresh OpRef for a newly created vector op.
-    pub fn alloc_op_pos(&mut self) -> OpRef {
-        let pos = OpRef::from_raw(self.next_pos);
+    /// Allocate a fresh typed OpRef for a newly created vector op. The
+    /// caller supplies the op's result type (`opcode.result_type()`) so
+    /// the returned OpRef carries the proper `Int/Float/Ref/Void` variant
+    /// instead of the legacy `Untyped` namespace.
+    pub fn alloc_op_pos(&mut self, tp: Type) -> OpRef {
+        let pos = OpRef::op_typed(self.next_pos, tp);
         self.next_pos += 1;
         pos
     }
@@ -820,7 +823,7 @@ impl VecScheduleState {
         count: usize,
     ) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = self.alloc_op_pos();
+        op.pos = self.alloc_op_pos(opcode.result_type());
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
         vinfo.count = count as i16;

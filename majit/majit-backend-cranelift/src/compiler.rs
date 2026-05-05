@@ -4390,8 +4390,16 @@ fn build_type_overrides(
     for (op_idx, op) in ops.iter().enumerate() {
         let result_type = op.result_type();
         if result_type != Type::Void {
-            let var_idx = op_var_index(op, op_idx, inputargs.len()) as u32;
-            if let Some(ia_type) = type_index.inputarg_type(OpRef::from_raw(var_idx)) {
+            // history.py:220 Box.type parity: an op's `.pos` is the typed
+            // OpRef the recorder assigned to its result. Use it directly
+            // — `inputarg_type` looks up by raw position so the variant
+            // tag is variant-blind, and an op without `.pos` (synthetic)
+            // can never collide with an inputarg slot anyway.
+            if op.pos.is_none() {
+                continue;
+            }
+            let var_idx = op.pos.raw();
+            if let Some(ia_type) = type_index.inputarg_type(op.pos) {
                 if ia_type != result_type {
                     op_def_positions.insert(var_idx, op_idx);
                 }

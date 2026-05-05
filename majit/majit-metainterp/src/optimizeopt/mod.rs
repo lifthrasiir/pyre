@@ -3846,7 +3846,7 @@ impl OptContext {
                     return majit_ir::Type::Ref;
                 }
                 livebox_types
-                    .get(&opref.raw())
+                    .get(opref)
                     .copied()
                     .unwrap_or(majit_ir::Type::Ref)
             })

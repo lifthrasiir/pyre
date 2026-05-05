@@ -3066,13 +3066,13 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef::from_raw(pos);
+        op.pos = OpRef::op_typed(pos, opcode.result_type());
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = OpRef::from_raw(pos);
+        op.pos = OpRef::op_typed(pos, opcode.result_type());
         op
     }
 

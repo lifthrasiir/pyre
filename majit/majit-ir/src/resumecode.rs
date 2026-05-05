@@ -73,7 +73,7 @@ pub fn numb_next_n_items(buf: &[u8], size: usize, mut index: usize) -> usize {
 pub fn create_numbering(items: &[i32]) -> Vec<u8> {
     let mut w = Writer::new(items.len());
     for &item in items {
-        w.append_int(item);
+        w.append_int(item as i64);
     }
     w.create_numbering()
 }
@@ -107,14 +107,19 @@ impl Writer {
         self.current.push(item);
     }
 
-    /// resumecode.py: append_int
+    /// resumecode.py:90-93 append_int — `short = rffi.cast(rffi.SHORT, item);
+    /// assert rffi.cast(lltype.Signed, short) == item`. The upstream
+    /// signature is "any int" (RPython `Signed` ≈ machine word); accepting
+    /// `i64` here lets the range check apply to the *original* caller value
+    /// rather than a silently-truncated copy.
     #[track_caller]
-    pub fn append_int(&mut self, item: i32) {
+    pub fn append_int(&mut self, item: i64) {
+        let short = item as i16;
         assert!(
-            item >= i16::MIN as i32 && item <= i16::MAX as i32,
+            short as i64 == item,
             "append_int: value {item} out of i16 range"
         );
-        self.append_short(item);
+        self.append_short(short as i32);
     }
 
     /// resumecode.py: create_numbering

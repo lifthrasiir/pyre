@@ -8329,23 +8329,24 @@ pub fn execute_inline_residual_call(
 // trace_through_callee removed — replaced by build_pending_inline_frame +
 // MetaInterp.push_inline_frame (RPython perform_call parity).
 
-/// listobject.rs:241-249 parity: int strategy only preserves identity for
-/// canonical cached ints. Unique small ints (from w_int_new_unique) trigger
-/// de-specialization to object strategy.
+/// `pypy/objspace/std/listobject.py:2390 is_plain_int1` parity.
 ///
-/// For large ints (outside small cache range), the strategy always keeps them
-/// as raw i64 values regardless of pointer identity.
+/// IntegerListStrategy stores raw i64 and so cannot preserve the
+/// W_*Object pointer identity of its elements. PyPy therefore demotes
+/// to object strategy on insertion of any value whose exact type is
+/// not `W_IntObject` — bools, int subclasses (PyPy `W_IntObjectUser`
+/// from `interpreter/typedef.py:205 subcls`), and `W_LongObject` whose
+/// value doesn't fit in a machine int.
+///
+/// Delegates to the single `pyre_object::is_plain_int1` helper that
+/// already implements the full upstream predicate including the
+/// `w_class != get_instantiate(&INT_TYPE)` int-subclass rejection
+/// (`listobject.rs:235`); a previous in-place `py_type_check` shortcut
+/// at this site was a NEW-DEVIATION that mishandled int subclasses
+/// because pyre stores them with `ob_type == &INT_TYPE` and only
+/// distinguishes them via `w_class` (`typedef.rs:686 w_int_new_unique`).
 pub unsafe fn int_strategy_preserves_identity(value: pyre_object::PyObjectRef) -> bool {
-    unsafe {
-        let v = pyre_object::w_int_get_value(value);
-        if pyre_object::w_int_small_cached(v) {
-            // Small cached range: only canonical pointer preserves int strategy.
-            std::ptr::eq(value, pyre_object::w_int_new(v))
-        } else {
-            // Large ints are always stored as raw i64 in int strategy.
-            true
-        }
-    }
+    unsafe { pyre_object::is_plain_int1(value) }
 }
 
 #[cfg(test)]

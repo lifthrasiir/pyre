@@ -3907,7 +3907,7 @@ mod tests {
             0x00, // d descr index 0
         ];
         let mut tc = fresh_trace_ctx();
-        let mut regs_i = vec![OpRef::from_raw(0)];
+        let mut regs_i = vec![OpRef::input_arg_int(0)];
         let descr_pool = switch_descr_pool(&[(5, 17)]);
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
@@ -3932,7 +3932,7 @@ mod tests {
             err,
             DispatchError::SwitchValueNotConcrete {
                 pc: 0,
-                value: OpRef::from_raw(0),
+                value: OpRef::input_arg_int(0),
             }
         );
     }

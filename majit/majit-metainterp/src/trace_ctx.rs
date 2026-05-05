@@ -1378,8 +1378,13 @@ impl TraceCtx {
                 return Some(tp);
             }
         }
+        // Untyped-OpRef fallback: `opref.ty()` returned None above, so a
+        // variant-aware `get_op_by_pos` would never match a typed
+        // `op.pos`. Look the op up by raw position only — once the
+        // Untyped variant retirement (#171) completes, the entire
+        // fallback chain disappears together with this branch.
         self.recorder
-            .get_op_by_pos(opref)
+            .get_op_by_raw_pos(opref.raw())
             .map(|op| op.result_type())
             .filter(|tp| *tp != Type::Void)
     }
@@ -4970,8 +4975,12 @@ mod tests {
 
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
         let mut recorder = ctx.recorder;
-        let num_inputs = recorder.num_inputargs();
-        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef::from_raw(i as u32)).collect();
+        let inputarg_types = recorder.inputarg_types();
+        let jump_args: Vec<OpRef> = inputarg_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
+            .collect();
         recorder.close_loop(&jump_args);
         let trace = recorder.get_trace();
         // Return only non-JUMP ops

@@ -423,7 +423,7 @@ mod tests {
             opcode,
             args: args.iter().copied().collect(),
             descr,
-            pos: OpRef::from_raw(0),
+            pos: OpRef::op_typed(0, opcode.result_type()),
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,

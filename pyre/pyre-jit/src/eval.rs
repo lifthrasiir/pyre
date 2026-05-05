@@ -6198,12 +6198,9 @@ mod tests {
 
         let run_case = |symbolic_type: Type, name: &str, expected_guard: Option<OpCode>| {
             let mut ctx = TraceCtx::for_test_types(&[symbolic_type]);
-            let local = match symbolic_type {
-                Type::Int => OpRef::input_arg_int(0),
-                Type::Float => OpRef::input_arg_float(0),
-                Type::Ref => OpRef::input_arg_ref(0),
-                Type::Void => OpRef::from_raw(0),
-            };
+            // resoperation.py:719/727/739 — InputArg has only Int/Float/Ref
+            // variants; `input_arg_typed` panics on Type::Void.
+            let local = OpRef::input_arg_typed(0, symbolic_type);
             let frame_ref = ctx.const_ref(frame_ptr as i64);
             let locals_array = trace_state::frame_locals_cells_stack_array_ref(&mut ctx, frame_ref);
             let mut sym = PyreSym::from_test_state(TestSymState {
@@ -6951,12 +6948,9 @@ mod tests {
 
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
             let list = OpRef::input_arg_ref(0);
-            let value = match symbolic_value_type {
-                Type::Int => OpRef::input_arg_int(1),
-                Type::Float => OpRef::input_arg_float(1),
-                Type::Ref => OpRef::input_arg_ref(1),
-                Type::Void => OpRef::from_raw(1),
-            };
+            // resoperation.py:719/727/739 — InputArg has only Int/Float/Ref
+            // variants; `input_arg_typed` panics on Type::Void.
+            let value = OpRef::input_arg_typed(1, symbolic_value_type);
             let mut sym = PyreSym::from_test_state(single_local_test_state(
                 &mut ctx,
                 &frame,

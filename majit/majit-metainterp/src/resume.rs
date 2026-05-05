@@ -143,7 +143,14 @@ pub struct NumberingState {
     /// RPython Box.type parity: type of each TAGBOX livebox, captured at
     /// numbering time when env.get_type() is called. Eliminates the need
     /// for post-hoc type inference cascades in store_final_boxes_in_guard.
-    pub livebox_types: std::collections::HashMap<u32, majit_ir::Type>,
+    ///
+    /// Keyed by the typed OpRef (resoperation.py:719-739 InputArg{Int,
+    /// Ref,Float}, resoperation.py:564-638 *Op mixins) so that
+    /// `InputArgRef(0)` and `RefOp(0)` do not collapse onto the same
+    /// raw u32 — pyre's flat-OpRef stand-in for PyPy's `box is box`
+    /// identity. See `LiveboxMap` (resume.rs:98) for the matching
+    /// typed-key convention.
+    pub livebox_types: std::collections::HashMap<majit_ir::OpRef, majit_ir::Type>,
 }
 
 impl NumberingState {
@@ -159,7 +166,7 @@ impl NumberingState {
     pub fn append_short(&mut self, item: i16) {
         self.writer.append_short(item as i32);
     }
-    pub fn append_int(&mut self, item: i32) {
+    pub fn append_int(&mut self, item: i64) {
         self.writer.append_int(item);
     }
     pub fn patch_current_size(&mut self, index: usize) {
@@ -3408,7 +3415,16 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py:370-374 register_box — add a non-const, non-seen box to
-    /// new_liveboxes with UNASSIGNED or UNASSIGNEDVIRTUAL tag.
+    /// new_liveboxes with `UNASSIGNED`. The virtual classification is
+    /// applied separately by `register_virtual_fields` (resume.py:359),
+    /// which overwrites the entry with `UNASSIGNEDVIRTUAL` (or a
+    /// pre-numbered tag from `liveboxes_from_env`). RPython's
+    /// `register_box` does not consult `env.is_virtual` — see
+    /// resume.py:370-374:
+    ///     if (box is not None and not isinstance(box, Const)
+    ///         and box not in self.liveboxes_from_env
+    ///         and box not in self.liveboxes):
+    ///         self.liveboxes[box] = UNASSIGNED
     fn register_box(
         &self,
         opref: majit_ir::OpRef,
@@ -3419,26 +3435,35 @@ impl ResumeDataLoopMemo {
         if opref.is_none() {
             return;
         }
-        // resume.py:370-374 register_box: constants are handled by
-        // _gettagged (TAGCONST/TAGINT) and don't need livebox slots.
+        // resume.py:371 — constants are handled by _gettagged
+        // (TAGCONST/TAGINT) and don't need livebox slots.
         let is_c = env.is_const(opref);
         let in_env = liveboxes_from_env.contains_key(opref);
         let in_new = new_liveboxes.contains_key(opref);
         if is_c || in_env || in_new {
             return;
         }
-        // resume.py:212-216: check if field is virtual
-        let is_virtual = match env.get_type(opref) {
-            majit_ir::Type::Ref => env.is_virtual_ref(opref),
-            majit_ir::Type::Int => env.is_virtual_raw(opref),
-            _ => false,
-        };
-        let t = if is_virtual {
-            UNASSIGNEDVIRTUAL
-        } else {
-            UNASSIGNED
-        };
-        new_liveboxes.insert(opref, t);
+        new_liveboxes.insert(opref, UNASSIGNED);
+    }
+
+    /// resume.py:359-368 register_virtual_fields — stamp a virtual
+    /// box's livebox tag and queue it for visitor_walk_recursive.
+    ///
+    /// `tagged = liveboxes_from_env.get(virtualbox, UNASSIGNEDVIRTUAL)`
+    /// then `self.liveboxes[virtualbox] = tagged` unconditionally
+    /// (overwriting any UNASSIGNED a prior `register_box` may have
+    /// installed). The pre-numbered branch lets a virtual that was
+    /// already TAGVIRTUAL'd in numbering keep its negative index.
+    fn register_virtual_box(
+        &self,
+        virtualbox: majit_ir::OpRef,
+        liveboxes_from_env: &LiveboxMap,
+        new_liveboxes: &mut LiveboxMap,
+    ) {
+        let tagged = liveboxes_from_env
+            .get(virtualbox)
+            .unwrap_or(UNASSIGNEDVIRTUAL);
+        new_liveboxes.insert(virtualbox, tagged);
     }
 
     /// resume.py:454-509 `_number_virtuals(liveboxes, num_env_virtuals)`.
@@ -3789,7 +3814,7 @@ impl ResumeDataLoopMemo {
                         opref, intrinsic_tp, box_type
                     );
                 }
-                numb_state.livebox_types.insert(opref.raw(), box_type);
+                numb_state.livebox_types.insert(opref, box_type);
                 let t = tag(numb_state.num_boxes, TAGBOX)?;
                 numb_state.num_boxes += 1;
                 t
@@ -3866,13 +3891,13 @@ impl ResumeDataLoopMemo {
         // i.e. payload first, identity last. The snapshot already carries the
         // tracing-time Box identities in that order, so line-by-line parity is
         // to run the whole array through `_number_boxes()` unchanged.
-        numb_state.append_int(snapshot.vable_array.len() as i32);
+        numb_state.append_int(snapshot.vable_array.len() as i64);
         self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
 
         // resume.py:243-247: virtualref array
         let vref_len = snapshot.vref_array.len();
         debug_assert!(vref_len & 1 == 0, "vref_array length must be even");
-        numb_state.append_int((vref_len >> 1) as i32);
+        numb_state.append_int((vref_len >> 1) as i64);
         self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
@@ -3880,8 +3905,8 @@ impl ResumeDataLoopMemo {
         // RPython uses jitcode.get_live_vars_info(pc) at decode time
         // to know how many tagged values each frame has.
         for frame in &snapshot.framestack {
-            numb_state.append_int(frame.jitcode_index);
-            numb_state.append_int(frame.pc);
+            numb_state.append_int(frame.jitcode_index as i64);
+            numb_state.append_int(frame.pc as i64);
             self._number_boxes(&frame.boxes, &mut numb_state, env)?;
         }
 
@@ -3904,7 +3929,7 @@ impl ResumeDataLoopMemo {
     ///   Heap field triples and known-class info for bridge compilation.
     ///
     /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
-    /// `livebox_types` maps OpRef.0 �� Type, captured at numbering time
+    /// `livebox_types` maps typed OpRef → Type, captured at numbering time
     /// (RPython Box.type parity).
     pub fn finish(
         &mut self,
@@ -3917,7 +3942,7 @@ impl ResumeDataLoopMemo {
         Vec<majit_ir::Const>,
         Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         Vec<majit_ir::OpRef>,
-        std::collections::HashMap<u32, majit_ir::Type>,
+        std::collections::HashMap<majit_ir::OpRef, majit_ir::Type>,
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
@@ -3928,19 +3953,22 @@ impl ResumeDataLoopMemo {
         // resume.py:408: self.liveboxes — newly discovered boxes from field walk
         let mut new_liveboxes = LiveboxMap::new();
 
-        // resume.py:414-426: iterate liveboxes_from_env, discover virtual fields.
-        // RPython iterates in insertion order; we sort by tag for determinism.
+        // resume.py:414-426: iterate liveboxes_from_env, discover virtual
+        // fields. RPython walks the dict in insertion order; pyre's
+        // `LiveboxMap` is built on `IndexMap` (resume.rs:98) so the
+        // `.iter()` sequence already matches that order, which the
+        // virtual worklist drain below relies on for byte-identical
+        // visitor_walk_recursive sequencing. Sorting by tag would
+        // observably re-order virtuals across builds.
         //
-        // resoperation.py:38 same_box parity: iter() yields the typed OpRef
-        // each entry was inserted with, so consumers no longer need to
-        // round-trip through `livebox_opref` / `OpRef::from_raw` to recover
+        // TAGBOX placement at `liveboxes[i] = opref` uses the
+        // tag-derived index (resume.py:417), so it is iteration-order-
+        // invariant; only the TAGVIRTUAL worklist push order matters.
+        //
+        // resoperation.py:38 same_box parity: iter() yields the typed
+        // OpRef each entry was inserted with, so consumers no longer
+        // need to round-trip through `OpRef::from_raw` to recover
         // `box.type` (history.py:220).
-        let mut sorted_liveboxes: Vec<(majit_ir::OpRef, i16)> =
-            numb_state.liveboxes.iter().collect();
-        sorted_liveboxes.sort_by_key(|&(_, tagged)| {
-            let (val, tagbits) = untag(tagged);
-            (tagbits, val)
-        });
 
         // Collect virtual fields discovered via env.get_virtual_fields()
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
@@ -3952,7 +3980,7 @@ impl ResumeDataLoopMemo {
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
         let mut virtual_worklist: Vec<majit_ir::OpRef> = Vec::new();
 
-        for &(opref, tagged) in &sorted_liveboxes {
+        for (opref, tagged) in numb_state.liveboxes.iter() {
             let (i, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
                 if (i as usize) < liveboxes.len() {
@@ -3979,20 +4007,23 @@ impl ResumeDataLoopMemo {
             if let Some(vf) = vf_result {
                 // resume.py:362-368: register_virtual_fields
                 for &field_opref in &vf.field_oprefs {
-                    // resume.py:370-374: register_box
+                    // resume.py:370-374: register_box (UNASSIGNED for
+                    // non-virtual fields).
                     self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
-                    // If field is a virtual, add to worklist for recursive processing
+                    // resume.py:419-426 visitor_walk_recursive: if the
+                    // field is a virtual, register_virtual_fields
+                    // overwrites the UNASSIGNED stamp with the env-
+                    // pre-numbered tag (or UNASSIGNEDVIRTUAL).
                     let resolved = env.get_box_replacement(field_opref);
                     if !resolved.is_none()
                         && !virtual_fields.contains_key(&resolved)
                         && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
                     {
-                        // Assign TAGVIRTUAL to nested virtual
-                        if numb_state.liveboxes.get(resolved).is_none()
-                            && new_liveboxes.get(resolved).is_none()
-                        {
-                            new_liveboxes.insert(resolved, UNASSIGNEDVIRTUAL);
-                        }
+                        self.register_virtual_box(
+                            resolved,
+                            &numb_state.liveboxes,
+                            &mut new_liveboxes,
+                        );
                         virtual_worklist.push(resolved);
                     }
                 }
@@ -4008,26 +4039,32 @@ impl ResumeDataLoopMemo {
             // resume.py:438-439: self.register_box(box); self.register_box(fieldbox)
             self.register_box(box_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
             self.register_box(fieldbox, env, &numb_state.liveboxes, &mut new_liveboxes);
-            // resume.py:440-442: info.visitor_walk_recursive(fieldbox, self)
-            if let Some(vf) = env.get_virtual_fields(fieldbox) {
-                for &field_opref in &vf.field_oprefs {
-                    self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
-                    // Nested virtual discovery (same as main worklist above)
-                    let resolved = env.get_box_replacement(field_opref);
-                    if !resolved.is_none()
-                        && !virtual_fields.contains_key(&resolved)
-                        && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
-                    {
-                        if numb_state.liveboxes.get(resolved).is_none()
-                            && new_liveboxes.get(resolved).is_none()
-                        {
-                            new_liveboxes.insert(resolved, UNASSIGNEDVIRTUAL);
-                        }
-                        virtual_worklist.push(resolved);
-                    }
+            // resume.py:440-442 — info.visitor_walk_recursive requires
+            // the fieldbox to be a virtual:
+            //     info = getptrinfo(fieldbox)
+            //     assert info is not None and info.is_virtual()
+            // A non-virtual fieldbox in pending_setfields is an
+            // invariant violation in the optheap producer side; the
+            // previous silent skip masked it.
+            let vf = env.get_virtual_fields(fieldbox).unwrap_or_else(|| {
+                panic!(
+                    "pending_setfields fieldbox {:?} (target={:?}) is not virtual \
+                     (resume.py:441 assert info is not None and info.is_virtual())",
+                    fieldbox, box_opref
+                )
+            });
+            for &field_opref in &vf.field_oprefs {
+                self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
+                let resolved = env.get_box_replacement(field_opref);
+                if !resolved.is_none()
+                    && !virtual_fields.contains_key(&resolved)
+                    && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
+                {
+                    self.register_virtual_box(resolved, &numb_state.liveboxes, &mut new_liveboxes);
+                    virtual_worklist.push(resolved);
                 }
-                virtual_fields.insert(fieldbox, vf);
             }
+            virtual_fields.insert(fieldbox, vf);
         }
 
         // resume.py:440-442 parity: drain worklist for nested virtuals
@@ -4047,11 +4084,11 @@ impl ResumeDataLoopMemo {
                         && !virtual_fields.contains_key(&resolved)
                         && (env.is_virtual_ref(resolved) || env.is_virtual_raw(resolved))
                     {
-                        if numb_state.liveboxes.get(resolved).is_none()
-                            && new_liveboxes.get(resolved).is_none()
-                        {
-                            new_liveboxes.insert(resolved, UNASSIGNEDVIRTUAL);
-                        }
+                        self.register_virtual_box(
+                            resolved,
+                            &numb_state.liveboxes,
+                            &mut new_liveboxes,
+                        );
                         virtual_worklist.push(resolved);
                     }
                 }
@@ -4112,8 +4149,8 @@ impl ResumeDataLoopMemo {
         // discovered during virtual field walking.
         let mut all_livebox_types = numb_state.livebox_types;
         for &opref in &ordered_liveboxes {
-            if !opref.is_none() && !all_livebox_types.contains_key(&opref.raw()) {
-                all_livebox_types.insert(opref.raw(), env.get_type(opref));
+            if !opref.is_none() && !all_livebox_types.contains_key(&opref) {
+                all_livebox_types.insert(opref, env.get_type(opref));
             }
         }
         (
@@ -4372,28 +4409,43 @@ pub fn decode_box(
                 DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
             } else {
                 // bridgeopt.py:54: box = resumestorage.rd_consts[num - TAG_CONST_OFFSET]
+                // — direct list index, IndexError on out-of-range. A
+                // bridgeopt-knowledge stream that names a const slot
+                // outside `rd_consts` is corrupt, and silently swapping
+                // in CONST_NULL hides the corruption from the optimizer.
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                if idx < rd_consts.len() {
-                    DecodedBox::Const(rd_consts[idx])
-                } else {
-                    DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
-                }
+                let c = rd_consts.get(idx).copied().unwrap_or_else(|| {
+                    panic!(
+                        "bridgeopt decode_box TAGCONST out-of-range: idx={} \
+                         rd_consts.len()={} (corrupt knowledge stream — see \
+                         bridgeopt.py:54)",
+                        idx,
+                        rd_consts.len()
+                    )
+                });
+                DecodedBox::Const(c)
             }
         }
         // bridgeopt.py:56: box = ConstInt(num)
         TAGINT => DecodedBox::Const(majit_ir::Const::Int(num as i64)),
         TAGBOX => {
-            // bridgeopt.py:58: box = liveboxes[num]
-            if (num as usize) < liveboxes.len() {
-                DecodedBox::LiveBox(liveboxes[num as usize])
-            } else {
-                DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
-            }
+            // bridgeopt.py:58: box = liveboxes[num] — direct list index,
+            // IndexError on out-of-range. See TAGCONST comment above.
+            let idx = num as usize;
+            let lb = *liveboxes.get(idx).unwrap_or_else(|| {
+                panic!(
+                    "bridgeopt decode_box TAGBOX out-of-range: idx={} \
+                     liveboxes.len()={} (corrupt knowledge stream — see \
+                     bridgeopt.py:58)",
+                    idx,
+                    liveboxes.len()
+                )
+            });
+            DecodedBox::LiveBox(lb)
         }
         _ => {
             // bridgeopt.py:60: raise AssertionError("unreachable")
-            debug_assert!(false, "decode_box: unexpected tag type {}", tag_type);
-            DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+            unreachable!("bridgeopt decode_box: unexpected tag type {}", tag_type);
         }
     }
 }
