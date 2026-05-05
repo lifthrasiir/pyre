@@ -1376,7 +1376,7 @@ fn dispatch_residual_call(
     // predicates instead of a producer-side enum.
     let dispatch_kind = dispatch_kind_for_effect_info(&stub.effect_info);
     if reskind == ResKind::Void {
-        if dispatch_kind == CallFlavor::Pure {
+        if dispatch_kind.is_pure() {
             panic!("dispatch_residual_call: pure void call is not a valid rewrite_call shape");
         }
         state
@@ -1404,27 +1404,19 @@ fn dispatch_residual_call(
     // `check_forces_virtual_or_virtualizable()` /
     // `extraeffect == LoopInvariant`.
     //
-    // Pure stays on the legacy `BC_CALL_PURE_*` bytecode shape because
-    // pyre pre-decides Pure at codewriter time and patches via
-    // `record_result_of_call_pure` after the trace records the plain
-    // CALL — aligning that to RPython's `pyjitpl.py:3553-3579`
-    // post-record patch model is a separate epic outside this slice's
-    // scope.  ReleaseGil + Ref panics per
-    // `resoperation.py:1243-1244 # no such thing`.
+    // Parity #14 Slice C.2+C.3: `CallFlavor::Pure*` now flows through
+    // the canonical `residual_call_*_canonical_via_target_with_effect_info`
+    // catchalls below.  `effect_info_for_call_flavor(Pure*)`
+    // (`flatten.rs`) returns the matching `EF_ELIDABLE_*` per
+    // `call.py:292-299`'s 3-way pick, which lands on the
+    // calldescr's `extra_info`; the canonical
+    // `BC_RESIDUAL_CALL_*_{I,R,F}` walker
+    // (`majit-metainterp/src/pyjitpl/dispatch.rs` Slice C.1) reads
+    // `effectinfo.check_is_elidable()` and routes the result through
+    // `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115`.
+    // ReleaseGil + Ref still panics per `resoperation.py:1243-1244 # no
+    // such thing`.
     match (dispatch_kind, reskind) {
-        (CallFlavor::Pure, ResKind::Int) => {
-            let dst = expect_result_reg(result, Kind::Int, "residual_call pure int needs result");
-            state.builder.call_pure_int_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Pure, ResKind::Ref) => {
-            let dst = expect_result_reg(result, Kind::Ref, "residual_call pure ref needs result");
-            state.builder.call_pure_ref_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Pure, ResKind::Float) => {
-            let dst =
-                expect_result_reg(result, Kind::Float, "residual_call pure float needs result");
-            state.builder.call_pure_float_typed(fn_idx, &call_args, dst);
-        }
         (CallFlavor::ReleaseGil, ResKind::Ref) => {
             // RPython `resoperation.py:1238 call_release_gil_for_descr`
             // explicitly skips the `tp == 'r'` arm with the comment
@@ -2322,13 +2314,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "CallFlavor::Pure has no production producer")]
     fn assemble_residual_call_irf_f_supports_pure_float_flavor() {
+        // Parity #14 Slice C.2+C.3: CallFlavor::Pure now routes through
+        // the canonical `BC_RESIDUAL_CALL_IRF_F` (=161) with the
+        // calldescr carrying ElidableCanRaise.  The walker
+        // (`pyjitpl/dispatch.rs` Slice C.1) reads
+        // `effectinfo.check_is_elidable()` and runs
+        // `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2121`.
         let mut ssarepr = SSARepr::new("residual_call_irf_f");
+        let mut builder = JitCodeBuilder::default();
+        let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
         ssarepr.insns.push(Insn::op_with_result(
             "residual_call_irf_f",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(fn_idx as i64),
                 Operand::ListOfKind(ListOfKind::new(
                     Kind::Int,
                     vec![Operand::Register(Register::new(Kind::Int, 0))],
@@ -2343,7 +2342,7 @@ mod tests {
                 )),
                 Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
                     effect_info: super::super::flatten::effect_info_for_call_flavor(
-                        CallFlavor::Pure,
+                        CallFlavor::PureCanRaise,
                     ),
                     arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Float],
                 })),
@@ -2353,7 +2352,7 @@ mod tests {
 
         let jitcode = assemble(
             &mut ssarepr,
-            JitCodeBuilder::default(),
+            builder,
             Some(NumRegs {
                 int: 1,
                 ref_: 1,
@@ -2361,8 +2360,8 @@ mod tests {
             }),
         );
 
-        // majit jitcode/mod.rs: `BC_CALL_PURE_FLOAT = 35`.
-        assert_eq!(jitcode.code[0], 35);
+        // majit_translate::insns::BC_RESIDUAL_CALL_IRF_F = 168.
+        assert_eq!(jitcode.code[0], 168);
     }
 
     #[test]

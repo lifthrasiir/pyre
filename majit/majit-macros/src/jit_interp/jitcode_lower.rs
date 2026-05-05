@@ -1974,39 +1974,47 @@ impl<'c> Lowerer<'c> {
                         );
                     }
                 }
-                crate::jit_interp::CallPolicyKind::ElidableInt => {
-                    // Pure stays on legacy BC_CALL_PURE_INT (post-record patch
-                    // model alignment is a separate epic outside Slice 1c
-                    // scope).
+                crate::jit_interp::CallPolicyKind::ElidableInt
+                | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
+                | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
+                    // Parity #14 Slice C.4 + Parity #20: Pure flows through
+                    // the canonical `BC_RESIDUAL_CALL_*_I` family with the
+                    // calldescr's `extra_info` set per `call.py:292-299
+                    // _canraise(op)`'s 3-way pick.  The walker
+                    // (`pyjitpl/dispatch.rs` Slice C.1) reads
+                    // `effectinfo.check_is_elidable()` and routes through
+                    // `record_result_of_call_pure` mirroring
+                    // `pyjitpl.py:2111-2115`; the trailing
+                    // `GUARD_NO_EXCEPTION` is gated on
+                    // `effectinfo.check_can_raise(False)` so cannot-raise
+                    // elidable callees skip it.
                     let throwaway_reg = self.alloc_reg();
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                Register::ints(&arg_regs),
-                                vec![Register::int(throwaway_reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #throwaway_reg);
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                __arg_regs,
-                                vec![Register::int(throwaway_reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg);
-                            },
-                        );
-                    }
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let call_stmt = match kind {
+                        crate::jit_interp::CallPolicyKind::ElidableInt => quote! {
+                            __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg);
+                        },
+                        crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise => quote! {
+                            __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #throwaway_reg);
+                        },
+                        crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => quote! {
+                            __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #throwaway_reg);
+                        },
+                        _ => unreachable!(),
+                    };
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::int(throwaway_reg)],
+                        ),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            #call_stmt
+                        },
+                    );
                 }
                 crate::jit_interp::CallPolicyKind::ResidualVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
@@ -2091,15 +2099,21 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
-                | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
+                | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableFloatOrMemerrorWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let throwaway_reg = self.alloc_reg();
@@ -2109,11 +2123,19 @@ impl<'c> Lowerer<'c> {
                         | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
                         | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                         | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
-                        | crate::jit_interp::CallPolicyKind::ElidableIntWrapped => BindingKind::Int,
+                        | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
+                        | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
+                        | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped => {
+                            BindingKind::Int
+                        }
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped
                         | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
                         | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
-                        | crate::jit_interp::CallPolicyKind::ElidableRefWrapped => BindingKind::Ref,
+                        | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
+                        | crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped
+                        | crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped => {
+                            BindingKind::Ref
+                        }
                         _ => BindingKind::Float,
                     };
                     let call_stmt = match kind {
@@ -2130,7 +2152,13 @@ impl<'c> Lowerer<'c> {
                             quote! { __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableIntWrapped => {
-                            quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped => {
+                            quote! { __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped => {
+                            quote! { __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
                             quote! { __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
@@ -2142,7 +2170,13 @@ impl<'c> Lowerer<'c> {
                             quote! { __builder.call_loopinvariant_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableRefWrapped => {
-                            quote! { __builder.call_pure_ref_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_pure_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped => {
+                            quote! { __builder.call_pure_ref_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped => {
+                            quote! { __builder.call_pure_ref_canonical_via_target_or_memerror(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
                             quote! { __builder.residual_call_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
@@ -2157,7 +2191,13 @@ impl<'c> Lowerer<'c> {
                             quote! { __builder.call_loopinvariant_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
-                            quote! { __builder.call_pure_float_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                            quote! { __builder.call_pure_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped => {
+                            quote! { __builder.call_pure_float_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableFloatOrMemerrorWrapped => {
+                            quote! { __builder.call_pure_float_canonical_via_target_or_memerror(__fn_idx, #typed_args, #throwaway_reg); }
                         }
                         _ => unreachable!(),
                     };
@@ -3564,50 +3604,60 @@ impl<'c> Lowerer<'c> {
                         );
                     }
                 }
-                crate::jit_interp::CallPolicyKind::ElidableInt => {
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                Register::ints(&arg_regs),
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #reg);
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(
-                                OpKind::Call,
-                                __arg_regs,
-                                vec![Register::new(result_kind, reg)],
-                            ),
-                            quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
-                            },
-                        );
-                    }
+                crate::jit_interp::CallPolicyKind::ElidableInt
+                | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
+                | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
+                    // Parity #14 Slice C.4 + Parity #20: see the stmt-form
+                    // ElidableInt arm earlier in this file for the
+                    // canonical migration rationale and the 3-way
+                    // `_canraise(op)` pick from `call.py:292-299`.
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    let call_stmt = match kind {
+                        crate::jit_interp::CallPolicyKind::ElidableInt => quote! {
+                            __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
+                        },
+                        crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise => quote! {
+                            __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
+                        },
+                        crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => quote! {
+                            __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
+                        },
+                        _ => unreachable!(),
+                    };
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::new(result_kind, reg)],
+                        ),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            #call_stmt
+                        },
+                    );
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
-                | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
+                | crate::jit_interp::CallPolicyKind::ElidableFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped
+                | crate::jit_interp::CallPolicyKind::ElidableFloatOrMemerrorWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let call_stmt = match kind {
@@ -3624,7 +3674,13 @@ impl<'c> Lowerer<'c> {
                             quote! { __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ElidableIntWrapped => {
-                            quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped => {
+                            quote! { __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped => {
+                            quote! { __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
                             result_kind = BindingKind::Ref;
@@ -3640,7 +3696,15 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::ElidableRefWrapped => {
                             result_kind = BindingKind::Ref;
-                            quote! { __builder.call_pure_ref_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_pure_ref_canonical_via_target(__fn_idx, #typed_args, #reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_pure_ref_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped => {
+                            result_kind = BindingKind::Ref;
+                            quote! { __builder.call_pure_ref_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg); }
                         }
                         crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
                             result_kind = BindingKind::Float;
@@ -3660,7 +3724,15 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::ElidableFloatWrapped => {
                             result_kind = BindingKind::Float;
-                            quote! { __builder.call_pure_float_typed(__fn_idx, #typed_args, #reg); }
+                            quote! { __builder.call_pure_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_pure_float_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg); }
+                        }
+                        crate::jit_interp::CallPolicyKind::ElidableFloatOrMemerrorWrapped => {
+                            result_kind = BindingKind::Float;
+                            quote! { __builder.call_pure_float_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg); }
                         }
                         _ => unreachable!(),
                     };
@@ -3809,7 +3881,7 @@ impl<'c> Lowerer<'c> {
                                     __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 3u8 => {
-                                    __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 4u8 => {
                                     let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
@@ -3872,7 +3944,7 @@ impl<'c> Lowerer<'c> {
                                     __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 3u8 => {
-                                    __builder.call_pure_int_typed(__fn_idx, #typed_args, #reg);
+                                    __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 4u8 => {
                                 let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =

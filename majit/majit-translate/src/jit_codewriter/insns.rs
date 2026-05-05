@@ -47,39 +47,52 @@ pub const BC_INLINE_CALL: u8 = 17;
 // `(fn_ptr_idx:u16, num_args:u16, [(kind:u8, reg:u16)]...)` payload in
 // favour of canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` (=159..=161).
 pub const BC_MOVE_I: u8 = 21;
-pub const BC_CALL_INT: u8 = 22;
-pub const BC_CALL_PURE_INT: u8 = 23;
+// slot 22 (formerly BC_CALL_INT) freed by Slice 4 Phase B.4 followup —
+// the canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_I` family supersedes the
+// untyped legacy int-call opcode.  See pyre-call-family-canonical-
+// migration.md for the matching producer/consumer migration.
+// slot 23 (formerly BC_CALL_PURE_INT) freed by Parity #14 Slice C.5 —
+// elidable EffectInfo on the canonical `BC_RESIDUAL_CALL_*_I` calldescr
+// drives `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115
+// do_residual_call`.  The Pure-vs-non-Pure surface is no longer encoded
+// in the opcode tag.
 // Ref-typed bytecodes
 pub const BC_MOVE_R: u8 = 27;
-pub const BC_CALL_REF: u8 = 28;
-pub const BC_CALL_PURE_REF: u8 = 29;
+// slot 28 (formerly BC_CALL_REF) freed by Slice 4 Phase B.4 — the
+// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_R` family supersedes the
+// untyped legacy ref-call opcode.  See pyre-call-family-canonical-
+// migration.md for the matching producer/consumer migration.
+// slot 29 (formerly BC_CALL_PURE_REF) freed by Parity #14 Slice C.5 —
+// see slot 23 above.
 // Float-typed bytecodes
 pub const BC_MOVE_F: u8 = 33;
-pub const BC_CALL_FLOAT: u8 = 34;
-pub const BC_CALL_PURE_FLOAT: u8 = 35;
-pub const BC_CALL_MAY_FORCE_INT: u8 = 38;
-pub const BC_CALL_MAY_FORCE_REF: u8 = 39;
-pub const BC_CALL_MAY_FORCE_FLOAT: u8 = 40;
-// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed by Slice 1c — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family carries the may_force
-// policy on `calldescr.extra_info` (RPython `effectinfo.py:201
-// EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`), not via a separate opcode.
-pub const BC_CALL_RELEASE_GIL_INT: u8 = 42;
+// slot 34 (formerly BC_CALL_FLOAT) freed by Slice 4 Phase B.4 — see
+// the BC_CALL_REF (slot 28) note above for the canonical replacement.
+// slot 35 (formerly BC_CALL_PURE_FLOAT) freed by Parity #14 Slice C.5
+// — see slot 23 above.
+// slots 38..=40 (formerly BC_CALL_MAY_FORCE_{INT,REF,FLOAT}) freed by
+// Slice 4 Phase B.4 — the may_force policy now rides on
+// `EffectInfo.extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` carried
+// by the canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_{I,R,F}` family
+// (`effectinfo.py:201`).
+// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed by Slice 1c — same
+// EffectInfo-carries-policy rationale as above; see slots 38..=40.
+// slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed by Slice 4 Phase B.4
+// — release-GIL policy rides on
+// `EffectInfo.call_release_gil_target` (`effectinfo.py:255
+// is_call_release_gil`).
 // BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
 // resoperation.py:1243-1244 (`# no such thing`) excludes
 // CALL_RELEASE_GIL_R from the upstream opcode table.
-pub const BC_CALL_RELEASE_GIL_FLOAT: u8 = 44;
-// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed by Slice 1c — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family marks release_gil
-// via `EffectInfo.call_release_gil_target` (RPython
-// `effectinfo.py:255 is_call_release_gil`), not a separate opcode.
-pub const BC_CALL_LOOPINVARIANT_INT: u8 = 46;
-pub const BC_CALL_LOOPINVARIANT_REF: u8 = 47;
-pub const BC_CALL_LOOPINVARIANT_FLOAT: u8 = 48;
-// slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed by Slice 1c — the
-// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_V` family carries
-// `EF_LOOPINVARIANT` on `calldescr.extra_info` (RPython
-// `effectinfo.py:202 EF_LOOPINVARIANT`), not a separate opcode.
+// slot 44 (formerly BC_CALL_RELEASE_GIL_FLOAT) freed by Slice 4 Phase
+// B.4 — see slot 42 above.
+// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed by Slice 1c — see
+// slot 42 above.
+// slots 46..=48 (formerly BC_CALL_LOOPINVARIANT_{INT,REF,FLOAT}) freed
+// by Slice 4 Phase B.4 — loop-invariant policy rides on
+// `EffectInfo.extraeffect = EF_LOOPINVARIANT` (`effectinfo.py:202`).
+// slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed by Slice 1c — see
+// slots 46..=48 above.
 pub const BC_CALL_ASSEMBLER_INT: u8 = 50;
 pub const BC_CALL_ASSEMBLER_REF: u8 = 51;
 pub const BC_CALL_ASSEMBLER_FLOAT: u8 = 52;

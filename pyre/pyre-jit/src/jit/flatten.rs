@@ -439,15 +439,28 @@ pub struct CallDescrStub {
 /// | `extradescrs`                  | `_jit_oopspec_extra_` decorator       |
 /// | `can_collect`                  | `collect_analyzer.analyze(op)`        |
 ///
-/// None of those analyzers are ported to pyre yet — the entire
-/// `majit-translate/src/{annotator,rtyper,translator}` infrastructure
-/// (and the `readwrite_analyzer` / `quasiimmut_analyzer` /
-/// `randomeffects_analyzer` / `collect_analyzer` callees in
-/// `rpython/jit/codewriter/`) is on the unported roadmap.  In
-/// consequence, every variant below leaves the analyzer-derived
-/// fields at `EffectInfo::default()` (`oopspecindex = None`,
-/// `*_descrs_*` = 0, `can_invalidate = false`, `extradescrs = None`,
-/// `can_collect = true` per the Default impl).
+/// All six analyzers + the public `getcalldescr` are ported in
+/// `majit-translate/src/jit_codewriter/call.rs`:
+///
+/// | Analyzer                | Pyre site                              |
+/// |-------------------------|----------------------------------------|
+/// | `RaiseAnalyzer`         | `analyze_can_raise_impl` (call.rs:2271)|
+/// | `VirtualizableAnalyzer` | `analyze_forces_virtualizable` (:2341) |
+/// | `RandomEffectsAnalyzer` | `analyze_random_effects` (:2401)       |
+/// | `QuasiImmutAnalyzer`    | `analyze_can_invalidate` (:2452)       |
+/// | `CollectAnalyzer`       | `analyze_can_collect` (:2505)          |
+/// | `ReadWriteAnalyzer`     | `analyze_readwrite` (:3123)            |
+/// | `_canraise` 3-way       | `_canraise` (:2773)                    |
+/// | `getcalldescr`          | `getcalldescr` (:2799)                 |
+///
+/// What is NOT plumbed is the *consumer side*: this producer (the
+/// pyre-jit `CallFlavor` enum) does not query
+/// `CallControl::getcalldescr` for the residual call's callee.  Every
+/// variant below therefore leaves the analyzer-derived fields at
+/// `EffectInfo::default()` (`oopspecindex = None`, `*_descrs_*` = 0,
+/// `can_invalidate = false`, `extradescrs = None`, `can_collect =
+/// true` per the Default impl) — the stub answer for callees the
+/// producer cannot identify by calldescr.
 ///
 /// Implications for the optimizer (audited in
 /// `majit-metainterp/src/optimizeopt/`):
@@ -474,14 +487,15 @@ pub struct CallDescrStub {
 ///     specialization unreachable (also unported on the consumer
 ///     side; matches by missing).
 ///
-/// Convergence: porting `majit-translate/src/jit_codewriter/call.rs`'s
-/// analyzer trio (a multi-session epic — depends on annotator/rtyper/
-/// translator) replaces the stub with real per-callee EI values.
-/// Until then, this function is the producer-side stub that future
-/// EI-aware optimizations must be careful not to rely on.  When a
-/// concrete callee needs a specific EI field set (e.g. an
-/// oopspec-specialized helper), construct the `EffectInfo` directly
-/// at the call site rather than extending this `CallFlavor` mnemonic.
+/// Convergence (Task #64): build a callee-identity-keyed registry of
+/// codewriter `getcalldescr` results so this producer can resolve a
+/// residual call's `EffectInfo` from `CallControl` instead of returning
+/// a `CallFlavor`-bucketed stub.  Until that plumbing lands, this
+/// function is the producer-side fallback that future EI-aware
+/// optimizations must be careful not to rely on.  When a concrete
+/// callee needs a specific EI field set (e.g. an oopspec-specialized
+/// helper), construct the `EffectInfo` directly at the call site
+/// rather than extending this `CallFlavor` mnemonic.
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
@@ -516,77 +530,26 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
             extraeffect: ExtraEffect::LoopInvariant,
             ..EffectInfo::default()
         },
-        // RPython `call.py:292-299 getcalldescr` chooses one of three
-        // elidable extraeffects based on the callee's static raise
-        // analysis:
+        // `call.py:292-299 getcalldescr`'s 3-way elidable pick:
         //
         //     elif elidable:
         //         cr = self._canraise(op)
-        //         if cr == "mem":
-        //             extraeffect = EF_ELIDABLE_OR_MEMORYERROR
-        //         elif cr:
-        //             extraeffect = EF_ELIDABLE_CAN_RAISE
-        //         else:
-        //             extraeffect = EF_ELIDABLE_CANNOT_RAISE
+        //         if cr == "mem":      extraeffect = EF_ELIDABLE_OR_MEMORYERROR
+        //         elif cr:             extraeffect = EF_ELIDABLE_CAN_RAISE
+        //         else:                extraeffect = EF_ELIDABLE_CANNOT_RAISE
         //
-        // The three differ in `check_can_raise(False)`:
-        // `ElidableCannotRaise (0) < CannotRaise (2)` → false (no
-        // GUARD_NO_EXCEPTION),
-        // `ElidableOrMemoryError (3) > CannotRaise (2)` → true,
-        // `ElidableCanRaise (4) > CannotRaise (2)` → true.  Picking
-        // the wrong one drops a guard the trace needs.
-        //
-        // Pyre has no static-raise analyzer (`randomeffects_analyzer`
-        // / `quasiimmut_analyzer` / `_canraise` infrastructure is
-        // unported — see `majit-translate` roadmap).  An earlier
-        // attempt to default to `ElidableCanRaise` (the conservative
-        // variant that satisfies `check_can_raise(False)`) was
-        // *itself* a NEW-DEVIATION because pyre's flatten path
-        // collapses `CallFlavor::Pure` to `BC_CALL_PURE_*` bytecode
-        // (`assembler.rs:1491` `(CallFlavor::Pure, _) => call_pure_*`),
-        // and the runtime dispatcher (`majit-metainterp/src/pyjitpl/
-        // dispatch.rs:1895 + 2004 + 2115`) consumes
-        // `BC_CALL_PURE_*` via `record_result_of_call_pure` without
-        // reading the descr's `EffectInfo` — so the
-        // `EF_ELIDABLE_CAN_RAISE`'s `GUARD_NO_EXCEPTION` requirement
-        // is silently dropped at runtime.  Producing
-        // `ElidableCanRaise` here therefore produces a *worse*
-        // parity surface than panicking: it looks correct on paper
-        // but the guard is never actually emitted, regressing main's
-        // fail-fast behaviour.
-        //
-        // Until the `BC_CALL_PURE_*` runtime sites read the descr's
-        // EI and emit `GuardNoException` per
-        // `pyjitpl.py:2111 exc = effectinfo.check_can_raise()`, no
-        // `CallFlavor::Pure` producer can be honoured correctly.
-        // No production `emit_residual_call(_, CallFlavor::Pure, ...)`
-        // site exists today (verified: every codewriter
-        // `emit_residual_call` call passes `Plain` or `MayForce`),
-        // so panicking here forces any future producer to either:
-        //   (1) wire `BC_CALL_PURE_*` runtime sites to emit
-        //       `GuardNoException` from the descr's EI, then add an
-        //       `ElidableCanRaise` arm here; or
-        //   (2) construct an `EffectInfo` directly at the call site
-        //       with the correct elidable variant and a runtime path
-        //       that honours its guard requirement.
-        //
-        // The reverse mapper `dispatch_kind_for_effect_info` and the
-        // dispatcher `dispatch_residual_call` (`assembler.rs:1491-
-        // 1505`) keep their `Pure` arms intact so they remain ready
-        // to consume a properly-formed elidable EI from such a
-        // future producer.
-        CallFlavor::Pure => panic!(
-            "effect_info_for_call_flavor: CallFlavor::Pure has no production \
-             producer in pyre, and the EF_ELIDABLE_* extraeffect cannot be \
-             chosen correctly without static raise analysis (call.py:292-299). \
-             Defaulting to ElidableCanRaise would silently drop \
-             GUARD_NO_EXCEPTION at the BC_CALL_PURE_* runtime sites \
-             (dispatch.rs:1895/2004/2115) which do not read the descr's EI. \
-             Construct EffectInfo directly with the correct \
-             ElidableCannotRaise / ElidableOrMemoryError / ElidableCanRaise \
-             variant AND wire BC_CALL_PURE_* dispatch to honour \
-             check_can_raise() before routing through this mnemonic."
-        ),
+        // Each `CallFlavor::Pure*` variant maps to the corresponding
+        // `EF_ELIDABLE_*` const so the producer's per-callee `_canraise`
+        // outcome reaches `do_residual_call`'s `check_can_raise(False)`
+        // gate verbatim: `ElidableCannotRaise` (0) → false (no
+        // `GUARD_NO_EXCEPTION`), `ElidableOrMemoryError` (3) /
+        // `ElidableCanRaise` (4) → true (guard recorded). Producers
+        // pick the right variant based on callee analysis; a producer
+        // that does not yet have the analyzer wired falls back to
+        // `PureCanRaise` (`Task #64` callee-identity-keyed registry).
+        CallFlavor::PureCannotRaise => majit_metainterp::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        CallFlavor::PureOrMemerror => majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        CallFlavor::PureCanRaise => majit_metainterp::ELIDABLE_EFFECT_INFO,
         // EF_RANDOM_EFFECTS — `effectinfo.py:24`. Upstream's
         // `call.py:282-289 getcalldescr` upgrades release-gil callees
         // to `EF_RANDOM_EFFECTS` whenever the analyzer flags random
@@ -606,9 +569,18 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // that `effectinfo.py:114, 197 call_release_gil_target`
         // demands; pyre uses a non-zero sentinel `(1, 0)` solely to
         // make `is_call_release_gil()`
-        // (`majit-ir/src/effectinfo.rs:292-295`) return true.  Real
-        // target plumbing is deferred to whatever lands the
-        // release-gil callee path; no production caller today.
+        // (`majit-ir/src/effectinfo.rs:292-295`) return true.  The
+        // `target_fn_addr` half is resolved downstream by
+        // `resolve_call_release_gil_target`
+        // (`majit-metainterp/src/jitcode/assembler.rs:3568`), which
+        // substitutes `target.concrete_ptr` for the `1` sentinel when
+        // the EI flows through `emit_canonical_call_typed_via_target*`.
+        // The `save_err = 0` half is the genuine remaining gap: pyre
+        // dispatches release-gil callees directly via `bh_call_*_dispatch`
+        // with no `_call_aroundstate_target_` decorator equivalent
+        // (`call.py:252-258`), so the upstream `RFFI_ERR_*` save modes
+        // have no surface to plumb through. Wiring `save_err` is part
+        // of Task #64 (real EffectInfo analyzers).
         //
         // The round-trip property
         // `dispatch_kind_for_effect_info(effect_info_for_call_flavor(ReleaseGil)) == ReleaseGil`
@@ -659,13 +631,15 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
     if ei.check_forces_virtual_or_virtualizable() {
         return CallFlavor::MayForce;
     }
-    if ei.extraeffect == ExtraEffect::LoopInvariant {
-        return CallFlavor::LoopInvariant;
+    match ei.extraeffect {
+        ExtraEffect::LoopInvariant => CallFlavor::LoopInvariant,
+        // `call.py:292-299`'s 3-way pick survives the round-trip:
+        // each `EF_ELIDABLE_*` lands on its matching `Pure*` variant.
+        ExtraEffect::ElidableCannotRaise => CallFlavor::PureCannotRaise,
+        ExtraEffect::ElidableOrMemoryError => CallFlavor::PureOrMemerror,
+        ExtraEffect::ElidableCanRaise => CallFlavor::PureCanRaise,
+        _ => CallFlavor::Plain,
     }
-    if ei.check_is_elidable() {
-        return CallFlavor::Pure;
-    }
-    CallFlavor::Plain
 }
 
 /// `rpython/jit/metainterp/optimizeopt/rewrite.py` `Rewrite.optimize_CALL_XXX`
@@ -698,8 +672,32 @@ pub enum CallFlavor {
     LoopInvariant,
     /// `EF_RELEASES_GIL`. Maps to `JitCodeBuilder::call_release_gil_*_typed`.
     ReleaseGil,
-    /// `EF_ELIDABLE_*`. Maps to `JitCodeBuilder::call_pure_*_typed`.
-    Pure,
+    /// `EF_ELIDABLE_CANNOT_RAISE` (`effectinfo.py:17`). `call.py:299
+    /// getcalldescr` picks this branch when `_canraise(op) == False`.
+    /// `pyjitpl.py:2126 do_residual_call` records `CALL_PURE_*` with
+    /// no trailing `GUARD_NO_EXCEPTION` because
+    /// `check_can_raise(False)` is false for `extraeffect == 0`.
+    PureCannotRaise,
+    /// `EF_ELIDABLE_OR_MEMORYERROR` (`effectinfo.py:20`). `call.py:295
+    /// getcalldescr` picks this when `_canraise(op) == "mem"` — the
+    /// elidable callee's only failure mode is `MemoryError`. Same
+    /// dispatch as `PureCanRaise` but distinguished for optimizer
+    /// metadata.
+    PureOrMemerror,
+    /// `EF_ELIDABLE_CAN_RAISE` (`effectinfo.py:21`). `call.py:297
+    /// getcalldescr` picks this when `_canraise(op) == True`.
+    PureCanRaise,
+}
+
+impl CallFlavor {
+    /// Convenience predicate for the three elidable variants —
+    /// `effectinfo.check_is_elidable()` parity (`effectinfo.py:225`).
+    pub fn is_pure(self) -> bool {
+        matches!(
+            self,
+            CallFlavor::PureCannotRaise | CallFlavor::PureOrMemerror | CallFlavor::PureCanRaise
+        )
+    }
 }
 
 /// `rpython/jit/codewriter/jtransform.py:423` `reskind =

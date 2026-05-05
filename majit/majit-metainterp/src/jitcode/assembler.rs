@@ -1819,20 +1819,14 @@ impl JitCodeBuilder {
                 // the escape-based fallback.
                 extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
                 can_invalidate: true,
-                // RPython `effectinfo.py:255 is_call_release_gil` only
-                // checks `bool(tgt_func)`, so any non-zero address marks
-                // the call as release-gil. The pair `(asm_helper_addr,
-                // saveerr)` is consumed by RPython's JIT codegen
-                // (`pyjitpl.py:3675 direct_call_release_gil`) to wrap
-                // the C callee in an asm helper; pyre's backend has no
-                // asm-helper concept and dispatches the C function
-                // directly via `bh_call_v_dispatch`. The trace-side
-                // `call_release_gil_void_typed_with_effect` sentinel-
-                // checks `<= 1` and reuses `func_ptr` as
-                // `realfuncaddr` in that case. PRE-EXISTING-ADAPTATION:
-                // future write-analyzer wiring would substitute the
-                // real `(asm_helper_addr, saveerr)` pair without
-                // changing the trace-side reader.
+                // effectinfo.py:255-257 is_call_release_gil() needs a
+                // non-zero `tgt_func`. The actual C address is filled
+                // in by `resolve_call_release_gil_target` from the
+                // resolved `target.concrete_ptr`; the (1, 0) seed is
+                // just a probe to flip the predicate. saveerr is left
+                // 0 — pyre dispatches release-gil callees directly
+                // via `bh_call_v_dispatch` with no errno save (Task
+                // #64 will wire real saveerr through the macro DSL).
                 call_release_gil_target: (1, 0),
                 ..crate::call_descr::DEFAULT_EFFECT_INFO
             },
@@ -1864,15 +1858,11 @@ impl JitCodeBuilder {
             ),
             fn_ptr_idx,
             arg_regs,
-            majit_ir::descr::EffectInfo {
-                // RPython `effectinfo.py:169-181 effectinfo_from_writeanalyze`:
-                // EF_LOOPINVARIANT clears `_write_descrs_*`, matching
-                // pyre's `LOOPINVARIANT_EFFECT_INFO` (`call_descr.rs:174`).
-                // Empty bitsets here are intentional, not the unknown-
-                // callee fallback used by may_force / release_gil.
-                extraeffect: majit_ir::descr::ExtraEffect::LoopInvariant,
-                ..majit_ir::descr::EffectInfo::default()
-            },
+            // RPython `effectinfo.py:169-181 effectinfo_from_writeanalyze`:
+            // EF_LOOPINVARIANT clears `_write_descrs_*`. Empty bitsets
+            // here are intentional, not the unknown-callee fallback used
+            // by may_force / release_gil.
+            crate::call_descr::LOOPINVARIANT_EFFECT_INFO,
             "call_loopinvariant_void_canonical_via_target",
         );
     }
@@ -1899,6 +1889,7 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
+        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
 
         let arg_classes: String = arg_regs
             .iter()
@@ -1947,6 +1938,17 @@ impl JitCodeBuilder {
             JitArgKind::Float => self.touch_float_reg(dst),
         }
         self.push_reg_u8(dst, "canonical residual_call_*_{i,r,f} dst");
+        // RPython `assembler.py:217-219` records `_resulttypes[len(self.code)]
+        // = op.result.kind` for any typed-result op.  Mirror here so the
+        // canonical residual_call_*_{i,r,f} family populates the same map
+        // the legacy `call_*_like` siblings already do — `MIFrame::
+        // make_result_of_lastop` (`pyjitpl.py:260-265`) reads it back when
+        // a caller materialises the typed result.
+        self.record_resulttype(match dst_kind {
+            JitArgKind::Int => 'i',
+            JitArgKind::Ref => 'r',
+            JitArgKind::Float => 'f',
+        });
         calldescr_idx
     }
 
@@ -1978,6 +1980,7 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
+        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -2145,6 +2148,13 @@ impl JitCodeBuilder {
         self.push_u16(calldescr_idx);
         self.touch_float_reg(dst);
         self.push_reg_u8(dst, "canonical residual_call_irf_f dst");
+        // RPython `assembler.py:217-219` records `_resulttypes[len(self.code)]
+        // = op.result.kind` for any typed-result op.  Sibling
+        // `emit_canonical_call_typed` (line 1951) already records this for
+        // `_i` / `_r` / `_f` (non-IRF) result variants — float-on-IRF must
+        // do the same so `MIFrame::make_result_of_lastop`
+        // (`pyjitpl.py:260-265`) reads the correct kind back.
+        self.record_resulttype('f');
         calldescr_idx
     }
 
@@ -2183,6 +2193,7 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
+        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -2232,8 +2243,10 @@ impl JitCodeBuilder {
     }
 
     /// Emit a canonical `residual_call_*_i` whose calldescr carries the
-    /// release-gil marker.  See void sibling at line 1801 for the
-    /// `(asm_helper_addr, saveerr) = (1, 0)` PRE-EXISTING-ADAPTATION.
+    /// release-gil marker.  `resolve_call_release_gil_target` fills
+    /// `realfuncaddr` from the resolved `target.concrete_ptr`; the
+    /// `(1, 0)` seed flips `is_call_release_gil()` for the resolver to
+    /// pick up.
     #[allow(dead_code)]
     pub fn call_release_gil_int_canonical_via_target(
         &mut self,
@@ -2461,48 +2474,6 @@ impl JitCodeBuilder {
         self.call_assembler_void_like(jitcode::BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
     }
 
-    pub fn call_may_force_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_may_force_int_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_may_force_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_int_like(jitcode::BC_CALL_MAY_FORCE_INT, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_release_gil_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_release_gil_int_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_release_gil_int_typed(
-        &mut self,
-        fn_ptr_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.call_int_like(jitcode::BC_CALL_RELEASE_GIL_INT, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_loopinvariant_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_loopinvariant_int_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_loopinvariant_int_typed(
-        &mut self,
-        fn_ptr_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.call_int_like(
-            jitcode::BC_CALL_LOOPINVARIANT_INT,
-            fn_ptr_idx,
-            arg_regs,
-            dst,
-        );
-    }
-
     pub fn call_assembler_int(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
         let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
         self.call_assembler_int_typed(target_idx, &args, dst);
@@ -2512,22 +2483,73 @@ impl JitCodeBuilder {
         self.call_assembler_int_like(jitcode::BC_CALL_ASSEMBLER_INT, target_idx, arg_regs, dst);
     }
 
-    pub fn call_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_int_typed(fn_ptr_idx, &args, dst);
+    /// Parity #14 Slice C.4: Pure sibling of
+    /// [`Self::residual_call_int_canonical_via_target`].  Emits the
+    /// canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_I` opcode with the
+    /// calldescr's `extra_info` set to `ELIDABLE_CAN_RAISE`
+    /// (`call_descr::ELIDABLE_EFFECT_INFO`).  The canonical walker
+    /// (`majit-metainterp/src/pyjitpl/dispatch.rs` Slice C.1) reads
+    /// `effectinfo.check_is_elidable()` and routes the result through
+    /// `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115`,
+    /// retiring the legacy `BC_CALL_PURE_INT`-specific code path.
+    ///
+    /// `_can_raise` is the conservative default — emits a trailing
+    /// `GUARD_NO_EXCEPTION` because `effectinfo.check_can_raise(False)`
+    /// is true for `extraeffect ≥ 3`. Callers that have classified
+    /// the callee per `call.py:292-299 _canraise(op)` should prefer
+    /// [`Self::call_pure_int_canonical_via_target_cannot_raise`] (no
+    /// guard) or
+    /// [`Self::call_pure_int_canonical_via_target_or_memerror`] (guard
+    /// retained, distinguished metadata).
+    pub fn call_pure_int_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_EFFECT_INFO,
+        );
     }
 
-    pub fn call_pure_int(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_pure_int_typed(fn_ptr_idx, &args, dst);
+    /// `EF_ELIDABLE_CANNOT_RAISE` sibling — `call.py:299 getcalldescr`'s
+    /// `else` branch (`_canraise(op) == False`). The calldescr's
+    /// `extraeffect == 0` makes `effectinfo.check_can_raise(False)`
+    /// false, so the canonical walker records `CALL_PURE_*` *without*
+    /// the trailing `GUARD_NO_EXCEPTION` (`pyjitpl.py:2126`).
+    pub fn call_pure_int_canonical_via_target_cannot_raise(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        );
     }
 
-    pub fn call_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_int_like(jitcode::BC_CALL_INT, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_pure_int_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_int_like(jitcode::BC_CALL_PURE_INT, fn_ptr_idx, arg_regs, dst);
+    /// `EF_ELIDABLE_OR_MEMORYERROR` sibling — `call.py:295 getcalldescr`'s
+    /// `cr == "mem"` branch. Same dispatch as `_can_raise` (`extraeffect
+    /// == 3` clears `check_can_raise(False)`'s gate at the boundary)
+    /// but distinguishes memory-only failure modes for the optimizer.
+    pub fn call_pure_int_canonical_via_target_or_memerror(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_int_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        );
     }
 
     // ── conditional_call / record_known_result (jtransform.py:1665-1688, 292-313) ──
@@ -2757,56 +2779,58 @@ impl JitCodeBuilder {
         self.push_u16(dst);
     }
 
-    pub fn call_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_ref_typed(fn_ptr_idx, &args, dst);
+    /// Parity #14 Slice C.4: see
+    /// [`Self::call_pure_int_canonical_via_target`] for the rationale.
+    pub fn call_pure_ref_canonical_via_target(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_ref_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_EFFECT_INFO,
+        );
     }
 
-    pub fn call_pure_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_pure_ref_typed(fn_ptr_idx, &args, dst);
+    /// `EF_ELIDABLE_CANNOT_RAISE` sibling — see
+    /// [`Self::call_pure_int_canonical_via_target_cannot_raise`].
+    pub fn call_pure_ref_canonical_via_target_cannot_raise(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_ref_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        );
     }
 
-    pub fn call_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_ref_like(jitcode::BC_CALL_REF, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_pure_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_ref_like(jitcode::BC_CALL_PURE_REF, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_may_force_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_may_force_ref_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_may_force_ref_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_ref_like(jitcode::BC_CALL_MAY_FORCE_REF, fn_ptr_idx, arg_regs, dst);
+    /// `EF_ELIDABLE_OR_MEMORYERROR` sibling — see
+    /// [`Self::call_pure_int_canonical_via_target_or_memerror`].
+    pub fn call_pure_ref_canonical_via_target_or_memerror(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_ref_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        );
     }
 
     // call_release_gil_ref / _typed intentionally absent:
     // resoperation.py:1243-1244 (`# no such thing`) excludes
     // CALL_RELEASE_GIL_R, so emitting BC_CALL_RELEASE_GIL_REF would
     // record an IR op the optimizer/backend cannot consume.
-
-    pub fn call_loopinvariant_ref(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_loopinvariant_ref_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_loopinvariant_ref_typed(
-        &mut self,
-        fn_ptr_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.call_ref_like(
-            jitcode::BC_CALL_LOOPINVARIANT_REF,
-            fn_ptr_idx,
-            arg_regs,
-            dst,
-        );
-    }
 
     pub fn call_assembler_ref(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
         let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
@@ -2863,73 +2887,51 @@ impl JitCodeBuilder {
         self.push_u16(dst);
     }
 
-    pub fn call_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_float_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_pure_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_pure_float_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_float_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_float_like(jitcode::BC_CALL_FLOAT, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_pure_float_typed(&mut self, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_float_like(jitcode::BC_CALL_PURE_FLOAT, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_may_force_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_may_force_float_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_may_force_float_typed(
+    /// Parity #14 Slice C.4: see
+    /// [`Self::call_pure_int_canonical_via_target`] for the rationale.
+    pub fn call_pure_float_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_float_like(jitcode::BC_CALL_MAY_FORCE_FLOAT, fn_ptr_idx, arg_regs, dst);
-    }
-
-    pub fn call_release_gil_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_release_gil_float_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_release_gil_float_typed(
-        &mut self,
-        fn_ptr_idx: u16,
-        arg_regs: &[JitCallArg],
-        dst: u16,
-    ) {
-        self.call_float_like(
-            jitcode::BC_CALL_RELEASE_GIL_FLOAT,
+        self.residual_call_float_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
             dst,
+            crate::call_descr::ELIDABLE_EFFECT_INFO,
         );
     }
 
-    pub fn call_loopinvariant_float(&mut self, fn_ptr_idx: u16, arg_regs: &[u16], dst: u16) {
-        let args: Vec<JitCallArg> = arg_regs.iter().copied().map(JitCallArg::int).collect();
-        self.call_loopinvariant_float_typed(fn_ptr_idx, &args, dst);
-    }
-
-    pub fn call_loopinvariant_float_typed(
+    /// `EF_ELIDABLE_CANNOT_RAISE` sibling — see
+    /// [`Self::call_pure_int_canonical_via_target_cannot_raise`].
+    pub fn call_pure_float_canonical_via_target_cannot_raise(
         &mut self,
         fn_ptr_idx: u16,
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_float_like(
-            jitcode::BC_CALL_LOOPINVARIANT_FLOAT,
+        self.residual_call_float_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
             dst,
+            crate::call_descr::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        );
+    }
+
+    /// `EF_ELIDABLE_OR_MEMORYERROR` sibling — see
+    /// [`Self::call_pure_int_canonical_via_target_or_memerror`].
+    pub fn call_pure_float_canonical_via_target_or_memerror(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        dst: u16,
+    ) {
+        self.residual_call_float_canonical_via_target_with_effect_info(
+            fn_ptr_idx,
+            arg_regs,
+            dst,
+            crate::call_descr::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
         );
     }
 
@@ -3527,6 +3529,57 @@ impl JitCodeBuilder {
             self.code[offset] = slot as u8;
         }
     }
+}
+
+/// pyjitpl.py:3675 `effectinfo.call_release_gil_target` parity.
+///
+/// PyPy populates `(realfuncaddr, saveerr)` at descr creation time:
+/// `codewriter/call.py:252-258` reads `_call_aroundstate_target_` off
+/// the wrapper callable and writes `(tgt_func, tgt_saveerr)` into the
+/// slot — the wrapper at `direct_call`'s `args[0]` and the real GIL-
+/// release target are intentionally distinct values.
+///
+/// Pyre's `#[jit_interp]` macro `release_gil_*` policy declarations
+/// (`majit-macros/src/jit_interp/mod.rs:226-251`) carry no `saveerr`
+/// attribute and no separate wrapper-vs-real-address distinction —
+/// the macro emits a wrapper where `func_ptr` IS the C address.  The
+/// emit-side wrappers seed `call_release_gil_target: (1, 0)` purely
+/// to flip `EffectInfo::is_call_release_gil()` (`effectinfo.rs:292-295`,
+/// `effectinfo.py:255-257`) on while the real address is unknown until
+/// `descrs[fn_ptr_idx]` resolves.  This helper substitutes the
+/// resolved `target.concrete_ptr` into that sentinel slot so the
+/// descr's IR carries `(real_addr, saveerr=0)`.
+///
+/// Sentinel-only override: any descr whose
+/// `call_release_gil_target.0` is already a real address (≠ sentinel
+/// `1`) is left untouched, mirroring PyPy's "descr already carries
+/// `(tgt_func, saveerr)` from the analyzer" structure at
+/// `call.py:252-258`.  Today the only producer of explicit targets is
+/// `trace_ctx::call_release_gil_{int,float}_typed`
+/// (`trace_ctx.rs:3795, 3824`) which bypasses this resolver, but
+/// keeping the override sentinel-conditional preserves the upstream
+/// invariant for any future analyzer-driven descr.
+///
+/// PRE-EXISTING-ADAPTATION (`saveerr=0`): pyre dispatches release-gil
+/// callees directly via `bh_call_*_dispatch` with no errno save/restore
+/// helper, so the upstream `RFFI_ERR_*` save modes have no equivalent
+/// at this layer.  Wiring `saveerr` through the macro DSL is part of
+/// Task #64 (real EffectInfo analyzers).
+fn resolve_call_release_gil_target(
+    mut effect_info: majit_ir::descr::EffectInfo,
+    realfuncaddr: *const (),
+) -> majit_ir::descr::EffectInfo {
+    // effectinfo.rs:292 is_call_release_gil checks `tgt_func != 0`, so
+    // skip the substitution for non-release-gil callers (the slot
+    // carries `_NO_CALL_RELEASE_GIL_TARGET = (0, 0)` for them).
+    // Match the sentinel `1` exclusively so descrs with an already-
+    // resolved `(tgt_func, saveerr)` from `_call_aroundstate_target_`
+    // (`call.py:252-258`) are preserved.
+    if effect_info.call_release_gil_target.0 == 1 {
+        let saveerr = effect_info.call_release_gil_target.1;
+        effect_info.call_release_gil_target = (realfuncaddr as usize as u64, saveerr);
+    }
+    effect_info
 }
 
 fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool {

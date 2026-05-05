@@ -6,7 +6,7 @@
 use crate::state::*;
 
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
-use majit_metainterp::{TraceAction, TraceCtx};
+use majit_metainterp::{DEFAULT_EFFECT_INFO, TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
@@ -270,7 +270,12 @@ fn emit_call_assembler_callee_frame(
                 vec![this.frame(), callable, args[0]],
             )
         };
-        let frame = ctx.call_ref_typed(helper, &helper_args, &helper_arg_types);
+        let frame = ctx.call_ref_typed_with_effect(
+            helper,
+            &helper_args,
+            &helper_arg_types,
+            DEFAULT_EFFECT_INFO,
+        );
         return Ok((frame, true));
     }
 
@@ -282,7 +287,12 @@ fn emit_call_assembler_callee_frame(
         };
         helper_args.extend_from_slice(args);
         let helper_arg_types = frame_callable_arg_types(args.len());
-        let frame = ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
+        let frame = ctx.call_ref_typed_with_effect(
+            frame_helper,
+            &helper_args,
+            &helper_arg_types,
+            DEFAULT_EFFECT_INFO,
+        );
         return Ok((frame, true));
     }
 
@@ -5241,12 +5251,18 @@ impl MIFrame {
                     let (helper, helper_arg_types) =
                         one_arg_callee_frame_helper(this.value_type(args[0]), is_self_recursive);
                     if is_self_recursive {
-                        ctx.call_ref_typed(helper, &[this.frame(), args[0]], &helper_arg_types)
+                        ctx.call_ref_typed_with_effect(
+                            helper,
+                            &[this.frame(), args[0]],
+                            &helper_arg_types,
+                            DEFAULT_EFFECT_INFO,
+                        )
                     } else {
-                        ctx.call_ref_typed(
+                        ctx.call_ref_typed_with_effect(
                             helper,
                             &[this.frame(), callable, args[0]],
                             &helper_arg_types,
+                            DEFAULT_EFFECT_INFO,
                         )
                     }
                 } else if let Some(frame_helper) =
@@ -5255,7 +5271,12 @@ impl MIFrame {
                     let mut helper_args = vec![this.frame(), callable];
                     helper_args.extend_from_slice(args);
                     let helper_arg_types = frame_callable_arg_types(args.len());
-                    ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types)
+                    ctx.call_ref_typed_with_effect(
+                        frame_helper,
+                        &helper_args,
+                        &helper_arg_types,
+                        DEFAULT_EFFECT_INFO,
+                    )
                 } else {
                     panic!("no frame helper for {} args", args.len());
                 }
@@ -5533,8 +5554,12 @@ impl MIFrame {
                 let mut helper_args = vec![this.frame(), callable];
                 helper_args.extend_from_slice(args);
                 let helper_arg_types = frame_callable_arg_types(args.len());
-                let callee_frame =
-                    ctx.call_ref_typed(frame_helper, &helper_args, &helper_arg_types);
+                let callee_frame = ctx.call_ref_typed_with_effect(
+                    frame_helper,
+                    &helper_args,
+                    &helper_arg_types,
+                    DEFAULT_EFFECT_INFO,
+                );
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 // pyjitpl.py:2017: do_residual_call step 1
                 this.vable_and_vrefs_before_residual_call(ctx);
@@ -6794,7 +6819,12 @@ impl OpcodeStepExecutor for MIFrame {
         // trace-time `ctx.const_ref(prev_exc as i64)` into the bridge
         // silently breaks nested exception state on re-entry.
         let prev_exc_opref = self.with_ctx(|_this, ctx| {
-            ctx.call_ref_typed(trace_get_current_exception_jit as *const (), &[], &[])
+            ctx.call_ref_typed_with_effect(
+                trace_get_current_exception_jit as *const (),
+                &[],
+                &[],
+                DEFAULT_EFFECT_INFO,
+            )
         });
         self.with_ctx(|_this, ctx| {
             ctx.call_void_typed(
@@ -6962,10 +6992,11 @@ impl OpcodeStepExecutor for MIFrame {
         let exc = exc_val.concrete.to_pyobj();
         let emit_runtime_raise = |slf: &mut Self| {
             slf.with_ctx(|this, ctx| {
-                ctx.call_ref_typed(
+                ctx.call_ref_typed_with_effect(
                     normalize_raise_varargs_jit as *const (),
                     &[this.frame(), exc_val.opref, cause_opref],
                     &[Type::Ref, Type::Ref, Type::Ref],
+                    DEFAULT_EFFECT_INFO,
                 )
             })
         };

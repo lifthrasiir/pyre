@@ -1468,8 +1468,10 @@ mod tests {
         // accepts a matching kind without panicking.
         use crate::JitCallArg;
         let mut builder = JitCodeBuilder::new();
-        // Emit a typed-int residual_call that records 'i' at end-of-instr.
-        builder.call_int_typed(0, &[JitCallArg::int(0)], 0);
+        // Emit a canonical Pure residual_call that records 'i' at
+        // end-of-instr per `assembler.py:217-219` (Parity #14 Slice C.5).
+        let fn_idx = builder.add_fn_ptr(0x1usize as *const ());
+        builder.call_pure_int_canonical_via_target(fn_idx, &[JitCallArg::int(0)], 0);
         let jitcode = Arc::new(builder.finish());
         let post_call_pc = jitcode.body().code.len();
         let recorded = jitcode
@@ -1498,7 +1500,8 @@ mod tests {
         // RPython `pyjitpl.py:264` assertion port.
         use crate::JitCallArg;
         let mut builder = JitCodeBuilder::new();
-        builder.call_int_typed(0, &[JitCallArg::int(0)], 0);
+        let fn_idx = builder.add_fn_ptr(0x1usize as *const ());
+        builder.call_pure_int_canonical_via_target(fn_idx, &[JitCallArg::int(0)], 0);
         let jitcode = Arc::new(builder.finish());
         let post_call_pc = jitcode.body().code.len();
 

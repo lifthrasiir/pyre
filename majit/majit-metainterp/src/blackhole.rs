@@ -2395,12 +2395,10 @@ impl BlackholeInterpreter {
                 }
             }
             // -- Int-typed calls --
-            jitcode::BC_CALL_INT
-            | jitcode::BC_CALL_PURE_INT
-            | jitcode::BC_CALL_MAY_FORCE_INT
-            | jitcode::BC_CALL_RELEASE_GIL_INT
-            | jitcode::BC_CALL_LOOPINVARIANT_INT
-            | jitcode::BC_CALL_ASSEMBLER_INT => {
+            // Parity #14 Slice C.5 retired BC_CALL_PURE_INT (Pure now flows
+            // through canonical BC_RESIDUAL_CALL_*_I); only
+            // BC_CALL_ASSEMBLER_INT reaches this arm.
+            jitcode::BC_CALL_ASSEMBLER_INT => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
@@ -2421,11 +2419,9 @@ impl BlackholeInterpreter {
                 self.registers_i[dst] = result;
             }
             // -- Ref-typed calls --
-            jitcode::BC_CALL_REF
-            | jitcode::BC_CALL_PURE_REF
-            | jitcode::BC_CALL_MAY_FORCE_REF
-            | jitcode::BC_CALL_LOOPINVARIANT_REF
-            | jitcode::BC_CALL_ASSEMBLER_REF => {
+            // Parity #14 Slice C.5: see Int arm above.  Only
+            // BC_CALL_ASSEMBLER_REF reaches this arm.
+            jitcode::BC_CALL_ASSEMBLER_REF => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;
@@ -2491,12 +2487,9 @@ impl BlackholeInterpreter {
             // the tracing path; using `call_float_function` here would
             // transmute the i64-returning concrete wrapper through an
             // `extern "C" fn(...) -> f64` signature and break the ABI.
-            jitcode::BC_CALL_FLOAT
-            | jitcode::BC_CALL_PURE_FLOAT
-            | jitcode::BC_CALL_MAY_FORCE_FLOAT
-            | jitcode::BC_CALL_RELEASE_GIL_FLOAT
-            | jitcode::BC_CALL_LOOPINVARIANT_FLOAT
-            | jitcode::BC_CALL_ASSEMBLER_FLOAT => {
+            // Parity #14 Slice C.5: see Int arm above.  Only
+            // BC_CALL_ASSEMBLER_FLOAT reaches this arm.
+            jitcode::BC_CALL_ASSEMBLER_FLOAT => {
                 let fn_ptr_idx = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
                 let num_args = self.next_u16() as usize;

@@ -843,22 +843,21 @@ where
     ///     self.last_exc_value = lltype.nullptr(rclass.OBJECT)
     /// ```
     ///
-    /// PyPy's `last_exc_box` is left untouched (the next
+    /// `last_exc_box` is intentionally left untouched: PyPy's
     /// `handle_possible_exception` overwrites it whenever
-    /// `last_exc_value` is non-NULL again, and every reader gates on
-    /// `last_exc_value`).  Pyre clears the box too for tidiness — the
-    /// ambient `last_exception_value == 0` state is the canonical
-    /// "no exception" signal so leaving a stale box doesn't change
-    /// semantics, but it does mask bookkeeping bugs in tests.
+    /// `last_exc_value` becomes non-NULL again, and every reader
+    /// (`opimpl_last_exception`, `opimpl_last_exc_value`,
+    /// `opimpl_goto_if_exception_mismatch`) gates on `last_exc_value`
+    /// before reading the box.
     ///
-    /// `BH_LAST_EXC_VALUE` is the TLS shim used by `bh_call_*_dispatch`
-    /// to surface a callee's exception across the C boundary; clearing
-    /// it together with the trace-side state matches PyPy's invariant
-    /// that a `clear_exception()` call leaves no observable trace of a
-    /// prior exception.
+    /// `BH_LAST_EXC_VALUE` is a structural adapter — the TLS shim used
+    /// by `bh_call_*_dispatch` to surface a callee's exception across
+    /// the C boundary.  Clearing it together with `last_exception_value`
+    /// keeps the two halves of pyre's split exception channel in sync
+    /// (RPython has a single `last_exc_value` field that the executor
+    /// writes directly).
     pub fn clear_exception(&mut self) {
         self.last_exception_value = 0;
-        self.last_exception_box = None;
         crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     }
 
@@ -1710,10 +1709,22 @@ where
             }
             jitcode::BC_LAST_EXC_VALUE => {
                 let dst = self.frames.current_mut().next_u16() as usize;
+                // pyjitpl.py:1716-1719 opimpl_last_exc_value:
+                //     exc_value = self.metainterp.last_exc_value
+                //     assert exc_value
+                //     return self.metainterp.last_exc_box
+                //
+                // The value-null check gates the box read because
+                // `clear_exception` (Parity #10) clears only
+                // `last_exception_value`; `last_exception_box` may
+                // remain populated with stale data after a successful
+                // residual call.  PyPy's `assert exc_value` makes the
+                // stale-box read fail-fast.
+                let value = self.last_exception_value;
+                assert!(value != 0, "last_exc_value without active exception");
                 let opref = self
                     .last_exception_box
-                    .expect("last_exc_value without active exception");
-                let value = self.last_exception_value;
+                    .expect("last_exc_value without exception box");
                 self.set_ref_reg(dst, Some(opref), Some(value));
             }
             // pyjitpl.py:1676-1685 opimpl_goto_if_exception_mismatch:
@@ -2054,13 +2065,12 @@ where
                     let is_loopinvariant =
                         effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
-                    let active_vable = if is_forces {
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    // pyjitpl.py:1941-1958 execute_varargs parity: the
-                    // RPython sequence is
+                    // pyjitpl.py:1941-1958 execute_varargs parity (plain
+                    // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py:2005
+                    // (MAY_FORCE_N branch).  Both branches share the same
+                    // first step: `clear_exception()` BEFORE
+                    // `vable_and_vrefs_before_residual_call`.  The full
+                    // RPython sequence (executes_varargs helper) is
                     //     clear_exception
                     //     execute_and_record_varargs        # execute → record
                     //     handle_possible_exception / assert_no_exception
@@ -2070,18 +2080,25 @@ where
                     // the post-call exception check decides between
                     // GUARD_NO_EXCEPTION and the catch path.
                     //
-                    // 1. clear_exception (`pyjitpl.py:2393` / `mod.rs:10214`):
-                    //    pyre transports the exception via the
+                    // 1. clear_exception (`pyjitpl.py:2757-2758` /
+                    //    `dispatch.rs:859`).  PyPy's `clear_exception()`
+                    //    nulls `self.last_exc_value`.  Pyre's parity
+                    //    (Parity #10) clears `last_exception_value` and the
                     //    `BH_LAST_EXC_VALUE` TLS shim used by
-                    //    `bh_call_v_dispatch` (`call_stub::bh_call_*`); the
-                    //    NotInTrace arm above seeds the same TLS.  PyPy's
-                    //    `clear_exception()` clears `last_exc_value`; pyre
-                    //    additionally clears the TLS shim and `last_exc_box`
-                    //    so a successful call following a caught exception
-                    //    does not leak stale exception state into a
-                    //    subsequent `last_exception` / `last_exc_value` /
-                    //    `goto_if_exception_mismatch` opimpl.
+                    //    `bh_call_*_dispatch` (`call_stub::bh_call_*`) — the
+                    //    TLS shim is pyre's structural adapter for surfacing
+                    //    a callee's exception across the C boundary.
+                    //    `last_exception_box` is intentionally left untouched
+                    //    matching upstream: `handle_possible_exception`
+                    //    overwrites it whenever `last_exc_value` becomes
+                    //    non-NULL again, and every reader gates on
+                    //    `last_exc_value` first.
                     self.clear_exception();
+                    let active_vable = if is_forces {
+                        self.prepare_standard_virtualizable_before_residual_call(ctx)
+                    } else {
+                        None
+                    };
                     // 2. concrete execute (RPython `executor.execute_varargs`
                     //    → `cpu.bh_call_v`).  llmodel.py:834 bh_call_v: a
                     //    genuinely void C callee returns nothing, so route
@@ -2347,12 +2364,15 @@ where
                         }
                     }
 
+                    // pyjitpl.py:2005-2010 MAY_FORCE_I branch parity:
+                    //     clear_exception  ← FIRST
+                    //     vable_and_vrefs_before_residual_call
+                    self.clear_exception();
                     let active_vable = if is_forces {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
                     };
-                    self.clear_exception();
                     // Concrete execute via `bh_call_i_dispatch` (i64
                     // return) — RPython `executor.execute_varargs` →
                     // `cpu.bh_call_i`.
@@ -2377,6 +2397,22 @@ where
                         record_observed_int_call(concrete_ptr, &concrete_args, concrete);
                     }
                     let effect_info = calldescr.extra_info.clone();
+                    // pyjitpl.py:2111-2115 do_residual_call plain branch:
+                    //     pure = effectinfo.check_is_elidable()
+                    //     return self.execute_varargs(rop.CALL_I,
+                    //                                 allboxes, descr,
+                    //                                 exc, pure)
+                    // pure ⇒ post-record fold via record_result_of_call_pure
+                    // (pyjitpl.py:1947-1949).  Only the plain branch carries
+                    // pure: forces/release_gil/loopinvariant don't combine
+                    // with elidable in upstream call.py:282-299 getcalldescr.
+                    let plain_branch = !is_release_gil && !is_forces && !is_loopinvariant;
+                    let pure = plain_branch && effectinfo.check_is_elidable();
+                    let patch_pos = if pure {
+                        Some(ctx.get_trace_position())
+                    } else {
+                        None
+                    };
                     let traced = if is_release_gil {
                         ctx.call_release_gil_int_typed_with_effect(
                             trace_ptr,
@@ -2409,6 +2445,38 @@ where
                             effect_info,
                         )
                     };
+                    // pyjitpl.py:1946-1948 execute_varargs:
+                    //     if pure and not self.metainterp.last_exc_value and op:
+                    //         op = self.metainterp.record_result_of_call_pure(...)
+                    // The post-record CALL_I → CALL_PURE_I cut + const fold
+                    // (`pyjitpl.py:3553-3579`) only fires when the concrete
+                    // callee did NOT raise.  A raising-pure leaves the
+                    // recorded CALL_I uncut, and finish_residual_call_exception_path
+                    // below emits GUARD_EXCEPTION + unwinds.
+                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                    let traced = match patch_pos {
+                        Some(patch_pos) if last_exc_value == 0 => {
+                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                            let mut call_args = vec![func_ref];
+                            call_args.extend_from_slice(&args);
+                            let concrete_values =
+                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
+                            ctx.record_result_of_call_pure(
+                                traced,
+                                &call_args,
+                                &concrete_values,
+                                crate::call_descr::make_call_descr_with_effect(
+                                    &arg_types,
+                                    majit_ir::Type::Int,
+                                    effectinfo.clone(),
+                                ),
+                                patch_pos,
+                                majit_ir::OpCode::CallI,
+                                majit_ir::Value::Int(concrete),
+                            )
+                        }
+                        _ => traced,
+                    };
                     // RPython pyjitpl.py opimpl_residual_call_*_may_force_*
                     // writes the call result into the frame *before*
                     // vable_after_residual_call fires GUARD_NOT_FORCED
@@ -2422,9 +2490,18 @@ where
                     {
                         return TraceAction::Abort;
                     }
-                    match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                        TraceAction::Continue => {}
-                        action => return action,
+                    // pyjitpl.py:1949 `exc = exc and not isinstance(op, Const)`:
+                    // a pure call that const-folded clears `exc`, so
+                    // `assert_no_exception` runs (no GUARD_NO_EXCEPTION emit).
+                    // finish_residual_call_exception_path's `assert!(exc == 0)`
+                    // covers that.  When pure didn't fold, the fresh CALL_PURE
+                    // op still needs GUARD_NO_EXCEPTION/EXCEPTION based on
+                    // effectinfo.check_can_raise() — same as non-pure.
+                    if !(pure && traced.is_constant()) {
+                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                            TraceAction::Continue => {}
+                            action => return action,
+                        }
                     }
                 }
             }
@@ -2564,12 +2641,14 @@ where
                         }
                     }
 
+                    // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:
+                    // clear_exception precedes vable_and_vrefs_before_residual_call.
+                    self.clear_exception();
                     let active_vable = if is_forces {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
                     };
-                    self.clear_exception();
                     let concrete = if concrete_ptr.is_null() {
                         0
                     } else {
@@ -2591,6 +2670,15 @@ where
                         record_observed_ref_call(concrete_ptr, &concrete_args, concrete);
                     }
                     let effect_info = calldescr.extra_info.clone();
+                    // pyjitpl.py:2111-2117 do_residual_call plain branch —
+                    // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
+                    let plain_branch = !is_forces && !is_loopinvariant;
+                    let pure = plain_branch && effectinfo.check_is_elidable();
+                    let patch_pos = if pure {
+                        Some(ctx.get_trace_position())
+                    } else {
+                        None
+                    };
                     let traced = if is_forces {
                         ctx.call_may_force_ref_typed_with_effect(
                             trace_ptr,
@@ -2616,6 +2704,31 @@ where
                             effect_info,
                         )
                     };
+                    // pyjitpl.py:1946 gate (see int sibling for full cite).
+                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                    let traced = match patch_pos {
+                        Some(patch_pos) if last_exc_value == 0 => {
+                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                            let mut call_args = vec![func_ref];
+                            call_args.extend_from_slice(&args);
+                            let concrete_values =
+                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
+                            ctx.record_result_of_call_pure(
+                                traced,
+                                &call_args,
+                                &concrete_values,
+                                crate::call_descr::make_call_descr_with_effect(
+                                    &arg_types,
+                                    majit_ir::Type::Ref,
+                                    effectinfo.clone(),
+                                ),
+                                patch_pos,
+                                majit_ir::OpCode::CallR,
+                                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                            )
+                        }
+                        _ => traced,
+                    };
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
@@ -2625,9 +2738,11 @@ where
                     {
                         return TraceAction::Abort;
                     }
-                    match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                        TraceAction::Continue => {}
-                        action => return action,
+                    if !(pure && traced.is_constant()) {
+                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                            TraceAction::Continue => {}
+                            action => return action,
+                        }
                     }
                 }
             }
@@ -2755,12 +2870,14 @@ where
                         }
                     }
 
+                    // pyjitpl.py:2005-2010 MAY_FORCE_F branch parity:
+                    // clear_exception precedes vable_and_vrefs_before_residual_call.
+                    self.clear_exception();
                     let active_vable = if is_forces {
                         self.prepare_standard_virtualizable_before_residual_call(ctx)
                     } else {
                         None
                     };
-                    self.clear_exception();
                     let concrete = if concrete_ptr.is_null() {
                         0.0f64
                     } else {
@@ -2786,6 +2903,15 @@ where
                         );
                     }
                     let effect_info = calldescr.extra_info.clone();
+                    // pyjitpl.py:2111-2121 do_residual_call plain branch —
+                    // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
+                    let plain_branch = !is_release_gil && !is_forces && !is_loopinvariant;
+                    let pure = plain_branch && effectinfo.check_is_elidable();
+                    let patch_pos = if pure {
+                        Some(ctx.get_trace_position())
+                    } else {
+                        None
+                    };
                     let traced = if is_release_gil {
                         ctx.call_release_gil_float_typed_with_effect(
                             trace_ptr,
@@ -2818,6 +2944,31 @@ where
                             effect_info,
                         )
                     };
+                    // pyjitpl.py:1946 gate (see int sibling for full cite).
+                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                    let traced = match patch_pos {
+                        Some(patch_pos) if last_exc_value == 0 => {
+                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                            let mut call_args = vec![func_ref];
+                            call_args.extend_from_slice(&args);
+                            let concrete_values =
+                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
+                            ctx.record_result_of_call_pure(
+                                traced,
+                                &call_args,
+                                &concrete_values,
+                                crate::call_descr::make_call_descr_with_effect(
+                                    &arg_types,
+                                    majit_ir::Type::Float,
+                                    effectinfo.clone(),
+                                ),
+                                patch_pos,
+                                majit_ir::OpCode::CallF,
+                                majit_ir::Value::Float(concrete),
+                            )
+                        }
+                        _ => traced,
+                    };
                     self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
                     if is_forces
                         && matches!(
@@ -2827,9 +2978,11 @@ where
                     {
                         return TraceAction::Abort;
                     }
-                    match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                        TraceAction::Continue => {}
-                        action => return action,
+                    if !(pure && traced.is_constant()) {
+                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                            TraceAction::Continue => {}
+                            action => return action,
+                        }
                     }
                 }
             }
@@ -3004,15 +3157,15 @@ where
                 let (value, concrete) = self.read_int_reg(src);
                 self.set_int_reg(dst, Some(value), Some(concrete));
             }
-            jitcode::BC_CALL_INT
-            | jitcode::BC_CALL_PURE_INT
-            | jitcode::BC_CALL_MAY_FORCE_INT
-            | jitcode::BC_CALL_RELEASE_GIL_INT
-            | jitcode::BC_CALL_LOOPINVARIANT_INT
-            | jitcode::BC_CALL_ASSEMBLER_INT => {
-                let (opcode, fn_ptr_idx, dst, arg_regs) = {
+            // Parity #14 Slice C.5 retired the Pure half of this arm —
+            // every Pure call site now emits canonical BC_RESIDUAL_CALL_*_I
+            // (Slices C.2/C.3/C.4); the canonical walker reads the
+            // calldescr's `check_is_elidable()` and routes through
+            // `record_result_of_call_pure`.  Only BC_CALL_ASSEMBLER_INT
+            // survives here.
+            jitcode::BC_CALL_ASSEMBLER_INT => {
+                let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
-                    let opcode = bytecode;
                     let fn_ptr_idx = frame.next_u16() as usize;
                     let dst = frame.next_u16() as usize;
                     let num_args = frame.next_u16() as usize;
@@ -3022,7 +3175,7 @@ where
                         let reg = frame.next_u16();
                         arg_regs.push(JitCallArg { kind, reg });
                     }
-                    (opcode, fn_ptr_idx, dst, arg_regs)
+                    (fn_ptr_idx, dst, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
@@ -3033,113 +3186,15 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if opcode == jitcode::BC_CALL_ASSEMBLER_INT {
-                    let (token_number, concrete_ptr) = self
-                        .frames
-                        .current_mut()
-                        .jitcode
-                        .call_assembler_target(fn_ptr_idx);
-                    let traced =
-                        ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types);
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    self.set_int_reg(dst, Some(traced), Some(concrete));
-                } else {
-                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
-                    let trace_ptr = if target.trace_ptr.is_null() {
-                        target.concrete_ptr
-                    } else {
-                        target.trace_ptr
-                    };
-                    let concrete_ptr = if target.concrete_ptr.is_null() {
-                        trace_ptr
-                    } else {
-                        target.concrete_ptr
-                    };
-                    let active_vable = if opcode == jitcode::BC_CALL_MAY_FORCE_INT {
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    // pyjitpl.py:1941-1948: CALL_PURE records plain CALL
-                    // first, executes, then patches via record_result_of_call_pure.
-                    //
-                    // PRE-EXISTING-ADAPTATION (pyjitpl.py:1941-1958
-                    // execute_varargs): the non-Pure legacy variants
-                    // (BC_CALL_INT/MAY_FORCE_INT/RELEASE_GIL_INT/
-                    // LOOPINVARIANT_INT) skip the
-                    // `handle_possible_exception()` →
-                    // GUARD_NO_EXCEPTION/GUARD_EXCEPTION recording that the
-                    // canonical BC_RESIDUAL_CALL_*_I path performs via
-                    // `finish_residual_call_exception_path`.  Convergence
-                    // path = Slice 4 (Task #58: BC_CALL_INT/REF/FLOAT × 5
-                    // policies migration to canonical residual_call); the
-                    // legacy `call_int_function` here goes straight through
-                    // a transmute'd `extern "C"` call without populating
-                    // `BH_LAST_EXC_VALUE`, so adding the guard requires
-                    // routing through `bh_call_i_dispatch` + threading the
-                    // `EffectInfo` from the descriptor — both Slice 4
-                    // prerequisites.  In tree, Slice 1c.3 has migrated all
-                    // non-Pure DSL emit sites away from these bytecodes;
-                    // CALL_PURE_INT remains on legacy intentionally per
-                    // pyjitpl.py:3553-3579 record_result_of_call_pure.
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID);
-                    // CALL_PURE is exempt because pure re-execution is harmless
-                    // and `record_result_of_call_pure` already folds the result.
-                    if in_observer_mode() && opcode != jitcode::BC_CALL_PURE_INT {
-                        record_observed_int_call(concrete_ptr, &concrete_args, concrete);
-                    }
-                    let traced = match opcode {
-                        jitcode::BC_CALL_INT => ctx.call_int_typed(trace_ptr, &args, &arg_types),
-                        jitcode::BC_CALL_PURE_INT => {
-                            let patch_pos = ctx.get_trace_position();
-                            let plain_op = ctx.call_int_typed(trace_ptr, &args, &arg_types);
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                plain_op,
-                                &call_args,
-                                &concrete_values,
-                                crate::call_descr::make_call_descr_for_opcode(
-                                    majit_ir::OpCode::CallPureI,
-                                    &arg_types,
-                                    majit_ir::Type::Int,
-                                ),
-                                patch_pos,
-                                majit_ir::OpCode::CallI,
-                                majit_ir::Value::Int(concrete),
-                            )
-                        }
-                        jitcode::BC_CALL_MAY_FORCE_INT => {
-                            ctx.call_may_force_int_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_RELEASE_GIL_INT => {
-                            ctx.call_release_gil_int_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_LOOPINVARIANT_INT => {
-                            ctx.call_loopinvariant_int_typed(trace_ptr, &args, &arg_types)
-                        }
-                        _ => unreachable!(),
-                    };
-                    // RPython pyjitpl.py opimpl_residual_call_*_may_force_*
-                    // writes the call result into the frame via the opcode
-                    // dispatch *before* vable_after_residual_call fires
-                    // GUARD_NOT_FORCED (rop.GUARD_NOT_FORCED reads the
-                    // post-call frame in capture_resumedata, so the result
-                    // register must already be visible there).
-                    self.set_int_reg(dst, Some(traced), Some(concrete));
-                    if opcode == jitcode::BC_CALL_MAY_FORCE_INT
-                        && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
-                    }
-                }
+                let (token_number, concrete_ptr) = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .call_assembler_target(fn_ptr_idx);
+                let traced =
+                    ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types);
+                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                self.set_int_reg(dst, Some(traced), Some(concrete));
             }
             // -- Ref-typed bytecodes ----
             // RPython `blackhole.py:641-643` `bhimpl_ref_copy`. `[src][dst]` per `r>r`.
@@ -3151,14 +3206,11 @@ where
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
             }
-            jitcode::BC_CALL_REF
-            | jitcode::BC_CALL_PURE_REF
-            | jitcode::BC_CALL_MAY_FORCE_REF
-            | jitcode::BC_CALL_LOOPINVARIANT_REF
-            | jitcode::BC_CALL_ASSEMBLER_REF => {
-                let (opcode, fn_ptr_idx, dst, arg_regs) = {
+            // Parity #14 Slice C.5 retired the Pure half — see the Int
+            // sibling above for the full rationale.
+            jitcode::BC_CALL_ASSEMBLER_REF => {
+                let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
-                    let opcode = bytecode;
                     let fn_ptr_idx = frame.next_u16() as usize;
                     let dst = frame.next_u16() as usize;
                     let num_args = frame.next_u16() as usize;
@@ -3168,7 +3220,7 @@ where
                         let reg = frame.next_u16();
                         arg_regs.push(JitCallArg { kind, reg });
                     }
-                    (opcode, fn_ptr_idx, dst, arg_regs)
+                    (fn_ptr_idx, dst, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
@@ -3179,87 +3231,15 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if opcode == jitcode::BC_CALL_ASSEMBLER_REF {
-                    let (token_number, concrete_ptr) = self
-                        .frames
-                        .current_mut()
-                        .jitcode
-                        .call_assembler_target(fn_ptr_idx);
-                    let traced =
-                        ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types);
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    self.set_ref_reg(dst, Some(traced), Some(concrete));
-                } else {
-                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
-                    let trace_ptr = if target.trace_ptr.is_null() {
-                        target.concrete_ptr
-                    } else {
-                        target.trace_ptr
-                    };
-                    let concrete_ptr = if target.concrete_ptr.is_null() {
-                        trace_ptr
-                    } else {
-                        target.concrete_ptr
-                    };
-                    let active_vable = if opcode == jitcode::BC_CALL_MAY_FORCE_REF {
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID);
-                    // CALL_PURE is exempt because pure re-execution is harmless
-                    // and `record_result_of_call_pure` already folds the result.
-                    if in_observer_mode() && opcode != jitcode::BC_CALL_PURE_REF {
-                        record_observed_ref_call(concrete_ptr, &concrete_args, concrete);
-                    }
-                    let traced = match opcode {
-                        jitcode::BC_CALL_REF => ctx.call_ref_typed(trace_ptr, &args, &arg_types),
-                        jitcode::BC_CALL_PURE_REF => {
-                            let patch_pos = ctx.get_trace_position();
-                            let plain_op = ctx.call_ref_typed(trace_ptr, &args, &arg_types);
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                plain_op,
-                                &call_args,
-                                &concrete_values,
-                                crate::call_descr::make_call_descr_for_opcode(
-                                    majit_ir::OpCode::CallPureR,
-                                    &arg_types,
-                                    majit_ir::Type::Ref,
-                                ),
-                                patch_pos,
-                                majit_ir::OpCode::CallR,
-                                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                            )
-                        }
-                        jitcode::BC_CALL_MAY_FORCE_REF => {
-                            ctx.call_may_force_ref_typed(trace_ptr, &args, &arg_types)
-                        }
-                        // BC_CALL_RELEASE_GIL_REF intentionally absent:
-                        // resoperation.py:1243-1244 (`# no such thing`).
-                        jitcode::BC_CALL_LOOPINVARIANT_REF => {
-                            ctx.call_loopinvariant_ref_typed(trace_ptr, &args, &arg_types)
-                        }
-                        _ => unreachable!(),
-                    };
-                    // RPython parity (see BC_CALL_MAY_FORCE_INT note above):
-                    // result is visible in the frame *before* the
-                    // virtualizable guard fires.
-                    self.set_ref_reg(dst, Some(traced), Some(concrete));
-                    if opcode == jitcode::BC_CALL_MAY_FORCE_REF
-                        && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
-                    }
-                }
+                let (token_number, concrete_ptr) = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .call_assembler_target(fn_ptr_idx);
+                let traced =
+                    ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types);
+                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                self.set_ref_reg(dst, Some(traced), Some(concrete));
             }
             // -- Float-typed bytecodes ---
             // RPython `blackhole.py:644-646` `bhimpl_float_copy`. `[src][dst]` per `f>f`.
@@ -3271,15 +3251,11 @@ where
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
             }
-            jitcode::BC_CALL_FLOAT
-            | jitcode::BC_CALL_PURE_FLOAT
-            | jitcode::BC_CALL_MAY_FORCE_FLOAT
-            | jitcode::BC_CALL_RELEASE_GIL_FLOAT
-            | jitcode::BC_CALL_LOOPINVARIANT_FLOAT
-            | jitcode::BC_CALL_ASSEMBLER_FLOAT => {
-                let (opcode, fn_ptr_idx, dst, arg_regs) = {
+            // Parity #14 Slice C.5 retired the Pure half — see the Int
+            // sibling above for the full rationale.
+            jitcode::BC_CALL_ASSEMBLER_FLOAT => {
+                let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
-                    let opcode = bytecode;
                     let fn_ptr_idx = frame.next_u16() as usize;
                     let dst = frame.next_u16() as usize;
                     let num_args = frame.next_u16() as usize;
@@ -3289,7 +3265,7 @@ where
                         let reg = frame.next_u16();
                         arg_regs.push(JitCallArg { kind, reg });
                     }
-                    (opcode, fn_ptr_idx, dst, arg_regs)
+                    (fn_ptr_idx, dst, arg_regs)
                 };
                 let mut args = Vec::with_capacity(arg_regs.len());
                 let mut concrete_args = Vec::with_capacity(arg_regs.len());
@@ -3300,90 +3276,15 @@ where
                     concrete_args.push(concrete);
                     arg_types.push(arg_type);
                 }
-                if opcode == jitcode::BC_CALL_ASSEMBLER_FLOAT {
-                    let (token_number, concrete_ptr) = self
-                        .frames
-                        .current_mut()
-                        .jitcode
-                        .call_assembler_target(fn_ptr_idx);
-                    let traced =
-                        ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types);
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    self.set_float_reg(dst, Some(traced), Some(concrete));
-                } else {
-                    let target = *self.frames.current_mut().jitcode.call_target(fn_ptr_idx);
-                    let trace_ptr = if target.trace_ptr.is_null() {
-                        target.concrete_ptr
-                    } else {
-                        target.trace_ptr
-                    };
-                    let concrete_ptr = if target.concrete_ptr.is_null() {
-                        trace_ptr
-                    } else {
-                        target.concrete_ptr
-                    };
-                    let active_vable = if opcode == jitcode::BC_CALL_MAY_FORCE_FLOAT {
-                        self.prepare_standard_virtualizable_before_residual_call(ctx)
-                    } else {
-                        None
-                    };
-                    let concrete = call_int_function(concrete_ptr, &concrete_args);
-                    // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID);
-                    // CALL_PURE is exempt because pure re-execution is harmless
-                    // and `record_result_of_call_pure` already folds the result.
-                    if in_observer_mode() && opcode != jitcode::BC_CALL_PURE_FLOAT {
-                        record_observed_float_call(concrete_ptr, &concrete_args, concrete);
-                    }
-                    let traced = match opcode {
-                        jitcode::BC_CALL_FLOAT => {
-                            ctx.call_float_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_PURE_FLOAT => {
-                            let patch_pos = ctx.get_trace_position();
-                            let plain_op = ctx.call_float_typed(trace_ptr, &args, &arg_types);
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                plain_op,
-                                &call_args,
-                                &concrete_values,
-                                crate::call_descr::make_call_descr_for_opcode(
-                                    majit_ir::OpCode::CallPureF,
-                                    &arg_types,
-                                    majit_ir::Type::Float,
-                                ),
-                                patch_pos,
-                                majit_ir::OpCode::CallF,
-                                majit_ir::Value::Float(f64::from_bits(concrete as u64)),
-                            )
-                        }
-                        jitcode::BC_CALL_MAY_FORCE_FLOAT => {
-                            ctx.call_may_force_float_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_RELEASE_GIL_FLOAT => {
-                            ctx.call_release_gil_float_typed(trace_ptr, &args, &arg_types)
-                        }
-                        jitcode::BC_CALL_LOOPINVARIANT_FLOAT => {
-                            ctx.call_loopinvariant_float_typed(trace_ptr, &args, &arg_types)
-                        }
-                        _ => unreachable!(),
-                    };
-                    // RPython parity (see BC_CALL_MAY_FORCE_INT note above):
-                    // result is visible in the frame *before* the
-                    // virtualizable guard fires.
-                    self.set_float_reg(dst, Some(traced), Some(concrete));
-                    if opcode == jitcode::BC_CALL_MAY_FORCE_FLOAT
-                        && matches!(
-                            Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
-                    }
-                }
+                let (token_number, concrete_ptr) = self
+                    .frames
+                    .current_mut()
+                    .jitcode
+                    .call_assembler_target(fn_ptr_idx);
+                let traced =
+                    ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types);
+                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                self.set_float_reg(dst, Some(traced), Some(concrete));
             }
             jitcode::BC_FLOAT_ADD => self.trace_binop_f(ctx, OpCode::FloatAdd),
             jitcode::BC_FLOAT_SUB => self.trace_binop_f(ctx, OpCode::FloatSub),
@@ -4773,15 +4674,25 @@ mod tests {
         );
     }
 
+    // ── canonical residual_call_*_{i,r,f} may_force tests ──
+    //
+    // After Slice 4 Phase B.1.1 the legacy non-Pure walker arms
+    // (BC_CALL_MAY_FORCE_INT/REF/FLOAT) are deleted; canonical
+    // residual_call_*_{i,r,f} via `call_may_force_*_canonical_via_target`
+    // is the sole vable+guard emit path covered here.  Same semantic
+    // shape (ForceToken → SetfieldGc → CallMayForce* → GuardNotForced
+    // → GuardNoException) the legacy tests asserted, routed through
+    // the `BC_RESIDUAL_CALL_*_I/R/F` walker.
+
     #[test]
-    fn jitcode_call_may_force_int_marks_standard_virtualizable_token_and_guards() {
+    fn jitcode_residual_call_int_may_force_marks_standard_virtualizable_token_and_guards() {
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_int_no_force as *const ());
-        builder.call_may_force_int_typed(fn_idx, &[JitCallArg::reference(0)], 1);
+        builder.call_may_force_int_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -4803,7 +4714,7 @@ mod tests {
         assert_eq!(obj.token, 0);
 
         let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
             recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
@@ -4820,17 +4731,21 @@ mod tests {
             recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            OpCode::GuardNoException
+        );
     }
 
     #[test]
-    fn jitcode_call_may_force_ref_marks_standard_virtualizable_token_and_guards() {
+    fn jitcode_residual_call_ref_may_force_marks_standard_virtualizable_token_and_guards() {
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_ref_no_force as *const ());
-        builder.call_may_force_ref_typed(fn_idx, &[JitCallArg::reference(0)], 1);
+        builder.call_may_force_ref_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -4852,7 +4767,7 @@ mod tests {
         assert_eq!(obj.token, 0);
 
         let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
             recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
@@ -4869,17 +4784,21 @@ mod tests {
             recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            OpCode::GuardNoException
+        );
     }
 
     #[test]
-    fn jitcode_call_may_force_float_marks_standard_virtualizable_token_and_guards() {
+    fn jitcode_residual_call_float_may_force_marks_standard_virtualizable_token_and_guards() {
         let mut obj = ResidualVable { token: 0 };
         let obj_ptr = (&mut obj as *mut ResidualVable) as usize as i64;
 
         let mut builder = JitCodeBuilder::new();
         builder.load_const_r_value(0, obj_ptr);
         let fn_idx = builder.add_fn_ptr(residual_float_no_force as *const ());
-        builder.call_may_force_float_typed(fn_idx, &[JitCallArg::reference(0)], 1);
+        builder.call_may_force_float_canonical_via_target(fn_idx, &[JitCallArg::reference(0)], 1);
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -4901,7 +4820,7 @@ mod tests {
         assert_eq!(obj.token, 0);
 
         let recorder = ctx.into_recorder();
-        assert_eq!(recorder.num_ops(), 4);
+        assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
             recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
             OpCode::ForceToken
@@ -4917,6 +4836,10 @@ mod tests {
         assert_eq!(
             recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
             OpCode::GuardNotForced
+        );
+        assert_eq!(
+            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            OpCode::GuardNoException
         );
     }
 

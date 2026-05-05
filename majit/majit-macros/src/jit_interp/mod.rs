@@ -235,8 +235,19 @@ pub(crate) enum CallPolicyKind {
     ReleaseGilIntWrapped,
     LoopInvariantInt,
     LoopInvariantIntWrapped,
+    // `EF_ELIDABLE_CAN_RAISE` (call.py:297). Default elidable variant —
+    // emits trailing `GUARD_NO_EXCEPTION`.
     ElidableInt,
     ElidableIntWrapped,
+    // `EF_ELIDABLE_CANNOT_RAISE` (call.py:299). Skips the
+    // `GUARD_NO_EXCEPTION` because `effectinfo.check_can_raise(False)`
+    // is false for `extraeffect == 0`.
+    ElidableIntCannotRaise,
+    ElidableIntCannotRaiseWrapped,
+    // `EF_ELIDABLE_OR_MEMORYERROR` (call.py:295). Same dispatch as
+    // `_can_raise` but distinguishes memory-only failure modes.
+    ElidableIntOrMemerror,
+    ElidableIntOrMemerrorWrapped,
     ResidualRefWrapped,
     MayForceRefWrapped,
     // ReleaseGilRefWrapped intentionally absent: resoperation.py:1243-1244
@@ -245,11 +256,15 @@ pub(crate) enum CallPolicyKind {
     // emit an IR op the optimizer/backend cannot consume.
     LoopInvariantRefWrapped,
     ElidableRefWrapped,
+    ElidableRefCannotRaiseWrapped,
+    ElidableRefOrMemerrorWrapped,
     ResidualFloatWrapped,
     MayForceFloatWrapped,
     ReleaseGilFloatWrapped,
     LoopInvariantFloatWrapped,
     ElidableFloatWrapped,
+    ElidableFloatCannotRaiseWrapped,
+    ElidableFloatOrMemerrorWrapped,
     InlineInt,
     InlineRef,
     InlineFloat,
@@ -273,19 +288,31 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "release_gil_int_wrapped" => CallPolicyKind::ReleaseGilIntWrapped,
         "loopinvariant_int" => CallPolicyKind::LoopInvariantInt,
         "loopinvariant_int_wrapped" => CallPolicyKind::LoopInvariantIntWrapped,
+        // `call.py:292-299 _canraise(op)` 3-way pick on the elidable
+        // branch. `elidable_*` (no suffix) is the EF_ELIDABLE_CAN_RAISE
+        // default; `_cannot_raise` / `_or_memerror` map to
+        // EF_ELIDABLE_CANNOT_RAISE / EF_ELIDABLE_OR_MEMORYERROR.
         "elidable_int" => CallPolicyKind::ElidableInt,
         "elidable_int_wrapped" => CallPolicyKind::ElidableIntWrapped,
+        "elidable_int_cannot_raise" => CallPolicyKind::ElidableIntCannotRaise,
+        "elidable_int_cannot_raise_wrapped" => CallPolicyKind::ElidableIntCannotRaiseWrapped,
+        "elidable_int_or_memerror" => CallPolicyKind::ElidableIntOrMemerror,
+        "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
         // "release_gil_ref_wrapped" intentionally rejected per
         // resoperation.py:1243-1244 — see CallPolicyKind comment.
         "loopinvariant_ref_wrapped" => CallPolicyKind::LoopInvariantRefWrapped,
         "elidable_ref_wrapped" => CallPolicyKind::ElidableRefWrapped,
+        "elidable_ref_cannot_raise_wrapped" => CallPolicyKind::ElidableRefCannotRaiseWrapped,
+        "elidable_ref_or_memerror_wrapped" => CallPolicyKind::ElidableRefOrMemerrorWrapped,
         "residual_float_wrapped" => CallPolicyKind::ResidualFloatWrapped,
         "may_force_float_wrapped" => CallPolicyKind::MayForceFloatWrapped,
         "release_gil_float_wrapped" => CallPolicyKind::ReleaseGilFloatWrapped,
         "loopinvariant_float_wrapped" => CallPolicyKind::LoopInvariantFloatWrapped,
         "elidable_float_wrapped" => CallPolicyKind::ElidableFloatWrapped,
+        "elidable_float_cannot_raise_wrapped" => CallPolicyKind::ElidableFloatCannotRaiseWrapped,
+        "elidable_float_or_memerror_wrapped" => CallPolicyKind::ElidableFloatOrMemerrorWrapped,
         "inline_int" => CallPolicyKind::InlineInt,
         "inline_ref" => CallPolicyKind::InlineRef,
         "inline_float" => CallPolicyKind::InlineFloat,

@@ -190,7 +190,7 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// blind spot upstream papered over with frozenset bitstrings before
 /// the bitstring rewrite. PRE-EXISTING-ADAPTATION: the bitset width
 /// upgrade is a separate slice from the EffectInfo port.
-pub(crate) const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
+pub const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::CanRaise,
     oopspecindex: OopSpecIndex::None,
     readonly_descrs_fields: u64::MAX,
@@ -206,18 +206,36 @@ pub(crate) const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
     call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
 };
 
+/// `EF_ELIDABLE_CANNOT_RAISE` (effectinfo.py:17). Selected by
+/// `call.py:299 getcalldescr` when `_canraise(op) == False` for an
+/// elidable callee — `pyjitpl.py:2126 do_residual_call` records
+/// `CALL_PURE_*` without the trailing `GUARD_NO_EXCEPTION` because
+/// `effectinfo.check_can_raise()` (`effectinfo.py:232`) is false for
+/// `extraeffect == 0`.
+pub const ELIDABLE_CANNOT_RAISE_EFFECT_INFO: EffectInfo =
+    EffectInfo::const_new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
+
+/// `EF_ELIDABLE_OR_MEMORYERROR` (effectinfo.py:20). Selected by
+/// `call.py:295 getcalldescr` when `_canraise(op) == "mem"` — i.e.
+/// the elidable callee's only failure mode is `MemoryError`. Same
+/// dispatch as `EF_ELIDABLE_CAN_RAISE` (`check_can_raise()` is true
+/// for extraeffect ≥ 3) but distinguishes memory-only raises for the
+/// optimizer.
+pub const ELIDABLE_OR_MEMERROR_EFFECT_INFO: EffectInfo =
+    EffectInfo::const_new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None);
+
 /// `EF_ELIDABLE_CAN_RAISE` (effectinfo.py:21). Pure calls do not need
 /// the conservative flush — `effectinfo_from_writeanalyze` (effectinfo.py:
 /// 169-181) clears `_write_descrs_*` for elidable extraeffects. With
 /// the bitsets at zero this becomes "no writes" inside
 /// `force_from_effectinfo`, matching upstream.
-const ELIDABLE_EFFECT_INFO: EffectInfo =
+pub const ELIDABLE_EFFECT_INFO: EffectInfo =
     EffectInfo::const_new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None);
 
 /// `EF_LOOPINVARIANT` (effectinfo.py:18). Same write-mask treatment as
 /// elidable; the trace optimizer recognises the opcode and skips cache
 /// invalidation regardless of the bitsets.
-const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
+pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
     EffectInfo::const_new(ExtraEffect::LoopInvariant, OopSpecIndex::None);
 
 /// Pick the upstream-equivalent default effect for an opcode whose

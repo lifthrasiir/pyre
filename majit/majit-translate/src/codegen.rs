@@ -1030,10 +1030,11 @@ pub fn generated_binary_float_value(
         // ll_math_pow (ll_math.py:260) is EF_CAN_RAISE, NOT force_virtual.
         // pyjitpl.py:2084-2121 execute_varargs(rop.CALL_F, ..., exc=True, pure=False)
         // → records CALL_F and then handle_possible_exception → GUARD_NO_EXCEPTION.
-        let call_result = ctx.call_float_typed(
+        let call_result = ctx.call_float_typed_with_effect(
             crate::trace_opcode::float_pow_jit as *const (),
             &[lhs_raw, rhs_raw],
             &[majit_ir::Type::Float, majit_ir::Type::Float],
+            majit_metainterp::DEFAULT_EFFECT_INFO,
         );
         // pyjitpl.py:3395 GUARD_NO_EXCEPTION from handle_possible_exception.
         frame.generate_guard(ctx, OpCode::GuardNoException, &[]);

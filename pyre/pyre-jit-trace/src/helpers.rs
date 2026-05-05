@@ -5,7 +5,7 @@
 //! correct calling convention and integer-based parameter passing.
 
 use majit_ir::{OpCode, OpRef, Type};
-use majit_metainterp::TraceCtx;
+use majit_metainterp::{DEFAULT_EFFECT_INFO, TraceCtx};
 
 use pyre_interpreter::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
@@ -47,7 +47,19 @@ pub fn emit_trace_call_int_typed(
     args: &[OpRef],
     arg_types: &[Type],
 ) -> OpRef {
-    ctx.call_int_typed(helper, args, arg_types)
+    // pyjitpl.py:1995-2068 do_residual_call parity: thread the
+    // codewriter-analyzed `EffectInfo` through `record_nospec`. The
+    // codewriter's `CallControl::getcalldescr`
+    // (`majit-translate/src/jit_codewriter/call.rs`) ports call.py:210-335
+    // including the raise / random-effects / write / collect /
+    // virtualizable / quasi-immut analyzers; the gap is the trace-side
+    // plumbing — pyre-jit-trace helpers live outside the codewriter
+    // pipeline so the analyzer's per-callee EI never reaches this
+    // emit site. Until per-helper EI registration lands (Task #64),
+    // fall back to the conservative `DEFAULT_EFFECT_INFO`
+    // (≡ `effectinfo.MOST_GENERAL` for unanalyzed callees: CanRaise +
+    // all-writes-set bitmasks).
+    ctx.call_int_typed_with_effect(helper, args, arg_types, DEFAULT_EFFECT_INFO)
 }
 
 pub fn emit_trace_call_ref(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) -> OpRef {
@@ -60,7 +72,8 @@ pub fn emit_trace_call_ref_typed(
     args: &[OpRef],
     arg_types: &[Type],
 ) -> OpRef {
-    ctx.call_ref_typed(helper, args, arg_types)
+    // See emit_trace_call_int_typed for the plumbing-gap rationale.
+    ctx.call_ref_typed_with_effect(helper, args, arg_types, DEFAULT_EFFECT_INFO)
 }
 
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
@@ -105,7 +118,7 @@ pub fn emit_trace_build_flat(
         )));
     };
     let arg_types = vec![Type::Ref; items.len()];
-    Ok(ctx.call_ref_typed(helper, items, &arg_types))
+    Ok(ctx.call_ref_typed_with_effect(helper, items, &arg_types, DEFAULT_EFFECT_INFO))
 }
 
 pub fn emit_trace_call_callable(
@@ -134,7 +147,7 @@ pub fn emit_trace_call_known_builtin(
     call_args.extend_from_slice(args);
     let mut arg_types = vec![Type::Ref];
     arg_types.extend(std::iter::repeat_n(Type::Ref, args.len()));
-    Ok(ctx.call_ref_typed(helper, &call_args, &arg_types))
+    Ok(ctx.call_ref_typed_with_effect(helper, &call_args, &arg_types, DEFAULT_EFFECT_INFO))
 }
 
 pub fn emit_trace_call_known_function(

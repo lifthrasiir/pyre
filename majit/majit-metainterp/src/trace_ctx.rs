@@ -3042,21 +3042,25 @@ impl TraceCtx {
 
     /// Record a function call with explicit argument and return types.
     ///
-    /// All type-specific call convenience methods delegate to this.
     /// `opcode` selects the call family (CallI/R/F/N, CallPureI/R/F/N, etc.).
+    /// Synthesizes the per-opcode default `EffectInfo`
+    /// (`call_descr::default_effect_for_opcode`).
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython `pyjitpl.py:1995-2068
-    /// do_residual_call` threads the same `calldescr` (with full
-    /// `EffectInfo`) through every result type via `record_nospec`. This
-    /// helper instead derives a default `EffectInfo` per-opcode, losing
-    /// any `oopspecindex`, `read/write_descrs_*`, `can_invalidate`,
-    /// `can_collect`, `call_release_gil_target` set by the codewriter.
-    /// The void residual_call path already uses
-    /// `call_*_void_typed_with_effect` to preserve `EffectInfo`; the
-    /// non-void path will close this gap once Slice 4 of
-    /// `~/.claude/plans/pyre-call-family-canonical-migration.md`
-    /// migrates `BC_CALL_INT/REF/FLOAT × 5 policies + ASSEMBLER` to the
-    /// canonical residual_call encoding.
+    /// **Prefer `call_typed_with_effect`** for line-by-line PyPy parity:
+    /// `pyjitpl.py:1995-2068 do_residual_call` threads the codewriter-
+    /// analyzed `calldescr` through `record_nospec` so the trace IR
+    /// retains `oopspecindex`, `read/write_descrs_*`, `can_invalidate`,
+    /// `can_collect`, and `call_release_gil_target` exactly as written.
+    /// This helper is the no-EI shortcut for callers that genuinely
+    /// have no per-callee analysis available — equivalent to PyPy's
+    /// `effectinfo.MOST_GENERAL` fallback for unanalyzed callees.
+    /// The codewriter's `CallControl::getcalldescr`
+    /// (`majit-translate/src/jit_codewriter/call.rs`) does port
+    /// call.py:210-335 in full (raise / random-effects / write /
+    /// collect / virtualizable / quasi-immut analyzers); the remaining
+    /// gap is plumbing the per-callsite EI it produces back to runtime
+    /// trace recording — Task #64 (analyzer-rollout) is that plumbing
+    /// work, not a missing analyzer.
     pub fn call_typed(
         &mut self,
         opcode: OpCode,
@@ -3294,6 +3298,30 @@ impl TraceCtx {
         self.call_typed(OpCode::CallI, func_ptr, args, arg_types, Type::Int)
     }
 
+    /// `call_int_typed` preserving the caller-supplied `EffectInfo`.
+    /// Mirrors `pyjitpl.py:1995-2068 do_residual_call` parity (see
+    /// `call_typed_with_effect` for the full rationale): PyPy passes
+    /// the original `calldescr` through `record_nospec` so the trace
+    /// IR retains `oopspec`, `read/write_descrs_*`, `can_invalidate`,
+    /// `can_collect`, and `call_release_gil_target` exactly as written
+    /// by the codewriter / write-analyzer.
+    pub fn call_int_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.call_typed_with_effect(
+            OpCode::CallI,
+            func_ptr,
+            args,
+            arg_types,
+            Type::Int,
+            effect_info,
+        )
+    }
+
     pub fn call_elidable_int_typed(
         &mut self,
         func_ptr: *const (),
@@ -3338,6 +3366,25 @@ impl TraceCtx {
         self.call_typed(OpCode::CallR, func_ptr, args, arg_types, Type::Ref)
     }
 
+    /// `call_ref_typed` preserving the caller-supplied `EffectInfo`.
+    /// See `call_int_typed_with_effect` for the parity rationale.
+    pub fn call_ref_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.call_typed_with_effect(
+            OpCode::CallR,
+            func_ptr,
+            args,
+            arg_types,
+            Type::Ref,
+            effect_info,
+        )
+    }
+
     pub fn call_float_typed(
         &mut self,
         func_ptr: *const (),
@@ -3345,6 +3392,25 @@ impl TraceCtx {
         arg_types: &[Type],
     ) -> OpRef {
         self.call_typed(OpCode::CallF, func_ptr, args, arg_types, Type::Float)
+    }
+
+    /// `call_float_typed` preserving the caller-supplied `EffectInfo`.
+    /// See `call_int_typed_with_effect` for the parity rationale.
+    pub fn call_float_typed_with_effect(
+        &mut self,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        effect_info: majit_ir::EffectInfo,
+    ) -> OpRef {
+        self.call_typed_with_effect(
+            OpCode::CallF,
+            func_ptr,
+            args,
+            arg_types,
+            Type::Float,
+            effect_info,
+        )
     }
 
     pub fn call_elidable_ref_typed(
@@ -3365,68 +3431,20 @@ impl TraceCtx {
         self.call_typed(OpCode::CallPureF, func_ptr, args, arg_types, Type::Float)
     }
 
-    /// Shared body for typed-helper Plain / MayForce / Pure / LoopInvariant
-    /// / ReleaseGil call families.  Records `[func_ref] + args`, matching
-    /// `pyjitpl.py:1995-2002 _build_allboxes(funcbox, argboxes, descr)`'s
-    /// `[funcbox] + reordered_argboxes` shape (here `args` already excludes
-    /// the funcbox — `func_ptr` is passed separately and prepended once).
+    /// Shared body for typed-helper MayForce calls.  Records
+    /// `[func_ref] + args`, matching `pyjitpl.py:1995-2002 _build_allboxes(
+    /// funcbox, argboxes, descr)`'s `[funcbox] + reordered_argboxes` shape
+    /// (here `args` already excludes the funcbox — `func_ptr` is passed
+    /// separately and prepended once).
     ///
-    /// PRE-EXISTING-ADAPTATION (CALL_RELEASE_GIL_*):
-    /// `pyjitpl.py:3671-3681 direct_call_release_gil` records a *different*
-    /// shape for release-gil callees:
-    ///
-    /// ```text
-    ///     realfuncaddr, saveerr = effectinfo.call_release_gil_target
-    ///     funcbox = ConstInt(adr2int(realfuncaddr))
-    ///     savebox = ConstInt(saveerr)
-    ///     opnum   = rop.call_release_gil_for_descr(calldescr)
-    ///     return self.history.record_nospec(
-    ///         opnum, [savebox, funcbox] + argboxes[1:], ..., calldescr)
-    /// ```
-    ///
-    /// i.e. `[savebox, funcbox_real] + argboxes[1:]` with `funcbox_real`
-    /// resolved from `effectinfo.call_release_gil_target` (the *real* C
-    /// function address, distinct from the wrapper at `argboxes[0]`).
-    /// Pyre's typed-helper API exposes neither field:
-    /// 1. The `#[jit_interp]` macro `release_gil_*` policy
-    ///    (`majit-macros/src/jit_interp/mod.rs:219-243`) takes only the
-    ///    bare callee — no `saveerr` attribute, no wrapper indirection.
-    ///    `func_ptr` here *is* the real C address, so the upstream
-    ///    `(realfuncaddr, saveerr)` distinction is intrinsically absent
-    ///    at this layer.
-    /// 2. `make_call_may_force_descr` does not populate the descr's
-    ///    `effect_info.call_release_gil_target` — there is no
-    ///    `(realfuncaddr, saveerr)` pair to thread.
-    ///
-    /// Consequence: this function records `[func_ptr] + args` for the
-    /// release-gil family too, conflating the upstream wrapper-vs-real
-    /// distinction.  Today this is observationally equivalent because
-    /// pyre's release-gil callees are direct C calls (no Python-side
-    /// wrapper), `saveerr == 0` is implied (no errno save/restore around
-    /// the call), and the `pyre-jit` codewriter never emits
-    /// `emit_residual_call(_, CallFlavor::ReleaseGil, _)` at all
-    /// (`flatten.rs:486` docstring).  The single production ReleaseGil
-    /// producer is the macro layer
-    /// (`majit-macros/src/jit_interp/jitcode_lower.rs:950+ / 2291+`)
-    /// emitting `BC_CALL_RELEASE_GIL_*` walked at runtime by
-    /// `majit-metainterp/src/pyjitpl/dispatch.rs:1640/1898/2124` →
-    /// `ctx.call_release_gil_*_typed` → here.
-    ///
-    /// Convergence (deferred — multi-session epic):
-    /// - Add `saveerr` attribute to the `#[jit_interp]` `release_gil_*`
-    ///   policy declarations in `majit-macros/src/jit_interp/mod.rs`.
-    /// - Plumb `(real_addr, saveerr)` into `make_call_*_descr` so the
-    ///   descr's `EffectInfo::call_release_gil_target` is populated.
-    /// - Branch in `call_release_gil_*_typed` to emit
-    ///   `[savebox, funcbox_real] + args[1:]` instead of routing through
-    ///   this shared `call_family_typed`.
-    /// - Update `dispatch.rs` BH walker to mirror the upstream
-    ///   `direct_call_release_gil` argbox reshape on replay.
-    ///
-    /// Until then: a future caller that introduces a release-gil callee
-    /// requiring `saveerr` semantics (errno save / save-and-restore
-    /// across the GIL release) will silently lose that semantic at this
-    /// site.  The convergence work above is mandatory before that lands.
+    /// Release-GIL calls do NOT route through here: the upstream
+    /// `pyjitpl.py:3671-3681 direct_call_release_gil` records the distinct
+    /// `[savebox, funcbox_real] + argboxes[1:]` shape with
+    /// `funcbox_real` resolved from
+    /// `effectinfo.call_release_gil_target` (the *real* C function
+    /// address, potentially distinct from the wrapper at `argboxes[0]`
+    /// per `call.py:252-258`).  That shape is implemented by
+    /// [`Self::record_release_gil_typed_with_effect`].
     fn call_family_typed(
         &mut self,
         opcode: OpCode,
@@ -3537,12 +3555,15 @@ impl TraceCtx {
     /// Pyre's typed-helper API takes `args` *without* a leading funcbox
     /// (the funcbox is the `func_ptr` parameter), so `args` is already
     /// the upstream `argboxes[1:]` shape. The trace op shape becomes
-    /// `[savebox, realfuncaddr] + args`. When the
-    /// `call_release_gil_target` slot carries the sentinel `(1, 0)`
-    /// emitted by `assembler.rs::call_release_gil_void_canonical_via_target`
-    /// (pyre has no asm-helper wrapper, so there is no real helper
-    /// address to thread), reuse `func_ptr` as `realfuncaddr` —
-    /// pyre's release-gil callees ARE the C function the trace records.
+    /// `[savebox, realfuncaddr] + args`. The body reads
+    /// `(realfuncaddr, saveerr)` directly off `effect_info.call_release_gil_target`
+    /// matching `pyjitpl.py:3675` line-by-line; the descr is guaranteed
+    /// to carry a real C address by the time we read it because either
+    /// (a) the emit-side `assembler.rs::resolve_call_release_gil_target`
+    /// substituted the resolved `target.concrete_ptr` into a sentinel
+    /// `(1, 0)` slot before the descr was materialized, or (b) a
+    /// producer-side typed caller (`trace_ctx.rs::call_release_gil_int_typed`,
+    /// `_float_typed`) populated the slot directly from `func_ptr`.
     ///
     /// Routes heapcache invalidation through `invalidate_caches_varargs`
     /// (heapcache.py:309-340) instead of the escape-only path used by
@@ -3602,17 +3623,34 @@ impl TraceCtx {
         ret_type: Type,
         effect_info: majit_ir::EffectInfo,
     ) -> OpRef {
+        // pyjitpl.py:3675-3677:
+        //   realfuncaddr, saveerr = effectinfo.call_release_gil_target
+        //   funcbox = ConstInt(adr2int(realfuncaddr))
+        //   savebox = ConstInt(saveerr)
+        // Pyre's emit-side `resolve_call_release_gil_target`
+        // (`jitcode/assembler.rs`) substitutes the resolved
+        // `target.concrete_ptr` into the `realfuncaddr` slot for the
+        // sentinel-(1, 0) descrs emitted by the macro DSL wrappers
+        // before the descr is materialized.  Caller-side
+        // `trace_ctx::call_release_gil_*_typed` already populates the
+        // slot with `func_ptr` directly (`trace_ctx.rs:3852, 3874`).
+        // Either way the descr carries a real C address by the time
+        // we read it here.
+        //
+        // PyPy's `call.py:252-258 _call_aroundstate_target_` allows
+        // the wrapper at `direct_call`'s `args[0]` and the real GIL-
+        // release target to be intentionally distinct values, so the
+        // recorded `funcbox` (built from `realfuncaddr`) is NOT
+        // required to equal `func_ptr` — only `realfuncaddr != 0` is
+        // structurally guaranteed.
         let (realfuncaddr, saveerr) = effect_info.call_release_gil_target;
-        // Sentinel: emit-side stamps `(1, 0)` to flag is_call_release_gil()
-        // without a real asm-helper address. Treat any
-        // `realfuncaddr <= 1` slot as "use the caller's func_ptr".
-        let realfuncaddr_value = if realfuncaddr <= 1 {
-            func_ptr as usize as i64
-        } else {
-            realfuncaddr as i64
-        };
+        debug_assert!(
+            realfuncaddr != 0,
+            "release_gil call_release_gil_target unset — emit-side resolve_call_release_gil_target should have populated realfuncaddr",
+        );
+        let _ = func_ptr;
         let savebox = self.constants.get_or_insert(saveerr as i64);
-        let funcbox = self.constants.get_or_insert(realfuncaddr_value);
+        let funcbox = self.constants.get_or_insert(realfuncaddr as i64);
 
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
@@ -3768,15 +3806,16 @@ impl TraceCtx {
         arg_types: &[Type],
     ) -> OpRef {
         // pyjitpl.py:3671-3681 direct_call_release_gil shape:
-        // `[savebox, funcbox_real] + argboxes[1:]`.  Without a per-callee
-        // `effectinfo.call_release_gil_target`, stamp the same sentinel
-        // `(1, 0)` the canonical void emit uses (assembler.rs:1836) so
-        // `is_call_release_gil()` returns true and the cranelift /
-        // dynasm consumers see the upstream-shaped op.
+        // `[savebox, funcbox_real] + argboxes[1:]`.  Pyre dispatches the
+        // C callee directly via `bh_call_*_dispatch` (no asm helper),
+        // so `realfuncaddr` IS `func_ptr` and `saveerr=0`.  Populating
+        // the field at the call site keeps the descr's IR carrying the
+        // real `(realfuncaddr, saveerr)` pair just like upstream's
+        // `effectinfo.call_release_gil_target`.
         let effect_info = majit_ir::EffectInfo {
             extraeffect: majit_ir::ExtraEffect::RandomEffects,
             can_invalidate: true,
-            call_release_gil_target: (1, 0),
+            call_release_gil_target: (func_ptr as usize as u64, 0),
             ..majit_ir::EffectInfo::default()
         };
         self.record_release_gil_typed_with_effect(
@@ -3798,7 +3837,7 @@ impl TraceCtx {
         let effect_info = majit_ir::EffectInfo {
             extraeffect: majit_ir::ExtraEffect::RandomEffects,
             can_invalidate: true,
-            call_release_gil_target: (1, 0),
+            call_release_gil_target: (func_ptr as usize as u64, 0),
             ..majit_ir::EffectInfo::default()
         };
         self.record_release_gil_typed_with_effect(
