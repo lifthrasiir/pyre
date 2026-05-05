@@ -104,7 +104,7 @@ pub struct PyFrame {
 /// every `PyFrame` is heap-allocated outside the nursery (`std::alloc`
 /// + a leaked `Box`) and roots are visited by the custom walker
 /// (`pyre-interpreter::eval::walk_pyframe_roots`); this id is therefore
-/// metadata-only at registration time. Phase 2.3 옵션 B's
+/// metadata-only at registration time.
 /// `emit_new_pyframe_inline_self_recursive` will be the first writer.
 ///
 /// Asserts the same id is returned by `gc.register_type(...)` so any

@@ -2756,7 +2756,7 @@ impl CodeWriter {
             stack_base,
         } = layout;
         // Per-arm fresh int scratch slots — Phase 2 Commit 2.2b
-        // (Tasks #158/#159/#122 plan, plan staged-sauteeing-koala).
+        // (Tasks #158/#159/#122 plan, plan migration notes).
         // Each opcode handler arm that needs a transient int-typed
         // register calls `ssarepr.fresh_var(Kind::Int, scratch_int_base)`
         // (flatten.rs:`SSARepr::fresh_var`) to claim a unique pre-regalloc
@@ -2771,7 +2771,7 @@ impl CodeWriter {
         // placeholder slots in the conflated Ref index space. Their final
         // post-regalloc colors are looked up from `alloc_result.rename` after
         // `apply_rename` runs (see below). Slot `+10` was the dedicated
-        // `null_ref_reg` PY_NULL holder before Tier 4 Epic A retired it; the
+        // `null_ref_reg` PY_NULL holder before Tier 4 Migration A retired it; the
         // portal red regs keep their numerical positions so layout-sensitive
         // tests stay stable.
         let portal_frame_reg = (nlocals + max_stackdepth + 11) as u16;
@@ -3167,13 +3167,13 @@ impl CodeWriter {
         // a caller-order Register list plus a u16 helper-table index and
         // encodes `may_force` in the target bytecode — none of which
         // fit into RPython's SSA tuple shape. Reviewer guidance:
-        //   "codewriter는 원본 RPython tuple 을 만들고, pyre 적응은
-        //    assembler 가 해야 한다."
+        // codewriter should build the original RPython tuple, and the
+        // assembler should handle the pyre adaptation.
         // Rather than baking the pyre shape into the SSA (which would
         // ossify a pyre-only SSA vocabulary), we keep the call handlers
         // on the direct builder path until assembler.rs grows exact
         // `residual_call_*` dispatch that can reconstruct the pyre
-        // caller-order list. See `B6_CODEWRITER_PIPELINE_PLAN.md`.
+        // caller-order list.
 
         macro_rules! emit_load_const_i {
             ($ssarepr:expr, $dst:expr, $value:expr $(,)?) => {{
@@ -3915,7 +3915,7 @@ impl CodeWriter {
             }};
         }
 
-        // Tier 4 Epic A — null_ref_reg → ConstRef(PY_NULL) migration.
+        // Tier 4 Migration A — null_ref_reg → ConstRef(PY_NULL) migration.
         // pyframe.py:389 `pushvalue(w_object)` lowers, when w_object is a
         // compile-time `ConstPtr.NULL`, to `setarrayitem_vable_r(
         // locals_cells_stack_w, depth, ConstPtr(NULL))` via
@@ -4266,7 +4266,7 @@ impl CodeWriter {
                         // assert the canonical 7-arg form on the way out.
                         //
                         // DEVIATION (β.2 migration target — see plan
-                        // `~/.claude/plans/inline-call-portal-migration.md`
+                        // internal parity notes
                         // + memory `inline_call_portal_beta2_audit_2026_05_03.md`):
                         //
                         // pycode is currently carried as an `Opaque(Ref)`
@@ -4525,7 +4525,7 @@ impl CodeWriter {
                         // (`regalloc.rs:78-86`); runtime register holds
                         // the boxed Ref written by the residual_call.
                         // Convergence: rtyper-equivalent `box_int_const`
-                        // graph op (Task #229 TmpVarEnv epic).
+                        // graph op (Task #229 TmpVarEnv migration).
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         current_depth += 1;
                         emit_vsd!(current_depth);
@@ -5460,7 +5460,7 @@ impl CodeWriter {
                                     cause_reg,
                                 )
                             } else {
-                                // Tier 4 Epic A: PY_NULL flows directly through
+                                // Tier 4 Migration A: PY_NULL flows directly through
                                 // the residual_call's ListOfKind(Ref) as a
                                 // raw constant — make_three_lists
                                 // (jtransform.py:437-445) admits Constant in
@@ -6767,8 +6767,8 @@ impl CodeWriter {
             .copied()
             .unwrap_or(portal_ec_reg);
 
-        // Phase 2 commit 2.1 (Tasks #158/#159/#122 epic, plan
-        // `~/.claude/plans/staged-sauteeing-koala.md`): record each
+        // Phase 2 commit 2.1 (Tasks #158/#159/#122 migration, plan
+        // internal parity notes): record each
         // Python-semantic stack slot's post-regalloc color. With the
         // input-arg pinning removed (regalloc.rs `enforce_input_args`
         // no longer rotates stack slots), the chordal coloring may
@@ -6796,7 +6796,7 @@ impl CodeWriter {
                 .unwrap_or(pre);
             stack_slot_color_map.push(post);
         }
-        // Task #110 slice 3a (parent #185 epic, plan
+        // Task #110 slice 3a (parent #185 migration, plan
         // `task110_ssa_authoritative_live_r_epic_plan.md`): record each
         // Python-semantic local slot's post-regalloc color so the encoder
         // (`pyre-jit-trace::trace_opcode::get_list_of_active_boxes`) can

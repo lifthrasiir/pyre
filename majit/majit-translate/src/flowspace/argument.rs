@@ -82,14 +82,14 @@ impl Signature {
     }
 
     /// upstream `rpython/flowspace/argument.py:49` — `Signature.__len__`.
-    /// 항상 3 (`argnames`, `varargname`, `kwargname`).
+    /// Always returns 3: `argnames`, `varargname`, and `kwargname`.
     pub fn len_tuple(&self) -> usize {
         3
     }
 
     /// upstream `rpython/flowspace/argument.py:49` — `Signature.__getitem__`.
-    /// `i ∈ {0, 1, 2}` 아니면 panic (upstream 도 `IndexError`). 각 인덱스
-    /// 는 `SignatureItem` 의 variant 로 노출된다.
+    /// Panics unless `i` is in `{0, 1, 2}`; upstream raises `IndexError`.
+    /// Each index is exposed as a `SignatureItem` variant.
     pub fn getitem(&self, i: usize) -> SignatureItem<'_> {
         match i {
             0 => SignatureItem::Argnames(&self.argnames),
@@ -100,9 +100,9 @@ impl Signature {
     }
 }
 
-/// upstream `Signature.__getitem__` 의 반환 shape. Rust 는 heterogeneous
-/// tuple 을 generic index 로 노출할 수 없어서 enum 으로 encode 한다 —
-/// 각 variant 는 upstream 튜플 position 과 일대일 대응한다.
+/// Return shape of upstream `Signature.__getitem__`. Rust cannot expose a
+/// heterogeneous tuple through a generic index, so this encodes the result
+/// as an enum; each variant maps one-to-one to an upstream tuple position.
 #[derive(Debug)]
 pub enum SignatureItem<'a> {
     /// `sig[0]` — `argnames` list.

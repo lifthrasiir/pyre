@@ -164,10 +164,10 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
 fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     CURRENT_FRAME.with(|cf| {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
-        // nursery-allocated `PyFrame` (Phase 2.3 옵션 B
-        // `emit_new_pyframe_inline_self_recursive`) the visitor copies
-        // it to the survivor space and rewrites the cell to the new
-        // address. For `std::alloc`-backed frames the visitor's
+        // nursery-allocated `PyFrame`
+        // (`emit_new_pyframe_inline_self_recursive`), the visitor copies it
+        // to the survivor space and rewrites the cell to the new address.
+        // For `std::alloc`-backed frames the visitor's
         // `is_nursery_object_start` guard short-circuits, leaving the
         // pointer untouched. `Cell::as_ptr()` exposes the storage
         // address; `*mut PyFrame` and `GcRef` share the `usize` repr
