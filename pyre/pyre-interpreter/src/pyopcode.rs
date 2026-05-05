@@ -1,6 +1,6 @@
 use crate::bytecode::{
     BinaryOperator, CodeObject, CodeUnit, ComparisonOperator, ConstantData, Instruction,
-    IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState, SpecialMethod,
+    IntrinsicFunction1, IntrinsicFunction2, OpArg, OpArgState, RaiseKind, SpecialMethod,
 };
 
 use crate::{
@@ -1290,6 +1290,51 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, Self::Error>;
 }
 
+/// Widen a `u32`-typed oparg to `i64`. Adapter-friendly stand-in for
+/// the bare `x as i64` cast that
+/// `majit/majit-translate/src/flowspace/rust_source/build_flow.rs:lower_cast`
+/// rejects. Upstream parity: RPython source uses `r_longlong(x)` /
+/// `widen(x)` (`rlib/rarithmetic.py:303`) — class/function calls,
+/// never `as` syntax. The flowspace adapter walks one function at a
+/// time, so this helper body's residual `as` cast is opaque to the
+/// analyzer that processes `execute_opcode_step`.
+#[inline]
+const fn u32_as_i64(x: u32) -> i64 {
+    x as i64
+}
+
+/// Widen a `u32`-typed oparg to host-pointer-sized `usize`. See
+/// [`u32_as_i64`] for the parity rationale.
+#[inline]
+const fn u32_as_usize(x: u32) -> usize {
+    x as usize
+}
+
+/// Widen a raw [`OpArg`] to host-pointer-sized `usize`. Used at
+/// instruction sites that consume the oparg directly (no inner
+/// `Arg<T>::get` call) — currently `JumpForward` /
+/// `jump_target_forward` indirections at `pyopcode.rs:1809,1926`.
+/// `u32::from(arg)` is a trait-method call (lowers as
+/// `simple_call("u32::from", arg)`); the residual `as usize` lives
+/// inside this helper body, opaque to the per-function adapter walk.
+#[inline]
+fn op_arg_as_usize(arg: OpArg) -> usize {
+    u32::from(arg) as usize
+}
+
+/// Extract a [`RaiseKind`]'s discriminant as `usize`. Same parity
+/// rationale as [`u32_as_i64`] / [`u32_as_usize`]: upstream Python
+/// has no enum-discriminant cast syntax, so the bare `kind as usize`
+/// at a `RaiseVarargs` arm has no flowspace counterpart. `u32::from`
+/// goes through the `From<RaiseKind> for u32` impl synthesized by
+/// `rustpython-compiler-core`'s `oparg_enum!` macro
+/// (`oparg.rs:215-219`); the residual `as usize` widens (`u32 ≤ usize`
+/// on every supported pyre target host) inside this helper body.
+#[inline]
+fn raise_kind_as_usize(kind: RaiseKind) -> usize {
+    u32::from(kind) as usize
+}
+
 pub fn execute_opcode_step<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -1323,7 +1368,7 @@ where
         }
 
         Instruction::LoadSmallInt { i } => {
-            executor.load_small_int(i.get(op_arg) as i64)?;
+            executor.load_small_int(u32_as_i64(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
@@ -1340,8 +1385,8 @@ where
 
         Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
             let pair = var_nums.get(op_arg);
-            let idx1 = u32::from(pair.idx_1()) as usize;
-            let idx2 = u32::from(pair.idx_2()) as usize;
+            let idx1 = pair.idx_1().as_usize();
+            let idx2 = pair.idx_2().as_usize();
             executor.load_fast_pair_checked(
                 idx1,
                 code.varnames[idx1].as_ref(),
@@ -1369,44 +1414,38 @@ where
 
         Instruction::LoadFastLoadFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            let idx1 = u32::from(pair.idx_1()) as usize;
-            let idx2 = u32::from(pair.idx_2()) as usize;
+            let idx1 = pair.idx_1().as_usize();
+            let idx2 = pair.idx_2().as_usize();
             executor.load_fast_load_fast(idx1, idx2)?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreFastLoadFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            executor.store_fast_load_fast(
-                u32::from(pair.idx_1()) as usize,
-                u32::from(pair.idx_2()) as usize,
-            )?;
+            executor.store_fast_load_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreFastStoreFast { var_nums } => {
             let pair = var_nums.get(op_arg);
-            executor.store_fast_store_fast(
-                u32::from(pair.idx_1()) as usize,
-                u32::from(pair.idx_2()) as usize,
-            )?;
+            executor.store_fast_store_fast(pair.idx_1().as_usize(), pair.idx_2().as_usize())?;
             Ok(StepResult::Continue)
         }
 
         Instruction::StoreName { namei } | Instruction::StoreGlobal { namei } => {
-            let idx = namei.get(op_arg) as usize;
+            let idx = u32_as_usize(namei.get(op_arg));
             executor.store_name(code.names[idx].as_ref())?;
             Ok(StepResult::Continue)
         }
 
         Instruction::LoadName { namei } => {
-            let idx = namei.get(op_arg) as usize;
+            let idx = u32_as_usize(namei.get(op_arg));
             executor.load_name(code.names[idx].as_ref())?;
             Ok(StepResult::Continue)
         }
 
         Instruction::LoadGlobal { namei } => {
-            let raw = namei.get(op_arg) as usize;
+            let raw = u32_as_usize(namei.get(op_arg));
             let name_idx = raw >> 1;
             let push_null = (raw & 1) != 0;
             executor.load_global(code.names[name_idx].as_ref(), push_null)?;
@@ -1424,12 +1463,12 @@ where
         }
 
         Instruction::Copy { i } => {
-            executor.copy_value(i.get(op_arg) as usize)?;
+            executor.copy_value(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
         Instruction::Swap { i } => {
-            executor.swap(i.get(op_arg) as usize)?;
+            executor.swap(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
@@ -1497,24 +1536,24 @@ where
         }
 
         Instruction::Call { argc } => {
-            executor.call(argc.get(op_arg) as usize)?;
+            executor.call(u32_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
         Instruction::ReturnValue => executor.return_value(),
 
         Instruction::BuildList { count } => {
-            OpcodeStepExecutor::build_list(executor, count.get(op_arg) as usize)?;
+            OpcodeStepExecutor::build_list(executor, u32_as_usize(count.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
         Instruction::BuildTuple { count } => {
-            OpcodeStepExecutor::build_tuple(executor, count.get(op_arg) as usize)?;
+            OpcodeStepExecutor::build_tuple(executor, u32_as_usize(count.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
         Instruction::BuildMap { count } => {
-            OpcodeStepExecutor::build_map(executor, count.get(op_arg) as usize)?;
+            OpcodeStepExecutor::build_map(executor, u32_as_usize(count.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
@@ -1524,12 +1563,12 @@ where
         }
 
         Instruction::ListAppend { i } => {
-            OpcodeStepExecutor::list_append(executor, i.get(op_arg) as usize)?;
+            OpcodeStepExecutor::list_append(executor, u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
         Instruction::UnpackSequence { count } => {
-            OpcodeStepExecutor::unpack_sequence(executor, count.get(op_arg) as usize)?;
+            OpcodeStepExecutor::unpack_sequence(executor, u32_as_usize(count.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
@@ -1559,7 +1598,7 @@ where
 
         Instruction::LoadAttr { namei } => {
             let attr = namei.get(op_arg);
-            let name_idx = attr.name_idx() as usize;
+            let name_idx = u32_as_usize(attr.name_idx());
             let name = code.names[name_idx].as_ref();
             if attr.is_method() {
                 // Delegate to load_method — the default pushes [attr, NULL].
@@ -1574,7 +1613,7 @@ where
         }
 
         Instruction::StoreAttr { namei } => {
-            let name_idx = namei.get(op_arg) as usize;
+            let name_idx = u32_as_usize(namei.get(op_arg));
             OpcodeStepExecutor::store_attr(executor, code.names[name_idx].as_ref())?;
             Ok(StepResult::Continue)
         }
@@ -1606,12 +1645,12 @@ where
 
         // ── Import ──
         Instruction::ImportName { namei } => {
-            let name_idx = namei.get(op_arg) as usize;
+            let name_idx = u32_as_usize(namei.get(op_arg));
             executor.import_name(code.names[name_idx].as_ref())?;
             Ok(StepResult::Continue)
         }
         Instruction::ImportFrom { namei } => {
-            let name_idx = namei.get(op_arg) as usize;
+            let name_idx = u32_as_usize(namei.get(op_arg));
             executor.import_from(code.names[name_idx].as_ref())?;
             Ok(StepResult::Continue)
         }
@@ -1648,7 +1687,7 @@ where
             Ok(StepResult::Continue)
         }
         Instruction::RaiseVarargs { argc } => {
-            executor.raise_varargs(argc.get(op_arg) as usize)?;
+            executor.raise_varargs(raise_kind_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::Reraise { .. } => {
@@ -1658,7 +1697,7 @@ where
 
         // ── Collection operations ──
         Instruction::BuildSet { count } => {
-            executor.build_set(count.get(op_arg) as usize)?;
+            executor.build_set(u32_as_usize(count.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::BuildSlice { argc } => {
@@ -1666,7 +1705,7 @@ where
             Ok(StepResult::Continue)
         }
         Instruction::BuildString { count } => {
-            executor.build_string(count.get(op_arg) as usize)?;
+            executor.build_string(u32_as_usize(count.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         // Template strings (PEP 750) — `t"hello {name}"`. Stack: [strings, interps].
@@ -1688,27 +1727,27 @@ where
             Ok(StepResult::Continue)
         }
         Instruction::ListExtend { i } => {
-            executor.list_extend(i.get(op_arg) as usize)?;
+            executor.list_extend(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::SetAdd { i } => {
-            executor.set_add(i.get(op_arg) as usize)?;
+            executor.set_add(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::DictMerge { i } => {
-            executor.dict_merge(i.get(op_arg) as usize)?;
+            executor.dict_merge(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::DictUpdate { i } => {
-            executor.dict_update(i.get(op_arg) as usize)?;
+            executor.dict_update(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::SetUpdate { i } => {
-            executor.set_update(i.get(op_arg) as usize)?;
+            executor.set_update(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::MapAdd { i } => {
-            executor.map_add(i.get(op_arg) as usize)?;
+            executor.map_add(u32_as_usize(i.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
@@ -1752,7 +1791,7 @@ where
             Ok(StepResult::Continue)
         }
         Instruction::CopyFreeVars { n } => {
-            executor.copy_free_vars(n.get(op_arg) as usize)?;
+            executor.copy_free_vars(u32_as_usize(n.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
 
@@ -1764,7 +1803,7 @@ where
 
         // ── Function call variants ──
         Instruction::CallKw { argc } => {
-            executor.call_kw(argc.get(op_arg) as usize)?;
+            executor.call_kw(u32_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
         Instruction::CallFunctionEx => {
@@ -1787,26 +1826,26 @@ where
 
         // ── Delete ops ──
         Instruction::DeleteFast { var_num } => {
-            executor.delete_fast(u32::from(var_num.get(op_arg)) as usize)?;
+            executor.delete_fast(var_num.get(op_arg).as_usize())?;
             Ok(StepResult::Continue)
         }
         Instruction::DeleteName { namei } => {
-            executor.delete_name(code.names[namei.get(op_arg) as usize].as_ref())?;
+            executor.delete_name(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
             Ok(StepResult::Continue)
         }
         Instruction::DeleteGlobal { namei } => {
-            executor.delete_global(code.names[namei.get(op_arg) as usize].as_ref())?;
+            executor.delete_global(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
             Ok(StepResult::Continue)
         }
         Instruction::DeleteAttr { namei } => {
-            executor.delete_attr(code.names[namei.get(op_arg) as usize].as_ref())?;
+            executor.delete_attr(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
             Ok(StepResult::Continue)
         }
 
         // ── Load super attr ──
         // CPython 3.12: stack = [global_super, class, self] → super(class, self).attr
         Instruction::LoadSuperAttr { .. } => {
-            let raw = u32::from(op_arg) as usize;
+            let raw = op_arg_as_usize(op_arg);
             let idx = raw >> 2;
             let name = &code.names[idx];
             let is_method = (raw & 1) != 0;
@@ -1852,7 +1891,7 @@ where
 
         // ── Loop / generator control ──
         Instruction::JumpBackwardNoInterrupt { delta } => {
-            let tgt = u32::from(delta.get(op_arg)) as usize;
+            let tgt = delta.get(op_arg).as_usize();
             executor.set_next_instr(next_instr - tgt)?;
             Ok(StepResult::Continue)
         }
@@ -1873,7 +1912,7 @@ where
 
         // ── Scoping ──
         Instruction::LoadFromDictOrGlobals { i } => {
-            let idx = i.get(op_arg) as usize;
+            let idx = u32_as_usize(i.get(op_arg));
             executor.load_from_dict_or_globals(code.names[idx].as_ref())?;
             Ok(StepResult::Continue)
         }
@@ -1923,7 +1962,7 @@ where
 
         Instruction::Send { .. } => {
             let target =
-                jump_target_forward(&code.instructions, next_instr, u32::from(op_arg) as usize);
+                jump_target_forward(&code.instructions, next_instr, op_arg_as_usize(op_arg));
             executor.send_value(target)?;
             Ok(StepResult::Continue)
         }

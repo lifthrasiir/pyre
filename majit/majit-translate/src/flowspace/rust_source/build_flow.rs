@@ -33,8 +33,12 @@ use syn::{
 };
 
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue, Link,
-    SpaceOperation, Variable, c_last_exception,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue,
+    HostObject, Link, SpaceOperation, Variable, c_last_exception,
+};
+
+use super::host_env::{
+    ModuleId, is_host_class_minted, mint_host_class, module_globals_lookup, pyre_stdlib_lookup,
 };
 
 /// Reasons the adapter rejects the input. Every variant carries a
@@ -75,7 +79,29 @@ impl std::error::Error for AdapterError {}
 /// Entry point. Walks `func` and emits the `FunctionGraph` that
 /// upstream `build_flow(GraphFunc)` would have produced for the
 /// equivalent Python source.
+///
+/// Mints a fresh [`ModuleId`] internally — the body's
+/// `LOAD_GLOBAL` lookups will see an empty registry slice and
+/// fall through to `pyre_stdlib_lookup` / mint, matching the
+/// pre-Issue-1.3 behaviour for direct single-`ItemFn` callers
+/// (driver tests, the `tests::*` cases below). Callers that want
+/// the body to resolve sibling-item names registered through
+/// [`super::register::register_rust_module`] must use
+/// [`build_flow_from_rust_in_module`] with the matching id.
 pub fn build_flow_from_rust(func: &ItemFn) -> Result<FunctionGraph, AdapterError> {
+    build_flow_from_rust_in_module(func, ModuleId::fresh())
+}
+
+/// Module-aware entry: lower `func` so that any `LOAD_GLOBAL`
+/// lookup against `module_id`'s registry slice resolves to the
+/// value the walker bound. Mirrors upstream `flowcontext.py:284
+/// self.w_globals = Constant(func.__globals__)` per-function
+/// scoping — `module_id` plays the role of the function's
+/// `__globals__` reference.
+pub fn build_flow_from_rust_in_module(
+    func: &ItemFn,
+    module_id: ModuleId,
+) -> Result<FunctionGraph, AdapterError> {
     validate_signature(func)?;
 
     let (inputargs, locals) = collect_params(func)?;
@@ -92,9 +118,19 @@ pub fn build_flow_from_rust(func: &ItemFn) -> Result<FunctionGraph, AdapterError
         returnblock: graph.returnblock.clone(),
         exceptblock: graph.exceptblock.clone(),
         loop_stack: Vec::new(),
+        module_id,
     };
 
-    match lower_block(&mut builder, &func.block)? {
+    // Function body root: tail expression flows directly into the
+    // returnblock Link (lines 105-110 below), so this is the one true
+    // upstream-`flowcontext.py:1232 RETURN_VALUE` boundary site.
+    // `at_boundary=true` propagates through control-flow lowerings so
+    // any nested `if`/`match`/`block` whose result IS the function's
+    // return value preserves boundary semantics for its arms; nested
+    // `lower_block`/`lower_if`/`lower_match` reached from value
+    // position (`let z = …;`, function args) flips `at_boundary` to
+    // `false` per the Slice O4 PRE-EXISTING-ADAPTATION.
+    match lower_block(&mut builder, &func.block, true)? {
         BlockExit::FallThrough(tail) => {
             // Body reached its closing `}` with a tail value —
             // terminate the currently-open block with a Link into
@@ -261,6 +297,13 @@ struct Builder {
     /// per `model.py:22-25`. `?` exception links target this.
     exceptblock: BlockRef,
     loop_stack: Vec<LoopCtx>,
+    /// Per-function module identity for `func_globals` lookup.
+    /// Mirrors upstream `flowcontext.py:284 self.w_globals =
+    /// Constant(func.__globals__)`: each function carries a per-
+    /// module reference, and `LOAD_GLOBAL` reads that module's
+    /// dict — not a process-shared registry. Issue 1.3 closure
+    /// (2026-05-05): replaces the prior process-global lookup.
+    module_id: ModuleId,
 }
 
 impl Builder {
@@ -300,12 +343,383 @@ impl Builder {
     fn open_new_block(&mut self, new: BlockBuilder) {
         self.current = new;
     }
+
+    /// Resolve a `syn::Path` in expression position to the `Hlvalue`
+    /// upstream `flowcontext.py` would have produced for the
+    /// equivalent Python source. Mirrors the
+    /// `LOAD_FAST` (`pyopcode.py:502`) → `LOAD_GLOBAL`
+    /// (`flowcontext.py:856`) → `LOAD_ATTR` (`:861` →
+    /// `operation.py:618 getattr`) lookup chain that Python bytecode
+    /// would compile a qualified name to.
+    ///
+    /// Resolution order matches upstream `flowcontext.py:835/845-854`:
+    /// locals (LOAD_FAST) → `func_globals` → `__builtin__` → fail.
+    ///
+    /// 1. **Single-segment paths** — locals first (LOAD_FAST priority,
+    ///    `pyopcode.py:502`); the bare identifier `None` resolves to
+    ///    `Constant(ConstValue::None)` (Python's NoneType singleton —
+    ///    flowspace's `Constant(None)` carrier per `model.py`);
+    ///    `host_env::HOST_RUST_MODULE_FUNCS` (the `func_globals`
+    ///    analogue, populated by [`super::register::register_rust_module`])
+    ///    yields a `Constant(HostObject(<UserFunction>))` for any
+    ///    top-level `fn` in a previously-walked `syn::File`; the
+    ///    closed-world `host_env::PYRE_STDLIB` registry (the
+    ///    `__builtin__` analogue) yields a
+    ///    `Constant(HostObject(<class>))` for `Ok` / `Some` / `Err` /
+    ///    `Result` / `Option`; otherwise `UnboundLocal`. No on-demand
+    ///    minting at single-segment scope — a bare PascalCase
+    ///    identifier could be a local, a unit struct, a const, or a
+    ///    type, and the adapter cannot disambiguate without
+    ///    annotator-level context.
+    /// 2. **Multi-segment paths** (`A::B::C`) — leftmost segment goes
+    ///    through single-segment resolution but with mint fallback
+    ///    (PRE-EXISTING-ADAPTATION, see "Mint-on-demand stand-in"
+    ///    below): if not in locals / not the `None` singleton / not
+    ///    in PYRE_STDLIB, find-or-mint a `HostObject::Class` via the
+    ///    process-global `host_env::mint_host_class(name)` so every
+    ///    occurrence of `StepResult::*` — across all graphs in the
+    ///    process — shares the same `StepResult` identity (mirrors
+    ///    upstream `LOAD_GLOBAL` reading from `func.func_globals`
+    ///    which returns the same Python object on every lookup
+    ///    regardless of which graph is being built —
+    ///    `flowcontext.py:847`). The `::` syntax disambiguates:
+    ///    `StepResult` here is unambiguously a type/module path. Each
+    ///    subsequent segment emits a `getattr(prev,
+    ///    ConstValue::byte_str(seg))` SpaceOperation per
+    ///    `operation.py:618 getattr` arity=2; the final `Variable`
+    ///    is the resolved expression value. N segments emit N-1
+    ///    getattr ops (PRE-EXISTING-ADAPTATION, see "Raw-getattr
+    ///    cascade stand-in" below).
+    ///
+    /// Paths with `qself` (`<T as Foo>::Bar`), generic arguments
+    /// (`Foo::<T>::Bar`), or a leading `::` (global path) reject as
+    /// `Unsupported`. Each is its own port — see Slice O7+ in the
+    /// orthodox HOST_ENV plan.
+    ///
+    /// ### PRE-EXISTING-ADAPTATION — Mint-on-demand stand-in for
+    /// names not yet registered through the walker
+    ///
+    /// Upstream `flowcontext.py:845 find_global` raises
+    /// `FlowingError("global name '%s' is not defined")` whenever
+    /// `varname` is absent from both `w_globals.value` and
+    /// `__builtin__`. Slices O7-O10 incrementally close this gap —
+    /// `register_rust_module` populates `HOST_RUST_MODULE_GLOBALS`
+    /// for every top-level `Item::Enum` / `Item::Struct` / literal
+    /// `Item::Const`. What remains uncovered:
+    ///
+    /// - **`Item::Fn` is intentionally NOT registered.** Slice O7
+    ///   originally registered sibling fns, but the walker has no
+    ///   way to wire `FunctionDesc.buildgraph`'s deferred-lowering
+    ///   path (`description.py:140` → `build_flow(GraphFunc)`) back
+    ///   to the Rust-AST adapter. A registered sibling fn would
+    ///   supply empty bytecode at lowering time. Reverted in the
+    ///   Issue 1.2 fix — see `register.rs::register_rust_module`'s
+    ///   "Why no Item::Fn?" docstring. The single entry-point fn
+    ///   that production callers want is found via
+    ///   `file.items.iter().find_map(...)` in
+    ///   `build_host_function_from_rust_file`, bypassing the
+    ///   registry.
+    /// - **Production callsites that don't walk the file first.**
+    ///   `Translation::from_rust_item_fn` and the driver tests in
+    ///   `translator/driver.rs` invoke `build_host_function_from_rust`
+    ///   on a single `ItemFn` without first registering the enclosing
+    ///   `syn::File`'s sibling items. Until those callsites switch to
+    ///   the walker-first idiom, the leftmost segment may legitimately
+    ///   miss the registry even though the enum exists in source.
+    /// - **`Item::Static`, compound `Item::Const`, `Item::Use`,
+    ///   `Item::Mod`, `Item::Impl`.** Walker dispatch deferred
+    ///   pending a const-expression evaluator and import-graph
+    ///   resolution.
+    /// - **Third-party crate types** (`rustpython_compiler_core::Instruction`)
+    ///   that pyre-interpreter references — the walker has no
+    ///   visibility into upstream crate sources.
+    ///
+    /// (Per-module `func_globals` scoping — Issue 1.3 — closed
+    /// 2026-05-05. The registry is now partitioned by `ModuleId`
+    /// per upstream `flowcontext.py:284 self.w_globals =
+    /// Constant(func.__globals__)`. `Builder.module_id` carries
+    /// the id `register_rust_module(file)` minted, so the lookup
+    /// hits the matching partition and two walks of files with
+    /// shared names see independent values.)
+    ///
+    /// For names that miss every prior layer, `mint_host_class`
+    /// finds-or-mints a placeholder `HostObject::Class` (process-
+    /// global identity, same `Arc::ptr_eq` invariant as
+    /// `func_globals[name]`). The cascade then proceeds with raw
+    /// emit (see "Constfold-then-emit" note below) because the
+    /// minted class has empty members; constfold would
+    /// `FlowingError` on every getattr.
+    ///
+    /// **Convergence path**: route every production callsite through
+    /// `register_rust_module(&parsed_file)` before invoking
+    /// `build_host_function_from_rust(item_fn)`. Then drop the
+    /// `mint_unknown` branch and surface `AdapterError::UnboundLocal`
+    /// (the closest local analogue of `FlowingError`) for
+    /// unregistered names. Tracked as Slice O9 (callsite cutover) +
+    /// Slice O10 (`Item::Const` walker dispatch).
+    ///
+    /// ### Constfold-then-emit cascade (Slice O8 — landed)
+    ///
+    /// Upstream `flowcontext.py:861 LOAD_ATTR` is
+    /// `op.getattr(w_obj, w_name).eval(self)` — `eval` runs the op's
+    /// `constfold()` (`operation.py:624 GetAttr.constfold`) before
+    /// recording. The cascade now mirrors that shape: each step
+    /// queries `class_get(name)` on the resolved leftmost. On
+    /// `Some(value)` the cascade folds the segment to a Constant
+    /// (matching upstream `try: result = getattr(obj, name); return
+    /// const(result)`). On `None` the cascade falls through to the
+    /// raw `getattr` SpaceOperation emission — this matches
+    /// upstream's `HLOperation.eval` recording path when constfold
+    /// returns `None` (e.g. non-foldable args), and is also the
+    /// load-bearing fallback for minted-class leftmosts (which have
+    /// empty class dicts by construction).
+    ///
+    /// ### PRE-EXISTING-ADAPTATION (Issue 2.1): constfold-miss is too lenient
+    ///
+    /// Upstream `operation.py:624 GetAttr.constfold` does:
+    ///
+    /// ```python
+    /// if w_obj.foldable() and w_name.foldable():
+    ///     try:
+    ///         result = getattr(obj, name)
+    ///     except Exception as e:
+    ///         raise FlowingError(
+    ///             "getattr(%s, %s) always raises %s: %s" %
+    ///             (obj, name, etype, e))
+    ///     return const(result)
+    /// ```
+    ///
+    /// — both args foldable + lookup miss == compile-time error.
+    /// The local Rust flowspace mirrors this at `model.rs:1201`
+    /// (returns `None` to surface as a graph-build error). pyre's
+    /// adapter cascade DOES NOT: when `acc` is a Constant carrying
+    /// a `HostObject::Class` and `class_get(name)` returns `None`,
+    /// the cascade falls through to the raw-emit branch instead of
+    /// raising. The lenient fallback is load-bearing while the
+    /// mint-on-demand stand-in is in place — minted classes have
+    /// empty dicts, so any `getattr(MintedFoo, "Variant")` cascade
+    /// would otherwise fail at every call site.
+    ///
+    /// **Convergence path** (multi-session, blocked on retiring the
+    /// mint stand-in):
+    ///
+    /// 1. Land enough walker coverage (Issue 2.3) and per-module
+    ///    scoping (Issue 1.3) that every leftmost-segment lookup
+    ///    succeeds against a real registered class.
+    /// 2. Drop the `mint_unknown` branch in
+    ///    [`Self::resolve_leftmost_segment`] so unregistered names
+    ///    are real `AdapterError::Unsupported` errors.
+    /// 3. Tighten the cascade's constfold-miss to raise
+    ///    `AdapterError::Unsupported` matching upstream's
+    ///    `FlowingError` semantic.
+    fn resolve_path_constant(&mut self, path: &syn::Path) -> Result<Hlvalue, AdapterError> {
+        if path.leading_colon.is_some() {
+            return Err(AdapterError::Unsupported {
+                reason: "leading-`::` global path (`::std::result::Result`) — globally-anchored \
+                    path resolution is its own port (out of M2.5e orthodox scope; see plan \
+                    Non-goals)"
+                    .into(),
+            });
+        }
+        for seg in &path.segments {
+            if !matches!(seg.arguments, syn::PathArguments::None) {
+                return Err(AdapterError::Unsupported {
+                    reason: "qualified path with generic arguments (`Foo::<T>::Bar`) — generic \
+                        type-arg reification is its own port (out of M2.5e orthodox scope; \
+                        see plan Non-goals)"
+                        .into(),
+                });
+            }
+        }
+        let n = path.segments.len();
+        if n == 0 {
+            return Err(AdapterError::Unsupported {
+                reason: "empty path (defensive — syn never produces this shape)".into(),
+            });
+        }
+
+        // Resolve the leftmost segment. Single-segment scope rejects
+        // unknown names; multi-segment scope mints on demand.
+        let leftmost = path.segments[0].ident.to_string();
+        let is_multi = n >= 2;
+        let mut acc = self.resolve_leftmost_segment(&leftmost, is_multi)?;
+
+        // Each subsequent segment mirrors upstream
+        // `flowcontext.py:861 LOAD_ATTR` →
+        // `op.getattr(w_obj, w_name).eval(self)`. `eval` runs the
+        // op's `constfold()` first (`operation.py:624
+        // GetAttr.constfold`): when `w_obj` is a foldable `Constant`
+        // host class with the named member populated, the segment
+        // collapses to `const(getattr(obj, name))`. Otherwise the
+        // raw `getattr` SpaceOperation is recorded — matching
+        // upstream's fall-through into `HLOperation.eval`'s
+        // recording path.
+        for seg in path.segments.iter().skip(1) {
+            let name = seg.ident.to_string();
+            // Mirrors `operation.py:624-642 GetAttr.constfold`. With
+            // both `w_obj` (`acc`) and `w_name` (the constant byte
+            // string) foldable, upstream's rule is: try Python's
+            // `getattr(obj, name)`; if it succeeds bind the result
+            // as `const(result)`; if it raises any exception, raise
+            // `FlowingError("getattr(%s, %s) always raises %s: %s")`.
+            // A Variable `acc` corresponds to upstream's
+            // `w_obj.foldable() == False` path which returns from
+            // `constfold` and lets `HLOperation.eval` record the
+            // raw `getattr` op.
+            if let Hlvalue::Constant(c) = &acc {
+                if let ConstValue::HostObject(host) = &c.value {
+                    if let Some(folded) = host.class_get(&name) {
+                        acc = Hlvalue::Constant(Constant::new(folded));
+                        continue;
+                    }
+                    // class dict miss — upstream Python's
+                    // `getattr(obj, name)` raises `AttributeError`,
+                    // which `operation.py:638-642` reraises as
+                    // `FlowingError`. Issue 3 (2026-05-05) closes
+                    // the prior raw-getattr fall-through for
+                    // walker-registered classes (whose class dicts
+                    // are authoritative).
+                    if !is_host_class_minted(host) {
+                        return Err(AdapterError::Unsupported {
+                            reason: format!(
+                                "getattr({}, {}) always raises AttributeError: \
+                                 {} has no attribute '{}'",
+                                host.qualname(),
+                                name,
+                                host.qualname(),
+                                name,
+                            ),
+                        });
+                    }
+                    // PRE-EXISTING-ADAPTATION (mint-on-demand):
+                    // mint-class dicts are intentionally empty
+                    // pending walker coverage of the source-file
+                    // declaration (`Item::Fn`, `Item::Use`,
+                    // `Item::Mod`, …). Treat the class as opaque —
+                    // upstream's `w_obj.foldable() == False` path,
+                    // which records the raw `getattr` op without
+                    // raising. Convergence path: once the missing
+                    // walker dispatches land and `mint_host_class`
+                    // is retired, drop this branch and the helper.
+                }
+            }
+            let result = Hlvalue::Variable(Variable::new());
+            self.emit_op(SpaceOperation::new(
+                "getattr",
+                vec![
+                    acc,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(name))),
+                ],
+                result.clone(),
+            ));
+            acc = result;
+        }
+        Ok(acc)
+    }
+
+    /// Single-segment resolution with mint-vs-reject choice driven by
+    /// `mint_unknown`. The split lets `resolve_path_constant` apply
+    /// different rules to the leftmost-segment of a multi-segment
+    /// path (mint on miss) vs a standalone single-segment path
+    /// (reject on miss).
+    ///
+    /// `mint_unknown=true` is the PRE-EXISTING-ADAPTATION described
+    /// at length on `resolve_path_constant` — see "Mint-on-demand
+    /// stand-in for the missing module-globals walker". Reject is
+    /// the upstream-orthodox shape (`flowcontext.py:845-854 find_global`
+    /// raises `FlowingError`); mint is the closed-world substitute
+    /// pending the M3.x walker.
+    fn resolve_leftmost_segment(
+        &mut self,
+        name: &str,
+        mint_unknown: bool,
+    ) -> Result<Hlvalue, AdapterError> {
+        // 1. Locals first — `pyopcode.py:502 LOAD_FAST` priority.
+        if let Some(local) = self.locals().get(name).cloned() {
+            return Ok(local);
+        }
+        // 2. `None` singleton — Python's NoneType singleton instance.
+        //    Upstream Python 2 has `None` in `__builtin__`; the Rust
+        //    `None` (Option::None variant) is the closest source-side
+        //    analogue and lowers to the same flowspace constant.
+        if name == "None" {
+            return Ok(Hlvalue::Constant(Constant::new(ConstValue::None)));
+        }
+        // 3. Module-globals (`func_globals` analogue) — populated by
+        //    `register_rust_module` walking a `syn::File` at "import"
+        //    time, partitioned by `ModuleId`. Mirrors upstream
+        //    `flowcontext.py:284 self.w_globals = Constant(func.__globals__)`
+        //    + `:847 w_globals.value[varname]`: each function carries
+        //    a per-module reference, so two different modules with
+        //    the same top-level name see independent values. The
+        //    `Builder.module_id` field carries the id the walker
+        //    minted at registration time so this lookup hits the
+        //    matching partition. The registered value is a
+        //    `ConstValue` (Slice O10 generalization) so consts
+        //    (Item::Const) lift to `Int` / `Bool` / `byte_str`
+        //    directly without a HostObject wrapper, matching
+        //    upstream `find_global` returning `const(value)` for
+        //    any Python type. Body lowering for fn entries is still
+        //    deferred to `FunctionDesc.buildgraph` exactly as
+        //    upstream defers `build_flow(func)` until the annotator
+        //    walks a call site.
+        if let Some(value) = module_globals_lookup(self.module_id, name) {
+            return Ok(Hlvalue::Constant(Constant::new(value)));
+        }
+        // 4. Closed-world Rust-stdlib registry (`Ok` / `Some` / `Err`
+        //    / `Result` / `Option`) — `__builtin__` analogue. Order
+        //    matches upstream `find_global` chain (`flowcontext.py:849-852`):
+        //    `func_globals[name]` first, then `getattr(__builtin__,
+        //    name)`.
+        if let Some(class) = pyre_stdlib_lookup(name) {
+            return Ok(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                class,
+            ))));
+        }
+        // 5. Process-global mint registry (only for multi-segment
+        //    leftmost). `host_env::mint_host_class` finds-or-mints,
+        //    so every graph in the process that names `name` shares
+        //    the same `HostObject::Class` identity — same invariant
+        //    upstream `func_globals[name]` provides at
+        //    `flowcontext.py:847` (process-shared globals dict).
+        if mint_unknown {
+            let class = mint_host_class(name);
+            return Ok(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                class,
+            ))));
+        }
+        Err(AdapterError::UnboundLocal {
+            name: name.to_string(),
+        })
+    }
 }
 
 // ____________________________________________________________
 // Statement & expression lowering.
 
-fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<BlockExit, AdapterError> {
+/// Lower a `{ ... }` syntactic block into the currently-open BlockBuilder.
+///
+/// `at_boundary=true` means the tail expression (if any) flows
+/// directly into the function's returnblock Link — either because
+/// this is the function-body root, or because the enclosing
+/// `lower_if` / `lower_match` / `lower_arm_body` caller is itself in
+/// boundary position (e.g. `fn f() { match x { 0 => Ok(1), _ =>
+/// Err(e) } }` where each arm body's tail IS the function tail).
+/// The Slice O4 PRE-EXISTING-ADAPTATION (`Ok(x)` / `Some(x)` →
+/// unwrap, `None` → `ConstValue::None`, `Err(e)` → raise edge per
+/// Slice O5) only fires under `at_boundary=true`.
+///
+/// `at_boundary=false` means the block result is consumed by the
+/// caller (`let z = { … };`, function arg, binop operand, etc.).
+/// In value position, `Ok(x)` stays a `simple_call(<Ok>, x)` op so
+/// the resulting host-class instance threads through to the consumer
+/// — `lower_arm_body`'s default arm routes through plain
+/// `lower_expr` instead of `lower_value_boundary`.
+fn lower_block(
+    b: &mut Builder,
+    block: &SynBlock,
+    at_boundary: bool,
+) -> Result<BlockExit, AdapterError> {
     let mut tail: Option<Hlvalue> = None;
     for (idx, stmt) in block.stmts.iter().enumerate() {
         let is_last = idx + 1 == block.stmts.len();
@@ -373,7 +787,12 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<BlockExit, AdapterEr
                     // forwards termination out of the enclosing block
                     // correctly.
                     Expr::If(if_expr) if if_expr.else_branch.is_none() => {
-                        match lower_if(b, if_expr)? {
+                        // `if cond { body }` as a statement: body's
+                        // tail value is discarded (the join produces
+                        // implicit None). Pass `at_boundary=false` so
+                        // the body never collapses an Ok/Some/Err
+                        // tail — there's no return edge to feed.
+                        match lower_if(b, if_expr, false)? {
                             BlockExit::FallThrough(_) => continue,
                             BlockExit::Terminated => return Ok(BlockExit::Terminated),
                         }
@@ -417,8 +836,10 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<BlockExit, AdapterEr
                     // observes termination. Non-control-flow
                     // expressions always fall through with a value,
                     // so `lower_arm_body`'s default arm routes them
-                    // through `lower_expr`.
-                    match lower_arm_body(b, expr)? {
+                    // through `lower_expr` (or, if `at_boundary`,
+                    // through `lower_value_boundary` for the Slice
+                    // O4 unwrap).
+                    match lower_arm_body(b, expr, at_boundary)? {
                         BlockExit::FallThrough(v) => tail = Some(v),
                         BlockExit::Terminated => return Ok(BlockExit::Terminated),
                     }
@@ -501,6 +922,278 @@ fn lower_let(b: &mut Builder, local: &Local) -> Result<(), AdapterError> {
     Ok(())
 }
 
+/// Recognise an unshadowed single-segment `Pat::Path` reference to one
+/// of the names in `expected_names`. Returns the matched name when the
+/// path shape is `Ok` / `Some` / `Err` / `None` (whichever the caller
+/// listed), the reference is not currently shadowed by a local, and
+/// the AST shape is plain (no `qself`, no leading colon, no generic
+/// args).
+///
+/// Returns `None` for any shape that does not match — the caller falls
+/// through to ordinary lowering.
+fn match_unshadowed_simple_ident<'a>(
+    b: &Builder,
+    expr: &'a Expr,
+    expected_names: &[&str],
+) -> Option<&'a syn::Ident> {
+    if let Expr::Path(ExprPath {
+        path,
+        qself: None,
+        attrs: _,
+    }) = expr
+    {
+        if path.leading_colon.is_some() || path.segments.len() != 1 {
+            return None;
+        }
+        let seg = &path.segments[0];
+        if !matches!(seg.arguments, syn::PathArguments::None) {
+            return None;
+        }
+        let name = seg.ident.to_string();
+        if !expected_names.iter().any(|n| *n == name) {
+            return None;
+        }
+        if b.locals().contains_key(&name) {
+            return None;
+        }
+        return Some(&seg.ident);
+    }
+    None
+}
+
+/// PRE-EXISTING-ADAPTATION for the Ok/Some/None collapse only (Codex
+/// 2026-05-03 parity audit accepted as "documented as structural
+/// adaptation, not parity"). Function/arm boundary positions in
+/// pyre-interpreter Rust source frequently end in `Ok(x)` / `Some(x)`
+/// / `None` per Rust idiom; upstream Python source has no
+/// Result/Option layer and uses bare `x` / `None` at the same
+/// boundary positions. Without boundary collapse, the returnblock
+/// Link would carry `simple_call(<Ok>, x)` instead of `x`, which is
+/// the same SpaceOperation upstream would emit for Python `return
+/// Ok(x)` — orthodox under O1+O2, but pyre's downstream (`build_flow
+/// → annotator → codewriter`) needs the unwrapped value at the
+/// return edge.
+///
+/// At each of the three boundary call sites — `lower_return`'s
+/// `ret.expr`, `lower_arm_body`'s default arm, and `lower_block`'s
+/// tail-expression (which routes through `lower_arm_body`) — this
+/// helper rewrites:
+///
+/// - `Ok(x)` / `Some(x)` (single-arg unshadowed call) →
+///   `lower_expr(x)` directly. Slice O4.
+/// - `None` (unshadowed single-segment path) →
+///   `Constant(ConstValue::None)`. Slice O4.
+/// - `Err(e)` (single-arg unshadowed call) → `emit_err_raise_boundary`
+///   emits the upstream `flowcontext.py:600-636 exc_from_raise` op
+///   sequence with a 2-exit `guessbool(isinstance(evalue, type))`
+///   fork preserved per `flowcontext.py:610` and closes the path
+///   with a Link to `graph.exceptblock` per `flowcontext.py:1259
+///   Raise.nomoreblocks`. Returns `BlockExit::Terminated`. Slice
+///   O5 (PARITY).
+///
+/// Any other expression falls through to ordinary `lower_expr`. The
+/// locals-first check honours `pyopcode.py:502 LOAD_FAST` priority
+/// (a user `let Ok = …` / `let Err = …` shadows the wrapper).
+/// Value-position `Ok(x)` / `Some(x)` / `Err(e)` (i.e. anywhere
+/// outside these boundary sites) keeps emitting `simple_call(<host
+/// class>, x)` per O1+O2 — the callee resolves through
+/// `host_env::PYRE_STDLIB`.
+fn lower_value_boundary(b: &mut Builder, expr: &Expr) -> Result<BlockExit, AdapterError> {
+    if match_unshadowed_simple_ident(b, expr, &["None"]).is_some() {
+        return Ok(BlockExit::FallThrough(Hlvalue::Constant(Constant::new(
+            ConstValue::None,
+        ))));
+    }
+    if let Expr::Call(ExprCall { func, args, .. }) = expr {
+        if args.len() == 1 {
+            if match_unshadowed_simple_ident(b, func.as_ref(), &["Ok", "Some"]).is_some() {
+                let inner = lower_expr(b, &args[0])?;
+                return Ok(BlockExit::FallThrough(inner));
+            }
+            if match_unshadowed_simple_ident(b, func.as_ref(), &["Err"]).is_some() {
+                return emit_err_raise_boundary(b, &args[0]);
+            }
+        }
+    }
+    Ok(BlockExit::FallThrough(lower_expr(b, expr)?))
+}
+
+/// Slice O5 — lower a boundary-position `Err(e)` to the upstream
+/// `flowcontext.py:600-636 exc_from_raise` op sequence and close the
+/// current path with a Link to `graph.exceptblock` per
+/// `flowcontext.py:1259 Raise.nomoreblocks`.
+///
+/// Upstream `flowcontext.py:RAISE_VARARGS(1)` calls
+/// `exc_from_raise(w_arg1=evalue, w_arg2=const(None))`. With
+/// `w_arg2 = const(None)` constant-folded inside `exc_from_raise` (the
+/// inner `is_(w_arg2, w_None)` and `is_(w_arg2, const(None))` both
+/// short-circuit on `Constant(None)` per upstream `guessbool` constant
+/// folding at `flowcontext.py:365`), the remaining flow is:
+///
+/// ```text
+/// is_class = isinstance(evalue, type)              # 609
+/// if is_class:                                     # 610 — guessbool fork
+///     w_value = simple_call(evalue)                # 614
+/// else:
+///     w_value = ll_assert_not_none(evalue)         # 633
+/// w_type = type(w_value)                           # 635
+/// Link [w_type, w_value] -> exceptblock            # 1259
+/// ```
+///
+/// Each branch lowers in its own block; both converge on a join
+/// block that emits `type` and Link to `exceptblock`. Mirrors the
+/// fork-and-join pattern `lower_if` uses for `if cond { … } else { …
+/// }`.
+///
+/// `BlockExit::Terminated` returned — Rust analogue of `StopFlowing`.
+///
+/// PRE-EXISTING-ADAPTATION (`flowspace/flowcontext.rs:1355` family
+/// level, NOT introduced by this slice): `ll_assert_not_none` is
+/// recorded as a direct opname (single arg, pure pseudo-op), not as
+/// the upstream shape. Upstream `flowcontext.py:633` is
+/// `op.simple_call(const(ll_assert_not_none), w_value).eval(self)` —
+/// a 2-arg `simple_call` whose first arg is a `Constant` carrying the
+/// host-side `ll_assert_not_none` function reference. The local port
+/// emits a single-arg pseudo-op of name `"ll_assert_not_none"`
+/// instead, mirroring the convention at
+/// `flowspace/flowcontext.rs:1355 record_pure_op("ll_assert_not_none",
+/// vec![w_value])` so this site stays consistent with the existing
+/// local lowering of the same upstream construct. `OpKind::from_opname`
+/// at `flowspace/operation.rs:252` already lists the name in the
+/// majit-synthetic-pseudo-op decline set.
+///
+/// **Convergence path** (out of scope for M2.5e; tracked as the
+/// `ll_assert_not_none` pseudo-op family port): both this site and
+/// `flowspace/flowcontext.rs:1355` flip together to emit
+/// `simple_call(const(HostObject(ll_assert_not_none)), w_value)`
+/// once `host_env` exposes a `HostObject` for the debug helper and
+/// the `OpKind::from_opname` synthetic-name list drops the entry.
+/// Splitting one site without the other would diverge the two
+/// producers — preserving consistency at the family level outranks
+/// splitting them.
+fn emit_err_raise_boundary(b: &mut Builder, e: &Expr) -> Result<BlockExit, AdapterError> {
+    // 1. Lower `e` into evalue inside the current block.
+    let evalue = lower_expr(b, e)?;
+
+    // 2. `flowcontext.py:609 op.isinstance(w_arg1, const(type))` —
+    //    emitted in the current block, then forked on per
+    //    `flowcontext.py:610 if guessbool(w_is_type)`.
+    let is_class = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "isinstance",
+        vec![
+            evalue.clone(),
+            Hlvalue::Constant(Constant::new(ConstValue::builtin("type"))),
+        ],
+        is_class.clone(),
+    ));
+
+    // 3. Allocate the True / False arm blocks. Each block has a single
+    //    inputarg receiving `evalue` from the fork's Link.args, so the
+    //    arm body's ops can reference it as an SSA value local to that
+    //    block (matches `Block` SSA discipline — args[i] only resolve
+    //    against the block's own inputargs, prior ops, or Constants).
+    let evalue_true_in = Hlvalue::Variable(Variable::named("evalue"));
+    let true_block = Block::shared(vec![evalue_true_in.clone()]);
+    let evalue_false_in = Hlvalue::Variable(Variable::named("evalue"));
+    let false_block = Block::shared(vec![evalue_false_in.clone()]);
+
+    // 4. Allocate the join block. Its sole inputarg `w_value` receives
+    //    each arm's synthesized w_value via Link.args — `simple_call`
+    //    result on the True side, `ll_assert_not_none` result on the
+    //    False side. Same shape as the post-fork Variable assignment
+    //    upstream `flowcontext.py:632-634` writes back to `w_value`
+    //    after either branch returns.
+    let w_value_join = Hlvalue::Variable(Variable::named("w_value"));
+    let join_block = Block::shared(vec![w_value_join.clone()]);
+
+    // 5. Close the current (fork) block with bool(false)/bool(true)
+    //    Links, mirroring `BlockRecorder.guessbool` at
+    //    `flowcontext.py:107-122` (False before True per the upstream
+    //    convention).
+    let false_link = Rc::new(RefCell::new(Link::new(
+        vec![evalue.clone()],
+        Some(false_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+    )));
+    let true_link = Rc::new(RefCell::new(Link::new(
+        vec![evalue.clone()],
+        Some(true_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+    )));
+    b.finalize_current(vec![false_link, true_link], Some(is_class));
+
+    // 6. True arm: `flowcontext.py:614 op.simple_call(w_arg1)` —
+    //    instantiate the class.
+    b.open_new_block(BlockBuilder {
+        block: true_block,
+        ops: Vec::new(),
+        locals: HashMap::new(),
+    });
+    let w_value_true = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "simple_call",
+        vec![evalue_true_in],
+        w_value_true.clone(),
+    ));
+    let true_to_join = Rc::new(RefCell::new(Link::new(
+        vec![w_value_true],
+        Some(join_block.clone()),
+        None,
+    )));
+    b.finalize_current(vec![true_to_join], None);
+
+    // 7. False arm: `flowcontext.py:632-634 if check_not_none: w_value
+    //    = simple_call(const(ll_assert_not_none), w_value)`. The False
+    //    arm is the (inst, None) shape per `flowcontext.py:625-631` —
+    //    `is_(w_arg2, const(None))` is constant-True (w_arg2 is the
+    //    implicit `const(None)` from `RAISE_VARARGS(1)`), so the
+    //    TypeError sub-arm is eliminated by upstream's guessbool
+    //    constant folding.
+    b.open_new_block(BlockBuilder {
+        block: false_block,
+        ops: Vec::new(),
+        locals: HashMap::new(),
+    });
+    let w_value_false = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "ll_assert_not_none",
+        vec![evalue_false_in],
+        w_value_false.clone(),
+    ));
+    let false_to_join = Rc::new(RefCell::new(Link::new(
+        vec![w_value_false],
+        Some(join_block.clone()),
+        None,
+    )));
+    b.finalize_current(vec![false_to_join], None);
+
+    // 8. Join arm: `flowcontext.py:635 w_type = op.type(w_value)`,
+    //    then `flowcontext.py:1259 Link([w_exc.w_type, w_exc.w_value],
+    //    ctx.graph.exceptblock)` closes the path. Both arms have
+    //    threaded their synthesized w_value through Link.args, so the
+    //    join's `w_value_join` inputarg holds whichever branch's
+    //    result reached this block at runtime.
+    b.open_new_block(BlockBuilder {
+        block: join_block,
+        ops: Vec::new(),
+        locals: HashMap::new(),
+    });
+    let w_type = Hlvalue::Variable(Variable::new());
+    b.emit_op(SpaceOperation::new(
+        "type",
+        vec![w_value_join.clone()],
+        w_type.clone(),
+    ));
+    let exit_link = Rc::new(RefCell::new(Link::new(
+        vec![w_type, w_value_join],
+        Some(b.exceptblock.clone()),
+        None,
+    )));
+    b.finalize_current(vec![exit_link], None);
+    Ok(BlockExit::Terminated)
+}
+
 /// Close the currently-open block with a Link into `graph.returnblock`
 /// carrying the return value, then report `Terminated` so enclosing
 /// control-flow lowering knows not to emit a fallthrough link from the
@@ -512,9 +1205,36 @@ fn lower_let(b: &mut Builder, local: &Local) -> Result<(), AdapterError> {
 /// and raises `StopFlowing`. Our `BlockExit::Terminated` is the Rust
 /// analogue of StopFlowing — it tells the caller not to wire further
 /// exits from the closed block.
+///
+/// `ret.expr` is lowered through `lower_arm_body(_, _, true)` so the
+/// boundary mode propagates into nested control-flow constructs
+/// (`return { Ok(x) };`, `return if c { Ok(a) } else { Ok(b) };`,
+/// `return match … { … => Ok(x) }`). Each arm/branch's tail then
+/// flows through `lower_value_boundary` per Slices O4 + O5: `Ok(x)`
+/// / `Some(x)` / `None` collapse to their inner value at the
+/// returnblock edge, while `Err(e)` triggers the orthodox
+/// `flowcontext.py:600-636 exc_from_raise` op sequence with a 2-exit
+/// `isinstance` fork and Link to `graph.exceptblock`. Leaf
+/// expressions reach `lower_value_boundary` via `lower_arm_body`'s
+/// default arm; ordinary identifiers / paths fall through to
+/// `lower_expr`.
 fn lower_return(b: &mut Builder, ret: &ExprReturn) -> Result<BlockExit, AdapterError> {
     let value = match &ret.expr {
-        Some(expr) => lower_expr(b, expr)?,
+        // `lower_arm_body(_, _, true)` is the boundary-aware
+        // dispatcher: Expr::Block → `lower_block(_, _, true)`,
+        // Expr::If → `lower_if(_, _, true)`, Expr::Match →
+        // `lower_match(_, _, true)`. Without this, nested
+        // control-flow inside an explicit `return` would lose
+        // boundary mode and the wrapper would survive into the
+        // returnblock Link (Issue 1 codex audit, 2026-05-05).
+        Some(expr) => match lower_arm_body(b, expr, true)? {
+            BlockExit::FallThrough(v) => v,
+            // Boundary helper terminated the block on its own (e.g.
+            // Slice O5's `Err(e)` raise edge, or a nested `return`
+            // inside the body). The block is gone and the caller
+            // observes termination; nothing further to wire.
+            BlockExit::Terminated => return Ok(BlockExit::Terminated),
+        },
         // Bare `return;` — upstream has no syntactic analogue since
         // Python `return` without a value implicitly pushes `None`
         // (`flowcontext.py:687` pops whatever `compile.c` pushed, which
@@ -537,22 +1257,25 @@ fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
         Expr::Path(ExprPath {
             path, qself: None, ..
         }) => {
-            let ident = path
-                .get_ident()
-                .ok_or_else(|| AdapterError::Unsupported {
-                    reason: "qualified path (type resolution lands in M2.5c)".into(),
-                })?
-                .to_string();
-            b.locals()
-                .get(&ident)
-                .cloned()
-                .ok_or(AdapterError::UnboundLocal { name: ident })
+            // Both single-segment and multi-segment paths route
+            // through `Builder::resolve_path_constant`, which
+            // mirrors upstream `flowcontext.py:856 LOAD_GLOBAL` +
+            // `:861 LOAD_ATTR` chain. See the helper for full
+            // upstream citations and the locals-first /
+            // pyre-stdlib / mint-on-multi-segment ordering.
+            b.resolve_path_constant(path)
         }
         Expr::Binary(ExprBinary {
             op, left, right, ..
         }) => lower_binop(b, *op, left, right),
         Expr::Paren(ExprParen { expr, .. }) => lower_expr(b, expr),
-        Expr::If(if_expr) => match lower_if(b, if_expr)? {
+        // Expression-position control flow runs in VALUE position —
+        // `at_boundary=false` so a tail `Ok(x)` / `Some(x)` / `Err(e)`
+        // / `None` inside the arm/body emits the
+        // `simple_call(<host class>, x)` op (or stays a Constant)
+        // instead of being collapsed by Slice O4. The collapse is
+        // upstream-orthodox only at the function-return edge.
+        Expr::If(if_expr) => match lower_if(b, if_expr, false)? {
             BlockExit::FallThrough(v) => Ok(v),
             // Every branch terminated via `return` — the if-
             // expression has no reachable value. Upstream bytecode
@@ -570,7 +1293,7 @@ fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
                     .into(),
             }),
         },
-        Expr::Block(block_expr) => match lower_block(b, &block_expr.block)? {
+        Expr::Block(block_expr) => match lower_block(b, &block_expr.block, false)? {
             BlockExit::FallThrough(v) => Ok(v),
             BlockExit::Terminated => Err(AdapterError::Unsupported {
                 reason: "block-expression whose body terminates via `return` — the \
@@ -594,7 +1317,7 @@ fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
                 match branch) instead"
                 .into(),
         }),
-        Expr::Match(match_expr) => match lower_match(b, match_expr)? {
+        Expr::Match(match_expr) => match lower_match(b, match_expr, false)? {
             BlockExit::FallThrough(v) => Ok(v),
             BlockExit::Terminated => Err(AdapterError::Unsupported {
                 reason: "match-expression where every arm terminates via `return` — \
@@ -811,10 +1534,14 @@ fn capture_arm_exit(b: &mut Builder, exit: BlockExit) -> Option<ArmCapture> {
 /// `else { … }`) or `Expr::If` (chained `else if …`). Both sub-
 /// routines return `BlockExit`, so termination threads through a
 /// chain of nested `else if` transparently.
-fn lower_else_arm(b: &mut Builder, else_expr: &Expr) -> Result<BlockExit, AdapterError> {
+fn lower_else_arm(
+    b: &mut Builder,
+    else_expr: &Expr,
+    at_boundary: bool,
+) -> Result<BlockExit, AdapterError> {
     match else_expr {
-        Expr::Block(block_expr) => lower_block(b, &block_expr.block),
-        Expr::If(nested_if) => lower_if(b, nested_if),
+        Expr::Block(block_expr) => lower_block(b, &block_expr.block, at_boundary),
+        Expr::If(nested_if) => lower_if(b, nested_if, at_boundary),
         _ => Err(AdapterError::Unsupported {
             reason: "`else` branch is neither a block nor an `if` — syn's grammar \
                 should forbid this; if it fires, please file a bug citing the \
@@ -824,7 +1551,11 @@ fn lower_else_arm(b: &mut Builder, else_expr: &Expr) -> Result<BlockExit, Adapte
     }
 }
 
-fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<BlockExit, AdapterError> {
+fn lower_if(
+    b: &mut Builder,
+    if_expr: &ExprIf,
+    at_boundary: bool,
+) -> Result<BlockExit, AdapterError> {
     // 1. Evaluate condition into the current block, then coerce via
     //    `bool(cond)` — mirrors upstream POP_JUMP_IF_FALSE at
     //    `flowcontext.py:756` which always emits `op.bool(w_value)`
@@ -888,7 +1619,7 @@ fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<BlockExit, AdapterError
         ops: Vec::new(),
         locals: then_locals,
     });
-    let then_exit = lower_block(b, &if_expr.then_branch)?;
+    let then_exit = lower_block(b, &if_expr.then_branch, at_boundary)?;
     let then_capture = capture_arm_exit(b, then_exit);
 
     // 6. Lower the else-branch the same way. `else_expr` is always
@@ -900,7 +1631,7 @@ fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<BlockExit, AdapterError
         ops: Vec::new(),
         locals: else_locals,
     });
-    let else_exit = lower_else_arm(b, else_expr)?;
+    let else_exit = lower_else_arm(b, else_expr, at_boundary)?;
     let else_capture = capture_arm_exit(b, else_exit);
 
     // 7. Fork the post-branch wiring by which arms fell through.
@@ -1093,7 +1824,12 @@ fn lower_if_without_else(
         ops: Vec::new(),
         locals: then_locals,
     });
-    let then_exit = lower_block(b, then_branch)?;
+    // `if cond { body }` body's tail value is discarded — the join
+    // produces implicit `None` regardless of what the body evaluated
+    // to. Pass `at_boundary=false` so `Ok(x)` / `Some(x)` / `None`
+    // / `Err(e)` body tails are NOT collapsed: there's no return
+    // edge for them to feed.
+    let then_exit = lower_block(b, then_branch, false)?;
     if let BlockExit::FallThrough(_tail) = then_exit {
         // Body's tail expression value is discarded — `if` without
         // else has no tail slot in the join (it produces implicit
@@ -1203,24 +1939,20 @@ fn branch_link_args(
 //    | `_`               | `Constant::Str("default")` (must be last)    |
 //
 // 2. **Variant cascade** (slices 2c + 2d) — any arm has a variant
-//    sub-pattern that `variant_match_path_str` recognises:
+//    sub-pattern that `pat_has_variant_shape` recognises:
 //    - `Pat::Path`            — unit variant (slice 2c).
 //    - `Pat::Struct { .. }`   — rest-only struct variant (slice 2d).
 //    - `Pat::TupleStruct(..)` — rest-only tuple variant (slice 2d).
 //
-//    Lowered as a chain of 2-exit boolean forks, each emitting
-//    `cond = isinstance(scrutinee, Constant::ByteStr(<path>))`.
+//    Lowered as a chain of 2-exit boolean forks, each emitting any
+//    necessary `getattr` ops to resolve the variant path's segments
+//    into a `Constant(HostObject(<class>))` carrier
+//    (`Builder::resolve_path_constant` mirroring `flowcontext.py:856
+//    LOAD_GLOBAL` + `:861 LOAD_ATTR`), followed by
+//    `cond = isinstance(scrutinee, <class>)` per `operation.py:449`.
 //    Upstream basis: `rpython/flowspace/flowcontext.py` lowering of
-//    `if isinstance(x, A): … elif isinstance(x, B): …` — the same
-//    isinstance-cascade shape Python source produces. The variant-
-//    class operand to `isinstance` is emitted as
-//    `Constant(ConstValue::ByteStr(<full variant path>))` —
-//    PRE-EXISTING-ADAPTATION pending HostObject::Class registration
-//    per Rust enum variant; upstream emits the actual class object
-//    (`flowspace/operation.py:474 isinstance` arg 2). Convergence path:
-//    register each variant as `HostObject::Class` via
-//    `Bookkeeper::register_rust_function`-style intake (M2.5d slice 3).
-//    Multi-session.
+//    `if isinstance(x, A.X): … elif isinstance(x, A.Y): …` — the
+//    same isinstance-cascade shape Python source produces.
 //
 // Patterns outside both subsets reject via `AdapterError::Unsupported`:
 // - `Pat::Range`                          — no upstream analogue.
@@ -1236,17 +1968,54 @@ fn branch_link_args(
 /// the arm naturally. Arms with a non-control-flow body (literal,
 /// path, binop, etc.) fall back to `lower_expr` and report
 /// `FallThrough` with the evaluated value.
-fn lower_arm_body(b: &mut Builder, body: &Expr) -> Result<BlockExit, AdapterError> {
+///
+/// Codex 2026-05-03 parity audit removed the prior
+/// `match_err_call_unshadowed` intercept that rewrote arm-tail
+/// `Err(e)` as a raise edge — upstream's RAISE_VARARGS shape
+/// (`flowcontext.py:638-656` + `:632-636 exc_from_raise`) is more
+/// than the partial `op.type(value) + Link(exceptblock)` the prior
+/// intercept emitted. Faithful `exc_from_raise` port is the
+/// orthodox follow-up (Slice O5).
+///
+/// Non-control-flow arm bodies route through `lower_value_boundary`
+/// (Slice O4) so `Ok(x)` / `Some(x)` / `None` at the arm's outer-
+/// tail position collapse to the inner value before threading into
+/// the match's join block / returnblock link.
+fn lower_arm_body(
+    b: &mut Builder,
+    body: &Expr,
+    at_boundary: bool,
+) -> Result<BlockExit, AdapterError> {
     match body {
-        Expr::Block(block_expr) => lower_block(b, &block_expr.block),
-        Expr::If(if_expr) => lower_if(b, if_expr),
-        Expr::Match(match_expr) => lower_match(b, match_expr),
+        // Control-flow constructs propagate `at_boundary` so a
+        // boundary-position `match`/`if`/`block` whose arms feed the
+        // function's return value continues to collapse Ok/Some/Err
+        // tails per the Slice O4 PRE-EXISTING-ADAPTATION.
+        Expr::Block(block_expr) => lower_block(b, &block_expr.block, at_boundary),
+        Expr::If(if_expr) => lower_if(b, if_expr, at_boundary),
+        Expr::Match(match_expr) => lower_match(b, match_expr, at_boundary),
+        // `return` is itself a boundary site regardless of context;
+        // `lower_return` routes through `lower_value_boundary` directly.
         Expr::Return(ret) => lower_return(b, ret),
-        _ => Ok(BlockExit::FallThrough(lower_expr(b, body)?)),
+        // Non-control-flow tail. At boundary, apply Slice O4 unwrap;
+        // otherwise emit the expression value as-is so value-position
+        // blocks like `let z = { Ok(x) }; z` keep `z` bound to the
+        // `simple_call(<Ok>, x)` result instead of unwrapping to `x`.
+        _ => {
+            if at_boundary {
+                lower_value_boundary(b, body)
+            } else {
+                Ok(BlockExit::FallThrough(lower_expr(b, body)?))
+            }
+        }
     }
 }
 
-fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, AdapterError> {
+fn lower_match(
+    b: &mut Builder,
+    match_expr: &ExprMatch,
+    at_boundary: bool,
+) -> Result<BlockExit, AdapterError> {
     // 1. Evaluate the scrutinee into the current block. Becomes the
     //    block's `exitswitch` when we close the fork (literal-switch
     //    path) or the operand to per-step `isinstance` ops (variant-
@@ -1282,7 +2051,7 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, Ada
         sub_pats.iter().any(|p| pat_has_variant_shape(p))
     });
     if needs_cascade {
-        return lower_match_variant_cascade(b, match_expr, scrutinee);
+        return lower_match_variant_cascade(b, match_expr, scrutinee, at_boundary);
     }
 
     // 2. Validate every arm up-front so the fork block is only closed
@@ -1398,7 +2167,7 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, Ada
             ops: Vec::new(),
             locals: branch_locals,
         });
-        let exit = lower_arm_body(b, &arm.body)?;
+        let exit = lower_arm_body(b, &arm.body, at_boundary)?;
         arm_captures.push(capture_arm_exit(b, exit));
     }
 
@@ -1467,11 +2236,16 @@ struct StructFieldBinding {
 }
 
 /// Match-arm classification produced by [`extract_variant_arm_info`].
-struct VariantPatInfo {
-    /// Joined `"::"` path string used as the `isinstance` second-
-    /// operand sentinel. Same encoding for unit, rest-only struct,
-    /// rest-only tuple, and binding-carrying struct variants.
-    path: String,
+struct VariantPatInfo<'a> {
+    /// The original `syn::Path` (validated for the cascade-recognised
+    /// shape). The cascade emits the isinstance step's second operand
+    /// by routing this path through `Builder::resolve_path_constant`,
+    /// which mirrors `flowcontext.py:856 LOAD_GLOBAL` + `:861
+    /// LOAD_ATTR` chain so `isinstance(x, A.B)` carries a real
+    /// `Constant(HostObject(class))` per `operation.py:449`. Same
+    /// path shape across unit, rest-only struct, rest-only tuple, and
+    /// binding-carrying struct variants.
+    path: &'a syn::Path,
     /// Per-field bindings the cascade must materialise at arm-body
     /// entry. Empty for unit variants, rest-only struct/tuple
     /// variants, and `Pat::Wild` field skips. One entry per named-
@@ -1480,29 +2254,27 @@ struct VariantPatInfo {
 }
 
 /// Validate the multi-segment, no-generics, no-qself shape every
-/// cascade-recognised variant path must obey, and return the joined
-/// `"::"` string for use as the `isinstance` sentinel.
+/// cascade-recognised variant path must obey. Returns the original
+/// `syn::Path` reference unchanged when the shape passes; the cascade
+/// later resolves it through `Builder::resolve_path_constant` to a
+/// `Constant(HostObject(class))` per `flowcontext.py:856 LOAD_GLOBAL`
+/// + `:861 LOAD_ATTR` semantics.
 ///
 /// Single-segment paths (`CONST_MAX` / `Foo`) reject — without
 /// resolution context the adapter cannot distinguish a const
 /// reference from a top-level type. Paths with generics
 /// (`Foo::<T>::Bar`), `qself` (`<T as Foo>::Bar`), or a leading `::`
 /// (global path) reject for the same reason.
-fn variant_path_string(qself: Option<&syn::QSelf>, path: &syn::Path) -> Option<String> {
+fn variant_path_ref<'a>(qself: Option<&syn::QSelf>, path: &'a syn::Path) -> Option<&'a syn::Path> {
     if qself.is_some() || path.leading_colon.is_some() || path.segments.len() < 2 {
         return None;
     }
-    let mut joined = String::new();
-    for (i, seg) in path.segments.iter().enumerate() {
+    for seg in path.segments.iter() {
         if !matches!(seg.arguments, syn::PathArguments::None) {
             return None;
         }
-        if i > 0 {
-            joined.push_str("::");
-        }
-        joined.push_str(&seg.ident.to_string());
     }
-    Some(joined)
+    Some(path)
 }
 
 /// Walk a `Pat::Struct`'s `FieldPat` list and extract the per-field
@@ -1572,21 +2344,24 @@ fn extract_struct_field_bindings(
 /// bindings, pending slice 2f). The caller routes `None` through the
 /// cascade's per-shape rejection diagnostic.
 ///
-/// No upstream counterpart — this is the Position-2 adapter's
-/// substitute for upstream's class/instance checks; see the
-/// HostObject::Class convergence path noted in `lower_match`'s
-/// dispatch comment.
-fn extract_variant_arm_info(pat: &Pat) -> Option<VariantPatInfo> {
+/// No upstream counterpart — Rust's `syn::Pat` shape carries no class
+/// identity, so the classifier records the original `syn::Path` and
+/// hands it to `Builder::resolve_path_constant` at cascade emission
+/// time. That routes through the closed-world `host_env::PYRE_STDLIB`
+/// registry plus the process-global `host_env::HOST_CLASS_MINTS`
+/// runtime registry to produce a real `HostObject::Class` carrier —
+/// the second operand `operation.py:449 isinstance` expects.
+fn extract_variant_arm_info<'a>(pat: &'a Pat) -> Option<VariantPatInfo<'a>> {
     match pat {
         Pat::Path(p) => {
-            let path = variant_path_string(p.qself.as_ref(), &p.path)?;
+            let path = variant_path_ref(p.qself.as_ref(), &p.path)?;
             Some(VariantPatInfo {
                 path,
                 bindings: Vec::new(),
             })
         }
         Pat::Struct(p) => {
-            let path = variant_path_string(p.qself.as_ref(), &p.path)?;
+            let path = variant_path_ref(p.qself.as_ref(), &p.path)?;
             // Rest-only struct (`Foo::Bar { .. }`) — empty fields
             // with PatRest. Treat as unit-equivalent.
             if p.fields.is_empty() && p.rest.is_some() {
@@ -1599,7 +2374,7 @@ fn extract_variant_arm_info(pat: &Pat) -> Option<VariantPatInfo> {
             Some(VariantPatInfo { path, bindings })
         }
         Pat::TupleStruct(p) => {
-            let path = variant_path_string(p.qself.as_ref(), &p.path)?;
+            let path = variant_path_ref(p.qself.as_ref(), &p.path)?;
             // Rest-only tuple (`Foo::Bar(..)`) — exactly one
             // `Pat::Rest`. Element-binding form lands in slice 2f.
             if p.elems.len() == 1 && matches!(p.elems.first().unwrap(), Pat::Rest(_)) {
@@ -1637,7 +2412,7 @@ fn pat_has_variant_shape(pat: &Pat) -> bool {
 }
 
 /// Per-arm classification consumed by `lower_match_variant_cascade`.
-enum CascadeArm {
+enum CascadeArm<'a> {
     /// Variant arm. `paths` holds one path per or-pattern sub-arm —
     /// each entry produces an isinstance cascade step pointing at the
     /// same arm body block. `field_bindings` is extracted from the
@@ -1645,7 +2420,7 @@ enum CascadeArm {
     /// the same `field_name → local_name` set before this arm
     /// classifies as `Variant`.
     Variant {
-        paths: Vec<String>,
+        paths: Vec<&'a syn::Path>,
         field_bindings: Vec<StructFieldBinding>,
     },
     /// `_` arm — must be last. No binding into the body's locals.
@@ -1676,25 +2451,32 @@ fn struct_field_bindings_match(a: &[StructFieldBinding], b: &[StructFieldBinding
 
 /// Lower `match enum_val { Variant => body, …, _ => body }` where at
 /// least one arm references a unit enum variant. Each variant arm
-/// produces an `isinstance(scrutinee, Constant::ByteStr(<path>))`
-/// boolean fork; or-pattern arms unfold into multiple forks all
-/// pointing at the same arm-body block. The cascade terminates at a
-/// user-provided wildcard arm — exhaustive matches without a catch-all
-/// are rejected pending HostObject::Class registration.
+/// produces an `isinstance(scrutinee, Constant(HostObject(<class>)))`
+/// boolean fork — the second operand is the `HostObject::Class`
+/// `Builder::resolve_path_constant` returns for the variant path,
+/// emitting any necessary `getattr` ops (one per non-leftmost segment)
+/// into the cascade step's block beforehand. Or-pattern arms unfold
+/// into multiple forks all pointing at the same arm-body block. The
+/// cascade terminates at a user-provided wildcard arm — exhaustive
+/// matches without a catch-all are still rejected because the adapter
+/// does not enumerate the variant universe.
 ///
 /// Upstream analogue: the if-cascade `flowcontext.py` produces from
-/// Python source `if isinstance(x, A): … elif isinstance(x, B): …`.
-/// Each arm's `isinstance` op is `operation.py:474 isinstance` arity=2.
+/// Python source `if isinstance(x, A.X): … elif isinstance(x, A.Y):
+/// …`. Each cascade step's emission mirrors `flowcontext.py:856
+/// LOAD_GLOBAL` + `:861 LOAD_ATTR` (the getattr cascade) followed by
+/// `operation.py:449 isinstance` arity=2 on the resolved class.
 fn lower_match_variant_cascade(
     b: &mut Builder,
     match_expr: &ExprMatch,
     scrutinee: Hlvalue,
+    at_boundary: bool,
 ) -> Result<BlockExit, AdapterError> {
     let n_arms = match_expr.arms.len();
 
     // 1. Pre-classify every arm. Or-pattern sub-patterns flatten;
-    //    every sub-pattern must be a variant pattern recognized by
-    //    `variant_match_path_str` (unit `Pat::Path`, rest-only
+    //    every sub-pattern must be a variant pattern recognised by
+    //    `pat_has_variant_shape` (unit `Pat::Path`, rest-only
     //    `Pat::Struct { .. }`, or rest-only `Pat::TupleStruct(..)`),
     //    a wildcard `_`, or a `Pat::Ident` binding-wildcard.
     //    Wildcards (`_` / `name`) must be the standalone last arm.
@@ -1749,7 +2531,7 @@ fn lower_match_variant_cascade(
         // bindings). Or-pattern siblings of the same arm must agree
         // on the bindings shape so the shared arm-body block sees a
         // consistent locals view.
-        let mut paths: Vec<String> = Vec::with_capacity(sub_pats.len());
+        let mut paths: Vec<&syn::Path> = Vec::with_capacity(sub_pats.len());
         let mut arm_field_bindings: Option<Vec<StructFieldBinding>> = None;
         for sub_pat in &sub_pats {
             if let Some(info) = extract_variant_arm_info(sub_pat) {
@@ -1807,12 +2589,13 @@ fn lower_match_variant_cascade(
         });
     }
 
-    // 2. Require a wildcard last. The annotator cannot infer Rust-enum
-    //    exhaustiveness without HostObject::Class registration per
-    //    variant — that arrives in M2.5d slice 3. Until then, the
-    //    cascade must terminate at a user-provided catch-all.
-    //    PRE-EXISTING-ADAPTATION; convergence path same as the cascade
-    //    sentinel encoding above.
+    // 2. Require a wildcard last. The cascade lowers each variant arm
+    //    to a 2-exit `isinstance` fork; without a catch-all the final
+    //    "false" branch has no target. Upstream's exhaustiveness
+    //    check kicks in inside the annotator (one classdef knows the
+    //    full subclass set); the adapter cannot enumerate the variant
+    //    universe from `syn::ItemFn` alone, so the user-provided
+    //    wildcard arm is the only structural way to close the cascade.
     let last_is_wildcard = matches!(
         arm_kinds.last(),
         Some(CascadeArm::Wildcard | CascadeArm::BindWildcard(_))
@@ -1820,8 +2603,8 @@ fn lower_match_variant_cascade(
     if !last_is_wildcard {
         return Err(AdapterError::Unsupported {
             reason: "variant-cascade match must end with a wildcard arm (`_` or `name`) — \
-                exhaustive variant matches without a catch-all land alongside \
-                HostObject::Class registration in M2.5d slice 3"
+                the adapter cannot enumerate the variant universe from `syn::ItemFn`, so \
+                the catch-all is the only structural way to close the final isinstance fork"
                 .into(),
         });
     }
@@ -1873,14 +2656,14 @@ fn lower_match_variant_cascade(
     //    same arm body. The wildcard arm (always last per step 2) is
     //    NOT a step; it receives the final cascade step's "false"
     //    Link.
-    let cascade_steps: Vec<(usize, &str)> = arm_kinds
+    let cascade_steps: Vec<(usize, &syn::Path)> = arm_kinds
         .iter()
         .enumerate()
         .filter_map(|(arm_idx, kind)| match kind {
             CascadeArm::Variant { paths, .. } => Some((arm_idx, paths.as_slice())),
             _ => None,
         })
-        .flat_map(|(arm_idx, paths)| paths.iter().map(move |p| (arm_idx, p.as_str())))
+        .flat_map(|(arm_idx, paths)| paths.iter().map(move |p| (arm_idx, *p)))
         .collect();
     let n_steps = cascade_steps.len();
     if n_steps == 0 {
@@ -1908,15 +2691,25 @@ fn lower_match_variant_cascade(
             .get(&scrutinee_slot)
             .cloned()
             .expect("scrutinee_slot threads through cascade fork-blocks");
+        // Resolve the variant path to a `Constant(HostObject(<class>))`
+        // carrier through the same `Builder::resolve_path_constant`
+        // chain expression-position qualified paths use. This mirrors
+        // upstream `flowcontext.py:856 LOAD_GLOBAL` + `:861 LOAD_ATTR`
+        // for `isinstance(x, Foo.Bar)`: each cascade step block emits
+        // its own getattr ops (one per non-leftmost segment), then
+        // the isinstance op consumes the resolved leaf as its second
+        // operand per `operation.py:449 isinstance` arity=2. Identity
+        // sharing across cascade steps that name the same leftmost
+        // segment falls out of the process-global
+        // `host_env::HOST_CLASS_MINTS` registry (mirrors Python's
+        // `LOAD_GLOBAL` returning the same class object across every
+        // reference, including across graph boundaries —
+        // `flowcontext.py:847 w_globals.value[varname]`).
+        let class_carrier = b.resolve_path_constant(variant_path)?;
         let cond_var = Hlvalue::Variable(Variable::new());
         b.emit_op(SpaceOperation::new(
             "isinstance",
-            vec![
-                scrutinee_now,
-                Hlvalue::Constant(Constant::new(ConstValue::ByteStr(
-                    variant_path.as_bytes().to_vec(),
-                ))),
-            ],
+            vec![scrutinee_now, class_carrier],
             cond_var.clone(),
         ));
 
@@ -2018,7 +2811,7 @@ fn lower_match_variant_cascade(
             }
             _ => {}
         }
-        let exit = lower_arm_body(b, &arm.body)?;
+        let exit = lower_arm_body(b, &arm.body, at_boundary)?;
         arm_captures.push(capture_arm_exit(b, exit));
     }
 
@@ -2960,6 +3753,19 @@ fn lower_call(b: &mut Builder, call: &ExprCall) -> Result<Hlvalue, AdapterError>
     // (`module::fn`) would need module-resolved HostObject lookup
     // which the adapter does not perform — M2.5g registers adapter
     // -produced HostObjects by name, so those will land later.
+    //
+    // Codex 2026-05-03 parity audit removed the prior
+    // `try_lower_stdlib_variant_call` short-circuit that collapsed
+    // `Ok(x)` / `Some(x)` to their inner expression at every value
+    // position. Upstream Python `Ok(x)` is an ordinary
+    // constructor call: `LOAD_GLOBAL Ok; LOAD_FAST x; CALL_FUNCTION 1`,
+    // emitting `simple_call(Ok, x)` per `operation.py:663-679
+    // SimpleCall`. Erasing the call at value position produced a
+    // graph that did not match what `flowcontext.py` would emit
+    // for the equivalent Python source. Wrapper-transparency for
+    // `return Ok(x)` / `arm => Ok(x)` lives at the boundary sites
+    // (`lower_arm_body` / `lower_return`) only — see those
+    // helpers for the documented PRE-EXISTING-ADAPTATION shape.
     match &*call.func {
         Expr::Path(_) => {}
         _ => {
@@ -2970,6 +3776,7 @@ fn lower_call(b: &mut Builder, call: &ExprCall) -> Result<Hlvalue, AdapterError>
             });
         }
     }
+
     let callee = lower_expr(b, &call.func)?;
 
     let mut call_args: Vec<Hlvalue> = Vec::with_capacity(call.args.len() + 1);
@@ -4279,12 +5086,13 @@ mod tests {
     // ---- M2.5d slice 2c: variant-cascade tests -------------------
 
     /// `match` over a unit enum variant routes through the
-    /// isinstance-cascade path. Each variant emits one `isinstance` op
-    /// and one boolean fork; the wildcard arm is the cascade's terminal
-    /// "false" target. The graph layer no longer carries an n-way
-    /// switch — the entry block has exactly one `isinstance` op and a
-    /// 2-exit Bool fork, structurally identical to upstream's
-    /// `if isinstance(x, A): … else: …` lowering.
+    /// isinstance-cascade path. Each variant emits a `getattr` cascade
+    /// resolving `Foo::A` to a `Constant(HostObject(<A class>))`,
+    /// followed by an `isinstance` op + 2-exit Bool fork; the wildcard
+    /// arm is the cascade's terminal "false" target. Mirrors upstream
+    /// `flowcontext.py:856 LOAD_GLOBAL` + `:861 LOAD_ATTR` +
+    /// `operation.py:449 isinstance` shape for `if isinstance(x,
+    /// Foo.A): … else: …`.
     #[test]
     fn match_unit_variant_two_arms_emits_isinstance_cascade() {
         let g = lower(
@@ -4298,9 +5106,11 @@ mod tests {
         .unwrap();
         checkgraph(&g);
         let start = g.startblock.borrow();
-        // First-step block: one `isinstance` op + 2-exit Bool fork.
-        assert_eq!(start.operations.len(), 1);
-        assert_eq!(start.operations[0].opname, "isinstance");
+        // First-step block: getattr(<Foo>, "A") then isinstance(scrut,
+        // <A>) then 2-exit Bool fork.
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "isinstance");
         assert_eq!(start.exits.len(), 2);
         let ec_false = start.exits[0].borrow().exitcase.clone().unwrap();
         let ec_true = start.exits[1].borrow().exitcase.clone().unwrap();
@@ -4312,19 +5122,35 @@ mod tests {
             ec_true,
             Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
         );
-        // The variant-class operand to isinstance is the path-string
-        // sentinel `Foo::A` (PRE-EXISTING-ADAPTATION pending
-        // HostObject::Class registration).
-        let path_arg = match &start.operations[0].args[1] {
-            Hlvalue::Constant(c) => c.value.clone(),
-            other => panic!("expected Constant operand, got {other:?}"),
-        };
-        match path_arg {
-            ConstValue::ByteStr(bytes) => {
-                assert_eq!(bytes, b"Foo::A");
-            }
-            other => panic!("expected ByteStr operand, got {other:?}"),
+        // The getattr's first arg is `Constant(HostObject(Foo))` —
+        // the leftmost segment minted by `Builder::resolve_path_constant`
+        // and cached in the process-global `host_env::HOST_CLASS_MINTS`
+        // registry. The second arg is the attribute name `"A"` per
+        // `operation.py:618 getattr` arity=2.
+        match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(
+                        obj.is_class(),
+                        "leftmost segment must mint a HostObject::Class"
+                    );
+                    assert_eq!(obj.qualname(), "Foo");
+                }
+                other => panic!("expected HostObject leftmost, got {other:?}"),
+            },
+            other => panic!("expected Constant leftmost, got {other:?}"),
         }
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"A"),
+                other => panic!("expected ByteStr attr name, got {other:?}"),
+            },
+            other => panic!("expected Constant attr name, got {other:?}"),
+        }
+        // The isinstance op consumes the getattr result as its second
+        // operand — the resolved variant class, not a sentinel.
+        let getattr_result = start.operations[0].result.clone();
+        assert_eq!(start.operations[1].args[1], getattr_result);
     }
 
     /// Three variant arms produce three cascade steps. Each step is a
@@ -4447,7 +5273,9 @@ mod tests {
 
     /// Variant-cascade matches REQUIRE a wildcard last. Without one,
     /// the adapter rejects with a reason that names the constraint —
-    /// PRE-EXISTING-ADAPTATION pending HostObject::Class registration.
+    /// the adapter cannot enumerate Rust's variant universe from
+    /// `syn::ItemFn` alone, so the user-provided catch-all is the
+    /// only structural way to close the final isinstance fork.
     #[test]
     fn rejects_variant_match_without_wildcard() {
         match lower(
@@ -4496,10 +5324,11 @@ mod tests {
     }
 
     /// Slice 2d accept: rest-only struct-variant pattern
-    /// `Foo::Bar { .. }` lowers to a single `isinstance` cascade step
-    /// — structurally identical to the unit-variant case (slice 2c).
-    /// The field-binding extraction is deliberately deferred so this
-    /// slice carries zero new SpaceOperations.
+    /// `Foo::Bar { .. }` lowers to a single getattr+isinstance cascade
+    /// step — structurally identical to the unit-variant case (slice
+    /// 2c). The field-binding extraction is deliberately deferred so
+    /// this slice carries zero new SpaceOperations beyond the cascade
+    /// pair.
     #[test]
     fn match_rest_only_struct_variant_emits_isinstance_cascade() {
         let g = lower(
@@ -4513,21 +5342,24 @@ mod tests {
         .unwrap();
         checkgraph(&g);
         let start = g.startblock.borrow();
-        assert_eq!(start.operations.len(), 1);
-        assert_eq!(start.operations[0].opname, "isinstance");
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "isinstance");
         assert_eq!(start.exits.len(), 2);
-        let path_arg = match &start.operations[0].args[1] {
-            Hlvalue::Constant(c) => c.value.clone(),
-            other => panic!("expected Constant operand, got {other:?}"),
-        };
-        match path_arg {
-            ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"Foo::Resume"),
-            other => panic!("expected ByteStr operand, got {other:?}"),
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"Resume"),
+                other => panic!("expected ByteStr attr name, got {other:?}"),
+            },
+            other => panic!("expected Constant attr name, got {other:?}"),
         }
+        let getattr_result = start.operations[0].result.clone();
+        assert_eq!(start.operations[1].args[1], getattr_result);
     }
 
     /// Slice 2d accept: rest-only tuple-variant pattern
-    /// `Foo::Bar(..)` lowers to a single `isinstance` cascade step.
+    /// `Foo::Bar(..)` lowers to a single getattr+isinstance cascade
+    /// step.
     #[test]
     fn match_rest_only_tuple_variant_emits_isinstance_cascade() {
         let g = lower(
@@ -4541,16 +5373,90 @@ mod tests {
         .unwrap();
         checkgraph(&g);
         let start = g.startblock.borrow();
-        assert_eq!(start.operations.len(), 1);
-        assert_eq!(start.operations[0].opname, "isinstance");
-        let path_arg = match &start.operations[0].args[1] {
-            Hlvalue::Constant(c) => c.value.clone(),
-            other => panic!("expected Constant operand, got {other:?}"),
-        };
-        match path_arg {
-            ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"Foo::Pair"),
-            other => panic!("expected ByteStr operand, got {other:?}"),
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "isinstance");
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"Pair"),
+                other => panic!("expected ByteStr attr name, got {other:?}"),
+            },
+            other => panic!("expected Constant attr name, got {other:?}"),
         }
+        let getattr_result = start.operations[0].result.clone();
+        assert_eq!(start.operations[1].args[1], getattr_result);
+    }
+
+    /// O3 acceptance: every cascade step emits a getattr op resolving
+    /// its variant path against a `HostObject::Class` carrier instead
+    /// of the prior `Constant(ByteStr("Enum::Variant"))` sentinel.
+    /// This pins the orthodox shape `flowcontext.py:856 LOAD_GLOBAL`
+    /// + `:861 LOAD_ATTR` + `operation.py:449 isinstance` produces
+    /// for `if isinstance(x, A.B): … elif isinstance(x, A.C): …`.
+    #[test]
+    fn cascade_step_isinstance_arg2_is_host_class_carrier() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    Foo::B => 2,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let mut step_pairs: Vec<(SpaceOperation, SpaceOperation)> = Vec::new();
+        for blk in g.iterblocks() {
+            let blk_ref = blk.borrow();
+            for window in blk_ref.operations.windows(2) {
+                if window[0].opname == "getattr" && window[1].opname == "isinstance" {
+                    step_pairs.push((window[0].clone(), window[1].clone()));
+                }
+            }
+        }
+        assert_eq!(
+            step_pairs.len(),
+            2,
+            "two cascade steps each emit a (getattr, isinstance) op pair"
+        );
+        for (getattr_op, isinstance_op) in &step_pairs {
+            // Each step's getattr resolves against the same
+            // `HostObject::Class` for `Foo` (cached in
+            // `host_env::HOST_CLASS_MINTS` process-global registry).
+            match &getattr_op.args[0] {
+                Hlvalue::Constant(c) => match &c.value {
+                    ConstValue::HostObject(obj) => {
+                        assert!(obj.is_class());
+                        assert_eq!(obj.qualname(), "Foo");
+                    }
+                    other => panic!("expected HostObject leftmost, got {other:?}"),
+                },
+                other => panic!("expected Constant leftmost, got {other:?}"),
+            }
+            // Cascade step's isinstance second-arg is the getattr's
+            // result Variable — orthodox shape per `operation.py:449`.
+            assert_eq!(isinstance_op.args[1], getattr_op.result);
+        }
+        // Identity sharing: both steps' leftmost HostObject(Foo) are
+        // the same class object — `HOST_CLASS_MINTS` returns the same
+        // `HostObject` across all cascade steps (and across graphs)
+        // that name `Foo`.
+        let lhs0 = match &step_pairs[0].0.args[0] {
+            Hlvalue::Constant(c) => c.value.clone(),
+            _ => unreachable!(),
+        };
+        let lhs1 = match &step_pairs[1].0.args[0] {
+            Hlvalue::Constant(c) => c.value.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            lhs0, lhs1,
+            "cascade steps share the leftmost HostObject(Foo) class identity \
+             via host_env::HOST_CLASS_MINTS (mirrors LOAD_GLOBAL returning the \
+             same class object across every reference, including across \
+             graph boundaries — flowcontext.py:847)"
+        );
     }
 
     /// Slice 2d accept: heterogeneous variant arms in the same match
@@ -4687,38 +5593,41 @@ mod tests {
         )
         .unwrap();
         checkgraph(&g);
-        // The getattr op's second arg is the field name `pc`, NOT the
-        // local name `orig_pc` — same op upstream `flowcontext.py`
-        // emits for `obj.pc`.
-        let getattr_block = g
+        // The arm body's getattr second arg is the field name `pc`,
+        // NOT the local name `orig_pc` — same op upstream
+        // `flowcontext.py` emits for `obj.pc`. Filter against the
+        // cascade's own `getattr(<Foo>, "Resume")` step by matching
+        // on the byte-string operand.
+        let pc_getattrs = g
             .iterblocks()
             .iter()
-            .find(|b| {
+            .flat_map(|b| {
                 b.borrow()
                     .operations
                     .iter()
-                    .any(|op| op.opname == "getattr")
+                    .filter(|op| {
+                        op.opname == "getattr"
+                            && matches!(
+                                &op.args[1],
+                                Hlvalue::Constant(c)
+                                    if matches!(&c.value, ConstValue::ByteStr(bs) if bs == b"pc"),
+                            )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
             })
-            .cloned()
-            .expect("arm body block emits getattr");
-        let block_ref = getattr_block.borrow();
-        let getattr_op = block_ref
-            .operations
-            .iter()
-            .find(|op| op.opname == "getattr")
-            .unwrap();
-        match &getattr_op.args[1] {
-            Hlvalue::Constant(c) => match &c.value {
-                ConstValue::ByteStr(bs) => assert_eq!(bs, b"pc"),
-                other => panic!("expected ByteStr(pc), got {other:?}"),
-            },
-            other => panic!("expected Constant operand, got {other:?}"),
-        }
+            .count();
+        assert_eq!(
+            pc_getattrs, 1,
+            "exactly one `getattr(scrutinee, \"pc\")` op for the renaming binding"
+        );
     }
 
     /// Slice 2e accept: `{ field: _ }` is a field-skip pattern — the
-    /// field is matched but its value is discarded, no `getattr`
-    /// emitted. The arm body doesn't reference the field's name.
+    /// field is matched but its value is discarded, so no `getattr`
+    /// is emitted for the *field*. The arm body doesn't reference the
+    /// field's name. The cascade itself still emits its
+    /// `getattr(<Foo>, "Resume")` resolution step.
     #[test]
     fn match_struct_variant_wildcard_field_skip_emits_no_getattr() {
         let g = lower(
@@ -4731,20 +5640,29 @@ mod tests {
         )
         .unwrap();
         checkgraph(&g);
-        let total_getattrs = g
+        // No `getattr(scrutinee, "pc")` is emitted, but the cascade's
+        // own `getattr(<Foo>, "Resume")` resolution step is unaffected.
+        let pc_getattrs = g
             .iterblocks()
             .iter()
             .map(|b| {
                 b.borrow()
                     .operations
                     .iter()
-                    .filter(|op| op.opname == "getattr")
+                    .filter(|op| {
+                        op.opname == "getattr"
+                            && matches!(
+                                &op.args[1],
+                                Hlvalue::Constant(c)
+                                    if matches!(&c.value, ConstValue::ByteStr(bs) if bs == b"pc"),
+                            )
+                    })
                     .count()
             })
             .sum::<usize>();
         assert_eq!(
-            total_getattrs, 0,
-            "`{{ field: _ }}` skip emits no getattr — only the cascade isinstance step"
+            pc_getattrs, 0,
+            "`{{ field: _ }}` skip emits no `getattr(_, \"pc\")` — only the cascade's variant-resolution getattr"
         );
     }
 
@@ -5846,6 +6764,711 @@ mod tests {
         }
     }
 
+    // ---- M2.5e orthodox HOST_ENV-backed name resolution (Slice O1+O2)
+    //
+    // `Builder::resolve_path_constant` mirrors upstream's
+    // `flowcontext.py:856 LOAD_GLOBAL` + `:861 LOAD_ATTR` chain. The
+    // closed-world `host_env::PYRE_STDLIB` registry pre-registers
+    // `Ok` / `Some` / `Err` / `Result` / `Option` as
+    // `HostObject::Class` singletons; `None` resolves to the
+    // `Constant(ConstValue::None)` NoneType-singleton constant; the
+    // process-global `host_env::HOST_CLASS_MINTS` registry finds-or-
+    // mints `HostObject::Class` for multi-segment paths' leftmost
+    // segment on demand and shares identity across cascade steps —
+    // and across graphs — that name the same class (mirrors upstream
+    // `func_globals[name]` reading from a process-shared globals
+    // dict at `flowcontext.py:847`). Locals-first ordering
+    // (`pyopcode.py:502 LOAD_FAST`) means a user `let Ok = …`
+    // shadows the closed-world entry. See plan
+    // `~/.claude/plans/m2_5e_orthodox_host_env_resolution.md` Slice
+    // O1+O2 for the full upstream cite chain.
+
+    #[test]
+    fn ok_call_at_value_position_emits_simple_call_with_host_class_callee() {
+        // `let z = Ok(42); z` — value-position `Ok(42)` goes through
+        // `lower_call`'s ordinary path: `Ok` resolves through the
+        // closed-world PYRE_STDLIB registry to
+        // `Constant(HostObject(<Ok class>))`, and `lower_call` emits
+        // `simple_call(<host Ok>, 42)` per `operation.py:663-679
+        // SimpleCall` shape, matching what `flowcontext.py:856
+        // LOAD_GLOBAL Ok` + `:998 CALL_FUNCTION 1` would compile a
+        // Python `Ok(42)` call to. The Slice O4 boundary helper does
+        // NOT fire here because the call sits inside a `let` RHS, not
+        // at a function/arm tail.
+        let g = lower("fn f() -> i64 { let z = Ok(42); z }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "simple_call");
+        match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert_eq!(obj.qualname(), "Ok");
+                    assert!(obj.is_class());
+                }
+                other => panic!("expected HostObject(Ok), got {other:?}"),
+            },
+            other => panic!("expected Constant callee, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn some_call_at_value_position_emits_simple_call_with_host_class_callee() {
+        let g = lower("fn f(x: i64) -> i64 { let z = Some(x); z }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "simple_call");
+        match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert_eq!(obj.qualname(), "Some");
+                    assert!(obj.is_class());
+                }
+                other => panic!("expected HostObject(Some), got {other:?}"),
+            },
+            other => panic!("expected Constant callee, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn err_at_value_position_emits_simple_call_with_host_class_callee() {
+        // `let z = Err(e); z` — value-position `Err(e)` lowers as
+        // an ordinary constructor call: `simple_call(<host Err>, e)`
+        // per `operation.py:663-679`. With no orthodox `exc_from_raise`
+        // port yet (Slice O5 lands the boundary raise rewrite), this
+        // call shape applies in BOTH value and (non-O5) terminator
+        // positions; the difference materialises only when O5
+        // intercepts the tail position.
+        let g = lower("fn f(e: i64) -> i64 { let z = Err(e); z }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "simple_call");
+        match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert_eq!(obj.qualname(), "Err");
+                    assert!(obj.is_class());
+                }
+                other => panic!("expected HostObject(Err), got {other:?}"),
+            },
+            other => panic!("expected Constant callee, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn none_path_lowers_to_constant_none() {
+        // Bare `None` resolves to `Constant(ConstValue::None)` —
+        // Python's NoneType singleton instance. Mirrors upstream
+        // `Constant(None)` carriers in flowspace graphs (`model.py`
+        // `Constant.value = None`).
+        let g = lower("fn f() -> i64 { None }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "bare None resolves to a Constant; no SpaceOperation emits"
+        );
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::None => {}
+                other => panic!("expected ConstValue::None, got {other:?}"),
+            },
+            other => panic!("expected Constant return value, got {other:?}"),
+        }
+    }
+
+    // ---- M2.5e orthodox HOST_ENV (Slice O4): boundary-only
+    //      Result/Option transparency adaptation
+    //
+    // PRE-EXISTING-ADAPTATION (Codex 2026-05-03 parity audit accepted
+    // as "documented as structural adaptation, not parity"). Function
+    // /arm tail and `return expr` positions in pyre-interpreter Rust
+    // source frequently end in `Ok(x)` / `Some(x)` / `None`; upstream
+    // Python source has no Result/Option layer. `lower_value_boundary`
+    // collapses these wrappers at the three boundary call sites only
+    // (`lower_block` tail via `lower_arm_body`, `lower_arm_body`'s
+    // default arm, and `lower_return`'s `ret.expr`). Value-position
+    // calls keep flowing through ordinary `simple_call(<host class>,
+    // …)` lowering per O1+O2.
+
+    #[test]
+    fn ok_call_at_boundary_collapses_to_inner_value() {
+        // Function-tail `Ok(42)` collapses to its inner value at the
+        // returnblock edge — no `simple_call(<Ok>, 42)` is emitted.
+        // Mirrors what upstream Python `def f(): return 42` (the
+        // analogue without Result wrapping) would produce in
+        // flowspace.
+        let g = lower("fn f() -> i64 { Ok(42) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "Ok(42) at function tail collapses to inner value; no SpaceOperation emits — got {:?}",
+            start.operations,
+        );
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Int(v) => assert_eq!(*v, 42),
+                other => panic!("expected ConstValue::Int(42), got {other:?}"),
+            },
+            other => panic!("expected Constant return value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn some_call_at_boundary_collapses_to_inner_value() {
+        let g = lower("fn f(x: i64) -> i64 { Some(x) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "Some(x) at function tail collapses to inner value; no SpaceOperation emits"
+        );
+        let link = start.exits[0].borrow();
+        // Inner value `x` is the function's first inputarg —
+        // identity matches.
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Variable(_) => {}
+            other => panic!("expected Variable return value (inner x), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_call_at_explicit_return_collapses_to_inner_value() {
+        // `return Ok(x);` — explicit return route: `lower_return` calls
+        // the boundary helper before composing the returnblock Link.
+        let g = lower("fn f(x: i64) -> i64 { return Ok(x); }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "explicit return Ok(x) collapses; no SpaceOperation emits"
+        );
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Variable(_) => {}
+            other => panic!("expected Variable return value (inner x), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_call_at_match_arm_tail_collapses_to_inner_value() {
+        // Match-arm-tail boundary route: `lower_arm_body`'s default
+        // arm calls the boundary helper. Each variant arm collapses
+        // its `Ok(...)` wrapper at the arm's outer-tail position.
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => Ok(1),
+                    _ => Ok(0),
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // No `simple_call(<Ok>, …)` ops anywhere in the graph — both
+        // arm tails collapsed.
+        let simple_calls_to_ok: usize = g
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .filter(|op| {
+                        op.opname == "simple_call"
+                            && matches!(
+                                &op.args[0],
+                                Hlvalue::Constant(c)
+                                    if matches!(
+                                        &c.value,
+                                        ConstValue::HostObject(obj) if obj.qualname() == "Ok",
+                                    ),
+                            )
+                    })
+                    .count()
+            })
+            .sum();
+        assert_eq!(simple_calls_to_ok, 0);
+    }
+
+    #[test]
+    fn nested_ok_wrapping_qualified_path_at_boundary_collapses_to_getattr_only() {
+        // `Ok(StepResult::Continue)` at function tail: outer wrapper
+        // collapses, leaving only the inner getattr cascade.
+        let g = lower("fn f() -> i64 { Ok(StepResult::Continue) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "boundary collapse leaves only inner getattr; ops: {:?}",
+            start.operations
+        );
+        assert_eq!(start.operations[0].opname, "getattr");
+        let link = start.exits[0].borrow();
+        assert_eq!(
+            link.args[0].as_ref().unwrap(),
+            &start.operations[0].result,
+            "returnblock link carries the getattr result (inner StepResult::Continue)"
+        );
+    }
+
+    // ---- M2.5e orthodox HOST_ENV (Slice O5): exc_from_raise subset
+    //      port for boundary-position `Err(e)` — full 2-exit
+    //      `isinstance(evalue, type)` fork preserved
+    //
+    // PARITY (no fork elision). The boundary helper emits the upstream
+    // `flowcontext.py:600-636 exc_from_raise` op sequence with a
+    // 2-exit `guessbool(isinstance(arg, type))` fork per
+    // `flowcontext.py:610`. Both arms — True branch (instantiate via
+    // `simple_call(evalue)`) and False branch (assert via
+    // `ll_assert_not_none(evalue)`) — converge on a join block that
+    // emits `type(w_value)` and Links `[etype, w_value]` to
+    // `graph.exceptblock` per `flowcontext.py:1259 Raise.nomoreblocks`.
+    // Value-position `Err(e)` continues through ordinary
+    // `simple_call(<Err>, e)` (see
+    // `err_at_value_position_emits_simple_call_with_host_class_callee`).
+
+    #[test]
+    fn err_call_at_boundary_emits_isinstance_fork_and_raise_edge() {
+        let g = lower("fn f(e: i64) -> i64 { Err(e) }").unwrap();
+        checkgraph(&g);
+        // Start block: 1 isinstance op + Bool fork to True/False arms.
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "isinstance");
+        assert_eq!(start.exits.len(), 2);
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert_eq!(obj.qualname(), "type");
+                    assert!(obj.is_class());
+                }
+                other => panic!("expected HostObject(type) isinstance arg2, got {other:?}"),
+            },
+            other => panic!("expected Constant isinstance arg2, got {other:?}"),
+        }
+        // Bool(false) before Bool(true) per upstream BlockRecorder.guessbool
+        // (`flowcontext.py:107-122`).
+        let exit_false = start.exits[0].borrow();
+        let exit_true = start.exits[1].borrow();
+        assert_eq!(
+            exit_false.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+        assert_eq!(
+            exit_true.exitcase.as_ref().unwrap(),
+            &Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+        let false_block = exit_false.target.as_ref().unwrap();
+        let true_block = exit_true.target.as_ref().unwrap();
+        // True arm: simple_call(evalue) — the instantiation path per
+        // `flowcontext.py:614`.
+        let true_ref = true_block.borrow();
+        assert_eq!(true_ref.operations.len(), 1);
+        assert_eq!(true_ref.operations[0].opname, "simple_call");
+        // False arm: ll_assert_not_none(evalue) — the (instance, None)
+        // shape per `flowcontext.py:632-634`.
+        let false_ref = false_block.borrow();
+        assert_eq!(false_ref.operations.len(), 1);
+        assert_eq!(false_ref.operations[0].opname, "ll_assert_not_none");
+        // Both arms converge on the same join block.
+        assert_eq!(true_ref.exits.len(), 1);
+        assert_eq!(false_ref.exits.len(), 1);
+        let true_join = true_ref.exits[0].borrow().target.as_ref().unwrap().clone();
+        let false_join = false_ref.exits[0].borrow().target.as_ref().unwrap().clone();
+        assert!(
+            std::rc::Rc::ptr_eq(&true_join, &false_join),
+            "True and False arm Links converge on the same join block"
+        );
+        // Join block: type(w_value) + Link [etype, w_value] -> exceptblock.
+        let join_ref = true_join.borrow();
+        assert_eq!(join_ref.operations.len(), 1);
+        assert_eq!(join_ref.operations[0].opname, "type");
+        assert_eq!(join_ref.exits.len(), 1);
+        let exit_link = join_ref.exits[0].borrow();
+        assert!(
+            std::rc::Rc::ptr_eq(exit_link.target.as_ref().unwrap(), &g.exceptblock),
+            "join Links to graph.exceptblock per flowcontext.py:1259"
+        );
+        assert_eq!(exit_link.args.len(), 2);
+        assert_eq!(
+            exit_link.args[0].as_ref().unwrap(),
+            &join_ref.operations[0].result,
+            "Link arg[0] = etype = type(w_value)"
+        );
+    }
+
+    #[test]
+    fn err_at_explicit_return_emits_isinstance_fork_and_raise_edge() {
+        // `return Err(e);` — `lower_return` route also hits the
+        // boundary helper; same fork+join+raise-edge shape.
+        let g = lower("fn f(e: i64) -> i64 { return Err(e); }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "isinstance");
+        assert_eq!(start.exits.len(), 2);
+    }
+
+    #[test]
+    fn err_at_match_arm_tail_emits_raise_edge_to_exceptblock() {
+        // Match-arm tail boundary route: each arm's `Err(e)` lowers
+        // to its own fork+join+raise edge.
+        let g = lower(
+            "fn f(x: Foo, e: i64) -> i64 {
+                match x {
+                    Foo::A => 0,
+                    _ => Err(e),
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Exactly one Link in the entire graph targets exceptblock —
+        // from the wildcard arm's join block.
+        let exceptblock_links = g
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .exits
+                    .iter()
+                    .filter(|exit| {
+                        exit.borrow()
+                            .target
+                            .as_ref()
+                            .map(|t| std::rc::Rc::ptr_eq(t, &g.exceptblock))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            exceptblock_links, 1,
+            "exactly one path Links to exceptblock — the wildcard arm's join"
+        );
+    }
+
+    #[test]
+    fn local_binding_shadows_err_at_boundary_does_not_emit_raise_edge() {
+        // Locals-first ordering at the boundary: `let Err = some_fn;
+        // Err(b)` — the inner `Err` references the local function,
+        // not the closed-world host class. The boundary helper
+        // recognises the shadowing and falls through to ordinary
+        // `lower_call`, emitting `simple_call(<local Variable>, b)`
+        // — no fork, no raise edge.
+        let g = lower(
+            "fn f(some_fn: i64, b: i64) -> i64 {
+                let Err = some_fn;
+                Err(b)
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "shadowed Err at boundary emits simple_call only; ops: {:?}",
+            start.operations
+        );
+        assert_eq!(start.operations[0].opname, "simple_call");
+        // No exit Links to exceptblock anywhere — the shadowing path
+        // keeps the value-flow into the returnblock.
+        let to_exceptblock = g.iterblocks().iter().any(|b| {
+            b.borrow().exits.iter().any(|exit| {
+                exit.borrow()
+                    .target
+                    .as_ref()
+                    .map(|t| std::rc::Rc::ptr_eq(t, &g.exceptblock))
+                    .unwrap_or(false)
+            })
+        });
+        assert!(
+            !to_exceptblock,
+            "shadowed Err must not emit a raise edge to exceptblock"
+        );
+    }
+
+    #[test]
+    fn local_binding_shadows_ok_at_boundary_does_not_collapse() {
+        // Locals-first ordering at the boundary: `let Ok = some_fn;
+        // Ok(b)` — the inner `Ok` references the local function, not
+        // the closed-world host class. The boundary helper recognises
+        // the shadowing and falls through to ordinary `lower_call`,
+        // emitting `simple_call(<local Variable>, b)`.
+        let g = lower(
+            "fn f(some_fn: i64, b: i64) -> i64 {
+                let Ok = some_fn;
+                Ok(b)
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "shadowed Ok at boundary still emits simple_call; ops: {:?}",
+            start.operations
+        );
+        assert_eq!(start.operations[0].opname, "simple_call");
+        match &start.operations[0].args[0] {
+            Hlvalue::Variable(_) => {}
+            other => panic!("expected Variable callee (local shadowing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_binding_shadows_ok_resolves_through_local() {
+        // pyopcode.py:502 LOAD_FAST priority — locals win over the
+        // closed-world PYRE_STDLIB registry. With `let Ok = a;` the
+        // identifier `Ok` resolves through locals; `Ok(b)` lowers
+        // as `simple_call(<local Variable>, b)` because the locals
+        // lookup succeeds before the host-class fallback.
+        let g = lower(
+            "fn f(a: i64, b: i64) -> i64 {
+                let Ok = a;
+                let _r = Ok(b);
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "expected exactly one simple_call; ops: {:?}",
+            start.operations
+        );
+        assert_eq!(start.operations[0].opname, "simple_call");
+        match &start.operations[0].args[0] {
+            Hlvalue::Variable(_) => {}
+            other => panic!("expected Variable callee (local shadowing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_path_in_tail_emits_getattr_cascade() {
+        // `StepResult::Continue` — multi-segment qualified path.
+        // Leftmost `StepResult` is not in PYRE_STDLIB, so the
+        // resolver mints a `HostObject::Class` and caches it on the
+        // Builder. The trailing `Continue` segment emits a single
+        // `getattr` op per `flowcontext.py:861 LOAD_ATTR` /
+        // `operation.py:618 getattr` arity=2, with the second
+        // argument a `Constant(ConstValue::ByteStr("Continue"))`.
+        // N=2 segments → N-1=1 getattr op.
+        let g = lower("fn f() -> i64 { StepResult::Continue }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "2-segment path emits 1 getattr op; ops: {:?}",
+            start.operations
+        );
+        assert_eq!(start.operations[0].opname, "getattr");
+        // Receiver is the minted host class.
+        match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert_eq!(obj.qualname(), "StepResult");
+                    assert!(obj.is_class());
+                }
+                other => panic!("expected HostObject(StepResult), got {other:?}"),
+            },
+            other => panic!("expected Constant receiver, got {other:?}"),
+        }
+        // Attribute name is the trailing segment as a byte string.
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(b) => assert_eq!(b, b"Continue"),
+                other => panic!("expected ByteStr attr name, got {other:?}"),
+            },
+            other => panic!("expected Constant attr name, got {other:?}"),
+        }
+        // Result threads into the returnblock link.
+        let link = start.exits[0].borrow();
+        assert_eq!(
+            link.args[0].as_ref().unwrap(),
+            &start.operations[0].result,
+            "returnblock link must carry the getattr result"
+        );
+    }
+
+    #[test]
+    fn qualified_path_call_callee_emits_getattr_then_simple_call() {
+        // `StepResult::Return(value)` — multi-segment callee resolves
+        // through the same getattr cascade, then `lower_call` emits
+        // `simple_call(<getattr result>, value)`.
+        let g = lower("fn f(value: i64) -> i64 { StepResult::Return(value) }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "simple_call");
+        // simple_call's first arg = getattr result (the bound class
+        // attribute that the call invokes).
+        assert_eq!(start.operations[1].args[0], start.operations[0].result);
+    }
+
+    #[test]
+    fn three_segment_path_emits_two_getattr_ops_in_cascade() {
+        // `A::B::C` — N=3 segments → N-1=2 getattr ops chained.
+        // Leftmost `A` is the minted class; `getattr(<A>, "B")` is
+        // op[0]; `getattr(op[0].result, "C")` is op[1]. Mirrors
+        // upstream LOAD_GLOBAL + 2× LOAD_ATTR (`flowcontext.py:861`).
+        let g = lower("fn f() -> i64 { A::B::C }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "getattr");
+        // op[1]'s receiver chains from op[0]'s result.
+        assert_eq!(start.operations[1].args[0], start.operations[0].result);
+    }
+
+    #[test]
+    fn repeat_qualified_path_shares_host_class_identity() {
+        // Two references to `StepResult::*` in the same graph share
+        // the same `Constant(HostObject(<StepResult>))` identity —
+        // `host_env::HOST_CLASS_MINTS` finds-or-mints, returning the
+        // same class on the second cascade step (mirrors
+        // `LOAD_GLOBAL StepResult` returning the same object on
+        // every lookup, regardless of graph — `flowcontext.py:847`).
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                let _a = StepResult::Continue;
+                let _b = StepResult::Halt;
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        let host_a = match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => obj.clone(),
+                other => panic!("expected HostObject in op[0], got {other:?}"),
+            },
+            other => panic!("expected Constant receiver, got {other:?}"),
+        };
+        let host_b = match &start.operations[1].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => obj.clone(),
+                other => panic!("expected HostObject in op[1], got {other:?}"),
+            },
+            other => panic!("expected Constant receiver, got {other:?}"),
+        };
+        assert_eq!(
+            host_a, host_b,
+            "host_env::HOST_CLASS_MINTS must share StepResult identity \
+             across both cascade steps (HostObject::eq is Arc::ptr_eq)"
+        );
+    }
+
+    #[test]
+    fn qualified_path_shares_host_class_identity_across_graphs() {
+        // Cross-graph identity: two separate `build_flow_from_rust`
+        // invocations that name `CrossGraphProbe::*` must observe the
+        // same `HostObject::Class` identity. Mirrors upstream
+        // `func_globals[name]` returning the same Python object on
+        // every `LOAD_GLOBAL` regardless of which graph is being
+        // built — `flowcontext.py:845-854 find_global` reads from a
+        // process-shared globals dict. Per-graph minting (the prior
+        // `Builder::host_classes` HashMap shape) violated this
+        // invariant.
+        let g1 = lower("fn f() -> i64 { let _a = CrossGraphProbe::A; 0 }").unwrap();
+        let g2 = lower("fn g() -> i64 { let _b = CrossGraphProbe::B; 0 }").unwrap();
+        let lhs1 = match &g1.startblock.borrow().operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => obj.clone(),
+                other => panic!("expected HostObject in g1, got {other:?}"),
+            },
+            other => panic!("expected Constant receiver in g1, got {other:?}"),
+        };
+        let lhs2 = match &g2.startblock.borrow().operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => obj.clone(),
+                other => panic!("expected HostObject in g2, got {other:?}"),
+            },
+            other => panic!("expected Constant receiver in g2, got {other:?}"),
+        };
+        assert_eq!(
+            lhs1, lhs2,
+            "CrossGraphProbe identity must be process-global \
+             (HostObject::eq is Arc::ptr_eq); per-graph minting \
+             would have produced two distinct Arcs",
+        );
+    }
+
+    #[test]
+    fn nested_ok_wrapping_qualified_path_at_value_position_emits_getattr_then_simple_call() {
+        // `let z = Ok(StepResult::Continue); z` — value-position
+        // wrap. Inner qualified path resolves first (1 getattr),
+        // then outer `Ok` constructor wraps the inner result (1
+        // simple_call) per upstream `LOAD_GLOBAL Ok; LOAD_GLOBAL
+        // StepResult; LOAD_ATTR Continue; CALL_FUNCTION 1`. Boundary
+        // collapse (Slice O4) does NOT fire because the call sits
+        // inside a `let` RHS — the boundary helper only intercepts
+        // function/arm tail and `return` operand positions.
+        let g = lower("fn f() -> i64 { let z = Ok(StepResult::Continue); z }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "simple_call");
+        // simple_call's callee = Ok host class; arg[1] = getattr result.
+        match &start.operations[1].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => assert_eq!(obj.qualname(), "Ok"),
+                other => panic!("expected Ok HostObject, got {other:?}"),
+            },
+            other => panic!("expected Constant callee, got {other:?}"),
+        }
+        assert_eq!(start.operations[1].args[1], start.operations[0].result);
+    }
+
+    #[test]
+    fn qualified_path_with_leading_colon_rejects() {
+        // `::std::result::Result` — globally-anchored path is its
+        // own port (out of M2.5e orthodox scope per the plan's
+        // Non-goals).
+        let err = lower("fn f() -> i64 { ::std::result::Result }").unwrap_err();
+        match err {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("leading-`::`"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(leading-::), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_path_with_generic_arguments_rejects() {
+        // `Vec::<i32>::new` — generic-argument paths reject pending
+        // type-arg reification (out of M2.5e orthodox scope per the
+        // plan's Non-goals).
+        let err = lower("fn f() -> i64 { Vec::<i32>::new() }").unwrap_err();
+        match err {
+            AdapterError::Unsupported { reason } => {
+                assert!(reason.contains("generic arguments"), "reason: {reason}");
+            }
+            other => panic!("expected Unsupported(generic args), got {other:?}"),
+        }
+    }
+
     #[test]
     fn char_literal_lowers_to_single_char_str() {
         // Rust `char` → `ConstValue::UniStr(len==1)`. Matches the
@@ -6052,5 +7675,457 @@ mod tests {
                 .any(|o| o.opname == "getattr")
         });
         assert!(has_getattr, "top-level expression statement must lower");
+    }
+
+    // ---- Slice O8: constfold-then-emit cascade -------------------
+
+    /// Walker-registered enum: cascade `MyEnum::Continue` resolves
+    /// to a *folded* `Constant(HostObject(<Continue child>))` — no
+    /// raw `getattr` op is recorded for the variant lookup.
+    ///
+    /// Mirrors upstream `flowcontext.py:861 LOAD_ATTR` →
+    /// `op.getattr(w_obj, w_name).eval(self)` →
+    /// `operation.py:624 GetAttr.constfold` returning
+    /// `const(getattr(MyEnum, "Continue"))` when both args are
+    /// foldable.
+    #[test]
+    fn cascade_constfolds_through_walker_registered_enum_variant() {
+        use crate::flowspace::rust_source::register::register_rust_module;
+        use syn::Item;
+
+        // Per-module scoping (Issue 1.3): the walker's `ModuleId`
+        // must match the body lowerer's id. Put the enum and the
+        // entry-point fn in the same `syn::File`, walk it once to
+        // register the enum under id `m`, then call
+        // `build_flow_from_rust_in_module(_, m)` so the body's
+        // `LOAD_GLOBAL` resolution hits the matching partition.
+        let src = "pub enum ParityProbe_O8_Constfold_Enum { ContinueA, StopA }
+                   fn f(x: ParityProbe_O8_Constfold_Enum) -> i64 {
+                       match x {
+                           ParityProbe_O8_Constfold_Enum::ContinueA => 1,
+                           _ => 0,
+                       }
+                   }";
+        let file = syn::parse_file(src).expect("walker + entry fixture parses");
+        let module_id = register_rust_module(&file);
+        let entry = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(item_fn) if item_fn.sig.ident == "f" => Some(item_fn),
+                _ => None,
+            })
+            .expect("entry-point fn `f` in fixture");
+
+        // Match against the walker-registered enum's variant. The
+        // cascade's first step (`getattr(<enum>, "ContinueA")`) must
+        // collapse to a `Constant(HostObject(<ContinueA child>))`,
+        // making the startblock have just the `isinstance` op (no
+        // raw `getattr` precedes it).
+        let g = super::build_flow_from_rust_in_module(entry, module_id)
+            .expect("lower against walker-registered enum");
+        checkgraph(&g);
+
+        let start = g.startblock.borrow();
+        // PARITY: with constfold, the first cascade step folds the
+        // variant lookup and `isinstance` becomes the SOLE op of
+        // the startblock. The minted-class fallback (test
+        // `match_unit_variant_two_arms_emits_isinstance_cascade`)
+        // emits 2 ops because the leftmost was minted with empty
+        // members.
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "constfold collapses the variant getattr, leaving only `isinstance`: \
+             {:?}",
+            start
+                .operations
+                .iter()
+                .map(|o| o.opname.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(start.operations[0].opname, "isinstance");
+
+        // The isinstance op's second arg is the folded variant
+        // class — a `Constant(HostObject(<variant>))` whose
+        // qualname is `<EnumName>.<VariantName>`.
+        match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => {
+                    assert!(obj.is_class(), "folded variant must be a class");
+                    assert_eq!(obj.qualname(), "ParityProbe_O8_Constfold_Enum.ContinueA");
+                }
+                other => panic!("expected HostObject variant, got {other:?}"),
+            },
+            other => panic!("expected Constant variant carrier, got {other:?}"),
+        }
+    }
+
+    /// Walker-registered struct: `MyStruct::field` lookup misses
+    /// the (empty) class dict — Issue 3 (2026-05-05) closes the
+    /// raw-getattr fall-through for walker-registered classes:
+    /// upstream `operation.py:638-642 GetAttr.constfold` raises
+    /// `FlowingError` whenever both args are foldable and Python's
+    /// `getattr` would raise `AttributeError`. The Rust counterpart
+    /// surfaces `AdapterError::Unsupported`. The mint-on-demand path
+    /// (PRE-EXISTING-ADAPTATION) keeps the raw-emit fall-through —
+    /// see [`cascade_falls_through_to_raw_emit_for_minted_class_missing_member`].
+    #[test]
+    fn cascade_fails_loud_for_walker_registered_class_missing_member() {
+        use crate::flowspace::rust_source::register::register_rust_module;
+        use syn::Item;
+
+        let src = "pub struct ParityProbe_Issue3_Empty_Struct { f: i64 }
+                   fn f(x: ParityProbe_Issue3_Empty_Struct) -> i64 {
+                       match x {
+                           ParityProbe_Issue3_Empty_Struct::nonexistent_member => 1,
+                           _ => 0,
+                       }
+                   }";
+        let file = syn::parse_file(src).expect("walker + entry fixture parses");
+        let module_id = register_rust_module(&file);
+        let entry = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(item_fn) if item_fn.sig.ident == "f" => Some(item_fn),
+                _ => None,
+            })
+            .expect("entry-point fn `f` in fixture");
+
+        let err = super::build_flow_from_rust_in_module(entry, module_id)
+            .expect_err("walker-registered class + missing member must fail-loud");
+        match err {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("AttributeError") && reason.contains("nonexistent_member"),
+                    "expected upstream-style AttributeError → FlowingError message, got: {reason}",
+                );
+            }
+            other => panic!("expected AdapterError::Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Mint-on-demand classes (PRE-EXISTING-ADAPTATION) carry empty
+    /// class dicts pending walker coverage of the source-file
+    /// declaration. The cascade treats them as opaque — analogous to
+    /// upstream's `w_obj.foldable() == False` path which records the
+    /// raw `getattr` op instead of folding. Convergence: once
+    /// mint-on-demand is retired (every multi-segment leftmost
+    /// resolves through the walker), this branch + the
+    /// `is_host_class_minted` helper go away and walker-registered
+    /// fail-loud applies uniformly.
+    #[test]
+    fn cascade_falls_through_to_raw_emit_for_minted_class_missing_member() {
+        // No `register_rust_module` pre-pass — `ParityProbe_Issue3_Minted`
+        // is not in any registry slice, so the multi-segment leftmost
+        // resolution lands on `mint_host_class`. Body lowering then
+        // hits the cascade's class-dict miss and falls through to the
+        // raw `getattr` op per the PRE-EXISTING-ADAPTATION.
+        let item = parse(
+            "fn f(x: i64) -> i64 {
+                match x {
+                    ParityProbe_Issue3_Minted::variant => 1,
+                    _ => 0,
+                }
+            }",
+        );
+        let g = super::build_flow_from_rust(&item)
+            .expect("mint-class missing member must fall through to raw emit");
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        // Fall-through preserves the raw-emit behaviour: getattr
+        // followed by isinstance.
+        assert_eq!(start.operations.len(), 2);
+        assert_eq!(start.operations[0].opname, "getattr");
+        assert_eq!(start.operations[1].opname, "isinstance");
+    }
+
+    // ____________________________________________________________
+    // Slice O4 boundary-vs-value-position discipline (Issue 1.1
+    // regression suite).
+    //
+    // The Slice O4 PRE-EXISTING-ADAPTATION (`Ok(x)` / `Some(x)` →
+    // unwrap, `None` → `Constant(None)`, `Err(e)` → raise edge per
+    // O5) collapses the Result/Option wrapper at the
+    // function-return boundary. The threading invariant verified
+    // here: collapse fires ONLY when the wrapper sits at a real
+    // return edge — function tail, `return` statement, or the tail
+    // of an `if`/`match`/`block` whose result IS the function's
+    // return value. Value-position uses (let-init, function arg,
+    // binop operand) MUST keep emitting `simple_call(<host class>,
+    // x)` so the host-class instance threads through to the
+    // consumer.
+    //
+    // Upstream RPython has no Result/Option layer so there's no
+    // direct counterpart; the discipline mirrors the structural
+    // invariant that `flowcontext.py:1232 RETURN_VALUE` is the
+    // only return-edge site, never an intermediate block tail or
+    // value-position match.
+
+    #[test]
+    fn ok_call_in_value_position_block_emits_simple_call() {
+        // Regression test for Issue 1.1: `let z = { Ok(x) }; z` —
+        // value-position block tail. Before the fix, lower_block's
+        // tail dispatch unconditionally went through
+        // lower_value_boundary and unwrapped Ok(x) to x, so `z` got
+        // bound to the bare argument. Correct behaviour: emit
+        // `simple_call(<Ok>, x)`; bind `z` to the call result.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                let z = { Ok(x) };
+                z
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        // Exactly one op — the simple_call(<Ok>, x) for the inner
+        // block. The outer block tail is `z` (a bare path), no op.
+        assert_eq!(
+            start.operations.len(),
+            1,
+            "value-position Ok(x) block tail must emit simple_call; ops: {:?}",
+            start.operations
+        );
+        assert_eq!(start.operations[0].opname, "simple_call");
+        // Callee is the Ok host class (Constant), not unwrapped.
+        match &start.operations[0].args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::HostObject(obj) => assert_eq!(obj.qualname(), "Ok"),
+                other => panic!("expected ConstValue::HostObject(Ok), got {other:?}"),
+            },
+            other => panic!("expected Constant callee for value-position Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_call_in_value_position_if_arms_emit_simple_call_each() {
+        // Regression test for Issue 1.1: `let z = if c { Ok(a) }
+        // else { Ok(b) }; z`. Both arms are value-position so each
+        // must emit `simple_call(<Ok>, _)` rather than collapsing
+        // to the inner value.
+        let g = lower(
+            "fn f(c: bool, a: i64, b: i64) -> i64 {
+                let z = if c { Ok(a) } else { Ok(b) };
+                z
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Walk every block; total simple_call ops over the whole
+        // graph must be exactly 2 (one per if-arm).
+        let mut total_simple_calls = 0usize;
+        for block in g.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname == "simple_call" {
+                    total_simple_calls += 1;
+                }
+            }
+        }
+        assert_eq!(
+            total_simple_calls, 2,
+            "expected 2 simple_call ops (one per Ok-wrapper arm); \
+             value-position if must NOT collapse arm tails"
+        );
+    }
+
+    #[test]
+    fn ok_call_in_value_position_match_arms_emit_simple_call_each() {
+        // Regression test for Issue 1.1: `let z = match x { 0 =>
+        // Ok(1), _ => Ok(2) }; z`. Both arms value-position →
+        // each emits its own `simple_call(<Ok>, _)`.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                let z = match x { 0 => Ok(1), _ => Ok(2) };
+                z
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let mut total_simple_calls = 0usize;
+        for block in g.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname == "simple_call" {
+                    total_simple_calls += 1;
+                }
+            }
+        }
+        assert_eq!(
+            total_simple_calls, 2,
+            "expected 2 simple_call ops (one per Ok-wrapper arm); \
+             value-position match must NOT collapse arm tails"
+        );
+    }
+
+    #[test]
+    fn nested_ok_in_function_tail_block_still_collapses() {
+        // Sanity check: the boundary mode threads correctly through
+        // a function-tail block. `fn f() -> i64 { { Ok(x) } }` —
+        // the inner `{ Ok(x) }` IS at boundary because the outer
+        // block is the function body. Slice O4 still collapses.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                { Ok(x) }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "function-tail nested-block Ok(x) collapses; no SpaceOperation emits"
+        );
+    }
+
+    #[test]
+    fn nested_ok_in_function_tail_match_still_collapses() {
+        // Sanity: function-tail match with Ok arm tails — the
+        // boundary flag propagates from fn-body into lower_match,
+        // so each arm collapses Ok per Slice O4.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                match x {
+                    0 => Ok(1),
+                    _ => Ok(2),
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let mut simple_call_count = 0usize;
+        for block in g.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname == "simple_call" {
+                    simple_call_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            simple_call_count, 0,
+            "function-tail match arm Ok wrappers must collapse; got {simple_call_count} simple_call ops"
+        );
+    }
+
+    // ____________________________________________________________
+    // Issue 1 (Codex audit 2026-05-05) — explicit `return EXPR;`
+    // boundary semantics for nested control-flow EXPR.
+    //
+    // Before the fix, `lower_return` called `lower_value_boundary`
+    // directly. `lower_value_boundary` only intercepts the literal
+    // `Ok(_)` / `Some(_)` / `None` / `Err(_)` shapes; for
+    // `Expr::Block` / `Expr::If` / `Expr::Match` it fell through
+    // to `lower_expr`, which routes those constructs through
+    // `lower_block(_, false)` / `lower_if(_, false)` /
+    // `lower_match(_, false)` — value mode. Result: the wrapper
+    // op survived into the returnblock Link.
+    //
+    // The fix routes `lower_return.ret.expr` through
+    // `lower_arm_body(_, _, true)` so block/if/match dispatch
+    // through their boundary-aware lowerings. The leaf cases
+    // (`Ok(x)` / etc.) still reach `lower_value_boundary` via
+    // `lower_arm_body`'s default arm.
+
+    #[test]
+    fn explicit_return_block_with_ok_tail_collapses() {
+        // `return { Ok(x) };` — explicit return of a nested block.
+        // The inner Ok wrapper must collapse: this is a real
+        // function-return boundary, so the wrapper would otherwise
+        // survive into the returnblock Link.
+        let g = lower("fn f(x: i64) -> i64 { return { Ok(x) }; }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "explicit return of {{ Ok(x) }} must collapse the wrapper; got ops: {:?}",
+            start.operations
+        );
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Variable(_) => {}
+            other => panic!("expected Variable return value (inner x), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_return_if_with_ok_arm_tails_collapses_each() {
+        // `return if c { Ok(a) } else { Ok(b) };` — explicit return
+        // of a value-producing if. Both arms feed the function
+        // return so each Ok wrapper must collapse.
+        let g =
+            lower("fn f(c: bool, a: i64, b: i64) -> i64 { return if c { Ok(a) } else { Ok(b) }; }")
+                .unwrap();
+        checkgraph(&g);
+        let mut simple_call_count = 0usize;
+        for block in g.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname == "simple_call" {
+                    simple_call_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            simple_call_count, 0,
+            "explicit return if must collapse Ok in BOTH arms; got {simple_call_count} \
+             simple_call ops (was: leaked through lower_expr's value-mode lowering)"
+        );
+    }
+
+    #[test]
+    fn explicit_return_match_with_ok_arm_tails_collapses_each() {
+        // `return match x { 0 => Ok(1), _ => Ok(2) };` — explicit
+        // return of a value-producing match. Each arm tail is at
+        // the function-return boundary; Ok wrappers must collapse.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                return match x { 0 => Ok(1), _ => Ok(2) };
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let mut simple_call_count = 0usize;
+        for block in g.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname == "simple_call" {
+                    simple_call_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            simple_call_count, 0,
+            "explicit return match must collapse Ok in EVERY arm; got {simple_call_count} \
+             simple_call ops"
+        );
+    }
+
+    #[test]
+    fn explicit_return_nested_block_in_if_with_ok_collapses() {
+        // `return if c { { Ok(a) } } else { Ok(b) };` — the then-
+        // arm wraps Ok in another inner block. Both layers should
+        // observe at_boundary=true: the outer if-arm's lower_block
+        // (boundary=true) plus the tail Ok in that inner block
+        // hits lower_value_boundary directly.
+        let g = lower(
+            "fn f(c: bool, a: i64, b: i64) -> i64 {
+                return if c { { Ok(a) } } else { Ok(b) };
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let mut simple_call_count = 0usize;
+        for block in g.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname == "simple_call" {
+                    simple_call_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            simple_call_count, 0,
+            "explicit return with nested block-in-arm must collapse; \
+             got {simple_call_count} simple_call ops"
+        );
     }
 }
