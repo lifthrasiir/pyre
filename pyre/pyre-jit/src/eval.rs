@@ -3009,23 +3009,25 @@ fn bound_reached(
             || {},
         ))
     } else if !driver.is_tracing() {
-        // warmstate.py:437-444 compile_and_run_once parity:
-        // start tracing AND trace synchronously in a single call.
+        // warmstate.py:425-444 bound_reached: enter tracing if the cell's
+        // counter / flags allow.  Pyre's `driver.bound_reached` does NOT
+        // compile synchronously — it returns `BackEdgeAction::StartedTracing`
+        // and the actual trace is driven by `jit_merge_point_keyed` below
+        // when `is_tracing()` becomes true after this call.
+        //
+        // PyPy parity: `maybe_compile_and_run` (warmstate.py:482-511)
+        // identifies "the compile we just made" through `cell.procedure_token`
+        // (per-greenkey cell), NOT by reading any global last-compiled
+        // value.  Pyre's equivalent is `has_compiled_loop(green_key)` —
+        // never `last_compiled_key()`, which is a single global slot that
+        // accumulates across iterations and cannot tell "stale prior
+        // compile" from "fresh same-key compile this round".  If a
+        // cross-loop cut compiles an INNER key, attachment goes to the
+        // INNER cell; the next iteration's `has_compiled_loop` query at
+        // the inner entry point dispatches to it (warmstate.py:482-483).
         let had_compiled = driver.has_compiled_loop(green_key);
         driver.bound_reached(green_key, loop_header_pc, &mut jit_state, env);
-        // force_start_tracing may return RunCompiled (retargeted trace
-        // already compiled for this cell). In that case, enter compiled.
-        // compile.py:269: actual key may be inner key after cross-loop cut.
-        let actual_key = driver.last_compiled_key().unwrap_or(green_key);
-        if !driver.is_tracing() && driver.has_compiled_loop(actual_key) {
-            Some(driver.run_compiled_detailed_with_bridge_keyed(
-                actual_key,
-                loop_header_pc,
-                &mut jit_state,
-                env,
-                || {},
-            ))
-        } else if driver.is_tracing() {
+        if driver.is_tracing() {
             // RPython pyjitpl.py:2876-2888 _compile_and_run_once:
             // interpret() traces the entire loop synchronously.
             // Set tracing_call_depth so inner function calls (which

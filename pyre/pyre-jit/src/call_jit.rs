@@ -1691,6 +1691,27 @@ fn jit_blackhole_resume_from_guard(
     } else {
         fail_values
     };
+    // `green_key == 0` is the giveup sentinel passed by the
+    // CALL_ASSEMBLER guard-failure helpers (compiler.rs:2674,
+    // dynasm/lib.rs:579) when `descr_owning_jct` returned `None`
+    // (memmgr-evicted weakref — pyjitpl.py:2898 should-be-rare path).
+    //
+    // PRE-EXISTING-ADAPTATION (Pyre-only, Python-portal-specific):
+    // pyre's resume storage is keyed by `(green_key, trace_id, fail_index)`,
+    // so we MUST recover a green_key to look up the storage.  PyPy's
+    // `resume_in_blackhole` uses descr identity directly (descr.rd_data),
+    // so it has no such recovery problem.
+    //
+    // The recovery exploits pyre's CALL_ASSEMBLER virtualizable layout
+    // `vable_boxes = [frame, ni, code, vsd, ns, locals..., stack...]`
+    // (call_jit.rs:2471-2472) — `fail_values[0]` IS the callee's
+    // `PyFrame*`, so `frame.pycode` plus `pc=0` reconstructs the
+    // entry green_key.  This contract is Python-portal-specific and
+    // would NOT hold for a non-virtualizable JIT or a portal whose
+    // first fail arg is a scalar.  Convergence: Phase E.3+ unification
+    // (Task #235) replaces `(green_key, trace_id, fail_index)` keying
+    // with descr identity — at which point this whole recovery block
+    // collapses.
     let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
         let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
         if !frame_ptr.is_null() {

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
-use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
+use majit_ir::{Descr, FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -649,32 +649,39 @@ impl DynasmBackend {
     /// this to get a populated cpu before running `compile_loop`.
     pub fn attach_default_test_descrs(&mut self) {
         use majit_ir::Type;
+        // DoneWithThisFrame{Void,Int,Ref,Float}Descr / ExitFrameWithExceptionDescr
+        // — `compile.py:185` skips these (not `ResumeDescr`).
         let void: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
             u32::MAX,
             0,
             vec![],
-            true,
+            true,  // is_finish
+            false, // is_resume_guard
         ));
         let int: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
             u32::MAX,
             0,
             vec![Type::Int],
             true,
+            false,
         ));
         let r: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
             u32::MAX,
             0,
             vec![Type::Ref],
             true,
+            false,
         ));
         let float: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
             u32::MAX,
             0,
             vec![Type::Float],
             true,
+            false,
         ));
         let exit_exc: majit_ir::DescrRef = {
-            let mut d = crate::guard::DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
+            let mut d =
+                crate::guard::DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
             d.is_exit_frame_with_exception = true;
             Arc::new(d)
         };
@@ -1066,14 +1073,14 @@ impl DynasmBackend {
             } else {
                 vec![Type::Int]
             };
-            return Arc::new(DynasmFailDescr::new(u32::MAX, 0, types, true));
+            return Arc::new(DynasmFailDescr::new(u32::MAX, 0, types, true, false));
         }
 
         // compile.py:658-662 ExitFrameWithExceptionDescrRef — route to
         // jitexc.ExitFrameWithExceptionRef via is_exit_frame_with_exception.
         // Result type is Ref (exc value at slot 0, jitexc.py:45).
         if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
             d.is_exit_frame_with_exception = true;
             return Arc::new(d);
         }
@@ -1115,7 +1122,7 @@ impl DynasmBackend {
             // dispatch reads the exc value through the standard
             // get_ref_value(0) path (compile.py:660).
             unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
             d.is_exit_frame_with_exception = true;
             return Arc::new(d);
         }
@@ -1169,10 +1176,6 @@ impl DynasmBackend {
     /// bridges. Used by compile_bridge to locate the exact guard descr
     /// that failed — RPython passes the faildescr object directly.
     ///
-    /// trace_id == 0 is normalized to the root trace id, matching
-    /// cranelift (compiler.rs:10092) and the BridgeFailDescrProxy
-    /// convention.
-    ///
     /// Panics if not found — in RPython, the faildescr is the exact
     /// object, so there is no lookup-miss path. Use `try_find_descr` for
     /// query-style callers (e.g. `bridge_was_compiled` /
@@ -1197,12 +1200,12 @@ impl DynasmBackend {
         fail_index: u32,
     ) -> Option<Arc<DynasmFailDescr>> {
         let compiled = Self::get_compiled(token);
-        // Normalize trace_id: 0 → root trace id
-        let trace_id = if trace_id == 0 {
-            compiled.trace_id
-        } else {
-            trace_id
-        };
+        // RPython looks up the faildescr by object identity (the resume
+        // descr stored on the guard op IS what `cpu.get_latest_descr()`
+        // returns).  Pyre's lookup is `(trace_id, fail_index)`-keyed; the
+        // `trace_id` is always a real allocated id (alloc_trace_id starts
+        // at 1).  No `0 → root_trace_id` sentinel — that path was a
+        // pyre-only deviation removed alongside `normalize_trace_id`.
 
         if let Some(found) = compiled
             .fail_descrs
@@ -1392,10 +1395,34 @@ impl Backend for DynasmBackend {
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
-        // pyre stores `green_key` — the handle `MetaInterp.compiled_loops`
-        // is indexed by — rather than the CLT object.
-        for descr in &compiled.fail_descrs {
-            descr.set_rd_loop_token(token.green_key);
+        // RPython predicates the stamp on `isinstance(descr, ResumeDescr)`
+        // (`compile.py:185`); pyre uses the `is_resume_guard()` trait
+        // method (descr.rs:779), implemented true on the
+        // `ResumeGuardDescr` family (compile.rs:3117/3296/3434/3558/4125).
+        //
+        // PRE-EXISTING-ADAPTATION: the actual stamp happens on the
+        // backend-side `DynasmFailDescr`, not the metainterp-side
+        // `ResumeGuardDescr` that lives on the IR op (`op.descr`).
+        // Upstream has one descr object per guard, so `compile.py:183-186`
+        // walks `loop.operations` and writes `op.descr.rd_loop_token`
+        // directly.  Pyre's two-tier descr split (Phase E in the epic)
+        // means the runtime reader (`cpu.get_latest_descr()`) hands back
+        // the backend descr; therefore the canonical stamp must reach
+        // the backend descr.  Convergence requires unifying the two
+        // descr objects per fail (Unified-Descr Port Epic, Sessions 5+).
+        //
+        // The metainterp-side `op.descr.rd_loop_token_clt` is also
+        // stamped in `pyjitpl/mod.rs::record_loop_or_bridge` (compile.py:185
+        // line-by-line counterpart); the backend stamp here is the
+        // pyre-side parallel write that survives the eventual unification
+        // (the unified descr will retain the same `rd_loop_token` field).
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            for descr in &compiled.fail_descrs {
+                if !descr.is_resume_guard() {
+                    continue;
+                }
+                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+            }
         }
 
         // `rpython/jit/backend/x86/assembler.py:513-526` initializes the
@@ -1509,7 +1536,7 @@ impl Backend for DynasmBackend {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
-                fail_descr.fail_index(),
+                fail_descr.fail_index_per_trace(),
                 majit_ir::format_trace(&prepared_ops, &constants)
             );
         }
@@ -1540,7 +1567,7 @@ impl Backend for DynasmBackend {
         let guard_descr = Self::find_descr(
             original_token,
             fail_descr.trace_id(),
-            fail_descr.fail_index(),
+            fail_descr.fail_index_per_trace(),
         );
         let arglocs = Asm::rebuild_faillocs_from_descr(&guard_descr, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
@@ -1600,11 +1627,16 @@ impl Backend for DynasmBackend {
         self.register_fail_descrs(&compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
-        // inherit the original loop's CompiledLoopToken.  `loop.original_
-        // jitcell_token` at :176 is the parent — same handle pyre reaches
-        // via `original_token.green_key`.
-        for descr in &compiled.fail_descrs {
-            descr.set_rd_loop_token(original_token.green_key);
+        // inherit the original loop's CompiledLoopToken.  See the
+        // sibling `compile_loop` site for the parity rationale on the
+        // `is_resume_guard()` predicate (`compile.py:185`).
+        if let Some(clt) = original_token.compiled_loop_token.as_ref() {
+            for descr in &compiled.fail_descrs {
+                if !descr.is_resume_guard() {
+                    continue;
+                }
+                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+            }
         }
 
         original_token.asmmemmgr_blocks().push(Box::new(compiled));
@@ -2318,6 +2350,17 @@ impl Backend for DynasmBackend {
             }
         }
         None
+    }
+
+    fn compiled_bridge_descr_arc(
+        &self,
+        original_token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> Option<Arc<dyn majit_ir::Descr>> {
+        let source_descr =
+            Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
+        Some(source_descr as Arc<dyn majit_ir::Descr>)
     }
 
     fn update_fail_descr_recovery_layout(

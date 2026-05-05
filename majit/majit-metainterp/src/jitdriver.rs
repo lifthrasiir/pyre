@@ -1493,16 +1493,26 @@ impl<S: JitState> JitDriver<S> {
                 // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
                 let meta = self.meta.take_trace_meta().unwrap();
                 if let Some(green_key) = self.meta.compile_simple_loop(meta) {
-                    // PRE-EXISTING-ADAPTATION: see pyjitpl/mod.rs compile_loop
-                    // site for the RPython citation and convergence path.
-                    // Segmented loop mirrors `pyjitpl.py:1662-1663`.
-                    let install_num = self.meta.warm_state.alloc_token_number();
-                    let install_token =
-                        std::sync::Arc::new(majit_backend::JitCellToken::new(install_num));
+                    // pyjitpl.py:1662-1663 line-by-line: pass the compiled
+                    // `target_token` returned by `compile_simple_loop` to
+                    // `attach_procedure_to_interp`, NOT a fresh synthetic
+                    // uncompiled JitCellToken.  pyre's `compile_simple_loop`
+                    // returns the green_key; the actual `Arc<JitCellToken>`
+                    // is the `token` field of the freshly-installed
+                    // `CompiledEntry` in `self.compiled_loops`.
+                    let install_token = std::sync::Arc::clone(
+                        &self
+                            .meta
+                            .compiled_loops
+                            .get(&green_key)
+                            .expect(
+                                "compile_simple_loop returned Some(green_key) ⇒ \
+                                 compiled_loops has the new CompiledEntry",
+                            )
+                            .token,
+                    );
                     // `warmstate.py:339-348` redirect+record_jump_to chain
-                    // routed through MetaInterp's caller-side helper so the
-                    // backend `redirect_call_assembler` is reachable when
-                    // both old/new tokens carry compiled code.
+                    // routed through MetaInterp's caller-side helper.
                     self.meta
                         .attach_procedure_with_redirect(green_key, install_token);
                 }
@@ -4449,7 +4459,14 @@ mod tests {
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
-        let trace_id = 0u64; // will be normalized to root_trace_id
+        // Use the actual root trace_id allocated at compile_loop time.
+        // RPython has no `trace_id == 0 → root_trace_id` normalize step;
+        // the descr identity carries the exact trace_id, and tests must
+        // pass the same identity.
+        let trace_id = driver
+            .meta
+            .compiled_root_trace_id(key)
+            .expect("compiled loop should have a root trace_id");
         let result =
             driver
                 .meta

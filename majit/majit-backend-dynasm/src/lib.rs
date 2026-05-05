@@ -524,21 +524,41 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
 ///         resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
 ///     assert 0, "unreachable"
 ///
-/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre's CA slow path always
-/// walks the bridge-tracer hook (`CA_BRIDGE_FN`) first and then runs
-/// the blackhole hook (`CA_BLACKHOLE_FN`), rather than choosing one
-/// via `must_compile`. The bridge hook is responsible for the
-/// _tracing and attaching_ step only; it never re-enters the newly
-/// attached bridge, so the blackhole hook still gets to finish the
-/// current frame. This differs from upstream's "trace+fall-through"
-/// semantics in `_trace_and_compile_from_bridge` but preserves the
-/// end result: each CA slow entry attaches at most one bridge _and_
-/// produces a resume value.
+/// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre's CA slow path runs
+/// the bridge-tracer hook (`CA_BRIDGE_FN` → `jit_ca_handle_guard_failure`
+/// in pyre-jit/src/call_jit.rs:2425) and then the blackhole hook
+/// (`CA_BLACKHOLE_FN`) sequentially, instead of choosing one via the
+/// outer `if must_compile` branch.  The PyPy line-by-line port of
+/// must_compile / stack_almost_full / start_compiling /
+/// `_trace_and_compile_from_bridge` / done_compiling is carried out
+/// inside `jit_ca_handle_guard_failure` (call_jit.rs:2438-2499) — the
+/// flow IS modeled, just one layer down.
+///
+/// **Why the outer dispatch shape differs**: PyPy's
+/// `_trace_and_compile_from_bridge` (compile.py:719-733) raises
+/// `EnterJitAssembler` (warmstate.py:513) at success to non-locally
+/// unwind back to the JIT entry point and re-enter the newly-attached
+/// bridge.  Pyre uses Rust returns where PyPy uses Python exceptions:
+/// `jit_ca_handle_guard_failure` returns `bool` after attaching, and
+/// the trampoline cannot unwind/re-enter from this point — the next
+/// outer iteration's `eval_loop_jit` dispatch picks up the bridge
+/// instead.  Therefore blackhole always runs to finish the current
+/// frame; the next iteration runs the bridge.  End result equivalent
+/// (each CA slow entry attaches at most one bridge AND produces a
+/// resume value).
+///
+/// **Convergence path**: introducing a control-flow primitive that
+/// non-locally unwinds from `jit_ca_handle_guard_failure` back to the
+/// CALL_ASSEMBLER trampoline (Rust `panic_unwind`, `setjmp/longjmp`,
+/// or refactoring the JIT entry to be re-entrant) would let the outer
+/// dispatch read `if must_compile { trace; raise } else { blackhole }`
+/// directly.  None of these are session-scope; the deviation is
+/// retained until that mechanism lands.
 fn handle_fail_resume_guard(
     descr: &guard::DynasmFailDescr,
     descr_raw: usize,
     frame_ptr: *mut jitframe::JitFrame,
-    green_key: u64,
+    _outer_green_key: u64,
 ) -> i64 {
     let trace_id = descr.trace_id;
     let fail_index = descr.fail_index;
@@ -549,11 +569,25 @@ fn handle_fail_resume_guard(
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
+    // pyjitpl.py:2897-2899 parity: recover the owning Arc<JitCellToken>
+    // identity from the descr.  When the weakref is dead (memmgr-evicted
+    // JCT — "should be rare" per upstream), `compile.giveup()` raises
+    // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29), caught at
+    // pyjitpl.py:2906-2907, falling through to blackhole resume.  Pyre
+    // mirrors this by gating bridge tracing on `Some(jct)` and passing
+    // `green_key=0` to the blackhole callback so it derives the key from
+    // the deadframe's pyframe pointer (call_jit.rs:1694-1704); never
+    // substitute the parent CALL_ASSEMBLER caller's green_key here — that
+    // would mis-route resume storage and trip `compile_bridge`'s
+    // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl/mod.rs:8297-8301).
+    let owning_jct = majit_backend::descr_owning_jct(descr);
+
     // compile.py:704-709 `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
-    if let Some(bridge_fn) = CA_BRIDGE_FN.get() {
+    // Skipped on giveup (None).
+    if let (Some(jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
         bridge_fn(
-            green_key,
+            jct.green_key,
             trace_id,
             fail_index,
             raw_values.as_ptr(),
@@ -562,10 +596,12 @@ fn handle_fail_resume_guard(
         );
     }
 
+    let bh_green_key = owning_jct.as_ref().map(|j| j.green_key).unwrap_or(0);
+
     // compile.py:710-716 `resume_in_blackhole`.
     if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
         if let Some(bh_result) = blackhole(
-            green_key,
+            bh_green_key,
             trace_id,
             fail_index,
             raw_values.as_ptr(),
@@ -745,7 +781,8 @@ mod tests {
             7,  // fail_index
             99, // trace_id
             vec![Type::Int, Type::Int],
-            false,
+            false, // is_finish
+            true,  // is_resume_guard
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
 
@@ -760,7 +797,13 @@ mod tests {
     fn test_helper_trampoline_does_not_execute_bridge() {
         // compile.py:701 parity: helper does NOT re-enter bridges.
         // Bridges are executed via patched guard jumps, not the helper.
-        let descr = Arc::new(guard::DynasmFailDescr::new(3, 17, vec![Type::Int], false));
+        let descr = Arc::new(guard::DynasmFailDescr::new(
+            3,
+            17,
+            vec![Type::Int],
+            false,
+            true,
+        ));
         descr.set_bridge_addr(test_bridge_finish_int as *const () as usize);
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 

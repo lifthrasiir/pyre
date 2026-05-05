@@ -29,8 +29,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter, WriteBarrierDescr};
 use majit_ir::{
-    AccumInfo, CallDescr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode, OpRef,
-    OpTypeIndex, Type, Value,
+    AccumInfo, CallDescr, Descr, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op, OpCode,
+    OpRef, OpTypeIndex, Type, Value,
 };
 
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
@@ -2671,16 +2671,22 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
     }
 }
 
-fn call_assembler_finish_or_blackhole_deadframe(
-    mut frame: DeadFrame,
-    fallback_green_key: u64,
-) -> Option<i64> {
+fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<i64> {
     let (is_normal_finish, green_key, trace_id, fail_index, fail_arg_types) = {
         let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
         let fail_descr = &jf.fail_descr;
+        // pyjitpl.py:2897-2899 parity: `rd_loop_token.loop_token_wref()` may be
+        // dead (memmgr-evicted JCT) — `compile.giveup()` raises
+        // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29) and falls
+        // through to blackhole resume.  Pass `green_key=0` to the blackhole
+        // callback so it derives the key from the deadframe's pyframe pointer
+        // (call_jit.rs:1694-1704); never substitute the parent CALL_ASSEMBLER
+        // target's green_key here — that would mis-route resume storage.
         (
             fail_descr.is_finish() && !fail_descr.is_exit_frame_with_exception,
-            fail_descr.rd_loop_token().unwrap_or(fallback_green_key),
+            majit_backend::descr_owning_jct(fail_descr.as_ref())
+                .map(|jct| jct.green_key)
+                .unwrap_or(0),
             fail_descr.trace_id,
             fail_descr.fail_index,
             fail_descr.fail_arg_types.clone(),
@@ -3112,8 +3118,7 @@ fn call_assembler_guard_failure_inner(
             &fail_descr_ref.fail_arg_types,
             attachments,
         );
-        if let Some(result) = call_assembler_finish_or_blackhole_deadframe(frame, target.green_key)
-        {
+        if let Some(result) = call_assembler_finish_or_blackhole_deadframe(frame) {
             return result;
         }
         return 0;
@@ -3127,22 +3132,30 @@ fn call_assembler_guard_failure_inner(
     // the bridge descriptor, not necessarily `target.fail_descrs[fail_index]`.
     let fail_index = fail_descr_ref.fail_index();
     let fail_descr = fail_descr_ref;
-    let green_key = fail_descr.rd_loop_token().unwrap_or(target.green_key);
-    let trace_id = if fail_descr.trace_id == 0 {
-        target.trace_id
-    } else {
-        fail_descr.trace_id
-    };
+    // pyjitpl.py:2897-2899 parity: recover the owning Arc<JitCellToken>
+    // identity from the descr.  When the weakref is dead (memmgr-evicted
+    // JCT — "should be rare" per upstream), `compile.giveup()` raises
+    // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29), caught at
+    // pyjitpl.py:2906-2907, falling through to blackhole resume.  Pyre
+    // mirrors this by gating bridge tracing on `Some(jct)` and passing
+    // `green_key=0` to the blackhole callback so it derives the key from
+    // the deadframe's pyframe pointer (call_jit.rs:1694-1704); never
+    // substitute the parent CALL_ASSEMBLER target's green_key here — that
+    // would mis-route resume storage and trip
+    // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
+    // (pyjitpl/mod.rs:8297-8301).
+    let owning_jct = majit_backend::descr_owning_jct(fail_descr);
+    let trace_id = fail_descr.trace_id;
     fail_descr.increment_fail_count();
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
     // Check jitcounter threshold; if reached, trace alternate path and
     // compile bridge. The bridge is attached to fail_descr for fast
-    // dispatch on subsequent guard failures.
-    if let Some(bridge_fn) = CALL_ASSEMBLER_BRIDGE_FN.get() {
+    // dispatch on subsequent guard failures.  Skipped on giveup (None).
+    if let (Some(jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
         let raw_num = fail_descr.fail_arg_types.len();
         if bridge_fn(
-            green_key,
+            jct.green_key,
             trace_id,
             fail_index,
             outputs_ptr,
@@ -3154,6 +3167,7 @@ fn call_assembler_guard_failure_inner(
             // through blackhole instead of re-entering the new bridge.
         }
     }
+    let green_key = owning_jct.as_ref().map(|j| j.green_key).unwrap_or(0);
 
     // resume.py:1312 blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
@@ -12984,18 +12998,12 @@ fn collect_guards(
         };
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
-        // resume.py:450-488 parity: propagate rd_* from op.descr to the
-        // backend `descr` layout so `compiled_exit_layout_from_backend`
-        // (pyjitpl/mod.rs:817-845) can reconstruct the blackhole chain
-        // even after the frontend's `CompiledTrace.exit_layouts` entry
-        // is evicted.  Read through op.descr → ResumeGuardDescr.rd_*
-        // (or chase prev for ResumeGuardCopiedDescr) — single source
-        // of truth, matching upstream `_attrs_` storage.
-        let fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
-        descr.rd_numb = fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec());
-        descr.rd_consts = fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec());
-        descr.rd_virtuals = fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec());
-        descr.rd_pendingfields = fd.and_then(|fd| fd.rd_pendingfields()).map(|s| s.to_vec());
+        // Unified-Descr Port Epic Session 5b: capture the metainterp
+        // ResumeGuardDescr Arc.  rd_numb/rd_consts/rd_virtuals/
+        // rd_pendingfields readers (FailDescr trait impl) forward
+        // through this Arc to the resume.py:450-488 storage on the
+        // metainterp side, so no separate local copy is kept here.
+        descr.meta_descr = op.descr.clone();
         let descr = Arc::new(descr);
         if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
             eprintln!(
@@ -13181,10 +13189,28 @@ impl majit_backend::Backend for CraneliftBackend {
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
-        // pyre stores `green_key` — the handle `MetaInterp.compiled_loops`
-        // is indexed by — rather than the CLT object.
-        for descr in &compiled.fail_descrs {
-            descr.set_rd_loop_token(token.green_key);
+        // RPython gates on `isinstance(descr, ResumeDescr)` (`compile.py:185`);
+        // pyre uses `is_resume_guard()` overridden on `CraneliftFailDescr`
+        // to return `!is_finish` — backend descrs play the runtime role
+        // of upstream `ResumeGuardDescr` for guard exits and of the
+        // `DoneWithThisFrame*` family for finish exits.
+        //
+        // PRE-EXISTING-ADAPTATION: the actual stamp happens on the
+        // backend-side `CraneliftFailDescr`, not the metainterp-side
+        // `ResumeGuardDescr` that lives on the IR op.  Convergence
+        // requires unifying the two descr objects per fail (Unified-Descr
+        // Port Epic, Sessions 5+).  The metainterp-side
+        // `op.descr.rd_loop_token_clt` is also stamped in
+        // `pyjitpl/mod.rs::record_loop_or_bridge` (compile.py:185
+        // line-by-line counterpart); the backend stamp here is the
+        // pyre-side parallel write that survives the eventual unification.
+        if let Some(clt) = token.compiled_loop_token.as_ref() {
+            for descr in &compiled.fail_descrs {
+                if !descr.is_resume_guard() {
+                    continue;
+                }
+                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+            }
         }
 
         token.compiled = Some(Box::new(compiled));
@@ -13262,6 +13288,23 @@ impl majit_backend::Backend for CraneliftBackend {
         );
     }
 
+    /// `compile.py:484 do_compile_bridge(metainterp_sd, faildescr,
+    /// inputargs, operations, original_loop_token, log, memo)` — RPython's
+    /// upstream signature has *one* token: `original_loop_token`, derived
+    /// from `metainterp.resumekey_original_loop_token` (= the source
+    /// descr's `rd_loop_token.loop_token_wref()`, `pyjitpl.py:2897`).
+    /// PyPy's x86 backend can resolve the source FailDescr against that
+    /// single token because it patches the source machine code directly.
+    ///
+    /// **NEW-DEVIATION (fix queue):** the second `previous_tokens` slice
+    /// is pyre-only.  Cranelift recompiles the bridge as a fresh module
+    /// rather than patching live machine code, so when the source guard
+    /// lives in a retired token (post-recompile, post-eviction), the
+    /// owning `CompiledLoop.fail_descrs` table is no longer reachable
+    /// from `original_token` alone.  The backend descr now keeps a one-way
+    /// pointer to the source metainterp descr; once bridge compilation can
+    /// resolve the source descr identity without scanning predecessor tokens,
+    /// this parameter must be deleted to converge on `compile.py:484`.
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
@@ -13280,16 +13323,35 @@ impl majit_backend::Backend for CraneliftBackend {
             .ok_or_else(|| {
                 BackendError::CompilationFailed("original token has no compiled loop".to_string())
             })?;
-        let source_trace_id = if fail_descr.trace_id() == 0 {
-            original_compiled.trace_id
-        } else {
-            fail_descr.trace_id()
-        };
+        // compile.py:569 / compile.py:593 line-by-line: the caller hands
+        // `send_bridge_to_backend` the actual `faildescr` object;
+        // `fail_descr.trace_id()` is the bridge origin's allocated id
+        // (`alloc_trace_id` starts at 1, no sentinel) and identifies the
+        // owning trace whether the descr lives on the current token or a
+        // predecessor in `previous_tokens` (post-recompile, the running
+        // machine code still holds the OLD descr).  Search current +
+        // previous tokens; do NOT short-circuit to root-trace when the
+        // descr is found in a predecessor.
+        let source_trace_id = fail_descr.trace_id();
         let source_descr = find_fail_descr_in_fail_descrs(
             &original_compiled.fail_descrs,
             source_trace_id,
-            fail_descr.fail_index(),
-        );
+            fail_descr.fail_index_per_trace(),
+        )
+        .or_else(|| {
+            previous_tokens.iter().find_map(|t| {
+                t.compiled
+                    .as_ref()
+                    .and_then(|c| c.downcast_ref::<CompiledLoop>())
+                    .and_then(|c| {
+                        find_fail_descr_in_fail_descrs(
+                            &c.fail_descrs,
+                            source_trace_id,
+                            fail_descr.fail_index_per_trace(),
+                        )
+                    })
+            })
+        });
         if source_descr.is_none() {
             // RPython compile.py:569: send_bridge_to_backend always has a
             // valid faildescr. If source_descr is not found, the bridge
@@ -13297,7 +13359,7 @@ impl majit_backend::Backend for CraneliftBackend {
             return Err(BackendError::CompilationFailed(format!(
                 "source fail descr not found for trace {} fail {}",
                 source_trace_id,
-                fail_descr.fail_index()
+                fail_descr.fail_index_per_trace()
             )));
         }
         let caller_layout = source_descr.as_ref().and_then(|d| {
@@ -13310,7 +13372,7 @@ impl majit_backend::Backend for CraneliftBackend {
             inputargs,
             ops,
             Some(flag_ptr), // compile.py:186: bridges share parent's invalidation flag
-            Some((source_trace_id, fail_descr.fail_index())),
+            Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
         );
         let compiled = compiled?;
@@ -13343,15 +13405,21 @@ impl majit_backend::Backend for CraneliftBackend {
             trace_id: compiled.trace_id,
             input_types: compiled.input_types.clone(),
             header_pc: compiled.header_pc,
-            source_guard: Some((source_trace_id, fail_descr.fail_index())),
+            source_guard: Some((source_trace_id, fail_descr.fail_index_per_trace())),
         };
+        let clt_arc = original_token.compiled_loop_token.clone();
         for descr in &compiled.fail_descrs {
             descr.set_trace_info(bridge_trace_info.clone());
             // `compile.py:183-186 record_loop_or_bridge`: a bridge's
             // ResumeDescrs inherit the original loop's CompiledLoopToken.
-            // pyre uses `original_token.green_key` as the handle into
-            // `MetaInterp.compiled_loops`.
-            descr.set_rd_loop_token(original_token.green_key);
+            // `is_resume_guard()` restricts the stamp to guard descrs
+            // per `compile.py:185 isinstance(descr, ResumeDescr)`.
+            if !descr.is_resume_guard() {
+                continue;
+            }
+            if let Some(clt) = clt_arc.as_ref() {
+                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+            }
         }
         {
             let terminal_exit_layouts = compiled.terminal_exit_layouts_mut();
@@ -13381,7 +13449,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 trace_id: compiled.trace_id,
                 input_types: compiled.input_types.clone(),
                 header_pc: compiled.header_pc,
-                source_guard: (source_trace_id, fail_descr.fail_index()),
+                source_guard: (source_trace_id, fail_descr.fail_index_per_trace()),
                 caller_prefix_layout: compiled.caller_prefix_layout.clone(),
                 code_ptr: compiled.code_ptr,
                 fail_descrs: compiled.fail_descrs,
@@ -13407,7 +13475,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     if let Some(prev_descr) = find_fail_descr_in_fail_descrs(
                         &prev_compiled.fail_descrs,
                         source_trace_id,
-                        fail_descr.fail_index(),
+                        fail_descr.fail_index_per_trace(),
                     ) {
                         if !prev_descr.has_bridge() {
                             // Reconstruct a minimal BridgeData from the
@@ -13920,6 +13988,24 @@ impl majit_backend::Backend for CraneliftBackend {
                 .map(|descr| descr.layout())
                 .collect(),
         )
+    }
+
+    fn compiled_bridge_descr_arc(
+        &self,
+        original_token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> Option<Arc<dyn majit_ir::Descr>> {
+        let original_compiled = original_token
+            .compiled
+            .as_ref()
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+        let source_descr = find_fail_descr_in_fail_descrs(
+            &original_compiled.fail_descrs,
+            source_trace_id,
+            source_fail_index,
+        )?;
+        Some(source_descr as Arc<dyn majit_ir::Descr>)
     }
 
     fn compiled_trace_fail_descr_layouts(
@@ -15587,51 +15673,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_bridge_normalizes_legacy_root_source_guard_trace_id() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int(0)];
-        let mut root_guard = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        root_guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
-        let root_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            root_guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-        ];
-
-        backend.set_next_trace_id(300);
-        backend.set_next_header_pc(1000);
-        let mut token = JitCellToken::new(8015);
-        backend
-            .compile_loop(&inputargs, &root_ops, &mut token)
-            .unwrap();
-
-        let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-        ];
-        let legacy_fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
-        backend.set_next_trace_id(301);
-        backend.set_next_header_pc(2000);
-        backend
-            .compile_bridge(&legacy_fail_descr, &inputargs, &bridge_ops, &token, &[])
-            .unwrap();
-
-        let bridge_info = backend
-            .compiled_trace_info(&token, 301)
-            .expect("bridge trace info should exist");
-        assert_eq!(bridge_info.source_guard, Some((300, 0)));
-        let bridge_layouts = backend
-            .compiled_trace_fail_descr_layouts(&token, 301)
-            .expect("bridge trace layouts should exist");
-        assert!(
-            bridge_layouts
-                .iter()
-                .all(|layout| layout.trace_info.as_ref().unwrap().source_guard == Some((300, 0)))
-        );
-    }
-
-    #[test]
     fn test_nested_bridge_compilation_uses_source_trace_fail_descr_tree() {
         let mut backend = CraneliftBackend::new();
 
@@ -16552,48 +16593,6 @@ mod tests {
     }
 
     // ── Compile bridge test ──
-
-    #[test]
-    fn test_compile_bridge() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
-        ];
-
-        let mut token = JitCellToken::new(50);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
-
-        let bridge_inputargs = vec![InputArg::new_int(0)];
-        let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
-                1,
-            ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
-        ];
-
-        let mut constants = HashMap::new();
-        constants.insert(100, 10i64);
-        backend.set_constants(constants);
-
-        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
-
-        let info = backend
-            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token, &[])
-            .unwrap();
-
-        assert!(info.code_addr != 0);
-    }
 
     // ── Conditional call tests ──
 
@@ -18295,9 +18294,26 @@ mod tests {
         bridge_constants.insert(100, 100i64);
         backend.set_constants(bridge_constants);
 
-        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int]);
+        // compile.py:569 / compile.py:593: bridge attaches to the actual
+        // FailDescr the running machine code holds, not a synthetic with
+        // trace_id=0.  Pull the real descr off the compiled loop.
+        let real_fail_descr = std::sync::Arc::clone(
+            &token
+                .compiled
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap()
+                .fail_descrs[0],
+        );
         let bridge_info = backend
-            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(
+                &*real_fail_descr,
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+            )
             .unwrap();
         assert!(bridge_info.code_addr != 0);
 
@@ -18412,9 +18428,24 @@ mod tests {
         bridge_constants.insert(100, 1000i64);
         backend.set_constants(bridge_constants);
 
-        let fail_descr = CraneliftFailDescr::new(0, vec![Type::Int, Type::Int]);
+        // compile.py:569: bridge attaches to the actual FailDescr.
+        let real_fail_descr = std::sync::Arc::clone(
+            &token
+                .compiled
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap()
+                .fail_descrs[0],
+        );
         backend
-            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(
+                &*real_fail_descr,
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+            )
             .unwrap();
 
         // With bridge: guard fails on x=0, y=42 -> bridge returns 0 + 42 + 1000 = 1042

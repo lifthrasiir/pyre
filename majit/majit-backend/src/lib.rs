@@ -716,43 +716,6 @@ pub struct AsmInfo {
     pub code_size: usize,
 }
 
-/// Marker descriptor for loop version guards.
-///
-/// When a guard uses this descriptor, the alternative loop version
-/// is compiled immediately after the main loop (not lazily on failure).
-/// This enables speculative optimization: vectorized fast path with
-/// scalar fallback, type-specialized path with generic fallback, etc.
-///
-/// Mirrors `CompileLoopVersionDescr` from rpython/jit/metainterp/compile.py.
-#[derive(Debug)]
-pub struct LoopVersionDescr {
-    /// Index identifying this version guard.
-    pub version_index: u32,
-    /// Fail argument types for the guard.
-    pub fail_arg_types: Vec<Type>,
-}
-
-impl Descr for LoopVersionDescr {
-    fn index(&self) -> u32 {
-        self.version_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-    fn is_loop_version(&self) -> bool {
-        true
-    }
-}
-
-impl FailDescr for LoopVersionDescr {
-    fn fail_index(&self) -> u32 {
-        self.version_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.fail_arg_types
-    }
-}
-
 /// Tracks alternative loop versions to compile after the main loop.
 ///
 /// Each version is an alternative trace that handles cases where the
@@ -837,6 +800,16 @@ impl JitFrameInfo {
 pub struct CompiledLoopToken {
     /// `model.py:299` `self.number = number`.
     pub number: u64,
+    /// `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
+    /// clt.loop_token_wref = wref` parity. Weak back-reference to the
+    /// owning `JitCellToken`. Set immediately after `make_jitcell_token`
+    /// allocates the clt, and read by guard-failure paths via the descr
+    /// chain `descr.rd_loop_token() -> Arc<CompiledLoopToken>` →
+    /// `clt.loop_token_wref.upgrade()` → `Arc<JitCellToken>` → green_key.
+    /// `Mutex` because the wref is set after `CompiledLoopToken::new` —
+    /// the owning Arc is built first, then `set_loop_token_wref` patches
+    /// the weak ref through `&CompiledLoopToken`.
+    pub loop_token_wref: parking_lot::Mutex<std::sync::Weak<JitCellToken>>,
     /// `model.py:300` `self.bridges_count = 0`.
     pub bridges_count: parking_lot::Mutex<usize>,
     /// `model.py:301` `self.invalidate_positions = []`.
@@ -878,6 +851,7 @@ impl CompiledLoopToken {
     pub fn new(number: u64) -> Self {
         CompiledLoopToken {
             number,
+            loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
             bridges_count: parking_lot::Mutex::new(0),
             invalidate_positions: parking_lot::Mutex::new(Vec::new()),
             looptokens_redirected_to: parking_lot::Mutex::new(Vec::new()),
@@ -886,6 +860,24 @@ impl CompiledLoopToken {
             frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
             _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// `compile.py:180-181` `clt.loop_token_wref = wref` setter. Called
+    /// immediately after the owning `Arc<JitCellToken>` becomes the
+    /// stable identity (i.e., once `make_jitcell_token` has stamped its
+    /// generation and the token is the soon-to-be `compiled_loops[gk]`
+    /// entry's `.token` field). The weak ref ages out automatically when
+    /// memmgr drops the owning Arc.
+    pub fn set_loop_token_wref(&self, wref: std::sync::Weak<JitCellToken>) {
+        *self.loop_token_wref.lock() = wref;
+    }
+
+    /// `compile.py:180-181` reader. Returns `None` after the owning
+    /// `JitCellToken` has been dropped (memmgr eviction); guard failures
+    /// reaching here on a dropped token are unreachable in practice
+    /// because the descr chain holds the clt alive transitively.
+    pub fn upgrade_loop_token(&self) -> Option<Arc<JitCellToken>> {
+        self.loop_token_wref.lock().upgrade()
     }
 
     /// `model.py:309-314` `compiling_a_bridge(self)`. The accompanying
@@ -943,6 +935,39 @@ impl CompiledLoopToken {
         // `model.py:329` `self.looptokens_redirected_to = new_loop_tokens`
         *self.looptokens_redirected_to.lock() = new_loop_tokens;
     }
+}
+
+/// `compile.py:186` reader chain helper: `descr.rd_loop_token` →
+/// `clt.loop_token_wref.upgrade()` → `JitCellToken.green_key`.
+///
+/// Returns `None` for descrs that have no `rd_loop_token` set (the
+/// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
+/// per `compile.py:185 isinstance(descr, ResumeDescr)` — non-resume
+/// descrs are skipped by the post-compile walker) or whose owning
+/// `JitCellToken` has been dropped by memmgr.  Bridge-source paths
+/// consume the metainterp ResumeGuardDescr Arc directly (Unified-Descr
+/// Port Epic Session 6.7), so the chain resolves through the descr's
+/// own `rd_loop_token_clt` slot.
+pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>> {
+    descr
+        .rd_loop_token_clt()?
+        .downcast_ref::<Arc<CompiledLoopToken>>()
+}
+
+/// `pyjitpl.py:2897` reader chain: `resumedescr.rd_loop_token.loop_token_wref()`
+/// — recover the owning `Arc<JitCellToken>` object identity from a
+/// FailDescr.  RPython callers consume the returned object directly
+/// (e.g. `compile.py:593` passes the descr's owning loop token to
+/// bridge attach); pyre callers can either keep the `Arc<JCT>` or
+/// derive `green_key` via `jct.green_key`.
+///
+/// Returns `None` when `descr` is a non-resume FailDescr
+/// (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
+/// which `compile.py:185` skips via `isinstance(descr, ResumeDescr)`)
+/// or when the owning JCT was evicted by memmgr.  Bridge-source paths
+/// consume the metainterp ResumeGuardDescr Arc directly (Session 6.7).
+pub fn descr_owning_jct(descr: &dyn FailDescr) -> Option<Arc<JitCellToken>> {
+    descr_owning_clt(descr)?.upgrade_loop_token()
 }
 
 /// Token identifying a compiled loop. Bridges are attached to this.
@@ -1369,13 +1394,23 @@ pub trait Backend: Send {
     ) {
     }
 
-    /// Compile a bridge (side exit path) and attach it to the loop.
+    /// `compile.py:484 do_compile_bridge(metainterp_sd, faildescr, inputargs,
+    /// operations, original_loop_token, log, memo)` — RPython's upstream
+    /// signature carries one token (`original_loop_token`), reached via
+    /// `metainterp.resumekey_original_loop_token = resumedescr.rd_loop_token
+    /// .loop_token_wref()` (`pyjitpl.py:2897`).  PyPy's x86 backend resolves
+    /// the source FailDescr against that single token because it patches the
+    /// running machine code in place.
     ///
-    /// `previous_tokens` contains old tokens from retraces. Because
-    /// Cranelift can't patch existing machine code (unlike RPython's x86
-    /// backend), the running machine code may reference fail_descrs from
-    /// an older token. The bridge must be attached to ALL matching
-    /// fail_descrs across current + previous tokens.
+    /// **NEW-DEVIATION (fix queue):** the second `previous_tokens` slice is
+    /// pyre-only.  Cranelift recompiles bridges as fresh modules instead of
+    /// patching existing machine code, so when the source guard lives in a
+    /// retired token (post-recompile), the owning `CompiledLoop.fail_descrs`
+    /// table is no longer reachable from `original_token` alone.  Backend
+    /// descrs keep a one-way pointer to the source metainterp descr; once
+    /// bridge compilation can resolve source descr identity without scanning
+    /// predecessor tokens, this parameter must be deleted to converge on
+    /// `compile.py:484`.  Dynasm already ignores it (in-place patching).
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
@@ -1385,41 +1420,14 @@ pub trait Backend: Send {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
     ) -> Result<AsmInfo, BackendError>;
 
-    /// Compile all registered loop versions as bridges.
-    ///
-    /// Called after `compile_loop()` succeeds. For each version registered
-    /// in the token's `version_info`, finds the corresponding version guard
-    /// descriptor and compiles the alternative trace as a bridge.
-    fn compile_versions(&mut self, token: &JitCellToken) -> Result<Vec<AsmInfo>, BackendError> {
-        let versions = match &token.version_info {
-            Some(info) => info
-                .versions
-                .iter()
-                .map(|(guard_idx, inputargs, ops)| (*guard_idx, inputargs.clone(), ops.clone()))
-                .collect::<Vec<_>>(),
-            None => return Ok(Vec::new()),
-        };
-
-        let mut results = Vec::new();
-        for (guard_idx, inputargs, ops) in &versions {
-            let descr = LoopVersionDescr {
-                version_index: *guard_idx,
-                fail_arg_types: inputargs.iter().map(|ia| ia.tp).collect(),
-            };
-            let asm = self.compile_bridge(&descr, inputargs, ops, token, &[])?;
-            results.push(asm);
-        }
-        Ok(results)
-    }
-
     /// Register a freshly-compiled JitCellToken as still reachable from
     /// the frontend.  Backends that need to resolve `jf_descr` pointers
     /// across token boundaries (dynasm's `find_descr_by_ptr` cross-token
     /// fallback) use this to iterate all live tokens without maintaining
     /// a separate ptr-to-Arc side table.  Called by `MetaInterp` after
-    /// `compile_loop` / `compile_versions` succeeds.  Default no-op for
-    /// backends whose descr-resolution paths do not cross tokens
-    /// (cranelift resolves via `CompiledLoop::fail_descrs` directly).
+    /// `compile_loop` succeeds.  Default no-op for backends whose
+    /// descr-resolution paths do not cross tokens (cranelift resolves
+    /// via `CompiledLoop::fail_descrs` directly).
     fn track_compiled_token(&mut self, _token: Arc<JitCellToken>) {}
 
     /// Mark the most recently compiled bridge on the given guard as a
@@ -1608,6 +1616,38 @@ pub trait Backend: Send {
         _source_trace_id: u64,
         _source_fail_index: u32,
     ) -> Option<Vec<FailDescrLayout>> {
+        None
+    }
+
+    /// `cpu.get_latest_descr(deadframe)` parity for the bridge-source path.
+    ///
+    /// `pyjitpl/mod.rs::bridge_source_descr` looks up the failed guard's
+    /// descr through the metainterp trace ops (`trace.guard_op_indices →
+    /// trace.ops[idx].descr`), the line-by-line port of `op.getdescr()`
+    /// at `compile.py:184`.  When the metainterp side cannot produce the
+    /// descr (synthetic / cut-tentative ops, post-retrace stale traces),
+    /// the backend still owns the live `Arc<dyn Descr>` that pyre's
+    /// runtime guard-failure helpers received as `descr_addr`.  This
+    /// method returns that backend-side identity so the metainterp can
+    /// fall back to it without panicking.
+    ///
+    /// Returns `None` for backends that don't own a `(token, trace_id,
+    /// fail_index)`-keyed descr store — bare-backend tests use that
+    /// default; the production cranelift / dynasm impls override.
+    ///
+    /// PyPy parity: under the unified ResumeGuardDescr identity the two
+    /// paths return the same object, so the fallback is observationally
+    /// identical to the metainterp lookup.  During pyre's split-descr
+    /// gap (Phase E.3+ continued epic) the backend `CraneliftFailDescr`
+    /// / `DynasmFailDescr` already implement `Descr`, so the upcast
+    /// `Arc<BackendFailDescr> → Arc<dyn Descr>` is direct — no proxy
+    /// struct, no field-by-field reconstruction.
+    fn compiled_bridge_descr_arc(
+        &self,
+        _original_token: &JitCellToken,
+        _source_trace_id: u64,
+        _source_fail_index: u32,
+    ) -> Option<Arc<dyn Descr>> {
         None
     }
 
@@ -2405,41 +2445,6 @@ impl Drop for JittedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_ir::Type;
-
-    #[test]
-    fn loop_version_descr_is_loop_version() {
-        let descr = LoopVersionDescr {
-            version_index: 42,
-            fail_arg_types: vec![Type::Int, Type::Int],
-        };
-        assert!(descr.is_loop_version());
-        assert_eq!(descr.index(), 42);
-        assert_eq!(descr.fail_index(), 42);
-        assert_eq!(descr.fail_arg_types(), &[Type::Int, Type::Int]);
-        assert!(!descr.is_finish());
-    }
-
-    #[test]
-    fn loop_version_descr_as_fail_descr() {
-        let descr = LoopVersionDescr {
-            version_index: 7,
-            fail_arg_types: vec![Type::Int, Type::Ref, Type::Float],
-        };
-        let fail = descr.as_fail_descr().unwrap();
-        assert_eq!(fail.fail_index(), 7);
-        assert_eq!(fail.fail_arg_types(), &[Type::Int, Type::Ref, Type::Float]);
-    }
-
-    #[test]
-    fn regular_descr_is_not_loop_version() {
-        #[derive(Debug)]
-        struct PlainDescr;
-        impl Descr for PlainDescr {}
-
-        let d = PlainDescr;
-        assert!(!d.is_loop_version());
-    }
 
     #[test]
     fn loop_version_info_add_and_track() {

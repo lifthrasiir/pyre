@@ -284,6 +284,18 @@ fn test_bridge_end_to_end() {
     constants.insert(OpRef::from_const(1).raw(), 0i64);
     backend.set_constants(constants);
 
+    // Pin the loop trace id to match the test's TestFailDescr defaults
+    // (`trace_id() == 0`).  In production, metainterp's
+    // `record_loop_or_bridge` (compile.py:185 line-by-line counterpart)
+    // stamps the metainterp ResumeGuardDescr's trace_id to match the
+    // backend allocation; this integration test bypasses metainterp, so
+    // we instead pin the backend's `next_trace_id` to align both sides
+    // explicitly.  Without this, `find_fail_descr_in_fail_descrs`
+    // compares the backend descr's `trace_id` field (allocated by
+    // `compile_loop`, default 1) against the bridge fail descr's
+    // `trace_id()` trait method (which forwards through the test's
+    // TestFailDescr meta_descr, default 0).
+    backend.set_next_trace_id(0);
     let mut token = JitCellToken::new(10);
     backend
         .compile_loop(&trace.inputargs, &trace.ops, &mut token)
@@ -303,6 +315,8 @@ fn test_bridge_end_to_end() {
     assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), 1); // i
     assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
+    let source_trace_id = descr.trace_id();
+    let source_fail_index_per_trace = descr.fail_index_per_trace();
 
     // Now compile a bridge for the guard failure.
     // Bridge takes (i, sum) and returns sum * 2.
@@ -320,10 +334,17 @@ fn test_bridge_end_to_end() {
     bridge_constants.insert(OpRef::from_const(0).raw(), 2i64);
     backend.set_constants(bridge_constants);
 
-    // We need a CraneliftFailDescr to pass to compile_bridge.
-    // The fail_index matches the guard's index in the original loop.
+    // Build a CraneliftFailDescr that mirrors the source guard's
+    // identity for the bridge-compile lookup.
     let bridge_fail_descr =
-        majit_backend_cranelift::guard::CraneliftFailDescr::new(0, vec![Type::Int, Type::Int]);
+        majit_backend_cranelift::guard::CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            source_fail_index_per_trace,
+            source_trace_id,
+            vec![Type::Int, Type::Int],
+            false,
+            Vec::new(),
+            None,
+        );
 
     let bridge_info = backend
         .compile_bridge(

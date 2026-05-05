@@ -1201,19 +1201,48 @@ impl<M: Clone> MetaInterp<M> {
         trace_id
     }
 
-    pub(crate) fn normalize_trace_id(compiled: &CompiledEntry<M>, trace_id: u64) -> u64 {
-        if trace_id == 0 {
-            compiled.root_trace_id
-        } else {
-            trace_id
+    /// Test/external accessor for the root trace_id of a compiled entry.
+    /// Production code reaches the same value via the resume guard descr's
+    /// `descr.trace_id()` (set at backend compile time) or via
+    /// `bridge_info().trace_id` after `start_retrace_from_guard`.
+    pub fn compiled_root_trace_id(&self, green_key: u64) -> Option<u64> {
+        self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
+    }
+
+    /// Salvage the evicted entry's per-trace metadata into the new
+    /// CompiledEntry being built for the same `green_key`, and return the
+    /// list of `Arc<JitCellToken>` to seed the new entry's
+    /// `previous_tokens` for cross-token JUMP/redirect keepalive.
+    ///
+    /// Mirrors `pyjitpl.py` recompile semantics where successor compiled
+    /// loops absorb predecessor's per-fail metadata so old guards (which
+    /// still reference their original compiled trace via descr identity)
+    /// stay reachable through the current `compiled_loops[green_key]`
+    /// entry — without a parallel side-table.
+    ///
+    /// `merged_traces` is populated with the old entry's `traces` for any
+    /// trace_id not already present (the new entry's freshly-built
+    /// `traces` HashMap takes precedence on collision).
+    fn retire_compiled_entry(
+        &mut self,
+        _owning_key: u64,
+        entry: CompiledEntry<M>,
+        merged_traces: &mut HashMap<u64, CompiledTrace>,
+    ) -> Vec<Arc<JitCellToken>> {
+        let token = entry.token;
+        let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
+        previous_tokens.push(Arc::clone(&token));
+        previous_tokens.extend(entry.previous_tokens);
+        for (tid, ct) in entry.traces {
+            merged_traces.entry(tid).or_insert(ct);
         }
+        previous_tokens
     }
 
     fn trace_for_exit<'a>(
         compiled: &'a CompiledEntry<M>,
         trace_id: u64,
     ) -> Option<(u64, &'a CompiledTrace)> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
         compiled
             .traces
             .get(&trace_id)
@@ -1221,12 +1250,18 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// O(1) owner lookup via `descr.rd_loop_token` (compile.py:186 stamp,
-    /// stored as the owning loop's green_key).  Replaces the O(N) scan in
-    /// `trace_for_exit_any` for every descr that went through Session 2's
-    /// `record_loop_or_bridge` walker — i.e. every guard produced by the
-    /// regular compile_loop / compile_bridge paths.  Returns `None` for
-    /// pre-populated descrs (`compile_tmp_callback` stubs) so callers
-    /// fall through to the legacy scan.
+    /// stored as the owning loop's green_key).  Every guard produced by
+    /// the regular compile_loop / compile_bridge paths goes through the
+    /// `record_loop_or_bridge` walker, which stamps the owning clt onto
+    /// the descr.  Returns `None` for pre-populated descrs
+    /// (`compile_tmp_callback` stubs) so callers fall through to the
+    /// legacy scan.
+    ///
+    /// Issue 1.1 fix: old traces from a prior compilation are merged
+    /// into the new entry's `traces` map at recompile time
+    /// (`retire_compiled_entry`), mirroring main's eager-merge
+    /// behavior.  The previous retired-tokens fallback was a pyre-only
+    /// side-table that has been removed.
     fn trace_for_exit_by_rd_loop_token<'a>(
         &'a self,
         rd_loop_token: Option<u64>,
@@ -1234,27 +1269,11 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<(u64, u64, &'a CompiledTrace)> {
         let green_key = rd_loop_token?;
         let compiled = self.compiled_loops.get(&green_key)?;
-        let resolved = Self::normalize_trace_id(compiled, trace_id);
-        let trace = compiled.traces.get(&resolved)?;
-        Some((green_key, resolved, trace))
-    }
-
-    /// Find `(owning_green_key, trace_id, CompiledTrace)` for a
-    /// trace_id that may not belong to the currently-executing token.
-    /// Needed when a bridge attached to loop A JUMPs into loop B's body
-    /// and a guard in B fires: the descr's trace_id identifies B's
-    /// trace, but `self.compiled_loops.get(&A_key)` doesn't carry B's
-    /// traces. RPython never hits this because its per-trace exit
-    /// metadata is reached through the descr object directly
-    /// (`resumekey` chain).
-    fn trace_for_exit_any<'a>(&'a self, trace_id: u64) -> Option<(u64, u64, &'a CompiledTrace)> {
-        for (&owning_key, compiled) in &self.compiled_loops {
-            let resolved = Self::normalize_trace_id(compiled, trace_id);
-            if let Some(trace) = compiled.traces.get(&resolved) {
-                return Some((owning_key, resolved, trace));
-            }
-        }
-        None
+        let resolved = trace_id;
+        compiled
+            .traces
+            .get(&resolved)
+            .map(|trace| (green_key, resolved, trace))
     }
 
     fn compiled_exit_layout_from_trace(
@@ -1269,13 +1288,61 @@ impl<M: Clone> MetaInterp<M> {
             .map(|layout| layout.public(owning_key, trace_id, fail_index))
     }
 
+    /// `compile.py:855 ResumeGuardDescr._attrs_` parity: per-guard exit
+    /// types live on the descr object itself.  RPython has no such
+    /// recovery helper because every `Box` already carries `.type`
+    /// (`history.py:220 ConstInt` etc., `resoperation.py:1597`); the
+    /// optimizer's `store_final_boxes_in_guard` writes the fail args to
+    /// the guard op via `setfailargs` and that's enough.
+    ///
+    /// Pyre's `OpRef` is untyped, so the descr exposes `fail_arg_types()`
+    /// as a cached `Vec<Type>` set by `set_fail_arg_types` at
+    /// optimizer.py:724 time.  This helper returns that vector — and
+    /// only that vector.  Three canonical sources, in priority order:
+    ///
+    /// 1. `trace.exit_layouts[fail_index].exit_types` — backend-finalised
+    ///    layout (already encoded the descr metadata).
+    /// 2. `op.fail_arg_types` — guard-op cached vector.
+    /// 3. `op.descr.fail_arg_types()` — the canonical descr field.
+    ///
+    /// Returns `None` if none of the canonical sources carry the data.
+    /// The earlier OpRef-walker fallback (inputargs / constant_types /
+    /// `op.pos` producer scan) was a pyre-only NEW-DEVIATION: RPython
+    /// would have `Box.type` in hand at the same point and never need a
+    /// trace-level walk.  Removed per `/parity` review.
+    fn infer_exit_types_from_trace(trace: &CompiledTrace, fail_index: u32) -> Option<Vec<Type>> {
+        if let Some(layout) = trace.exit_layouts.get(&fail_index) {
+            return Some(layout.exit_types.clone());
+        }
+        let op_index = trace
+            .guard_op_indices
+            .get(&fail_index)
+            .copied()
+            .or_else(|| {
+                trace.ops.iter().position(|op| {
+                    op.descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                        .is_some_and(|descr| descr.fail_index() == fail_index)
+                })
+            })?;
+        let op = trace.ops.get(op_index)?;
+        if let Some(types) = &op.fail_arg_types {
+            return Some(types.clone());
+        }
+        op.descr
+            .as_ref()
+            .and_then(|descr| descr.as_fail_descr())
+            .map(|descr| descr.fail_arg_types().to_vec())
+            .filter(|types| !types.is_empty())
+    }
+
     fn backend_fail_descr_layout(
         &self,
         compiled: &CompiledEntry<M>,
         trace_id: u64,
         fail_index: u32,
     ) -> Option<majit_backend::FailDescrLayout> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
         let lookup = |token: &JitCellToken| {
             if token.compiled.is_none() {
                 return None;
@@ -1313,7 +1380,6 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         op_index: usize,
     ) -> Option<majit_backend::TerminalExitLayout> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
         let lookup = |token: &JitCellToken| {
             if token.compiled.is_none() {
                 return None;
@@ -1336,7 +1402,8 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
     ) -> Option<CompiledExitLayout> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let frontend_exit_types = Self::trace_for_exit(compiled, trace_id)
+            .and_then(|(_, trace)| Self::infer_exit_types_from_trace(trace, fail_index));
         self.backend_fail_descr_layout(compiled, trace_id, fail_index)
             .map(|layout| {
                 // compile.py:861 copy_all_attributes_from parity:
@@ -1355,14 +1422,28 @@ impl<M: Clone> MetaInterp<M> {
                         layout.rd_pendingfields.clone().unwrap_or_default(),
                     )
                 });
+                let exit_types = if layout.fail_arg_types.is_empty() {
+                    frontend_exit_types.unwrap_or_default()
+                } else {
+                    layout.fail_arg_types
+                };
+                let gc_ref_slots = if layout.gc_ref_slots.is_empty() {
+                    exit_types
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, ty)| (*ty == Type::Ref).then_some(idx))
+                        .collect()
+                } else {
+                    layout.gc_ref_slots
+                };
                 CompiledExitLayout {
                     rd_loop_token: owning_key, // compile.py:186
                     trace_id,
                     fail_index: layout.fail_index,
                     source_op_index: layout.source_op_index,
-                    exit_types: layout.fail_arg_types,
+                    exit_types,
                     is_finish: layout.is_finish,
-                    gc_ref_slots: layout.gc_ref_slots,
+                    gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout,
                     resume_layout: None,
@@ -1378,7 +1459,6 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         op_index: usize,
     ) -> Option<CompiledExitLayout> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
         self.backend_terminal_exit_layout(compiled, trace_id, op_index)
             .map(|layout| CompiledExitLayout {
                 rd_loop_token: owning_key, // compile.py:186
@@ -1401,7 +1481,6 @@ impl<M: Clone> MetaInterp<M> {
         owning_key: u64,
         trace_id: u64,
     ) -> Option<CompiledTraceLayout> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
         let mut exit_layouts =
             if let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id) {
                 let mut layouts: Vec<_> = trace
@@ -4013,7 +4092,13 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
         let mut token =
             make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
-        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
+        self.configure_loop_token_for_driver(
+            Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
+            green_key,
+            driver_descriptor.as_ref(),
+        );
+        // `compile.py:180-181` wref wiring — done inside
+        // `record_loop_or_bridge` once all `Arc::get_mut` writes settle.
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -4087,8 +4172,12 @@ impl<M: Clone> MetaInterp<M> {
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.backend
-                .compile_loop(&inputargs, &compiled_ops, &mut token)
+            self.backend.compile_loop(
+                &inputargs,
+                &compiled_ops,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
         }));
         let compile_result = match compile_result {
             Ok(r) => r,
@@ -4128,10 +4217,13 @@ impl<M: Clone> MetaInterp<M> {
         match compile_result {
             Ok(_) => {
                 // compile.py:826-830 store_hash: assign jitcounter hashes.
-                self.assign_guard_hashes(&token);
+                self.assign_guard_hashes(token.as_ref());
+                // compile.py:566-567 send_loop_to_backend registers the token
+                // with the memory manager before record_loop_or_bridge reads it.
+                self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge — record this loop's
                 // CALL_ASSEMBLER / JUMP keepalive targets.
-                self.record_loop_or_bridge(&token, &compiled_ops);
+                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -4153,16 +4245,23 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_ops,
                     &compiled_constant_types,
                 );
-                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                if let Some(backend_layouts) =
+                    self.backend.compiled_fail_descr_layouts(token.as_ref())
+                {
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
-                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                if let Some(backend_layouts) =
+                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
+                {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
                         &backend_layouts,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let mut resume_data = resume_data;
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
@@ -4173,13 +4272,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_backend_guard_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut exit_layouts,
                 );
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
@@ -4218,20 +4317,13 @@ impl<M: Clone> MetaInterp<M> {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
-                    self.backend.migrate_bridges(&old_entry.token, &token);
+                    self.backend
+                        .migrate_bridges(&old_entry.token, token.as_ref());
                     // Box Identity Phase E.2b parity: preserve old entry's
                     // high-water so previously stored bridges' OpRefs stay
                     // disjoint from any future bridge.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
-                    previous_tokens.push(old_entry.token);
-                    previous_tokens.extend(old_entry.previous_tokens);
-                    // RPython parity: ResumeGuardDescr lives on the guard
-                    // and never gets discarded. Preserve old trace metadata
-                    // so guards from previous compilations can still find
-                    // their exit_layouts.
-                    for (tid, ct) in old_entry.traces {
-                        traces.entry(tid).or_insert(ct);
-                    }
+                    previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::majit_log_enabled() {
                     eprintln!("[jit][compiled_loops.insert] green_key={green_key}");
@@ -4239,7 +4331,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
-                        token: std::sync::Arc::new(token),
+                        token: Arc::clone(&token),
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens,
@@ -4256,34 +4348,8 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
-                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
-                self.register_compiled_token_for_keepalive(green_key);
-                // PRE-EXISTING-ADAPTATION: pass a freshly-allocated
-                // uncompiled `JitCellToken` to `attach_procedure_to_interp`
-                // instead of the actual compiled `CompiledEntry::token`.
-                //
-                // RPython `warmstate.py:339-348` and the call sites at
-                // `compile.py:1019` (ResumeFromInterpDescr.compile_and_attach),
-                // `pyjitpl.py:1662-1663` (segmented loop) and
-                // `pyjitpl.py:3171-3174` (compile_loop) all pass the
-                // actual compiled jitcell_token, so `cell.loop_token`
-                // shares object identity with the compiled procedure
-                // token.
-                //
-                // Slice 5.1 (commit `a84a7a5ef91`) already lifted
-                // `CompiledEntry::token` to `Arc<JitCellToken>`, so the
-                // mechanical Arc::clone that was previously blocked is
-                // now structurally feasible — `make_attach_token_for_probe`
-                // performs exactly that clone.  Convergence is no
-                // longer blocked on the type, only on the empirical
-                // failure described in the PROBE doc below.
-                //
-                // Task #195 Slice 5.2 PROBE: under
-                // MAJIT_PROBE_REDIRECT_IDENTITY=1, route the actual
-                // compiled Arc<JitCellToken> here.  See
-                // `make_attach_token_for_probe` doc.
-                let attach_token = self.make_attach_token_for_probe(green_key);
-                self.attach_procedure_with_redirect(green_key, attach_token);
+                // warmstate.py:339-348 attach the same compiled token object.
+                self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
 
                 self.stats.loops_compiled += 1;
 
@@ -4543,17 +4609,17 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     };
                 }
-                let fail_descr = {
+                let descr_arc = {
                     let compiled = match self.compiled_loops.get(&origin_key) {
                         Some(c) => c,
                         None => return CompileOutcome::Cancelled,
                     };
-                    match self.bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
-                        Some(d) => Box::new(d) as Box<dyn majit_ir::FailDescr>,
+                    match self.bridge_source_descr(compiled, trace_id, fail_index) {
+                        Some(d) => d,
                         None => {
                             if crate::majit_log_enabled() {
                                 eprintln!(
-                                    "[jit] bridge_fail_descr_proxy({}, {}) = None → Cancelled",
+                                    "[jit] bridge_source_descr({}, {}) = None → Cancelled",
                                     trace_id, fail_index
                                 );
                             }
@@ -4561,10 +4627,13 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     }
                 };
+                let fail_descr = descr_arc
+                    .as_fail_descr()
+                    .expect("bridge source op.descr must implement FailDescr");
                 let success = self.compile_bridge(
                     origin_key,
                     fail_index,
-                    &*fail_descr,
+                    fail_descr,
                     &bridge_ops,
                     &bridge_inputargs,
                     constants,
@@ -4910,14 +4979,24 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
         let mut token =
             make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
-        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
+        self.configure_loop_token_for_driver(
+            Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
+            green_key,
+            driver_descriptor.as_ref(),
+        );
+        // `compile.py:180-181` wref wiring — done inside
+        // `record_loop_or_bridge` once all `Arc::get_mut` writes settle.
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.backend
-                .compile_loop(&inputargs, &combined_ops, &mut token)
+            self.backend.compile_loop(
+                &inputargs,
+                &combined_ops,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
         }));
         let compile_result = match compile_result {
             Ok(r) => r,
@@ -4931,7 +5010,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         match compile_result {
             Ok(_) => {
-                self.assign_guard_hashes(&token);
+                self.assign_guard_hashes(token.as_ref());
                 // `compile.py:237` / `compile.py:289` — every TargetToken
                 // whose LABEL or JUMP appears in `combined_ops` carries
                 // `original_jitcell_token = jitcell_token`.  In the retrace
@@ -4951,8 +5030,9 @@ impl<M: Clone> MetaInterp<M> {
                 for target_token in &unroll_opt.target_tokens {
                     target_token.set_original_jitcell_token_number(token_num);
                 }
+                self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &combined_ops);
+                self.record_loop_or_bridge(&token, &combined_ops, trace_id);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -4973,16 +5053,23 @@ impl<M: Clone> MetaInterp<M> {
                     &combined_ops,
                     &compiled_constant_types,
                 );
-                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                if let Some(backend_layouts) =
+                    self.backend.compiled_fail_descr_layouts(token.as_ref())
+                {
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
-                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                if let Some(backend_layouts) =
+                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
+                {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
                         &backend_layouts,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let mut resume_data = resume_data;
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
@@ -4993,13 +5080,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_backend_guard_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut exit_layouts,
                 );
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
@@ -5029,14 +5116,11 @@ impl<M: Clone> MetaInterp<M> {
                     // Cranelift workaround (no RPython counterpart): copy
                     // bridges from old token to new, since Cranelift cannot
                     // patch machine code in-place. No-op for dynasm.
-                    self.backend.migrate_bridges(&old_entry.token, &token);
+                    self.backend
+                        .migrate_bridges(&old_entry.token, token.as_ref());
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
-                    previous_tokens.push(old_entry.token);
-                    previous_tokens.extend(old_entry.previous_tokens);
-                    for (tid, ct) in old_entry.traces {
-                        traces.entry(tid).or_insert(ct);
-                    }
+                    previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::majit_log_enabled() {
                     eprintln!("[jit][compiled_loops.insert] green_key={green_key}",);
@@ -5044,7 +5128,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
-                        token: std::sync::Arc::new(token),
+                        token: Arc::clone(&token),
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens: if unroll_opt.target_tokens.is_empty() {
@@ -5060,14 +5144,7 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
-                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
-                self.register_compiled_token_for_keepalive(green_key);
-                // PRE-EXISTING-ADAPTATION: see compile_loop site for the
-                // RPython citation and convergence path. Retrace path
-                // mirrors `pyjitpl.py:3171-3174 attach_procedure_to_interp`.
-                // Slice 5.2 PROBE: see make_attach_token_for_probe doc.
-                let attach_token = self.make_attach_token_for_probe(green_key);
-                self.attach_procedure_with_redirect(green_key, attach_token);
+                self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
 
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -5366,7 +5443,13 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
         let mut token =
             make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
-        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
+        self.configure_loop_token_for_driver(
+            Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
+            green_key,
+            driver_descriptor.as_ref(),
+        );
+        // `compile.py:180-181` wref wiring — done inside
+        // `record_loop_or_bridge` once all `Arc::get_mut` writes settle.
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -5429,14 +5512,17 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        match self
-            .backend
-            .compile_loop(&inputargs, &optimized_ops, &mut token)
-        {
+        match self.backend.compile_loop(
+            &inputargs,
+            &optimized_ops,
+            Arc::get_mut(&mut token)
+                .expect("JitCellToken must stay uniquely owned until backend compile"),
+        ) {
             Ok(_) => {
-                self.assign_guard_hashes(&token);
+                self.assign_guard_hashes(token.as_ref());
+                self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &optimized_ops);
+                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -5450,16 +5536,23 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     &compiled_constant_types,
                 );
-                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                if let Some(backend_layouts) =
+                    self.backend.compiled_fail_descr_layouts(token.as_ref())
+                {
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
-                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                if let Some(backend_layouts) =
+                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
+                {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
                         &backend_layouts,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let mut resume_data = resume_data;
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
@@ -5470,13 +5563,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_backend_guard_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut exit_layouts,
                 );
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
@@ -5516,16 +5609,13 @@ impl<M: Clone> MetaInterp<M> {
                         // high-water so previously stored bridges' OpRefs stay
                         // disjoint from any future bridge.
                         next_global_opref = next_global_opref.max(old_entry.next_global_opref);
-                        previous_tokens.push(old_entry.token);
-                        previous_tokens.extend(old_entry.previous_tokens);
-                        for (tid, ct) in old_entry.traces {
-                            traces.entry(tid).or_insert(ct);
-                        }
+                        previous_tokens =
+                            self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
                     self.compiled_loops.insert(
                         green_key,
                         CompiledEntry {
-                            token: std::sync::Arc::new(token),
+                            token: Arc::clone(&token),
                             num_inputs: inputargs.len(),
                             meta,
                             front_target_tokens: ft,
@@ -5536,15 +5626,8 @@ impl<M: Clone> MetaInterp<M> {
                             next_global_opref,
                         },
                     );
-                    // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
-                    self.register_compiled_token_for_keepalive(green_key);
                 }
-                // PRE-EXISTING-ADAPTATION: see compile_loop site for the
-                // RPython citation and convergence path. finish_and_compile
-                // mirrors `pyjitpl.py:3171-3174 attach_procedure_to_interp`.
-                // Slice 5.2 PROBE: see make_attach_token_for_probe doc.
-                let attach_token = self.make_attach_token_for_probe(green_key);
-                self.attach_procedure_with_redirect(green_key, attach_token);
+                self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -5707,7 +5790,13 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
         let mut token =
             make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
-        self.configure_loop_token_for_driver(&mut token, green_key, driver_descriptor.as_ref());
+        self.configure_loop_token_for_driver(
+            Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
+            green_key,
+            driver_descriptor.as_ref(),
+        );
+        // `compile.py:180-181` wref wiring — done inside
+        // `record_loop_or_bridge` once all `Arc::get_mut` writes settle.
         let trace_id = self.alloc_trace_id();
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(green_key);
@@ -5760,14 +5849,17 @@ impl<M: Clone> MetaInterp<M> {
         // handle VStr/VUni at the backend layer (dynasm) get a no-op.
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
-        match self
-            .backend
-            .compile_loop(&inputargs, &compiled_ops, &mut token)
-        {
+        match self.backend.compile_loop(
+            &inputargs,
+            &compiled_ops,
+            Arc::get_mut(&mut token)
+                .expect("JitCellToken must stay uniquely owned until backend compile"),
+        ) {
             Ok(_) => {
-                self.assign_guard_hashes(&token);
+                self.assign_guard_hashes(token.as_ref());
+                self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &compiled_ops);
+                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -5781,16 +5873,23 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_ops,
                     &compiled_constant_types,
                 );
-                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                if let Some(backend_layouts) =
+                    self.backend.compiled_fail_descr_layouts(token.as_ref())
+                {
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
-                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                if let Some(backend_layouts) =
+                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
+                {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
                         &backend_layouts,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let mut resume_data = resume_data;
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
@@ -5801,13 +5900,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_backend_guard_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut exit_layouts,
                 );
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
@@ -5833,16 +5932,12 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(old_entry) = self.compiled_loops.remove(&green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
-                    previous_tokens.push(old_entry.token);
-                    previous_tokens.extend(old_entry.previous_tokens);
-                    for (tid, ct) in old_entry.traces {
-                        traces.entry(tid).or_insert(ct);
-                    }
+                    previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
-                        token: std::sync::Arc::new(token),
+                        token: Arc::clone(&token),
                         num_inputs: inputargs.len(),
                         meta,
                         front_target_tokens: vec![target_token],
@@ -5853,8 +5948,6 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
-                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
-                self.register_compiled_token_for_keepalive(green_key);
                 self.stats.loops_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
@@ -6045,7 +6138,7 @@ impl<M: Clone> MetaInterp<M> {
         Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
-        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
+        let trace_id = result.trace_id;
 
         let trace_layout =
             Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
@@ -6159,7 +6252,7 @@ impl<M: Clone> MetaInterp<M> {
         Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
-        let trace_id = Self::normalize_trace_id(compiled, result.trace_id);
+        let trace_id = result.trace_id;
 
         let trace_layout =
             Self::trace_for_exit(compiled, trace_id).and_then(|(trace_id, trace)| {
@@ -6278,7 +6371,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let descr = self.backend.get_latest_descr(&frame);
         let fail_index = descr.fail_index();
-        let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
+        let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = descr.fail_arg_types().to_vec();
@@ -6290,11 +6383,17 @@ impl<M: Clone> MetaInterp<M> {
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
-        // compile.py:186 `descr.rd_loop_token` — owning loop's green_key,
-        // stamped at compile time. Used to resolve guard exits that belong
-        // to a loop other than the one currently executing (bridge-into-B
-        // while running A). O(1) replacement for `trace_for_exit_any` scan.
-        let rd_loop_token = descr.rd_loop_token();
+        // compile.py:186 `descr.rd_loop_token` — owning loop's clt,
+        // stamped at compile time.  Walk the chain
+        // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
+        // recover the owning `Arc<JitCellToken>` (pyjitpl.py:2897
+        // `resumedescr.rd_loop_token.loop_token_wref()`) for guard
+        // exits that belong to a loop other than the one currently
+        // executing (bridge-into-B while running A).  Derive
+        // `green_key` from `jct.green_key` so identity is preserved
+        // through the lookup. O(1) replacement for the legacy O(N)
+        // scan over `compiled_loops`.
+        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key);
         Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
@@ -6303,14 +6402,14 @@ impl<M: Clone> MetaInterp<M> {
 
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
-        let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
-            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-            .or_else(|| self.trace_for_exit_any(trace_id))
-            .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
-            })
-            .unwrap_or_else(|| CompiledExitLayout {
+        // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
+        // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
+        // and `fail_index == u32::MAX`; they carry no per-trace exit
+        // metadata. Skip the trace lookup entirely and synthesize the
+        // default layout, mirroring RPython where FINISH descrs are
+        // dispatched on identity rather than trace-keyed lookup.
+        let mut exit_layout = if is_finish {
+            CompiledExitLayout {
                 rd_loop_token: green_key,
                 trace_id,
                 fail_index,
@@ -6322,7 +6421,33 @@ impl<M: Clone> MetaInterp<M> {
                 recovery_layout: None,
                 resume_layout: None,
                 storage: None,
-            });
+            }
+        } else {
+            Self::trace_for_exit(compiled, trace_id)
+                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+                .and_then(|(owning_key, resolved_id, trace)| {
+                    Self::compiled_exit_layout_from_trace(
+                        trace,
+                        owning_key,
+                        resolved_id,
+                        fail_index,
+                    )
+                })
+                .unwrap_or_else(|| CompiledExitLayout {
+                    rd_loop_token: green_key,
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    exit_types: exit_types.clone(),
+                    is_finish,
+                    gc_ref_slots,
+                    force_token_slots,
+                    recovery_layout: None,
+                    resume_layout: None,
+                    storage: None,
+                })
+        };
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
         // extend exit_layout.exit_types to match (conservative Int for extras).
@@ -6399,7 +6524,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let descr = self.backend.get_latest_descr(&frame);
         let fail_index = descr.fail_index();
-        let trace_id = Self::normalize_trace_id(compiled, descr.trace_id());
+        let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = descr.fail_arg_types().to_vec();
@@ -6412,7 +6537,7 @@ impl<M: Clone> MetaInterp<M> {
         let status = descr.get_status();
         let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
-        let rd_loop_token = descr.rd_loop_token();
+        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key);
         Self::finish_compiled_run_io();
 
         // RPython: guard failure counter tick and bridge compilation happen
@@ -6424,26 +6549,49 @@ impl<M: Clone> MetaInterp<M> {
 
         let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
-        let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
-            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-            .or_else(|| self.trace_for_exit_any(trace_id))
-            .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
-            })
-            .unwrap_or_else(|| CompiledExitLayout {
+        // FINISH descrs (singletons) have `trace_id == 0`; skip the
+        // trace lookup and synthesize the default layout per
+        // `run_compiled_detailed`.
+        let mut exit_layout = if is_finish {
+            CompiledExitLayout {
                 rd_loop_token: green_key,
                 trace_id,
                 fail_index,
                 source_op_index: None,
                 exit_types: exit_types.clone(),
                 is_finish,
-                gc_ref_slots,
-                force_token_slots,
+                gc_ref_slots: gc_ref_slots.clone(),
+                force_token_slots: force_token_slots.clone(),
                 recovery_layout: None,
                 resume_layout: None,
                 storage: None,
-            });
+            }
+        } else {
+            Self::trace_for_exit(compiled, trace_id)
+                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+                .and_then(|(owning_key, resolved_id, trace)| {
+                    Self::compiled_exit_layout_from_trace(
+                        trace,
+                        owning_key,
+                        resolved_id,
+                        fail_index,
+                    )
+                })
+                .unwrap_or_else(|| CompiledExitLayout {
+                    rd_loop_token: green_key,
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    exit_types: exit_types.clone(),
+                    is_finish,
+                    gc_ref_slots,
+                    force_token_slots,
+                    recovery_layout: None,
+                    resume_layout: None,
+                    storage: None,
+                })
+        };
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
         // extend exit_layout.exit_types to match (conservative Int for extras).
@@ -6524,12 +6672,12 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         resume_data: ResumeData,
     ) {
+        // pyjitpl.py: `attach_resume_data_to_trace` callers always pass
+        // the real allocated trace_id; `alloc_trace_id` starts at 1, so
+        // `trace_id == 0` would be a sentinel-misuse bug, not a valid
+        // input.  RPython has no `0 → root_trace_id` fallback because
+        // it dispatches by descr object identity, not numeric trace id.
         let Some((trace_id, trace_info)) = self.compiled_loops.get(&green_key).map(|compiled| {
-            let trace_id = if trace_id == 0 {
-                compiled.root_trace_id
-            } else {
-                trace_id
-            };
             (
                 trace_id,
                 self.backend.compiled_trace_info(&compiled.token, trace_id),
@@ -6639,10 +6787,17 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<CompiledExitLayout> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-        Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index).or_else(
-            || self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index),
-        )
+        if let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id) {
+            if let Some(layout) = Self::compiled_exit_layout_from_trace(
+                trace,
+                green_key,
+                resolved_trace_id,
+                fail_index,
+            ) {
+                return Some(layout);
+            }
+        }
+        self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
     }
 
     /// Get the full static layout for a terminal FINISH/JUMP op in the root trace.
@@ -6713,32 +6868,6 @@ impl<M: Clone> MetaInterp<M> {
         crate::stack_almost_full()
     }
 
-    /// `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`
-    /// — register the freshly-compiled token with the memory manager
-    /// so its `generation` is current and the Arc is held by
-    /// `alive_loops`.
-    ///
-    /// RPython runs this at the tail of `send_loop_to_backend`, which
-    /// happens before `record_loop_or_bridge` and gives that walker
-    /// the `compile.py:178-179 generation > 0` invariant.  Pyre stores
-    /// the token Arc in `compiled_loops[green_key]` first and walks
-    /// `record_loop_or_bridge` BEFORE `compiled_loops.insert` (using
-    /// the still-mutable `&JitCellToken`), so the registration is
-    /// done here right after the insert.  The `generation > 0`
-    /// invariant therefore holds for the *next* compile's walker run
-    /// and for runtime keep-alive ticks, but not yet at the
-    /// just-finished compile's walker — see the docstring at
-    /// `record_loop_or_bridge` for the convergence path (Slice X-F).
-    fn register_compiled_token_for_keepalive(&mut self, green_key: u64) {
-        let token_arc = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|e| std::sync::Arc::clone(&e.token));
-        if let Some(arc) = token_arc {
-            self.warm_state.memory_manager.keep_loop_alive(&arc);
-        }
-    }
-
     /// pyjitpl.py:2345-2348: try_to_free_some_loops — advance the
     /// memory manager's generation counter.  Old loops not accessed
     /// for max_age generations are removed from `alive_loops`.
@@ -6772,6 +6901,11 @@ impl<M: Clone> MetaInterp<M> {
                 continue;
             };
             if std::sync::Arc::ptr_eq(&entry.token, &token) {
+                // Current eviction is the `LoopToken.__del__` analog
+                // (memmgr.py:73): the whole green_key's loop disappears,
+                // including every previous-token predecessor on the
+                // entry (the merged `traces` map and the
+                // previous_tokens Vec drop together).
                 self.compiled_loops.remove(&gk);
                 if crate::majit_log_enabled() {
                     eprintln!("[jit][memmgr] evicted current loop key={}", gk);
@@ -6794,53 +6928,9 @@ impl<M: Clone> MetaInterp<M> {
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return 0;
         };
-        self.bridge_fail_descr_proxy(compiled, trace_id, fail_index)
-            .map(|p| p.fail_arg_types.len())
+        self.bridge_source_descr(compiled, trace_id, fail_index)
+            .and_then(|d| d.as_fail_descr().map(|fd| fd.fail_arg_types().len()))
             .unwrap_or(0)
-    }
-
-    /// Task #195 Slice 5.2 PROBE.
-    ///
-    /// Under `MAJIT_PROBE_REDIRECT_IDENTITY=1` returns the actual
-    /// compiled `Arc<JitCellToken>` already in `compiled_loops` so
-    /// `attach_procedure_to_interp` can route the same object that
-    /// `compile_loop` produced — RPython parity per
-    /// `warmstate.py:339-348` + `compile.py:266` / `:1019`.  The
-    /// resulting `cell.loop_token` then shares Arc identity with
-    /// `compiled_loops[green_key].token`, which is the upstream
-    /// invariant that drives `redirect_call_assembler` /
-    /// `record_jump_to` correctness.
-    ///
-    /// Default (PROBE off) returns a fresh `Arc<JitCellToken>`
-    /// wrapping an uncompiled install_token — the pre-Slice-5.3
-    /// PRE-EXISTING-ADAPTATION (see commit a2b3cd36b9f and the
-    /// PRE-EXISTING-ADAPTATION comments at the four attach sites).
-    /// Slice 5.3 will flip the default ON after the PROBE regression
-    /// is root-caused.
-    ///
-    /// Empirical PROBE state (re-measured 2026-05-01 against eval2-on-main
-    /// HEAD `26606bef27b`):  with PROBE on, `nbody` produces *wrong
-    /// output* on **both** backends (dynasm + cranelift), while the
-    /// other 13 check.py benchmarks pass.  Cranelift's
-    /// `redirect_call_assembler_target` is a thread-cache invalidate +
-    /// target lookup with no byte-patch surface, so the asymmetry
-    /// between the install-token sentinel `JitCellToken.number` and
-    /// the compiled token's number must be load-bearing in a layer
-    /// above the dynasm fast-path.  Convergence therefore requires
-    /// auditing every consumer of `cell.loop_token.number` /
-    /// `JitCellToken.number` (warmstate dispatch, blackhole exit,
-    /// `compiled_fail_descr_layouts` indexing, runtime descr
-    /// classifier) for a hidden assumption that those numbers are
-    /// distinct, then either fixing or removing the assumption.
-    /// Task #213 covers the audit.
-    fn make_attach_token_for_probe(&mut self, green_key: u64) -> std::sync::Arc<JitCellToken> {
-        if std::env::var_os("MAJIT_PROBE_REDIRECT_IDENTITY").is_some() {
-            if let Some(c) = self.compiled_loops.get(&green_key) {
-                return std::sync::Arc::clone(&c.token);
-            }
-        }
-        let install_num = self.warm_state.alloc_token_number();
-        std::sync::Arc::new(JitCellToken::new(install_num))
     }
 
     /// `warmstate.py:339-348 attach_procedure_to_interp` parity.
@@ -6861,16 +6951,9 @@ impl<M: Clone> MetaInterp<M> {
     /// chain runs here, where `MetaInterp` owns both the warm-state
     /// cell map and the backend.
     ///
-    /// PRE-EXISTING-ADAPTATION: under the install-token sentinel
-    /// model (`make_attach_token_for_probe` PROBE off default),
-    /// both `old_token` and the new `attach_token` carry
-    /// `compiled = None`, so the redirect is a no-op on every
-    /// backend.  The `compiled.is_some()` guard skips the chain in
-    /// that case, since neither `redirect_call_assembler` nor
-    /// `record_jump_to` is meaningful for sentinel Arcs.  When
-    /// Slice X-F (Task #211) lands the actual compiled Arc into
-    /// every attach site, the guard becomes a no-op and the chain
-    /// fires per upstream.
+    /// The compile paths pass the actual compiled `Arc<JitCellToken>`,
+    /// so `cell.loop_token` shares identity with the token registered in
+    /// `MemoryManager`, matching upstream's single-object flow.
     pub fn attach_procedure_with_redirect(
         &mut self,
         green_key: u64,
@@ -6880,18 +6963,21 @@ impl<M: Clone> MetaInterp<M> {
             .warm_state
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token));
         if let Some(old_token) = old_token {
-            // `warmstate.py:343 if old_token is not None:` — both
-            // tokens must own real compiled code for the redirect
-            // chain to mean anything.  See PRE-EXISTING-ADAPTATION
-            // note in the doc above.
-            if old_token.compiled.is_some() && attach_token.compiled.is_some() {
-                // `warmstate.py:344` `cpu.redirect_call_assembler(old, new)`.
-                let _ = self
-                    .backend
-                    .redirect_call_assembler(&old_token, &attach_token);
-                // `warmstate.py:347` `old_token.record_jump_to(procedure_token)`.
-                old_token.record_jump_to(attach_token);
-            }
+            // `warmstate.py:343-347` line-by-line: when an `old_token`
+            // is present, redirect + record_jump_to run unconditionally.
+            // Upstream guarantees both tokens own real compiled code at
+            // this point — the public attach paths (`compile_loop`,
+            // `compile_simple_loop_or_bridge`, bridge-finish) only call
+            // here after `backend.compile_loop` has stamped the new
+            // token, and the old token retained its compiled blob from
+            // the previous attach.
+            //
+            // `warmstate.py:344` `cpu.redirect_call_assembler(old, new)`.
+            let _ = self
+                .backend
+                .redirect_call_assembler(&old_token, &attach_token);
+            // `warmstate.py:347` `old_token.record_jump_to(procedure_token)`.
+            old_token.record_jump_to(attach_token);
         }
     }
 
@@ -7019,8 +7105,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `loop.operations` from `compile.py:183`) and triages each op's
     /// descr by upstream type:
     ///
-    /// 1. `compile.py:185-186 ResumeDescr` — store back-pointer to the
-    ///    owning `CompiledLoopToken`.
+    /// 1. `compile.py:185-186 ResumeDescr` — `descr.rd_loop_token = clt`.
     /// 2. `compile.py:187-191 JitCellToken` (CALL_ASSEMBLER) — record
     ///    keepalive on `original` and clear the descr reference.
     /// 3. `compile.py:192-203 TargetToken` (JUMP) — walk to the target's
@@ -7029,51 +7114,129 @@ impl<M: Clone> MetaInterp<M> {
     /// Each branch below cites its upstream line and, where pyre cannot
     /// yet match RPython 1:1, names a PRE-EXISTING-ADAPTATION with the
     /// blocker that gates convergence.
-    fn record_loop_or_bridge(&self, original: &JitCellToken, ops: &[majit_ir::Op]) {
+    fn record_loop_or_bridge(
+        &self,
+        original: &Arc<JitCellToken>,
+        ops: &[majit_ir::Op],
+        trace_id: u64,
+    ) {
         // `compile.py:178-179` `assert original_jitcell_token.generation > 0`.
-        //
-        // PRE-EXISTING-ADAPTATION: pyre calls `MemoryManager.keep_loop_alive`
-        // at *runtime* (`jitdriver.rs:2657`, after a compiled loop finishes
-        // executing), not at compile time inside `send_loop_to_backend`
-        // (`compile.py:567`). The token's `generation` is therefore still 0
-        // when this walker runs. Convergence requires moving
-        // `keep_loop_alive` to the compile-time path, which is part of
-        // Slice X-F (Task #211) — the `attach_procedure_to_interp` rewrite.
+        debug_assert!(
+            original.generation.get() > 0,
+            "compile.py:179 — token must be registered with memmgr before record_loop_or_bridge"
+        );
         //
         // `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
-        // clt.loop_token_wref = wref`.
-        //
-        // PRE-EXISTING-ADAPTATION: requires `Arc<JitCellToken>` (so we can
-        // `Arc::downgrade`) at every call site; the loop-compile sites
-        // (3961 etc.) currently pass a bare `&JitCellToken` from a local
-        // `JitCellToken::new(...)` that is wrapped in `Arc::new` only
-        // afterwards (line 4059). Lifting the wrap earlier requires Slice
-        // X-F (Task #211) which routes the production Arc through
-        // `attach_procedure_to_interp` from creation. The two consumers
-        // (`compile.py:726` bridge force-segmenting flag check,
-        // `pyjitpl.py:2897` `resumekey_original_loop_token` graceful
-        // give-up) also need separate ports.
+        // clt.loop_token_wref = wref`. Issue 3.3 Phase A line-by-line.
+        // Wire the weak back-reference now that all `Arc::get_mut(&mut
+        // token)` writes have settled (the walker runs after
+        // `backend.compile_loop`).
+        if let Some(clt) = original.compiled_loop_token.as_ref() {
+            clt.set_loop_token_wref(Arc::downgrade(original));
+        }
         //
         // `compile.py:183` `for op in loop.operations`.
-        for op in ops {
+        for (op_idx, op) in ops.iter().enumerate() {
             let Some(descr) = op.descr.as_ref() else {
                 // `compile.py:184 descr = op.getdescr()` returns `None`
                 // for ops without a descr; the subsequent `isinstance`
                 // checks all fail.
                 continue;
             };
+            // Phase E op.descr Arc-survival probe: log strong_count
+            // for resume guards at the metainterp walker. Compares
+            // against backend stamp-site count to determine whether
+            // op.descr survives past `backend.compile_loop` drop.
+            // `compile.py:185-186` line-by-line port:
+            // ```python
+            // if isinstance(descr, ResumeDescr):
+            //     descr.rd_loop_token = clt   # stick it there
+            // ```
+            // The metainterp-side ResumeGuardDescr (this `descr`, carried
+            // on `op.descr` in the IR) is the canonical RPython location
+            // of `rd_loop_token`. Phase A/B previously stamped only the
+            // backend descr because `cpu.get_latest_descr()` returns the
+            // backend object; with Phase E foundation in place
+            // (E.1 backend_data slot, E.2/E.5 backend stamp on op.descr,
+            // E.3-prereq keepalive) the same stamp now also lands on the
+            // metainterp descr — closing the deviation called out in
+            // mod.rs:632/729 audit.
+            //
+            // Also push the metainterp ResumeGuardDescr Arc onto the
+            // JitCellToken keepalive so it outlives the IR Loop drop
+            // (~29% of guards reach refcount 0 otherwise per the
+            // MAJIT_PROBE_OP_DESCR_ALIVE measurement).
+            // compile.py:185 `if isinstance(descr, ResumeDescr): ...` —
+            // ResumeDescr is the union of `ResumeGuardDescr`-family + the
+            // `ResumeGuardCopiedDescr` sibling (compile.py:832).  Pyre
+            // mirrors the check via the `is_resume_guard()` /
+            // `is_resume_guard_copied()` predicate pair on the FailDescr
+            // trait; including both keeps the stamp aligned with the 7
+            // metainterp descrs that override `set_rd_loop_token_clt`
+            // (mod.rs:632 audit).
+            if descr.is_resume_guard() || descr.is_resume_guard_copied() {
+                let probe_before = if std::env::var_os("MAJIT_PROBE_OP_DESCR_ALIVE").is_some() {
+                    Some((
+                        std::sync::Arc::strong_count(descr),
+                        std::sync::Arc::weak_count(descr),
+                    ))
+                } else {
+                    None
+                };
+                // Pyre-only owning-trace stamp.  RPython resolves descr
+                // identity by `id(descr)` (`history.py:125`); pyre's
+                // runtime exit paths look up by `(trace_id, fail_index)`,
+                // so the owning trace_id is captured on the descr itself
+                // and read directly via `descr.trace_id()`.
+                descr
+                    .as_fail_descr()
+                    .expect(
+                        "compile.py:185 isinstance(descr, ResumeDescr) — \
+                         every ResumeDescr-family descr is a FailDescr",
+                    )
+                    .set_trace_id(trace_id);
+                if let Some(clt) = original.compiled_loop_token.as_ref() {
+                    let cloned = std::sync::Arc::clone(clt);
+                    let any_arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = cloned;
+                    descr
+                        .as_fail_descr()
+                        .expect(
+                            "compile.py:185 isinstance(descr, ResumeDescr) — \
+                                 every ResumeDescr-family descr is a FailDescr",
+                        )
+                        .set_rd_loop_token_clt(any_arc);
+                }
+                if let Some((sc_before, wc_before)) = probe_before {
+                    let sc_after = std::sync::Arc::strong_count(descr);
+                    let wc_after = std::sync::Arc::weak_count(descr);
+                    eprintln!(
+                        "[probe op_descr] metainterp/walker op_idx={} fail_index={:?} strong={}->{} weak={}->{}",
+                        op_idx,
+                        descr.as_fail_descr().map(|fd| fd.fail_index()),
+                        sc_before,
+                        sc_after,
+                        wc_before,
+                        wc_after,
+                    );
+                }
+            }
 
             // `compile.py:185-186` `if isinstance(descr, ResumeDescr):
             // descr.rd_loop_token = clt`.
             //
-            // PRE-EXISTING-ADAPTATION: pyre's `ResumeGuardDescr.rd_loop_token`
-            // is `u64` (the green key) assigned at descr construction
-            // (`compile.rs:1372`), not a `Weak<CompiledLoopToken>` patched
-            // here. Convergence requires lifting `rd_loop_token` to a
-            // weak handle on the owning `CompiledLoopToken`, with the
-            // resume readers (`resume.rs`, blackhole resume,
-            // `pyjitpl.py:2897` reader) updated to dereference the weak
-            // ref (the consumer of `loop_token_wref` above).
+            // PRE-EXISTING-ADAPTATION (deep epic Phase E): the `descr`
+            // here is the metainterp-side `ResumeGuardDescr` attached to
+            // the IR op (`op.descr`).  At runtime,
+            // `cpu.get_latest_descr()` returns the BACKEND descr
+            // (`DynasmFailDescr` / `CraneliftFailDescr`) — a separate
+            // object built fresh during backend compile.  RPython has a
+            // single descr object per fail, so `compile.py:186` patches
+            // the same object `cpu.get_latest_descr()` will return.
+            // Pyre therefore stamps the backend descr post-compile
+            // (`runner.rs::compile_loop` / `compiler.rs::compile_loop`)
+            // gated on `is_resume_guard()`.  Convergence requires
+            // unifying the IR-side and backend-side descrs into a single
+            // object (multi-session epic).
 
             // `compile.py:187-191` `if isinstance(descr, JitCellToken)`.
             //
@@ -7292,18 +7455,6 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.keys().copied().collect()
     }
 
-    /// Check whether `trace_id` belongs to a bridge (not a root trace).
-    pub fn is_bridge_trace_id(&self, trace_id: u64) -> bool {
-        // A trace_id is a bridge if it doesn't match any compiled loop's root_trace_id.
-        if trace_id == 0 {
-            return false;
-        }
-        !self
-            .compiled_loops
-            .values()
-            .any(|entry| entry.root_trace_id == trace_id)
-    }
-
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
     /// result_type == INT.
     pub fn has_raw_int_finish(&self) -> bool {
@@ -7385,14 +7536,9 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// The Arc source is the freshly-executed compiled `JitCellToken`
     /// from `compiled_loops[green_key].token` (`warmstate.py:398` —
-    /// `loop_token` is the token that just ran).  Reading
-    /// `cell.loop_token` instead would currently observe the
-    /// install-token sentinel produced by `make_attach_token_for_probe`
-    /// (PROBE off default), whose `green_key` is 0 and whose
-    /// `compiled` is None — that breaks both `next_generation`
-    /// eviction (`memmgr.rs:228 evict by token.green_key` →
-    /// `compiled_loops.remove(&0)` is a no-op) and
-    /// `compile.py:567 send_loop_to_backend` keepalive semantics.
+    /// `loop_token` is the token that just ran).  The warm cell is also
+    /// attached to this Arc after compile, but `compiled_loops` remains
+    /// the direct owner for the currently executable token.
     /// Cells with no compiled entry (key not yet compiled, or
     /// already evicted) silently no-op — RPython's
     /// `keep_loop_alive` is likewise gated by
@@ -7429,15 +7575,12 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py:826-830 store_hash for bridge guards.
     fn assign_bridge_guard_hashes(
         &mut self,
-        green_key: u64,
+        source_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
     ) {
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return;
-        };
         let layouts = self.backend.compiled_bridge_fail_descr_layouts(
-            &compiled.token,
+            source_token,
             source_trace_id,
             source_fail_index,
         );
@@ -7452,11 +7595,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
             })
             .collect();
-        let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return;
-        };
         self.backend.store_bridge_guard_hashes(
-            &compiled.token,
+            source_token,
             source_trace_id,
             source_fail_index,
             &hashes,
@@ -7474,7 +7614,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<(u64, usize)> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let tid = Self::normalize_trace_id(compiled, trace_id);
+        let tid = trace_id;
         let (s, a) = self
             .backend
             .get_guard_status(&compiled.token, tid, fail_index);
@@ -7505,13 +7645,13 @@ impl<M: Clone> MetaInterp<M> {
     /// Find the compiled_loops key that owns a given trace_id.
     fn find_owning_key(&self, green_key: u64, trace_id: u64) -> u64 {
         if let Some(compiled) = self.compiled_loops.get(&green_key) {
-            let tid = Self::normalize_trace_id(compiled, trace_id);
+            let tid = trace_id;
             if compiled.traces.contains_key(&tid) {
                 return green_key;
             }
         }
         for (&key, compiled) in &self.compiled_loops {
-            let tid = Self::normalize_trace_id(compiled, trace_id);
+            let tid = trace_id;
             if compiled.traces.contains_key(&tid) {
                 return key;
             }
@@ -7519,52 +7659,72 @@ impl<M: Clone> MetaInterp<M> {
         green_key
     }
 
-    pub(crate) fn bridge_fail_descr_proxy(
+    /// Resolve the source ResumeGuardDescr Arc the optimizer stamped onto
+    /// the originating guard op (`op.descr`).  Returns the metainterp
+    /// `Arc<dyn Descr>` directly: after Sessions 6.5/6.6 stamped
+    /// `trace_id` and `fail_index_per_trace` onto the descr itself,
+    /// callers no longer need a `(trace_id, fail_index)` capturing
+    /// proxy — they consume the Arc and reach the per-trace key via
+    /// `descr.as_fail_descr()?.fail_index_per_trace()`.  RPython parity:
+    /// `cpu.get_latest_descr()` returns the same `ResumeGuardDescr` the
+    /// metainterp stamped (`history.py:125`); `op.getdescr()` /
+    /// `compile.py:184` is the equivalent path.
+    ///
+    /// Synthetic / FINISH exits without a `guard_op_indices` entry
+    /// legitimately produce `None`; the strict
+    /// `compile.py:800 assert resumekey_original_loop_token is not None`
+    /// is enforced at `compile_bridge` entry instead.
+    pub(crate) fn bridge_source_descr(
         &self,
         compiled: &CompiledEntry<M>,
         trace_id: u64,
         fail_index: u32,
-    ) -> Option<compile::BridgeFailDescrProxy> {
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let exit_layout = Self::trace_for_exit(compiled, trace_id)
-            .and_then(|(_, trace_data)| trace_data.exit_layouts.get(&fail_index));
-        let backend_layout = self.backend_fail_descr_layout(compiled, trace_id, fail_index);
-        // compile.py:797-811 parity: bridge inputargs come from the guard's
-        // fail_arg_types AFTER store_final_boxes_in_guard (which may add
-        // virtual field boxes, changing the types list). The backend's
-        // fail_descr has the UPDATED types; exit_layout.exit_types may have
-        // the ORIGINAL MetaFailDescr types (before optimizer update).
-        // Prefer the backend's types when available.
-        let fail_arg_types = match (backend_layout.as_ref(), exit_layout) {
-            (Some(backend), Some(layout))
-                if backend.fail_arg_types.is_empty() && !layout.exit_types.is_empty() =>
-            {
-                layout.exit_types.clone()
+    ) -> Option<std::sync::Arc<dyn majit_ir::Descr>> {
+        // `compile.py:184` `op.getdescr()` — primary path: the metainterp
+        // ResumeGuardDescr Arc the optimizer stamped onto the originating
+        // guard op.  Under unified ResumeGuardDescr identity (PyPy parity)
+        // `cpu.get_latest_descr()` returns the same object (`history.py:125`).
+        if let Some(trace) = Self::trace_for_exit(compiled, trace_id).map(|(_, t)| t) {
+            if let Some(&idx) = trace.guard_op_indices.get(&fail_index) {
+                if let Some(op) = trace.ops.get(idx) {
+                    if let Some(descr) = op.descr.as_ref() {
+                        return Some(descr.clone());
+                    }
+                }
             }
-            (Some(backend), _) => backend.fail_arg_types.clone(),
-            (None, Some(layout)) => layout.exit_types.clone(),
-            (None, None) => return None,
-        };
-        let gc_ref_slots = backend_layout
-            .as_ref()
-            .map(|layout| layout.gc_ref_slots.clone())
-            .or_else(|| exit_layout.map(|layout| layout.gc_ref_slots.clone()))?;
-        let force_token_slots = backend_layout
-            .as_ref()
-            .map(|layout| layout.force_token_slots.clone())
-            .or_else(|| exit_layout.map(|layout| layout.force_token_slots.clone()))?;
-        let is_finish = backend_layout
-            .as_ref()
-            .map(|layout| layout.is_finish)
-            .or_else(|| exit_layout.map(|layout| layout.is_finish))?;
-        Some(compile::BridgeFailDescrProxy {
-            fail_index,
-            trace_id,
-            fail_arg_types,
-            gc_ref_slots,
-            force_token_slots,
-            is_finish,
-        })
+        }
+        // `warmspot.py:1022` `cpu.get_latest_descr(deadframe)` parity:
+        // when `op.descr` is unavailable (synthetic / cut-tentative ops,
+        // post-retrace stale traces) the backend still owns the live
+        // FailDescr Arc — it's the same identity pyre's runtime guard-
+        // failure helpers received as `descr_addr` and the same identity
+        // PyPy's deadframe carries.  Walk the current token first, then
+        // `previous_tokens` (matches `bridge_was_compiled`'s chain at
+        // mod.rs:7710).
+        //
+        // Empirically (epic #236 Slice E, 2026-05-05) this fallback
+        // fires zero times across nbody / fannkuch / fib_recursive /
+        // raise_catch_loop / spectral_norm × {dynasm, cranelift};
+        // current production benchmarks always carry a live `op.descr`
+        // at the lookup.  The fallback is kept as defensive RPython
+        // parity for the split-descr period — Phase E.3+ unification
+        // will eventually collapse both paths back to a single
+        // ResumeGuardDescr identity.
+        if let Some(descr) =
+            self.backend
+                .compiled_bridge_descr_arc(&compiled.token, trace_id, fail_index)
+        {
+            return Some(descr);
+        }
+        for prev_token in &compiled.previous_tokens {
+            if let Some(descr) = self
+                .backend
+                .compiled_bridge_descr_arc(prev_token, trace_id, fail_index)
+            {
+                return Some(descr);
+            }
+        }
+        None
     }
 
     /// Check whether a bridge was actually compiled and attached for a guard.
@@ -7650,19 +7810,18 @@ impl<M: Clone> MetaInterp<M> {
 }
 
 impl<M: Clone> MetaInterp<M> {
-    /// Obtain a FailDescr proxy for a guard identified by green_key,
-    /// trace_id, and fail_index. Used by call_assembler bridge callbacks
-    /// that need to pass a FailDescr to compile_bridge.
+    /// Obtain the source ResumeGuardDescr Arc for a guard identified by
+    /// green_key, trace_id, and fail_index. Used by call_assembler bridge
+    /// callbacks that need to pass a FailDescr to compile_bridge —
+    /// callers reach the FailDescr surface via `as_fail_descr()`.
     pub fn get_fail_descr_for_bridge(
         &self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-    ) -> Option<Box<dyn majit_ir::FailDescr>> {
+    ) -> Option<std::sync::Arc<dyn majit_ir::Descr>> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        Some(Box::new(
-            self.bridge_fail_descr_proxy(compiled, trace_id, fail_index)?,
-        ))
+        self.bridge_source_descr(compiled, trace_id, fail_index)
     }
 
     fn recovery_slot_types_from_exit_types_and_layout(
@@ -7696,16 +7855,8 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
     ) -> Option<Vec<Type>> {
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        if let Some(layout) = self.backend_fail_descr_layout(compiled, trace_id, fail_index) {
-            return Some(Self::recovery_slot_types_from_exit_types_and_layout(
-                &layout.fail_arg_types,
-                layout.recovery_layout.as_ref(),
-            ));
-        }
-        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
-        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
+        let exit_layout =
+            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
         Some(Self::recovery_slot_types_from_exit_types_and_layout(
             &exit_layout.exit_types,
             exit_layout.recovery_layout.as_ref(),
@@ -7752,7 +7903,6 @@ impl<M: Clone> MetaInterp<M> {
         // `get_rd_virtuals` and `get_resume_data_summary` see the
         // storage even when only the backend has it.
         let compiled = self.compiled_loops.get(&green_key)?;
-        let trace_id = Self::normalize_trace_id(compiled, trace_id);
         if let Some((_, trace_data)) = Self::trace_for_exit(compiled, trace_id) {
             if let Some(exit_layout) = trace_data.exit_layouts.get(&fail_index) {
                 if let Some(ref storage) = exit_layout.storage {
@@ -7979,13 +8129,21 @@ impl<M: Clone> MetaInterp<M> {
         self.backend.set_next_trace_id(trace_id);
         self.backend.set_next_header_pc(original_green_key);
 
-        let mut token = JitCellToken::new(self.warm_state.alloc_token_number());
-        token.green_key = original_green_key;
-        token.num_scalar_inputargs = self.num_scalar_inputargs;
+        let mut token = make_jitcell_token(self.warm_state.alloc_token_number(), None);
+        {
+            let token_mut =
+                Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned");
+            token_mut.green_key = original_green_key;
+            token_mut.num_scalar_inputargs = self.num_scalar_inputargs;
+        }
 
         let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.backend
-                .compile_loop(bridge_inputargs, &optimized_ops, &mut token)
+            self.backend.compile_loop(
+                bridge_inputargs,
+                &optimized_ops,
+                Arc::get_mut(&mut token)
+                    .expect("JitCellToken must stay uniquely owned until backend compile"),
+            )
         }));
         let compile_result = match compile_result {
             Ok(r) => r,
@@ -7994,9 +8152,10 @@ impl<M: Clone> MetaInterp<M> {
 
         match compile_result {
             Ok(_) => {
-                self.assign_guard_hashes(&token);
+                self.assign_guard_hashes(token.as_ref());
+                self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &optimized_ops);
+                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         bridge_inputargs,
@@ -8010,16 +8169,23 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     &compiled_constant_types,
                 );
-                if let Some(backend_layouts) = self.backend.compiled_fail_descr_layouts(&token) {
-                    compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts);
+                if let Some(backend_layouts) =
+                    self.backend.compiled_fail_descr_layouts(token.as_ref())
+                {
+                    compile::merge_backend_exit_layouts(
+                        &mut exit_layouts,
+                        backend_layouts.as_slice(),
+                    );
                 }
-                if let Some(backend_layouts) = self.backend.compiled_terminal_exit_layouts(&token) {
+                if let Some(backend_layouts) =
+                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
+                {
                     compile::merge_backend_terminal_exit_layouts(
                         &mut terminal_exit_layouts,
                         &backend_layouts,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(&token, trace_id);
+                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
                 let mut resume_data = resume_data;
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
@@ -8030,13 +8196,13 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_backend_guard_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut exit_layouts,
                 );
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
                     &mut self.backend,
-                    &token,
+                    token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
                 );
@@ -8083,17 +8249,15 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(old_entry) = self.compiled_loops.remove(&original_green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(old_entry.next_global_opref);
-                    self.backend.migrate_bridges(&old_entry.token, &token);
-                    previous_tokens.push(old_entry.token);
-                    previous_tokens.extend(old_entry.previous_tokens);
-                    for (tid, ct) in old_entry.traces {
-                        traces.entry(tid).or_insert(ct);
-                    }
+                    self.backend
+                        .migrate_bridges(&old_entry.token, token.as_ref());
+                    previous_tokens =
+                        self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
                 self.compiled_loops.insert(
                     original_green_key,
                     CompiledEntry {
-                        token: std::sync::Arc::new(token),
+                        token: Arc::clone(&token),
                         num_inputs: bridge_inputargs.len(),
                         meta,
                         front_target_tokens,
@@ -8104,15 +8268,7 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
-                // `compile.py:566-567` `keep_loop_alive(original_jitcell_token)`.
-                self.register_compiled_token_for_keepalive(original_green_key);
-                // PRE-EXISTING-ADAPTATION: see compile_loop site for the
-                // RPython citation and convergence path. Entry-bridge
-                // mirrors `compile.py:1019 ResumeFromInterpDescr.
-                // compile_and_attach`.
-                // Slice 5.2 PROBE: see make_attach_token_for_probe doc.
-                let attach_token = self.make_attach_token_for_probe(original_green_key);
-                self.attach_procedure_with_redirect(original_green_key, attach_token);
+                self.attach_procedure_with_redirect(original_green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(original_green_key, bridge_ops.len(), num_optimized_ops);
@@ -8153,6 +8309,38 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        // `pyjitpl.py:2897-2899` parity:
+        //   self.resumekey_original_loop_token =
+        //       resumedescr.rd_loop_token.loop_token_wref()
+        //   if self.resumekey_original_loop_token is None:
+        //       raise compile.giveup()  # should be rare
+        // `compile.giveup()` (`compile.py:27-29`) raises
+        // `SwitchToBlackhole(ABORT_BRIDGE)`, which RPython catches at
+        // `pyjitpl.py:2906-2907` and falls through to blackhole resume.
+        // Pyre's `compile_bridge` mirrors that abort by returning `false`;
+        // the caller (`compile_trace`) maps `false` to
+        // `CompileOutcome::Cancelled`, the same control-flow blackhole
+        // resume observes.  The weakref-dead path is "should be rare" per
+        // upstream, but structurally required — never panic.
+        let source_jct: Arc<JitCellToken> = match majit_backend::descr_owning_jct(fail_descr) {
+            Some(jct) => jct,
+            None => {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[jit] compile_bridge: rd_loop_token weakref dead → \
+                         compile.giveup() (pyjitpl.py:2898), key={} fail_index={}",
+                        green_key, fail_index,
+                    );
+                }
+                return false;
+            }
+        };
+        debug_assert_eq!(
+            source_jct.green_key, green_key,
+            "compile.py:801 — bridge source descr's rd_loop_token must match \
+             the caller-supplied green_key (origin_key from bridge_info)"
+        );
+
         // RPython unroll.py:183-236: Optimizer.optimize_bridge()
         // compile.py:1035-1038: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
@@ -8171,14 +8359,20 @@ impl<M: Clone> MetaInterp<M> {
             Option<PendingBridgeRd>,
         ) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
-            let source_trace_id = {
-                let tid = fail_descr.trace_id();
-                if tid == 0 {
-                    compiled.root_trace_id
-                } else {
-                    tid
-                }
-            };
+            // `fail_descr.trace_id()` is the bridge origin's allocated
+            // id (non-zero per `alloc_trace_id` starting at 1).  RPython
+            // reaches the same value through the resumekey object's
+            // identity (`compile.py:1049 self.resumekey.original_jitcell_token`);
+            // pyre carries it as a u64 stamped at backend compile time.
+            // No `0 → root_trace_id` sentinel — the bridge proxy's
+            // `trace_id` was sourced from `bridge_info().trace_id`
+            // (production) or `compiled_root_trace_id(green_key)` (tests),
+            // both of which only ever hold real allocated ids.
+            let source_trace_id = fail_descr.trace_id();
+            debug_assert_ne!(
+                source_trace_id, 0,
+                "compile_bridge expects bridge origin descr.trace_id() to be a real allocated id, not the FINISH-singleton sentinel"
+            );
             let pending = compiled.traces.get(&source_trace_id).and_then(|trace| {
                 let guard_op_idx = trace.guard_op_indices.get(&fail_index)?;
                 let guard_op = trace.ops.get(*guard_op_idx)?;
@@ -8299,6 +8493,7 @@ impl<M: Clone> MetaInterp<M> {
             eprintln!("inputargs: {:?}", bridge_inputargs);
             eprint!("{}", majit_ir::format_trace(bridge_ops, &constants));
         }
+        let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         // compile.py:1077-1078 parity: optimize_bridge may raise InvalidLoop
         // (e.g. rewrite.py:404-407 GUARD_CLASS proven to always fail).
         // RPython catches it via the abstract jitexc handler and discards
@@ -8417,7 +8612,13 @@ impl<M: Clone> MetaInterp<M> {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             // compile.py:701-717: bridge failure → blackhole resume.
             // Catch Cranelift panics to prevent crashing the process.
-            let token = &compiled.token;
+            // `compile.py:807-810 send_bridge_to_backend(...,
+            //  new_loop.original_jitcell_token, ...)` — the backend's
+            // `original_loop_token` is the *source descr's* owning JCT
+            // (= `metainterp.resumekey_original_loop_token`), not the
+            // current running loop's token.  Pass `source_jct` so backend
+            // stamping (`runner.rs:1670`, `compiler.rs:13352`) reaches the
+            // correct CLT for newly compiled bridge-internal guards.
             let previous_tokens = &compiled.previous_tokens;
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -8432,7 +8633,7 @@ impl<M: Clone> MetaInterp<M> {
                     fail_descr,
                     bridge_inputargs,
                     &optimized_ops,
-                    token,
+                    &source_jct,
                     previous_tokens,
                 )
             })) {
@@ -8466,40 +8667,31 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // compile.py:826-830 store_hash for bridge guards.
                 let source_trace_id = {
-                    let tid = fail_descr.trace_id();
-                    if tid == 0 {
-                        self.compiled_loops
-                            .get(&green_key)
-                            .map(|c| c.root_trace_id)
-                            .unwrap_or(tid)
-                    } else {
-                        tid
-                    }
+                    // pyjitpl.py:1049 — fail_descr.trace_id() is the
+                    // bridge origin's real allocated id (`alloc_trace_id`
+                    // starts at 1).  RPython reaches the same value via
+                    // the resumekey object's identity; no sentinel
+                    // fallback to root_trace_id.
+                    fail_descr.trace_id()
                 };
-                self.assign_bridge_guard_hashes(green_key, source_trace_id, fail_index);
-                // compile.py:213 record_loop_or_bridge — bridges share
-                // their original loop's token, so we record onto
-                // `compiled.token` rather than a fresh one. The walk needs
-                // `&self` (for `jitcell_token_by_number` fallback), so we
-                // clone the owning Arc here and run the walk *before* the
-                // following `get_mut` borrow scope.
-                if let Some(original_arc) = self
-                    .compiled_loops
-                    .get(&green_key)
-                    .map(|compiled| std::sync::Arc::clone(&compiled.token))
-                {
-                    self.record_loop_or_bridge(&original_arc, &optimized_ops);
-                }
+                self.assign_bridge_guard_hashes(source_jct.as_ref(), source_trace_id, fail_index);
+                // `compile.py:811 record_loop_or_bridge(metainterp_sd,
+                //  new_loop)` parity — `new_loop.original_jitcell_token =
+                //  metainterp.resumekey_original_loop_token` (compile.py:801).
+                // The walker stamps every internal `ResumeDescr.rd_loop_token
+                //  = clt(source_jct)` (compile.py:186), so the new
+                // bridge-internal guards inherit the *source* JCT identity
+                // (could be a previous_tokens entry on cross-loop or
+                // post-recompile failures), not the current running loop's
+                // latest token.
+                self.record_loop_or_bridge(&source_jct, &optimized_ops, bridge_trace_id);
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-                    let source_trace_id = {
-                        let trace_id = fail_descr.trace_id();
-                        if trace_id == 0 {
-                            compiled.root_trace_id
-                        } else {
-                            trace_id
-                        }
-                    };
+                    // pyjitpl.py:1049 — `fail_descr.trace_id()` is the
+                    // bridge origin's allocated id (`alloc_trace_id`
+                    // starts at 1).  No `0 → root_trace_id` sentinel;
+                    // RPython resolves the source via descr identity.
+                    let source_trace_id = fail_descr.trace_id();
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(
                             bridge_inputargs,
@@ -8514,7 +8706,7 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_constant_types,
                     );
                     if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
-                        &compiled.token,
+                        source_jct.as_ref(),
                         source_trace_id,
                         fail_index,
                     ) {
@@ -8522,7 +8714,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                     if let Some(backend_layouts) =
                         self.backend.compiled_bridge_terminal_exit_layouts(
-                            &compiled.token,
+                            source_jct.as_ref(),
                             source_trace_id,
                             fail_index,
                         )
@@ -8534,7 +8726,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                     let bridge_trace_info = self
                         .backend
-                        .compiled_trace_info(&compiled.token, bridge_trace_id);
+                        .compiled_trace_info(source_jct.as_ref(), bridge_trace_id);
                     let mut resume_data = resume_data;
                     compile::enrich_guard_resume_layouts_for_trace(
                         &mut resume_data,
@@ -8545,13 +8737,13 @@ impl<M: Clone> MetaInterp<M> {
                     );
                     compile::patch_backend_guard_recovery_layouts_for_trace(
                         &mut self.backend,
-                        &compiled.token,
+                        source_jct.as_ref(),
                         bridge_trace_id,
                         &mut exit_layouts,
                     );
                     compile::patch_backend_terminal_recovery_layouts_for_trace(
                         &mut self.backend,
-                        &compiled.token,
+                        source_jct.as_ref(),
                         bridge_trace_id,
                         &mut terminal_exit_layouts,
                     );
@@ -8630,7 +8822,7 @@ impl<M: Clone> MetaInterp<M> {
         // Read the subtype tag off the descr stamped by
         // `store_final_boxes_in_guard` (`is_guard_exc()` — equivalent to
         // RPython's `isinstance(descr, ResumeGuardExcDescr)`).
-        let norm_tid = Self::normalize_trace_id(compiled, trace_id);
+        let norm_tid = trace_id;
         let is_exception_guard = Self::trace_for_exit(compiled, norm_tid)
             .and_then(|(_, trace)| {
                 let idx = *trace.guard_op_indices.get(&fail_index)?;
@@ -8639,15 +8831,18 @@ impl<M: Clone> MetaInterp<M> {
             })
             .unwrap_or(false);
 
-        let fail_descr = match self.bridge_fail_descr_proxy(compiled, trace_id, fail_index) {
-            Some(descr) => descr,
+        let descr_arc = match self.bridge_source_descr(compiled, trace_id, fail_index) {
+            Some(arc) => arc,
             None => return None,
         };
+        let fail_descr = descr_arc
+            .as_fail_descr()
+            .expect("bridge source op.descr must implement FailDescr");
 
         // compile.py:797-811 parity: bridge inputargs come from the guard's
-        // fail_arg_types AFTER store_final_boxes_in_guard. The backend's
-        // fail_descr has the UPDATED types (may include virtual field boxes).
-        // bridge_fail_descr_proxy already prefers backend types.
+        // fail_arg_types AFTER store_final_boxes_in_guard.  The metainterp
+        // ResumeGuardDescr Arc carries the post-`store_final_boxes_in_guard`
+        // type vector (compile.py:855 `_attrs_`).
         let bridge_input_types = fail_descr.fail_arg_types();
         self.warm_state.start_retrace(bridge_input_types);
         // RPython pyjitpl.py:2609 `create_history(max_num_inputargs)` — the
@@ -8684,7 +8879,7 @@ impl<M: Clone> MetaInterp<M> {
         // for the colliding index and `getintbound` panics with
         // Int/Ref mismatch. Reserve bridge's pool past the parent's
         // highest const index so every new allocation is disjoint.
-        if let Some(source_trace) = compiled.traces.get(&norm_tid) {
+        if let Some((_, source_trace)) = Self::trace_for_exit(compiled, norm_tid) {
             let max_const = source_trace
                 .constants
                 .keys()
@@ -8746,10 +8941,8 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         // compile.py:988-991: resolve metainterp_sd, vinfo, ginfo
-        let norm_tid = {
-            let compiled = self.compiled_loops.get(&green_key)?;
-            Self::normalize_trace_id(compiled, trace_id)
-        };
+        let _compiled = self.compiled_loops.get(&green_key)?;
+        let norm_tid = trace_id;
         let exit_layout =
             self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?;
 
@@ -16946,48 +17139,30 @@ mod tests {
             .iter_mut()
             .find(|descr| descr.fail_index == fail_index)
             .expect("fail descr");
-        // Test-only: bypass Arc::get_mut (the runtime keeps a second
-        // Arc for the attached-descr registry) by reinterpreting the
-        // Arc interior as &mut. Safe because test drivers are single-
-        // threaded and no JIT code runs while this helper is active.
+        // Session 5b: rd_* now forward through `meta_descr` to the
+        // metainterp ResumeGuardDescr Arc.  Test fixtures synthesise
+        // DynasmFailDescr without going through the assembler, so they
+        // have no meta_descr.  Mint a fresh metainterp ResumeGuardDescr
+        // (carries the rd_* setters) and stamp it as the back-pointer.
         let descr = unsafe {
             &mut *(std::sync::Arc::as_ptr(descr)
                 as *mut majit_backend_dynasm::guard::DynasmFailDescr)
         };
-        descr.rd_numb = Some(rd_numb);
-        descr.rd_consts = Some(rd_consts);
-        descr.rd_virtuals = Some(vec![]);
-        descr.rd_pendingfields = Some(vec![]);
-    }
-
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    fn patch_dynasm_fail_descr_types(
-        token: &std::sync::Arc<JitCellToken>,
-        fail_index: u32,
-        fail_arg_types: Vec<Type>,
-    ) {
-        let token: &mut JitCellToken =
-            unsafe { &mut *(std::sync::Arc::as_ptr(token) as *mut JitCellToken) };
-        let compiled = token
-            .compiled
-            .as_mut()
-            .expect("compiled token")
-            .downcast_mut::<DynasmCompiledCode>()
-            .expect("dynasm compiled code");
-        let descr = compiled
-            .fail_descrs
-            .iter_mut()
-            .find(|descr| descr.fail_index == fail_index)
-            .expect("fail descr");
-        // Test-only: bypass Arc::get_mut (the runtime keeps a second
-        // Arc for the attached-descr registry) by reinterpreting the
-        // Arc interior as &mut. Safe because test drivers are single-
-        // threaded and no JIT code runs while this helper is active.
-        let descr = unsafe {
-            &mut *(std::sync::Arc::as_ptr(descr)
-                as *mut majit_backend_dynasm::guard::DynasmFailDescr)
-        };
-        descr.fail_arg_types = fail_arg_types;
+        if descr.meta_descr.is_none() {
+            descr.meta_descr = Some(crate::compile::make_resume_guard_descr_typed(
+                descr.fail_arg_types.clone(),
+            ));
+        }
+        let meta_fd = descr
+            .meta_descr
+            .as_ref()
+            .unwrap()
+            .as_fail_descr()
+            .expect("metainterp descr must implement FailDescr");
+        meta_fd.set_rd_numb(Some(rd_numb));
+        meta_fd.set_rd_consts(Some(rd_consts));
+        meta_fd.set_rd_virtuals(Some(vec![]));
+        meta_fd.set_rd_pendingfields(Some(vec![]));
     }
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
@@ -17280,71 +17455,24 @@ mod tests {
             meta.get_exit_types(green_key, trace_id, fail_index),
             Some(vec![Type::Int])
         );
-        let fail_descr = meta
+        let descr_arc = meta
             .get_fail_descr_for_bridge(green_key, trace_id, fail_index)
             .expect("bridge fail descr should search previous tokens too");
+        let fail_descr = descr_arc
+            .as_fail_descr()
+            .expect("bridge source op.descr must implement FailDescr");
         assert_eq!(fail_descr.fail_arg_types(), &[Type::Int]);
     }
 
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    #[test]
-    fn guard_fail_descr_proxy_falls_back_to_trace_exit_types_when_backend_types_are_empty() {
-        let mut meta = MetaInterp::<()>::new(1);
-        let green_key = 87;
-        let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(
-            OpCode::GuardTrue,
-            &[OpRef::input_arg_int(0)],
-            OpRef::NONE.raw(),
-        );
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            guard,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-        attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
-
-        let (trace_id, fail_index) = {
-            let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
-            let trace_id = entry.root_trace_id;
-            // Both the GuardTrue and the Finish op end up in exit_layouts
-            // (each backend's collect_guards emits a FailDescr for the
-            // Finish too). HashMap iteration order is randomized per
-            // process, so pick the guard deterministically via
-            // is_finish == false.
-            let fail_index = *entry
-                .traces
-                .get(&trace_id)
-                .and_then(|trace| {
-                    trace
-                        .exit_layouts
-                        .iter()
-                        .find(|(_, layout)| !layout.is_finish)
-                        .map(|(k, _)| k)
-                })
-                .expect("compiled guard exit");
-            (trace_id, fail_index)
-        };
-
-        {
-            let entry = meta
-                .compiled_loops
-                .get_mut(&green_key)
-                .expect("compiled entry");
-            patch_dynasm_fail_descr_types(&entry.token, fail_index, vec![]);
-        }
-
-        assert_eq!(meta.fail_arg_count_for(green_key, trace_id, fail_index), 1);
-        let fail_descr = meta
-            .get_fail_descr_for_bridge(green_key, trace_id, fail_index)
-            .expect("empty backend fail_arg_types should fall back to trace exit layout");
-        assert_eq!(fail_descr.fail_arg_types(), &[Type::Int]);
-    }
+    // `guard_fail_descr_proxy_trusts_empty_backend_fail_arg_types`
+    // removed in Unified-Descr Port Epic, Session 6: the proxy now
+    // forwards `fail_arg_types()` to the metainterp `ResumeGuardDescr`
+    // Arc, so patching the backend descr's `fail_arg_types` no longer
+    // changes the proxy's view (the test's premise was a split-descr
+    // adaptation that does not survive unification).  PyPy parity:
+    // `cpu.get_latest_descr()` (`history.py:125`) returns the same
+    // descr object the metainterp stamped; there is no "backend
+    // override" to test.
 
     #[test]
     fn guard_failure_recovery_uses_previous_token_backend_exit_layout() {

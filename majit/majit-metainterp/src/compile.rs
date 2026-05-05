@@ -16,13 +16,13 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use smallvec::smallvec;
 
 use majit_backend::{
-    Backend, BackendError, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout,
-    JitCellToken, TerminalExitLayout,
+    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, ExitFrameLayout,
+    ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
 use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op,
@@ -54,19 +54,29 @@ use crate::resume::{
 /// index into `metainterp_sd.jitdrivers_sd` instead of a direct
 /// reference, since the descriptor lives in another crate).
 ///
-/// Returns a bare `JitCellToken` so the caller can apply pyre-specific
-/// fields (`green_key`, `num_scalar_inputargs`,
-/// `virtualizable_arg_index` via `MetaInterp::configure_loop_token_for_driver`)
-/// while the token is still solely owned, then wrap it in
-/// `Arc::new(token)` once it is fully populated.  The Arc is the
-/// canonical handle thereafter, mirroring the single-object identity
-/// that flows through `compile_loop` (`compile.py:266`) →
+/// Returns the canonical `Arc<JitCellToken>` immediately.  Callers can
+/// mutate the token before it is cloned with `Arc::get_mut`, then pass
+/// the same Arc through `compile_loop` (`compile.py:266`) →
 /// `attach_procedure_to_interp` (`compile.py:1019`) →
 /// `MemoryManager.keep_loop_alive` (`compile.py:567`/`:1149`).
-pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> JitCellToken {
+pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> Arc<JitCellToken> {
     let mut token = JitCellToken::new(number);
     token.outermost_jitdriver_index = jd_index;
-    token
+    Arc::new(token)
+}
+
+/// `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
+/// clt.loop_token_wref = wref` parity. Must be called *after* every
+/// `Arc::get_mut(&mut token)` mutation has settled, because creating
+/// the `Weak` increments the weak count and `Arc::get_mut` requires
+/// `weak_count == 0`. Practically this means: configure the token
+/// fields first (`configure_loop_token_for_driver`, `inputarg_types`
+/// etc.), then call this helper before the token is published into
+/// `compiled_loops` / `attach_procedure_with_redirect`.
+pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
+    if let Some(clt) = token.compiled_loop_token.as_ref() {
+        clt.set_loop_token_wref(Arc::downgrade(token));
+    }
 }
 
 /// Resolve the type of an OpRef in guard fail_args.
@@ -257,6 +267,20 @@ pub(crate) fn build_guard_metadata(
 
         if is_guard {
             guard_op_indices.insert(fail_index, op_idx);
+            // Pyre-only: stamp the per-trace `fail_index` onto the
+            // metainterp ResumeGuardDescr so `(trace_id, fail_index)`
+            // lookups can resolve through the descr Arc directly.
+            // Skip non-resume FailDescrs (whose
+            // `set_fail_index_per_trace` panics by default).
+            if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                if op
+                    .descr
+                    .as_ref()
+                    .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
+                {
+                    fd.set_fail_index_per_trace(fail_index);
+                }
+            }
         }
 
         // RPython Box.type parity: each fail-arg's type is `livebox.type`,
@@ -1961,46 +1985,6 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct BridgeFailDescrProxy {
-    pub(crate) fail_index: u32,
-    pub(crate) trace_id: u64,
-    pub(crate) fail_arg_types: Vec<Type>,
-    pub(crate) gc_ref_slots: Vec<usize>,
-    pub(crate) force_token_slots: Vec<usize>,
-    pub(crate) is_finish: bool,
-}
-
-impl majit_ir::Descr for BridgeFailDescrProxy {
-    fn index(&self) -> u32 {
-        self.fail_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
-        Some(self)
-    }
-}
-
-impl majit_ir::FailDescr for BridgeFailDescrProxy {
-    fn fail_index(&self) -> u32 {
-        self.fail_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.fail_arg_types
-    }
-    fn is_finish(&self) -> bool {
-        self.is_finish
-    }
-    fn trace_id(&self) -> u64 {
-        self.trace_id
-    }
-    fn is_gc_ref_slot(&self, slot: usize) -> bool {
-        self.gc_ref_slots.contains(&slot)
-    }
-    fn force_token_slots(&self) -> &[usize] {
-        &self.force_token_slots
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // `rpython/jit/metainterp/compile.py:623-674` — finish/propagate descrs.
 //
@@ -2285,12 +2269,22 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
 pub struct PropagateExceptionDescr {
     /// `history.py:122` `index = -1` default.
     descr_index: std::sync::atomic::AtomicI32,
+    /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
+    /// for the dynasm-backend payload (mirror of the `ResumeGuardDescr`
+    /// scaffold).  RPython parity: `compile.py:1092
+    /// PropagateExceptionDescr(AbstractFailDescr)` carries `rd_locs`
+    /// and `adr_jump_offset` from `history.py:121` `_attrs_` directly.
+    dynasm: DynasmDescrPayload,
+    /// Mirror of `dynasm` for the cranelift backend.
+    cranelift: CraneliftDescrPayload,
 }
 
 impl PropagateExceptionDescr {
     pub fn new() -> Self {
         Self {
             descr_index: std::sync::atomic::AtomicI32::new(-1),
+            dynasm: DynasmDescrPayload::default(),
+            cranelift: CraneliftDescrPayload::default(),
         }
     }
 }
@@ -2406,14 +2400,14 @@ impl DescrContainer for dyn Backend + '_ {
 /// `redirect_call_assembler` (`x86/assembler.py:1138`) in-place patches
 /// `_ll_function_addr` so callers reach the real loop transparently.
 ///
-/// # Wiring status (Step 1 of the `compile_tmp_callback` port plan)
+/// # Wiring status
 ///
-/// This function is introduced as dead code. The production path still
-/// goes through `Backend::register_pending_target`. Step 2 routes
-/// `warmstate::get_assembler_token` (`warmstate.py:714-723`) through
-/// this function and marks the resulting cell with `tmp=true`. Step 3
-/// drops `register_pending_target` and the cranelift/dynasm pending
-/// placeholder registries entirely.
+/// The recursive `CALL_ASSEMBLER` path (`pyjitpl/mod.rs::handle_call_assembler`)
+/// already routes pending callees through this helper. Step 2 — wiring
+/// `warmstate::get_assembler_token` (`warmstate.py:714-723`) to mark the
+/// resulting cell with `tmp=true` — and Step 3 — dropping
+/// `register_pending_target` plus the cranelift/dynasm pending placeholder
+/// registries entirely — remain pending (Tasks #195/#211).
 ///
 /// # Parameters
 ///
@@ -2469,8 +2463,12 @@ pub fn compile_tmp_callback(
     // `compile.py:168` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
     // is set inside `make_jitcell_token`.
     let mut jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
-    jitcell_token.green_key = green_key;
-    jitcell_token.virtualizable_arg_index = jitdriver_sd.virtualizable_arg_index();
+    {
+        let token = Arc::get_mut(&mut jitcell_token)
+            .expect("fresh tmp callback JitCellToken must be uniquely owned");
+        token.green_key = green_key;
+        token.virtualizable_arg_index = jitdriver_sd.virtualizable_arg_index();
+    }
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  PRE-EXISTING-ADAPTATION: `rpython/rlib/jit.py`'s `jl`
@@ -2617,7 +2615,18 @@ pub fn compile_tmp_callback(
     // log=False)`.
     backend.set_constants(constants);
     backend.set_constant_types(constant_types);
-    backend.compile_loop(&inputargs, &operations, &mut jitcell_token)?;
+    backend.compile_loop(
+        &inputargs,
+        &operations,
+        Arc::get_mut(&mut jitcell_token)
+            .expect("tmp callback JitCellToken must stay uniquely owned until backend compile"),
+    )?;
+    // `compile.py:180-181` wire wref now that all `Arc::get_mut` writes
+    // have settled.  `compile_tmp_callback` doesn't go through
+    // `record_loop_or_bridge` (the tmp callback is a synthetic
+    // 3-instruction loop, not a real trace), so wref wiring happens
+    // directly here.
+    wire_clt_loop_token_wref(&jitcell_token);
     //
     // `compile.py:1148-1149` `if memory_manager is not None:
     //   memory_manager.keep_loop_alive(jitcell_token)` — pyre's
@@ -2625,13 +2634,12 @@ pub fn compile_tmp_callback(
     // `set_procedure_token(token, tmp=true)` runs in `warmstate.rs`.
     //
     // `compile.py:1150` `return jitcell_token`.
-    let arc_token = Arc::new(jitcell_token);
     // `compile.py:179-180` record_loop_or_bridge: the tmp-callback loop is a
     // real compiled loop even though MetaInterp never inserts it into
     // compiled_loops. Register it with the backend so `find_descr_by_ptr`
     // can still walk its fail_descrs on cross-token guard resolution.
-    backend.track_compiled_token(Arc::clone(&arc_token));
-    Ok(arc_token)
+    backend.track_compiled_token(Arc::clone(&jitcell_token));
+    Ok(jitcell_token)
 }
 
 #[cfg(test)]
@@ -3011,6 +3019,24 @@ fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Per-descr dynasm-backend payload (Unified-Descr Port Epic, Session 2
+/// scaffold).  PyPy parity model: `history.py:121 AbstractFailDescr._attrs_
+/// = ('adr_jump_offset', 'rd_locs', 'rd_loop_token', 'rd_vector_info')`
+/// keeps backend fields on the same descr object.  pyre's split currently
+/// stores those backend fields on `DynasmFailDescr`
+/// (`majit-backend-dynasm/src/guard.rs:25`); subsequent sessions of the
+/// epic move them onto this typed payload so the `Arc<dyn FailDescr>` on
+/// the IR op carries the backend state directly.  Empty in Session 2.
+#[derive(Debug, Default)]
+pub struct DynasmDescrPayload {}
+
+/// Per-descr cranelift-backend payload (Unified-Descr Port Epic, Session 2
+/// scaffold).  Mirror of `DynasmDescrPayload` for the cranelift backend's
+/// counterpart fields on `CraneliftFailDescr`
+/// (`majit-backend-cranelift/src/guard.rs:106`).  Empty in Session 2.
+#[derive(Debug, Default)]
+pub struct CraneliftDescrPayload {}
+
 /// Per-guard backend FailDescr carrying a unique `fail_index`, the
 /// runtime fail-arg `Type` vector, and a vectorization accumulator
 /// chain.  Pyre-only adaptation: this is the bare backend descr used
@@ -3035,6 +3061,13 @@ struct MetaFailDescr {
     /// schedule.py:654: vector accumulation info attached during vectorization.
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+    /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
+    /// for the dynasm-backend payload that future sessions migrate
+    /// from `DynasmFailDescr` (`majit-backend-dynasm/src/guard.rs:25`)
+    /// onto this descr (PyPy `history.py:121` single-object model).
+    dynasm: DynasmDescrPayload,
+    /// Mirror of `dynasm` for the cranelift backend.
+    cranelift: CraneliftDescrPayload,
 }
 
 // Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
@@ -3055,6 +3088,8 @@ impl majit_ir::Descr for MetaFailDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+            dynasm: DynasmDescrPayload::default(),
+            cranelift: CraneliftDescrPayload::default(),
         }))
     }
 }
@@ -3104,6 +3139,59 @@ struct ResumeGuardDescr {
     payload: RdPayload,
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+    /// `compile.py:186` `descr.rd_loop_token = clt` line-by-line port.
+    ///
+    /// The owning `Arc<CompiledLoopToken>` typed as `Arc<dyn Any +
+    /// Send + Sync>` (the `token_handle_any` pattern — `majit-ir`
+    /// cannot reference `majit-backend::CompiledLoopToken` without a
+    /// dependency cycle).  Stamped by `record_loop_or_bridge`
+    /// (`pyjitpl/mod.rs::record_loop_or_bridge`, compile.py:183-186
+    /// counterpart) for every resume guard, alongside (and
+    /// transitionally with) the same stamp on the backend descr.
+    /// `pyjitpl.py:2897 resumedescr.rd_loop_token.loop_token_wref()`
+    /// readers chain through this slot; `clt.loop_token_wref()`
+    /// (compile.py:180-181) yields the owning `JitCellToken` weakref.
+    rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<CompiledLoopToken>>>,
+    /// Phase E.1 — backend-specific extension slot.
+    ///
+    /// In RPython the same descr object carries
+    /// `llsupport/assembler.py:279 descr.rd_locs = positions` and
+    /// `x86/assembler.py:857 tok.faildescr.adr_jump_offset = addr`
+    /// alongside the metainterp-side `rd_*` payload via Python's
+    /// dynamic-attribute model.  Rust direct translation: a
+    /// type-erased `Box<dyn Any + Send + Sync>` filled by the backend
+    /// at compile time (e.g. `DynasmGuardData`, `CraneliftGuardData`).
+    /// `UnsafeCell` so identity is preserved across the write — the
+    /// `Arc<dyn FailDescr>` address stamped on the IR op stays valid.
+    backend_data: UnsafeCell<Option<Box<dyn std::any::Any + Send + Sync>>>,
+    /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
+    /// for the dynasm-backend payload that future sessions migrate
+    /// from `DynasmFailDescr` (`majit-backend-dynasm/src/guard.rs:25`)
+    /// onto this descr.  PyPy `history.py:121 AbstractFailDescr._attrs_`
+    /// keeps `adr_jump_offset` / `rd_locs` / `rd_loop_token` on the
+    /// same object as `rd_numb` / `rd_consts` etc.; this field is the
+    /// pyre-side typed substitute for `backend_data` boxing.
+    dynasm: DynasmDescrPayload,
+    /// Mirror of `dynasm` for the cranelift backend.
+    cranelift: CraneliftDescrPayload,
+    /// Pyre-only: identifier of the compiled trace that owns this guard.
+    ///
+    /// RPython resolves descr identity directly by Python `id(descr)`
+    /// (`history.py:125`).  Pyre's runtime exit path uses a
+    /// `(trace_id, fail_index)` key when threading guard failures back
+    /// from `runner.rs::find_descr` / `compiler.rs::find_descr_by_ptr`,
+    /// so the owning trace_id is captured on the descr by
+    /// `record_loop_or_bridge` (`compile.py:185-186` walker) and read
+    /// directly via `FailDescr::trace_id`.
+    trace_id: AtomicU64,
+    /// Pyre-only: per-trace `fail_index` assigned by
+    /// `build_guard_metadata`.  The struct's `fail_index` field above
+    /// holds the global `alloc_fail_index()` value used for descr
+    /// identity; this slot mirrors the per-trace key the optimizer
+    /// hands the backend (`(trace_id, fail_index)` lookup parity).
+    /// Stamped at `build_guard_metadata` time, where the local
+    /// `fail_index` counter increments per guard.
+    fail_index_per_trace: AtomicU32,
 }
 
 unsafe impl Send for ResumeGuardDescr {}
@@ -3127,6 +3215,21 @@ impl majit_ir::Descr for ResumeGuardDescr {
             resume_data: self.resume_data.clone(),
             payload: self.payload.deep_clone(),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+            // Phase E.1: clone produces a fresh descr with no backend
+            // data — RPython compile.py:844-846 `ResumeGuardDescr()`
+            // mints a default-attributes object; backend-stored
+            // extension fields are populated only when this fresh descr
+            // reaches the backend codegen path
+            // (`llsupport/assembler.py:279`).
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            dynasm: DynasmDescrPayload::default(),
+            cranelift: CraneliftDescrPayload::default(),
+            // Cloned descrs reach the backend codegen path freshly, so
+            // `record_loop_or_bridge` re-stamps `trace_id` for the
+            // owning compiled trace.
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         }))
     }
 }
@@ -3134,6 +3237,19 @@ impl majit_ir::Descr for ResumeGuardDescr {
 impl FailDescr for ResumeGuardDescr {
     fn fail_index(&self) -> u32 {
         self.fail_index
+    }
+    fn trace_id(&self) -> u64 {
+        self.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.types.get() }
@@ -3199,6 +3315,32 @@ impl FailDescr for ResumeGuardDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.payload.set_rd_pendingfields_arc(value)
     }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        // Safety: single-threaded JIT, no concurrent writers.
+        unsafe { (*self.backend_data.get()).as_deref() }
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        // Safety: single-threaded JIT, no concurrent readers.
+        unsafe { *self.backend_data.get() = Some(data) };
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        // compile.py:186 reader: return `&Arc<CompiledLoopToken>` typed
+        // through `dyn Any` so `descr_owning_clt` can `downcast_ref::<Arc<
+        // CompiledLoopToken>>()` consistently across backend + metainterp
+        // descrs.  Safety: single-threaded JIT, no concurrent writers.
+        let cell = unsafe { &*self.rd_loop_token_clt.get() };
+        cell.as_ref().map(|arc| arc as &dyn std::any::Any)
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        // compile.py:186 stamp.  Downcast at storage time so the cell
+        // holds the strongly typed `Arc<CompiledLoopToken>` matching
+        // backend descrs.  Safety: single-threaded JIT, no concurrent
+        // readers.
+        let typed: std::sync::Arc<CompiledLoopToken> = clt
+            .downcast::<CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
+    }
 }
 
 /// Create a FailDescr for `num_live` integer values with an auto-assigned
@@ -3211,6 +3353,8 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(vec![Type::Int; num_live]),
         vector_info: UnsafeCell::new(None),
+        dynasm: DynasmDescrPayload::default(),
+        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3223,6 +3367,8 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         fail_index,
         types: UnsafeCell::new(vec![Type::Int; num_live]),
         vector_info: UnsafeCell::new(None),
+        dynasm: DynasmDescrPayload::default(),
+        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3232,6 +3378,8 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),
         vector_info: UnsafeCell::new(None),
+        dynasm: DynasmDescrPayload::default(),
+        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3261,6 +3409,12 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         },
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
+        backend_data: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
+        dynasm: DynasmDescrPayload::default(),
+        cranelift: CraneliftDescrPayload::default(),
+        trace_id: AtomicU64::new(0),
+        fail_index_per_trace: AtomicU32::new(0),
     })
 }
 
@@ -3309,6 +3463,20 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
 impl FailDescr for ResumeAtPositionDescr {
     fn fail_index(&self) -> u32 {
         self.inner.fail_index
+    }
+    fn trace_id(&self) -> u64 {
+        self.inner.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.inner.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.inner
+            .fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -3373,6 +3541,22 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.inner.payload.set_rd_pendingfields_arc(value)
     }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        unsafe { (*self.inner.backend_data.get()).as_deref() }
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        unsafe { *self.inner.backend_data.get() = Some(data) };
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
+        cell.as_ref().map(|arc| arc as &dyn std::any::Any)
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<CompiledLoopToken> = clt
+            .downcast::<CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
+    }
 }
 
 /// Create a ResumeAtPositionDescr with auto-assigned fail_index, the
@@ -3391,6 +3575,12 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            dynasm: DynasmDescrPayload::default(),
+            cranelift: CraneliftDescrPayload::default(),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         },
     })
 }
@@ -3450,6 +3640,20 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn fail_index(&self) -> u32 {
         self.inner.fail_index
     }
+    fn trace_id(&self) -> u64 {
+        self.inner.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.inner.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.inner
+            .fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
+    }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
     }
@@ -3513,6 +3717,22 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.inner.payload.set_rd_pendingfields_arc(value)
     }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        unsafe { (*self.inner.backend_data.get()).as_deref() }
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        unsafe { *self.inner.backend_data.get() = Some(data) };
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
+        cell.as_ref().map(|arc| arc as &dyn std::any::Any)
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<CompiledLoopToken> = clt
+            .downcast::<CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
+    }
 }
 
 /// Create a ResumeGuardForcedDescr with auto-assigned fail_index, the
@@ -3531,6 +3751,12 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            dynasm: DynasmDescrPayload::default(),
+            cranelift: CraneliftDescrPayload::default(),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         },
     })
 }
@@ -3574,6 +3800,20 @@ impl FailDescr for ResumeGuardExcDescr {
     fn fail_index(&self) -> u32 {
         self.inner.fail_index
     }
+    fn trace_id(&self) -> u64 {
+        self.inner.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.inner.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.inner
+            .fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
+    }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
     }
@@ -3637,6 +3877,22 @@ impl FailDescr for ResumeGuardExcDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.inner.payload.set_rd_pendingfields_arc(value)
     }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        unsafe { (*self.inner.backend_data.get()).as_deref() }
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        unsafe { *self.inner.backend_data.get() = Some(data) };
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
+        cell.as_ref().map(|arc| arc as &dyn std::any::Any)
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<CompiledLoopToken> = clt
+            .downcast::<CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
+    }
 }
 
 /// Create a ResumeGuardExcDescr with auto-assigned fail_index, the
@@ -3655,6 +3911,12 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            dynasm: DynasmDescrPayload::default(),
+            cranelift: CraneliftDescrPayload::default(),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         },
     })
 }
@@ -3692,6 +3954,30 @@ pub struct ResumeGuardCopiedDescr {
     /// guard owns its own vector-info chain (history.py:143
     /// `attach_vector_info` writes `self.rd_vector_info`).
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+    /// Phase E.1 — backend-specific extension slot.  Copied descrs
+    /// share their donor's *resume* payload via `prev`
+    /// (`compile.py:849 get_resumestorage(): return prev`), but the
+    /// backend-stored fields (`rd_locs`, `adr_jump_offset`) are written
+    /// per-fail at codegen time (`llsupport/assembler.py:279`), so
+    /// each copied descr owns its own slot — same scoping as
+    /// `vector_info` above (history.py:143 writes `self.rd_vector_info`,
+    /// not `prev.rd_vector_info`).
+    backend_data: UnsafeCell<Option<Box<dyn std::any::Any + Send + Sync>>>,
+    /// `compile.py:186` `descr.rd_loop_token = clt`.  Copied descrs are
+    /// stamped per-guard by the same `record_loop_or_bridge` walker
+    /// (`compile.py:185 isinstance(descr, ResumeDescr)` covers
+    /// `ResumeGuardCopiedDescr` — `_attrs_` lists `rd_loop_token`
+    /// directly on `AbstractFailDescr` at history.py:125, owned by
+    /// the receiver, not chased through `prev`).
+    rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<CompiledLoopToken>>>,
+    /// Pyre-only owning-trace identifier — same role as on
+    /// `ResumeGuardDescr`. Stamped by `record_loop_or_bridge`
+    /// (`compile.py:185-186` walker) since copied descrs are equally
+    /// owned by exactly one trace.
+    trace_id: AtomicU64,
+    /// Pyre-only per-trace fail-index — same role as on
+    /// `ResumeGuardDescr`. Stamped by `build_guard_metadata`.
+    fail_index_per_trace: AtomicU32,
 }
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
@@ -3738,6 +4024,10 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_index: alloc_fail_index(),
             prev: UnsafeCell::new(self.prev().clone()),
             vector_info: UnsafeCell::new(None),
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         }))
     }
 }
@@ -3745,6 +4035,19 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
 impl FailDescr for ResumeGuardCopiedDescr {
     fn fail_index(&self) -> u32 {
         self.fail_index
+    }
+    fn trace_id(&self) -> u64 {
+        self.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
     }
     /// compile.py:849 `get_resumestorage(): return prev`: reads chase
     /// to the donor.  The `fail_arg_types` slot is shared too —
@@ -3844,6 +4147,22 @@ impl FailDescr for ResumeGuardCopiedDescr {
              upstream optimizer.py:728 only finalizes ResumeGuardDescr"
         );
     }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        unsafe { (*self.backend_data.get()).as_deref() }
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        unsafe { *self.backend_data.get() = Some(data) };
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        let cell = unsafe { &*self.rd_loop_token_clt.get() };
+        cell.as_ref().map(|arc| arc as &dyn std::any::Any)
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<CompiledLoopToken> = clt
+            .downcast::<CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
+    }
 }
 
 /// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
@@ -3883,6 +4202,10 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_index: alloc_fail_index(),
                 prev: UnsafeCell::new(self.inner.prev().clone()),
                 vector_info: UnsafeCell::new(None),
+                backend_data: UnsafeCell::new(None),
+                rd_loop_token_clt: UnsafeCell::new(None),
+                trace_id: AtomicU64::new(0),
+                fail_index_per_trace: AtomicU32::new(0),
             },
         }))
     }
@@ -3891,6 +4214,20 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
 impl FailDescr for ResumeGuardCopiedExcDescr {
     fn fail_index(&self) -> u32 {
         self.inner.fail_index
+    }
+    fn trace_id(&self) -> u64 {
+        self.inner.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.inner.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.inner
+            .fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
     }
     fn fail_arg_types(&self) -> &[Type] {
         self.inner.fail_arg_types()
@@ -3943,6 +4280,18 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
         self.inner.set_rd_pendingfields(value)
     }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.inner.backend_data()
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        self.inner.set_backend_data(data)
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        self.inner.rd_loop_token_clt()
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.inner.set_rd_loop_token_clt(clt)
+    }
 }
 
 /// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
@@ -3976,6 +4325,10 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_index: alloc_fail_index(),
         prev: UnsafeCell::new(prev),
         vector_info: UnsafeCell::new(None),
+        backend_data: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
+        trace_id: AtomicU64::new(0),
+        fail_index_per_trace: AtomicU32::new(0),
     })
 }
 
@@ -4001,6 +4354,10 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_index: alloc_fail_index(),
             prev: UnsafeCell::new(prev),
             vector_info: UnsafeCell::new(None),
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         },
     })
 }
@@ -4109,6 +4466,23 @@ pub struct CompileLoopVersionDescr {
     resume_data: ResumeData,
     payload: RdPayload,
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+    /// Phase E.1 — backend-specific extension slot.  Same role as on
+    /// `ResumeGuardDescr`; loop-version guards are a `ResumeGuardDescr`
+    /// subclass per `compile.py:895` and reach the backend codegen
+    /// path identically.
+    backend_data: UnsafeCell<Option<Box<dyn std::any::Any + Send + Sync>>>,
+    /// `compile.py:186` `descr.rd_loop_token = clt`.  Same role as on
+    /// `ResumeGuardDescr`; loop-version descrs are a `ResumeGuardDescr`
+    /// subclass per `compile.py:895` and reach `record_loop_or_bridge`
+    /// identically (CompileLoopVersionDescr inherits the
+    /// `_attrs_` slot list at history.py:125 via AbstractFailDescr).
+    rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<CompiledLoopToken>>>,
+    /// Pyre-only owning-trace identifier — same role as on
+    /// `ResumeGuardDescr`. Stamped by `record_loop_or_bridge`.
+    trace_id: AtomicU64,
+    /// Pyre-only per-trace fail-index — same role as on
+    /// `ResumeGuardDescr`. Stamped by `build_guard_metadata`.
+    fail_index_per_trace: AtomicU32,
 }
 
 unsafe impl Send for CompileLoopVersionDescr {}
@@ -4135,6 +4509,12 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             resume_data: self.resume_data.clone(),
             payload: self.payload.deep_clone(),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+            // Phase E.1: clone mints a fresh descr with no backend
+            // extension yet — same scoping as ResumeGuardDescr.clone_descr.
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         }))
     }
 }
@@ -4142,6 +4522,19 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
 impl FailDescr for CompileLoopVersionDescr {
     fn fail_index(&self) -> u32 {
         self.fail_index
+    }
+    fn trace_id(&self) -> u64 {
+        self.trace_id.load(Ordering::Relaxed)
+    }
+    fn set_trace_id(&self, trace_id: u64) {
+        self.trace_id.store(trace_id, Ordering::Relaxed);
+    }
+    fn fail_index_per_trace(&self) -> u32 {
+        self.fail_index_per_trace.load(Ordering::Relaxed)
+    }
+    fn set_fail_index_per_trace(&self, fail_index: u32) {
+        self.fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.types.get() }
@@ -4213,6 +4606,22 @@ impl FailDescr for CompileLoopVersionDescr {
     }
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.payload.set_rd_pendingfields_arc(value)
+    }
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        unsafe { (*self.backend_data.get()).as_deref() }
+    }
+    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+        unsafe { *self.backend_data.get() = Some(data) };
+    }
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        let cell = unsafe { &*self.rd_loop_token_clt.get() };
+        cell.as_ref().map(|arc| arc as &dyn std::any::Any)
+    }
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<CompiledLoopToken> = clt
+            .downcast::<CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
 }
 
@@ -4286,6 +4695,10 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         payload,
         // guard.py:91: descr.rd_vector_info = None
         vector_info: UnsafeCell::new(None),
+        backend_data: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
+        trace_id: AtomicU64::new(0),
+        fail_index_per_trace: AtomicU32::new(0),
     })
 }
 
@@ -4421,6 +4834,10 @@ mod fail_descr_tests {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
+            backend_data: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            trace_id: AtomicU64::new(0),
+            fail_index_per_trace: AtomicU32::new(0),
         }) as DescrRef;
         let lv_fi = lv.as_fail_descr().unwrap().fail_index();
         assert!(lv.as_fail_descr().unwrap().loop_version());

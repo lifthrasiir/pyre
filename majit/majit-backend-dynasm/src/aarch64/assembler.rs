@@ -2541,11 +2541,14 @@ impl<'a> AssemblerARM64<'a> {
                 } else {
                     self.done_with_this_frame_descr_ptr_for_type(result_type)
                 };
+                // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
+                // `compile.py:185` skips these — not a `ResumeDescr`.
                 let descr = Arc::new(DynasmFailDescr::new(
                     fail_index,
                     self.trace_id,
                     fail_arg_types.clone(),
-                    true,
+                    true,  // is_finish
+                    false, // is_resume_guard
                 ));
 
                 // Store result to jf_frame[0]
@@ -2887,12 +2890,14 @@ impl<'a> AssemblerARM64<'a> {
             }
             OpCode::SaveException => self.genop_save_exception(op),
             OpCode::SaveExcClass => self.genop_save_exc_class(op),
-            // ── Guards (via regalloc_perform_guard, shouldn't reach here) ──
-            _ if op.opcode.is_guard() => {
-                // Guards should go through regalloc_perform_guard, not here.
-                // Fallback: use existing guard implementation.
-                self.implement_guard_nojump(op, fail_index);
-            }
+            // Guards never reach the non-guard regalloc dispatch — they
+            // are emitted exclusively from `regalloc_perform_guard` via
+            // the `RegAllocOp::PerformWithGuard` arm.
+            _ if op.opcode.is_guard() => unreachable!(
+                "regalloc_perform reached with guard {:?}; guards must \
+                 route through regalloc_perform_guard",
+                op.opcode
+            ),
             // ── No-ops ──
             _ => {}
         }
@@ -3334,11 +3339,13 @@ impl<'a> AssemblerARM64<'a> {
         let descr = if let Some(pre) = self.pending_force_descr.take() {
             pre
         } else {
+            // Guard exit — `compile.py:185` ResumeGuardDescr family.
             Arc::new(DynasmFailDescr::new(
                 fail_index,
                 self.trace_id,
                 fail_arg_types,
-                false,
+                false, // is_finish
+                true,  // is_resume_guard
             ))
         };
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -3433,15 +3440,12 @@ impl<'a> AssemblerARM64<'a> {
             descr_mut.fail_arg_locs = fail_arg_locs;
             descr_mut.rd_locs = rd_locs;
             descr_mut.source_op_index = Some(op_index);
-            // resume.py:450-488 parity: read rd_* through op.descr →
-            // ResumeGuardDescr (or chase prev for copied descrs).
-            let fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
-            descr_mut.rd_numb = fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec());
-            descr_mut.rd_consts = fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec());
-            descr_mut.rd_virtuals = fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec());
-            descr_mut.rd_pendingfields =
-                fd.and_then(|fd| fd.rd_pendingfields()).map(|s| s.to_vec());
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
+            // Unified-Descr Port Epic Session 5a: capture the metainterp
+            // ResumeGuardDescr Arc as a back-pointer.  rd_numb/rd_consts/
+            // rd_virtuals/rd_pendingfields readers (Session 5b) forward
+            // through this Arc.
+            descr_mut.meta_descr = op.descr.clone();
         }
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
@@ -3837,59 +3841,6 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — guards
     // ----------------------------------------------------------------
 
-    /// Emit a conditional jump to a recovery stub for a guard op.
-    /// The condition is inverted: we jump to the stub when the guard FAILS.
-    /// x86/assembler.py:1880-1891 _cmp_guard_class:
-    ///   loc_ptr = locs[0]; loc_classptr = locs[1]
-    ///   offset = self.cpu.vtable_offset
-    ///   if offset is not None:
-    ///       self.mc.CMP(mem(loc_ptr, offset), loc_classptr)
-    ///   else:
-    ///       assert isinstance(loc_classptr, ImmedLoc)
-    ///       classptr = loc_classptr.value
-    ///       expected_typeid = gc_ll_descr.
-    ///           get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-    ///       self._cmp_guard_gc_type(loc_ptr, ImmedLoc(expected_typeid))
-    ///
-    /// Inputs are pre-loaded: rax = loc_ptr (object), rcx = loc_classptr.
-    /// Sets ZF=1 on equal, ZF=0 on not-equal — caller branches via Jcc.
-    /// `expected_classptr_imm` is the immediate value of loc_classptr, used
-    /// only by the gcremovetypeptr branch (RPython requires this to be an
-    /// `ImmedLoc`).
-    fn _cmp_guard_class_old(&mut self, expected_classptr_imm: Option<i64>) {
-        if let Some(off_usize) = self.vtable_offset {
-            // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
-            let off_u32 = off_usize as u32;
-            dynasm!(self.mc
-                ; .arch aarch64
-                ; ldr x0, [x0, #off_u32]
-                ; cmp x0, x1
-            );
-        } else {
-            // x86/assembler.py:1886-1891 gcremovetypeptr fallback +
-            // x86/assembler.py:1893-1901 _cmp_guard_gc_type:
-            //   on x86_64 the typeid is a 32-bit half-word at offset 0.
-            let classptr = expected_classptr_imm.expect(
-                "_cmp_guard_class: gcremovetypeptr requires loc_classptr \
-                 to be an immediate (assert isinstance(loc_classptr, \
-                 ImmedLoc) in x86/assembler.py:1887)",
-            );
-            let expected_typeid = self.lookup_typeid_from_classptr(classptr as usize).expect(
-                "GuardClass: vtable_offset is None but the dynasm \
-                     backend has no gc_ll_descr.get_typeid_from_classptr_if_\
-                     gcremovetypeptr",
-            );
-            let typeid_w = expected_typeid as i32;
-            dynasm!(self.mc
-                ; .arch aarch64
-                ; ldr w0, [x0]
-                ; movz w1, #typeid_w as u32 & 0xffff
-                ; movk w1, #(typeid_w as u32 >> 16) & 0xffff, lsl #16
-                ; cmp w0, w1
-            );
-        }
-    }
-
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Looks up the materialized table populated by the runner from
@@ -3951,27 +3902,6 @@ impl<'a> AssemblerARM64<'a> {
         }
         dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
         dynasm!(self.mc ; .arch aarch64 ; =>skip);
-    }
-
-    /// assembler.py:2157 implement_guard — emit conditional jump to
-    /// failure stub and append guard token to pending list.
-    fn implement_guard(&mut self, op: &Op, fail_index: u32) {
-        let cc = self
-            .guard_success_cc
-            .take()
-            .expect("implement_guard: guard_success_cc not set");
-        let fail_cc = invert_cc(cc);
-        let fail_label = self.emit_guard_jcc(fail_cc);
-        // guard_success_cc is already None after .take()
-
-        self.append_guard_token(op, fail_index, fail_label);
-    }
-
-    /// Register a guard token without emitting a conditional jump.
-    /// assembler.py:1799-1806 genop_guard_guard_not_invalidated pattern.
-    fn implement_guard_nojump(&mut self, op: &Op, fail_index: u32) {
-        let fail_label = self.mc.new_dynamic_label();
-        self.append_guard_token(op, fail_index, fail_label);
     }
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or
@@ -4042,143 +3972,6 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Common tail: build DynasmFailDescr, create GuardToken, push to
-    /// pending_guard_tokens and fail_descrs.
-    fn append_guard_token(&mut self, op: &Op, fail_index: u32, fail_label: DynamicLabel) {
-        let fail_arg_types = self.infer_fail_arg_types(op, None);
-        let fail_args = op
-            .fail_args
-            .as_ref()
-            .map(|fa| fa.to_vec())
-            .unwrap_or_default();
-        // Dynasm helper parity: fail_arg_locs are absolute jf_frame slots
-        // consumed via JitFrame::get_int_value(). None = virtual/unmapped.
-        let fail_arg_locs: Vec<Option<usize>> = fail_args
-            .iter()
-            .map(|opref| {
-                if opref.is_none() || opref.is_constant() {
-                    None
-                } else {
-                    self.opref_to_slot
-                        .get(&opref.raw())
-                        .copied()
-                        .map(|slot| slot + JITFRAME_FIXED_SIZE)
-                }
-            })
-            .collect();
-        let mut descr = DynasmFailDescr::new(fail_index, self.trace_id, fail_arg_types, false);
-        descr.fail_arg_locs = fail_arg_locs;
-        let descr = Arc::new(descr);
-        let gcmap = self.gcmap_from_fail_arg_locs(&descr.fail_arg_types, &descr.fail_arg_locs);
-        self.pending_guard_tokens.push(GuardToken {
-            fail_label,
-            fail_descr: descr.clone(),
-            const_stores: Vec::new(),
-            gcmap,
-        });
-        if op.opcode == OpCode::GuardNotForced2 {
-            self.finish_gcmap = Some(gcmap);
-        }
-        self.fail_descrs.push(descr);
-    }
-
-    // ----------------------------------------------------------------
-    // assembler.py:1773 genop_guard_guard_true
-    // ----------------------------------------------------------------
-
-    /// regalloc.py:429 load_condition_into_cc — if guard_success_cc
-    /// is not yet set, emit TEST arg0 and set cc = NZ.
-    fn load_condition_into_cc(&mut self, op: &Op) {
-        if self.guard_success_cc.is_none() {
-            self.load_arg_to_rax(op.arg(0));
-            dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
-            self.guard_success_cc = Some(CC_NE); // rx86.Conditions['NZ']
-        }
-    }
-
-    /// assembler.py:1773 genop_guard_guard_true.
-    /// genop_guard_guard_nonnull = genop_guard_guard_true (alias)
-    /// genop_guard_guard_no_overflow = genop_guard_guard_true (alias)
-    fn genop_guard_guard_true(&mut self, op: &Op, fail_index: u32) {
-        self.load_condition_into_cc(op);
-        self.implement_guard(op, fail_index);
-    }
-
-    /// assembler.py:1777 genop_guard_guard_false.
-    /// genop_guard_guard_isnull = genop_guard_guard_false (alias)
-    /// genop_guard_guard_overflow = genop_guard_guard_false (alias)
-    fn genop_guard_guard_false(&mut self, op: &Op, fail_index: u32) {
-        self.load_condition_into_cc(op);
-        self.guard_success_cc = Some(invert_cc(self.guard_success_cc.take().unwrap()));
-        self.implement_guard(op, fail_index);
-    }
-
-    /// assembler.py:1871 genop_guard_guard_value.
-    fn genop_guard_guard_value(&mut self, op: &Op, fail_index: u32) {
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
-        dynasm!(self.mc ; .arch aarch64 ; cmp x0, x1);
-
-        self.guard_success_cc = Some(CC_E);
-        self.implement_guard(op, fail_index);
-
-        // regalloc.py:496-501 make_a_counter_per_value
-        if let Some(descr) = self.fail_descrs.last() {
-            if let Some(fa) = op.fail_args.as_ref() {
-                let arg0 = op.arg(0);
-                if let Some(idx) = fa.iter().position(|&r| r == arg0) {
-                    let type_tag = match descr.fail_arg_types.get(idx) {
-                        Some(Type::Ref) => DynasmFailDescr::TY_REF,
-                        Some(Type::Float) => DynasmFailDescr::TY_FLOAT,
-                        _ => DynasmFailDescr::TY_INT,
-                    };
-                    descr.make_a_counter_per_value(idx as u32, type_tag);
-                }
-            }
-        }
-    }
-
-    /// assembler.py:1903 genop_guard_guard_class.
-    fn genop_guard_guard_class(&mut self, op: &Op, fail_index: u32) {
-        let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
-            ResolvedArg::Const(v) => Some(v),
-            _ => None,
-        };
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
-        self._cmp_guard_class_old(expected_classptr_imm);
-        self.guard_success_cc = Some(CC_E);
-        self.implement_guard(op, fail_index);
-    }
-
-    /// assembler.py:1908 genop_guard_guard_nonnull_class.
-    /// CMP(locs[0], imm1); JB → fail; _cmp_guard_class; JNE → fail
-    fn genop_guard_guard_nonnull_class(&mut self, op: &Op, fail_index: u32) {
-        self.load_arg_to_rax(op.arg(0));
-        // assembler.py:1909 CMP(locs[0], imm1) — JB catches NULL (0)
-        dynasm!(self.mc ; .arch aarch64 ; cmp x0, 1);
-
-        // assembler.py:1911 emit_forward_jump('B') — jump if below (NULL)
-        let fail_label = self.emit_guard_jcc(CC_B);
-
-        let expected_classptr_imm = match self.resolve_opref(op.arg(1)) {
-            ResolvedArg::Const(v) => Some(v),
-            _ => None,
-        };
-        self.load_arg_to_rax(op.arg(0));
-        self.load_arg_to_rcx(op.arg(1));
-        self._cmp_guard_class_old(expected_classptr_imm);
-
-        // assembler.py:1914 patch_forward_jump — both paths share the
-        // same fail_label, so a second JNE to the same target suffices.
-        dynasm!(self.mc ; .arch aarch64 ; b.ne =>fail_label);
-
-        // assembler.py:1916-1917
-        // guard_success_cc is not used here — we already emitted the jumps.
-        // Manually append the guard token.
-        self.append_guard_token(op, fail_index, fail_label);
-    }
-
     /// assembler.py:1794 generate_guard_no_exception:
     /// `LDR loc, [loc]; CMP loc, #0` with success on zero.
     fn emit_guard_no_exception_check(&mut self) {
@@ -4189,19 +3982,6 @@ impl<'a> AssemblerARM64<'a> {
             ; cmp x16, xzr
         );
         self.guard_success_cc = Some(CC_E);
-    }
-
-    /// assembler.py:1782 genop_guard_guard_no_exception.
-    fn genop_guard_guard_no_exception(&mut self, op: &Op, fail_index: u32) {
-        self.emit_guard_no_exception_check();
-        self.implement_guard(op, fail_index);
-    }
-
-    /// assembler.py:1799 genop_guard_guard_not_invalidated.
-    /// Does NOT emit a conditional jump — records position for external
-    /// invalidation patching.
-    fn genop_guard_guard_not_invalidated(&mut self, op: &Op, fail_index: u32) {
-        self.implement_guard_nojump(op, fail_index);
     }
 
     /// assembler.py:2207-2222 _store_force_index: before a call that may force,
@@ -4221,11 +4001,13 @@ impl<'a> AssemblerARM64<'a> {
         // The full metadata (faillocs, rd_numb, etc.) will be filled in
         // when the guard is actually emitted in append_guard_token_with_faillocs.
         let fail_arg_types = self.infer_fail_arg_types(next_op, Some(next_idx));
+        // Pre-allocated GuardNotForced descr — ResumeGuardDescr family.
         let descr = Arc::new(DynasmFailDescr::new(
             fail_index,
             self.trace_id,
             fail_arg_types,
-            false,
+            false, // is_finish
+            true,  // is_resume_guard
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
         self.pending_force_descr = Some(descr);
@@ -4237,18 +4019,6 @@ impl<'a> AssemblerARM64<'a> {
             ; str X(16), [x29, JF_FORCE_DESCR_OFS as u32]
             ; str xzr, [x29, JF_DESCR_OFS as u32]
         );
-    }
-
-    /// assembler.py:2228-2232 genop_guard_guard_not_forced.
-    /// Check jf_descr == 0 (not forced); if non-zero, guard fails.
-    fn genop_guard_guard_not_forced(&mut self, op: &Op, fail_index: u32) {
-        // assembler.py:2229-2231: CMP [jf_descr], 0; guard_success_cc = 'E'
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x0, [x29, JF_DESCR_OFS as u32]
-            ; cmp x0, 0
-        );
-        self.guard_success_cc = Some(CC_E);
-        self.implement_guard(op, fail_index);
     }
 
     // ----------------------------------------------------------------
@@ -4460,11 +4230,13 @@ impl<'a> AssemblerARM64<'a> {
                 .collect()
         };
         // compile.py:618-669 parity: use type-specific global singleton.
+        // FINISH op exit (DoneWithThisFrame*) — `compile.py:185` skips these.
         let descr = Arc::new(DynasmFailDescr::new(
             fail_index,
             self.trace_id,
             fail_arg_types.clone(),
-            true,
+            true,  // is_finish
+            false, // is_resume_guard
         ));
         // Finish ops write the type-appropriate singleton pointer to jf_descr
         // so CALL_ASSEMBLER's fast path CMP matches the correct variant.

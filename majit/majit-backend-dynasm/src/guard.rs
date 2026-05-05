@@ -8,7 +8,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use majit_backend::ExitRecoveryLayout;
-use majit_ir::{Const, Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
+use majit_ir::{Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
 
 /// Re-export the shared per-cpu descr attachment types so existing
 /// `crate::guard::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle}`
@@ -27,6 +27,17 @@ pub struct DynasmFailDescr {
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// `compile.py:185` `isinstance(descr, ResumeDescr)` parity at the
+    /// runtime descr layer.  Set explicitly at construction site to
+    /// reflect the upstream class hierarchy (ResumeGuardDescr family
+    /// → true; DoneWithThisFrame*/ExitFrameWithExceptionDescr → false).
+    /// Currently invariant under construction with `is_resume_guard ==
+    /// !is_finish` (dynasm has no `is_external_jump` counterpart — the
+    /// raw cross-loop JMP at `assembler.py:2456-2462 closing_jump`
+    /// produces no fail descr) but kept as an explicit field so the
+    /// type discrimination is owned by the producer rather than
+    /// derived at the use site.
+    pub is_resume_guard: bool,
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
     /// True when this FINISH was emitted via
     /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
@@ -41,14 +52,6 @@ pub struct DynasmFailDescr {
     /// Trace op index of the guard that produced this exit.
     pub source_op_index: Option<usize>,
 
-    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool referenced by rd_numb.
-    pub rd_consts: Option<Vec<Const>>,
-    /// resume.py:488 — virtual object field info.
-    pub rd_virtuals: Option<Vec<std::rc::Rc<RdVirtualInfo>>>,
-    /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values).
-    pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
     /// Backend-origin recovery layout, built at compile time from fail_arg_types.
     pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
 
@@ -67,12 +70,32 @@ pub struct DynasmFailDescr {
     pub bridge_addr: UnsafeCell<usize>,
     // fail_args_slots removed: bridge source_slots are derived from
     // fail_arg_locs via rebuild_faillocs_from_descr (assembler.py:201).
-    /// `compile.py:186` `descr.rd_loop_token = clt` — the owning
-    /// `CompiledLoopToken`, stored as pyre's stable `u64` **green_key**
-    /// (the handle `MetaInterp.compiled_loops` is indexed by).  Late-set
-    /// by the post-compile walker that ports `compile.py:183-203
-    /// record_loop_or_bridge`.
-    pub rd_loop_token: UnsafeCell<Option<u64>>,
+    /// `compile.py:186` `descr.rd_loop_token = clt` line-by-line port:
+    /// the owning `Arc<CompiledLoopToken>` itself. Set by
+    /// `record_loop_or_bridge` (compile.py:171-211 walker).  Together
+    /// with `CompiledLoopToken.loop_token_wref` (compile.py:180-181)
+    /// this gives readers a direct chain `descr.rd_loop_token_clt() ->
+    /// clt -> upgrade -> Arc<JitCellToken>` matching RPython's
+    /// `descr.rd_loop_token.loop_token_wref()` access.
+    pub rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<majit_backend::CompiledLoopToken>>>,
+    /// Unified-Descr Port Epic Session 5a: back-pointer to the metainterp
+    /// `ResumeGuardDescr` Arc the optimizer stamped onto the originating
+    /// guard op (`op.descr`).  PyPy keeps a single descr object per
+    /// guard (`history.py:121`); pyre's split-descr architecture stores
+    /// this Arc as a back-pointer so subsequent Session 5b/c/d can
+    /// migrate readers of duplicated fields (`rd_numb`/`rd_consts`/
+    /// `rd_virtuals`/`rd_pendingfields`/`fail_arg_types` etc.) to read
+    /// through the metainterp Arc instead of the local copy.  Once all
+    /// readers migrate, the local fields are dropped and DynasmFailDescr
+    /// becomes a pure backend-payload struct, ready for Session 5h
+    /// migration into the metainterp Arc's `backend_data` slot.
+    ///
+    /// `None` for synthetic backend descrs minted by the runtime
+    /// classifier (`runner.rs::find_descr_by_ptr` for FINISH /
+    /// PropagateExceptionDescr / ExitFrameWithExceptionDescr exits) —
+    /// those exits route through dedicated metainterp Done* descrs
+    /// owned by `MetaInterpStaticData`, not via `op.descr`.
+    pub meta_descr: Option<DescrRef>,
 }
 
 // Safety: single-threaded JIT (like RPython with GIL).
@@ -90,38 +113,42 @@ impl DynasmFailDescr {
     pub const TY_REF: u64 = 0x04;
     pub const TY_FLOAT: u64 = 0x06;
 
-    pub fn new(fail_index: u32, trace_id: u64, fail_arg_types: Vec<Type>, is_finish: bool) -> Self {
+    pub fn new(
+        fail_index: u32,
+        trace_id: u64,
+        fail_arg_types: Vec<Type>,
+        is_finish: bool,
+        is_resume_guard: bool,
+    ) -> Self {
         DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
             is_finish,
+            is_resume_guard,
             is_exit_frame_with_exception: false,
             fail_arg_locs: Vec::new(),
             rd_locs: Vec::new(),
             source_op_index: None,
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
-            rd_pendingfields: None,
             recovery_layout: UnsafeCell::new(None),
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
             bridge_addr: UnsafeCell::new(0),
-            rd_loop_token: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            meta_descr: None,
         }
     }
 
-    /// `compile.py:186` read side: owning loop's green_key, or `None` if
-    /// `record_loop_or_bridge` has not yet run for this descr.
-    pub fn rd_loop_token(&self) -> Option<u64> {
-        unsafe { *self.rd_loop_token.get() }
+    /// `compile.py:186` write side: invoked by the post-compile walker
+    /// once per ResumeDescr in the newly-compiled trace.  Stamps the
+    /// owning `Arc<CompiledLoopToken>`.
+    pub fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<majit_backend::CompiledLoopToken>) {
+        unsafe { *self.rd_loop_token_clt.get() = Some(clt) };
     }
 
-    /// `compile.py:186` write side: invoked by the post-compile walker
-    /// once per ResumeDescr in the newly-compiled trace.
-    pub fn set_rd_loop_token(&self, green_key: u64) {
-        unsafe { *self.rd_loop_token.get() = Some(green_key) };
+    /// `compile.py:186` reader for the clt-typed slot.
+    pub fn rd_loop_token_clt(&self) -> Option<&std::sync::Arc<majit_backend::CompiledLoopToken>> {
+        unsafe { (*self.rd_loop_token_clt.get()).as_ref() }
     }
 
     /// compile.py:826-830 store_hash.
@@ -188,11 +215,18 @@ impl DynasmFailDescr {
 
     /// Build a FailDescrLayout for this descriptor (parity with CraneliftFailDescr::layout).
     pub fn layout(&self) -> majit_backend::FailDescrLayout {
+        // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
+        // can reach them after the frontend trace cache evicts the owning
+        // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).  Read through
+        // the metainterp ResumeGuardDescr Arc captured at assembly time
+        // (Session 5b — single source of truth).
+        let meta_fd = self.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
         majit_backend::FailDescrLayout {
             fail_index: self.fail_index,
             fail_arg_types: self.fail_arg_types.clone(),
             is_finish: self.is_finish,
-            trace_id: self.trace_id,
+            // Session 5c: read trace_id through meta_descr too.
+            trace_id: meta_fd.map_or(self.trace_id, |fd| fd.trace_id()),
             source_op_index: self.source_op_index,
             gc_ref_slots: self
                 .fail_arg_types
@@ -204,13 +238,12 @@ impl DynasmFailDescr {
             frame_stack: None,
             recovery_layout: self.recovery_layout(),
             trace_info: None,
-            // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
-            // can reach them after the frontend trace cache evicts the owning
-            // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).
-            rd_numb: self.rd_numb.clone(),
-            rd_consts: self.rd_consts.clone(),
-            rd_virtuals: self.rd_virtuals.clone(),
-            rd_pendingfields: self.rd_pendingfields.clone(),
+            rd_numb: meta_fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec()),
+            rd_consts: meta_fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec()),
+            rd_virtuals: meta_fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec()),
+            rd_pendingfields: meta_fd
+                .and_then(|fd| fd.rd_pendingfields())
+                .map(|s| s.to_vec()),
         }
     }
 }
@@ -250,10 +283,36 @@ impl Descr for DynasmFailDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+
+    /// `compile.py:185` `isinstance(descr, ResumeDescr)` parity at the
+    /// runtime descr layer.  Session 5d: forward through the metainterp
+    /// ResumeGuardDescr Arc captured at assembly time so the type
+    /// discrimination matches the metainterp-side class hierarchy
+    /// (`compile.py:676 ResumeDescr` family). Fallback to the local
+    /// `is_resume_guard` flag for synthetic test descrs that bypass
+    /// the assembler-time meta_descr stamp.
+    fn is_resume_guard(&self) -> bool {
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.is_resume_guard, |fd| fd.is_resume_guard())
+    }
 }
 
 impl FailDescr for DynasmFailDescr {
     fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+
+    fn fail_index_per_trace(&self) -> u32 {
+        // The backend descr's structural `fail_index` IS the per-trace
+        // key — `assembler.py:227 self.faildescr.index = i` is allocated
+        // per-trace at backend compile time.  Only the metainterp side
+        // distinguishes a global `fail_index` (alloc_fail_index counter)
+        // from the per-trace key; the backend has only the per-trace
+        // value.  Override the trait default (0) so that callers that
+        // receive the backend descr through `bridge_source_descr`'s
+        // fallback chain (mod.rs:7713) can still locate the source guard.
         self.fail_index
     }
 
@@ -262,19 +321,53 @@ impl FailDescr for DynasmFailDescr {
     }
 
     fn is_finish(&self) -> bool {
-        self.is_finish
+        // Session 5d: forward through metainterp ResumeGuardDescr Arc.
+        // DoneWithThisFrame{Void,Int,Ref,Float} and ExitFrameWithExceptionDescrRef
+        // override `is_finish() -> true` on the metainterp side; the rest
+        // — including `PropagateExceptionDescr` (`compile.py:1092`
+        // `class PropagateExceptionDescr(AbstractFailDescr)` inherits
+        // `final_descr = False`, see `compile.rs:2314`) — take the trait
+        // default `false`.
+        // Fallback to local field for synthetic test descrs.
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.is_finish, |fd| fd.is_finish())
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
-        self.is_exit_frame_with_exception
+        // Session 5d: forward through metainterp ResumeGuardDescr Arc.
+        // ExitFrameWithExceptionDescrRef overrides on the metainterp side.
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.is_exit_frame_with_exception, |fd| {
+                fd.is_exit_frame_with_exception()
+            })
     }
 
     fn trace_id(&self) -> u64 {
-        self.trace_id
+        // Session 5c: forward through metainterp ResumeGuardDescr Arc
+        // (Session 5a back-pointer).  Single source of truth — the
+        // metainterp side stamps trace_id in record_loop_or_bridge
+        // (compile.py:185 line-by-line counterpart).  Fallback to
+        // local field for synthetic test descrs that bypass the
+        // assembler-time meta_descr stamp.
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.trace_id, |fd| fd.trace_id())
     }
 
-    fn rd_loop_token(&self) -> Option<u64> {
-        DynasmFailDescr::rd_loop_token(self)
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        DynasmFailDescr::rd_loop_token_clt(self).map(|arc| arc as &dyn std::any::Any)
+    }
+
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<majit_backend::CompiledLoopToken> = clt
+            .downcast::<majit_backend::CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        DynasmFailDescr::set_rd_loop_token_clt(self, typed);
     }
 
     fn get_status(&self) -> u64 {
@@ -293,26 +386,31 @@ impl FailDescr for DynasmFailDescr {
         self.status.load(Ordering::Acquire) & Self::ST_BUSY_FLAG != 0
     }
 
-    // resume.py:450-488 readers: expose the backend-side rd_* fields
-    // through the FailDescr trait so callers holding a `&dyn FailDescr`
-    // pointing at a DynasmFailDescr observe the same payload that
-    // `layout()` snapshots.  The metainterp-side
-    // `ResumeGuardDescr::rd_*()` returns the populated payload; without
-    // these overrides, the trait default returns `None` for backend
-    // descrs even though `pub rd_numb` etc. are populated at compile
-    // time.  Setters keep their panic default — backend descrs are
-    // write-once during compile (see `assembler.rs:2718-2722` for the
-    // single producer site).
+    // resume.py:450-488 readers: forward to the metainterp ResumeGuardDescr
+    // Arc captured at assembly time (Session 5a back-pointer).  Single
+    // source of truth — drops the duplicated local rd_* copies.
     fn rd_numb(&self) -> Option<&[u8]> {
-        self.rd_numb.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_numb())
     }
     fn rd_consts(&self) -> Option<&[majit_ir::Const]> {
-        self.rd_consts.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_consts())
     }
     fn rd_virtuals(&self) -> Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]> {
-        self.rd_virtuals.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_virtuals())
     }
     fn rd_pendingfields(&self) -> Option<&[majit_ir::GuardPendingFieldEntry]> {
-        self.rd_pendingfields.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_pendingfields())
     }
 }

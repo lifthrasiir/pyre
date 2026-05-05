@@ -862,7 +862,7 @@ pub trait FailDescr: Descr {
     // `get_resumestorage(): return prev`).
     //
     // Default impls return `None` / panic for non-resume FailDescrs
-    // (e.g. `BridgeFailDescrProxy`, `_DoneWithThisFrameDescr` family,
+    // (e.g. `_DoneWithThisFrameDescr` family,
     // `ExitFrameWithExceptionDescrRef`) — these never carry resume
     // data, matching RPython where the `_attrs_` only live on
     // `AbstractResumeGuardDescr` subclasses.
@@ -1031,21 +1031,123 @@ pub trait FailDescr: Descr {
         0
     }
 
-    /// `compile.py:186` `descr.rd_loop_token = clt` parity: the owning
-    /// `CompiledLoopToken` of the loop that emitted this guard.
+    /// Stamp the owning trace's identifier onto a resume-guard descr.
     ///
-    /// Returned as pyre's stable `u64` **green_key** — the sticky handle
-    /// `MetaInterp.compiled_loops` is indexed by.  Upstream uses the
-    /// `CompiledLoopToken` object itself and reaches the owning
-    /// `JitCellToken` via `rd_loop_token.loop_token_wref()`; pyre reaches
-    /// the same `CompiledEntry` via `compiled_loops.get(&green_key)`.
+    /// Pyre-only: RPython resolves descr identity by Python `id(descr)`
+    /// (`history.py:125`), so the same `ResumeGuardDescr` object the
+    /// metainterp stamps is what `cpu.get_latest_descr()` later returns.
+    /// Pyre's runtime exit path uses a `(trace_id, fail_index)` lookup
+    /// key (`runner.rs::find_descr` / `compiler.rs::find_descr_by_ptr`)
+    /// that needs the owning trace_id captured on the descr; the
+    /// `record_loop_or_bridge` walker (`compile.py:185-186`) is the
+    /// natural stamp site since it already has `trace_id` in scope and
+    /// already dispatches on `is_resume_guard()`.
     ///
-    /// Late-set: returns `None` only for synthetic descrs fabricated
-    /// inside `find_descr_by_ptr` for per-cpu FINISH-exit matches.
-    /// All real guard descrs are stamped by the post-compile walker
-    /// equivalent of `record_loop_or_bridge` (`compile.py:183-203`).
-    fn rd_loop_token(&self) -> Option<u64> {
+    /// Default panic — only `ResumeGuardDescr`-family descrs override.
+    fn set_trace_id(&self, _trace_id: u64) {
+        panic!(
+            "set_trace_id invoked on a FailDescr that does not carry a \
+             trace_id slot (compile.py:185 isinstance(descr, ResumeDescr) \
+             gates the stamp; only ResumeGuardDescr-family descrs accept it)"
+        );
+    }
+
+    /// Per-trace fail-index assigned by `compile.rs::build_guard_metadata`.
+    ///
+    /// Pyre-only: pyre's runtime exit path uses a `(trace_id, fail_index)`
+    /// key where `fail_index` is the per-trace numbering the optimizer
+    /// hands the backend (matching `assembler.py:227 self.faildescr.index
+    /// = i` semantics).  The descr's structural `fail_index` is allocated
+    /// from a global counter (`alloc_fail_index`), so a separate slot
+    /// captures the per-trace key for lookup parity.  Default 0 — non-
+    /// resume FailDescrs are not threaded through `build_guard_metadata`.
+    fn fail_index_per_trace(&self) -> u32 {
+        0
+    }
+
+    /// `build_guard_metadata` per-trace fail-index stamp setter.  Default
+    /// panic — only `ResumeGuardDescr`-family descrs override.
+    fn set_fail_index_per_trace(&self, _fail_index: u32) {
+        panic!(
+            "set_fail_index_per_trace invoked on a FailDescr that does not \
+             carry a per-trace fail_index slot (only ResumeGuardDescr-family \
+             descrs reach the build_guard_metadata pipeline)"
+        );
+    }
+
+    /// `compile.py:186` `descr.rd_loop_token = clt` line-by-line port.
+    ///
+    /// Returns the owning `Arc<CompiledLoopToken>` typed as `&dyn Any`
+    /// (the `token_handle_any` pattern — `majit-ir` cannot reference
+    /// `majit-backend::CompiledLoopToken` without a dependency cycle).
+    /// Consumers in `majit-metainterp` downcast to
+    /// `Arc<CompiledLoopToken>` and chain `clt.upgrade_loop_token()` to
+    /// reach the owning `JitCellToken` via the weakref clt holds per
+    /// `compile.py:180-181`.
+    ///
+    /// Default `None` — non-resume FailDescrs (`_DoneWithThisFrameDescr`
+    /// family, `ExitFrameWithExceptionDescrRef`) are skipped by
+    /// `compile.py:185 isinstance(descr, ResumeDescr)` and never receive
+    /// a clt stamp.  `ResumeGuardDescr` (and subclasses) override this to
+    /// return the captured `Arc<CompiledLoopToken>`; the bridge-source
+    /// path consumes the metainterp ResumeGuardDescr Arc directly
+    /// (Unified-Descr Port Epic, Session 6.7) so no proxy override is
+    /// needed.
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         None
+    }
+
+    /// `compile.py:186` setter for the new clt-typed slot. Default
+    /// panics — only resume guard descrs accept this.  Implementations
+    /// store the Arc cast back to `Arc<CompiledLoopToken>` via
+    /// `downcast`; the trait keeps the parameter as
+    /// `Arc<dyn Any + Send + Sync>` so `majit-ir` does not depend on
+    /// `majit-backend`.
+    fn set_rd_loop_token_clt(&self, _clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        panic!(
+            "set_rd_loop_token_clt invoked on a non-resume FailDescr \
+             (compile.py:186 only writes to ResumeGuardDescr objects)"
+        );
+    }
+
+    /// Backend-specific extension slot.
+    ///
+    /// In RPython the same `ResumeGuardDescr` object carries both the
+    /// metainterp-side fields (`rd_numb`, `rd_consts`, `rd_virtuals`,
+    /// `rd_pendingfields`, `status`, `rd_loop_token`) at compile.py:855
+    /// + compile.py:186 *and* the backend-stored fields (`rd_locs`,
+    /// `adr_jump_offset`, `fail_arg_locs`) that
+    /// `llsupport/assembler.py:279` and `x86/assembler.py:857` write
+    /// directly through Python's dynamic attribute model.  The Rust
+    /// direct translation uses a type-erased `Box<dyn Any + Send + Sync>`
+    /// slot the backend fills with a backend-specific struct
+    /// (e.g. `DynasmGuardData`, `CraneliftGuardData`) at compile time.
+    /// Callers downcast through `downcast_ref::<T>()` on the returned
+    /// reference.
+    ///
+    /// Default `None` — non-resume FailDescrs (`_DoneWithThisFrameDescr`
+    /// family, `ExitFrameWithExceptionDescrRef`) never go through the
+    /// backend-codegen path that populates this slot, mirroring how
+    /// upstream's `assembler.py:279 guardtok.faildescr.rd_locs =
+    /// positions` only fires for `ResumeGuardDescr`-family descrs.
+    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
+    /// Setter for the backend extension slot. Default panics — only
+    /// `ResumeGuardDescr` and its subtypes (`ResumeAtPositionDescr`,
+    /// `ResumeGuardForcedDescr`, `ResumeGuardExcDescr`,
+    /// `ResumeGuardCopiedDescr`, `ResumeGuardCopiedExcDescr`,
+    /// `CompileLoopVersionDescr`) accept it. Implementations replace
+    /// any prior `Box` in place — the descr identity (Arc address,
+    /// fail_index, status, subtype tag) survives the write.
+    fn set_backend_data(&self, _data: Box<dyn std::any::Any + Send + Sync>) {
+        panic!(
+            "set_backend_data invoked on a FailDescr that does not \
+             carry a backend_data slot (compile.py:186 + \
+             llsupport/assembler.py:279,857: only ResumeGuardDescr-family \
+             descrs receive backend extension data)"
+        );
     }
 
     /// Whether the given exit slot should be treated as a real GC root.

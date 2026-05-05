@@ -186,24 +186,30 @@ pub struct CraneliftFailDescr {
     /// one extra interpreter round-trip on the guard fire that first
     /// triggers it.
     pub bridge_frame_depth_cache: std::sync::atomic::AtomicUsize,
-    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
-    /// Populated at compile time from the frontend's `StoredExitLayout` so
-    /// `compiled_exit_layout_from_backend` can reconstruct the blackhole
-    /// chain after the `CompiledTrace` entry is evicted but the descriptor
-    /// remains reachable via its backend-side handle.
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
-    pub rd_consts: Option<Vec<Const>>,
-    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
-    /// Deferred heap writes associated with this guard exit.
-    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
-    /// `compile.py:186` `descr.rd_loop_token = clt` — the owning
-    /// `CompiledLoopToken`, stored as pyre's stable `u64` **green_key**
-    /// (the handle `MetaInterp.compiled_loops` is indexed by).  Late-set
-    /// by the post-compile walker that ports `compile.py:183-203
-    /// record_loop_or_bridge`.
-    pub rd_loop_token: UnsafeCell<Option<u64>>,
+    /// `compile.py:186` `descr.rd_loop_token = clt` line-by-line port:
+    /// the owning `Arc<CompiledLoopToken>`. Late-set by the post-compile
+    /// walker that ports `compile.py:183-203 record_loop_or_bridge`.
+    /// Together with `CompiledLoopToken.loop_token_wref`
+    /// (`compile.py:180-181`) this gives readers a direct chain
+    /// `descr.rd_loop_token_clt() -> clt.upgrade -> Arc<JitCellToken>`
+    /// matching RPython's `descr.rd_loop_token.loop_token_wref()`
+    /// access (`pyjitpl.py:2897`).
+    pub rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<majit_backend::CompiledLoopToken>>>,
+    /// Unified-Descr Port Epic Session 5a: back-pointer to the metainterp
+    /// `ResumeGuardDescr` Arc the optimizer stamped onto the originating
+    /// guard op (`op.descr`).  PyPy keeps a single descr object per
+    /// guard (`history.py:121`); pyre's split-descr architecture stores
+    /// this Arc as a back-pointer so subsequent Session 5b/c/d can
+    /// migrate readers of duplicated fields (`rd_numb`/`rd_consts`/
+    /// `rd_virtuals`/`rd_pendingfields`/`fail_arg_types` etc.) to read
+    /// through the metainterp Arc instead of the local copy.
+    ///
+    /// `None` for synthetic backend descrs minted by the runtime
+    /// classifier (`compiler.rs::find_descr_by_ptr` for FINISH /
+    /// PropagateExceptionDescr / ExitFrameWithExceptionDescr exits) —
+    /// those exits route through dedicated metainterp Done* descrs
+    /// owned by `MetaInterpStaticData`, not via `op.descr`.
+    pub meta_descr: Option<DescrRef>,
 }
 
 impl std::fmt::Debug for CraneliftFailDescr {
@@ -317,11 +323,8 @@ impl CraneliftFailDescr {
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
             bridge_frame_depth_cache: std::sync::atomic::AtomicUsize::new(0),
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
-            rd_pendingfields: None,
-            rd_loop_token: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            meta_descr: None,
         }
     }
 
@@ -360,24 +363,21 @@ impl CraneliftFailDescr {
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
             bridge_frame_depth_cache: std::sync::atomic::AtomicUsize::new(0),
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
-            rd_pendingfields: None,
-            rd_loop_token: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
+            meta_descr: None,
         }
     }
 
-    /// `compile.py:186` read side: owning loop's green_key, or `None` if
-    /// `record_loop_or_bridge` has not yet run for this descr.
-    pub fn rd_loop_token(&self) -> Option<u64> {
-        unsafe { *self.rd_loop_token.get() }
+    /// `compile.py:186` write side: invoked by the post-compile walker
+    /// once per ResumeDescr in the newly-compiled trace.  Stamps the
+    /// owning `Arc<CompiledLoopToken>`.
+    pub fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<majit_backend::CompiledLoopToken>) {
+        unsafe { *self.rd_loop_token_clt.get() = Some(clt) };
     }
 
-    /// `compile.py:186` write side: invoked by the post-compile walker
-    /// once per ResumeDescr in the newly-compiled trace.
-    pub fn set_rd_loop_token(&self, green_key: u64) {
-        unsafe { *self.rd_loop_token.get() = Some(green_key) };
+    /// `compile.py:186` reader for the clt-typed slot.
+    pub fn rd_loop_token_clt(&self) -> Option<&std::sync::Arc<majit_backend::CompiledLoopToken>> {
+        unsafe { (*self.rd_loop_token_clt.get()).as_ref() }
     }
 
     // UnsafeCell accessor helpers — single-threaded, no lock needed.
@@ -531,10 +531,15 @@ impl CraneliftFailDescr {
             .collect();
         let recovery = unsafe { &*self.recovery_layout.get() }.clone();
         let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
+        // resume.py:450-488 propagate rd_* for post-eviction reconstruction.
+        // Read through the metainterp ResumeGuardDescr Arc (Session 5b
+        // back-pointer) — single source of truth.
+        let meta_fd = self.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
         FailDescrLayout {
             fail_index: self.fail_index,
             source_op_index: self.source_op_index,
-            trace_id: self.trace_id,
+            // Session 5c: read trace_id through meta_descr too.
+            trace_id: meta_fd.map_or(self.trace_id, |fd| fd.trace_id()),
             trace_info: unsafe { &*self.trace_info.get() }.clone(),
             fail_arg_types: self.fail_arg_types.clone(),
             is_finish: self.is_finish,
@@ -542,11 +547,12 @@ impl CraneliftFailDescr {
             force_token_slots: self.force_token_slots.clone(),
             recovery_layout: recovery,
             frame_stack,
-            // resume.py:450-488 propagate rd_* for post-eviction reconstruction.
-            rd_numb: self.rd_numb.clone(),
-            rd_consts: self.rd_consts.clone(),
-            rd_virtuals: self.rd_virtuals.clone(),
-            rd_pendingfields: self.rd_pendingfields.clone(),
+            rd_numb: meta_fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec()),
+            rd_consts: meta_fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec()),
+            rd_virtuals: meta_fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec()),
+            rd_pendingfields: meta_fd
+                .and_then(|fd| fd.rd_pendingfields())
+                .map(|s| s.to_vec()),
         }
     }
 }
@@ -559,10 +565,46 @@ impl majit_ir::Descr for CraneliftFailDescr {
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }
+
+    /// `compile.py:185` `isinstance(descr, ResumeDescr)` parity. Backend
+    /// `CraneliftFailDescr` plays the role of upstream's
+    /// `ResumeGuardDescr` for guard-failure exits, of the
+    /// `DoneWithThisFrame*` / `ExitFrameWithExceptionDescr` family for
+    /// finish exits, and of `TargetToken` for external JUMP exits (the
+    /// dispatcher-routed cross-loop JUMP path).  Only the first is a
+    /// `ResumeDescr` in upstream; finish descrs and `TargetToken`s are
+    /// distinct class hierarchies and `compile.py:185` skips them.
+    ///
+    /// Session 5d: forward through metainterp ResumeGuardDescr Arc when
+    /// available.  `is_external_jump` short-circuits to false because
+    /// cranelift's external-JUMP descrs are backend-only synthetic
+    /// objects with no metainterp counterpart (meta_descr is None for
+    /// them anyway, but the early-return makes the intent explicit).
+    fn is_resume_guard(&self) -> bool {
+        if self.is_external_jump {
+            return false;
+        }
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(!self.is_finish, |fd| fd.is_resume_guard())
+    }
 }
 
 impl FailDescr for CraneliftFailDescr {
     fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+
+    fn fail_index_per_trace(&self) -> u32 {
+        // The backend descr's structural `fail_index` IS the per-trace
+        // key — `assembler.py:227 self.faildescr.index = i` is allocated
+        // per-trace at backend compile time.  Only the metainterp side
+        // distinguishes a global `fail_index` (alloc_fail_index counter)
+        // from the per-trace key; the backend has only the per-trace
+        // value.  Override the trait default (0) so that callers that
+        // receive the backend descr through `bridge_source_descr`'s
+        // fallback chain (mod.rs:7713) can still locate the source guard.
         self.fail_index
     }
 
@@ -571,14 +613,34 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn is_finish(&self) -> bool {
-        self.is_finish
+        // Session 5d: forward through metainterp ResumeGuardDescr Arc.
+        // DoneWithThisFrame{Void,Int,Ref,Float} and ExitFrameWithExceptionDescrRef
+        // override `is_finish() -> true` on the metainterp side; the rest
+        // — including `PropagateExceptionDescr` (`compile.py:1092`
+        // `class PropagateExceptionDescr(AbstractFailDescr)` inherits
+        // `final_descr = False`, see `compile.rs:2314`) — take the trait
+        // default `false`.
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.is_finish, |fd| fd.is_finish())
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
-        self.is_exit_frame_with_exception
+        // Session 5d: forward through metainterp ResumeGuardDescr Arc.
+        // ExitFrameWithExceptionDescrRef overrides on the metainterp side.
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.is_exit_frame_with_exception, |fd| {
+                fd.is_exit_frame_with_exception()
+            })
     }
 
     fn is_external_jump(&self) -> bool {
+        // Session 5d: backend-only flag, no metainterp counterpart —
+        // external-JUMP descrs are synthesized at the cranelift backend
+        // for cross-loop JUMP targets and have meta_descr == None.
         self.is_external_jump
     }
 
@@ -587,11 +649,27 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn trace_id(&self) -> u64 {
-        self.trace_id
+        // Session 5c: forward through metainterp ResumeGuardDescr Arc
+        // (Session 5a back-pointer).  Single source of truth — the
+        // metainterp side stamps trace_id in record_loop_or_bridge
+        // (compile.py:185 line-by-line counterpart).  Fallback to
+        // local field for synthetic test descrs that bypass the
+        // assembler-time meta_descr stamp.
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .map_or(self.trace_id, |fd| fd.trace_id())
     }
 
-    fn rd_loop_token(&self) -> Option<u64> {
-        CraneliftFailDescr::rd_loop_token(self)
+    fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        CraneliftFailDescr::rd_loop_token_clt(self).map(|arc| arc as &dyn std::any::Any)
+    }
+
+    fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let typed: std::sync::Arc<majit_backend::CompiledLoopToken> = clt
+            .downcast::<majit_backend::CompiledLoopToken>()
+            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
+        CraneliftFailDescr::set_rd_loop_token_clt(self, typed);
     }
 
     fn is_gc_ref_slot(&self, slot: usize) -> bool {
@@ -622,24 +700,32 @@ impl FailDescr for CraneliftFailDescr {
         self.is_compiling()
     }
 
-    // resume.py:450-488 readers: expose the backend-side rd_* fields
-    // through the FailDescr trait so callers holding a `&dyn FailDescr`
-    // pointing at a CraneliftFailDescr observe the same payload that
-    // backend-side direct field reads observe.  Without these overrides,
-    // the trait default returns `None` even though `pub rd_numb` etc.
-    // are populated at compile time.  Setters keep their panic default —
-    // backend descrs are write-once during compile.
+    // resume.py:450-488 readers: forward to the metainterp ResumeGuardDescr
+    // Arc captured at assembly time (Session 5a back-pointer).  Single
+    // source of truth — drops the duplicated local rd_* copies.
     fn rd_numb(&self) -> Option<&[u8]> {
-        self.rd_numb.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_numb())
     }
     fn rd_consts(&self) -> Option<&[majit_ir::Const]> {
-        self.rd_consts.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_consts())
     }
     fn rd_virtuals(&self) -> Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]> {
-        self.rd_virtuals.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_virtuals())
     }
     fn rd_pendingfields(&self) -> Option<&[majit_ir::GuardPendingFieldEntry]> {
-        self.rd_pendingfields.as_deref()
+        self.meta_descr
+            .as_ref()
+            .and_then(|m| m.as_fail_descr())
+            .and_then(|fd| fd.rd_pendingfields())
     }
 }
 
