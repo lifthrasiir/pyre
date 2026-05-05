@@ -217,7 +217,7 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
     // saw the same registry — that path no longer exists; the id
     // must be threaded explicitly.)
     let file_for_walker = parse_pyopcode();
-    let module_id = register_rust_module(&file_for_walker);
+    let module_id = register_rust_module(&file_for_walker).expect("walker must succeed");
     let err = build_flow_from_rust_in_module(func, module_id)
         .err()
         .expect(

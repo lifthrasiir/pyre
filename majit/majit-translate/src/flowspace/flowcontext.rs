@@ -1713,7 +1713,24 @@ impl FlowContext {
     }
 
     fn find_global(&self, varname: &str) -> Result<Hlvalue, FlowContextError> {
-        if let Some(globals) = self.w_globals.value.dict_items() {
+        // RPython `flowcontext.py:284 self.w_globals = Constant(func.__globals__)`
+        // wraps `func.__globals__` — a *live* dict reference, not a
+        // snapshot. The lookup at `flowcontext.py:847
+        // w_globals.value[varname]` therefore observes any module-
+        // import-time write performed after FlowContext construction.
+        // Mirror by routing through `GraphFunc::live_globals()` so the
+        // rust-source path's `module_globals_id` partition is read at
+        // lookup time, not at FlowContext::new time. Non-rust-source
+        // callers (no `module_globals_id`) fall through to the
+        // statically-attached `globals` Constant — `live_globals()`
+        // already returns that as the fallback.
+        let live = self
+            .graph
+            .func
+            .as_ref()
+            .map(|func| func.live_globals())
+            .unwrap_or_else(|| self.w_globals.value.clone());
+        if let Some(globals) = live.dict_items() {
             if let Some(value) = globals.get(&ConstValue::byte_str(varname)) {
                 return Ok(Hlvalue::Constant(Constant::new(value.clone())));
             }
@@ -2740,6 +2757,12 @@ impl FlowContext {
                     //     level = self.popvalue().value
                     //     w_obj = self.import_name(modulename, glob, None, fromlist, level)
                     //     self.pushvalue(w_obj)
+                    //
+                    // `self.w_globals.value` upstream is the live
+                    // `func.__globals__` dict reference. Route through
+                    // `live_globals()` so the rust-source registry's
+                    // post-construction module-import writes are
+                    // visible at IMPORT_NAME time.
                     let w_fromlist = self.pop_hlvalue()?;
                     let w_level = self.pop_hlvalue()?;
                     let w_modulename = self.getname_w(oparg as usize)?;
@@ -2757,7 +2780,12 @@ impl FlowContext {
                             ))));
                         }
                     };
-                    let glob = self.w_globals.value.clone();
+                    let glob = self
+                        .graph
+                        .func
+                        .as_ref()
+                        .map(|func| func.live_globals())
+                        .unwrap_or_else(|| self.w_globals.value.clone());
                     let fromlist = match &w_fromlist {
                         Hlvalue::Constant(Constant { value, .. }) => value.clone(),
                         _ => ConstValue::None,

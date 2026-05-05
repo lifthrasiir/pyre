@@ -277,13 +277,38 @@ pub(super) fn mint_host_class(name: &str) -> HostObject {
 ///
 /// Population is the responsibility of
 /// [`super::register::register_rust_module`], which walks a
-/// `syn::File` and registers each top-level item here under a fresh
+/// `syn::File` and registers each top-level item here under a
 /// `ModuleId`. Re-registration of the same `(module_id, name)` is
-/// a no-op (first writer wins) so a defensive duplicate definition
-/// inside a single walk does not flip the binding mid-walk —
-/// mirrors `module.__dict__[name] = ...` running once at import
-/// time. Cross-walk same-name registration NEVER collides because
-/// the keys' `ModuleId` components differ.
+/// last-writer-wins, mirroring upstream `module.__dict__[name] =
+/// value` semantics: every top-level binding statement
+/// unconditionally overwrites any prior entry. Within a single
+/// walk Rust syntax does not allow duplicate top-level item names,
+/// so the observable difference is across walks of the same
+/// `module_id` (path-keyed re-walk after `Translation` rebuilds
+/// against the same source file) — the second walk's bindings
+/// supersede the first, matching `exec(source, dict)` /
+/// `importlib.reload` semantics.
+///
+/// **Model boundary** (Codex audit, 2026-05-05): a path-keyed
+/// re-walk is treated like `exec(source, dict)` / `reload`, NOT
+/// like `import` returning a cached `sys.modules` entry. This is
+/// the parity-correct framing for the *registration* path: every
+/// top-level statement is an unconditional `__dict__[name] =
+/// value` assignment in upstream Python, regardless of whether the
+/// module is being imported for the first time or reloaded. A
+/// caller who wants `sys.modules` cache-hit semantics ("don't
+/// re-execute the body if the module is already loaded") must
+/// gate the call on a prior `module_globals_lookup` of any
+/// expected name and short-circuit themselves — the registry does
+/// not implement that gate. Production callsites
+/// (`from_rust_file_entry_point_with_source`) currently invoke
+/// the walker once per `Translation`, so the re-walk window only
+/// opens in tests and in cross-`Translation` workflows where the
+/// caller is expected to know whether a refresh is desired.
+/// Already-built `GraphFunc` instances observe the registry through
+/// `GraphFunc::live_globals()` so a deliberate refresh propagates
+/// through the same live-`__dict__` channel upstream uses for
+/// post-import mutations.
 static HOST_RUST_MODULE_GLOBALS: LazyLock<Mutex<HashMap<ModuleId, HashMap<String, ConstValue>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -306,10 +331,13 @@ pub(super) fn module_globals_lookup(module_id: ModuleId, name: &str) -> Option<C
 }
 
 /// Register `value` as the module-globals entry for `name` under
-/// `module_id`. Idempotent within a single `module_id` — re-
-/// registering the same `(module_id, name)` with a different value
-/// keeps the FIRST entry. Cross-`module_id` same-name registration
-/// is independent: each id partitions its own bindings, mirroring
+/// `module_id`. Last-writer-wins: re-registering the same
+/// `(module_id, name)` with a different value clobbers the prior
+/// entry, mirroring upstream `module.__dict__[name] = value`
+/// (each top-level binding statement is an unconditional
+/// assignment — `exec(source, dict)` / `importlib.reload`
+/// semantics). Cross-`module_id` same-name registration is
+/// independent: each id partitions its own bindings, mirroring
 /// two Python modules whose `__dict__`s happen to share a key.
 ///
 /// For class entries, the wrapped `HostObject::Class` is expected
@@ -334,6 +362,14 @@ pub(super) fn module_globals_lookup(module_id: ModuleId, name: &str) -> Option<C
 /// resolved against. Returns an empty map when `module_id` has no
 /// registered entries (matches `func.__globals__ == {}` for a
 /// function defined with no enclosing module bindings).
+/// Public-via-`mod.rs` accessor (`module_globals_snapshot_for_id`)
+/// for the `pub` field carrier `GraphFunc.module_globals_id` —
+/// keeps `host_env` itself private while exposing the read path
+/// through a single re-export.
+pub(crate) fn module_globals_snapshot_pub(module_id: ModuleId) -> HashMap<ConstValue, ConstValue> {
+    module_globals_snapshot(module_id)
+}
+
 pub(super) fn module_globals_snapshot(module_id: ModuleId) -> HashMap<ConstValue, ConstValue> {
     let map = HOST_RUST_MODULE_GLOBALS
         .lock()
@@ -353,8 +389,7 @@ pub(super) fn register_module_global(module_id: ModuleId, name: &str, value: Con
         .expect("HOST_RUST_MODULE_GLOBALS Mutex poisoned");
     map.entry(module_id)
         .or_default()
-        .entry(name.to_string())
-        .or_insert(value);
+        .insert(name.to_string(), value);
 }
 
 #[cfg(test)]
@@ -493,15 +528,16 @@ mod tests {
     }
 
     #[test]
-    fn register_module_global_is_idempotent_first_writer_wins_within_module() {
-        // upstream Python module-import semantics: re-importing a
-        // module returns the cached module object — `def` statements
-        // do not rebind already-bound names in `sys.modules`. Within
-        // a single `ModuleId` partition, two registrations of the
-        // same name keep the first.
+    fn register_module_global_is_last_writer_wins_within_module() {
+        // upstream `module.__dict__[name] = value` is an
+        // unconditional assignment: every top-level binding statement
+        // (whether on first import, `exec(source, dict)`, or
+        // `importlib.reload`) overwrites any prior entry. Within a
+        // single `ModuleId` partition, the most recent registration
+        // wins.
         let id = ModuleId::fresh();
-        let first = HostObject::new_class("ParityProbe_FuncGlobals_idempotent", vec![]);
-        let second = HostObject::new_class("ParityProbe_FuncGlobals_idempotent", vec![]);
+        let first = HostObject::new_class("ParityProbe_FuncGlobals_lastwriter", vec![]);
+        let second = HostObject::new_class("ParityProbe_FuncGlobals_lastwriter", vec![]);
         assert_ne!(
             first, second,
             "two fresh classes with the same qualname must NOT share identity \
@@ -509,24 +545,24 @@ mod tests {
         );
         register_module_global(
             id,
-            "ParityProbe_FuncGlobals_idempotent",
+            "ParityProbe_FuncGlobals_lastwriter",
             ConstValue::HostObject(first.clone()),
         );
         register_module_global(
             id,
-            "ParityProbe_FuncGlobals_idempotent",
+            "ParityProbe_FuncGlobals_lastwriter",
             ConstValue::HostObject(second.clone()),
         );
-        let observed = module_globals_lookup(id, "ParityProbe_FuncGlobals_idempotent").unwrap();
+        let observed = module_globals_lookup(id, "ParityProbe_FuncGlobals_lastwriter").unwrap();
         assert_eq!(
             observed,
-            ConstValue::HostObject(first),
-            "first registration wins within a single ModuleId",
+            ConstValue::HostObject(second),
+            "last registration wins within a single ModuleId",
         );
         assert_ne!(
             observed,
-            ConstValue::HostObject(second),
-            "second registration must NOT clobber within the same ModuleId",
+            ConstValue::HostObject(first),
+            "first registration must be clobbered by the second",
         );
     }
 

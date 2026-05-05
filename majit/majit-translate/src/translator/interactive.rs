@@ -1746,7 +1746,7 @@ mod tests {
         // proved the production-side walker pre-pass works; this
         // assertion separately exercises the walker's observable
         // output for an arbitrary id.
-        let probe_id = register_rust_module(&file);
+        let probe_id = register_rust_module(&file).expect("walker must succeed");
         use crate::flowspace::model::ConstValue;
         let registered = crate::flowspace::rust_source::register::module_globals_for_test(
             probe_id,

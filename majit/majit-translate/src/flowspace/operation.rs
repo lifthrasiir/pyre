@@ -578,6 +578,22 @@ impl OpKind {
     /// `False`; pure arithmetic / container construction is `True`.
     /// Matches the `pure=` argument of `add_operator` plus the explicit
     /// `PureOperation` base of subclasses like `NewTuple` and `Pow`.
+    ///
+    /// **`_ovf` siblings are NOT pure.** Upstream
+    /// `add_operator(name, ovf=True)` registers BOTH the base op (with
+    /// `base_cls = OverflowingOperation`, which extends
+    /// `PureOperation`) AND a suffixed twin via
+    /// `add_operator(name + '_ovf', arity, dispatch, pyfunc=ovf_func)`
+    /// (`operation.py:337-338`). The recursive call carries no
+    /// `pure=True` / `ovf=True`, so the suffixed twin's `base_cls`
+    /// falls through to plain `HLOperation` (`operation.py:321`) —
+    /// which has the default `constfold(self) -> None`
+    /// (`operation.py:96-97`). Therefore `_ovf` ops never constfold:
+    /// they remain as ops even when all operands are constants and a
+    /// constant-time `ovf_func(*args)` would raise. Reading them as
+    /// pure (and folding them) inserts a hard-error divergence at
+    /// every constant-zero-divisor / overflow site that upstream
+    /// would have left to the runtime.
     pub fn pure(self) -> bool {
         match self {
             OpKind::Is
@@ -592,31 +608,22 @@ impl OpKind {
             | OpKind::GetSlice
             | OpKind::Pos
             | OpKind::Neg
-            | OpKind::NegOvf
             | OpKind::Bool
             | OpKind::Abs
-            | OpKind::AbsOvf
             | OpKind::Hex
             | OpKind::Oct
             | OpKind::Bin
             | OpKind::Ord
             | OpKind::Invert
             | OpKind::Add
-            | OpKind::AddOvf
             | OpKind::Sub
-            | OpKind::SubOvf
             | OpKind::Mul
-            | OpKind::MulOvf
             | OpKind::TrueDiv
             | OpKind::FloorDiv
-            | OpKind::FloorDivOvf
             | OpKind::Div
-            | OpKind::DivOvf
             | OpKind::Mod
-            | OpKind::ModOvf
             | OpKind::DivMod
             | OpKind::LShift
-            | OpKind::LShiftOvf
             | OpKind::RShift
             | OpKind::And
             | OpKind::Or
@@ -638,6 +645,17 @@ impl OpKind {
             | OpKind::Buffer
             | OpKind::NewTuple
             | OpKind::Pow => true,
+
+            // `_ovf` siblings: HLOperation default (no constfold).
+            OpKind::NegOvf
+            | OpKind::AbsOvf
+            | OpKind::AddOvf
+            | OpKind::SubOvf
+            | OpKind::MulOvf
+            | OpKind::FloorDivOvf
+            | OpKind::DivOvf
+            | OpKind::ModOvf
+            | OpKind::LShiftOvf => false,
 
             // upstream `class GetAttr(SingleDispatchMixin, HLOperation)`
             // (operation.py:617-646) is NOT a PureOperation — only its
@@ -1021,6 +1039,21 @@ impl HLOperation {
                 _ => unreachable!("foldable() above excludes Variable args"),
             })
             .collect();
+        // RPython `PureOperation.constfold` (operation.py:120-127) wraps
+        // `pyfunc(*args)` in `try/except Exception` and re-raises the
+        // captured exception as `FlowingError(...)` when all args are
+        // foldable. Rust `pyfunc` returns `Option<ConstValue>`, conflating
+        // "type combo not yet handled" (decline → `Ok(None)`) with
+        // "operation deterministically raises" (e.g. division by zero,
+        // mixed-type ordering comparison) which upstream surfaces as
+        // FlowingError. Detect the deterministic-raise cases explicitly
+        // before pyfunc fall-through so the exposed graph shape matches
+        // upstream — record_pure_op consumers (build_flow / flowcontext)
+        // see the FlowingError instead of silently emitting a runtime-
+        // failing SpaceOperation.
+        if let Some(err) = constfold_always_raises(self.kind, &args) {
+            return Err(err);
+        }
         let Some(result) = pyfunc(self.kind, &args) else {
             return Ok(None);
         };
@@ -1267,47 +1300,41 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::Is, [a, b]) => Some(ConstValue::Bool(a == b)),
 
         // --- binary arithmetic (int) ---
+        // `_ovf` siblings are NOT pure (`OpKind::pure()` rejects them),
+        // so the `pure()` gate in `HLOperation::constfold` short-
+        // circuits before reaching this dispatch — matching upstream
+        // `add_operator(name + '_ovf', …)` falling through to plain
+        // `HLOperation`. The arms below cover only the BASE pure ops.
         (OpKind::Add, [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            a.checked_add(*b).map(ConstValue::Int)
-        }
-        (OpKind::AddOvf, [ConstValue::Int(a), ConstValue::Int(b)]) => {
             a.checked_add(*b).map(ConstValue::Int)
         }
         (OpKind::Sub, [ConstValue::Int(a), ConstValue::Int(b)]) => {
             a.checked_sub(*b).map(ConstValue::Int)
         }
-        (OpKind::SubOvf, [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            a.checked_sub(*b).map(ConstValue::Int)
-        }
         (OpKind::Mul, [ConstValue::Int(a), ConstValue::Int(b)]) => {
             a.checked_mul(*b).map(ConstValue::Int)
         }
-        (OpKind::MulOvf, [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            a.checked_mul(*b).map(ConstValue::Int)
-        }
         (OpKind::FloorDiv, [ConstValue::Int(a), ConstValue::Int(b)])
-        | (OpKind::FloorDivOvf, [ConstValue::Int(a), ConstValue::Int(b)])
-        | (OpKind::Div, [ConstValue::Int(a), ConstValue::Int(b)])
-        | (OpKind::DivOvf, [ConstValue::Int(a), ConstValue::Int(b)]) => {
+        | (OpKind::Div, [ConstValue::Int(a), ConstValue::Int(b)]) => {
             // RPython flow-space folds `div` as `operator.floordiv` for
-            // int operands; `ZeroDivisionError` is not caught, so a
-            // zero divisor declines the fold.
-            if *b == 0 {
-                None
-            } else {
-                a.checked_div_euclid(*b).map(ConstValue::Int)
-            }
+            // int operands (Python 3 floor-toward-`-inf`), implemented
+            // by `ll_int_py_div` (rpython/rtyper/rint.py:398). `Rust`'s
+            // `checked_div_euclid` is Euclidean (always non-negative
+            // remainder) and diverges from Python for negative divisors
+            // — `3 // -2 == -2` in Python but Euclidean gives `-1`.
+            // `int_py_floor_div` ports `ll_int_py_div` line-by-line.
+            // `ZeroDivisionError` is not caught here; the always-raises
+            // whitelist surfaces it for `Div`/`FloorDiv`/`Mod` and their
+            // `_ovf` siblings.
+            int_py_floor_div(*a, *b).map(ConstValue::Int)
         }
-        (OpKind::Mod, [ConstValue::Int(a), ConstValue::Int(b)])
-        | (OpKind::ModOvf, [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            if *b == 0 {
-                None
-            } else {
-                a.checked_rem_euclid(*b).map(ConstValue::Int)
-            }
+        (OpKind::Mod, [ConstValue::Int(a), ConstValue::Int(b)]) => {
+            // `ll_int_py_mod` (rpython/rtyper/rint.py:496): Python's
+            // `%` returns a remainder with the sign of the divisor, not
+            // the dividend (so `3 % -2 == -1`, not `1`).
+            int_py_mod(*a, *b).map(ConstValue::Int)
         }
-        (OpKind::LShift, [ConstValue::Int(a), ConstValue::Int(b)])
-        | (OpKind::LShiftOvf, [ConstValue::Int(a), ConstValue::Int(b)]) => {
+        (OpKind::LShift, [ConstValue::Int(a), ConstValue::Int(b)]) => {
             if *b < 0 || *b >= 64 {
                 None
             } else {
@@ -1367,8 +1394,8 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // --- comparisons (int / float / str / bool) ---
         (OpKind::Lt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_lt())),
         (OpKind::Le, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_le())),
-        (OpKind::Eq, [a, b]) => Some(ConstValue::Bool(a == b)),
-        (OpKind::Ne, [a, b]) => Some(ConstValue::Bool(a != b)),
+        (OpKind::Eq, [a, b]) => Some(ConstValue::Bool(python_eq_const(a, b))),
+        (OpKind::Ne, [a, b]) => Some(ConstValue::Bool(!python_eq_const(a, b))),
         (OpKind::Gt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_gt())),
         (OpKind::Ge, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_ge())),
 
@@ -1382,16 +1409,262 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
 /// Ordering helper for the `Lt / Le / Gt / Ge` fold family. Returns
 /// `None` for cross-type comparisons that RPython would raise on (e.g.
 /// `int < str`) or for NaN float operands.
+///
+/// Mixed numeric (Bool ↔ Int ↔ Float) IS folded — Python 3 admits
+/// `1 < 1.5`, `True < 2`, `1.0 > False` because `bool` is an `int`
+/// subclass and `int`/`float` admit numeric coercion in
+/// `operator.lt` etc. (`PureOperation.constfold` calls `pyfunc`
+/// directly, so the dispatch follows Python's coercion rules).
 fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Ordering> {
+    use ConstValue as C;
     match (a, b) {
-        (ConstValue::Int(x), ConstValue::Int(y)) => Some(x.cmp(y)),
-        (ConstValue::Float(x), ConstValue::Float(y)) => {
-            f64::from_bits(*x).partial_cmp(&f64::from_bits(*y))
-        }
-        (ConstValue::ByteStr(x), ConstValue::ByteStr(y)) => Some(x.cmp(y)),
-        (ConstValue::UniStr(x), ConstValue::UniStr(y)) => Some(x.cmp(y)),
-        (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(x.cmp(y)),
+        (C::Int(x), C::Int(y)) => Some(x.cmp(y)),
+        (C::Float(x), C::Float(y)) => f64::from_bits(*x).partial_cmp(&f64::from_bits(*y)),
+        (C::ByteStr(x), C::ByteStr(y)) => Some(x.cmp(y)),
+        (C::UniStr(x), C::UniStr(y)) => Some(x.cmp(y)),
+        (C::Bool(x), C::Bool(y)) => Some(x.cmp(y)),
+        // Bool ↔ Int (bool is int subclass).
+        (C::Bool(x), C::Int(y)) => Some(i64::from(*x).cmp(y)),
+        (C::Int(x), C::Bool(y)) => Some(x.cmp(&i64::from(*y))),
+        // Int ↔ Float (numeric coercion via host f64 cast).
+        (C::Int(x), C::Float(b)) => (*x as f64).partial_cmp(&f64::from_bits(*b)),
+        (C::Float(b), C::Int(x)) => f64::from_bits(*b).partial_cmp(&(*x as f64)),
+        // Bool ↔ Float (bool → int → float).
+        (C::Bool(x), C::Float(b)) => (i64::from(*x) as f64).partial_cmp(&f64::from_bits(*b)),
+        (C::Float(b), C::Bool(x)) => f64::from_bits(*b).partial_cmp(&(i64::from(*x) as f64)),
         _ => None,
+    }
+}
+
+/// Python-3 floor division over `i64`. Line-by-line port of
+/// `rpython/rtyper/rint.py:398 ll_int_py_div`:
+///
+/// ```text
+/// r = trunc_div(x, y)        # C-style truncation toward 0
+/// p = r * y
+/// u = (p - x) if y < 0 else (x - p)
+/// return r + (u >> (BITS - 1))
+/// ```
+///
+/// `(u >> 63)` is `-1` when `u < 0` else `0`, applying the
+/// floor-toward-`-inf` correction whenever C's truncated quotient
+/// over-shot Python's floor (sign mismatch between dividend and
+/// divisor with non-zero remainder).
+///
+/// Returns `None` for `y == 0` (the always-raises whitelist surfaces
+/// `ZeroDivisionError`) and for `x == i64::MIN, y == -1` (Rust's
+/// `checked_div` rejects the wrap; the runtime path handles bigint
+/// promotion at upstream).
+fn int_py_floor_div(x: i64, y: i64) -> Option<i64> {
+    let r = x.checked_div(y)?;
+    let p = r.checked_mul(y)?;
+    let u = if y < 0 {
+        p.checked_sub(x)?
+    } else {
+        x.checked_sub(p)?
+    };
+    r.checked_add(u >> (i64::BITS - 1))
+}
+
+/// Python-3 `%` over `i64`. Line-by-line port of
+/// `rpython/rtyper/rint.py:496 ll_int_py_mod`:
+///
+/// ```text
+/// r = trunc_mod(x, y)        # C-style %, sign of dividend
+/// u = -r if y < 0 else r
+/// return r + (y & (u >> (BITS - 1)))
+/// ```
+///
+/// The `(u >> 63)` mask is `-1` when `u < 0` else `0`; `y & -1 == y`
+/// adds the divisor to flip the remainder's sign whenever Python's
+/// `(sign of divisor)` rule disagrees with C's `(sign of dividend)`
+/// rule.
+///
+/// Returns `None` for `y == 0` and for `x == i64::MIN, y == -1`
+/// (same overflow boundary as [`int_py_floor_div`]).
+fn int_py_mod(x: i64, y: i64) -> Option<i64> {
+    let r = x.checked_rem(y)?;
+    let u = if y < 0 { r.checked_neg()? } else { r };
+    r.checked_add(y & (u >> (i64::BITS - 1)))
+}
+
+/// Python-3 `==` semantics over `ConstValue`. Mirrors upstream
+/// `PureOperation.constfold` calling `operator.eq(*args)` rather than
+/// the host language's variant equality:
+///
+/// - **Numeric coercion** — Python's `bool` is a subclass of `int`,
+///   and `int` / `float` admit cross-type equality via numeric
+///   value (`True == 1`, `1 == 1.0`, `True == 1.0`). The naive Rust
+///   `ConstValue::PartialEq` derives variant-strict equality and
+///   would say those are unequal.
+/// - **Distinct types stay false** — `"a" == b"a"`, `1 == "1"`,
+///   `None == 0` all return `False` in Python 3 (`BytesWarning` is a
+///   diagnostic, not an exception). For these the strict variant
+///   compare matches semantics, so we fall through to `a == b`.
+/// - **Containers** — `Tuple` / `List` of equal length compare
+///   element-wise via the same `python_eq_const`, so
+///   `(1, True) == (1, 1)` returns `True` (each numeric element
+///   coerces). `Dict` deep-equality is left to variant compare for
+///   now: keys hash by variant identity, so `{1: 'a'}` and
+///   `{True: 'a'}` already key into different slots, and rebuilding
+///   the lookup via Python-equality would require re-keying the
+///   whole side-table — left as a follow-up.
+fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
+    use ConstValue as C;
+    match (a, b) {
+        (C::Bool(x), C::Bool(y)) => x == y,
+        (C::Bool(x), C::Int(y)) | (C::Int(y), C::Bool(x)) => i64::from(*x) == *y,
+        (C::Int(x), C::Int(y)) => x == y,
+        (C::Bool(x), C::Float(bits)) | (C::Float(bits), C::Bool(x)) => {
+            f64::from_bits(*bits) == (i64::from(*x) as f64)
+        }
+        (C::Int(x), C::Float(bits)) | (C::Float(bits), C::Int(x)) => {
+            f64::from_bits(*bits) == (*x as f64)
+        }
+        (C::Float(a), C::Float(b)) => f64::from_bits(*a) == f64::from_bits(*b),
+        // Container deep equality — Python compares
+        // `tuple` / `list` element-wise via `==` per element. So
+        // `(True,) == (1,)` is True even though Bool/Int are
+        // distinct variants. Cross-container types stay distinct
+        // (`(1,) == [1]` is False in Python 3).
+        (C::Tuple(xs), C::Tuple(ys)) | (C::List(xs), C::List(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| python_eq_const(x, y))
+        }
+        _ => a == b,
+    }
+}
+
+/// Detect operation/argument combinations that RPython's
+/// `PureOperation.constfold` (operation.py:120-127) catches as
+/// `Exception` and re-raises as `FlowingError`. Returns
+/// `Some(FlowingError)` when the combination ALWAYS raises in
+/// upstream Python; `None` otherwise (let pyfunc decide whether to
+/// fold or decline).
+///
+/// Covered cases (the audit-flagged subset that surfaces through
+/// `record_pure_op` — see `HLOperation::constfold` callsite):
+///
+/// - **Integer division / modulo by zero** — upstream Python raises
+///   `ZeroDivisionError`. Mirrors `Div(int, 0)`, `Mod(int, 0)`,
+///   `FloorDiv(int, 0)` (the operator-pair entries from
+///   `operation.py:475-491 add_operator`).
+/// - **TrueDiv with int / float zero divisor** — upstream Python
+///   raises `ZeroDivisionError` for both `1 / 0` and `1.0 / 0.0`.
+///   Mirrors `TrueDiv` registered as `add_operator('truediv', 2,
+///   pure=True)`.
+/// - **Mixed-type ordering comparison** — upstream Python 3 raises
+///   `TypeError("<' not supported between instances of …")` for
+///   `Lt`/`Le`/`Gt`/`Ge` between mismatched primitive types.
+///   `Eq`/`Ne` are NOT covered: Python 3 returns `False` / `True`
+///   for cross-type identity comparison, never raises.
+///
+/// Other "always raises" combinations (e.g. `len()` of a non-
+/// iterable, `int()` of a non-numeric str) are intentionally NOT
+/// covered here pending the broader pyfunc signature port — those
+/// type-error cases are documented in their pyfunc match arms as
+/// "decline" and continue to fall through to runtime emission until
+/// pyfunc itself surfaces an error channel.
+fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<FlowingError> {
+    let make_err = |reason: &str| {
+        FlowingError::new(format!(
+            "{}{:?} always raises {}",
+            kind.opname(),
+            args,
+            reason,
+        ))
+    };
+    match (kind, args) {
+        // ZeroDivisionError on int /, //, %. upstream
+        // `PureOperation.constfold` (operation.py:120-127) calls
+        // `cls.pyfunc(*args)` and re-raises any `Exception` as
+        // `FlowingError`. For the BASE ops, that's
+        // `operator.{div,floordiv,mod}` which raises
+        // `ZeroDivisionError` on a zero divisor.
+        //
+        // The `_ovf` siblings (DivOvf / FloorDivOvf / ModOvf) are
+        // intentionally NOT covered here. Upstream creates them via
+        // `add_operator(name + '_ovf', arity, dispatch, pyfunc=ovf_func)`
+        // (`operation.py:337-338`) without `pure=True`, so their
+        // base class is plain `HLOperation` whose default
+        // `constfold(self) -> None` (`operation.py:96-97`) leaves
+        // them as ops at compile time. Folding them here would
+        // surface a hard-error divergence at every constant-zero-
+        // divisor site that upstream leaves to the runtime.
+        // `OpKind::pure()` enforces this by classifying `_ovf`
+        // siblings as non-pure, so this whitelist arm is
+        // unreachable for them; the explicit comment is here in
+        // case a future caller bypasses the `pure()` gate.
+        (
+            OpKind::Div | OpKind::FloorDiv | OpKind::Mod,
+            [ConstValue::Int(_), ConstValue::Int(0)],
+        ) => Some(make_err(
+            "ZeroDivisionError: integer division or modulo by zero",
+        )),
+        // ZeroDivisionError on truediv. Upstream `PureOperation.const
+        // fold` calls `operator.truediv(lhs, rhs)`; for numeric lhs
+        // and zero rhs the dispatch raises `ZeroDivisionError`. For
+        // non-numeric lhs (e.g. `"x" / 0`) Python raises `TypeError`
+        // first ("unsupported operand type(s)") before the divisor is
+        // even consulted — so we only classify zero-divisor truediv
+        // as ZeroDivisionError when lhs is itself foldable-numeric
+        // (Int / Bool / Float). For non-numeric lhs we decline here
+        // and leave the type-error path to the broader pyfunc port.
+        (OpKind::TrueDiv, [lhs, ConstValue::Int(0)]) if is_foldable_numeric(lhs) => {
+            Some(make_err("ZeroDivisionError: division by zero"))
+        }
+        (OpKind::TrueDiv, [lhs, ConstValue::Float(bits)])
+            if is_foldable_numeric(lhs) && f64::from_bits(*bits) == 0.0 =>
+        {
+            Some(make_err("ZeroDivisionError: float division by zero"))
+        }
+        // TypeError on cross-type ordering comparisons. Eq/Ne deliberately
+        // not included — upstream Python 3 returns Bool for those.
+        (OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge, [a, b])
+            if cross_type_ordering(a, b) =>
+        {
+            Some(make_err(
+                "TypeError: ordering comparison not supported between distinct primitive types",
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `true` for `ConstValue` variants that participate in upstream
+/// numeric arithmetic (`int` / `bool` / `float`). Used by
+/// [`constfold_always_raises`] to guard the truediv zero-divisor
+/// classification: only numeric lhs reaches `ZeroDivisionError`
+/// — non-numeric lhs raises `TypeError` first per upstream
+/// `operator.truediv` dispatch.
+fn is_foldable_numeric(v: &ConstValue) -> bool {
+    matches!(
+        v,
+        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::Float(_)
+    )
+}
+
+/// Helper for [`constfold_always_raises`]: returns `true` when `a`
+/// and `b` are foldable primitives whose Python-3 cross-type
+/// ordering would raise `TypeError` (e.g. `Int <-> UniStr`,
+/// `ByteStr <-> Int`). Same-type, NaN-float, and Eq/Ne paths return
+/// `false` (handled elsewhere or not raise).
+fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
+    use ConstValue as C;
+    let kind = |v: &ConstValue| match v {
+        C::Int(_) => Some(0),
+        C::Bool(_) => Some(0), // Python: bool is int — same kind
+        C::Float(_) => Some(1),
+        C::UniStr(_) => Some(2),
+        C::ByteStr(_) => Some(3),
+        _ => None,
+    };
+    match (kind(a), kind(b)) {
+        (Some(ka), Some(kb)) => {
+            // Int<->Float same-numeric kind (Python 3 admits int<->float
+            // ordering); UniStr<->ByteStr distinct (Python 3 raises).
+            (ka, kb) != (0, 1) && (ka, kb) != (1, 0) && ka != kb
+        }
+        _ => false,
     }
 }
 
@@ -1979,6 +2252,21 @@ mod tests {
         assert!(!OpKind::SetAttr.pure());
         assert!(!OpKind::SimpleCall.pure());
         assert!(!OpKind::InplaceAdd.pure());
+        // `_ovf` siblings: NOT pure. upstream `add_operator(name +
+        // '_ovf', arity, dispatch, pyfunc=ovf_func)` carries no
+        // `pure=True` (`operation.py:337-338`), so the suffixed
+        // class falls through to plain `HLOperation` whose default
+        // `constfold(self) -> None` (`operation.py:96-97`) prevents
+        // any constant-time overflow / zero-divisor folding.
+        assert!(!OpKind::AddOvf.pure());
+        assert!(!OpKind::SubOvf.pure());
+        assert!(!OpKind::MulOvf.pure());
+        assert!(!OpKind::NegOvf.pure());
+        assert!(!OpKind::AbsOvf.pure());
+        assert!(!OpKind::FloorDivOvf.pure());
+        assert!(!OpKind::DivOvf.pure());
+        assert!(!OpKind::ModOvf.pure());
+        assert!(!OpKind::LShiftOvf.pure());
     }
 
     #[test]
@@ -2490,10 +2778,139 @@ mod tests {
     }
 
     #[test]
-    fn constfold_division_declines_zero() {
-        assert_eq!(fold(OpKind::Div, vec![ci(1), ci(0)]), None);
-        assert_eq!(fold(OpKind::Mod, vec![ci(1), ci(0)]), None);
-        assert_eq!(fold(OpKind::FloorDiv, vec![ci(1), ci(0)]), None);
+    fn constfold_division_by_zero_raises_flowing_error() {
+        // upstream `PureOperation.constfold` (operation.py:120-127)
+        // wraps `pyfunc(*args)` in `try/except Exception` and re-raises
+        // captured exceptions as `FlowingError`. Division by zero is
+        // the canonical case — Python's int `/`, `//`, `%` raise
+        // `ZeroDivisionError`, so a constant-folded `1 / 0` must
+        // surface as FlowingError, not silent decline.
+        // Only base ops raise at constfold time. upstream `_ovf`
+        // siblings are NOT pure (`add_operator(name + '_ovf', …)`
+        // carries no `pure=True`, `operation.py:337-338`), so their
+        // `HLOperation.constfold` default returns `None`
+        // (`operation.py:96-97`) — the op stays as an op for the
+        // runtime to handle. Folding `_ovf` zero-divisor at compile
+        // time would surface a hard-error divergence vs upstream.
+        for kind in [OpKind::Div, OpKind::Mod, OpKind::FloorDiv] {
+            let op = HLOperation::new(kind, vec![ci(1), ci(0)]);
+            let err = op.constfold().expect_err("zero divisor must raise");
+            assert!(
+                err.message.contains("ZeroDivisionError"),
+                "{kind:?}: {}",
+                err.message
+            );
+        }
+        for kind in [OpKind::DivOvf, OpKind::ModOvf, OpKind::FloorDivOvf] {
+            let op = HLOperation::new(kind, vec![ci(1), ci(0)]);
+            assert_eq!(
+                op.constfold().expect("_ovf sibling must NOT raise at fold"),
+                None,
+                "{kind:?} is HLOperation default — must decline (op stays at runtime)",
+            );
+        }
+        // TrueDiv with int or float zero divisor.
+        let op = HLOperation::new(OpKind::TrueDiv, vec![ci(1), ci(0)]);
+        let err = op
+            .constfold()
+            .expect_err("truediv int zero divisor must raise");
+        assert!(err.message.contains("ZeroDivisionError"));
+        let op = HLOperation::new(OpKind::TrueDiv, vec![cf(1.0), cf(0.0)]);
+        let err = op
+            .constfold()
+            .expect_err("truediv float zero divisor must raise");
+        assert!(err.message.contains("ZeroDivisionError"));
+        // TrueDiv with non-numeric lhs: upstream
+        // `operator.truediv("x", 0)` raises `TypeError` first (the
+        // dispatch fails before the divisor is consulted), NOT
+        // `ZeroDivisionError`. The always-raises whitelist therefore
+        // declines this case rather than misclassifying it as a
+        // zero-divisor error — fold falls through to the broader
+        // pyfunc port, where the type-error path is documented as a
+        // pre-existing gap.
+        assert_eq!(
+            fold(OpKind::TrueDiv, vec![cs("x"), ci(0)]),
+            None,
+            "non-numeric lhs / zero divisor must NOT classify as ZeroDivisionError",
+        );
+        assert_eq!(
+            fold(OpKind::TrueDiv, vec![cs("x"), cf(0.0)]),
+            None,
+            "non-numeric lhs / float zero divisor must NOT classify as ZeroDivisionError",
+        );
+    }
+
+    #[test]
+    fn constfold_floor_div_and_mod_python_semantics() {
+        // upstream `operator.floordiv` / `operator.mod` over ints:
+        // floor toward `-inf` (Python 3 semantics), NOT C truncation
+        // toward 0 and NOT Euclidean (always non-negative remainder).
+        // `rpython/rtyper/rint.py:398 ll_int_py_div` and `:496
+        // ll_int_py_mod` carry the correction over the C primitive;
+        // our `int_py_floor_div` / `int_py_mod` helpers port those
+        // line-by-line.
+        //
+        // Sign coverage matrix (4 quadrants × Div/FloorDiv/Mod):
+        // Python results from the reference implementation —
+        //   3 // 2 = 1,   3 % 2 = 1
+        //   3 // -2 = -2, 3 % -2 = -1
+        //   -3 // 2 = -2, -3 % 2 = 1
+        //   -3 // -2 = 1, -3 % -2 = -1
+        // (a) same sign: floor matches C-trunc, no correction.
+        for kind in [OpKind::FloorDiv, OpKind::Div] {
+            assert_eq!(
+                fold(kind, vec![ci(3), ci(2)]),
+                Some(ConstValue::Int(1)),
+                "{kind:?}(3, 2) must be 1",
+            );
+            assert_eq!(
+                fold(kind, vec![ci(-3), ci(-2)]),
+                Some(ConstValue::Int(1)),
+                "{kind:?}(-3, -2) must be 1",
+            );
+        }
+        assert_eq!(
+            fold(OpKind::Mod, vec![ci(3), ci(2)]),
+            Some(ConstValue::Int(1))
+        );
+        assert_eq!(
+            fold(OpKind::Mod, vec![ci(-3), ci(-2)]),
+            Some(ConstValue::Int(-1)),
+        );
+        // (b) mixed sign — these are where C-trunc / Euclidean diverge
+        // from Python floor. Pre-fix Euclidean would return wrong
+        // values here (see commit message).
+        for kind in [OpKind::FloorDiv, OpKind::Div] {
+            assert_eq!(
+                fold(kind, vec![ci(3), ci(-2)]),
+                Some(ConstValue::Int(-2)),
+                "{kind:?}(3, -2) must be -2 (Python floor)",
+            );
+            assert_eq!(
+                fold(kind, vec![ci(-3), ci(2)]),
+                Some(ConstValue::Int(-2)),
+                "{kind:?}(-3, 2) must be -2 (Python floor)",
+            );
+        }
+        assert_eq!(
+            fold(OpKind::Mod, vec![ci(3), ci(-2)]),
+            Some(ConstValue::Int(-1)),
+            "Mod(3, -2) must be -1 (sign of divisor, not dividend)",
+        );
+        assert_eq!(
+            fold(OpKind::Mod, vec![ci(-3), ci(2)]),
+            Some(ConstValue::Int(1)),
+        );
+        // (c) i64::MIN / -1 declines (Rust checked_div rejects the
+        // 2's-complement overflow; the runtime path handles bigint
+        // promotion at upstream).
+        for kind in [OpKind::FloorDiv, OpKind::Div, OpKind::Mod] {
+            assert_eq!(
+                fold(kind, vec![ci(i64::MIN), ci(-1)]),
+                None,
+                "{kind:?}(MIN, -1) must decline",
+            );
+        }
     }
 
     #[test]
@@ -2538,7 +2955,16 @@ mod tests {
             fold(OpKind::TrueDiv, vec![cf(7.0), cf(2.0)]),
             Some(ConstValue::float(3.5))
         );
-        assert_eq!(fold(OpKind::TrueDiv, vec![cf(1.0), cf(0.0)]), None);
+        // float zero divisor: upstream `operator.truediv(1.0, 0.0)`
+        // raises `ZeroDivisionError`. `PureOperation.constfold` re-
+        // raises that as `FlowingError`, so this must be observed as
+        // `Err`, not silent decline. (The test helper `fold` collapses
+        // `Err` to `None`, so we drive `constfold` directly here.)
+        let op = HLOperation::new(OpKind::TrueDiv, vec![cf(1.0), cf(0.0)]);
+        let err = op
+            .constfold()
+            .expect_err("float zero divisor must raise FlowingError");
+        assert!(err.message.contains("ZeroDivisionError"), "{}", err.message);
     }
 
     #[test]
@@ -2563,8 +2989,155 @@ mod tests {
             fold(OpKind::Le, vec![cs("a"), cs("b")]),
             Some(ConstValue::Bool(true))
         );
-        // cross-type: upstream raises TypeError → fold declines.
-        assert_eq!(fold(OpKind::Lt, vec![ci(1), cs("a")]), None);
+        // cross-type ordering comparison: upstream Python 3 raises
+        // `TypeError("'<' not supported between instances of 'int' and
+        // 'str'")`. `PureOperation.constfold` re-raises as
+        // `FlowingError`. Eq/Ne are deliberately NOT raised — Python
+        // 3 returns Bool for cross-type identity comparison.
+        let op = HLOperation::new(OpKind::Lt, vec![ci(1), cs("a")]);
+        let err = op
+            .constfold()
+            .expect_err("cross-type Lt must raise FlowingError");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+        // Eq/Ne tolerate cross-type — fold returns Bool(false)/Bool(true).
+        assert_eq!(
+            fold(OpKind::Eq, vec![ci(1), cs("a")]),
+            Some(ConstValue::Bool(false))
+        );
+        assert_eq!(
+            fold(OpKind::Ne, vec![ci(1), cs("a")]),
+            Some(ConstValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn constfold_cross_type_numeric_ordering() {
+        // upstream `operator.lt` / `operator.gt` / `operator.le` /
+        // `operator.ge` over int/float/bool admit numeric coercion:
+        // `1 < 1.5`, `True < 2`, `1.0 > False` are all foldable.
+        // Pre-fix `cmp_fold` returned `None` for cross-type pairs,
+        // forcing the runtime to evaluate trivially-foldable ordering
+        // — wasted op + lost FlowingError surface for impossible-
+        // ordering cases.
+        // Int < Float.
+        assert_eq!(
+            fold(OpKind::Lt, vec![ci(1), cf(1.5)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Gt, vec![cf(2.0), ci(1)]),
+            Some(ConstValue::Bool(true)),
+        );
+        // Bool < Int (bool subclass of int).
+        assert_eq!(
+            fold(OpKind::Lt, vec![cb(true), ci(2)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Le, vec![cb(false), ci(0)]),
+            Some(ConstValue::Bool(true)),
+        );
+        // Bool < Float.
+        assert_eq!(
+            fold(OpKind::Lt, vec![cb(true), cf(1.5)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Ge, vec![cf(0.0), cb(false)]),
+            Some(ConstValue::Bool(true)),
+        );
+        // Cross-NON-numeric (Int vs UniStr) still raises FlowingError
+        // via `cross_type_ordering` whitelist (sanity).
+        let op = HLOperation::new(OpKind::Lt, vec![ci(1), cs("a")]);
+        let err = op.constfold().expect_err("Int < UniStr must raise");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+    }
+
+    #[test]
+    fn constfold_eq_ne_container_deep_equality() {
+        // upstream tuple/list `==` compares element-wise via Python's
+        // `==` per element, so `(True,) == (1,)` is True (Bool ↔ Int
+        // numeric coercion). Pre-fix the variant-strict fallback
+        // would return False, mismatching upstream constfold.
+        let t_true = ConstValue::Tuple(vec![ConstValue::Bool(true)]);
+        let t_one = ConstValue::Tuple(vec![ConstValue::Int(1)]);
+        assert_eq!(
+            fold(OpKind::Eq, vec![c(t_true.clone()), c(t_one.clone())]),
+            Some(ConstValue::Bool(true)),
+            "(True,) == (1,) must fold True per element-wise numeric coercion",
+        );
+        assert_eq!(
+            fold(OpKind::Ne, vec![c(t_true), c(t_one)]),
+            Some(ConstValue::Bool(false)),
+        );
+        // Length mismatch always False.
+        let t_two = ConstValue::Tuple(vec![ConstValue::Int(1), ConstValue::Int(2)]);
+        let t_one2 = ConstValue::Tuple(vec![ConstValue::Int(1)]);
+        assert_eq!(
+            fold(OpKind::Eq, vec![c(t_two), c(t_one2)]),
+            Some(ConstValue::Bool(false)),
+        );
+        // List vs Tuple — distinct container types remain unequal
+        // (Python 3: `[1] == (1,)` is False).
+        let lst = ConstValue::List(vec![ConstValue::Int(1)]);
+        let tup = ConstValue::Tuple(vec![ConstValue::Int(1)]);
+        assert_eq!(
+            fold(OpKind::Eq, vec![c(lst), c(tup)]),
+            Some(ConstValue::Bool(false)),
+        );
+        // Nested element-wise — `((True,),)` vs `((1,),)`.
+        let nested_a = ConstValue::Tuple(vec![ConstValue::Tuple(vec![ConstValue::Bool(true)])]);
+        let nested_b = ConstValue::Tuple(vec![ConstValue::Tuple(vec![ConstValue::Int(1)])]);
+        assert_eq!(
+            fold(OpKind::Eq, vec![c(nested_a), c(nested_b)]),
+            Some(ConstValue::Bool(true)),
+        );
+    }
+
+    #[test]
+    fn constfold_eq_ne_python_numeric_coercion() {
+        // upstream `PureOperation.constfold` calls `operator.eq(*args)`
+        // / `operator.ne(*args)` which dispatches Python's numeric
+        // coercion: `True == 1`, `1 == 1.0`, `True == 1.0` all return
+        // `True`. The naive Rust `ConstValue::PartialEq` derives
+        // variant-strict equality and would say those are unequal —
+        // diverging from constfold parity.
+        // Bool ↔ Int.
+        assert_eq!(
+            fold(OpKind::Eq, vec![cb(true), ci(1)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Eq, vec![ci(1), cb(true)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Eq, vec![cb(false), ci(0)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Ne, vec![cb(true), ci(0)]),
+            Some(ConstValue::Bool(true)),
+        );
+        // Int ↔ Float.
+        assert_eq!(
+            fold(OpKind::Eq, vec![ci(1), cf(1.0)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Eq, vec![cf(1.5), ci(1)]),
+            Some(ConstValue::Bool(false)),
+        );
+        // Bool ↔ Float.
+        assert_eq!(
+            fold(OpKind::Eq, vec![cb(true), cf(1.0)]),
+            Some(ConstValue::Bool(true)),
+        );
+        // Distinct types stay False (no numeric coercion).
+        assert_eq!(
+            fold(OpKind::Eq, vec![ci(1), cs("1")]),
+            Some(ConstValue::Bool(false)),
+        );
     }
 
     #[test]

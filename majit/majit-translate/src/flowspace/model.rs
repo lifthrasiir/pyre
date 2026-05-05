@@ -925,7 +925,12 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
             _ => None,
         },
         "__globals__" => match &pyobj.inner.kind {
-            HostObjectKind::UserFunction { graph_func } => Some(graph_func.globals.value.clone()),
+            // Issue 2.1 (2026-05-05): re-snapshot via `live_globals`
+            // so `func.__globals__` mirrors upstream's *live* module
+            // dict reference (`flowcontext.py:284`). For
+            // rust-source-built funcs this picks up any registry
+            // entries that landed after the GraphFunc was built.
+            HostObjectKind::UserFunction { graph_func } => Some(graph_func.live_globals()),
             _ => None,
         },
         "__defaults__" => match &pyobj.inner.kind {
@@ -1225,7 +1230,10 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
                     .or_else(|| split_attr_name_module(&func.name).1);
                 Ok(module_name.map(ConstValue::byte_str))
             }
-            "__globals__" => Ok(Some(func.globals.value.clone())),
+            // Issue 2.1 (2026-05-05): live-snapshot accessor mirrors
+            // upstream `func.__globals__` reading the module dict
+            // directly (`flowcontext.py:284`).
+            "__globals__" => Ok(Some(func.live_globals())),
             "__defaults__" => {
                 if func.defaults.is_empty() {
                     Ok(Some(ConstValue::None))
@@ -3269,6 +3277,25 @@ pub struct GraphFunc {
     /// to `true` by RPython's `@not_rpython` decorator to mark a
     /// function as flow-space-ineligible.
     pub not_rpython: bool,
+    /// Issue 2.1 (2026-05-05): when set, `func.__globals__`
+    /// introspection paths
+    /// (`HostObject::class_get("__globals__")` /
+    /// `getattr(func, "__globals__")`) re-snapshot the registry
+    /// partition keyed on this id at access time, mirroring upstream
+    /// `flowcontext.py:284 self.w_globals = Constant(func.__globals__)`
+    /// where `func.__globals__` is a *live* reference to the
+    /// module's `__dict__`. The snapshot stored in `self.globals`
+    /// remains as a static fallback (and as the canonical
+    /// `module = __name__`-extraction source at construction time
+    /// per `from_host_code`).
+    ///
+    /// `None` for non-rust-source-built `GraphFunc`s — those keep
+    /// the legacy snapshot semantic (`self.globals` is an
+    /// already-frozen `ConstValue::Dict(items)` mirroring upstream
+    /// behaviour for Python-bytecode-built graphs whose
+    /// `func.__globals__` we have already serialised into
+    /// `Constant`).
+    pub module_globals_id: Option<crate::flowspace::rust_source::ModuleId>,
 }
 
 impl GraphFunc {
@@ -3301,6 +3328,24 @@ impl GraphFunc {
             filename: None,
             module: None,
             not_rpython: false,
+            module_globals_id: None,
+        }
+    }
+
+    /// Issue 2.1 (2026-05-05): live-snapshot accessor for
+    /// `func.__globals__`. When `module_globals_id` is set,
+    /// re-queries the registry partition so callers see any
+    /// entries added after this `GraphFunc` was constructed —
+    /// matching upstream's live `func.__globals__` reference
+    /// (`flowcontext.py:284`).
+    ///
+    /// When `module_globals_id` is `None` (non-rust-source path),
+    /// returns a clone of the static `self.globals.value` snapshot.
+    pub fn live_globals(&self) -> ConstValue {
+        if let Some(id) = self.module_globals_id {
+            ConstValue::Dict(crate::flowspace::rust_source::module_globals_snapshot_for_id(id))
+        } else {
+            self.globals.value.clone()
         }
     }
 

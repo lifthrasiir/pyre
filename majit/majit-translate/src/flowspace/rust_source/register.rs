@@ -211,7 +211,7 @@ pub fn build_host_function_from_rust_file(
     // the same id, mirroring upstream
     // `entry_point_a.__globals__ is entry_point_b.__globals__`
     // for two functions defined in the same Python module.
-    let module_id = register_rust_module_at(file, source_filename);
+    let module_id = register_rust_module_at(file, source_filename)?;
 
     // Locate the entry-point fn. Upstream `interactive.py:14` takes
     // the function object directly; here the caller names it because
@@ -320,14 +320,23 @@ pub fn build_host_function_metadata_from_rust(
 /// `build_host_function_from_rust`, which DOES run the Rust-AST
 /// adapter and produce a real `prebuilt_flow_graph`.
 ///
-/// ### Idempotence
+/// ### Re-registration semantics
 ///
-/// Re-calling on the same file (or a file containing a name already
-/// registered from another walk) is a no-op for already-bound names —
-/// `register_module_global` keeps the first registration to preserve
-/// the per-process identity invariant. This matches Python's
-/// `sys.modules` cache: re-importing a module does not rebuild the
-/// class objects, it returns the cached module unchanged.
+/// `register_module_global` is **last-writer-wins** under a fixed
+/// `(module_id, name)`: every call unconditionally overwrites the
+/// prior entry. This mirrors upstream `module.__dict__[name] =
+/// value` — every top-level binding statement is an unconditional
+/// assignment, whether on first import, `exec(source, dict)`, or
+/// `importlib.reload`. Within a single walk Rust syntax does not
+/// allow duplicate top-level item names, so the observable effect
+/// is across walks of the same path-keyed module: a second walk's
+/// bindings supersede the first. Callers who want `sys.modules`
+/// cache-hit semantics ("don't re-execute when already loaded")
+/// must gate the call themselves on a prior `module_globals_lookup`
+/// — the registry does not implement that gate. Production
+/// callsites (`from_rust_file_entry_point_with_source`) invoke
+/// the walker once per `Translation`, so the re-walk window is
+/// open only in tests and cross-`Translation` workflows.
 ///
 /// ### Scope (Slice O10 walker — Item::Enum / Item::Struct / Item::Const)
 ///
@@ -362,44 +371,60 @@ pub fn build_host_function_metadata_from_rust(
 ///
 /// ### Per-module scoping (Issue 1.3, 2026-05-05)
 ///
-/// Returns a fresh [`ModuleId`] minted at the start of the walk;
-/// every `register_module_global` call inside this function tags
-/// its entry with that id. Callers thread the returned id into
-/// `Builder.module_id` (via `build_flow_from_rust_in_module` /
-/// `build_host_function_from_rust_in_module`) so the body lowerer's
-/// `LOAD_GLOBAL` lookups resolve against the matching partition.
-/// Two separate walks of files that share top-level names mint
-/// distinct ids and never collide — mirroring upstream
-/// `flowcontext.py:284 self.w_globals = Constant(func.__globals__)`
-/// per-module scoping.
+/// Returns a fresh [`ModuleId`] every time — anonymous walks
+/// never merge. Mirrors upstream Python's `exec(source,
+/// fresh_dict)` semantic: each call runs the source against an
+/// independent `__dict__`, even if the source bytes are
+/// byte-identical to a prior `exec`.
 ///
 /// This BC entry routes through [`register_rust_module_at`] with
-/// no path. Callers that want re-walks of the same source file to
-/// converge on a single id (matching upstream `sys.modules`) call
-/// [`register_rust_module_at`] directly with `Some(path)`.
-pub fn register_rust_module(file: &File) -> ModuleId {
+/// `None` path. Callers that need shared registry slices across
+/// multiple walks (e.g. two entry points from the same source
+/// file sharing `func.__globals__`) MUST thread a stable path
+/// through [`register_rust_module_at`] — that's the only orthodox
+/// way to opt into upstream `sys.modules[name]` import-cache
+/// behavior.
+pub fn register_rust_module(file: &File) -> Result<ModuleId, AdapterError> {
     register_rust_module_at(file, None)
 }
 
 /// Path-aware sibling of [`register_rust_module`]. When
 /// `source_filename` is `Some(path)`, the registry id is keyed on
-/// `path`: two walks of files at the same path converge on the
-/// same [`ModuleId`] and the second walk is a no-op (entries
-/// already first-writer-wins-bound from the first walk). When
-/// `None`, mints a fresh id per call.
+/// `path` so that two walks of files at the same path converge on
+/// the same [`ModuleId`] (mirrors upstream `sys.modules[name]`
+/// import-cache). When `None`, the call mints a fresh
+/// [`ModuleId`] every time — anonymous walks NEVER merge.
 ///
 /// Mirrors upstream's two ways of obtaining a module dict:
 ///
-/// - **Path-keyed** ↔ `sys.modules[modulename]`: every `def` /
-///   `class` statement in the same source file binds into the same
-///   `__dict__` via the import-cache lookup. Two `Translation`
-///   instances built against entry points from the same file see
-///   identical `func.__globals__` references.
-/// - **Anonymous** ↔ `exec(source, dict={})`: the module dict is a
-///   throwaway, so two walks against the same source create two
-///   independent dicts. Right answer for unit-test fixtures and the
-///   bare [`build_host_function_from_rust`] single-`ItemFn` entry.
-pub fn register_rust_module_at(file: &File, source_filename: Option<&str>) -> ModuleId {
+/// - **Path-keyed** (`Some(path)`) ↔ `sys.modules[modulename]`:
+///   every `def` / `class` statement in the same source file binds
+///   into the same `__dict__` via the import-cache lookup. Two
+///   `Translation` instances built against entry points from the
+///   same file see identical `func.__globals__` references.
+/// - **Anonymous** (`None`) ↔ `exec(source, fresh_dict)`: each
+///   `exec` runs the code against a fresh namespace, even if the
+///   source string is byte-identical to a prior `exec`. Two
+///   anonymous walks of structurally-identical content therefore
+///   produce **independent** module identities — upstream Python
+///   never merges two `exec` calls into one `__dict__` based on
+///   content.
+///
+/// **Why not content-hash anonymous?** A prior revision (Issue 2.2,
+/// 2026-05-05) keyed the `None` branch on a token-stream content
+/// hash so two walks of the same source string converged on one
+/// `ModuleId`. Codex parity audit (2026-05-05) flagged that as a
+/// regression: `exec(source, dict_a)` and `exec(source, dict_b)`
+/// in upstream Python produce **distinct** `__dict__`s — content
+/// equality does not imply module identity. Path-keyed sharing
+/// is the only orthodox way to opt into a shared registry slice;
+/// callers who need that contract MUST thread a stable path
+/// (filesystem path, fixture label, anything) through
+/// `Some(...)`.
+pub fn register_rust_module_at(
+    file: &File,
+    source_filename: Option<&str>,
+) -> Result<ModuleId, AdapterError> {
     let module_id = match source_filename {
         Some(path) => ModuleId::for_path(path),
         None => ModuleId::fresh(),
@@ -416,39 +441,47 @@ pub fn register_rust_module_at(file: &File, source_filename: Option<&str>) -> Mo
         match item {
             Item::Enum(item_enum) => {
                 let name = item_enum.ident.to_string();
-                if module_globals_lookup(module_id, &name).is_some() {
-                    // First-writer-wins idempotence within this
-                    // module's partition (defensive — Rust does
-                    // not allow two top-level enums with the same
-                    // name in one source file, so this branch
-                    // is normally unreachable).
-                    continue;
-                }
+                // Last-writer-wins per upstream
+                // `module.__dict__[name] = value` (every top-level
+                // binding statement is an unconditional assignment;
+                // `exec(source, dict)` / `importlib.reload`
+                // semantics). Rust syntax does not allow duplicate
+                // top-level item names within a single source file,
+                // so the observable effect is across walks of the
+                // same path-keyed `module_id`: the second walk's
+                // bindings supersede the first.
                 let host = build_host_class_from_enum(item_enum);
                 register_module_global(module_id, &name, ConstValue::HostObject(host));
             }
             Item::Struct(item_struct) => {
                 let name = item_struct.ident.to_string();
-                if module_globals_lookup(module_id, &name).is_some() {
-                    continue;
-                }
                 let host = build_host_class_from_struct(item_struct);
                 register_module_global(module_id, &name, ConstValue::HostObject(host));
             }
             Item::Const(item_const) => {
                 let name = item_const.ident.to_string();
-                if module_globals_lookup(module_id, &name).is_some() {
-                    continue;
-                }
                 // upstream Python import-time evaluation: the RHS
                 // runs against the partially-built `module.__dict__`,
                 // so compound expressions like `const Y: i64 = X + 1`
                 // resolve `X` through the prior binding. The walker
                 // threads `const_bindings` (the local source-order
                 // accumulator) into the evaluator so forward
-                // dependencies between sibling consts work without
-                // a process-global registry round-trip.
-                if let Some(value) = eval_const_expr(&item_const.expr, &const_bindings) {
+                // dependencies between sibling consts work; the
+                // evaluator ALSO consults `module_globals_lookup` as
+                // fallback when the path-keyed `module_id` was already
+                // populated by a prior walk (Issue 2.3, 2026-05-05) —
+                // mirrors upstream `module.__dict__` being the live
+                // reference visible across re-imports.
+                // Codex parity audit (2026-05-05): deterministic-
+                // failure cases (overflow, type mismatch, unbound name)
+                // surface as `Err` and abort the walk, matching upstream
+                // Python's import-time exception. Unsupported shapes
+                // (function calls, struct literals, multi-segment paths,
+                // float / char literals) return `Ok(None)` and are
+                // silently skipped — those are walker-coverage gaps
+                // (Issue 2.3 follow-up), not deterministic failures.
+                if let Some(value) = eval_const_expr(&item_const.expr, &const_bindings, module_id)?
+                {
                     register_module_global(module_id, &name, value.clone());
                     const_bindings.insert(name, value);
                 }
@@ -496,7 +529,7 @@ pub fn register_rust_module_at(file: &File, source_filename: Option<&str>) -> Mo
             }
         }
     }
-    module_id
+    Ok(module_id)
 }
 
 /// Build the `HostObject::Class` corresponding to `item_enum` and
@@ -535,11 +568,25 @@ fn build_host_class_from_enum(item_enum: &ItemEnum) -> HostObject {
 
 /// Evaluate a `const` RHS expression to a [`ConstValue`] using
 /// `bindings` as the lookup environment for prior `const` names in
-/// the same module walk. Returns `None` for unsupported shapes
-/// (`Lit::Float`, `Lit::Char`, calls, struct literals, …) so the
-/// walker can skip the entry, leaving the name unresolved exactly
-/// as upstream Python raises `FlowingError` only when a missing
-/// global is referenced (lazy resolution).
+/// the same module walk.
+///
+/// Tri-state return mirrors upstream Python's import-time RHS
+/// evaluation contract:
+///
+/// - `Ok(Some(v))` — RHS evaluated successfully; bind `name = v`.
+/// - `Ok(None)` — RHS shape is *unsupported* by this static
+///   evaluator (e.g. function call, struct literal, multi-segment
+///   path, `Lit::Float` / `Lit::Char`). Walker silently skips the
+///   binding because we cannot statically tell whether upstream
+///   Python's runtime evaluator would succeed or raise — this is
+///   the "incomplete walker coverage" case (Issue 2.3 follow-up).
+/// - `Err(e)` — RHS shape is *supported* but evaluation
+///   deterministically fails. Upstream Python raises immediately
+///   at import time (`OverflowError`, `TypeError`, `NameError`,
+///   `ZeroDivisionError`, …); the walker propagates the error to
+///   abort the walk, matching upstream's "import-time RHS failure
+///   is an immediate exception, not an unresolved global" semantic
+///   (Codex parity audit, 2026-05-05).
 ///
 /// Supported shapes:
 ///
@@ -557,32 +604,69 @@ fn build_host_class_from_enum(item_enum: &ItemEnum) -> HostObject {
 ///   `Lit::Int(-1)`, so unwrap one level for the common signed-int
 ///   form.
 /// - **`Expr::Path` (single segment)** → `bindings.get(name)`
-///   lookup. Mirrors upstream Python's name resolution against
+///   lookup, or `module_globals_lookup(module_id, name)` fallback.
+///   Mirrors upstream Python's name resolution against
 ///   `module.__dict__` at import time: by the time the RHS of
 ///   `Y = X + 1` runs, the prior `X = 1` has already bound
-///   `module.__dict__["X"]`. Multi-segment paths fall through to
-///   `None` (a path like `mod::CONST_X` would require cross-file
-///   lookup and is out of scope for this slice).
-/// - **`Expr::Binary { Add | Sub | Mul | Div | Rem, lhs, rhs }`**
-///   over `Int` operands → `Int(a OP b)`. Uses Rust's checked
-///   arithmetic so overflow returns `None` (and the const skips
-///   silently — same outcome as upstream raising on integer
-///   overflow at import time). `Div` / `Rem` returns `None` on
-///   zero divisor.
-fn eval_const_expr(expr: &Expr, bindings: &StdHashMap<String, ConstValue>) -> Option<ConstValue> {
+///   `module.__dict__["X"]`. The fallback through the registry
+///   handles the path-keyed re-walk case (Issue 2.3): when
+///   `module_id` was minted by a prior walk that already
+///   populated `X`, the second walk's fresh `bindings` does not
+///   carry it but the registry partition does — upstream's live
+///   `module.__dict__` is visible across re-imports too.
+///   Multi-segment paths fall through to `None` (a path like
+///   `mod::CONST_X` would require cross-file lookup and is out
+///   of scope for this slice).
+/// - **`Expr::Binary { Add | Sub | Mul | Div | Rem | Shl | Shr |
+///   BitAnd | BitOr | BitXor, lhs, rhs }`** over `Int` operands →
+///   `Int(a OP b)`. Uses Rust's checked arithmetic; arithmetic
+///   overflow surfaces as `Err(OverflowError: …)` (mirrors upstream
+///   raising at import time — silent decline would invite a
+///   wrong-shape constant into the module dict). `Div` / `Rem`
+///   raise `Err(ZeroDivisionError)` on zero divisor; `Shl` / `Shr`
+///   raise `Err(ValueError)` on negative or `>= 64` shift counts.
+/// - **`Expr::Binary { Eq | Ne, lhs, rhs }`** over any operand
+///   pair → `Bool(...)`. Same-type pairs use the matching arm's
+///   structural equality; mixed-type pairs (e.g. `Int` vs `UniStr`)
+///   return `Bool(false)` for `Eq` / `Bool(true)` for `Ne` — Python
+///   3 does NOT raise on `==` / `!=` between distinct primitive
+///   types. Numeric coercion for `True == 1` etc. is folded by
+///   `HLOperation::constfold` once the const reaches the SSA layer.
+/// - **`Expr::Binary { Lt | Le | Gt | Ge, lhs, rhs }`** over
+///   same-type operands → `Bool(...)`. Mixed-type ordering raises
+///   `Err(TypeError)` matching Python 3's
+///   `'<' not supported between instances of …`.
+/// - **`Expr::Binary { And | Or, lhs, rhs }`** over `Bool`
+///   operands → `Bool(...)`. Rust `&&`/`||` are typed `bool ->
+///   bool -> bool` so unlike Python's value-returning
+///   short-circuit, the result is always `Bool`.
+/// - **`Expr::Unary { Not, expr }`** over `Bool` → `Bool(!b)` (Rust
+///   `!bool` is logical negation), or over `Int` → `Int(!n)` (Rust
+///   `!int` is bitwise complement, mirroring Python `~`).
+fn eval_const_expr(
+    expr: &Expr,
+    bindings: &StdHashMap<String, ConstValue>,
+    module_id: ModuleId,
+) -> Result<Option<ConstValue>, AdapterError> {
+    let raise = |reason: String| AdapterError::Flowing { reason };
     match expr {
         Expr::Lit(ExprLit { lit, .. }) => match lit {
-            Lit::Int(n) => n.base10_parse::<i64>().ok().map(ConstValue::Int),
-            Lit::Bool(b) => Some(ConstValue::Bool(b.value)),
+            Lit::Int(n) => match n.base10_parse::<i64>() {
+                Ok(v) => Ok(Some(ConstValue::Int(v))),
+                Err(_) => Err(raise(format!(
+                    "OverflowError: integer literal {n} does not fit in i64"
+                ))),
+            },
+            Lit::Bool(b) => Ok(Some(ConstValue::Bool(b.value))),
             // `"..."` literal — unicode. Same shape as
             // `build_flow.rs::lower_literal::Lit::Str` so the
             // identical `"abc"` source carries the identical
             // ConstValue regardless of position.
-            Lit::Str(s) => Some(ConstValue::uni_str(s.value())),
+            Lit::Str(s) => Ok(Some(ConstValue::uni_str(s.value()))),
             // `b"..."` literal — bytes. Mirrors
             // `build_flow.rs::lower_literal::Lit::ByteStr`.
-            Lit::ByteStr(s) => Some(ConstValue::ByteStr(s.value())),
-            _ => None,
+            Lit::ByteStr(s) => Ok(Some(ConstValue::ByteStr(s.value()))),
+            _ => Ok(None),
         },
         // `const X: i64 = -1` — `syn` parses as `Unary { op: Neg,
         // expr: Lit(1) }` rather than a signed literal. Unwrap one
@@ -591,44 +675,259 @@ fn eval_const_expr(expr: &Expr, bindings: &StdHashMap<String, ConstValue>) -> Op
             op: UnOp::Neg(_),
             expr,
             ..
-        }) => match eval_const_expr(expr, bindings)? {
-            ConstValue::Int(n) => n.checked_neg().map(ConstValue::Int),
-            _ => None,
-        },
-        // `const Y: i64 = X` — single-segment path resolves to a
-        // prior binding in the same walk. Multi-segment paths are
-        // out of scope.
+        }) => {
+            let Some(v) = eval_const_expr(expr, bindings, module_id)? else {
+                return Ok(None);
+            };
+            match v {
+                ConstValue::Int(n) => match n.checked_neg() {
+                    Some(neg) => Ok(Some(ConstValue::Int(neg))),
+                    None => Err(raise(format!(
+                        "OverflowError: -({n}) overflows i64 (i64::MIN unary negation)"
+                    ))),
+                },
+                other => Err(raise(format!(
+                    "TypeError: unary `-` operand must be Int, got {other:?}"
+                ))),
+            }
+        }
+        // `const X: bool = !true` over Bool → logical negation.
+        // `const X: i64 = !0` over Int → bitwise complement
+        // (Rust's `!` on integers is the same as Python's `~`).
+        Expr::Unary(ExprUnary {
+            op: UnOp::Not(_),
+            expr,
+            ..
+        }) => {
+            let Some(v) = eval_const_expr(expr, bindings, module_id)? else {
+                return Ok(None);
+            };
+            match v {
+                ConstValue::Bool(b) => Ok(Some(ConstValue::Bool(!b))),
+                ConstValue::Int(n) => Ok(Some(ConstValue::Int(!n))),
+                other => Err(raise(format!(
+                    "TypeError: unary `!` operand must be Bool or Int, got {other:?}"
+                ))),
+            }
+        }
+        // `const Y: i64 = X` — single-segment path. Resolution
+        // order matches upstream Python's import-time name
+        // resolution against `module.__dict__`: per-walk source-
+        // order `bindings` first, then the registry partition
+        // (Issue 2.3 — covers re-walk: a path-keyed `module_id`
+        // already populated by a prior walk has the entry in
+        // the registry but not in this walk's fresh `bindings`).
+        // Multi-segment paths are out of scope for the const
+        // evaluator (silent skip).
         Expr::Path(ExprPath {
             qself: None, path, ..
         }) if path.segments.len() == 1 => {
             let seg = &path.segments[0];
             if !seg.arguments.is_empty() {
-                return None;
+                return Ok(None);
             }
-            bindings.get(&seg.ident.to_string()).cloned()
+            let name = seg.ident.to_string();
+            match bindings
+                .get(&name)
+                .cloned()
+                .or_else(|| module_globals_lookup(module_id, &name))
+            {
+                Some(v) => Ok(Some(v)),
+                None => Err(raise(format!(
+                    "NameError: name '{name}' is not defined at import time"
+                ))),
+            }
         }
-        // `const Y: i64 = X + 1` — checked arithmetic over
-        // `ConstValue::Int` operands. Other operand kinds (float,
-        // bool, str) and other binops (shifts, bitwise, comparisons)
-        // are out of scope until pyre exercises them.
+        // `const Y = X + 1` etc — operator dispatch over evaluated
+        // operands. Type-mismatch / overflow / division-by-zero
+        // surface as `Err` so the walker bails immediately, matching
+        // upstream Python's import-time exception. Truly unsupported
+        // operator/operand combinations return `Ok(None)` (silent
+        // skip).
+        //
+        // **Short-circuit `&&` / `||`** (codex parity audit,
+        // 2026-05-05): both Rust source and upstream Python's
+        // `and`/`or` are short-circuit at the source level —
+        // `false && BAD` evaluates to `false` without touching
+        // `BAD`, and `true || BAD` evaluates to `true` similarly.
+        // The naive "evaluate both operands then dispatch" path
+        // would force-evaluate the RHS, diverging in cases where
+        // the RHS would itself raise (e.g. unbound name, division
+        // by zero). LHS is evaluated first; if it's a `Bool` whose
+        // value determines the result, the RHS is skipped.
         Expr::Binary(ExprBinary {
             left, op, right, ..
         }) => {
-            let lhs = eval_const_expr(left, bindings)?;
-            let rhs = eval_const_expr(right, bindings)?;
-            let (ConstValue::Int(a), ConstValue::Int(b)) = (lhs, rhs) else {
-                return None;
+            let Some(lhs) = eval_const_expr(left, bindings, module_id)? else {
+                return Ok(None);
             };
-            match op {
-                BinOp::Add(_) => a.checked_add(b).map(ConstValue::Int),
-                BinOp::Sub(_) => a.checked_sub(b).map(ConstValue::Int),
-                BinOp::Mul(_) => a.checked_mul(b).map(ConstValue::Int),
-                BinOp::Div(_) => a.checked_div(b).map(ConstValue::Int),
-                BinOp::Rem(_) => a.checked_rem(b).map(ConstValue::Int),
-                _ => None,
+            if let ConstValue::Bool(b) = lhs {
+                match op {
+                    BinOp::And(_) if !b => return Ok(Some(ConstValue::Bool(false))),
+                    BinOp::Or(_) if b => return Ok(Some(ConstValue::Bool(true))),
+                    _ => {}
+                }
             }
+            let Some(rhs) = eval_const_expr(right, bindings, module_id)? else {
+                return Ok(None);
+            };
+            eval_binop(op, &lhs, &rhs)
         }
-        _ => None,
+        _ => Ok(None),
+    }
+}
+
+/// Evaluate a Rust `BinOp` over two evaluated `ConstValue` operands.
+///
+/// Tri-state return mirrors [`eval_const_expr`]:
+///
+/// - `Ok(Some(v))` — success.
+/// - `Ok(None)` — shape unsupported by this evaluator (e.g. an
+///   operator that's never reachable from typed Rust source for
+///   the given operand pair). Walker silently skips.
+/// - `Err(e)` — supported shape but operation deterministically
+///   raises (overflow, type mismatch, division-by-zero, shift
+///   count out of range). Walker propagates as `AdapterError`,
+///   matching upstream Python's import-time exception.
+fn eval_binop(
+    op: &BinOp,
+    lhs: &ConstValue,
+    rhs: &ConstValue,
+) -> Result<Option<ConstValue>, AdapterError> {
+    let raise = |reason: String| AdapterError::Flowing { reason };
+    let int_overflow = |op_name: &str, a: i64, b: i64| {
+        Err(raise(format!(
+            "OverflowError: {a} {op_name} {b} overflows i64"
+        )))
+    };
+    let int_zerodiv = |op_name: &str| {
+        Err(raise(format!(
+            "ZeroDivisionError: integer {op_name} by zero"
+        )))
+    };
+    let int_shift_oor = |op_name: &str, b: i64| {
+        Err(raise(format!(
+            "ValueError: {op_name} count {b} out of range (must fit in u32 and < 64)"
+        )))
+    };
+    match (lhs, rhs) {
+        (ConstValue::Int(a), ConstValue::Int(b)) => match op {
+            BinOp::Add(_) => match a.checked_add(*b) {
+                Some(v) => Ok(Some(ConstValue::Int(v))),
+                None => int_overflow("+", *a, *b),
+            },
+            BinOp::Sub(_) => match a.checked_sub(*b) {
+                Some(v) => Ok(Some(ConstValue::Int(v))),
+                None => int_overflow("-", *a, *b),
+            },
+            BinOp::Mul(_) => match a.checked_mul(*b) {
+                Some(v) => Ok(Some(ConstValue::Int(v))),
+                None => int_overflow("*", *a, *b),
+            },
+            BinOp::Div(_) => {
+                if *b == 0 {
+                    return int_zerodiv("division");
+                }
+                match a.checked_div(*b) {
+                    Some(v) => Ok(Some(ConstValue::Int(v))),
+                    None => int_overflow("/", *a, *b),
+                }
+            }
+            BinOp::Rem(_) => {
+                if *b == 0 {
+                    return int_zerodiv("modulo");
+                }
+                match a.checked_rem(*b) {
+                    Some(v) => Ok(Some(ConstValue::Int(v))),
+                    None => int_overflow("%", *a, *b),
+                }
+            }
+            // `<<` / `>>` — `checked_shl` / `checked_shr` take a
+            // `u32` count and reject `count >= 64`. Negative `b`
+            // is also rejected (cannot fit in `u32`).
+            BinOp::Shl(_) => match u32::try_from(*b).ok().and_then(|n| a.checked_shl(n)) {
+                Some(v) => Ok(Some(ConstValue::Int(v))),
+                None => int_shift_oor("<<", *b),
+            },
+            BinOp::Shr(_) => match u32::try_from(*b).ok().and_then(|n| a.checked_shr(n)) {
+                Some(v) => Ok(Some(ConstValue::Int(v))),
+                None => int_shift_oor(">>", *b),
+            },
+            BinOp::BitAnd(_) => Ok(Some(ConstValue::Int(a & b))),
+            BinOp::BitOr(_) => Ok(Some(ConstValue::Int(a | b))),
+            BinOp::BitXor(_) => Ok(Some(ConstValue::Int(a ^ b))),
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(a == b))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(a != b))),
+            BinOp::Lt(_) => Ok(Some(ConstValue::Bool(a < b))),
+            BinOp::Le(_) => Ok(Some(ConstValue::Bool(a <= b))),
+            BinOp::Gt(_) => Ok(Some(ConstValue::Bool(a > b))),
+            BinOp::Ge(_) => Ok(Some(ConstValue::Bool(a >= b))),
+            _ => Ok(None),
+        },
+        (ConstValue::Bool(a), ConstValue::Bool(b)) => match op {
+            // Rust `&&` / `||` are short-circuit at the source
+            // level — the lowerer in `eval_const_expr` handles the
+            // short-circuit semantics before we reach here. By the
+            // time `eval_binop` runs both operands have been fully
+            // evaluated; the operator semantic is then `bool && bool`
+            // / `bool || bool` (boolean conjunction / disjunction
+            // returning bool, not Python's value-returning short-
+            // circuit).
+            BinOp::And(_) => Ok(Some(ConstValue::Bool(*a && *b))),
+            BinOp::Or(_) => Ok(Some(ConstValue::Bool(*a || *b))),
+            BinOp::BitAnd(_) => Ok(Some(ConstValue::Bool(*a & *b))),
+            BinOp::BitOr(_) => Ok(Some(ConstValue::Bool(*a | *b))),
+            BinOp::BitXor(_) => Ok(Some(ConstValue::Bool(*a ^ *b))),
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(a == b))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(a != b))),
+            _ => Ok(None),
+        },
+        (ConstValue::UniStr(a), ConstValue::UniStr(b)) => match op {
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(a == b))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(a != b))),
+            BinOp::Lt(_) => Ok(Some(ConstValue::Bool(a < b))),
+            BinOp::Le(_) => Ok(Some(ConstValue::Bool(a <= b))),
+            BinOp::Gt(_) => Ok(Some(ConstValue::Bool(a > b))),
+            BinOp::Ge(_) => Ok(Some(ConstValue::Bool(a >= b))),
+            _ => Ok(None),
+        },
+        (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) => match op {
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(a == b))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(a != b))),
+            BinOp::Lt(_) => Ok(Some(ConstValue::Bool(a < b))),
+            BinOp::Le(_) => Ok(Some(ConstValue::Bool(a <= b))),
+            BinOp::Gt(_) => Ok(Some(ConstValue::Bool(a > b))),
+            BinOp::Ge(_) => Ok(Some(ConstValue::Bool(a >= b))),
+            _ => Ok(None),
+        },
+        // Mixed-type operand pair. Python 3's behaviour splits on the
+        // operator family:
+        //
+        // - **`==` / `!=`**: never raise across distinct primitive
+        //   types — `1 == "1"` returns `False`, `1 != "1"` returns
+        //   `True`. Rust typed source rules out numeric-coerced
+        //   pairs like `true == 1` at parse time (Rust's `==` is
+        //   typed `T: PartialEq`, no implicit `bool ↔ i64` coerce),
+        //   so this arm only ever fires on genuinely distinct
+        //   primitive carriers (`Int` vs `UniStr`, etc.); the
+        //   answer is always `Bool(false)` / `Bool(true)`. The
+        //   structural difference vs upstream Python (where
+        //   `True == 1` IS True) is documented as a Rust-language
+        //   adaptation, not a parity gap.
+        // - **Ordering (`<`, `<=`, `>`, `>=`)**: Python 3 raises
+        //   `TypeError("'<' not supported between instances of …")`
+        //   at import time. Surface as walker error so the binding
+        //   does not silently bind a wrong-shape `Bool`.
+        // - **All other ops** (`+`, `-`, `*`, `/`, etc.) over
+        //   distinct types: `TypeError` per upstream `operator.add`
+        //   etc.
+        _ => match op {
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(false))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(true))),
+            _ => Err(raise(format!(
+                "TypeError: unsupported operand types for binop: {lhs:?} OP {rhs:?}"
+            ))),
+        },
     }
 }
 
@@ -750,6 +1049,18 @@ fn build_host_metadata_parts(
     // enclosing module bindings.
     let func_globals = Constant::new(ConstValue::Dict(module_globals_snapshot(module_id)));
     let mut gf = GraphFunc::from_host_code(host_code.clone(), func_globals, Vec::new());
+    // Issue 2.1 (2026-05-05): record `module_id` on `GraphFunc` so
+    // `func.__globals__` introspection paths
+    // (`HostObject::class_get("__globals__")` /
+    // `getattr(func, "__globals__")`) re-snapshot the registry at
+    // access time — mirrors upstream `flowcontext.py:284
+    // self.w_globals = Constant(func.__globals__)` where
+    // `func.__globals__` is a *live* reference to the module
+    // dict. The static snapshot stored in `gf.globals` above
+    // remains as the canonical `module = __name__`-extraction
+    // source per `from_host_code` and as the static fallback
+    // for non-rust-source callers.
+    gf.module_globals_id = Some(module_id);
     // upstream `bytecode.py:46-60` populates `GraphFunc.source` from
     // `inspect.getsource(func)`. When the caller threads in the
     // source text, mirror that — downstream readers (`model.rs:3210
@@ -1140,7 +1451,7 @@ mod tests {
         let src = "fn parity_probe_walker_alpha() -> i64 { 1 }
                    fn parity_probe_walker_beta(a: i64) -> i64 { a }";
         let file = syn::parse_file(src).expect("file fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
 
         assert!(
             module_globals_lookup(module_id, "parity_probe_walker_alpha").is_none(),
@@ -1161,7 +1472,7 @@ mod tests {
 
         let src = "fn parity_probe_walker_with_cast(x: u32) -> i64 { x as i64 }";
         let file = syn::parse_file(src).expect("file fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         assert!(
             module_globals_lookup(module_id, "parity_probe_walker_with_cast").is_none(),
             "Item::Fn skip is unconditional regardless of body lowerability",
@@ -1179,7 +1490,7 @@ mod tests {
 
         let src = "static PARITY_PROBE_WALKER_STATIC_ONLY: i64 = 1;";
         let file = syn::parse_file(src).expect("file fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         assert!(module_globals_lookup(module_id, "PARITY_PROBE_WALKER_STATIC_ONLY").is_none());
     }
 
@@ -1194,7 +1505,7 @@ mod tests {
 
         let src = "pub enum ParityProbeEnum_Slice_O8 { Alpha, Beta, Gamma }";
         let file = syn::parse_file(src).expect("enum fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
 
         let parent =
             lookup_host(module_id, "ParityProbeEnum_Slice_O8").expect("enum registered after walk");
@@ -1232,7 +1543,7 @@ mod tests {
 
         let src = "pub struct ParityProbeStruct_Slice_O8 { x: i64, y: i64 }";
         let file = syn::parse_file(src).expect("struct fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let host = lookup_host(module_id, "ParityProbeStruct_Slice_O8")
             .expect("struct registered after walk");
         assert!(host.is_class());
@@ -1294,30 +1605,106 @@ mod tests {
     }
 
     #[test]
+    fn graph_func_live_globals_reflects_post_construction_walker_writes() {
+        // Issue 2.1 (2026-05-05): `func.__globals__` must surface
+        // entries added to the registry partition AFTER `GraphFunc`
+        // construction, mirroring upstream `flowcontext.py:284
+        // self.w_globals = Constant(func.__globals__)` where
+        // `func.__globals__` is a *live* reference to the module
+        // dict. `live_globals()` re-snapshots the partition keyed
+        // on `module_globals_id`.
+        //
+        // Construction sequence: build entry-point first (snapshot
+        // taken with only items the walker has registered so far),
+        // then register additional items into the same `module_id`.
+        // The static `gf.globals.value` snapshot stays stale; the
+        // `live_globals()` accessor returns the post-write state.
+        use super::super::host_env::register_module_global;
+        let path = "/parity_probe/issue21_live_globals.rs";
+        let src = "fn parity_probe_issue21_entry() -> i64 { 1 }";
+        let file = syn::parse_file(src).expect("entry-point fixture parses");
+        let (host, _pygraph) = build_host_function_from_rust_file(
+            &file,
+            "parity_probe_issue21_entry",
+            Some(path),
+            None,
+        )
+        .expect("file-aware entry succeeds");
+        let gf = host.user_function().expect("user function");
+        let module_id = gf.module_globals_id.expect("rust-source built sets the id");
+
+        // Static snapshot is the dict at construction time — empty
+        // beyond what the walker pre-pass wrote. Sanity-check the
+        // construction-time invariant first.
+        let static_dict = match &gf.globals.value {
+            ConstValue::Dict(items) => items.clone(),
+            other => panic!("expected ConstValue::Dict, got {other:?}"),
+        };
+
+        // Now register a fresh entry into the same partition,
+        // simulating either a follow-up walker pass or a deferred
+        // `Item::*` registration. Upstream Python: a later
+        // `module.NEW_NAME = ...` assignment would be visible to
+        // any subsequent `func.__globals__["NEW_NAME"]` read.
+        register_module_global(
+            module_id,
+            "ParityProbe_Issue21_late_addition",
+            ConstValue::Int(99),
+        );
+
+        // Static snapshot is unchanged (snapshot semantic).
+        let static_dict_after = match &gf.globals.value {
+            ConstValue::Dict(items) => items.clone(),
+            other => panic!("expected ConstValue::Dict, got {other:?}"),
+        };
+        assert_eq!(
+            static_dict, static_dict_after,
+            "static `gf.globals.value` snapshot stays frozen at construction time",
+        );
+
+        // Live snapshot via `live_globals()` reflects the new entry.
+        let live = gf.live_globals();
+        let live_dict = match &live {
+            ConstValue::Dict(items) => items,
+            other => panic!("expected live_globals() Dict, got {other:?}"),
+        };
+        assert_eq!(
+            live_dict.get(&ConstValue::byte_str(b"ParityProbe_Issue21_late_addition")),
+            Some(&ConstValue::Int(99)),
+            "live_globals must surface entries added to the partition \
+             post-construction (upstream `func.__globals__` is a live ref)",
+        );
+    }
+
+    #[test]
     fn register_rust_module_at_with_same_path_returns_same_id() {
         // Issue 2 (2026-05-05): two walks of the same source path
         // converge on the same `ModuleId` — mirrors upstream
-        // `sys.modules[path]` import-cache. Second walk's
-        // registrations are noops (first-writer-wins inside the
-        // partition) but the id matches so a downstream
-        // `Builder.module_id` lookup against either id sees the
-        // first walk's bindings.
+        // `sys.modules[path]` import-cache identity. The second
+        // walk's registrations clobber the first under
+        // last-writer-wins (`module.__dict__[name] = value`
+        // semantics) — the cross-id lookup observes the second
+        // walk's binding regardless of whether file1 / file2 are
+        // identical or distinct.
 
         let src = "pub struct ParityProbe_Issue2_path_share;";
         let file1 = syn::parse_file(src).expect("file 1 parses");
         let file2 = syn::parse_file(src).expect("file 2 parses");
-        let id1 = register_rust_module_at(&file1, Some("/parity_probe/issue2_share.rs"));
-        let id2 = register_rust_module_at(&file2, Some("/parity_probe/issue2_share.rs"));
+        let id1 = register_rust_module_at(&file1, Some("/parity_probe/issue2_share.rs"))
+            .expect("walker must succeed");
+        let id2 = register_rust_module_at(&file2, Some("/parity_probe/issue2_share.rs"))
+            .expect("walker must succeed");
         assert_eq!(
             id1, id2,
             "same path must yield the same ModuleId (sys.modules cache parity)",
         );
         let host = lookup_host(id1, "ParityProbe_Issue2_path_share")
-            .expect("first walk's binding visible from shared id");
+            .expect("walk's binding visible from shared id");
         let cross = lookup_host(id2, "ParityProbe_Issue2_path_share").unwrap();
         assert_eq!(
             host, cross,
-            "shared id must serve identical HostObject identity across walks",
+            "shared id must serve identical HostObject identity across walks \
+             (last-writer-wins: the second walk's HostObject is what both ids see)",
         );
     }
 
@@ -1332,8 +1719,10 @@ mod tests {
         let src2 = "pub struct ParityProbe_Issue2_path_distinct { x: i64 }";
         let file1 = syn::parse_file(src1).expect("file 1 parses");
         let file2 = syn::parse_file(src2).expect("file 2 parses");
-        let id1 = register_rust_module_at(&file1, Some("/parity_probe/issue2_distinct_a.rs"));
-        let id2 = register_rust_module_at(&file2, Some("/parity_probe/issue2_distinct_b.rs"));
+        let id1 = register_rust_module_at(&file1, Some("/parity_probe/issue2_distinct_a.rs"))
+            .expect("walker must succeed");
+        let id2 = register_rust_module_at(&file2, Some("/parity_probe/issue2_distinct_b.rs"))
+            .expect("walker must succeed");
         assert_ne!(id1, id2, "distinct paths must mint distinct ids");
         let host1 = lookup_host(id1, "ParityProbe_Issue2_path_distinct").unwrap();
         let host2 = lookup_host(id2, "ParityProbe_Issue2_path_distinct").unwrap();
@@ -1344,20 +1733,40 @@ mod tests {
     }
 
     #[test]
-    fn register_rust_module_at_with_none_path_mints_fresh_each_call() {
-        // Issue 2 (2026-05-05): `None` path falls back to
-        // `ModuleId::fresh()` (anonymous module, like
-        // `exec(source, dict={})`). Two anonymous walks of the same
-        // source remain isolated — caller didn't ask for caching, so
-        // they shouldn't get it.
-        let src = "pub struct ParityProbe_Issue2_anonymous;";
+    fn register_rust_module_at_with_none_path_mints_fresh_per_call() {
+        // Codex parity revert (2026-05-05): the `None` branch was
+        // previously content-hashed (Issue 2.2), but that merged
+        // distinct anonymous walks of identical source whenever the
+        // bytes matched — diverging from upstream Python's
+        // `exec(source, dict_a)` / `exec(source, dict_b)` semantic
+        // (each `exec` runs against an independent `__dict__`). The
+        // fix mints a fresh ModuleId per anonymous call. Callers
+        // who need shared identity opt in via `Some(path)`.
+        let src = "pub struct ParityProbe_Anonymous_FreshPerCall;";
         let file = syn::parse_file(src).expect("anonymous walk parses");
-        let id1 = register_rust_module_at(&file, None);
-        let id2 = register_rust_module_at(&file, None);
+        let id1 = register_rust_module_at(&file, None).expect("walker must succeed");
+        let id2 = register_rust_module_at(&file, None).expect("walker must succeed");
         assert_ne!(
             id1, id2,
-            "None path must mint a fresh id per call (anonymous walks stay isolated)",
+            "anonymous walks (None path) MUST mint independent ModuleIds even \
+             when the source bytes are identical — content equality does not \
+             imply module identity in upstream Python",
         );
+    }
+
+    #[test]
+    fn register_rust_module_at_with_none_path_distinguishes_distinct_content() {
+        // Anonymous walks of distinct content produce distinct ids
+        // (trivially follows from "every None call mints fresh").
+        // Kept as a separate oracle so future regressions to
+        // content-hash sharing fail this test too.
+        let src1 = "pub struct ParityProbe_Anon_Distinct_A;";
+        let src2 = "pub struct ParityProbe_Anon_Distinct_B;";
+        let file1 = syn::parse_file(src1).expect("file 1 parses");
+        let file2 = syn::parse_file(src2).expect("file 2 parses");
+        let id1 = register_rust_module_at(&file1, None).expect("walker must succeed");
+        let id2 = register_rust_module_at(&file2, None).expect("walker must succeed");
+        assert_ne!(id1, id2, "distinct anonymous walks mint distinct ModuleIds",);
     }
 
     #[test]
@@ -1378,8 +1787,8 @@ mod tests {
         let src2 = "pub struct ParityProbeStruct_isolate { x: i64 }"; // distinct shape, same name
         let file1 = syn::parse_file(src1).expect("file 1 parses");
         let file2 = syn::parse_file(src2).expect("file 2 parses");
-        let id1 = register_rust_module(&file1);
-        let id2 = register_rust_module(&file2);
+        let id1 = register_rust_module(&file1).expect("walker must succeed");
+        let id2 = register_rust_module(&file2).expect("walker must succeed");
         assert_ne!(id1, id2, "fresh walks must produce distinct ModuleIds");
         let host1 = lookup_host(id1, "ParityProbeStruct_isolate")
             .expect("file 1's binding visible from id1");
@@ -1399,20 +1808,19 @@ mod tests {
     }
 
     #[test]
-    fn register_rust_module_idempotent_within_single_walk_for_duplicate_name() {
-        // Within a single `register_rust_module` call, a duplicate
-        // top-level name is defensive (Rust would fail to compile)
-        // — but if such a fixture is parsed, the first registration
-        // wins to preserve the identity invariant for whoever already
-        // observed the binding inside the same partition. Mirrors
-        // upstream Python semantics where a `class` statement
-        // executed twice in the same module body would re-bind the
-        // name, but our walker treats the partition as immutable
-        // once written so observers stay coherent.
+    fn register_rust_module_last_writer_wins_under_same_module_id() {
+        // Last-writer-wins under a fixed `ModuleId` mirrors upstream
+        // `module.__dict__[name] = value` semantics: every top-level
+        // binding statement is an unconditional assignment. Within a
+        // single `register_rust_module` call Rust syntax does not
+        // allow duplicate top-level item names, so the observable
+        // effect is across walks of the same path-keyed module — the
+        // second walk's bindings supersede the first.
         //
-        // We can't actually feed two `pub struct Foo;` to syn::parse_file
-        // (it errors on duplicate items), so we instead exercise
-        // `register_module_global` directly under a fixed id.
+        // We can't feed two `pub struct Foo;` to syn::parse_file (it
+        // errors on duplicate items), so we exercise
+        // `register_module_global` directly under a fixed id to
+        // model the cross-walk re-binding.
         let id = ModuleId::fresh();
         let first = HostObject::new_class("ParityProbeStruct_within_walk", vec![]);
         let second = HostObject::new_class("ParityProbeStruct_within_walk", vec![]);
@@ -1427,10 +1835,10 @@ mod tests {
             ConstValue::HostObject(second.clone()),
         );
         let observed = lookup_host(id, "ParityProbeStruct_within_walk").unwrap();
-        assert_eq!(observed, first, "first registration wins within same id");
+        assert_eq!(observed, second, "last registration wins within same id");
         assert_ne!(
-            observed, second,
-            "second registration must NOT clobber within same id",
+            observed, first,
+            "first registration must be clobbered by the second under same id",
         );
     }
 
@@ -1445,7 +1853,7 @@ mod tests {
         // directly as `ConstValue::Int(42)`.
         let src = "pub const ParityProbe_O10_const_int: i64 = 42;";
         let file = syn::parse_file(src).expect("const fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let value = module_globals_lookup(module_id, "ParityProbe_O10_const_int")
             .expect("integer const registered after walk");
         assert_eq!(value, ConstValue::Int(42));
@@ -1458,7 +1866,7 @@ mod tests {
         // of unary minus to recognise the signed-int form.
         let src = "pub const ParityProbe_O10_const_neg_int: i64 = -7;";
         let file = syn::parse_file(src).expect("negated const fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let value = module_globals_lookup(module_id, "ParityProbe_O10_const_neg_int")
             .expect("negated integer const registered after walk");
         assert_eq!(value, ConstValue::Int(-7));
@@ -1468,7 +1876,7 @@ mod tests {
     fn register_rust_module_walks_item_const_bool_literal() {
         let src = "pub const ParityProbe_O10_const_bool: bool = true;";
         let file = syn::parse_file(src).expect("const bool parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let value = module_globals_lookup(module_id, "ParityProbe_O10_const_bool")
             .expect("bool const registered after walk");
         assert_eq!(value, ConstValue::Bool(true));
@@ -1483,7 +1891,7 @@ mod tests {
         // between expression and module-const positions.
         let src = "pub const ParityProbe_O10_const_str: &str = \"abc\";";
         let file = syn::parse_file(src).expect("const str parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let value = module_globals_lookup(module_id, "ParityProbe_O10_const_str")
             .expect("str const registered after walk");
         assert_eq!(value, ConstValue::uni_str("abc"));
@@ -1502,7 +1910,7 @@ mod tests {
                    pub const ParityProbe_Issue4_const_Z: i64 = ParityProbe_Issue4_const_Y * 3;
                    pub const ParityProbe_Issue4_const_NEG: i64 = -ParityProbe_Issue4_const_Z;";
         let file = syn::parse_file(src).expect("compound const fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         assert_eq!(
             module_globals_lookup(module_id, "ParityProbe_Issue4_const_X"),
             Some(ConstValue::Int(1)),
@@ -1526,45 +1934,339 @@ mod tests {
     }
 
     #[test]
-    fn register_rust_module_skips_compound_const_with_unsupported_op() {
-        // Compound const with an op the evaluator does not yet
-        // handle (shifts, comparisons, …) skips silently. Mirrors
-        // upstream lazy-resolution: the name stays unresolved, and
-        // a later call site raises `FlowingError` if it tries to
-        // reference the missing global.
-        let src = "pub const ParityProbe_Issue4_const_BASE: i64 = 1;
-                   pub const ParityProbe_Issue4_const_SHIFT: i64 = ParityProbe_Issue4_const_BASE << 4;";
-        let file = syn::parse_file(src).expect("compound shift fixture parses");
-        let module_id = register_rust_module(&file);
+    fn register_rust_module_walks_compound_const_with_shift_and_bitwise() {
+        // Issue 2.4 (2026-05-05): `eval_const_expr` covers shifts
+        // and bitwise ops over Int operands. Mirrors upstream
+        // Python import-time evaluation: `MASK = 1 << 4 | 0x3` would
+        // bind `module.__dict__["MASK"]` to the evaluated integer.
+        let src = "pub const ParityProbe_Issue24_BASE: i64 = 1;
+                   pub const ParityProbe_Issue24_SHIFT: i64 = ParityProbe_Issue24_BASE << 4;
+                   pub const ParityProbe_Issue24_RSHIFT: i64 = 64 >> 2;
+                   pub const ParityProbe_Issue24_AND: i64 = 0x1F & 0x07;
+                   pub const ParityProbe_Issue24_OR: i64 = 0x10 | 0x01;
+                   pub const ParityProbe_Issue24_XOR: i64 = 0x0F ^ 0x05;
+                   pub const ParityProbe_Issue24_NOT: i64 = !0;";
+        let file = syn::parse_file(src).expect("shift+bitwise fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         assert_eq!(
-            module_globals_lookup(module_id, "ParityProbe_Issue4_const_BASE"),
-            Some(ConstValue::Int(1)),
+            module_globals_lookup(module_id, "ParityProbe_Issue24_SHIFT"),
+            Some(ConstValue::Int(16)),
+            "1 << 4 = 16",
         );
-        assert!(
-            module_globals_lookup(module_id, "ParityProbe_Issue4_const_SHIFT").is_none(),
-            "unsupported binop must keep the const skipped per lazy-resolution semantics",
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_RSHIFT"),
+            Some(ConstValue::Int(16)),
+            "64 >> 2 = 16",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_AND"),
+            Some(ConstValue::Int(0x07)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_OR"),
+            Some(ConstValue::Int(0x11)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_XOR"),
+            Some(ConstValue::Int(0x0A)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_NOT"),
+            Some(ConstValue::Int(!0_i64)),
+            "Rust `!` on Int is bitwise complement (Python `~`)",
         );
     }
 
     #[test]
-    fn register_rust_module_skips_compound_const_referencing_unbound_name() {
-        // Forward-reference to a name not yet bound (or never bound)
-        // skips silently. Upstream Python would raise `NameError` at
-        // import time; the walker treats it as "evaluator returned
-        // None" and skips, deferring the error to lazy resolution.
+    fn register_rust_module_walks_compound_const_with_comparison_and_bool() {
+        // Issue 2.4 (2026-05-05): comparison ops over Int / Bool /
+        // strings produce Bool; `&&`/`||` over Bool stay Bool.
+        // Mirrors Python's `MAX_NEG = MAX < 0` / `BOTH = A && B`
+        // import-time evaluation.
+        let src = "pub const ParityProbe_Issue24_MAX: i64 = 100;
+                   pub const ParityProbe_Issue24_IS_BIG: bool = ParityProbe_Issue24_MAX > 50;
+                   pub const ParityProbe_Issue24_EQ: bool = ParityProbe_Issue24_MAX == 100;
+                   pub const ParityProbe_Issue24_AND_BOOL: bool = true && false;
+                   pub const ParityProbe_Issue24_OR_BOOL: bool = false || true;
+                   pub const ParityProbe_Issue24_NOT_BOOL: bool = !false;";
+        let file = syn::parse_file(src).expect("comparison fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_IS_BIG"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_EQ"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_AND_BOOL"),
+            Some(ConstValue::Bool(false)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_OR_BOOL"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_Issue24_NOT_BOOL"),
+            Some(ConstValue::Bool(true)),
+        );
+    }
+
+    #[test]
+    fn register_rust_module_short_circuits_and_or_at_compile_time() {
+        // Codex parity audit (2026-05-05): both Rust source and
+        // upstream Python's `and`/`or` are short-circuit.
+        // `false && BAD` evaluates to `false` without ever touching
+        // `BAD`; `true || BAD` evaluates to `true`. Without
+        // short-circuit, the RHS reference to an unbound name would
+        // surface as `NameError` and abort the walker.
+        let src = "pub const ParityProbe_ShortCircuit_AND: bool = false && ParityProbe_UnboundRhs;
+                   pub const ParityProbe_ShortCircuit_OR: bool = true || ParityProbe_UnboundRhs;";
+        let file = syn::parse_file(src).expect("short-circuit fixture parses");
+        let module_id = register_rust_module(&file).expect(
+            "short-circuit must skip RHS evaluation — unbound name in RHS \
+             does not abort the walker when LHS already determines result",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ShortCircuit_AND"),
+            Some(ConstValue::Bool(false)),
+            "`false && X` short-circuits to false without evaluating X",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ShortCircuit_OR"),
+            Some(ConstValue::Bool(true)),
+            "`true || X` short-circuits to true without evaluating X",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_evaluates_rhs_when_lhs_does_not_short_circuit() {
+        // Negative-direction oracle for short-circuit: when LHS does
+        // NOT determine the result, RHS must be evaluated. `true &&
+        // X` and `false || X` both depend on X.
+        let src = "pub const ParityProbe_ShortCircuit_RHS_AND: bool = true && false;
+                   pub const ParityProbe_ShortCircuit_RHS_OR: bool = false || true;";
+        let file = syn::parse_file(src).expect("non-short-circuit fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ShortCircuit_RHS_AND"),
+            Some(ConstValue::Bool(false)),
+            "`true && false` reads the RHS",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ShortCircuit_RHS_OR"),
+            Some(ConstValue::Bool(true)),
+            "`false || true` reads the RHS",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_aborts_when_short_circuit_does_not_apply() {
+        // RHS deterministic-failure surfaces when LHS does not
+        // short-circuit: `true && BAD` MUST evaluate BAD and propagate
+        // its NameError, distinguishing this from the short-circuit
+        // path above.
+        let src = "pub const ParityProbe_ShortCircuit_NoShort_AND: bool = true && ParityProbe_UnboundRhs;";
+        let file = syn::parse_file(src).expect("non-short-circuit-failure fixture parses");
+        let err = register_rust_module(&file).expect_err(
+            "true && <unbound> must surface RHS NameError because LHS \
+             does not short-circuit",
+        );
+        match err {
+            AdapterError::Flowing { reason } => {
+                assert!(
+                    reason.contains("NameError") && reason.contains("ParityProbe_UnboundRhs"),
+                    "expected NameError on RHS, got: {reason}",
+                );
+            }
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_overflow_const_aborts_walker() {
+        // `i64::MAX + 1` overflows — codex parity audit (2026-05-05)
+        // requires that import-time deterministic-failure cases
+        // surface as walker errors, not silent skips. Mirrors upstream
+        // Python's import-time `OverflowError` (caught by
+        // `PureOperation.constfold` and re-raised as `FlowingError`,
+        // operation.py:120-127).
+        let src = "pub const ParityProbe_Issue24_OVERFLOW: i64 = 9223372036854775807 + 1;";
+        let file = syn::parse_file(src).expect("overflow fixture parses");
+        let err = register_rust_module(&file).expect_err("overflow must abort the walker");
+        match err {
+            AdapterError::Flowing { reason } => {
+                assert!(
+                    reason.contains("OverflowError"),
+                    "expected upstream-style OverflowError surface, got: {reason}",
+                );
+            }
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_rewalks_path_keyed_module_resolves_via_registry() {
+        // Issue 2.3 (2026-05-05): when a path-keyed `module_id` is
+        // re-walked (e.g. two `Translation::from_rust_file_entry_point_with_source`
+        // calls against the same source file), the second walk's
+        // local `const_bindings` is fresh-empty. `eval_const_expr`
+        // must fall back to `module_globals_lookup(module_id, ...)`
+        // to surface the registered prior binding — mirrors upstream
+        // `module.__dict__` being the live reference visible across
+        // re-imports.
+        //
+        // Walk 1 binds X. Walk 2 has only Y = X + 1; Y must resolve.
+        let path = "issue_2_3_const_rewalk_fixture.rs";
+        let src1 = "pub const ParityProbe_Issue23_X: i64 = 7;";
+        let file1 = syn::parse_file(src1).expect("walk-1 fixture parses");
+        let id1 = register_rust_module_at(&file1, Some(path)).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(id1, "ParityProbe_Issue23_X"),
+            Some(ConstValue::Int(7)),
+        );
+        // Walk 2 — same path → same module_id. New const Y references X.
+        let src2 = "pub const ParityProbe_Issue23_Y: i64 = ParityProbe_Issue23_X + 1;";
+        let file2 = syn::parse_file(src2).expect("walk-2 fixture parses");
+        let id2 = register_rust_module_at(&file2, Some(path)).expect("walker must succeed");
+        assert_eq!(id1, id2, "path-keyed re-walk reuses same ModuleId");
+        assert_eq!(
+            module_globals_lookup(id2, "ParityProbe_Issue23_Y"),
+            Some(ConstValue::Int(8)),
+            "Y = X + 1 resolves X via registry fallback (X bound in prior walk, \
+             absent from this walk's local const_bindings)",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_path_keyed_rewalk_is_last_writer_wins() {
+        // Codex parity audit (2026-05-05): a path-keyed re-walk that
+        // re-binds the SAME name MUST clobber the prior entry, not
+        // skip it. Mirrors upstream `module.__dict__[name] = value`:
+        // every top-level binding statement is an unconditional
+        // assignment (`exec(source, dict)` / `importlib.reload`
+        // semantics). The pre-fix walker silently dropped the second
+        // walk's binding under first-writer-wins, diverging from
+        // Python module-execution semantics.
+        let path = "issue6_lastwriter_rewalk_fixture.rs";
+        let src1 = "pub const ParityProbe_LastWriter_X: i64 = 1;";
+        let src2 = "pub const ParityProbe_LastWriter_X: i64 = 2;";
+        let file1 = syn::parse_file(src1).expect("walk-1 fixture parses");
+        let file2 = syn::parse_file(src2).expect("walk-2 fixture parses");
+        let id1 = register_rust_module_at(&file1, Some(path)).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(id1, "ParityProbe_LastWriter_X"),
+            Some(ConstValue::Int(1)),
+            "walk 1 binds X = 1",
+        );
+        let id2 = register_rust_module_at(&file2, Some(path)).expect("walker must succeed");
+        assert_eq!(id1, id2, "path-keyed re-walk reuses same ModuleId");
+        assert_eq!(
+            module_globals_lookup(id2, "ParityProbe_LastWriter_X"),
+            Some(ConstValue::Int(2)),
+            "walk 2 last-writer-wins: X is now 2 (was 1 from walk 1)",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_path_keyed_rewalk_overwrites_struct_class_identity() {
+        // Same last-writer-wins applies to `Item::Struct` / `Item::Enum`
+        // class registrations: a path-keyed re-walk re-mints the
+        // `HostObject::Class` carrier and overwrites the prior entry,
+        // mirroring upstream `module.__dict__[ClassName] = <new
+        // class>` after re-executing the module body.
+        let path = "issue6_lastwriter_class_rewalk_fixture.rs";
+        let src1 = "pub struct ParityProbe_LastWriter_Cls;";
+        let src2 = "pub struct ParityProbe_LastWriter_Cls { x: i64 }";
+        let file1 = syn::parse_file(src1).expect("walk-1 fixture parses");
+        let file2 = syn::parse_file(src2).expect("walk-2 fixture parses");
+        let id1 = register_rust_module_at(&file1, Some(path)).expect("walker must succeed");
+        let host1 = lookup_host(id1, "ParityProbe_LastWriter_Cls").expect("walk 1 binds class");
+        let id2 = register_rust_module_at(&file2, Some(path)).expect("walker must succeed");
+        assert_eq!(id1, id2, "path-keyed re-walk reuses same ModuleId");
+        let host2 = lookup_host(id2, "ParityProbe_LastWriter_Cls").expect("walk 2 binds class");
+        assert_ne!(
+            host1, host2,
+            "walk 2 mints a fresh HostObject::Class carrier and clobbers walk 1's binding",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_eq_ne_mixed_types_returns_bool_not_typeerror() {
+        // Codex parity audit (2026-05-05): Python 3 `==` / `!=` over
+        // distinct primitive types do NOT raise — `1 == "1"` returns
+        // `False`, `1 != "1"` returns `True`. Only ordering
+        // (`<`, `<=`, `>`, `>=`) raises `TypeError`. The walker's
+        // `eval_binop` previously routed every mixed-type pair to
+        // `TypeError` via the catch-all, mis-aborting valid module
+        // top-level constants like `pub const X: bool = 1 == "1";`.
+        //
+        // The fixture deliberately omits parens around the binop —
+        // `Expr::Paren` transparency is a separate pre-existing
+        // walker-coverage gap (eval_const_expr's catch-all silently
+        // declines wrapped expressions) and would mask the parity
+        // we want to test here.
+        let src = "pub const ParityProbe_Issue3_eq_int_str: bool = 1 == \"a\";
+                   pub const ParityProbe_Issue3_ne_int_str: bool = 1 != \"a\";";
+        let file = syn::parse_file(src).expect("eq-mixed fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert_eq!(
+            super::super::host_env::module_globals_lookup(
+                module_id,
+                "ParityProbe_Issue3_eq_int_str"
+            ),
+            Some(ConstValue::Bool(false)),
+            "Python 3: `1 == \"a\"` is False, NOT TypeError",
+        );
+        assert_eq!(
+            super::super::host_env::module_globals_lookup(
+                module_id,
+                "ParityProbe_Issue3_ne_int_str"
+            ),
+            Some(ConstValue::Bool(true)),
+            "Python 3: `1 != \"a\"` is True, NOT TypeError",
+        );
+        // Ordering on mixed types DOES raise TypeError — that arm of
+        // `eval_binop` must continue to abort the walker.
+        let bad_src = "pub const ParityProbe_Issue3_lt_mixed: bool = 1 < \"a\";";
+        let bad_file = syn::parse_file(bad_src).expect("lt-mixed fixture parses");
+        let err = register_rust_module(&bad_file)
+            .expect_err("Python 3 `1 < \"a\"` raises TypeError — walker must abort");
+        match err {
+            AdapterError::Flowing { reason } => {
+                assert!(
+                    reason.contains("TypeError"),
+                    "expected TypeError on mixed-type ordering, got: {reason}",
+                );
+            }
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_unbound_name_aborts_walker() {
+        // Forward-reference to a name not yet bound — codex parity
+        // audit (2026-05-05) requires that import-time `NameError`
+        // surface as a walker error, not silent skip. Mirrors upstream
+        // Python: `Y = X + 1` evaluated before `X` is bound raises
+        // `NameError` at import time, which `PureOperation.constfold`
+        // routes through `FlowingError`.
         let src =
             "pub const ParityProbe_Issue4_const_FORWARD: i64 = ParityProbe_Issue4_const_LATER + 1;
                    pub const ParityProbe_Issue4_const_LATER: i64 = 1;";
         let file = syn::parse_file(src).expect("forward-ref fixture parses");
-        let module_id = register_rust_module(&file);
-        assert!(
-            module_globals_lookup(module_id, "ParityProbe_Issue4_const_FORWARD").is_none(),
-            "forward reference to LATER must skip (LATER not yet bound when FORWARD evaluates)",
-        );
-        assert_eq!(
-            module_globals_lookup(module_id, "ParityProbe_Issue4_const_LATER"),
-            Some(ConstValue::Int(1)),
-            "LATER registers normally once its turn comes",
-        );
+        let err = register_rust_module(&file)
+            .expect_err("unbound forward reference must abort the walker");
+        match err {
+            AdapterError::Flowing { reason } => {
+                assert!(
+                    reason.contains("NameError")
+                        && reason.contains("ParityProbe_Issue4_const_LATER"),
+                    "expected NameError on unbound forward reference, got: {reason}",
+                );
+            }
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
     }
 }

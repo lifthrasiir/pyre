@@ -36,6 +36,7 @@ use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue,
     HostObject, Link, SpaceOperation, Variable, c_last_exception,
 };
+use crate::flowspace::operation::{HLOperation, OpKind};
 
 use super::host_env::{
     ModuleId, is_host_class_minted, mint_host_class, module_globals_lookup, pyre_stdlib_lookup,
@@ -60,6 +61,12 @@ pub enum AdapterError {
     /// locals map. Corresponds to upstream `UnboundLocalError` at
     /// `flowcontext.py:LOAD_FAST` when a local is read before store.
     UnboundLocal { name: String },
+    /// Flow-build-time hard error surfaced from `HLOperation::constfold`
+    /// (`flowspace/operation.rs:996`). Mirrors upstream
+    /// `flowcontext.py`'s `FlowContextError::Flowing(FlowingError)`
+    /// path — `getattr(obj, name)` always raising AttributeError, the
+    /// 3-arg getattr rejection, and similar build-time semantic errors.
+    Flowing { reason: String },
 }
 
 impl std::fmt::Display for AdapterError {
@@ -70,6 +77,7 @@ impl std::fmt::Display for AdapterError {
             }
             AdapterError::Unsupported { reason } => write!(f, "unsupported construct: {reason}"),
             AdapterError::UnboundLocal { name } => write!(f, "unbound local: {name}"),
+            AdapterError::Flowing { reason } => write!(f, "flow error: {reason}"),
         }
     }
 }
@@ -309,6 +317,42 @@ struct Builder {
 impl Builder {
     fn emit_op(&mut self, op: SpaceOperation) {
         self.current.ops.push(op);
+    }
+
+    /// Record a pure-op `(opname, args)` honoring upstream
+    /// `HLOperation.eval(ctx)` (`operation.py:92-96`): consult
+    /// `constfold()` first, return the folded `Constant` if both args
+    /// are foldable; otherwise allocate a fresh result `Variable` and
+    /// emit the `SpaceOperation`. Mirrors
+    /// `flowspace/flowcontext.rs:1734 FlowContext::record_pure_op` —
+    /// the adapter is on the input side of `flowcontext`, but the
+    /// `HLOperation.eval` contract that downstream consumers rely on
+    /// applies to every emission, not only the bytecode-driven one.
+    ///
+    /// `OpKind::from_opname` declines for synthetic pseudo-ops
+    /// (`same_as`, `ll_assert_not_none`, …) — those fall through to a
+    /// plain `emit_op` exactly as the upstream registry does for
+    /// non-`add_operator` names.
+    fn record_pure_op(
+        &mut self,
+        opname: &str,
+        args: Vec<Hlvalue>,
+    ) -> Result<Hlvalue, AdapterError> {
+        if let Some(kind) = OpKind::from_opname(opname) {
+            let hlop = HLOperation::new(kind, args.clone());
+            match hlop.constfold() {
+                Ok(Some(folded)) => return Ok(folded),
+                Ok(None) => {}
+                Err(flowing) => {
+                    return Err(AdapterError::Flowing {
+                        reason: flowing.to_string(),
+                    });
+                }
+            }
+        }
+        let result = Hlvalue::Variable(Variable::new());
+        self.emit_op(SpaceOperation::new(opname, args, result.clone()));
+        Ok(result)
     }
 
     fn locals(&self) -> &HashMap<String, Hlvalue> {
@@ -603,6 +647,16 @@ impl Builder {
                     // is retired, drop this branch and the helper.
                 }
             }
+            // Stays on raw `emit_op` rather than
+            // `Builder::record_pure_op`: routing through
+            // `record_pure_op` invokes `HLOperation::constfold` →
+            // `constfold_getattr` → `const_runtime_getattr` →
+            // `host_getattr`, which raises `FlowingError` on missing
+            // attributes — including the minted-host opaque case the
+            // explicit `is_host_class_minted` branch above is
+            // designed to fall through. Convergence lands together
+            // with `mint_host_class` retirement (M2.5g extern-Rust-
+            // helper walker epic).
             let result = Hlvalue::Variable(Variable::new());
             self.emit_op(SpaceOperation::new(
                 "getattr",
@@ -1078,15 +1132,13 @@ fn emit_err_raise_boundary(b: &mut Builder, e: &Expr) -> Result<BlockExit, Adapt
     // 2. `flowcontext.py:609 op.isinstance(w_arg1, const(type))` —
     //    emitted in the current block, then forked on per
     //    `flowcontext.py:610 if guessbool(w_is_type)`.
-    let is_class = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
+    let is_class = b.record_pure_op(
         "isinstance",
         vec![
             evalue.clone(),
             Hlvalue::Constant(Constant::new(ConstValue::builtin("type"))),
         ],
-        is_class.clone(),
-    ));
+    )?;
 
     // 3. Allocate the True / False arm blocks. Each block has a single
     //    inputarg receiving `evalue` from the fork's Link.args, so the
@@ -1130,12 +1182,7 @@ fn emit_err_raise_boundary(b: &mut Builder, e: &Expr) -> Result<BlockExit, Adapt
         ops: Vec::new(),
         locals: HashMap::new(),
     });
-    let w_value_true = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
-        "simple_call",
-        vec![evalue_true_in],
-        w_value_true.clone(),
-    ));
+    let w_value_true = b.record_pure_op("simple_call", vec![evalue_true_in])?;
     let true_to_join = Rc::new(RefCell::new(Link::new(
         vec![w_value_true],
         Some(join_block.clone()),
@@ -1155,12 +1202,13 @@ fn emit_err_raise_boundary(b: &mut Builder, e: &Expr) -> Result<BlockExit, Adapt
         ops: Vec::new(),
         locals: HashMap::new(),
     });
-    let w_value_false = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
-        "ll_assert_not_none",
-        vec![evalue_false_in],
-        w_value_false.clone(),
-    ));
+    // `ll_assert_not_none` is a synthetic pseudo-op that
+    // `OpKind::from_opname` declines (operation.rs:254-352 lists only
+    // upstream `add_operator` names). `record_pure_op` falls through
+    // to a plain `emit_op` for it — same shape as upstream where
+    // helper-pseudo-op recording bypasses the `HLOperation.eval`
+    // constfold gate.
+    let w_value_false = b.record_pure_op("ll_assert_not_none", vec![evalue_false_in])?;
     let false_to_join = Rc::new(RefCell::new(Link::new(
         vec![w_value_false],
         Some(join_block.clone()),
@@ -1179,12 +1227,7 @@ fn emit_err_raise_boundary(b: &mut Builder, e: &Expr) -> Result<BlockExit, Adapt
         ops: Vec::new(),
         locals: HashMap::new(),
     });
-    let w_type = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
-        "type",
-        vec![w_value_join.clone()],
-        w_type.clone(),
-    ));
+    let w_type = b.record_pure_op("type", vec![w_value_join.clone()])?;
     let exit_link = Rc::new(RefCell::new(Link::new(
         vec![w_type, w_value_join],
         Some(b.exceptblock.clone()),
@@ -1421,9 +1464,7 @@ fn lower_binop(
     let opname = binop_opname(op)?;
     let lhs = lower_expr(b, left)?;
     let rhs = lower_expr(b, right)?;
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(opname, vec![lhs, rhs], result.clone()));
-    Ok(result)
+    b.record_pure_op(opname, vec![lhs, rhs])
 }
 
 /// Rust `BinOp` → upstream `operation.py` opname. Covers the 16
@@ -1562,8 +1603,7 @@ fn lower_if(
     //    before the guessbool test. The `bool` op is in upstream's
     //    `operation.py:467 add_operator('bool', 1)` registry.
     let cond_raw = lower_expr(b, &if_expr.cond)?;
-    let cond = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new("bool", vec![cond_raw], cond.clone()));
+    let cond = b.record_pure_op("bool", vec![cond_raw])?;
 
     // Extract the else-less path early so the rest of `lower_if` can
     // assume `else_expr` is present; the common `bool(cond)` +
@@ -1571,6 +1611,29 @@ fn lower_if(
     let Some((_else_tok, else_expr)) = &if_expr.else_branch else {
         return lower_if_without_else(b, cond, &if_expr.then_branch);
     };
+
+    // guessbool early-resolution per `flowcontext.py:341`:
+    //
+    //     def guessbool(self, w_condition):
+    //         if isinstance(w_condition, Constant):
+    //             return w_condition.value
+    //         return self.recorder.guessbool(self, w_condition)
+    //
+    // `record_pure_op("bool", [cond_raw])` already routes through
+    // `HLOperation::constfold`, so when every arg folds the result is
+    // a `Constant(Bool)`. Upstream `POP_JUMP_IF_FALSE`
+    // (`flowcontext.py:756`) inspects the bool and only enqueues one
+    // PC target — the un-taken arm is never enqueued. Mirror that
+    // here by lowering only the chosen arm into the current block;
+    // no fork is materialized and the dead arm is not emitted.
+    if let Hlvalue::Constant(c) = &cond
+        && let ConstValue::Bool(value) = c.value
+    {
+        if value {
+            return lower_block(b, &if_expr.then_branch, at_boundary);
+        }
+        return lower_else_arm(b, else_expr, at_boundary);
+    }
 
     // 2. Snapshot state at the fork point. Upstream `FrameState.copy()`
     //    clones locals_w so STORE_FAST inside one branch doesn't leak
@@ -1774,6 +1837,37 @@ fn lower_if_without_else(
     cond: Hlvalue,
     then_branch: &SynBlock,
 ) -> Result<BlockExit, AdapterError> {
+    // guessbool early-resolution per `flowcontext.py:341`: when
+    // `record_pure_op("bool", ...)` constfolded `cond` to a
+    // `Constant(Bool)`, only one PC target is enqueued upstream.
+    // Lower body (Constant(true)) or skip body (Constant(false))
+    // directly into the current block — the if-without-else
+    // expression value is `None` either way (Python statement
+    // convention; see step 6 below).
+    if let Hlvalue::Constant(c) = &cond
+        && let ConstValue::Bool(value) = c.value
+    {
+        if value {
+            // `if true { body }` — fall through into body. Tail
+            // value of body is discarded (statement form), so
+            // `at_boundary=false` keeps Result/Option wrapper
+            // collapse off the body's tail per `lower_if`'s no-else
+            // contract above.
+            let body_exit = lower_block(b, then_branch, false)?;
+            return Ok(match body_exit {
+                BlockExit::Terminated => BlockExit::Terminated,
+                BlockExit::FallThrough(_) => {
+                    BlockExit::FallThrough(Hlvalue::Constant(Constant::new(ConstValue::None)))
+                }
+            });
+        }
+        // `if false { body }` — body never runs; current block
+        // continues unchanged with `None` as the expression value.
+        return Ok(BlockExit::FallThrough(Hlvalue::Constant(Constant::new(
+            ConstValue::None,
+        ))));
+    }
+
     // 1. Snapshot pre-fork locals. Same discipline as the with-else
     //    path: deterministic ordering via sort, one entry per
     //    live local name at the fork point.
@@ -2624,6 +2718,19 @@ fn lower_match_variant_cascade(
             // always operates on a Variable. Upstream's
             // `flowcontext.py` `IS_OP` / `COMPARE_OP` paths likewise
             // bind the value to a Variable before forking on it.
+            //
+            // Stays on raw `emit_op` rather than
+            // `Builder::record_pure_op`: `same_as` is a synthetic
+            // pseudo-op in upstream too — it never appears in
+            // `rpython/flowspace/operation.py`'s `add_operator`
+            // registry, and `model.py:634, :707` reference it only
+            // as an excluded opname in the `raising_op` /
+            // `summary` filters. `OpKind::from_opname`
+            // (`operation.rs:254-352`) likewise declines it, so
+            // `record_pure_op` could not fold it anyway, and the
+            // surrounding code needs the raw `Variable` (not an
+            // `Hlvalue` wrapper) to derive the
+            // `#match_scrutinee_{id}` slot below.
             let v = Variable::new();
             b.emit_op(SpaceOperation::new(
                 "same_as",
@@ -2706,12 +2813,7 @@ fn lower_match_variant_cascade(
         // reference, including across graph boundaries —
         // `flowcontext.py:847 w_globals.value[varname]`).
         let class_carrier = b.resolve_path_constant(variant_path)?;
-        let cond_var = Hlvalue::Variable(Variable::new());
-        b.emit_op(SpaceOperation::new(
-            "isinstance",
-            vec![scrutinee_now, class_carrier],
-            cond_var.clone(),
-        ));
+        let cond_var = b.record_pure_op("isinstance", vec![scrutinee_now, class_carrier])?;
 
         let arm_body_block = arm_body_blocks[*arm_idx].0.clone();
         // Final step's "false" target IS the wildcard arm's body
@@ -2787,8 +2889,7 @@ fn lower_match_variant_cascade(
                     .cloned()
                     .expect("variant arm body inherits scrutinee slot via merged_names");
                 for binding in field_bindings {
-                    let value = Hlvalue::Variable(Variable::new());
-                    b.emit_op(SpaceOperation::new(
+                    let value = b.record_pure_op(
                         "getattr",
                         vec![
                             scrutinee_now.clone(),
@@ -2796,8 +2897,7 @@ fn lower_match_variant_cascade(
                                 &binding.field_name,
                             ))),
                         ],
-                        value.clone(),
-                    ));
+                    )?;
                     b.set_local(binding.local_name.clone(), value);
                 }
             }
@@ -2955,25 +3055,69 @@ fn lower_while(b: &mut Builder, while_expr: &ExprWhile) -> Result<(), AdapterErr
     // result — the annotator / optimizer can fold it away when the
     // input is already `SomeBool`.
     let cond_raw = lower_expr(b, &while_expr.cond)?;
-    let cond = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new("bool", vec![cond_raw], cond.clone()));
+    let cond = b.record_pure_op("bool", vec![cond_raw])?;
     let header_locals_at_fork: Vec<Hlvalue> = merged_names
         .iter()
         .map(|n| b.current.locals[n].clone())
         .collect();
 
+    // guessbool early-resolution per `flowcontext.py:341`: when
+    // `record_pure_op("bool", ...)` constfolds the predicate to a
+    // `Constant(Bool)`, upstream `POP_JUMP_IF_FALSE` enqueues only
+    // one PC target — the un-taken arm is never scheduled. Mirror
+    // that here by emitting a single unconditional Link with no
+    // exitswitch in place of the canonical 2-exit fork.
+    let const_bool = match &cond {
+        Hlvalue::Constant(c) => match c.value {
+            ConstValue::Bool(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    };
+    if matches!(const_bool, Some(false)) {
+        // `while false { body }` — body PC never enqueued upstream;
+        // emit unconditional header→exit Link with no body
+        // allocation. Skip loop_stack / back-edge / body lowering
+        // entirely.
+        let exit_link = Rc::new(RefCell::new(Link::new(
+            header_locals_at_fork,
+            Some(exit_block.clone()),
+            None,
+        )));
+        b.finalize_current(vec![exit_link], None);
+        b.open_new_block(BlockBuilder {
+            block: exit_block,
+            ops: Vec::new(),
+            locals: exit_locals,
+        });
+        return Ok(());
+    }
+
     let (body_block, body_locals) = branch_block_with_inputargs(&merged_names);
-    let false_link = Rc::new(RefCell::new(Link::new(
-        header_locals_at_fork.clone(),
-        Some(exit_block.clone()),
-        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
-    )));
-    let true_link = Rc::new(RefCell::new(Link::new(
-        header_locals_at_fork,
-        Some(body_block.clone()),
-        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
-    )));
-    b.finalize_current(vec![false_link, true_link], Some(cond));
+    if matches!(const_bool, Some(true)) {
+        // `while true { body }` — false-arm is dead; emit
+        // unconditional header→body Link with no exitswitch. Exit
+        // is reachable only via `break` / `return`. Body fall-
+        // through still emits the back-edge to the header.
+        let body_link = Rc::new(RefCell::new(Link::new(
+            header_locals_at_fork,
+            Some(body_block.clone()),
+            None,
+        )));
+        b.finalize_current(vec![body_link], None);
+    } else {
+        let false_link = Rc::new(RefCell::new(Link::new(
+            header_locals_at_fork.clone(),
+            Some(exit_block.clone()),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+        )));
+        let true_link = Rc::new(RefCell::new(Link::new(
+            header_locals_at_fork,
+            Some(body_block.clone()),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+        )));
+        b.finalize_current(vec![false_link, true_link], Some(cond));
+    }
 
     // 5. Push the loop context before lowering the body so nested
     //    `break` / `continue` resolve against *this* loop.
@@ -3161,8 +3305,7 @@ fn lower_for(b: &mut Builder, for_expr: &ExprForLoop) -> Result<(), AdapterError
     //    character, so `syn::Ident::to_string()` can never produce
     //    a name that collides with the slot.
     let iterable = lower_expr(b, &for_expr.expr)?;
-    let v_iter = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new("iter", vec![iterable], v_iter.clone()));
+    let v_iter = b.record_pure_op("iter", vec![iterable])?;
     let iter_slot = format!("#for_iter_{}", b.loop_stack.len());
     b.set_local(iter_slot.clone(), v_iter);
 
@@ -3209,8 +3352,7 @@ fn lower_for(b: &mut Builder, for_expr: &ExprForLoop) -> Result<(), AdapterError
         locals: header_locals,
     });
     let iter_h = b.current.locals[&iter_slot].clone();
-    let v_next = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new("next", vec![iter_h], v_next.clone()));
+    let v_next = b.record_pure_op("next", vec![iter_h])?;
 
     // 7. Body block. Upstream STORE_FAST
     //    (`flowcontext.py:878-884`) rebinds the loop-variable slot in
@@ -3720,15 +3862,13 @@ fn lower_method_call(
     // `getattr(receiver, "method")` — the method name is a Python
     // byte-string constant, matching Python 2 method names.
     let method_name = method_call.method.to_string();
-    let bound = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
+    let bound = b.record_pure_op(
         "getattr",
         vec![
             receiver,
             Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
         ],
-        bound.clone(),
-    ));
+    )?;
 
     // `simple_call(bound, *args)` — arg list starts with the bound
     // method (which carries the receiver after upstream's
@@ -3739,13 +3879,7 @@ fn lower_method_call(
     for arg in &method_call.args {
         call_args.push(lower_expr(b, arg)?);
     }
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
-        "simple_call",
-        call_args,
-        result.clone(),
-    ));
-    Ok(result)
+    b.record_pure_op("simple_call", call_args)
 }
 
 fn lower_call(b: &mut Builder, call: &ExprCall) -> Result<Hlvalue, AdapterError> {
@@ -3784,13 +3918,7 @@ fn lower_call(b: &mut Builder, call: &ExprCall) -> Result<Hlvalue, AdapterError>
     for arg in &call.args {
         call_args.push(lower_expr(b, arg)?);
     }
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
-        "simple_call",
-        call_args,
-        result.clone(),
-    ));
-    Ok(result)
+    b.record_pure_op("simple_call", call_args)
 }
 
 // ____________________________________________________________
@@ -3813,9 +3941,7 @@ fn lower_tuple(b: &mut Builder, tup: &ExprTuple) -> Result<Hlvalue, AdapterError
     for elem in &tup.elems {
         args.push(lower_expr(b, elem)?);
     }
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new("newtuple", args, result.clone()));
-    Ok(result)
+    b.record_pure_op("newtuple", args)
 }
 
 fn lower_array(b: &mut Builder, arr: &ExprArray) -> Result<Hlvalue, AdapterError> {
@@ -3823,9 +3949,7 @@ fn lower_array(b: &mut Builder, arr: &ExprArray) -> Result<Hlvalue, AdapterError
     for elem in &arr.elems {
         args.push(lower_expr(b, elem)?);
     }
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new("newlist", args, result.clone()));
-    Ok(result)
+    b.record_pure_op("newlist", args)
 }
 
 // ____________________________________________________________
@@ -3853,9 +3977,7 @@ fn lower_unary(b: &mut Builder, u: &ExprUnary) -> Result<Hlvalue, AdapterError> 
         // `-x` — upstream `operation.py:466 neg` arity=1.
         UnOp::Neg(_) => {
             let arg = lower_expr(b, &u.expr)?;
-            let result = Hlvalue::Variable(Variable::new());
-            b.emit_op(SpaceOperation::new("neg", vec![arg], result.clone()));
-            Ok(result)
+            b.record_pure_op("neg", vec![arg])
         }
         // `!x` — Rust overloads this for bitwise (ints) AND logical
         // (bools). Upstream handles the two paths *differently*:
@@ -3895,40 +4017,28 @@ fn lower_field(b: &mut Builder, f: &ExprField) -> Result<Hlvalue, AdapterError> 
             // Constant index — the annotator can distinguish by
             // receiver type (Tuple vs user struct).
             let int_index = idx.index as i64;
-            let result = Hlvalue::Variable(Variable::new());
-            b.emit_op(SpaceOperation::new(
+            return b.record_pure_op(
                 "getitem",
                 vec![
                     base,
                     Hlvalue::Constant(Constant::new(ConstValue::Int(int_index))),
                 ],
-                result.clone(),
-            ));
-            return Ok(result);
+            );
         }
     };
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
+    b.record_pure_op(
         "getattr",
         vec![
             base,
             Hlvalue::Constant(Constant::new(ConstValue::byte_str(attr_name))),
         ],
-        result.clone(),
-    ));
-    Ok(result)
+    )
 }
 
 fn lower_index(b: &mut Builder, idx: &ExprIndex) -> Result<Hlvalue, AdapterError> {
     let base = lower_expr(b, &idx.expr)?;
     let key = lower_expr(b, &idx.index)?;
-    let result = Hlvalue::Variable(Variable::new());
-    b.emit_op(SpaceOperation::new(
-        "getitem",
-        vec![base, key],
-        result.clone(),
-    ));
-    Ok(result)
+    b.record_pure_op("getitem", vec![base, key])
 }
 
 fn lower_cast(_b: &mut Builder, _c: &ExprCast) -> Result<Hlvalue, AdapterError> {
@@ -4826,6 +4936,185 @@ mod tests {
             Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::None),
             other => panic!("expected Constant(None), got {other:?}"),
         }
+    }
+
+    // ---- guessbool early-resolution (PRE-EXISTING-ADAPTATION #3) ---
+    //
+    // upstream `flowcontext.py:341 guessbool`:
+    //
+    //     def guessbool(self, w_condition):
+    //         if isinstance(w_condition, Constant):
+    //             return w_condition.value
+    //         return self.recorder.guessbool(self, w_condition)
+    //
+    // When `record_pure_op("bool", ...)` constfolds the predicate to
+    // `Constant(Bool(value))`, only the chosen PC target is enqueued
+    // upstream — the un-taken arm is never scheduled. Mirror by
+    // skipping the fork and lowering only the chosen arm.
+
+    #[test]
+    fn if_true_constfolds_to_then_arm_only_no_fork() {
+        // `if true { 1 } else { 2 }` — bool(true) folds to
+        // Constant(Bool(true)); only then-arm flows. The startblock
+        // emits ZERO operations and links unconditionally to
+        // returnblock with arg=Constant(1).
+        let g = lower("fn f() -> i64 { if true { 1 } else { 2 } }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "guessbool early-resolution must not emit `bool` op for Constant arg"
+        );
+        assert!(start.exitswitch.is_none(), "no fork means no exitswitch");
+        assert_eq!(start.exits.len(), 1, "single unconditional exit");
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(1)),
+            other => panic!("expected Constant(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_false_constfolds_to_else_arm_only_no_fork() {
+        // `if false { 1 } else { 2 }` — only else-arm flows.
+        let g = lower("fn f() -> i64 { if false { 1 } else { 2 } }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 0);
+        assert!(start.exitswitch.is_none());
+        assert_eq!(start.exits.len(), 1);
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(2)),
+            other => panic!("expected Constant(2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_true_no_else_lowers_body_inline() {
+        // `if true { let _y = 1; }` (no else) — body flows inline
+        // into the current block; expression value is `None` per the
+        // statement-form contract. No fork, no join block.
+        let g = lower("fn f() -> i64 { if true { let _y = 1; } 0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert!(start.exitswitch.is_none());
+        assert_eq!(start.exits.len(), 1);
+        // returnblock-bound link carries Constant(0).
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(0)),
+            other => panic!("expected Constant(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_false_no_else_skips_body_entirely() {
+        // `if false { panic!() }` (no else) — body never lowered,
+        // so the (would-be panicking) body has no observable effect
+        // on the graph. Only the trailing `0` reaches the
+        // returnblock. Mirrors upstream's "PC never enqueued for the
+        // un-taken arm" semantic.
+        let g = lower(
+            "fn f() -> i64 {
+                if false { let _y: i64 = 1; }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "skipped body must not contribute operations"
+        );
+        assert!(start.exitswitch.is_none());
+        assert_eq!(start.exits.len(), 1);
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(0)),
+            other => panic!("expected Constant(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_false_emits_header_to_exit_with_no_body() {
+        // `while false { body }` — body PC never enqueued. Header
+        // closes with single unconditional Link → exit_block, no
+        // exitswitch. No body block in the graph.
+        let g = lower(
+            "fn f() -> i64 {
+                while false { let _y: i64 = 1; }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Block topology: start → header → exit → returnblock.
+        // (header == post-pre-loop entry; exit_block lowering
+        // continues straight into the returnblock with the trailing
+        // `0` tail.)
+        let start = g.startblock.borrow();
+        assert!(start.exitswitch.is_none(), "no fork in startblock");
+        assert_eq!(start.exits.len(), 1, "unconditional pre-loop link");
+        let header = start.exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("pre-loop link has target")
+            .clone();
+        let header_ref = header.borrow();
+        assert!(
+            header_ref.exitswitch.is_none(),
+            "while-false header has no fork (guessbool early-resolution)"
+        );
+        assert_eq!(
+            header_ref.exits.len(),
+            1,
+            "while-false header has single Link to exit_block"
+        );
+        // Body block must NOT exist in the graph — `iterblocks`
+        // discovers reachable blocks and `while false`'s body is
+        // never reached.
+        drop(header_ref);
+        drop(start);
+        let blocks = g.iterblocks();
+        // start + header + exit + returnblock = 4 blocks. No body.
+        assert_eq!(blocks.len(), 4);
+    }
+
+    #[test]
+    fn while_true_emits_header_to_body_unconditional() {
+        // `while true { break; }` — header closes with single
+        // unconditional Link → body_block, no exitswitch. The exit
+        // path is reached only via `break`, not via a cond fork.
+        let g = lower(
+            "fn f() -> i64 {
+                while true { break; }
+                0
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        let header = start.exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("pre-loop link has target")
+            .clone();
+        let header_ref = header.borrow();
+        assert!(
+            header_ref.exitswitch.is_none(),
+            "while-true header has no fork (guessbool early-resolution)"
+        );
+        assert_eq!(
+            header_ref.exits.len(),
+            1,
+            "while-true header has single Link to body"
+        );
     }
 
     #[test]
@@ -6694,13 +6983,19 @@ mod tests {
     }
 
     #[test]
-    fn tuple_literal_emits_newtuple_op() {
+    fn tuple_literal_constfolds_when_all_args_are_constants() {
+        // upstream `operation.py NewTuple(PureOperation, pyfunc=tuple)`
+        // — `op.newtuple(*items).eval(self)` consults
+        // `PureOperation.constfold` (`operation.py:120-132`). All-foldable
+        // args reduce to `Constant(tuple(args))` at flow-build time;
+        // no `newtuple` SpaceOperation is recorded. The Rust-AST
+        // adapter routes through `Builder::record_pure_op` which
+        // mirrors `flowspace/flowcontext.rs:1734 record_pure_op`,
+        // so the same fold applies.
         let g = lower("fn f() -> i64 { let _t = (1, 2, 3); 0 }").unwrap();
         checkgraph(&g);
         let start = g.startblock.borrow();
-        assert_eq!(start.operations.len(), 1);
-        assert_eq!(start.operations[0].opname, "newtuple");
-        assert_eq!(start.operations[0].args.len(), 3);
+        assert_eq!(start.operations.len(), 0);
     }
 
     #[test]
@@ -6726,29 +7021,40 @@ mod tests {
     }
 
     #[test]
-    fn tuple_as_method_argument() {
-        // The tuple flows into a method call — checks that
-        // `lower_tuple`'s result is re-readable downstream.
-        // Emission order is receiver → getattr → args → simple_call.
+    fn tuple_as_method_argument_folds_constant_tuple() {
+        // The tuple flows into a method call — checks that the all-
+        // Constant tuple `(1, 2)` collapses to a Constant per upstream
+        // `operation.py NewTuple(PureOperation).constfold`, leaving
+        // only `getattr` + `simple_call` SpaceOperations recorded.
+        // The receiver `x` is a Variable so `getattr(x, "fold")`
+        // does NOT fold (`constfold_getattr` requires a foldable
+        // receiver — `operation.py:634`).
         let g = lower("fn f(x: i64) -> i64 { x.fold((1, 2)) }").unwrap();
         checkgraph(&g);
         let start = g.startblock.borrow();
-        assert_eq!(start.operations.len(), 3);
+        assert_eq!(start.operations.len(), 2);
         assert_eq!(start.operations[0].opname, "getattr");
-        assert_eq!(start.operations[1].opname, "newtuple");
-        assert_eq!(start.operations[2].opname, "simple_call");
-        // simple_call's second arg = newtuple result.
-        assert_eq!(start.operations[2].args[1], start.operations[1].result);
+        assert_eq!(start.operations[1].opname, "simple_call");
+        // simple_call's second arg = the folded tuple Constant.
+        match &start.operations[1].args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Tuple(items) => assert_eq!(items.len(), 2),
+                other => panic!("expected Tuple constant, got {other:?}"),
+            },
+            other => panic!("expected Constant tuple arg, got {other:?}"),
+        }
     }
 
     #[test]
-    fn empty_tuple_emits_newtuple_with_no_args() {
+    fn empty_tuple_constfolds_to_empty_constant_tuple() {
+        // upstream `operation.py NewTuple(PureOperation, pyfunc=tuple)`
+        // — `op.newtuple()` with zero args is the empty tuple `()`,
+        // which folds to `Constant(())` per `PureOperation.constfold`.
+        // No `newtuple` SpaceOperation is recorded.
         let g = lower("fn f() -> i64 { let _u = (); 0 }").unwrap();
         checkgraph(&g);
         let start = g.startblock.borrow();
-        assert_eq!(start.operations.len(), 1);
-        assert_eq!(start.operations[0].opname, "newtuple");
-        assert_eq!(start.operations[0].args.len(), 0);
+        assert_eq!(start.operations.len(), 0);
     }
 
     // ---- M2.5d reject tests --------------------------------------
@@ -7707,7 +8013,7 @@ mod tests {
                        }
                    }";
         let file = syn::parse_file(src).expect("walker + entry fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let entry = file
             .items
             .iter()
@@ -7783,7 +8089,7 @@ mod tests {
                        }
                    }";
         let file = syn::parse_file(src).expect("walker + entry fixture parses");
-        let module_id = register_rust_module(&file);
+        let module_id = register_rust_module(&file).expect("walker must succeed");
         let entry = file
             .items
             .iter()

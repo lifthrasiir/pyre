@@ -79,15 +79,40 @@
 //!    + pendingblocks loop inside the adapter, then let upstream
 //!    `simplify.py` collapse the empty blocks. Multi-session.
 //!
-//! 3. **Raw `SpaceOperation` emission without `HLOperation.eval()`**
-//!    (`build_flow.rs:241, :616`) replaces upstream's
-//!    `operation.py:92, :120` constfold + `flowcontext.py:364, :756`
-//!    `guessbool` early-resolution. Every adapter op goes straight into
-//!    the graph whether or not its arguments are constants; conditional
-//!    forks always materialize even when the scrutinee is a literal.
-//!    *Convergence path*: port `HLOperation` with `eval()` /
-//!    `constfold()` and `guessbool()` into the adapter so constant
-//!    branches collapse at graph-build time. Multi-session.
+//! 3. **`HLOperation.eval` constfold side wired (2026-05-05);
+//!    `guessbool` early-resolution wired (2026-05-05).** Pure-op
+//!    emission routes through [`build_flow::Builder::record_pure_op`]
+//!    which mirrors `flowspace/flowcontext.rs:1734 record_pure_op`:
+//!    every recognised opname runs through `HLOperation::constfold`
+//!    (`operation.py:92, :120`) before `emit_op`, so all-foldable args
+//!    collapse to a `Constant` at flow-build time exactly as upstream
+//!    `op.<name>(*args).eval(self)` would. Control-flow lowering then
+//!    consults the post-fold `Constant(Bool)` and follows upstream
+//!    `flowcontext.py:341 guessbool`'s `if isinstance(w_condition,
+//!    Constant): return w_condition.value` short-circuit — only the
+//!    chosen arm flows; no 2-exit fork materializes. Wired in
+//!    `lower_if`, `lower_if_without_else`, and `lower_while`.
+//!    One pure-op callsite stays on raw `emit_op` as a real
+//!    PRE-EXISTING-ADAPTATION:
+//!    - `build_flow.rs:651` cascade `getattr` in
+//!      `Builder::resolve_path_constant`: keeps an explicit
+//!      `host.class_get` / `is_host_class_minted` path because
+//!      `const_runtime_getattr` raises `FlowingError` on minted-class
+//!      misses, while the adapter's mint-on-demand stand-in needs the
+//!      "treat as opaque, fall through to raw `getattr`" semantics
+//!      pending the M2.5g extern-Rust-helper walker. Convergence
+//!      lands when minting retires.
+//!
+//!    A second raw `emit_op` callsite at `build_flow.rs:2658`
+//!    (`same_as` in `lower_match`) is NOT a PRE-EXISTING-ADAPTATION
+//!    — `same_as` is a synthetic pseudo-op in upstream too,
+//!    referenced only at `rpython/flowspace/model.py:634`
+//!    (`raising_op.opname not in ("keepalive", "cast_pointer",
+//!    "same_as")`) and `:707 summary` (excluded opname); it never
+//!    appears in `operation.py`'s `add_operator` registry. Raw
+//!    `emit_op` IS the orthodox shape; the surrounding code also
+//!    needs the raw `Variable` (not an `Hlvalue` wrapper) to derive
+//!    the `#match_scrutinee_{id}` slot.
 
 pub mod build_flow;
 mod host_env;
@@ -99,3 +124,21 @@ pub use register::{
     build_host_function_from_rust, build_host_function_from_rust_file,
     build_host_function_metadata_from_rust, register_rust_module, register_rust_module_at,
 };
+
+/// Live snapshot of the module-globals partition keyed on
+/// `module_id`. Issue 2.1 (2026-05-05): `GraphFunc.module_globals_id`
+/// uses this to mirror upstream `flowcontext.py:284 self.w_globals =
+/// Constant(func.__globals__)` — `func.__globals__` is a *live*
+/// reference, so introspection paths
+/// (`HostObject::class_get("__globals__")` at `model.rs:1228`,
+/// `getattr(func, "__globals__")` at `model.rs:928`) re-snapshot
+/// the registry at access time rather than reading the snapshot
+/// taken at GraphFunc construction.
+pub fn module_globals_snapshot_for_id(
+    module_id: ModuleId,
+) -> std::collections::HashMap<
+    crate::flowspace::model::ConstValue,
+    crate::flowspace::model::ConstValue,
+> {
+    host_env::module_globals_snapshot_pub(module_id)
+}
