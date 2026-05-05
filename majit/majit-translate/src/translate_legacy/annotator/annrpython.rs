@@ -238,6 +238,29 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
                     .unwrap_or(ValueType::Unknown)
             }
         }
+        // RPython `rfloat.py:rtype_neg` / `intop.py:rtype_neg`: `neg`
+        // preserves the operand's lowleveltype (Float vs Int).  Pyre's
+        // pre-jtransform graph emits a single `OpKind::UnaryOp` op="neg"
+        // for both kinds, so resolve from the operand annotation when
+        // `result_ty` is still Unknown.  Without this, `-z` where `z:
+        // f64` annotates to Int (the previous default), which then
+        // poisons every downstream phi-merge inputarg via union(Int,
+        // Float) → Unknown → GcRef backfill.
+        OpKind::UnaryOp {
+            op,
+            operand,
+            result_ty,
+        } if op == "neg" => {
+            if result_ty != &ValueType::Unknown {
+                result_ty.clone()
+            } else {
+                state
+                    .types
+                    .get(operand)
+                    .cloned()
+                    .unwrap_or(ValueType::Int)
+            }
+        }
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()

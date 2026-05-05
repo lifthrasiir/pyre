@@ -267,7 +267,7 @@ pub struct HeapCache {
     heap_array_cache: HashMap<u32, HashMap<u32, CacheEntry>>,
 
     /// Known class map: object_ref -> class pointer.
-    /// RPython: stored inside `CacheEntry`. Vec indexed by OpRef.0.
+    /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
     known_class: Vec<Option<GcRef>>,
 
     /// Quasi-immutable fields known in this trace.

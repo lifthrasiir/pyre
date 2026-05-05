@@ -568,13 +568,19 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         OpKind::UnaryOp { op, result_ty, .. } if op == "same_as" => {
             valuetype_to_concrete(result_ty)
         }
+        // For `BinOp` / `UnaryOp` whose `result_ty` is still
+        // `ValueType::Unknown`, return `ConcreteType::Unknown` rather
+        // than defaulting to `Signed`.  The override at line ~55 only
+        // fires when `inferred != Unknown`; previously the `Signed`
+        // fallback overrode the annotator's value (e.g. the `neg(Float)
+        // → Float` annotation produced by the dedicated `op == "neg"`
+        // arm in `infer_op_type`), poisoning downstream phi-merge
+        // inputargs whose link arg types are correctly Float.  With
+        // `Unknown` here the override is skipped and the annotator's
+        // value persists; the loop below still upgrades the concrete
+        // type to `Float` for `neg(Float)` etc. via the special arms.
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
-            let c = valuetype_to_concrete(result_ty);
-            if c != ConcreteType::Unknown {
-                c
-            } else {
-                ConcreteType::Signed
-            }
+            valuetype_to_concrete(result_ty)
         }
         // Vtable funcptr extraction returns an integer pointer (RPython
         // `op.args[0]` of `indirect_call` is `Ptr(FuncType)`).

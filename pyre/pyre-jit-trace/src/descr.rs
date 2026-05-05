@@ -462,8 +462,9 @@ pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
 pub use pyre_object::strobject::W_STR_GC_TYPE_ID;
 // `PYFRAME_GC_TYPE_ID` lives in `pyre-interpreter::pyframe` alongside
 // the `PyFrame` struct it describes. Re-exported for the JIT
-// registration site (`pyre-jit/src/eval.rs`). Registered ahead of any
-// future `NewWithVtable(PyFrame)` in trace IR.
+// registration site (`pyre-jit/src/eval.rs`). Phase 2.3 옵션 B
+// foundation — registered ahead of any future
+// `NewWithVtable(PyFrame)` in trace IR.
 pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
@@ -949,11 +950,10 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // Needed so inline PyFrame allocation can write the caller's
-            // execution context into the new frame's execution_context slot
-            // with SetfieldGc. This matches the `ec` red from
-            // interp_jit.py:67 `reds=[frame, ec]`; pyre stores `ec` inline in
-            // the PyFrame header.
+            // Phase 2.3 옵션 B prerequisite: inline PyFrame 생성 시 새 frame 의
+            // execution_context 슬롯에 caller 의 ec 를 SetfieldGc 로 쓰기 위해
+            // 필요. RPython parity 는 interp_jit.py:67 reds=[frame, ec] 의 ec
+            // 슬롯과 동등 — pyre 는 ec 를 PyFrame 헤더에 inline 저장.
             (
                 "PyFrame.execution_context",
                 crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET,
@@ -1380,9 +1380,9 @@ pub fn pyframe_lastblock_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 
-/// FieldDescr for `PyFrame.execution_context`, used by inline PyFrame
-/// allocation to SetfieldGc the caller's `ec` into the new frame.
-/// Call sites are the `helpers.rs::emit_new_pyframe_inline*` helpers.
+/// Phase 2.3 옵션 B prerequisite: PyFrame.execution_context FieldDescr.
+/// inline PyFrame 생성 시 caller 의 ec 를 새 frame 으로 SetfieldGc 하기 위해.
+/// 호출 사이트는 다음 세션의 `helpers.rs::emit_new_pyframe_inline*`.
 pub fn pyframe_execution_context_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
 }

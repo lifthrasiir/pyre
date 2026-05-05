@@ -989,7 +989,11 @@ pub fn insert_renamings(
     assert_eq!(
         link.args.len(),
         target_inputargs.len(),
-        "insert_renamings: link.args and target.inputargs must have equal length"
+        "insert_renamings: link.args and target.inputargs must have equal length \
+         (link.args={:?}, target.inputargs={:?}, target_block={:?})",
+        link.args,
+        target_inputargs,
+        link.target,
     );
 
     // Each entry captures one raw (src, dst) pair with its dst `(kind,

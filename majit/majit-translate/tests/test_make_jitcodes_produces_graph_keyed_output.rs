@@ -1,6 +1,6 @@
-//! Structural regression test for graph-keyed `make_jitcodes` output.
+//! Phase E acceptance anchor (lucky-growing-puzzle).
 //!
-//! Test name matches the intended acceptance command
+//! Test name matches the plan's stated acceptance command
 //! (`cargo test -p majit-translate test_make_jitcodes_produces_graph_keyed_output`).
 //!
 //! ## RPython references
@@ -19,15 +19,15 @@
 //!
 //! ## What this test anchors
 //!
-//! The structural contract is that `make_jitcodes` output is
+//! Phase E's structural claim is that `make_jitcodes` output is
 //! **graph-keyed** — one `JitCode` per `CallPath`, with no
 //! `Instruction`-variant tables, no opcode-to-fragment lookups, no
-//! anything Python bytecode-shaped. The intended shape is `{graph: JitCode}`
-//! only; do not introduce a variant-keyed map.
+//! anything Python bytecode-shaped. The plan's explicit prohibition is:
+//! > 산출물은 `{graph: JitCode}` 만 — variant-keyed map 도입 금지.
 //!
 //! `test_phase_f_all_jitcodes.rs` already covers most of the
 //! behavioural acceptance; this file adds the **structural** anchor
-//! with focused assertions that detect
+//! the plan specifies by name, with focused assertions that detect
 //! any future drift toward variant-keyed output schemas.
 
 use majit_translate::{CallPath, generated::all_jitcodes, jitcode::JitCode};
@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 #[test]
 fn test_make_jitcodes_produces_graph_keyed_output() {
-    // `AllJitCodes::by_path` is keyed by `CallPath` (graph identity),
-    // matching upstream `call.py:87 self.jitcodes`.
+    // Phase E contract: `AllJitCodes::by_path` is keyed by `CallPath`
+    // (graph identity), matching upstream `call.py:87 self.jitcodes`.
     // The `by_path` field's type ensures at compile time that no
     // Instruction-variant key can ever land here — this test only has
     // to verify that the live registry respects the contract without

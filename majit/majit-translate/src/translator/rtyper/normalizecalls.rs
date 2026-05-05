@@ -4,7 +4,7 @@
 //! which lines 14-204, 266-295, and 373-389 cover the pieces this
 //! module ports). The remaining class-PBC halves
 //! (`merge_classpbc_getattr_into_classdef`, `create_class_constructors`)
-//! land with the rtyper specialization work; they depend on
+//! land with the rtyper specialization epic; they depend on
 //! `rpython/rtyper/rclass.py` infrastructure that pyre still has as
 //! scaffolding only. [`perform_normalizations`] is the driver entry
 //! point and runs the call-family, inheritance-id, and
@@ -36,10 +36,10 @@
 //!
 //! ## Upstream call-family clarification
 //!
-//! Upstream call-family scope:
+//! Per the user's plan correction (session transcript):
 //!
-//! `normalizecalls.py` performs signature and annotation normalization, not
-//! graph monomorphization.
+//! > `normalizecalls.py`는 graph monomorphization이 아니라
+//! > signature/annotation normalization만 한다.
 //!
 //! The job of this module is _signature agreement_ across the families
 //! that the annotator has already built — e.g. two `__init__` methods on

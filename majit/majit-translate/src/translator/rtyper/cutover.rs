@@ -405,6 +405,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(1))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -412,6 +413,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -441,6 +443,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(1))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -448,6 +451,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -485,6 +489,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(1))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -492,6 +497,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -736,6 +742,7 @@ fn id(x: &Foo) -> &Foo { x }
                 vec![LinkArg::Value(ValueId(2))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -743,6 +750,7 @@ fn id(x: &Foo) -> &Foo { x }
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -787,6 +795,7 @@ fn id(x: &Foo) -> &Foo { x }
                 vec![LinkArg::Value(ValueId(2))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -794,6 +803,7 @@ fn id(x: &Foo) -> &Foo { x }
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -900,6 +910,7 @@ fn fib(n: i64) -> i64 {
                 vec![LinkArg::Value(ValueId(1))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -907,6 +918,7 @@ fn fib(n: i64) -> i64 {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -950,6 +962,7 @@ fn fib(n: i64) -> i64 {
                 vec![LinkArg::Value(ValueId(2))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -957,6 +970,7 @@ fn fib(n: i64) -> i64 {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -972,22 +986,24 @@ fn fib(n: i64) -> i64 {
     #[test]
     fn anchor_load_fast_repeated_cross_block_read_dedups_within_block() {
         let _lock = anchor_lock();
-        // Cat 3.2 next slice: when an `Expr::Path` cross-block read
-        // emits a fresh `OpKind::Input` (because the local name was
-        // bound in a predecessor block), the freshly-emitted result
-        // is registered as the authoritative `(ValueId, current_block)`
-        // so subsequent same-name reads within the *same* current
-        // block reuse it instead of emitting another `OpKind::Input`.
-        // RPython parity: `flowspace/flowcontext.py:835 LOAD_FAST` reads
-        // the existing locals slot rather than introducing a fresh
-        // Variable on every read.
+        // Cat 3.2 same-block dedup invariant — orthogonal to Cat 2.1
+        // Slice 2's lazy cross-block install.  RPython parity:
+        // `flowspace/flowcontext.py:835 LOAD_FAST` reads the existing
+        // locals slot rather than introducing a fresh Variable on
+        // every read, so `x + x` inside one block must collapse to a
+        // single `OpKind::Input { name: "x" }` followed by a single
+        // BinOp consuming that op's result twice.
         //
-        // Construct a function whose post-`if` block reads the
-        // pre-`if` parameter `x` twice: `x + x`.  Without this slice
-        // both reads emit a separate `OpKind::Input{name:"x"}` in the
-        // post-`if` block; with the slice the second read reuses the
-        // first.  Total `OpKind::Input{name:"x"}` count drops from 3
-        // (entry + post-if x2) to 2 (entry + post-if x1).
+        // Pre-Slice-2: the post-`if` block emitted a naked
+        // `OpKind::Input{name:"x"}` directly (no inputarg, no
+        // `Link.args` thread-back) and the dedup invariant held
+        // trivially because there was only one cross-block reading
+        // block.  Post-Slice-2: lazy thread-back installs an
+        // `OpKind::Input{name:"x"}` per block on the predecessor
+        // chain (entry parameter + each empty pass-through merge +
+        // the actual reading block), and the dedup invariant becomes
+        // a per-block assertion: no single block emits more than one
+        // `Input{name:"x"}`.
         let graph = build_anchor_graph(
             r#"
 fn cross_block(x: i64, cond: bool) -> i64 {
@@ -997,7 +1013,26 @@ fn cross_block(x: i64, cond: bool) -> i64 {
 "#,
             "cross_block",
         );
-        let input_x_count: usize = graph
+        for block in &graph.blocks {
+            let count: usize = block
+                .operations
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        crate::model::OpKind::Input { name, .. } if name == "x"
+                    )
+                })
+                .count();
+            assert!(
+                count <= 1,
+                "Cat 3.2 same-block dedup: B{} emitted {} `Input{{name:\"x\"}}` \
+                 ops but `x + x` must collapse to one within a single block",
+                block.id.0,
+                count,
+            );
+        }
+        let total_input_x: usize = graph
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
@@ -1008,45 +1043,99 @@ fn cross_block(x: i64, cond: bool) -> i64 {
                 )
             })
             .count();
-        assert_eq!(
-            input_x_count, 2,
-            "Cat 3.2 cross-block dedup: post-`if` block reads of `x` must \
-             collapse to one OpKind::Input — expected 2 total \
-             (entry + post-if), got {input_x_count}"
+        assert!(
+            total_input_x >= 1,
+            "Cat 3.2 cross-block read: at least the entry block must define \
+             `OpKind::Input{{name:\"x\"}}` for the function parameter",
         );
     }
 
     #[test]
-    fn anchor_cat_2_1_cross_block_reads_fail_dual_gate_until_link_args_thread() {
+    fn anchor_cat_2_1_both_open_arm_rebind_post_merge_read_phi_threads() {
         let _lock = anchor_lock();
-        // Cat 2.1 — cross-block locals threading via `Link.args` /
-        // target-`inputarg` join is a deferred multi-session epic.
+        // Cat 2.1 Stage C — both-open-arm + per-arm rebind merge.
+        // RPython `flowspace/flowcontext.py` parity: at the merge
+        // point of `if cond { x = 1 } else { x = 2 }; x`, the post-
+        // merge `LOAD_FAST x` resolves to a fresh phi inputarg in
+        // the merge block whose `Link.args` from each arm carry the
+        // arm-rebound `ValueId`.
         //
-        // Pyre's frontend emits a fresh `OpKind::Input { name }` in
-        // each block that reads a local across a control-flow split
-        // (post-`if`, post-`loop`, ...) instead of threading the
-        // local through `Link.args` / target `inputargs` the way
-        // RPython's `flowspace/flowcontext.py:835 LOAD_FAST` does.
-        // The adapter's per-block `name_to_value` (built from
-        // `block.inputargs`) cannot resolve such a name when the
-        // post-split block has no inputargs of its own — surfacing
-        // as `function_graph_to_flowspace`'s
-        // `"Input \`x\` ... has no in-scope flowspace Variable/Constant"`
-        // diagnostic.
+        // Stage A1-A3 + B1-B2 + C1 minimal land the foundations: per-
+        // block `framestate`, first-bind positional slot order, union
+        // / getoutputargs, ctx restore between arms, relaxed lazy
+        // installer fence, None-kill of one-arm-only locals.  The
+        // lazy installer (Slice 2) handles the cross-block read of
+        // the rebound `x` at the post-merge use site, allocating a
+        // single merge-block inputarg + threading each arm's rebound
+        // `ValueId` back through that arm's `Link.args`.
         //
-        // A previous attempt to alias cross-block reads to the
-        // defining block's inputarg `Variable` (without modifying
-        // the legacy graph shape) was reverted because it tripped
-        // `flowspace/model.py:checkgraph`'s
-        // "variable used in more than one block" assertion (line
-        // 3886-3893 in the Rust port) — Variables must be defined
-        // in exactly one block, so cross-block locals genuinely
-        // require a target-`inputarg` introduction with matching
-        // `LinkArg::Value` plumbed at every predecessor `Link.exits`.
+        // This anchor pins the both-open-arm + rebind shape end-to-
+        // end via `dual_gate_check`.  Per-block `Link.args` arity =
+        // target `inputargs` arity is checked separately to
+        // surface any predecessor / target mismatch the lazy install
+        // might leave behind.
+        let graph = build_anchor_graph(
+            r#"
+fn rebind_both_arms(cond: bool) -> i64 {
+    let x: i64;
+    if cond { x = 1; } else { x = 2; }
+    x + x
+}
+"#,
+            "rebind_both_arms",
+        );
+        let (annotations, legacy_state) = run_legacy_resolve(&graph);
+        dual_gate_check(&graph, &annotations, &legacy_state).expect(
+            "Cat 2.1 Stage C — both-open-arm rebind merge resolves via lazy Link.args + phi inputarg",
+        );
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let target_arity = graph.block(link.target).inputargs.len();
+                assert_eq!(
+                    link.args.len(),
+                    target_arity,
+                    "Stage C invariant: Link from B{} to B{} arity {} != target inputargs {}",
+                    block.id.0,
+                    link.target.0,
+                    link.args.len(),
+                    target_arity,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_cat_2_1_cross_block_reads_pass_dual_gate_after_link_args_thread() {
+        let _lock = anchor_lock();
+        // Cat 2.1 Slice 2 — cross-block locals threading via lazy
+        // `Link.args` / target-`inputarg` install at the actual
+        // cross-block read site.  RPython
+        // `flowspace/flowcontext.py:835 LOAD_FAST` parity.
         //
-        // This anchor pins the current failure mode so a future
-        // Cat 2.1 slice that lands proper Link.args threading can
-        // flip the assertion from `expect_err` to `expect` cleanly.
+        // Slice 2 wires `front/ast.rs::lower_expr`'s `Expr::If` arm
+        // through `lazy_install_local_at_current_block`: when a
+        // post-`if` block performs a `LOAD_FAST` of a local whose
+        // definition lives in a dominating block, the read site
+        // allocates a fresh `OpKind::Input` in the merge block,
+        // promotes it to `inputargs`, and walks back to every
+        // predecessor edge whose `set_branch` / `set_goto` recorded a
+        // `LocalsFrameState` snapshot, appending the predecessor-side
+        // `ValueId` to that link's `args` so `len(link.args) ==
+        // len(target.inputargs)` per `flowspace/model.py:114
+        // Link.__init__`.
+        //
+        // This shape (single-open-arm-no-rebind: `if cond { return; }
+        // x + x`) is the simplest case — only one predecessor, no
+        // rebinding inside the open arm.  Slices 3-6 extend the
+        // recording to the both-open-arm + match + loop + break /
+        // continue join sites.
+        //
+        // The previous incarnation of this anchor pinned the failure
+        // mode via `expect_err`; Slice 2 closes that gap so the
+        // assertion flips to `expect`.  The graph-shape checks below
+        // pin the post-Slice-2 invariants — the merge block has its
+        // own inputargs and the predecessor's `link.args` arity now
+        // matches it.
         let graph = build_anchor_graph(
             r#"
 fn cross_block(x: i64, cond: bool) -> i64 {
@@ -1057,14 +1146,26 @@ fn cross_block(x: i64, cond: bool) -> i64 {
             "cross_block",
         );
         let (annotations, legacy_state) = run_legacy_resolve(&graph);
-        let err = dual_gate_check(&graph, &annotations, &legacy_state)
-            .expect_err("cross_block surfaces Cat 2.1 cross-block locals gap");
-        assert!(
-            err.contains("has no in-scope flowspace Variable/Constant")
-                || err.contains("variable")
-                || err.contains("real path failed")
-                || err.contains("real path panicked"),
-            "Cat 2.1 anchor must pin the cross-block locals diagnostic, got: {err}"
-        );
+        dual_gate_check(&graph, &annotations, &legacy_state)
+            .expect("Cat 2.1 — Slice 2 closes cross-block locals via lazy Link.args threading");
+
+        // Per-block invariant: every link from `block` to its target
+        // carries `args` whose arity matches the target's inputargs.
+        // Equivalent to `flowspace/model.py:114 Link.__init__` +
+        // `:checkgraph`.
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let target_arity = graph.block(link.target).inputargs.len();
+                assert_eq!(
+                    link.args.len(),
+                    target_arity,
+                    "Slice 2 invariant: Link from B{} to B{} arity {} != target inputargs {}",
+                    block.id.0,
+                    link.target.0,
+                    link.args.len(),
+                    target_arity,
+                );
+            }
+        }
     }
 }

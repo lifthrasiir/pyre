@@ -861,6 +861,256 @@ pub struct Block {
     pub exitswitch: Option<ExitSwitch>,
     /// RPython `Block.exits`.
     pub exits: Vec<Link>,
+    /// Framestate snapshot captured at the moment this block was closed
+    /// (its `set_goto` / `set_branch` / `set_return`).  Read by the
+    /// frontend's lazy cross-block local installer to recover, after the
+    /// fact, what `(name → ValueId)` mapping was visible to a
+    /// predecessor when its outgoing link fired.  Build-time only —
+    /// downstream rtyper/jtransform passes ignore this field; it is
+    /// neither serialised nor required to remain populated past the
+    /// front end.  RPython parity: `flowspace/flowcontext.py:38
+    /// SpamBlock.__init__ self.framestate = framestate` attaches a
+    /// framestate to the block representing the locals state visible at
+    /// that block boundary; pyre stores the analogous "exit-time"
+    /// snapshot here so cross-block reads in successors can derive
+    /// `Link.args` retroactively.
+    pub framestate: Option<FrameState>,
+}
+
+/// One slot of a `FrameState` snapshot — a single locally-bound
+/// name, the `ValueId` it pointed at when the snapshot was taken, and
+/// the `ValueType` that classifies the kind register bank.
+///
+/// RPython parity: corresponds to one slot of `frame.locals_w` at the
+/// moment `flowspace/flowcontext.py` closes a block.  RPython keys
+/// `locals_w` by CPython-assigned slot index; pyre carries the slot
+/// name explicitly so the same `FrameStateEntry` can be located across
+/// merge points without consulting a separate slot table — slot order
+/// is enforced by the position of the entry in the containing
+/// `FrameState.entries` Vec (first-bind positional, see `FrameState`
+/// docstring).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameStateEntry {
+    pub name: String,
+    pub value_id: ValueId,
+    pub value_type: ValueType,
+}
+
+/// Locals snapshot captured at a block boundary — see `Block.framestate`
+/// for usage semantics.  Entries are stored **densely** at graph-wide
+/// first-bind slot positions: slot `i` corresponds to the name at
+/// `GraphBuildContext::local_first_bind_order[i]`, and `None` indicates
+/// the slot is unbound at this snapshot point (RPython's "undefined
+/// local" sentinel).  Names are appended to the graph-wide order on
+/// first bind anywhere in the function and never moved or removed —
+/// `LocalBindingSnapshot::restore` does NOT roll the order back, so the
+/// slot index of a name is truly invariant across the entire lowering.
+/// This mirrors RPython `co_varnames` slot order — every predecessor's
+/// exit snapshot walks the same slot positions, so two predecessors of
+/// the same merge point line up positionally even when one of them
+/// rolled back its bindings via `LocalBindingSnapshot::restore`.
+///
+/// RPython parity: `flowspace/framestate.py:18 FrameState` — a tuple of
+/// `(locals_w, stack, last_exception, blocklist, next_offset)`.  Pyre's
+/// frontend runs over Rust source rather than Python bytecode, so
+/// `stack` / `last_exception` / `blocklist` / `next_offset` have no
+/// analogue here and only the `locals_w` slice is meaningful.  This
+/// is a partial projection of upstream's FrameState — the bytecode
+/// flowspace's full counterpart lives at
+/// `flowspace::framestate::FrameState`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrameState {
+    /// Slot `i` ↔ graph-wide first-bind name at index `i`; `None` if
+    /// unbound at this snapshot point.  RPython parity:
+    /// `framestate.py:19 self.locals_w` — list of `Variable | Constant
+    /// | None` indexed by `co_varnames` slot.
+    pub entries: Vec<Option<FrameStateEntry>>,
+}
+
+impl FrameState {
+    /// Iterate `(name, ValueId, &ValueType)` over **bound** slots in
+    /// storage order.  Unbound slots (None-killed) are skipped.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, ValueId, &ValueType)> + '_ {
+        self.entries
+            .iter()
+            .filter_map(|e| e.as_ref())
+            .map(|e| (e.name.as_str(), e.value_id, &e.value_type))
+    }
+
+    /// `Link.args` payload for this snapshot — `ValueId`s of bound
+    /// slots in storage order.  Unbound (None) slots are skipped.
+    #[allow(dead_code)]
+    pub fn link_args(&self) -> Vec<ValueId> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.as_ref().map(|e| e.value_id))
+            .collect()
+    }
+
+    /// Compute a state at least as general as both `self` and `other`
+    /// via positional zip over slots — direct port of RPython
+    /// `framestate.py:14 _union` (`return [union(v1, v2) for v1, v2
+    /// in zip(seq1, seq2)]`).  When one side has fewer slots than the
+    /// other (a name appended after the shorter side's snapshot was
+    /// taken), the missing slots are treated as `None` so the
+    /// positional zip extends to `max(len(self), len(other))`.
+    ///
+    /// Per-slot semantics (RPython `framestate.py:105-128 union`):
+    ///   - `(None, _) | (_, None)` → None-kill (`framestate.py:
+    ///     110-111`); slot dropped from the merged state.
+    ///   - `(Some(s), Some(o))` with `s.value_id == o.value_id` →
+    ///     `CarryThrough(vid)` (`framestate.py:108 if w1 == w2:
+    ///     return w1`).
+    ///   - `(Some(s), Some(o))` with disagreeing vids →
+    ///     `NeedsPhi` (`framestate.py:113-114 return Variable()`).
+    ///
+    /// `ValueType` mismatch raises `UnionError::TypeMismatch` —
+    /// pyre-specific stricter guard not present in RPython because
+    /// RPython's `Variable` is untyped at flowspace level; the
+    /// pyre-typed pipeline cannot represent a slot whose register
+    /// bank disagrees across predecessors.
+    ///
+    /// Caller (Stage C1+) allocates fresh `ValueId`s for the
+    /// `NeedsPhi` slots when materialising the successor block's
+    /// inputargs; `union` itself is purely descriptive and does not
+    /// mutate the graph.
+    pub fn union(&self, other: &FrameState) -> Result<MergedFrameState, UnionError> {
+        let len = std::cmp::max(self.entries.len(), other.entries.len());
+        let mut merged = Vec::with_capacity(len);
+        for i in 0..len {
+            let s = self.entries.get(i).and_then(|e| e.as_ref());
+            let o = other.entries.get(i).and_then(|e| e.as_ref());
+            match (s, o) {
+                // RPython `framestate.py:110-111`: one side is None →
+                // None-kill.  Slot is preserved positionally with `None`
+                // so `MergedFrameState.entries` stays the same length as
+                // the wider predecessor and downstream positional walks
+                // (`getoutputargs`) keep slot indices stable.
+                (None, _) | (_, None) => merged.push(None),
+                (Some(s_entry), Some(o_entry)) => {
+                    debug_assert_eq!(
+                        s_entry.name, o_entry.name,
+                        "graph-wide first-bind invariant broken at slot {i}"
+                    );
+                    if s_entry.value_type != o_entry.value_type {
+                        return Err(UnionError::TypeMismatch {
+                            name: s_entry.name.clone(),
+                            self_type: s_entry.value_type.clone(),
+                            other_type: o_entry.value_type.clone(),
+                        });
+                    }
+                    let merge = if s_entry.value_id == o_entry.value_id {
+                        SlotMerge::CarryThrough(s_entry.value_id)
+                    } else {
+                        SlotMerge::NeedsPhi
+                    };
+                    merged.push(Some(MergedFrameStateEntry {
+                        name: s_entry.name.clone(),
+                        merge,
+                        value_type: s_entry.value_type.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(MergedFrameState { entries: merged })
+    }
+
+    /// Output arguments to thread `self` (a predecessor's exit state)
+    /// into the merge block whose entry framestate is `target`.  RPython
+    /// parity: `framestate.py:92-99 FrameState.getoutputargs` walks
+    /// `targetstate.mergeable` positionally, picking `self.mergeable[i]`
+    /// at every Variable position.  `target.entries` is dense at the
+    /// graph-wide first-bind slot positions, with `None` at slots that
+    /// were None-killed by the union; surviving (`Some`) slot `i` lines
+    /// up with `self.entries[i]` because both predecessors share the
+    /// same graph-wide first-bind order.
+    ///
+    /// Panics if `target` contains a `Some` slot at an index where
+    /// `self.entries[i]` is `None` or out of range — that would mean
+    /// `target` was not produced by `self.union(_)`, which violates the
+    /// merge invariant.
+    pub fn getoutputargs(&self, target: &MergedFrameState) -> Vec<ValueId> {
+        target
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.as_ref().map(|t| {
+                    let s = self
+                        .entries
+                        .get(i)
+                        .and_then(|e| e.as_ref())
+                        .expect("target slot must be bound in self — union invariant");
+                    debug_assert_eq!(
+                        s.name, t.name,
+                        "graph-wide first-bind invariant broken at slot {i}"
+                    );
+                    s.value_id
+                })
+            })
+            .collect()
+    }
+}
+
+/// One slot of a `MergedFrameState` — see `FrameState::union` for
+/// production semantics.  `merge` distinguishes slots where the
+/// predecessors agreed on the same `ValueId` (carry-through, no phi
+/// needed at the merge block) from slots where they disagreed (a
+/// fresh inputarg / phi must be allocated by the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedFrameStateEntry {
+    pub name: String,
+    pub merge: SlotMerge,
+    pub value_type: ValueType,
+}
+
+/// Result of `FrameState::union` — entries are densely positioned at
+/// graph-wide first-bind slot indices (same shape as `FrameState`), with
+/// `None` at slots that the union killed (RPython `framestate.py:
+/// 110-111` None-kill semantics) and `Some(MergedFrameStateEntry)` at
+/// surviving slots.  Positional walks (`FrameState::getoutputargs`)
+/// rely on slot indices lining up with the source predecessor's
+/// `entries` directly, mirroring RPython's equal-length `locals_w`
+/// shape across union/getoutputargs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergedFrameState {
+    pub entries: Vec<Option<MergedFrameStateEntry>>,
+}
+
+/// Per-slot merge classification produced by `FrameState::union`.
+/// RPython parity: `framestate.py:105-128 union` returns either the
+/// shared value (`CarryThrough`) or a fresh `Variable` (`NeedsPhi`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotMerge {
+    /// Both predecessors agreed on the same `ValueId`; the successor
+    /// inputarg can adopt that vid directly without a phi node
+    /// (RPython `framestate.py:108 if w1 == w2: return w1`).
+    CarryThrough(ValueId),
+    /// Predecessors disagree on `ValueId`; the successor must
+    /// allocate a fresh inputarg (RPython `framestate.py:113-114
+    /// return Variable()`).  The fresh `ValueId` is allocated by the
+    /// caller when materialising the merge block, so `union` itself
+    /// stays pure data.
+    NeedsPhi,
+}
+
+/// Reasons `FrameState::union` may refuse to merge — pyre's analogue
+/// of RPython `framestate.py:101 UnionError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnionError {
+    /// Two predecessor states disagree on a slot's `ValueType` (e.g.
+    /// one side bound the slot to an `Int`, the other to a `Ref`).
+    /// The merge cannot be lowered onto a single int/ref/float
+    /// register bank, so the join is untypable.  RPython surfaces
+    /// this through `framestate.py:117 raise UnionError` for
+    /// `SpecTag` constants; pyre extends the case to mismatched
+    /// kinds because pyre's `ValueType` is what pins register bank
+    /// classification.
+    TypeMismatch {
+        name: String,
+        self_type: ValueType,
+        other_type: ValueType,
+    },
 }
 
 impl Block {
@@ -978,6 +1228,7 @@ impl FunctionGraph {
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
+                    framestate: None,
                 },
                 Block {
                     id: returnblock,
@@ -985,6 +1236,7 @@ impl FunctionGraph {
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
+                    framestate: None,
                 },
                 Block {
                     id: exceptblock,
@@ -992,6 +1244,7 @@ impl FunctionGraph {
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
+                    framestate: None,
                 },
             ],
             notes: Vec::new(),
@@ -1028,6 +1281,7 @@ impl FunctionGraph {
             operations: Vec::new(),
             exitswitch: None,
             exits: Vec::new(),
+            framestate: None,
         });
         id
     }
@@ -1042,6 +1296,7 @@ impl FunctionGraph {
             operations: Vec::new(),
             exitswitch: None,
             exits: Vec::new(),
+            framestate: None,
         });
         (id, args)
     }
@@ -1432,5 +1687,72 @@ mod tests {
 
         graph.closeblock(entry, vec![Link::new(vec![], first, None)]);
         graph.closeblock(entry, vec![Link::new(vec![], second, None)]);
+    }
+
+    #[test]
+    fn framestate_union_kills_one_sided_local() {
+        // RPython parity: `framestate.py:110-111` "if w1 is None or w2
+        // is None: return None" — a slot present in one predecessor
+        // but missing in the other is killed (dropped) from the merged
+        // state.  Pyre realises this via dense positional entries:
+        // the graph-wide first-bind order assigns slots [x=0,
+        // self_only=1, other_only=2]; `self` has slot 1 bound but slot
+        // 2 unbound, `other` has slot 2 bound but slot 1 unbound, so
+        // both one-sided slots collapse to None-kill at union.
+        let self_state = FrameState {
+            entries: vec![
+                Some(FrameStateEntry {
+                    name: "x".into(),
+                    value_id: ValueId(0),
+                    value_type: ValueType::Int,
+                }),
+                Some(FrameStateEntry {
+                    name: "self_only".into(),
+                    value_id: ValueId(1),
+                    value_type: ValueType::Int,
+                }),
+                None,
+            ],
+        };
+        let other_state = FrameState {
+            entries: vec![
+                Some(FrameStateEntry {
+                    name: "x".into(),
+                    value_id: ValueId(2),
+                    value_type: ValueType::Int,
+                }),
+                None,
+                Some(FrameStateEntry {
+                    name: "other_only".into(),
+                    value_id: ValueId(3),
+                    value_type: ValueType::Int,
+                }),
+            ],
+        };
+        let merged = self_state
+            .union(&other_state)
+            .expect("union with type-compatible common slot must succeed");
+        assert_eq!(
+            merged.entries.len(),
+            3,
+            "merged state preserves positional length = max(len)"
+        );
+        let surviving = merged.entries[0]
+            .as_ref()
+            .expect("slot 0 (x) is bound on both sides and must survive");
+        assert_eq!(surviving.name, "x");
+        assert_eq!(surviving.merge, SlotMerge::NeedsPhi);
+        assert_eq!(surviving.value_type, ValueType::Int);
+        assert!(
+            merged.entries[1].is_none() && merged.entries[2].is_none(),
+            "one-sided slots must be None-killed positionally"
+        );
+        assert!(
+            merged.entries.iter().all(|e| e
+                .as_ref()
+                .map(|s| s.name != "self_only" && s.name != "other_only")
+                .unwrap_or(true)),
+            "one-sided slot names must not appear among surviving entries"
+        );
     }
 }

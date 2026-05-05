@@ -220,7 +220,7 @@ impl NameManager {
     /// land on a hit. Per AGENTS.md §4 ("Removing an RPython method
     /// to 'simplify' things is not allowed"), the upstream-shape
     /// name is preserved as a wrapper even though `local_scope` is
-    /// the canonical Rust spelling per the parity rules §2.
+    /// the canonical Rust spelling per CLAUDE.md §2.
     #[allow(non_snake_case)]
     pub fn localScope(rc: &Rc<RefCell<Self>>, parent: Option<&LocalScope>) -> LocalScope {
         Self::local_scope_from(rc, parent)
@@ -258,8 +258,9 @@ pub struct LocalScope {
     /// Held as `Option<Rc<LocalScope>>` — `None` mirrors upstream's
     /// "parent is the NameManager", which is already reachable via
     /// [`Self::glob`]. The field is dead upstream too (no reader
-    /// outside `__init__`), but preserved for structural parity: an RPython
-    /// object attribute stays a Rust struct field.
+    /// outside `__init__`), but preserved for structural parity per
+    /// AGENTS.md "RPython object attribute는 Rust struct field로
+    /// 보존".
     pub parent: Option<Rc<LocalScope>>,
     /// RPython `_LocalScope.glob` (`gensupp.py:77`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /

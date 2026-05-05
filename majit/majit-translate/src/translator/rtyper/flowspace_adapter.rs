@@ -1460,6 +1460,7 @@ mod tests {
             }],
             exitswitch: None,
             exits: Vec::new(),
+            framestate: None,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -1530,6 +1531,7 @@ mod tests {
             ],
             exitswitch: None,
             exits: Vec::new(),
+            framestate: None,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -1583,6 +1585,7 @@ mod tests {
             ],
             exitswitch: None,
             exits: Vec::new(),
+            framestate: None,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -1620,6 +1623,7 @@ mod tests {
             ],
             exitswitch: None,
             exits: Vec::new(),
+            framestate: None,
         };
         block.id = graph.startblock;
         graph.blocks = vec![block];
@@ -2147,6 +2151,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(1))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2154,6 +2159,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
         graph
@@ -2223,6 +2229,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(1))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2230,6 +2237,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock];
 
@@ -2282,6 +2290,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(2))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2289,6 +2298,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
@@ -2354,6 +2364,7 @@ mod tests {
                     Some(LinkArg::Value(ValueId(11))),
                 ),
             ],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2361,6 +2372,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         let exceptblock = Block {
             id: graph.exceptblock,
@@ -2368,6 +2380,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         graph.blocks = vec![startblock, returnblock, exceptblock];
 
@@ -2421,6 +2434,7 @@ mod tests {
                 vec![LinkArg::Value(ValueId(2))],
                 graph.returnblock,
             )],
+            framestate: None,
         };
         let returnblock = Block {
             id: graph.returnblock,
@@ -2428,6 +2442,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![],
+            framestate: None,
         };
         annotations.set(ValueId(3), ValueType::Int);
         graph.blocks = vec![startblock, returnblock];
