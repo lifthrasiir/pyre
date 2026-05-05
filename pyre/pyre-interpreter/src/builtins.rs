@@ -1957,6 +1957,27 @@ fn exec_or_eval(
         crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
 
+    // pyopcode.py:738-759 exec_ — refuse a code object that needs a
+    // closure with the exec-side TypeError.  PyPy exposes a keyword-only
+    // `w_closure` parameter and builds an `outer_func` from it after
+    // validating the tuple of cells.  Pyre's exec() builtin currently
+    // accepts only source/globals/locals, so no closure cells can be
+    // supplied yet.
+    //
+    // eval() takes no closure parameter even on CPython; the eval-side
+    // error message comes from initialize_frame_scopes (pyframe.py:242-246
+    // "directly executed code object may not contain free variables") via
+    // createframe → ?, which is what compiling.py:99 eval_function reaches
+    // through code.exec_code.
+    if !is_eval {
+        let needed_freevars = unsafe { (&*raw_code).freevars.len() };
+        if needed_freevars > 0 {
+            return Err(crate::PyError::type_error(format!(
+                "code object requires a closure of exactly length {needed_freevars}"
+            )));
+        }
+    }
+
     // Build a DictStorage from the supplied globals dict (or fall back to
     // the caller's frame globals when None / missing). Mutations made by
     // the executed code propagate back to the original dict via the
@@ -2027,10 +2048,25 @@ fn exec_or_eval(
             unsafe { (*frame).execution_context }
         }
     });
-    let mut frame =
-        crate::pyframe::PyFrame::new_with_namespace(code_obj_ref as *const (), exec_ctx, ns_ptr);
+    // eval.py:31-33 Code.exec_code → space.createframe(...) + frame.run().
+    // For eval() with a code object that carries freevars, createframe
+    // surfaces pyframe.py:242-246's TypeError "directly executed code
+    // object may not contain free variables" directly — exec()'s
+    // closure-mismatch TypeError was already raised above.
+    let mut frame = match crate::createframe(code_obj_ref as *const (), ns_ptr, exec_ctx, None) {
+        Ok(frame) => frame,
+        Err(err) => {
+            let _ = unsafe { Box::from_raw(ns_ptr) };
+            let _ = raw_code;
+            return Err(err);
+        }
+    };
     frame.fix_array_ptrs();
-    let result = crate::eval::eval_frame_plain(&mut frame);
+    // run() rather than execute_frame so that
+    // `eval(compile("(x for x in [])", ..., 'eval'))` of generator-flagged
+    // code returns the wrapped generator object instead of executing the
+    // body inline.
+    let result = frame.run();
 
     // Drain the namespace back into the dict the caller passed in so the
     // exec'd module-level bindings are visible to subsequent code.

@@ -595,7 +595,14 @@ impl PyFrame {
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
             self.getorcreate_debug_data(-1).w_globals = w_globals;
         }
-        self.initialize_frame_scopes(outer_func, code);
+        // pyframe.py:119 — final step of __init__.  PyFrame::__init__ has
+        // no in-tree callers (rebuilt frames go through createframe); on the
+        // unlikely path of an uncaught freevar/closure mismatch surface it
+        // as a panic so the caller can be added in the same change rather
+        // than silently corrupting state.
+        self.initialize_frame_scopes(outer_func, code).expect(
+            "PyFrame::__init__: initialize_frame_scopes raised — caller should use createframe",
+        );
     }
 
     /// PyPy-compatible `__repr__`.
@@ -641,9 +648,19 @@ impl PyFrame {
         PY_NULL
     }
 
-    /// PyPy-compatible `initialize_frame_scopes`.
+    /// pyframe.py:223-261 initialize_frame_scopes.
+    ///
+    /// Errors mirror pyframe.py:242-246 (TypeError "directly executed code
+    /// object may not contain free variables") and pyframe.py:251-253
+    /// (ValueError "code object received a closure with an unexpected
+    /// number of free variables") so callers can surface them through
+    /// PyPy's OperationError-equivalent path instead of panicking.
     #[inline]
-    pub fn initialize_frame_scopes(&mut self, outer_func: PyObjectRef, _code: *const ()) {
+    pub fn initialize_frame_scopes(
+        &mut self,
+        outer_func: PyObjectRef,
+        _code: *const (),
+    ) -> Result<(), crate::PyError> {
         let code = unsafe { &*pyframe_get_pycode(self) };
         let flags = code.flags;
         if !flags.contains(CodeFlags::OPTIMIZED) {
@@ -658,7 +675,7 @@ impl PyFrame {
         let ncellvars = code.cellvars.len();
         let nfreevars = code.freevars.len();
         if ncellvars == 0 && nfreevars == 0 {
-            return;
+            return Ok(());
         }
 
         let closure = if !outer_func.is_null() && unsafe { crate::is_function(outer_func) } {
@@ -671,14 +688,16 @@ impl PyFrame {
         } else {
             unsafe { w_tuple_len(closure) }
         };
-        assert!(
-            nfreevars == 0 || !outer_func.is_null(),
-            "directly executed code object may not contain free variables"
-        );
-        assert!(
-            closure_size == nfreevars,
-            "code object received a closure with an unexpected number of free variables"
-        );
+        if nfreevars > 0 && outer_func.is_null() {
+            return Err(crate::PyError::type_error(
+                "directly executed code object may not contain free variables",
+            ));
+        }
+        if closure_size != nfreevars {
+            return Err(crate::PyError::value_error(format!(
+                "code object received a closure with an unexpected number of free variables"
+            )));
+        }
 
         let mut index = code.varnames.len();
         for _ in 0..ncellvars {
@@ -690,6 +709,7 @@ impl PyFrame {
                 unsafe { w_tuple_getitem(closure, i as i64).unwrap_or(PY_NULL) };
             index += 1;
         }
+        Ok(())
     }
 
     /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
@@ -743,16 +763,46 @@ impl PyFrame {
         frame
     }
 
-    /// Create a new frame for executing a code object with a fresh execution context.
-    pub fn new(code: CodeObject) -> Self {
+    /// Test-helper constructor — creates a frame with a fresh execution
+    /// context.
+    ///
+    /// PRE-EXISTING-ADAPTATION: PyPy has no equivalent — tests there call
+    /// `space.appexec` or build the context explicitly before invoking
+    /// `space.createframe`.  Pyre keeps `PyFrame::new` for test
+    /// ergonomics (~67 callers across `pyre-interpreter`, `pyre-jit`,
+    /// `pyre-jit-trace` test modules) but routes the body through
+    /// `createframe` (PyPy `baseobjspace.py:796`) so every heap-allocated
+    /// `PyFrame` flows through the canonical entry point.
+    pub fn new(code: CodeObject) -> Box<Self> {
         Self::new_with_context(code, Rc::new(PyExecutionContext::default()))
+            .expect("PyFrame::new: test entry code must not carry freevars")
     }
 
-    /// Create a new frame for executing a code object in the given context.
+    /// Module-entry adapter for `createframe` — leaks owned arguments
+    /// into the raw-pointer shape that `createframe` expects, builds
+    /// the module-entry `__dict__` (with `__name__ = "__main__"`), and
+    /// returns the resulting heap-allocated frame.
     ///
-    /// The `Rc` is leaked via `Rc::into_raw` — consistent with pyre's
-    /// memory model where code objects and namespaces are also leaked.
-    pub fn new_with_context(code: CodeObject, execution_context: Rc<PyExecutionContext>) -> Self {
+    /// PRE-EXISTING-ADAPTATION: PyPy's `space.createframe(code, w_globals,
+    /// outer_func)` (`baseobjspace.py:796`) takes already-constructed
+    /// `code` and `w_globals` Python objects and reads execution context
+    /// from `space.threadlocals`. PyPy callers (`pypy/interpreter/main.py
+    /// run_module`, etc.) build `w_globals` and set `__name__` themselves
+    /// before calling `createframe`. Pyre's adapter exists because:
+    /// (1) Rust has no GC, so `code`/`w_globals`/`ec` lifetimes must be
+    /// leaked into raw pointers manually; (2) pyre's `ExecutionContext`
+    /// is per-frame (not per-space), so callers pass `Rc<EC>` explicitly.
+    /// Three production callers (`pyrex/lib.rs`, `pyre-wasm/lib.rs`,
+    /// `pyre-wasm-test/main.rs`) plus `PyFrame::new` (test helper)
+    /// invoke this; without the adapter each would duplicate the 9-line
+    /// leak setup.
+    ///
+    /// Returns `Result<Box<Self>, PyError>` so createframe's freevar /
+    /// closure errors surface as interpreter errors instead of panics.
+    pub fn new_with_context(
+        code: CodeObject,
+        execution_context: Rc<PyExecutionContext>,
+    ) -> Result<Box<Self>, crate::PyError> {
         let mut w_globals = Box::new(execution_context.fresh_dict_storage());
         w_globals.fix_ptr();
         // Set __name__ — PyPy: Module.__init__ sets __name__ in w_dict
@@ -768,11 +818,17 @@ impl PyFrame {
             crate::w_code_set_w_globals(w_code, w_globals);
         }
         let ctx_ptr = Rc::into_raw(execution_context);
-        Self::new_with_namespace(w_code as *const (), ctx_ptr, w_globals)
+        crate::createframe(w_code as *const (), w_globals, ctx_ptr, None)
     }
 
-    /// Create a new frame with an explicitly provided namespace pointer.
-    pub fn new_with_namespace(
+    /// PyFrame constructor body called from `createframe` (PyPy
+    /// `baseobjspace.py:796`) when `outer_func` is `None` — sets up the
+    /// fixed-array stack, debug data, w_globals binding, and module-level
+    /// `w_locals = w_globals` semantics.  Crate-private since Slice C.6
+    /// (PyFrame Heap-Allocation Epic): the only caller is `createframe`,
+    /// which canonicalises heap allocation and wraps the returned value
+    /// in `Box<Self>`.
+    pub(crate) fn new_with_namespace(
         code: *const (),
         execution_context: *const PyExecutionContext,
         w_globals: *mut DictStorage,
@@ -807,13 +863,12 @@ impl PyFrame {
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
         }
-        // Module-level semantics (pypy/interpreter/module.py): locals == globals.
-        // PyPy doesn't set NEWLOCALS on module code, so initialize_frame_scopes
-        // does `w_locals = w_globals` for !OPTIMIZED && !NEWLOCALS. rustpython's
-        // codegen, however, sets NEWLOCALS on module code too — so the
-        // flag-based branch would hand us a fresh empty dict. new_with_namespace
-        // is only used for the module-level entry frame, so force the PyPy
-        // semantics here directly.
+        // Module-level w_locals = w_globals binding flows naturally
+        // through `createframe → initialize_frame_scopes` since RustPython
+        // codegen emits empty flags for the module seed CodeInfo
+        // (pyframe.py:233-235).  This constructor bypasses
+        // initialize_frame_scopes, so still bind w_locals to w_globals
+        // explicitly to match what `createframe` would observe.
         frame.getorcreate_debug_data(-1).w_locals = w_globals;
         frame
     }
@@ -1784,6 +1839,112 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
 }
 
 // Virtualizable configuration is in jit/frame_layout.rs
+
+/// pypy/interpreter/baseobjspace.py:796-798 `createframe`.
+///
+/// ```python
+/// def createframe(self, code, w_globals, outer_func=None):
+///     "Create an empty PyFrame suitable for this code object."
+///     return self.FrameClass(self, code, w_globals, outer_func)
+/// ```
+///
+/// Returns `Box<PyFrame>` matching PyPy's heap-allocated PyFrame (RPython
+/// class instance — `pyframe.py:51 class PyFrame(W_Root)`).  The Box
+/// represents the canonical heap-residency invariant per the PyFrame
+/// Heap-Allocation Epic
+/// (`~/.claude/plans/pyframe-heap-allocation-epic-2026-05-05.md` Slice C.2).
+///
+/// The body inlines `pyframe.py:98-119 PyFrame.__init__` line-by-line:
+/// allocate `locals_cells_stack_w` of size `nlocals + ncellvars + nfreevars
+/// + stacksize`, set `valuestackdepth`, optionally bind debug `w_globals`
+/// when `code.frame_stores_global(w_globals)`, then call
+/// `self.initialize_frame_scopes(outer_func, code)` (`pyframe.py:223`)
+/// which performs cell init, freevar copy from `outer_func.closure`, and
+/// raises on freevar/closure-size mismatch.  No constructor switch — both
+/// branches share the same allocation + scope-init path so the cell/freevar
+/// invariants of `pyframe.py:223-261` hold uniformly.
+///
+/// `outer_func` carries the closure-providing function reference per PyPy
+/// (`function.py:126-127, 208-209, 219-220`).  `None` for module / exec /
+/// REPL frames where freevars must be empty (PyPy raises TypeError
+/// "directly executed code object may not contain free variables" in
+/// `pyframe.py:242-246`).  `Some(func)` for function calls AND class-body
+/// execution (`pypy/module/__builtin__/compiling.py:208`), where the
+/// function's closure tuple seeds the freevar slots via
+/// `function_get_closure`.  Pyre adds `execution_context` and `w_globals`
+/// as explicit parameters because pyre lacks PyPy's `space` implicit
+/// carrier.
+///
+/// **Args binding** (positional argument values into
+/// `locals_cells_stack_w[0..nargs]`) is **caller-side** per PyPy
+/// `pycode.py:241-249 funcrun`: caller invokes
+/// `space.createframe(...) → args.parse_into_scope(...) → frame.init_cells()
+/// → frame.run(...)`.  createframe itself never binds args and never calls
+/// `init_cells()`.
+///
+/// # Safety
+/// `code`, `w_globals`, and `execution_context` must be valid pointers
+/// for the duration the returned `Box<PyFrame>` is alive.  `outer_func`,
+/// when `Some`, must be a valid Function `PyObjectRef`.
+pub fn createframe(
+    code: *const (),
+    w_globals: *mut DictStorage,
+    execution_context: *const PyExecutionContext,
+    outer_func: Option<PyObjectRef>,
+) -> Result<Box<PyFrame>, crate::PyError> {
+    // pyframe.py:98-119 PyFrame.__init__ — line-by-line.
+    //   self.space = space               (pyre: implicit, no field)
+    //   self.pycode = code               (pycode field below)
+    //   if code.frame_stores_global(w_globals):
+    //       self.getorcreatedebug().w_globals = w_globals
+    //   ncellvars = len(code.co_cellvars)
+    //   nfreevars = len(code.co_freevars)
+    //   size = code.co_nlocals + ncellvars + nfreevars + code.co_stacksize
+    //   self.locals_cells_stack_w = [None] * size
+    //   self.valuestackdepth = code.co_nlocals + ncellvars + nfreevars
+    //   ...
+    //   self.initialize_frame_scopes(outer_func, code)
+    let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
+    let code_ref = unsafe { &*raw };
+    let num_locals = code_ref.varnames.len();
+    let ncellvars = code_ref.cellvars.len();
+    let nfreevars = code_ref.freevars.len();
+    let max_stack = code_ref.max_stackdepth as usize;
+    let stores_global =
+        unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+
+    let size = num_locals + ncellvars + nfreevars + max_stack;
+    let mut frame = Box::new(PyFrame {
+        execution_context,
+        pycode: code,
+        locals_cells_stack_w: unsafe { alloc_fixed_array_with_header(size, PY_NULL) },
+        valuestackdepth: num_locals + ncellvars + nfreevars,
+        last_instr: -1,
+        escaped: false,
+        debugdata: std::ptr::null_mut(),
+        lastblock: std::ptr::null_mut(),
+        w_globals,
+        vable_token: 0,
+        frame_finished_execution: false,
+        f_generator_nowref: PY_NULL,
+        w_yielding_from: PY_NULL,
+        f_backref: std::ptr::null_mut(),
+    });
+    if stores_global {
+        frame.getorcreate_debug_data(-1).w_globals = w_globals;
+    }
+    // pyframe.py:119 — final step of __init__.  PY_NULL plays the role of
+    // Python `None` per the existing `initialize_frame_scopes` convention
+    // (pyframe.rs:664).  Top-level module / interactive / expression code
+    // arrives here without CO_NEWLOCALS — RustPython codegen emits empty
+    // flags for the seed CodeInfo (`crates/codegen/src/compile.rs Compiler::new`)
+    // so initialize_frame_scopes selects the `!OPTIMIZED && !NEWLOCALS`
+    // arm and binds `w_locals = w_globals` per pyframe.py:233-235.
+    let outer_ref = outer_func.unwrap_or(PY_NULL);
+    frame.initialize_frame_scopes(outer_ref, code)?;
+
+    Ok(frame)
+}
 
 #[cfg(test)]
 mod tests {

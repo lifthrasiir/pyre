@@ -16,7 +16,6 @@ use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_load, dict_storage_store};
 use pyre_object::*;
 
-use crate::eval::eval_frame_plain;
 use crate::pyframe::PyFrame;
 
 // ── sys.modules cache ────────────────────────────────────────────────
@@ -3938,8 +3937,15 @@ fn exec_code_module(
 ) -> Result<PyObjectRef, crate::PyError> {
     let code_ptr = Box::into_raw(Box::new(code));
     let w_code = crate::w_code_new(code_ptr as *const ());
-    let mut frame = PyFrame::new_with_namespace(w_code as *const (), execution_context, namespace);
-    eval_frame_plain(&mut frame)
+    // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py:31-33
+    // Code.exec_code → space.createframe(...) + frame.run().  Surface
+    // initialize_frame_scopes' freevar/closure mismatch (TypeError /
+    // ValueError per pyframe.py:242-253) as PyError so the importer
+    // reports it instead of panicking.  Route through run() so the
+    // GENERATOR / COROUTINE / ASYNC_GENERATOR dispatch in
+    // pyframe.py:268-273 holds for the import path too.
+    let mut frame = crate::createframe(w_code as *const (), namespace, execution_context, None)?;
+    frame.run()
 }
 
 // ── load_source_module ───────────────────────────────────────────────
@@ -3982,6 +3988,13 @@ fn load_source_module(
     // Set __file__ (PyPy: _prepare_module sets __file__)
     let file_obj = pyre_object::w_str_new(&pathname_str);
     crate::dict_storage_store(&mut namespace, "__file__", file_obj);
+
+    // importing.py:285 sets __cached__ on the module dict before
+    // exec_code_module runs.  Pyre has no .pyc cache today, so the
+    // bytecode-compiled file path is unknown — set to None so that
+    // app-level code that probes `mod.__cached__` sees a defined
+    // attribute matching CPython's "no cache available" sentinel.
+    crate::dict_storage_store(&mut namespace, "__cached__", pyre_object::w_none());
 
     // Set __package__ — PyPy: _prepare_module sets __package__
     // For "a.b.c" → __package__ = "a.b"; for "a" → __package__ = "a"

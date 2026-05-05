@@ -5906,7 +5906,6 @@ mod tests {
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
     use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ConstantData, Instruction};
-    use pyre_interpreter::eval::eval_frame_plain;
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{
         BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, Mode, OpcodeStepExecutor,
@@ -6366,11 +6365,10 @@ mod tests {
     #[test]
     fn test_raise_varargs_rejects_non_exception_types_like_interpreter() {
         let code = compile_exec("x = int\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new_with_context(
-            code,
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
-        eval_frame_plain(&mut frame).expect("module body should execute");
+        let mut frame = pyre_interpreter::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("module body should execute");
         let ty = unsafe {
             (*frame.fget_w_globals())
                 .get("x")
@@ -6411,11 +6409,10 @@ mod tests {
     #[test]
     fn test_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
         let code = compile_exec("x = len\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new_with_context(
-            code,
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
-        eval_frame_plain(&mut frame).expect("module body should execute");
+        let mut frame = pyre_interpreter::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("module body should execute");
         let callable = unsafe {
             (*frame.fget_w_globals())
                 .get("x")
@@ -6435,7 +6432,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
-            concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
         };
 
@@ -6542,11 +6539,10 @@ mod tests {
     #[test]
     fn test_trace_code_step_routes_malformed_raise_through_generic_exception_path() {
         let lookup_code = compile_exec("x = int\n").expect("lookup code should compile");
-        let mut lookup_frame = pyre_interpreter::PyFrame::new_with_context(
-            lookup_code,
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
-        eval_frame_plain(&mut lookup_frame).expect("lookup module should execute");
+        let mut lookup_frame = pyre_interpreter::PyFrame::new(lookup_code);
+        lookup_frame
+            .execute_frame(None, None)
+            .expect("lookup module should execute");
         let int_type = unsafe {
             (*lookup_frame.fget_w_globals())
                 .get("x")
@@ -6591,10 +6587,7 @@ mod tests {
                 .set_jitcodes_from_make_result(vec![std::sync::Arc::new(pyjit)]);
         });
 
-        let mut frame = Box::new(pyre_interpreter::PyFrame::new_with_context(
-            code.clone(),
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        ));
+        let mut frame = pyre_interpreter::PyFrame::new(code.clone());
         frame.fix_array_ptrs();
         frame.push(int_type);
 
@@ -6636,10 +6629,7 @@ mod tests {
     fn test_push_exc_info_and_pop_except_preserve_symbolic_previous_exception() {
         let code = compile_exec("try:\n    raise ValueError\nexcept Exception:\n    pass\n")
             .expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new_with_context(
-            code,
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
+        let mut frame = pyre_interpreter::PyFrame::new(code);
         let prev_exc = pyre_interpreter::PyError::value_error("prev").to_exc_object();
         let caught_exc = pyre_interpreter::PyError::runtime_error("caught").to_exc_object();
 
@@ -6660,7 +6650,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
-            concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
         };
 
@@ -6738,7 +6728,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -6868,7 +6858,7 @@ mod tests {
             })
             .expect("test source should contain function code");
 
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -7045,11 +7035,10 @@ mod tests {
     fn test_load_method_accepts_plain_python_instance_method() {
         let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
             .expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new_with_context(
-            code,
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
-        eval_frame_plain(&mut frame).expect("class body should execute");
+        let mut frame = pyre_interpreter::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("class body should execute");
         let instance = unsafe {
             (*frame.fget_w_globals())
                 .get("c")
@@ -7069,7 +7058,7 @@ mod tests {
             pending_result_type: None,
             pending_inline_frame: None,
             orgpc: 0,
-            concrete_frame_addr: (&mut frame as *mut pyre_interpreter::PyFrame) as usize,
+            concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
         };
 
@@ -7097,7 +7086,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("1 + 2").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         install_test_jitcode(&code, frame.pycode);
@@ -7328,7 +7317,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
         let full_len = frame.locals_w().len();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -7371,7 +7360,7 @@ mod tests {
             })
             .expect("test source should contain function code");
 
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -7473,7 +7462,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
 
         let code = compile_exec("x = 1").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.locals_w_mut()[0] = w_int_new(41);
         frame.fix_array_ptrs();
         let mut ctx = TraceCtx::for_test(1);
@@ -7610,7 +7599,7 @@ mod tests {
             })
             .expect("test bytecode should contain POP_JUMP_IF after COMPARE_OP");
 
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -7698,7 +7687,7 @@ mod tests {
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
         install_test_jitcode(&code, code_ref);
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -7799,7 +7788,7 @@ mod tests {
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();
         install_test_jitcode(&code, code_ref);
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.fix_array_ptrs();
 
         let mut ctx = TraceCtx::for_test(2);
@@ -7975,7 +7964,7 @@ mod tests {
         ensure_test_callbacks();
 
         let raw_code = compile_exec("len(x)").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(raw_code));
+        let mut frame = PyFrame::new(raw_code);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let code_ref = frame.pycode as *const ();
@@ -8198,7 +8187,7 @@ mod tests {
 
         ensure_test_callbacks();
         let code = compile_exec("len(x)").expect("test code should compile");
-        let mut frame = Box::new(PyFrame::new(code));
+        let mut frame = PyFrame::new(code);
         frame.locals_w_mut()[0] = w_int_new(41);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.fix_array_ptrs();

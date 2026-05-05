@@ -40,7 +40,11 @@ pub fn run_python(source: &str) -> String {
     };
 
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
-    let mut frame = pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context);
+    let mut frame =
+        match pyre_interpreter::pyframe::PyFrame::new_with_context(code, execution_context) {
+            Ok(frame) => frame,
+            Err(e) => return format!("Error: {e}"),
+        };
 
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

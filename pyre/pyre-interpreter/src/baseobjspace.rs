@@ -5051,9 +5051,18 @@ pub fn unpackiterable(
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let w_iterator = iter(w_iterable)?;
     if expected_length == -1 {
-        // baseobjspace.py:994 — `self._unpackiterable_unknown_length(w_iterator, w_iterable)`.
-        // Pyre folds the `is_generator` fast-path into the same loop
-        // because `next()` already short-circuits over generator state.
+        // PRE-EXISTING-ADAPTATION: PyPy `baseobjspace.py:988-994` branches on
+        // `is_generator(w_iterator)` and calls `w_iterator.unpack_into(lst_w)`
+        // (`generator.py:322-343`, jitdriver-backed) for generators, then
+        // `_unpackiterable_unknown_length` (`baseobjspace.py:1000-1021`) which
+        // preallocates with `length_hint(w_iterable, 0)` (`:1080-1108`) and
+        // runs the loop under `unpackiterable_driver.jit_merge_point`.
+        // Pyre lacks (a) `len_w` and `get_and_call_function` (length_hint
+        // dependencies), (b) `GeneratorIterator.unpack_into`, (c) the
+        // `unpackiterable_driver` JitDriver wiring.  Functionally correct
+        // (`next()` loop produces the same items) but loses preallocation
+        // and the generator fast-path; convergence requires porting the
+        // three helpers above.
         let mut items = Vec::new();
         loop {
             match next(w_iterator) {

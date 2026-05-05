@@ -189,7 +189,13 @@ fn run_source(source: &str, mode: Mode) {
     // updates the slot.  Mirrors PyPy's `space.threadlocals` always
     // holding the active EC for the current thread.
     call::set_last_exec_ctx(Rc::as_ptr(&execution_context));
-    let mut frame = PyFrame::new_with_context(code, execution_context);
+    let mut frame = match PyFrame::new_with_context(code, execution_context) {
+        Ok(frame) => frame,
+        Err(e) => {
+            pyre_interpreter::eprint_exception(&e, true);
+            std::process::exit(1);
+        }
+    };
 
     // Register __main__ module in sys.modules — PyPy: app_main sets
     // sys.modules['__main__'] before executing user code so that

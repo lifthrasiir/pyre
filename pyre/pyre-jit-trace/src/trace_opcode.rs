@@ -7203,7 +7203,6 @@ impl OpcodeStepExecutor for MIFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_interpreter::eval::eval_frame_plain;
     use std::rc::Rc;
 
     #[cfg(feature = "cranelift")]
@@ -7238,11 +7237,10 @@ mod tests {
     fn normalize_raise_varargs_jit_null_frame_still_publishes_pending_exception() {
         clear_pending_jit_exception();
         let code = pyre_interpreter::compile_exec("x = ValueError\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new_with_context(
-            code,
-            Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
-        eval_frame_plain(&mut frame).expect("module body should execute");
+        let mut frame = pyre_interpreter::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("module body should execute");
         let exc_class = unsafe {
             (*frame.fget_w_globals())
                 .get("x")

@@ -458,7 +458,13 @@ pub fn call_user_function_plain_with_ctx(
     let mut func_frame =
         PyFrame::new_for_call_with_closure(w_code, args, globals, execution_context, closure);
     func_frame.fix_array_ptrs();
-    eval_frame_plain(&mut func_frame)
+    // pyframe.py:268-273 run — wrap as generator/coroutine when the code
+    // carries CO_GENERATOR / CO_COROUTINE / CO_ASYNC_GENERATOR.  The
+    // generator-flag dispatch site for the normal call path lives at
+    // call.rs:1260; this MIFrame Box tracking entry must mirror it so
+    // calls dispatched without a concrete_frame produce the same result
+    // as calls dispatched with one.
+    func_frame.run()
 }
 
 /// Explicit residual-call protocol used by JIT inline framestack concrete
@@ -1277,7 +1283,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     let mut frame =
         PyFrame::new_for_call_with_closure(w_code, &final_args, globals, exec_ctx, closure);
     frame.fix_array_ptrs();
-    match eval_frame_plain(&mut frame) {
+    match frame.execute_frame(None, None) {
         Ok(v) => v,
         Err(e) => {
             set_call_error(e);
@@ -1561,7 +1567,7 @@ fn build_class_inner(
     let mut frame = PyFrame::new_for_call_with_closure(w_code, &[], globals, exec_ctx, closure);
     frame.setdictscope(class_ns_ptr);
 
-    eval_frame_plain(&mut frame)?;
+    frame.execute_frame(None, None)?;
 
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()

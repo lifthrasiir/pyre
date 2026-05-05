@@ -3502,7 +3502,6 @@ pub extern "C" fn bh_set_current_exception(exc: i64) {
 mod tests_bh_normalize_raise {
     use super::*;
     use majit_metainterp::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
-    use pyre_interpreter::eval::eval_frame_plain;
     use pyre_interpreter::{PyErrorKind, compile_exec};
 
     #[test]
@@ -3515,11 +3514,10 @@ mod tests_bh_normalize_raise {
     #[test]
     fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
         let code = compile_exec("x = len\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new_with_context(
-            code,
-            std::rc::Rc::new(pyre_interpreter::PyExecutionContext::default()),
-        );
-        eval_frame_plain(&mut frame).expect("module body should execute");
+        let mut frame = pyre_interpreter::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("module body should execute");
         let callable = unsafe {
             (*frame.fget_w_globals())
                 .get("x")

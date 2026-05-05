@@ -504,7 +504,17 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
 }
 
 /// Execute a frame — pure interpreter, no JIT.
-pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
+///
+/// Crate-private since Slice C.3 (PyFrame Heap-Allocation Epic): canonical
+/// surface is `PyFrame::run` / `PyFrame::execute_frame` (PyPy
+/// `pyframe.py:268 run` / `pyframe.py:331 execute_frame`).  Retained as a
+/// free function because pyre's JIT override mechanism (call.rs
+/// `EVAL_OVERRIDE: OnceLock<EvalFn>` where `EvalFn = fn(&mut PyFrame) ->
+/// PyResult`) requires a `fn` pointer.  Rust methods cannot be cast to
+/// `fn` pointers, so the canonical body stays as a free function and the
+/// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (call.rs:328 etc.)
+/// continues to reference it directly.
+pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     eval_frame_plain_with_operr(frame, None)
 }
 
@@ -512,7 +522,7 @@ pub fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
 /// return_trace/leave wrapping. When `operr` is Some, the generator's
 /// throw() path routes it through handle_operation_error and sets
 /// last_instr = next_instr - 1 before resuming (pyframe.py:273-277).
-pub fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
+pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
     frame.fix_array_ptrs();
     if frame.execution_context.is_null() {
         if let Some(mut err) = operr {
@@ -2604,14 +2614,14 @@ mod tests {
 
     fn run_eval(source: &str) -> PyResult {
         let code = compile_eval(source).expect("compile failed");
-        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
-        eval_frame_plain(&mut frame)
+        let mut frame = PyFrame::new(code);
+        frame.execute_frame(None, None)
     }
 
-    fn run_exec_frame(source: &str) -> (PyResult, PyFrame) {
+    fn run_exec_frame(source: &str) -> (PyResult, Box<PyFrame>) {
         let code = compile_exec(source).expect("compile failed");
-        let mut frame = PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
-        let result = eval_frame_plain(&mut frame);
+        let mut frame = PyFrame::new(code);
+        let result = frame.execute_frame(None, None);
         (result, frame)
     }
 
@@ -2655,14 +2665,15 @@ mod tests {
         let cause = *w_globals.get("cause").expect("missing cause");
 
         let code = compile_exec("raise exc from cause").expect("compile failed");
-        let mut raise_frame =
-            PyFrame::new_with_context(code, Rc::new(PyExecutionContext::default()));
+        let mut raise_frame = PyFrame::new(code);
         unsafe {
             (*raise_frame.fget_w_globals()).insert("exc".to_string(), exc);
             (*raise_frame.fget_w_globals()).insert("cause".to_string(), cause);
         }
 
-        let err = eval_frame_plain(&mut raise_frame).expect_err("raise from should fail");
+        let err = raise_frame
+            .execute_frame(None, None)
+            .expect_err("raise from should fail");
         assert_eq!(err.to_exc_object(), exc);
         assert_eq!(crate::getattr(exc, "__cause__").expect("read cause"), cause);
     }
@@ -2714,7 +2725,7 @@ mod tests {
         let source = "x = 5\ny = x * x";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let x = *(*frame.w_globals).get("x").unwrap();
             let y = *(*frame.w_globals).get("y").unwrap();
@@ -2728,7 +2739,7 @@ mod tests {
         let source = "i = 0\nwhile i < 10:\n    i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             assert_eq!(w_int_get_value(i), 10);
@@ -2763,7 +2774,7 @@ r = acc",
             "expected an instruction with an ExtendedArg prefix"
         );
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let r = *(*frame.w_globals).get("r").unwrap();
             assert_eq!(w_int_get_value(r), 6);
@@ -2778,7 +2789,9 @@ r = acc",
             code.instructions.replace_op(1, Instruction::GetIter);
         }
         let mut frame = PyFrame::new(code);
-        let err = eval_frame_plain(&mut frame).expect_err("expected bytecode corruption");
+        let err = frame
+            .execute_frame(None, None)
+            .expect_err("expected bytecode corruption");
         assert_eq!(err.kind, PyErrorKind::BytecodeCorruption);
         assert_eq!(err.message, "bytecode corruption");
     }
@@ -2905,7 +2918,7 @@ r = acc",
         let source = "s = 0\nfor i in range(10):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 45);
@@ -2917,7 +2930,7 @@ r = acc",
         let source = "s = 0\nfor i in range(3000):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 4_498_500);
@@ -2937,7 +2950,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -2957,7 +2970,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -2978,7 +2991,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -2999,7 +3012,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3018,7 +3031,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3037,7 +3050,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3056,7 +3069,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3075,7 +3088,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3096,7 +3109,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3119,7 +3132,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3142,7 +3155,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3163,7 +3176,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3184,7 +3197,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3207,7 +3220,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3228,7 +3241,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3248,7 +3261,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3268,7 +3281,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3289,7 +3302,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3312,7 +3325,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3333,7 +3346,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3352,7 +3365,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3371,7 +3384,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3394,7 +3407,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3415,7 +3428,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3437,7 +3450,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3458,7 +3471,7 @@ while i < 3000:
     i = i + 1";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let i = *(*frame.w_globals).get("i").unwrap();
             let acc = *(*frame.w_globals).get("acc").unwrap();
@@ -3472,7 +3485,7 @@ while i < 3000:
         let source = "s = 0\nfor i in range(5, 10):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 35);
@@ -3484,7 +3497,7 @@ while i < 3000:
         let source = "s = 0\nfor i in range(0, 10, 2):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let s = *(*frame.w_globals).get("s").unwrap();
             // 0 + 2 + 4 + 6 + 8 = 20
@@ -3497,7 +3510,7 @@ while i < 3000:
         let source = "s = 42\nfor i in range(0):\n    s = 0";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let s = *(*frame.w_globals).get("s").unwrap();
             assert_eq!(w_int_get_value(s), 42);
@@ -3509,7 +3522,7 @@ while i < 3000:
         let source = "s = 0\nfor i in range(5):\n    s = s + i";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let s = *(*frame.w_globals).get("s").unwrap();
             // 0 + 1 + 2 + 3 + 4 = 10
@@ -3524,7 +3537,7 @@ while i < 3000:
         let source = "x = len([1, 2, 3])";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 3);
@@ -3536,7 +3549,7 @@ while i < 3000:
         let source = "x = abs(-5)";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let x = *(*frame.w_globals).get("x").unwrap();
             assert_eq!(w_int_get_value(x), 5);
@@ -3548,7 +3561,7 @@ while i < 3000:
         let source = "a = min(3, 7)\nb = max(3, 7)";
         let code = compile_exec(source).expect("compile failed");
         let mut frame = PyFrame::new(code);
-        let _ = eval_frame_plain(&mut frame);
+        let _ = frame.execute_frame(None, None);
         unsafe {
             let a = *(*frame.w_globals).get("a").unwrap();
             let b = *(*frame.w_globals).get("b").unwrap();

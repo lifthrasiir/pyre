@@ -1925,7 +1925,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
-        return pyre_interpreter::eval::eval_frame_plain(frame);
+        return frame.execute_frame(None, None);
     }
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
@@ -1946,7 +1946,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            return pyre_interpreter::eval::eval_frame_plain(frame);
+            return frame.execute_frame(None, None);
         }
     }
 
@@ -5766,7 +5766,7 @@ mod tests {
         ensure_test_jit_callbacks();
         let module = compile_exec(source).expect("test code should compile");
         let code = function_code_from_module(&module, function_name);
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         init(&mut frame);
         frame.fix_array_ptrs();
 
@@ -5811,7 +5811,7 @@ mod tests {
         ensure_test_jit_callbacks();
         let module = compile_exec(source).expect("test code should compile");
         let code = function_code_from_module(&module, function_name);
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         init(&mut frame);
         frame.fix_array_ptrs();
 
@@ -5890,7 +5890,7 @@ mod tests {
             })
             .expect("test source should contain function code");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
@@ -5991,7 +5991,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
@@ -6079,7 +6079,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
@@ -6184,7 +6184,7 @@ mod tests {
             compile_exec("def f(b):\n    return b\nf(1)\n").expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
@@ -6262,7 +6262,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
@@ -6329,7 +6329,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
@@ -6418,7 +6418,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);
@@ -6563,7 +6563,7 @@ mod tests {
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        let mut frame = Box::new(PyFrame::new(code.clone()));
+        let mut frame = PyFrame::new(code.clone());
         frame.locals_w_mut()[0] = w_list_new(vec![w_int_new(11)]);
         frame.locals_w_mut()[1] = w_int_new(7);
         frame.locals_w_mut()[2] = w_list_new(vec![w_int_new(21)]);

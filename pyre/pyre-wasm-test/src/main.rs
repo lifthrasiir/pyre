@@ -23,11 +23,17 @@ fn run_test(name: &str, source: &str, expected: &str) {
     };
 
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
-    let mut frame = pyframe::PyFrame::new_with_context(code, execution_context);
+    let mut frame = match pyframe::PyFrame::new_with_context(code, execution_context) {
+        Ok(frame) => frame,
+        Err(e) => {
+            eprintln!("[FAIL] {name}: Error: {e}");
+            return;
+        }
+    };
 
-    // Use eval_frame_plain on WASI (no JS runtime for JIT execute).
+    // Use plain interpreter on WASI (no JS runtime for JIT execute).
     // The JIT compile path is tested separately.
-    match eval::eval_frame_plain(&mut frame) {
+    match frame.execute_frame(None, None) {
         Ok(_) => {
             let actual = TEST_OUTPUT.with(|buf| buf.borrow().trim_end().to_string());
             if actual == expected {

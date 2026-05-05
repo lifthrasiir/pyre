@@ -220,11 +220,15 @@ fn shell_exec(
         ShellCompileAction::Execute(code) => {
             let code_ptr = Box::into_raw(Box::new(code));
             let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
-            let mut frame = PyFrame::new_with_namespace(
+            let mut frame = match pyre_interpreter::createframe(
                 w_code as *const (),
-                runtime.ctx_ptr,
                 runtime.namespace,
-            );
+                runtime.ctx_ptr,
+                None,
+            ) {
+                Ok(frame) => frame,
+                Err(err) => return ShellExecResult::RuntimeErr(err),
+            };
             match eval_with_jit(&mut frame) {
                 Ok(result) => {
                     if !result.is_null() && !unsafe { pyre_object::is_none(result) } {

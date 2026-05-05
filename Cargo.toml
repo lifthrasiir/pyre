@@ -51,9 +51,8 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-# RustPython compiler toolchain
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "e79df4a6fb788eb8c0c8ea823621e175396612e5" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "e79df4a6fb788eb8c0c8ea823621e175396612e5" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "02a2b1983990088dd0ae5769cd2940d94db5eb69" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "02a2b1983990088dd0ae5769cd2940d94db5eb69" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
