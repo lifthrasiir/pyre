@@ -1745,7 +1745,12 @@ impl ExportedState {
         }
         // ── virtual_state GcRef fields ──
         // VirtualStateInfo::KnownClass, Virtual{known_class}, Constant(Ref)
-        let dummy_key = OpRef::from_raw(u32::MAX);
+        // The rooted_refs `key` slot here just tags the field origin;
+        // these entries are not keyed back into a typed-OpRef map, so
+        // use the canonical `OpRef::NONE` sentinel rather than a raw
+        // u32::MAX placeholder that would diverge from `OpRef::None`
+        // under variant-aware Eq/Hash.
+        let dummy_key = OpRef::NONE;
         for (i, entry) in self.virtual_state.state.iter().enumerate() {
             match &entry.info {
                 VirtualStateInfo::KnownClass { class_ptr } if !class_ptr.is_null() => {

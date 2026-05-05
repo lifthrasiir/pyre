@@ -5262,7 +5262,7 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         let result_reg = self.rm.force_allocate_reg(
-            dst.unwrap_or(OpRef::from_raw(u32::MAX)),
+            dst.unwrap_or(OpRef::NONE),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -5367,7 +5367,7 @@ impl<'a> RegAlloc<'a> {
         );
         self.possibly_free_var(size_arg, Type::Int);
         let result_reg = self.rm.force_allocate_reg(
-            dst.unwrap_or(OpRef::from_raw(u32::MAX)),
+            dst.unwrap_or(OpRef::NONE),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -5465,7 +5465,7 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         let result_reg = self.rm.force_allocate_reg(
-            dst.unwrap_or(OpRef::from_raw(u32::MAX)),
+            dst.unwrap_or(OpRef::NONE),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
