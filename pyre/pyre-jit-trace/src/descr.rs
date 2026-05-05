@@ -625,8 +625,8 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 /// is not listed there and stays mutable.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::methodobject::{
-        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET,
-        W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
+        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID,
+        W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group(
         W_METHOD_OBJECT_SIZE,

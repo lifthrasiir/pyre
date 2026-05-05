@@ -18811,8 +18811,7 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("expected guard_not_forced(_2) at +1")
-                && msg.contains("SameAsI"),
+            msg.contains("expected guard_not_forced(_2) at +1") && msg.contains("SameAsI"),
             "unexpected error message: {msg}"
         );
     }

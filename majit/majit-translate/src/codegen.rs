@@ -1218,6 +1218,109 @@ fn load_items_block(
     crate::state::opimpl_getfield_gc_r(ctx, obj, items_descr)
 }
 
+#[inline]
+fn list_len_descr_for_strategy(strategy_id: i64) -> majit_ir::DescrRef {
+    match strategy_id {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+fn list_heap_capacity_for_strategy(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    list: majit_ir::OpRef,
+    strategy_id: i64,
+    is_inline: bool,
+) -> majit_ir::OpRef {
+    use majit_ir::OpCode;
+
+    match strategy_id {
+        0 => {
+            let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
+            crate::state::opimpl_arraylen_gc(
+                ctx,
+                items_block,
+                crate::state::pyobject_gcarray_descr(),
+            )
+        }
+        1 | 2 => {
+            let heap_cap_descr = match strategy_id {
+                1 => crate::descr::list_int_items_heap_cap_descr(),
+                2 => crate::descr::list_float_items_heap_cap_descr(),
+                _ => unreachable!(),
+            };
+            let heap_cap = crate::state::opimpl_getfield_gc_i(ctx, list, heap_cap_descr);
+            if is_inline {
+                // Pyre-only typed-list storage adaptation: inline arrays
+                // encode capacity as `heap_cap == 0`; the backing pointer is
+                // the fixed inline buffer. Guard that shape before using the
+                // compile-time inline capacity constant.
+                frame.implement_guard_value(ctx, heap_cap, 0);
+                let inline_cap = match strategy_id {
+                    1 => pyre_object::INT_ARRAY_INLINE_CAP,
+                    2 => pyre_object::FLOAT_ARRAY_INLINE_CAP,
+                    _ => unreachable!(),
+                };
+                ctx.const_int(inline_cap as i64)
+            } else {
+                let zero = ctx.const_int(0);
+                let heap_storage = ctx.record_op(OpCode::IntGt, &[heap_cap, zero]);
+                frame.generate_guard(ctx, OpCode::GuardTrue, &[heap_storage]);
+                heap_cap
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+fn guard_append_without_resize(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    list: majit_ir::OpRef,
+    strategy_id: i64,
+    len: majit_ir::OpRef,
+    is_inline: bool,
+) {
+    use majit_ir::OpCode;
+
+    // RPython `_ll_list_resize_ge` fast case (lltypesystem/rlist.py:285):
+    // append can be inlined only while `len(items) >= length + 1`.
+    // If this guard fails, fall back before any side effect and let the
+    // interpreter/residual call perform the real resize.
+    let capacity = list_heap_capacity_for_strategy(frame, ctx, list, strategy_id, is_inline);
+    let has_room = ctx.record_op(OpCode::IntLt, &[len, capacity]);
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[has_room]);
+}
+
+#[inline]
+fn guard_pop_without_resize_le(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    list: majit_ir::OpRef,
+    strategy_id: i64,
+    new_len: majit_ir::OpRef,
+    is_inline: bool,
+) {
+    use majit_ir::OpCode;
+
+    // RPython `_ll_list_resize_le` fast case (lltypesystem/rlist.py:295):
+    // only inline `pop()` while no shrink/reallocation is needed:
+    //     newsize >= (len(items) >> 1) - 5
+    // The guard is deliberately before item clearing / length update.
+    let capacity = list_heap_capacity_for_strategy(frame, ctx, list, strategy_id, is_inline);
+    let one = ctx.const_int(1);
+    let half = ctx.record_op(OpCode::IntRshift, &[capacity, one]);
+    let five = ctx.const_int(5);
+    let shrink_threshold = ctx.record_op(OpCode::IntSub, &[half, five]);
+    let no_resize = ctx.record_op(OpCode::IntGe, &[new_len, shrink_threshold]);
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[no_resize]);
+}
+
 /// Trace list[int_key] setitem: guard_class → guard_strategy → arraylen →
 /// index computation → items_ptr → raw array setitem.
 ///
@@ -1440,7 +1543,7 @@ pub fn generated_list_append_by_strategy(
     ctx: &mut majit_metainterp::TraceCtx,
     list: majit_ir::OpRef,
     value: majit_ir::OpRef,
-    concrete_len: usize,
+    _concrete_len: usize,
     strategy_id: i64,
     is_inline: bool,
 ) {
@@ -1449,41 +1552,15 @@ pub fn generated_list_append_by_strategy(
     frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, list, strategy_id);
 
-    let len_descr = match strategy_id {
-        0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
-        2 => crate::descr::list_float_items_len_descr(),
-        _ => unreachable!(),
-    };
-
-    // Capacity guard. For Int/Float strategies: if inline storage,
-    // guard heap_cap==0; else guard len==concrete_len. Object
-    // strategy post-L1 has no "inline" option (ItemsBlock is always
-    // heap-allocated per rlist.py:116 `Ptr(GcArray(OBJECTPTR))`), so
-    // the inline branch is skipped.
-    if strategy_id == 0 {
-        let len = crate::state::trace_arraylen_gc(ctx, list, len_descr.clone());
-        frame.implement_guard_value(ctx, len, concrete_len as i64);
-    } else if is_inline {
-        let heap_cap_descr = match strategy_id {
-            1 => crate::descr::list_int_items_heap_cap_descr(),
-            2 => crate::descr::list_float_items_heap_cap_descr(),
-            _ => unreachable!(),
-        };
-        let heap_cap = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[list], heap_cap_descr);
-        frame.implement_guard_value(ctx, heap_cap, 0);
-    } else {
-        let len = crate::state::trace_arraylen_gc(ctx, list, len_descr.clone());
-        frame.implement_guard_value(ctx, len, concrete_len as i64);
-    }
-
-    let index = ctx.const_int(concrete_len as i64);
+    let len_descr = list_len_descr_for_strategy(strategy_id);
+    let len = crate::state::opimpl_getfield_gc_i(ctx, list, len_descr.clone());
+    guard_append_without_resize(frame, ctx, list, strategy_id, len, is_inline);
 
     // Write value: object strategy stores directly, int/float unbox first.
     match strategy_id {
         0 => {
             let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
-            crate::state::trace_items_block_setitem_value(ctx, items_block, index, value);
+            crate::state::trace_items_block_setitem_value(ctx, items_block, len, value);
         }
         1 => {
             let items_ptr = crate::state::opimpl_getfield_gc_i(
@@ -1497,7 +1574,7 @@ pub fn generated_list_append_by_strategy(
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
                 crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
             };
-            crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
+            crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, len, raw);
         }
         2 => {
             let items_ptr = crate::state::opimpl_getfield_gc_i(
@@ -1511,13 +1588,14 @@ pub fn generated_list_append_by_strategy(
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
                 crate::state::trace_unbox_float_with_resume(frame, ctx, value, float_type_addr)
             };
-            crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
+            crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, len, raw);
         }
         _ => unreachable!(),
     }
 
     // Update length: setfield_gc(list, len+1, len_descr).
-    let new_len = ctx.const_int((concrete_len + 1) as i64);
+    let one = ctx.const_int(1);
+    let new_len = ctx.record_op(OpCode::IntAdd, &[len, one]);
     let len_descr_idx = len_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, new_len], len_descr);
     ctx.heap_cache_mut().setfield_cached(list, len_descr_idx, new_len);
@@ -1554,18 +1632,14 @@ pub fn generated_list_pop_by_strategy(
     ctx: &mut majit_metainterp::TraceCtx,
     list: majit_ir::OpRef,
     strategy_id: i64,
+    is_inline: bool,
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
 
     frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, list, strategy_id);
 
-    let len_descr = match strategy_id {
-        0 => crate::descr::list_length_descr(),
-        1 => crate::descr::list_int_items_len_descr(),
-        2 => crate::descr::list_float_items_len_descr(),
-        _ => unreachable!(),
-    };
+    let len_descr = list_len_descr_for_strategy(strategy_id);
     let len_descr_idx = len_descr.index();
 
     let len = crate::state::opimpl_getfield_gc_i(ctx, list, len_descr.clone());
@@ -1585,6 +1659,7 @@ pub fn generated_list_pop_by_strategy(
     // same value — both naming kept for readability.
     let last_index = ctx.record_op(OpCode::IntSub, &[len, one]);
     let new_len = last_index;
+    guard_pop_without_resize_le(frame, ctx, list, strategy_id, new_len, is_inline);
 
     let popped = match strategy_id {
         0 => {

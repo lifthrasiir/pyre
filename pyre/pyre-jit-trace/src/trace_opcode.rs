@@ -4569,8 +4569,9 @@ impl MIFrame {
                     None
                 };
                 if let Some(sid) = strategy_id {
+                    let is_inline = w_list_is_inline_storage(concrete_list);
                     return Ok(self.with_ctx(|this, ctx| {
-                        crate::generated_list_pop_by_strategy(this, ctx, list, sid)
+                        crate::generated_list_pop_by_strategy(this, ctx, list, sid, is_inline)
                     }));
                 }
             }
@@ -4745,10 +4746,11 @@ impl MIFrame {
         if unsafe { is_method(concrete_callable) } {
             let inner_func = unsafe { w_method_get_func(concrete_callable) };
             let inner_self = unsafe { w_method_get_self(concrete_callable) };
-            // `is_builtin_code` gate: a list subclass overriding `append`
-            // or `pop` with a Python `def` would still produce
-            // `is_function(inner_func) == true` and a matching `func_name`,
-            // which would silently rewire the call to builtin list IR.
+            // `is_builtin_code` gate plus canonical-method identity check:
+            // a list subclass overriding `append` or `pop` with a Python
+            // `def` would still produce `is_function(inner_func) == true`
+            // and may reuse the same name, which must not silently rewire
+            // the call to builtin list IR.
             // PyPy's `_Method` dispatch (`baseobjspace.py:1252` →
             // `function.py:566`) just unwraps and calls `w_function`
             // generically, so the user override runs. Restrict the spec
@@ -4764,7 +4766,10 @@ impl MIFrame {
                 }
                 && unsafe { is_list(inner_self) }
             {
-                let func_name = unsafe { pyre_interpreter::function_get_name(inner_func) };
+                let canonical_list_method = |name: &str| {
+                    let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
+                    unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
+                };
                 let recover_self = |this: &mut Self| {
                     this.with_ctx(|this, ctx| {
                         this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
@@ -4781,13 +4786,13 @@ impl MIFrame {
                         )
                     })
                 };
-                if args.len() == 1 && func_name == "append" {
+                if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
                     let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
                     let self_ref = recover_self(self);
                     self.list_append_value(self_ref, args[0], inner_self, c_arg)?;
                     return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
                 }
-                if args.len() == 0 && func_name == "pop" {
+                if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
                     let concrete_len = unsafe { w_list_len(inner_self) };
                     // Empty-list pop raises IndexError; let the generic
                     // dispatcher handle that. Strategy-unknown lists also

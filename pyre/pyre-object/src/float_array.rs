@@ -1,13 +1,13 @@
 use std::ops::{Index, IndexMut};
 
-const INLINE_CAP: usize = 8;
+pub const FLOAT_ARRAY_INLINE_CAP: usize = 8;
 
 #[repr(C)]
 pub struct FloatArray {
     pub ptr: *mut f64,
     len: usize,
     heap_cap: usize,
-    inline_buf: [f64; INLINE_CAP],
+    inline_buf: [f64; FLOAT_ARRAY_INLINE_CAP],
 }
 
 pub const FLOAT_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(FloatArray, ptr);
@@ -17,8 +17,8 @@ pub const FLOAT_ARRAY_HEAP_CAP_OFFSET: usize = std::mem::offset_of!(FloatArray, 
 impl FloatArray {
     pub fn from_vec(mut values: Vec<f64>) -> Self {
         let len = values.len();
-        if len <= INLINE_CAP {
-            let mut inline_buf = [0.0; INLINE_CAP];
+        if len <= FLOAT_ARRAY_INLINE_CAP {
+            let mut inline_buf = [0.0; FLOAT_ARRAY_INLINE_CAP];
             inline_buf[..len].copy_from_slice(&values);
             let mut arr = Self {
                 ptr: std::ptr::null_mut(),
@@ -36,7 +36,7 @@ impl FloatArray {
                 ptr,
                 len,
                 heap_cap: cap,
-                inline_buf: [0.0; INLINE_CAP],
+                inline_buf: [0.0; FLOAT_ARRAY_INLINE_CAP],
             }
         }
     }
@@ -46,7 +46,7 @@ impl FloatArray {
         if self.heap_cap > 0 {
             self.heap_cap
         } else {
-            INLINE_CAP
+            FLOAT_ARRAY_INLINE_CAP
         }
     }
 
@@ -61,7 +61,7 @@ impl FloatArray {
     }
 
     fn grow_to_heap(&mut self, min_cap: usize) {
-        let target_cap = min_cap.max(INLINE_CAP * 2);
+        let target_cap = min_cap.max(FLOAT_ARRAY_INLINE_CAP * 2);
         let mut values = Vec::with_capacity(target_cap);
         values.extend_from_slice(&self.inline_buf[..self.len]);
         self.ptr = values.as_mut_ptr();
