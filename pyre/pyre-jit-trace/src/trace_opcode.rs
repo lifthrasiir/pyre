@@ -6,7 +6,9 @@
 use crate::state::*;
 
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
-use majit_metainterp::{CANNOT_RAISE_EFFECT_INFO, DEFAULT_EFFECT_INFO, TraceAction, TraceCtx};
+use majit_metainterp::{
+    CANNOT_RAISE_NO_HEAP_EFFECT_INFO, DEFAULT_EFFECT_INFO, TraceAction, TraceCtx,
+};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
@@ -6961,7 +6963,7 @@ impl OpcodeStepExecutor for MIFrame {
                 trace_get_current_exception_jit as *const (),
                 &[],
                 &[],
-                CANNOT_RAISE_EFFECT_INFO,
+                CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
             )
         });
         // `trace_set_current_exception_jit` (line 172) is a flat TLS
@@ -6973,7 +6975,7 @@ impl OpcodeStepExecutor for MIFrame {
                 trace_set_current_exception_jit as *const (),
                 &[exc.opref],
                 &[Type::Ref],
-                CANNOT_RAISE_EFFECT_INFO,
+                CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
             );
         });
         let prev_exc = get_current_exception();
@@ -7008,7 +7010,7 @@ impl OpcodeStepExecutor for MIFrame {
                 trace_set_current_exception_jit as *const (),
                 &[prev_exc.opref],
                 &[Type::Ref],
-                CANNOT_RAISE_EFFECT_INFO,
+                CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
             );
         });
         set_current_exception(prev_exc.concrete.to_pyobj());

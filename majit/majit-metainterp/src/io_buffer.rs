@@ -7,7 +7,7 @@ use std::io::{self, Write};
 
 use majit_ir::{OpCode, Type};
 
-use crate::call_descr::{CANNOT_RAISE_EFFECT_INFO, make_call_descr_with_effect};
+use crate::call_descr::{CANNOT_RAISE_NO_HEAP_EFFECT_INFO, make_call_descr_with_effect};
 use crate::trace_ctx::TraceCtx;
 
 // ── Thread-local I/O buffer ──────────────────────────────────────────
@@ -135,6 +135,6 @@ pub fn emit_commit_io(ctx: &mut TraceCtx) {
     // no Python-level dispatch that can raise. `EF_CANNOT_RAISE` lets
     // `do_residual_call` skip the trailing `GUARD_NO_EXCEPTION`
     // (`pyjitpl.py:2111-2115`).
-    let descr = make_call_descr_with_effect(&[], Type::Void, CANNOT_RAISE_EFFECT_INFO);
+    let descr = make_call_descr_with_effect(&[], Type::Void, CANNOT_RAISE_NO_HEAP_EFFECT_INFO);
     ctx.record_op_with_descr(OpCode::CallN, &[func_ref], descr);
 }

@@ -47,9 +47,9 @@ pub mod walkvirtual;
 pub mod warmstate;
 
 pub use call_descr::{
-    CANNOT_RAISE_EFFECT_INFO, DEFAULT_EFFECT_INFO, ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
-    ELIDABLE_EFFECT_INFO, ELIDABLE_OR_MEMERROR_EFFECT_INFO, EffectInfoSlot,
-    LOOPINVARIANT_EFFECT_INFO, effect_info_for_slot, make_call_assembler_descr,
+    CANNOT_RAISE_EFFECT_INFO, CANNOT_RAISE_NO_HEAP_EFFECT_INFO, DEFAULT_EFFECT_INFO,
+    ELIDABLE_CANNOT_RAISE_EFFECT_INFO, ELIDABLE_EFFECT_INFO, ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+    EffectInfoSlot, LOOPINVARIANT_EFFECT_INFO, effect_info_for_slot, make_call_assembler_descr,
     make_call_assembler_descr_by_number, make_call_assembler_descr_with_vable,
     make_call_assembler_descr_with_vable_by_number, make_call_descr,
     make_call_descr_from_target_slot, make_call_descr_with_effect,

@@ -241,6 +241,32 @@ pub const CANNOT_RAISE_EFFECT_INFO: EffectInfo = EffectInfo {
     call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
 };
 
+/// `EF_CANNOT_RAISE` for a callee that the producer statically knows
+/// touches no heap state and cannot trigger GC — typically a flat TLS
+/// read/write or a buffer-flush shim.  `call.py:320-324
+/// effectinfo_from_writeanalyze` would compute empty
+/// `readonly_descrs_*` / `write_descrs_*` bitsets and `can_collect =
+/// False` from `read_analyzer` / `write_analyzer` / `collect_analyzer`
+/// for such helpers.  Using [`CANNOT_RAISE_EFFECT_INFO`] for them is
+/// the analyzer-absent conservative fallback, which over-reports the
+/// callee as a heap mutator and inflates GC map / liveness work; this
+/// constant is the matching analyzer-output for known-flat helpers.
+pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::CannotRaise,
+    oopspecindex: OopSpecIndex::None,
+    readonly_descrs_fields: 0,
+    write_descrs_fields: 0,
+    readonly_descrs_arrays: 0,
+    write_descrs_arrays: 0,
+    readonly_descrs_interiorfields: 0,
+    write_descrs_interiorfields: 0,
+    can_invalidate: false,
+    can_collect: false,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
 /// `EF_ELIDABLE_CANNOT_RAISE` (effectinfo.py:17). Selected by
 /// `call.py:299 getcalldescr` when `_canraise(op) == False` for an
 /// elidable callee — `pyjitpl.py:2126 do_residual_call` records
