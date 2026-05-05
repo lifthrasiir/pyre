@@ -284,11 +284,21 @@ impl OpRef {
 /// `ConstInt.same_constant` (history.py:244) which reject across the
 /// disjoint Const / InputArg / ResOp sub-hierarchies.
 ///
-/// Hand-written rather than `#[derive]` so that `Self::None` collapses
-/// onto a single hash bucket — the variant is a sentinel and its
-/// `raw()` value of `u32::MAX` is encoding-internal, not semantic.
+/// Hand-written rather than `#[derive]` so that any "none" OpRef
+/// (`Self::None` and `Self::Untyped(u32::MAX)` — the legacy sentinel
+/// produced by `OpRef::from_raw(u32::MAX)`) collapses onto a single
+/// equivalence class. RPython has no separate identity for missing
+/// values; pre-Phase-3 raw-only equality also collapsed these. Without
+/// this special case `OpRef::None != OpRef::from_raw(u32::MAX)` would
+/// split the absent-value sentinel into two non-interchangeable keys.
 impl PartialEq for OpRef {
     fn eq(&self, other: &Self) -> bool {
+        if self.is_none() {
+            return other.is_none();
+        }
+        if other.is_none() {
+            return false;
+        }
         std::mem::discriminant(self) == std::mem::discriminant(other) && self.raw() == other.raw()
     }
 }
@@ -297,6 +307,13 @@ impl Eq for OpRef {}
 
 impl std::hash::Hash for OpRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if self.is_none() {
+            // Single bucket for every absent-value representation so
+            // `OpRef::None` and `Untyped(u32::MAX)` hash identically.
+            std::mem::discriminant(&OpRef::None).hash(state);
+            u32::MAX.hash(state);
+            return;
+        }
         std::mem::discriminant(self).hash(state);
         self.raw().hash(state);
     }
@@ -3004,6 +3021,47 @@ mod tests {
     // Resoperation parity tests
     // Ported from rpython/jit/metainterp/test/test_resoperation.py
     // ══════════════════════════════════════════════════════════════════
+
+    // ── OpRef Eq/Hash sentinel coverage ──
+
+    #[test]
+    fn opref_none_collapses_with_untyped_max() {
+        // Pre-Phase-3 raw-only equality treated `OpRef::from_raw(u32::MAX)`
+        // and the explicit `OpRef::None` as the same absent-value
+        // sentinel. RPython has no separate identity for missing
+        // values, so variant-aware Eq/Hash must keep that collapse.
+        let none = OpRef::NONE;
+        let untyped_max = OpRef::from_raw(u32::MAX);
+        assert!(none.is_none());
+        assert!(untyped_max.is_none());
+        assert_eq!(none, untyped_max);
+        assert_eq!(untyped_max, none);
+
+        let mut h1 = std::collections::hash_map::DefaultHasher::new();
+        let mut h2 = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&none, &mut h1);
+        std::hash::Hash::hash(&untyped_max, &mut h2);
+        assert_eq!(
+            std::hash::Hasher::finish(&h1),
+            std::hash::Hasher::finish(&h2)
+        );
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(none);
+        assert!(set.contains(&untyped_max));
+    }
+
+    #[test]
+    fn opref_typed_variants_disjoint_from_none() {
+        // The is_none() short-circuit must not bleed into typed
+        // variants — only `OpRef::None` and `Untyped(u32::MAX)`
+        // collapse onto the absent-value bucket.
+        let none = OpRef::NONE;
+        let typed = OpRef::int_op(0);
+        assert_ne!(none, typed);
+        assert_ne!(typed, none);
+        assert_ne!(OpRef::int_op(0), OpRef::ref_op(0));
+    }
 
     // ── Metadata table coverage ──
 
