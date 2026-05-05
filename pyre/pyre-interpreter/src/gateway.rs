@@ -5,33 +5,276 @@
 
 use pyre_object::pyobject::*;
 
-#[derive(Debug, Clone, Default)]
+/// pypy/interpreter/gateway.py:36-73 `class SignatureBuilder`.
+///
+/// ```python
+/// class SignatureBuilder(object):
+///     def __init__(self, ...):
+///         ...
+///         self.posonlyargcount = 0
+///         self.kwonlystartindex = -1
+///
+///     def append(self, argname):
+///         self.argnames.append(argname)
+///
+///     def marker_posonly(self):
+///         assert self.posonlyargcount == 0
+///         assert self.kwonlystartindex == -1
+///         self.posonlyargcount = len(self.argnames)
+///
+///     def marker_kwonly(self):
+///         assert self.kwonlystartindex == -1
+///         self.kwonlystartindex = len(self.argnames)
+///
+///     def signature(self):
+///         if self.kwonlystartindex == -1:
+///             kwonlyargcount = 0
+///         else:
+///             kwonlyargcount = len(self.argnames) - self.kwonlystartindex
+///         return Signature(self.argnames,
+///                          self.varargname, self.kwargname,
+///                          kwonlyargcount, self.posonlyargcount)
+/// ```
+///
+/// Pyre carries `kwonlystartindex` rather than `kwonlyargcount`
+/// directly so the marker-driven build (`marker_kwonly()` records
+/// where the kw-only tail starts; `signature()` derives the count at
+/// build time) matches PyPy 1:1.  The `-1` sentinel encodes "no
+/// `marker_kwonly` call seen yet".
+#[derive(Debug, Clone)]
 pub struct SignatureBuilder {
     pub name: &'static str,
     pub argnames: Vec<&'static str>,
     pub varargname: Option<&'static str>,
     pub kwargname: Option<&'static str>,
+    pub posonlyargcount: usize,
+    pub kwonlystartindex: isize,
 }
 
-impl SignatureBuilder {
-    pub fn append(&mut self, argname: &'static str) {
-        self.argnames.push(argname);
-    }
-
-    pub fn signature(&self) -> Signature {
-        Signature {
-            argnames: self.argnames.clone(),
-            varargname: self.varargname,
-            kwargname: self.kwargname,
+impl Default for SignatureBuilder {
+    fn default() -> Self {
+        Self {
+            name: "",
+            argnames: Vec::new(),
+            varargname: None,
+            kwargname: None,
+            posonlyargcount: 0,
+            kwonlystartindex: -1,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+impl SignatureBuilder {
+    /// gateway.py:54-55 `append`.
+    pub fn append(&mut self, argname: &'static str) {
+        self.argnames.push(argname);
+    }
+
+    /// gateway.py:57-60 `marker_posonly`.  PyPy asserts the marker is
+    /// emitted at most once and before `marker_kwonly`.
+    pub fn marker_posonly(&mut self) {
+        assert!(self.posonlyargcount == 0);
+        assert!(self.kwonlystartindex == -1);
+        self.posonlyargcount = self.argnames.len();
+    }
+
+    /// gateway.py:62-64 `marker_kwonly`.  PyPy asserts the marker is
+    /// emitted at most once.
+    pub fn marker_kwonly(&mut self) {
+        assert!(self.kwonlystartindex == -1);
+        self.kwonlystartindex = self.argnames.len() as isize;
+    }
+
+    /// gateway.py:66-73 `signature`.  Derives `kwonlyargcount` from
+    /// the argname list length minus the `marker_kwonly` index, or 0
+    /// if the marker never fired.
+    pub fn signature(&self) -> Signature {
+        let kwonlyargcount = if self.kwonlystartindex == -1 {
+            0
+        } else {
+            self.argnames.len() - self.kwonlystartindex as usize
+        };
+        Signature {
+            argnames: self.argnames.clone(),
+            varargname: self.varargname,
+            kwargname: self.kwargname,
+            kwonlyargcount,
+            posonlyargcount: self.posonlyargcount,
+        }
+    }
+}
+
+/// pypy/interpreter/signature.py:3-78 `class Signature`.
+///
+/// ```python
+/// class Signature(object):
+///     _immutable_ = True
+///     _immutable_fields_ = ["argnames[*]"]
+///     __slots__ = ("argnames", "posonlyargcount", "kwonlyargcount",
+///                  "varargname", "kwargname")
+/// ```
+///
+/// `argnames` contains both the positional-only and the positional
+/// arguments; the count of positional-only arguments is
+/// `posonlyargcount`.  Keyword-only argument names live at the tail
+/// of `argnames` and are counted by `kwonlyargcount`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
     pub argnames: Vec<&'static str>,
     pub varargname: Option<&'static str>,
     pub kwargname: Option<&'static str>,
+    pub posonlyargcount: usize,
+    pub kwonlyargcount: usize,
+}
+
+impl Signature {
+    /// pypy/interpreter/signature.py:8-16 `Signature.__init__`.
+    pub fn new(
+        argnames: Vec<&'static str>,
+        varargname: Option<&'static str>,
+        kwargname: Option<&'static str>,
+        kwonlyargcount: usize,
+        posonlyargcount: usize,
+    ) -> Self {
+        Self {
+            argnames,
+            varargname,
+            kwargname,
+            posonlyargcount,
+            kwonlyargcount,
+        }
+    }
+
+    /// pypy/interpreter/signature.py:18-24 `find_argname`:
+    /// ```python
+    /// @jit.elidable
+    /// def find_argname(self, name):
+    ///     try:
+    ///         return self.argnames.index(name)
+    ///     except ValueError:
+    ///         pass
+    ///     return -1
+    /// ```
+    pub fn find_argname(&self, name: &str) -> isize {
+        for (i, arg) in self.argnames.iter().enumerate() {
+            if *arg == name {
+                return i as isize;
+            }
+        }
+        -1
+    }
+
+    /// pypy/interpreter/signature.py:26-31 `find_w_argname`:
+    /// ```python
+    /// @jit.elidable
+    /// def find_w_argname(self, w_name):
+    ///     for i, name in enumerate(self.argnames):
+    ///         if w_name.eq_unwrapped(name):
+    ///             return i
+    ///     return -1
+    /// ```
+    ///
+    /// `w_name.eq_unwrapped(name)` compares the wrapped string with a
+    /// raw `&str`; pyre delegates to `find_argname` after unwrapping the
+    /// PyObject via `w_str_get_value`.  Non-string `w_name` returns `-1`
+    /// (matches PyPy's RPython unwrap-or-fail semantics for strings).
+    pub fn find_w_argname(&self, w_name: PyObjectRef) -> isize {
+        if w_name.is_null() {
+            return -1;
+        }
+        unsafe {
+            if !pyre_object::is_str(w_name) {
+                return -1;
+            }
+            let name = pyre_object::w_str_get_value(w_name);
+            self.find_argname(name)
+        }
+    }
+
+    /// pypy/interpreter/signature.py:33-34 `num_argnames`:
+    /// ```python
+    /// def num_argnames(self):
+    ///     return len(self.argnames) - self.kwonlyargcount
+    /// ```
+    pub fn num_argnames(&self) -> usize {
+        self.argnames.len() - self.kwonlyargcount
+    }
+
+    /// pypy/interpreter/signature.py:36-37 `num_posonlyargnames`:
+    /// ```python
+    /// def num_posonlyargnames(self):
+    ///     return self.posonlyargcount
+    /// ```
+    pub fn num_posonlyargnames(&self) -> usize {
+        self.posonlyargcount
+    }
+
+    /// pypy/interpreter/signature.py:39-40 `num_kwonlyargnames`:
+    /// ```python
+    /// def num_kwonlyargnames(self):
+    ///     return self.kwonlyargcount
+    /// ```
+    pub fn num_kwonlyargnames(&self) -> usize {
+        self.kwonlyargcount
+    }
+
+    /// pypy/interpreter/signature.py:42-43 `has_vararg`:
+    /// ```python
+    /// def has_vararg(self):
+    ///     return self.varargname is not None
+    /// ```
+    pub fn has_vararg(&self) -> bool {
+        self.varargname.is_some()
+    }
+
+    /// pypy/interpreter/signature.py:45-46 `has_kwarg`:
+    /// ```python
+    /// def has_kwarg(self):
+    ///     return self.kwargname is not None
+    /// ```
+    pub fn has_kwarg(&self) -> bool {
+        self.kwargname.is_some()
+    }
+
+    /// pypy/interpreter/signature.py:48-52 `scope_length`:
+    /// ```python
+    /// def scope_length(self):
+    ///     scopelen = len(self.argnames)
+    ///     scopelen += self.has_vararg()
+    ///     scopelen += self.has_kwarg()
+    ///     return scopelen
+    /// ```
+    pub fn scope_length(&self) -> usize {
+        let mut scopelen = self.argnames.len();
+        if self.has_vararg() {
+            scopelen += 1;
+        }
+        if self.has_kwarg() {
+            scopelen += 1;
+        }
+        scopelen
+    }
+
+    /// pypy/interpreter/signature.py:54-60 `getallvarnames`:
+    /// ```python
+    /// def getallvarnames(self):
+    ///     argnames = self.argnames
+    ///     if self.varargname is not None:
+    ///         argnames = argnames + [self.varargname]
+    ///     if self.kwargname is not None:
+    ///         argnames = argnames + [self.kwargname]
+    ///     return argnames
+    /// ```
+    pub fn getallvarnames(&self) -> Vec<&'static str> {
+        let mut argnames = self.argnames.clone();
+        if let Some(name) = self.varargname {
+            argnames.push(name);
+        }
+        if let Some(name) = self.kwargname {
+            argnames.push(name);
+        }
+        argnames
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -386,5 +629,49 @@ mod tests {
             <BuiltinCode as pyre_object::lltype::GcType>::SIZE,
             std::mem::size_of::<BuiltinCode>()
         );
+    }
+
+    /// pypy/interpreter/signature.py:33-46 accessor parity:
+    /// `def f(a, b, /, c, d, *args, e, f, **kwargs): ...`
+    /// → argnames=[a,b,c,d,e,f], varargname=args, kwargname=kwargs,
+    /// posonlyargcount=2, kwonlyargcount=2.
+    #[test]
+    fn signature_accessor_parity() {
+        let sig = Signature::new(
+            vec!["a", "b", "c", "d", "e", "f"],
+            Some("args"),
+            Some("kwargs"),
+            2,
+            2,
+        );
+        // num_argnames = len(argnames) - kwonlyargcount = 6 - 2 = 4
+        assert_eq!(sig.num_argnames(), 4);
+        assert_eq!(sig.num_posonlyargnames(), 2);
+        assert_eq!(sig.num_kwonlyargnames(), 2);
+        assert!(sig.has_vararg());
+        assert!(sig.has_kwarg());
+        // scope_length = len(argnames) + has_vararg + has_kwarg = 6 + 1 + 1 = 8
+        assert_eq!(sig.scope_length(), 8);
+        // find_argname returns -1 for unknown
+        assert_eq!(sig.find_argname("a"), 0);
+        assert_eq!(sig.find_argname("e"), 4);
+        assert_eq!(sig.find_argname("missing"), -1);
+        // getallvarnames appends varargname + kwargname
+        assert_eq!(
+            sig.getallvarnames(),
+            vec!["a", "b", "c", "d", "e", "f", "args", "kwargs"],
+        );
+    }
+
+    /// `def f(a, b): ...` — no *args / **kwargs / kwonly.
+    #[test]
+    fn signature_minimal_no_extras() {
+        let sig = Signature::new(vec!["a", "b"], None, None, 0, 0);
+        assert_eq!(sig.num_argnames(), 2);
+        assert_eq!(sig.num_kwonlyargnames(), 0);
+        assert!(!sig.has_vararg());
+        assert!(!sig.has_kwarg());
+        assert_eq!(sig.scope_length(), 2);
+        assert_eq!(sig.getallvarnames(), vec!["a", "b"]);
     }
 }

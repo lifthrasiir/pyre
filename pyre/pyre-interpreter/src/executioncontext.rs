@@ -1337,8 +1337,8 @@ impl ExecutionContext {
 
 #[derive(Clone)]
 pub struct AbstractActionFlag {
-    _periodic_actions: Vec<*mut PeriodicAsyncAction>,
-    _nonperiodic_actions: Vec<*mut AsyncAction>,
+    _periodic_actions: Vec<*mut dyn AsyncActionOps>,
+    _nonperiodic_actions: Vec<*mut dyn AsyncActionOps>,
     pub(crate) _fired_bitmask: usize,
     has_bytecode_counter: bool,
     pub checkinterval_scaled: usize,
@@ -1361,29 +1361,26 @@ impl AbstractActionFlag {
         }
     }
 
-    pub fn register_periodic_action(
-        &mut self,
-        action: *mut PeriodicAsyncAction,
-        use_bytecode_counter: bool,
-    ) {
-        if use_bytecode_counter {
-            self.has_bytecode_counter = true;
-        }
-        self._periodic_actions.push(action);
-        self._rebuild_action_dispatcher();
-    }
-
-    pub fn register_nonperiodic_action(&mut self, action: *mut AsyncAction) -> isize {
-        self._nonperiodic_actions.push(action);
-        assert!(self._nonperiodic_actions.len() < 32);
-        self._rebuild_action_dispatcher();
-        (self._nonperiodic_actions.len() - 1) as isize
-    }
-
-    pub fn getcheckinterval(&self) -> usize {
-        self.checkinterval_scaled / TICK_COUNTER_STEP
-    }
-
+    /// pypy/interpreter/executioncontext.py:531-556
+    /// `_rebuild_action_dispatcher`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (justified): PyPy rebuilds an inner
+    /// closure on every `register_*_action` call so that
+    /// `periodic_actions = unrolling_iterable(self._periodic_actions)`
+    /// captures the current periodic-action list at codegen time;
+    /// RPython's JIT then unrolls the periodic loop at trace time.
+    /// `unrolling_iterable` is an RPython-only JIT hint with no
+    /// runtime semantic effect — the closure body is identical to a
+    /// straightforward `for action in self._periodic_actions: …`.
+    ///
+    /// Pyre's `action_dispatcher` (`ActionFlagOps` trait default,
+    /// `executioncontext.rs:1537`) iterates `_periodic_actions`
+    /// directly each call.  Rebuilding the closure would produce no
+    /// observable change because (a) majit's loop optimizer subsumes
+    /// the unroll role for hot dispatchers and (b) the periodic list
+    /// is small (typically 1–3 entries — release-the-GIL,
+    /// report-the-signals).  Empty body preserved as the canonical
+    /// "rebuild is a no-op in pyre" marker.
     pub fn _rebuild_action_dispatcher(&mut self) {}
 }
 
@@ -1420,6 +1417,69 @@ pub trait ActionFlagOps {
     /// Composition accessor: shared `AbstractActionFlag` state.
     fn abstract_flag_mut(&mut self) -> &mut AbstractActionFlag;
 
+    /// pypy/interpreter/executioncontext.py:493-510
+    /// `register_periodic_action`.
+    ///
+    /// ```python
+    /// if use_bytecode_counter:
+    ///     self._periodic_actions.append(action)
+    ///     self.has_bytecode_counter = True
+    /// else:
+    ///     self._periodic_actions.insert(0, action)
+    /// self._rebuild_action_dispatcher()
+    /// ```
+    ///
+    /// PyPy comment (line 503-504): "hack to put the release-the-GIL
+    /// one at the end of the list, and the report-the-signals one at
+    /// the start of the list."  When `use_bytecode_counter` is False
+    /// (signal handling), the action is prepended so it runs first.
+    ///
+    /// Lives on the trait (PyPy hangs `register_periodic_action` on
+    /// `AbstractActionFlag` itself, never overridden by `ActionFlag`)
+    /// so `*mut dyn ActionFlagOps` callers — the type pyre uses for
+    /// `space.actionflag` to admit a future `SignalActionFlag`
+    /// analogue — can reach it without downcasting.
+    ///
+    /// PyPy line 502 asserts `isinstance(action, PeriodicAsyncAction)`.
+    /// Pyre enforces the same constraint at compile time by typing the
+    /// argument as `*mut dyn PeriodicAsyncActionOps` — non-periodic
+    /// `AsyncAction` subclasses do not impl that subtrait, so passing
+    /// one is a type error rather than a runtime assert failure.
+    fn register_periodic_action(
+        &mut self,
+        action: *mut dyn PeriodicAsyncActionOps,
+        use_bytecode_counter: bool,
+    ) {
+        // Trait upcast (stable since Rust 1.86) erases the periodic
+        // marker so storage stays as the polymorphic
+        // `*mut dyn AsyncActionOps` that `action_dispatcher` reads.
+        let action_ops: *mut dyn AsyncActionOps = action;
+        let flag = self.abstract_flag_mut();
+        if use_bytecode_counter {
+            flag._periodic_actions.push(action_ops);
+            flag.has_bytecode_counter = true;
+        } else {
+            flag._periodic_actions.insert(0, action_ops);
+        }
+        flag._rebuild_action_dispatcher();
+    }
+
+    /// pypy/interpreter/executioncontext.py:512-517
+    /// `register_nonperiodic_action`.  Trait default for the same
+    /// reason as `register_periodic_action` above.
+    fn register_nonperiodic_action(&mut self, action: *mut dyn AsyncActionOps) -> isize {
+        let flag = self.abstract_flag_mut();
+        flag._nonperiodic_actions.push(action);
+        assert!(flag._nonperiodic_actions.len() < 32);
+        flag._rebuild_action_dispatcher();
+        (flag._nonperiodic_actions.len() - 1) as isize
+    }
+
+    /// pypy/interpreter/executioncontext.py:519-520 `getcheckinterval`.
+    fn getcheckinterval(&self) -> usize {
+        self.abstract_flag().checkinterval_scaled / TICK_COUNTER_STEP
+    }
+
     /// pypy/interpreter/executioncontext.py:482-490 `fire`.
     ///
     /// ```python
@@ -1433,16 +1493,17 @@ pub trait ActionFlagOps {
     ///         # to run at the next possible bytecode
     ///         self.reset_ticker(-1)
     /// ```
-    fn fire(&mut self, action: *mut AsyncAction) {
+    fn fire(&mut self, action: *mut dyn AsyncActionOps) {
         if action.is_null() {
             return;
         }
+        let base = unsafe { (*action).async_action() };
         // executioncontext.py:484 — `assert action._action_index >= 0`.
         debug_assert!(
-            unsafe { (*action)._action_index >= 0 },
+            base._action_index >= 0,
             "periodic actions must not call fire"
         );
-        let bitmask = unsafe { (*action).bitmask };
+        let bitmask = base.bitmask;
         let already_fired = self.abstract_flag()._fired_bitmask & bitmask != 0;
         if !already_fired {
             self.abstract_flag_mut()._fired_bitmask |= bitmask;
@@ -1500,17 +1561,13 @@ pub trait ActionFlagOps {
         // executioncontext.py:539-540 — periodic actions iter.
         // Snapshot pointers before iteration; perform() may register
         // additional actions and mutate `_periodic_actions`.
-        let periodic: Vec<*mut PeriodicAsyncAction> =
-            self.abstract_flag()._periodic_actions.clone();
+        let periodic: Vec<*mut dyn AsyncActionOps> = self.abstract_flag()._periodic_actions.clone();
         for action_ptr in periodic {
-            if action_ptr.is_null() {
-                continue;
-            }
-            if ec.is_null() {
+            if action_ptr.is_null() || ec.is_null() {
                 continue;
             }
             unsafe {
-                (*action_ptr).base.perform(&mut *ec, frame);
+                (*action_ptr).perform(&mut *ec, frame);
             }
         }
         // executioncontext.py:543-556 — nonperiodic bit-mask scan.
@@ -1558,29 +1615,6 @@ impl ActionFlag {
             base: AbstractActionFlag::new(),
             _ticker: 0,
         }
-    }
-
-    /// pypy/interpreter/executioncontext.py:492-510 — composition
-    /// forwarder; the registration logic itself lives on
-    /// `AbstractActionFlag` (PyPy hangs both `register_*_action`
-    /// methods on the abstract base, never overridden by `ActionFlag`).
-    pub fn register_periodic_action(
-        &mut self,
-        action: *mut PeriodicAsyncAction,
-        use_bytecode_counter: bool,
-    ) {
-        self.base
-            .register_periodic_action(action, use_bytecode_counter);
-    }
-
-    /// pypy/interpreter/executioncontext.py:512-517 — composition forwarder.
-    pub fn register_nonperiodic_action(&mut self, action: *mut AsyncAction) -> isize {
-        self.base.register_nonperiodic_action(action)
-    }
-
-    /// pypy/interpreter/executioncontext.py:519-520 — composition forwarder.
-    pub fn getcheckinterval(&self) -> usize {
-        self.base.getcheckinterval()
     }
 
     pub fn perform_frame_action(&mut self, ec: &mut ExecutionContext, frame: *mut PyFrame) {
@@ -1640,20 +1674,31 @@ pub struct AsyncAction {
     /// Set by `AbstractActionFlag::register_nonperiodic_action` and
     /// consumed by `fire` / `action_dispatcher`'s bit test.
     pub bitmask: usize,
-    /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`
-    /// virtual-dispatch slot.  PyPy resolves `action.perform(ec, frame)`
-    /// through Python class lookup; Rust composition cannot reach a
-    /// subclass's `perform` from a base-pointer call, so each concrete
-    /// subclass (UserDelAction, CheckSignalAction, …) plants a thunk
-    /// here at construction time.  `action_dispatcher` calls
-    /// `(action.perform_fn)(action_ptr, ec, frame)`; the thunk knows
-    /// the concrete container and dispatches.  Default thunk
-    /// (`perform_noop`) matches PyPy's `AsyncAction.perform` "To be
-    /// overridden." stub at line 608-609.
-    pub perform_fn: fn(*mut AsyncAction, &mut ExecutionContext, *mut PyFrame),
+    /// pypy/interpreter/executioncontext.py:603-606 `AsyncAction.fire`
+    /// uses `self.space.actionflag` — a constant lookup once the action
+    /// is constructed because PyPy's `space.actionflag` is set once at
+    /// `pypy/interpreter/baseobjspace.py:447` and never replaced.
+    /// Pyre keeps the actionflag on `ExecutionContext` rather than on
+    /// `space`, so we cache the back-reference at registration time
+    /// (`AsyncAction::new` / `UserDelAction::new` /
+    /// `AsyncActionOps::register_periodic_action`).  The pointer is
+    /// stable for the process lifetime because pyrex owns the EC for
+    /// the entire run.  `fire()` dereferences this slot directly,
+    /// matching PyPy's `self.space.actionflag.fire(self)` 1:1 without
+    /// the TLS detour.  `null` means the action has not been registered
+    /// yet — calling `fire` in that state is a programmer error
+    /// (PyPy's docstring at line 605 reads "The action must have been
+    /// registered at space initalization time.").
+    ///
+    /// Stored as `*mut dyn ActionFlagOps` so that `fire()` can dispatch
+    /// through the `ActionFlagOps::fire` trait default (which lives on
+    /// the trait, mirroring PyPy's polymorphic `actionflag.fire` call)
+    /// AND so a future `SignalActionFlag` analogue (PyPy's signal-aware
+    /// `AbstractActionFlag` subclass) can be installed without touching
+    /// `AsyncAction`.  PyPy types `space.actionflag` as the abstract
+    /// base, never as the concrete subclass.
+    pub actionflag: *mut dyn ActionFlagOps,
 }
-
-fn perform_noop(_action: *mut AsyncAction, _ec: &mut ExecutionContext, _frame: *mut PyFrame) {}
 
 impl Default for AsyncAction {
     fn default() -> Self {
@@ -1661,7 +1706,11 @@ impl Default for AsyncAction {
             space: pyre_object::PY_NULL,
             _action_index: -1,
             bitmask: 0,
-            perform_fn: perform_noop,
+            // Fat pointer: null data + ActionFlag vtable.  `fire()` /
+            // `register_periodic_action` tests `is_null()` on the data
+            // pointer before any deref, so the placeholder vtable never
+            // gets reached on an unregistered action.
+            actionflag: std::ptr::null_mut::<ActionFlag>(),
         }
     }
 }
@@ -1683,14 +1732,14 @@ impl AsyncAction {
     /// heap-identity makes `register_nonperiodic_action(self)` safe
     /// in-place.  Caller owns the Box and must keep it alive as long
     /// as the actionflag holds the registered pointer.
-    pub fn new(space: PyObjectRef, actionflag: &mut AbstractActionFlag) -> Box<Self> {
+    pub fn new(space: PyObjectRef, actionflag: &mut (dyn ActionFlagOps + 'static)) -> Box<Self> {
         let mut action = Box::new(Self {
             space,
             _action_index: -1,
             bitmask: 0,
-            perform_fn: perform_noop,
+            actionflag: actionflag as *mut dyn ActionFlagOps,
         });
-        let action_ptr: *mut AsyncAction = &mut *action;
+        let action_ptr: *mut dyn AsyncActionOps = &mut *action;
         let index = actionflag.register_nonperiodic_action(action_ptr);
         action._action_index = index;
         action.bitmask = 1usize << (index as usize);
@@ -1709,21 +1758,136 @@ impl AsyncAction {
             space,
             _action_index: -1,
             bitmask: 0,
-            perform_fn: perform_noop,
+            // PeriodicAsyncAction subclasses receive their actionflag
+            // back-reference at `register_periodic_action` time (the
+            // trait default below) rather than at construction —
+            // pyjitpl-style mirror of PyPy's two-step `__init__` +
+            // `space.actionflag.register_periodic_action(...)` flow.
+            //
+            // Fat null pointer constructed via ActionFlag upcast — see
+            // the `Default` impl above for the same pattern.
+            actionflag: std::ptr::null_mut::<ActionFlag>(),
         }
     }
+}
 
-    pub fn fire(&mut self) -> bool {
-        let _ = self._action_index;
-        true
+/// pypy/interpreter/executioncontext.py:588-609 — `AsyncAction` virtual surface.
+///
+/// PyPy resolves `action.perform(ec, frame)` through Python class
+/// lookup (line 608-609 — base body is "To be overridden.").  Rust
+/// composition cannot virtual-dispatch from a base-struct inherent
+/// method, so this trait carries the virtual `perform` entry plus an
+/// accessor pair (`async_action` / `async_action_mut`) for the shared
+/// `_action_index` / `bitmask` / `space` state held on `AsyncAction`.
+/// Concrete actions impl the trait; the action lists store
+/// `*mut dyn AsyncActionOps` so the dispatcher reaches the override
+/// through the embedded vtable, and `fire` / `action_dispatcher` can
+/// reach the base bitmask through the accessor.
+pub trait AsyncActionOps {
+    /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`:
+    /// `def perform(self, executioncontext, frame): "To be overridden."`
+    fn perform(&mut self, executioncontext: &mut ExecutionContext, frame: *mut PyFrame);
+
+    /// Composition accessor: shared `AsyncAction` state.
+    fn async_action(&self) -> &AsyncAction;
+    /// Composition accessor: shared `AsyncAction` state.
+    fn async_action_mut(&mut self) -> &mut AsyncAction;
+
+    /// pypy/interpreter/executioncontext.py:602-606 `AsyncAction.fire`:
+    ///
+    /// ```python
+    /// @rgc.no_collect
+    /// def fire(self):
+    ///     "Request for the action to be run before the next opcode."
+    ///     self.space.actionflag.fire(self)
+    /// ```
+    ///
+    /// Pyre stores `actionflag` on `ExecutionContext` rather than on
+    /// `space` (PRE-EXISTING-ADAPTATION — pyre's space is an opaque
+    /// `PyObjectRef`).  To keep PyPy's `self.space.actionflag.fire(self)`
+    /// directness, the actionflag back-reference is cached on the base
+    /// `AsyncAction` at registration time (see
+    /// `AsyncAction::new` / `UserDelAction::new` / the trait default
+    /// `register_periodic_action` above).  `fire()` dereferences that
+    /// back-ref unconditionally; the pointer is stable for the process
+    /// lifetime because pyrex owns the EC for the entire run.  The
+    /// `Self: Sized + 'static` bound captures the concrete subclass
+    /// vtable in the `*mut dyn AsyncActionOps` fat pointer so
+    /// `actionflag.fire`'s `(*action).async_action()` reads through the
+    /// override-aware vtable rather than the bare-base one.
+    ///
+    /// PyPy's docstring at line 605 reads "The action must have been
+    /// registered at space initalization time."  Pyre asserts the same:
+    /// `self.actionflag.is_null()` would mean the action skipped both
+    /// `register_nonperiodic_action` and `register_periodic_action`,
+    /// which is a programmer error.
+    fn fire(&mut self)
+    where
+        Self: Sized + 'static,
+    {
+        let actionflag = self.async_action().actionflag;
+        debug_assert!(
+            !actionflag.is_null(),
+            "AsyncAction::fire called before registration (executioncontext.py:605)"
+        );
+        let action_ptr: *mut dyn AsyncActionOps = self;
+        // executioncontext.py:606 — `self.space.actionflag.fire(self)`.
+        // The trait dispatch reaches the `ActionFlagOps::fire` default
+        // body at line 1454 (which encodes executioncontext.py:482-490
+        // `AbstractActionFlag.fire`).
+        unsafe { (*actionflag).fire(action_ptr) };
+    }
+}
+
+/// pypy/interpreter/executioncontext.py:588-609 — bare `AsyncAction`.
+/// Default `perform` is the "To be overridden." no-op; concrete
+/// subclasses override.
+impl AsyncActionOps for AsyncAction {
+    fn perform(&mut self, _executioncontext: &mut ExecutionContext, _frame: *mut PyFrame) {}
+
+    fn async_action(&self) -> &AsyncAction {
+        self
     }
 
-    /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`
-    /// virtual entry.  Routes through `perform_fn` so subclass thunks
-    /// can dispatch into their own bodies (UserDelAction, etc.).
-    pub fn perform(&mut self, executioncontext: &mut ExecutionContext, frame: *mut PyFrame) {
-        let self_ptr: *mut AsyncAction = self;
-        (self.perform_fn)(self_ptr, executioncontext, frame);
+    fn async_action_mut(&mut self) -> &mut AsyncAction {
+        self
+    }
+}
+
+/// pypy/interpreter/executioncontext.py:612-615 `class
+/// PeriodicAsyncAction(AsyncAction)`.  Marker subtrait that narrows
+/// `space.actionflag.register_periodic_action(self, ...)` so only
+/// types descending from `PeriodicAsyncAction` (the trait analogue of
+/// PyPy's class hierarchy) can be registered as periodic.  PyPy
+/// guards the same constraint at runtime with
+/// `assert isinstance(action, PeriodicAsyncAction)` in
+/// `executioncontext.py:502`; pyre lifts the assertion to the type
+/// system.
+pub trait PeriodicAsyncActionOps: AsyncActionOps {
+    /// pypy/interpreter/executioncontext.py:594-600 `else` branch
+    /// helper: subclasses of `PeriodicAsyncAction` call
+    /// `space.actionflag.register_periodic_action(self, ...)` after
+    /// `__init__`.  Lifted into this subtrait so the
+    /// `*mut dyn PeriodicAsyncActionOps` cast captures the concrete
+    /// subclass vtable (which carries the override of `perform`);
+    /// `Self: Sized` keeps trait-object dispatch off this method.
+    fn register_periodic_action(
+        &mut self,
+        actionflag: &mut (dyn ActionFlagOps + 'static),
+        use_bytecode_counter: bool,
+    ) where
+        Self: Sized + 'static,
+    {
+        // executioncontext.py:603-606 — cache the actionflag back-ref
+        // on the base AsyncAction so `fire()` can reach it without a
+        // TLS lookup.  PyPy's `self.space.actionflag` is a constant
+        // lookup once `space.actionflag` is set at
+        // `pypy/interpreter/baseobjspace.py:447` and never replaced;
+        // storing the resolved pointer here is the same caching the
+        // PyPy implementation does implicitly.
+        self.async_action_mut().actionflag = actionflag as *mut dyn ActionFlagOps;
+        let action_ptr: *mut dyn PeriodicAsyncActionOps = self;
+        actionflag.register_periodic_action(action_ptr, use_bytecode_counter);
     }
 }
 
@@ -1739,24 +1903,44 @@ impl PeriodicAsyncAction {
     ///
     /// Returns `Box<Self>` because `register_periodic_action` (called
     /// after construction by the subclass via `register`) takes a
-    /// stable `*mut PeriodicAsyncAction`.
+    /// stable `*mut dyn AsyncActionOps`.
     pub fn new(space: PyObjectRef) -> Box<Self> {
         Box::new(Self {
             base: AsyncAction::new_periodic_base(space),
         })
     }
 
-    /// Wraps the subclass-side
-    /// `space.actionflag.register_periodic_action(self, use_bytecode_counter)`
-    /// call.  PeriodicAsyncAction does not auto-register at
-    /// `__init__` time (executioncontext.py:597-600 sets
-    /// `_action_index = -1` and skips); concrete subclasses
-    /// (CheckSignalAction etc.) call this after construction.
-    pub fn register(&mut self, actionflag: &mut AbstractActionFlag, use_bytecode_counter: bool) {
-        let action_ptr: *mut PeriodicAsyncAction = self;
-        actionflag.register_periodic_action(action_ptr, use_bytecode_counter);
+    // pypy/interpreter/executioncontext.py:594-600 — PeriodicAsyncAction
+    // subclasses call `space.actionflag.register_periodic_action(self,
+    // use_bytecode_counter)` after their own `__init__`.  In pyre this
+    // is the trait default `AsyncActionOps::register_periodic_action`
+    // — it must be reached through the concrete subclass's vtable so
+    // the registered fat pointer's `perform` slot points to the
+    // override, not `PeriodicAsyncAction::perform` (which is a no-op
+    // per `executioncontext.py:612-615`).  Never call
+    // `PeriodicAsyncAction(...).register_periodic_action(...)`
+    // directly without a concrete subclass.
+}
+
+/// pypy/interpreter/executioncontext.py:612-615 — `class
+/// PeriodicAsyncAction(AsyncAction)`: empty body, inherits the
+/// "To be overridden." `perform` from `AsyncAction`.  Concrete
+/// subclasses (CheckSignalAction etc.) override.
+impl AsyncActionOps for PeriodicAsyncAction {
+    fn perform(&mut self, _executioncontext: &mut ExecutionContext, _frame: *mut PyFrame) {}
+
+    fn async_action(&self) -> &AsyncAction {
+        &self.base
+    }
+
+    fn async_action_mut(&mut self) -> &mut AsyncAction {
+        &mut self.base
     }
 }
+
+/// pypy/interpreter/executioncontext.py:612-615 — `PeriodicAsyncAction`
+/// admits `space.actionflag.register_periodic_action(self, ...)`.
+impl PeriodicAsyncActionOps for PeriodicAsyncAction {}
 
 pub struct UserDelAction {
     pub base: AsyncAction,
@@ -1789,50 +1973,30 @@ impl UserDelAction {
     /// `AsyncAction.__init__` (executioncontext.py:594-600) registers
     /// the live instance as a nonperiodic action because UserDelAction
     /// is NOT a PeriodicAsyncAction subclass.  Pyre boxes the
-    /// UserDelAction so `register_nonperiodic_action(&mut self.base)`
-    /// captures a stable pointer; the perform_fn thunk routes the
-    /// dispatcher's eventual `(*ptr).perform(ec, frame)` call back to
+    /// UserDelAction so registration captures a stable
+    /// `*mut dyn AsyncActionOps` whose vtable dispatches into
     /// `UserDelAction::perform` (executioncontext.py:632-633).
-    pub fn new(space: PyObjectRef, actionflag: &mut AbstractActionFlag) -> Box<Self> {
+    pub fn new(space: PyObjectRef, actionflag: &mut (dyn ActionFlagOps + 'static)) -> Box<Self> {
         let mut action = Box::new(Self {
             base: AsyncAction {
                 space,
                 _action_index: -1,
                 bitmask: 0,
-                perform_fn: Self::perform_thunk,
+                // executioncontext.py:603-606 — cache actionflag
+                // back-ref for `fire()` (mirror of PyPy's
+                // `self.space.actionflag` constant lookup).
+                actionflag: actionflag as *mut dyn ActionFlagOps,
             },
             finalizers_lock_count: 0,
             enabled_at_app_level: true,
             pending_with_disabled_del: None,
             finalizer_queue: WRootFinalizerQueue,
         });
-        let base_ptr: *mut AsyncAction = &mut action.base;
-        let index = actionflag.register_nonperiodic_action(base_ptr);
+        let action_ptr: *mut dyn AsyncActionOps = &mut *action;
+        let index = actionflag.register_nonperiodic_action(action_ptr);
         action.base._action_index = index;
         action.base.bitmask = 1usize << (index as usize);
         action
-    }
-
-    /// `AsyncAction.perform_fn` thunk that recovers `*mut UserDelAction`
-    /// from the registered `*mut AsyncAction` (the inner `base` field
-    /// lives at offset 0 by `#[repr(C)]`-equivalent layout: `base` is
-    /// the first field of `UserDelAction`, so a raw cast is sound for
-    /// the base sub-object access pyre uses today).
-    fn perform_thunk(action: *mut AsyncAction, ec: &mut ExecutionContext, frame: *mut PyFrame) {
-        // SAFETY: `action` was registered as `&mut self.base` in `new`,
-        // and `base` is the first field of `UserDelAction`; subtracting
-        // back yields the outer struct.  The pyre invariant: only the
-        // perform_fn thunk planted by the same constructor reads this
-        // pointer back to its concrete container.
-        let user_del = action as *mut UserDelAction;
-        unsafe {
-            (*user_del).perform(ec, frame);
-        }
-    }
-
-    pub fn perform(&mut self, executioncontext: &mut ExecutionContext, frame: *mut PyFrame) {
-        let _ = (executioncontext, frame);
-        self._run_finalizers();
     }
 
     /// `pypy/interpreter/executioncontext.py:636-643`:
@@ -1872,6 +2036,23 @@ impl UserDelAction {
 
     pub fn _call_finalizer(&mut self, _w_obj: PyObjectRef) {
         let _ = _w_obj;
+    }
+}
+
+/// pypy/interpreter/executioncontext.py:618-633 — `class
+/// UserDelAction(AsyncAction)`.  `perform` (line 632-633) calls
+/// `self._run_finalizers()`.
+impl AsyncActionOps for UserDelAction {
+    fn perform(&mut self, _executioncontext: &mut ExecutionContext, _frame: *mut PyFrame) {
+        self._run_finalizers();
+    }
+
+    fn async_action(&self) -> &AsyncAction {
+        &self.base
+    }
+
+    fn async_action_mut(&mut self) -> &mut AsyncAction {
+        &mut self.base
     }
 }
 

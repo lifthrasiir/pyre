@@ -333,6 +333,54 @@ pub unsafe fn function_get_name(obj: PyObjectRef) -> &'static str {
     unsafe { &*(*(obj as *const Function)).name }
 }
 
+/// pypy/interpreter/function.py:53 `self.qualname = qualname or self.name`.
+///
+/// PyPy's `Function` stores `qualname` as a separate field initialised
+/// from the code object's `co_qualname` (see
+/// `function.py:50-54 __init__`).  Pyre's `Function` does not yet
+/// carry that field, so the lookup mirrors the same precedence that
+/// `getattr(func, '__qualname__')` already implements (see
+/// `baseobjspace.rs:3635-3653`):
+///
+/// 1. ATTR_TABLE override (corresponds to PyPy's `set_qualname`
+///    `function.py:473-485`).
+/// 2. The bytecode `code.qualname` (CPython's `co_qualname`).
+/// 3. Fall back to the bare `function.name` — matches the
+///    `qualname or self.name` short-circuit.
+///
+/// PRE-EXISTING-ADAPTATION: storing `qualname` directly on `Function`
+/// requires growing the struct + GC offset table + JIT field offsets.
+/// Until that lands, this accessor is the line-by-line stand-in for
+/// `w_function.qualname`.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
+    unsafe {
+        // function.py:473-485 — explicit `set_qualname(qualname)`
+        // mirrors `obj.__qualname__ = ...` which lands in ATTR_TABLE.
+        if let Some(w_qn) = crate::baseobjspace::ATTR_TABLE.with(|table| {
+            table
+                .borrow()
+                .get(&(obj as usize))
+                .and_then(|d| d.get("__qualname__").copied())
+        }) && pyre_object::is_str(w_qn)
+        {
+            return pyre_object::w_str_get_value(w_qn).to_string();
+        }
+        // function.py:50-54 — `qualname=None` defaults to `co_qualname`.
+        let code = function_get_code(obj) as PyObjectRef;
+        if !code.is_null() && crate::pycode::is_code(code) {
+            let raw_code_ptr = crate::pycode::w_code_get_ptr(code) as *const crate::CodeObject;
+            if !raw_code_ptr.is_null() {
+                return (*raw_code_ptr).qualname.to_string();
+            }
+        }
+        // `qualname or self.name`.
+        function_get_name(obj).to_string()
+    }
+}
+
 #[inline]
 pub unsafe fn _eq(_obj: PyObjectRef, other: PyObjectRef) -> bool {
     _obj == other

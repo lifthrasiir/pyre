@@ -4905,7 +4905,7 @@ pub fn call_args_and_c_profile(
 pub fn call_args_and_c_profile_args(
     frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
-    arguments: &crate::argument::Arguments<'_>,
+    arguments: &crate::argument::Arguments,
     flat_args: &[PyObjectRef],
 ) -> PyObjectRef {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -5019,25 +5019,526 @@ pub fn wrappable_class_name(class: PyObjectRef) -> String {
     }
 }
 
-/// baseobjspace.py:951-989 unpackiterable(w_iterable):
-///   w_iterator = iter(w_iterable)
-///   items = []
-///   while True:
-///       try: w_item = next(w_iterator)
-///       except StopIteration: break
-///       items.append(w_item)
-///   return items
-pub fn unpackiterable(w_iterable: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+/// pypy/interpreter/baseobjspace.py:983-998 `unpackiterable`.
+///
+/// ```python
+/// def unpackiterable(self, w_iterable, expected_length=-1):
+///     """Unpack an iterable into a real (interpreter-level) list.
+///     Raise an OperationError(w_ValueError) if the length is wrong."""
+///     w_iterator = self.iter(w_iterable)
+///     if expected_length == -1:
+///         if self.is_generator(w_iterator):
+///             # special hack for speed
+///             lst_w = []
+///             w_iterator.unpack_into(lst_w)
+///             return lst_w
+///         return self._unpackiterable_unknown_length(w_iterator, w_iterable)
+///     else:
+///         lst_w = self._unpackiterable_known_length(w_iterator,
+///                                                   expected_length)
+///         return lst_w[:]     # make the resulting list resizable
+/// ```
+///
+/// `expected_length = -1` is PyPy's sentinel for "any length".  When
+/// the caller supplies a positive expected_length, the length-validation
+/// arm at `baseobjspace.py:1031-1053
+/// `_unpackiterable_known_length_jitlook` runs and raises ValueError
+/// on mismatch (`too many values to unpack` /
+/// `not enough values to unpack`).
+pub fn unpackiterable(
+    w_iterable: PyObjectRef,
+    expected_length: isize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let w_iterator = iter(w_iterable)?;
-    let mut items = Vec::new();
+    if expected_length == -1 {
+        // baseobjspace.py:994 — `self._unpackiterable_unknown_length(w_iterator, w_iterable)`.
+        // Pyre folds the `is_generator` fast-path into the same loop
+        // because `next()` already short-circuits over generator state.
+        let mut items = Vec::new();
+        loop {
+            match next(w_iterator) {
+                Ok(w_item) => items.push(w_item),
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(items)
+    } else {
+        // baseobjspace.py:996-998 — known-length path with shape validation.
+        _unpackiterable_known_length_jitlook(w_iterator, expected_length as usize)
+    }
+}
+
+/// pypy/interpreter/baseobjspace.py:1031-1053
+/// `_unpackiterable_known_length_jitlook`.
+///
+/// ```python
+/// @jit.unroll_safe
+/// def _unpackiterable_known_length_jitlook(self, w_iterator, expected_length):
+///     items = [None] * expected_length
+///     idx = 0
+///     while True:
+///         try:
+///             w_item = self.next(w_iterator)
+///         except OperationError as e:
+///             if not e.match(self, self.w_StopIteration):
+///                 raise
+///             break
+///         if idx == expected_length:
+///             raise oefmt(self.w_ValueError,
+///                         "too many values to unpack (expected %d)",
+///                         expected_length)
+///         items[idx] = w_item
+///         idx += 1
+///     if idx < expected_length:
+///         raise oefmt(self.w_ValueError,
+///                     "not enough values to unpack (expected %d, got %d)",
+///                     expected_length, idx)
+///     return items
+/// ```
+fn _unpackiterable_known_length_jitlook(
+    w_iterator: PyObjectRef,
+    expected_length: usize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let mut items: Vec<PyObjectRef> = Vec::with_capacity(expected_length);
     loop {
         match next(w_iterator) {
-            Ok(w_item) => items.push(w_item),
+            Ok(w_item) => {
+                if items.len() == expected_length {
+                    return Err(crate::PyError::value_error(format!(
+                        "too many values to unpack (expected {expected_length})",
+                    )));
+                }
+                items.push(w_item);
+            }
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
+    if items.len() < expected_length {
+        return Err(crate::PyError::value_error(format!(
+            "not enough values to unpack (expected {expected_length}, got {got})",
+            got = items.len(),
+        )));
+    }
     Ok(items)
+}
+
+/// pypy/interpreter/baseobjspace.py:1159-1163 base default + the
+/// `StdObjSpace` override at `pypy/objspace/std/objspace.py:609-617`.
+///
+/// ```python
+/// # baseobjspace.py:1159-1163 (base default)
+/// def view_as_kwargs(self, w_dict):
+///     """ if w_dict is a kwargs-dict, return two lists, one of unwrapped
+///     strings and one of wrapped values. otherwise return (None, None)
+///     """
+///     return (None, None)
+///
+/// # objspace.py:609-617 (StdObjSpace override)
+/// def view_as_kwargs(self, w_dict):
+///     # ... it never fails for dict subclasses; this emulates CPython's
+///     # behavior which often won't call custom __iter__() or keys()
+///     # methods in dict subclasses.
+///     if isinstance(w_dict, W_DictObject):
+///         return w_dict.view_as_kwargs()
+///     return (None, None)
+///
+/// # dictmultiobject.py:307-310 (W_DictObject.view_as_kwargs)
+/// def view_as_kwargs(self):
+///     if not self.user_overridden_class:
+///         return self.get_strategy().view_as_kwargs(self)
+///     return None, None
+///
+/// # dictmultiobject.py:1325-1334 (kwargs strategy)
+/// def view_as_kwargs(self, w_dict):
+///     d = self.unerase(w_dict.dstorage)
+///     l = len(d)
+///     keys, values = [None] * l, [None] * l
+///     i = 0
+///     for w_key, val in d.iteritems():
+///         keys[i] = w_key
+///         values[i] = val
+///         i += 1
+///     return keys, values
+/// ```
+///
+/// Pyre's `W_DictObject` does not carry the multi-strategy dispatch
+/// (Object/Bytes/Int/Unicode/Kwargs), so the strategy-level
+/// `view_as_kwargs` is open-coded here: walk the entries vector and
+/// require every key to be a unicode string for the fast path to
+/// apply, otherwise return `(None, None)` so callers fall through to
+/// the slow `keys()` iteration arm at `argument.py:121-150`.
+///
+/// `user_overridden_class` (typeobject.py term for "type is exact
+/// dict, not a subclass") corresponds to pyre's `is_dict(w_dict)` —
+/// pyre dict subclasses live as `W_InstanceObject` with a backing
+/// dict (`typedef.rs:820 dict_descr_new`), so an exact-type check on
+/// the wrapper rules out user subclasses.  Both tuple slots are
+/// `Option` so callers distinguish "no fast path" (None) from "fast
+/// path with zero entries" (Some(empty)).
+pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<Vec<PyObjectRef>>) {
+    if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
+        return (None, None);
+    }
+    // dictmultiobject.py:308 — `if not self.user_overridden_class`.
+    // pyre's `is_dict` already screens out subclass instances (those
+    // are `W_InstanceObject`), so any wrapper that reached this point
+    // is the exact-type case.  The strategy-level fast path (kwargs
+    // strategy at dictmultiobject.py:1325) only succeeds when every
+    // key is a unicode string — the ObjectStrategy and other
+    // non-string strategies return `(None, None)` from their base
+    // implementation.
+    let entries = unsafe { pyre_object::dictobject::w_dict_items(w_dict) };
+    let mut keys: Vec<PyObjectRef> = Vec::with_capacity(entries.len());
+    let mut values: Vec<PyObjectRef> = Vec::with_capacity(entries.len());
+    for (w_key, w_val) in entries {
+        if !unsafe { pyre_object::is_str(w_key) } {
+            return (None, None);
+        }
+        keys.push(w_key);
+        values.push(w_val);
+    }
+    (Some(keys), Some(values))
+}
+
+/// pypy/interpreter/baseobjspace.py:2105-2140 `object_functionstr`.
+///
+/// Full 4-branch port:
+///
+/// ```python
+/// def object_functionstr(self, w_function):
+///     from pypy.interpreter.function import Function, _Method
+///     if isinstance(w_function, Function):
+///         qualname = w_function.qualname
+///         w_module = w_function.fget___module__(self)
+///         if not self.is_w(w_module, self.w_None):
+///             try:
+///                 module = self.text_w(w_module)
+///                 if module and module != 'builtins':
+///                     return module + '.' + qualname + '()'
+///             except OperationError:
+///                 pass
+///         return qualname + '()'
+///     if isinstance(w_function, _Method):
+///         return self.object_functionstr(w_function.w_function)
+///     w_qualname = self.findattr(w_function, self.newtext('__qualname__'))
+///     if w_qualname is not None:
+///         try:
+///             qualname = self.text_w(w_qualname)
+///             w_module = self.findattr(w_function, self.newtext('__module__'))
+///             if w_module is not None and not self.is_w(w_module, self.w_None):
+///                 module = self.text_w(w_module)
+///                 if module and module != 'builtins':
+///                     return module + '.' + qualname + '()'
+///             return qualname + '()'
+///         except OperationError:
+///             pass
+///     try:
+///         return self.text_w(self.str(w_function))
+///     except OperationError:
+///         return self.type(w_function).getname(self) + ' object'
+/// ```
+///
+/// `object_functionstr` uses small private helpers instead of the
+/// public `findattr` / `display::py_str` shortcuts because PyPy's
+/// control flow is intentionally narrow here:
+///
+/// - `findattr` suppresses ordinary `OperationError` and returns
+///   `None`, but **re-raises** SystemExit / KeyboardInterrupt
+///   (`baseobjspace.py:881-884 if e.async(self): raise`).
+/// - the final fallback calls `space.str(w_function)` once, then
+///   `space.text_w(...)`; it does not try `repr()` after a failing or
+///   non-string `__str__`.
+///
+/// The async-propagation contract is preserved: the `__qualname__`
+/// findattr lives outside the inner try, so any async error there
+/// surfaces as `Err(PyError)` to `raise_type_error`, which then
+/// returns the async error in place of the TypeError prefix.  The
+/// `__module__` findattr and the `text_w(...)` calls live inside the
+/// PyPy try/except OperationError block — async OR ordinary errors
+/// there fall through to the `str(w_function)` fallback, matching
+/// PyPy's `except OperationError: pass`.
+///
+/// `function.py:53` initialises `self.qualname = qualname or self.name`,
+/// so `w_function.qualname` returns the dotted form (e.g.
+/// `Class.method`) for nested defs and the bare identifier for free
+/// functions.  Pyre's `Function` does not carry the field directly;
+/// `crate::function::function_get_qualname` reproduces the same
+/// precedence (set-attr override → `code.qualname` → `function.name`).
+pub fn object_functionstr(w_function: PyObjectRef) -> Result<String, crate::PyError> {
+    // baseobjspace.py:2108-2120 — Function fast path (also covers
+    // `FunctionWithFixedCode` and `BuiltinFunction`, both subclasses
+    // of `Function` per function.py:783,786).  Pyre's `is_function`
+    // unifies all three over `FUNCTION_TYPE` + `BUILTIN_FUNCTION_TYPE`.
+    if !w_function.is_null() && unsafe { crate::function::is_function(w_function) } {
+        // function.py:2108 `qualname = w_function.qualname` — match
+        // PyPy's stored `qualname` field via the helper that walks
+        // ATTR_TABLE → `code.qualname` → `name`.
+        let qualname = unsafe { crate::function::function_get_qualname(w_function) };
+        let w_module = unsafe { crate::function::fget___module__(w_function) };
+        if !is_w(w_module, w_none()) && unsafe { pyre_object::is_str(w_module) } {
+            let module = unsafe { pyre_object::w_str_get_value(w_module) };
+            if !module.is_empty() && module != "builtins" {
+                return Ok(format!("{module}.{qualname}()"));
+            }
+        }
+        return Ok(format!("{qualname}()"));
+    }
+    // baseobjspace.py:2121-2122 — `_Method` recursive fast path:
+    // unwrap to `w_function.w_function` and recurse.
+    if !w_function.is_null() && unsafe { pyre_object::methodobject::is_method(w_function) } {
+        let inner = unsafe { pyre_object::methodobject::w_method_get_func(w_function) };
+        return object_functionstr(inner);
+    }
+    // baseobjspace.py:2123 — `w_qualname = self.findattr(...)`.  This
+    // findattr lives **outside** the inner try/except, so an async
+    // exception (SystemExit/KeyboardInterrupt) here is propagated to
+    // the caller via `Err(...)` matching `findattr`'s `e.async(self):
+    // raise` re-raise (`baseobjspace.py:881-884`).
+    let w_qualname_opt = object_functionstr_findattr(w_function, "__qualname__")?;
+    // baseobjspace.py:2125-2135 — `try/except OperationError: pass`.
+    // Every fault inside this block (text_w(qualname), findattr(module),
+    // text_w(module)) must fall through to the `str(w_function)`
+    // fallback rather than propagate.  In particular the second
+    // `findattr(__module__)` is **inside** the try, so async errors
+    // there are also suppressed — matches PyPy literally.
+    'qualname: {
+        let Some(w_qualname) = w_qualname_opt else {
+            break 'qualname;
+        };
+        let Ok(qualname) = object_functionstr_text_w(w_qualname) else {
+            break 'qualname;
+        };
+        let w_module = match object_functionstr_findattr(w_function, "__module__") {
+            Ok(opt) => opt,
+            // try/except OperationError: pass — async findattr suppressed too.
+            Err(_) => break 'qualname,
+        };
+        match w_module {
+            // No `__module__` or `__module__ is None`: bare `qualname()`.
+            None => return Ok(format!("{qualname}()")),
+            Some(w_module) if is_w(w_module, w_none()) => return Ok(format!("{qualname}()")),
+            Some(w_module) => {
+                // text_w(w_module) — non-string raises in PyPy → except →
+                // fall through (do NOT return `qualname()` here, which
+                // would mask the OperationError).
+                let Ok(module) = object_functionstr_text_w(w_module) else {
+                    break 'qualname;
+                };
+                if !module.is_empty() && module != "builtins" {
+                    return Ok(format!("{module}.{qualname}()"));
+                }
+                // module empty or 'builtins': bare qualname().
+                return Ok(format!("{qualname}()"));
+            }
+        }
+    }
+    // baseobjspace.py:2137-2140 — `text_w(str(w_function))` fallback,
+    // else `type(w_function).getname() + ' object'`.  Both calls live
+    // in `try/except OperationError: pass`, so any error (including
+    // async) here is swallowed in PyPy — keep the same shape.  PyPy
+    // calls `space.str(w_function)`, which dispatches to `__str__`
+    // ALONE via `descroperation.str` (it does NOT fall back to
+    // `__repr__` — that would require `space.repr(...)`).  Routing
+    // through `display::py_str` would mask a failing/non-string
+    // `__str__` by calling `__repr__`, producing a different message
+    // than upstream.
+    if let Ok(w_s) = object_functionstr_str(w_function)
+        && unsafe { pyre_object::is_str(w_s) }
+    {
+        return Ok(unsafe { pyre_object::w_str_get_value(w_s).to_string() });
+    }
+    Ok(format!(
+        "{} object",
+        object_functionstr_type_name(w_function)
+    ))
+}
+
+/// `space.str(w_obj)` — `__str__`-only fast path for
+/// `object_functionstr`'s final fallback.
+///
+/// `pypy/objspace/descroperation.py str(self, space, w_obj)` does
+/// `lookup(w_obj, '__str__')` then `space.get_and_call_function(...)`.
+/// `__repr__` is never tried here — that would be `space.repr(...)`.
+/// Returning `Err` for any of: missing `__str__` slot, descriptor
+/// invocation failure, non-string return — caller suppresses to the
+/// `<Type> object` fallback per PyPy's `except OperationError`.
+fn object_functionstr_str(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if w_obj.is_null() {
+        return Err(crate::PyError::type_error("NULL object"));
+    }
+    unsafe {
+        if pyre_object::is_str(w_obj) {
+            return Ok(w_obj);
+        }
+        let Some(w_descr) = lookup(w_obj, "__str__") else {
+            return Err(crate::PyError::type_error(format!(
+                "'{}' object has no __str__",
+                object_functionstr_type_name(w_obj),
+            )));
+        };
+        crate::call::call_function_impl_result(w_descr, &[w_obj])
+    }
+}
+
+/// `object_functionstr`-local version of
+/// `baseobjspace.py:878-885 findattr`.
+///
+/// ```python
+/// def findattr(self, w_object, w_name):
+///     try:
+///         return self.getattr(w_object, w_name)
+///     except OperationError as e:
+///         # a PyPy extension: let SystemExit and KeyboardInterrupt go through
+///         if e.async(self):
+///             raise
+///         return None
+/// ```
+///
+/// `Err(_)` carries the propagated async exception
+/// (`PyErrorKind::SystemExit`, mirroring `OperationError.async`'s
+/// SystemExit/KeyboardInterrupt arm — `error.py:62-65`).  Pyre's
+/// `PyError` does not yet carry a `KeyboardInterrupt` kind; SystemExit
+/// alone covers the propagation contract for the cases pyre raises
+/// today.  Ordinary `OperationError`s (AttributeError, NameError,
+/// TypeError from descriptors) collapse to `Ok(None)`, matching
+/// PyPy's `return None` arm.
+fn object_functionstr_findattr(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    if unsafe { is_none(obj) } {
+        return Ok(None);
+    }
+    match getattr(obj, name) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind == crate::PyErrorKind::SystemExit => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `space.text_w(w_obj)` for the `object_functionstr` try blocks.
+fn object_functionstr_text_w(w_obj: PyObjectRef) -> Result<String, crate::PyError> {
+    unsafe {
+        if pyre_object::is_str(w_obj) {
+            Ok(pyre_object::w_str_get_value(w_obj).to_string())
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "expected str, got {} object",
+                object_functionstr_type_name(w_obj),
+            )))
+        }
+    }
+}
+
+fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
+    unsafe {
+        match crate::typedef::r#type(w_obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => "object".to_string(),
+        }
+    }
+}
+
+/// pypy/objspace/descroperation.py:319-326 `is_iterable`.
+///
+/// ```python
+/// def is_iterable(space, w_obj):
+///     w_descr = space.lookup(w_obj, '__iter__')
+///     if w_descr is None:
+///         if space.type(w_obj).flag_map_or_seq != 'M':
+///             w_descr = space.lookup(w_obj, '__getitem__')
+///         if w_descr is None:
+///             return False
+///     return True
+/// ```
+///
+/// PyPy's `space.lookup` walks the type's MRO without firing
+/// descriptors or `__getattr__`; pyre's `lookup` (`baseobjspace.rs:3945`)
+/// has the same MRO-only semantics.  Using `findattr` here would run
+/// the descriptor protocol and could surface false positives or
+/// side effects in the *args error path, so we route through `lookup`
+/// to match upstream exactly.
+///
+/// `flag_map_or_seq` is read off the resolved `space.type(w_obj)` and
+/// gates the `__getitem__` fallback exactly as PyPy does — when
+/// `'M'` (mapping) the fallback is skipped so a mapping-shaped type
+/// without `__iter__` is reported as not iterable.  Pyre reads the
+/// marker from `W_TypeObject`, the same level where PyPy stores
+/// `flag_map_or_seq`.
+///
+/// Builtin shortcuts list/tuple/str/bytes/dict/set/iter/generator/
+/// itertools mirror `iter()`'s direct-type arms at
+/// `baseobjspace.rs:5158-5208`.
+///
+/// # Safety
+/// Callers may pass any `PyObjectRef`; the function dereferences via
+/// the same checks `iter()` uses (null-check, type-tag check) and
+/// never reads through a dangling pointer beyond what existing pyre
+/// type-tag helpers guarantee.
+pub fn is_iterable(w_obj: PyObjectRef) -> bool {
+    let obj = unwrap_cell(w_obj);
+    if obj.is_null() {
+        return false;
+    }
+    unsafe {
+        if is_list(obj)
+            || is_tuple(obj)
+            || is_str(obj)
+            || pyre_object::bytesobject::is_bytes_like(obj)
+            || is_dict(obj)
+            || pyre_object::is_set_or_frozenset(obj)
+            || is_range_iter(obj)
+            || is_seq_iter(obj)
+            || pyre_object::generatorobject::is_generator(obj)
+            || pyre_object::itertoolsmodule::is_count(obj)
+            || pyre_object::itertoolsmodule::is_repeat(obj)
+        {
+            return true;
+        }
+        // descroperation.py:320 — `space.lookup(w_obj, '__iter__')`.
+        // MRO-only walk; no `__getattr__` / descriptor execution.
+        if lookup(w_obj, "__iter__").is_some() {
+            return true;
+        }
+        // descroperation.py:322-323 — fallback to `__getitem__` only
+        // when `space.type(w_obj).flag_map_or_seq != 'M'` (i.e. the
+        // type is not flagged as a mapping).  Mapping types report
+        // not-iterable when they don't supply `__iter__`.  The flag
+        // lives on `W_TypeObject` (typeobject.py:169) so user-defined
+        // `dict`/`list`/`tuple` subclasses inherit the marker via
+        // `inherit_flag_map_or_seq` at heap-type construction.
+        let w_type = crate::typedef::r#type(w_obj).unwrap_or(std::ptr::null_mut());
+        let is_mapping = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type) == b'M';
+        if !is_mapping && lookup(w_obj, "__getitem__").is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// pypy/interpreter/baseobjspace.py:1110-1116 `fixedview`.
+///
+/// ```python
+/// def fixedview(self, w_iterable, expected_length=-1):
+///     """ A fixed list view of w_iterable. Don't modify the result """
+///     return make_sure_not_resized(self.unpackiterable(w_iterable,
+///                                                      expected_length)[:])
+///
+/// fixedview_unroll = fixedview
+/// ```
+///
+/// Pyre returns a `Vec<PyObjectRef>` directly; the
+/// `make_sure_not_resized` annotation is an RPython JIT hint with no
+/// runtime effect that translates to "treat the result as immutable
+/// at the callsite", which Rust enforces via `&[PyObjectRef]` once
+/// the caller binds the return value.
+pub fn fixedview(
+    w_iterable: PyObjectRef,
+    expected_length: isize,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    unpackiterable(w_iterable, expected_length)
 }
 
 /// `iter(obj)` — PyPy: space.iter(w_obj)
@@ -5099,37 +5600,40 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        // Instance __iter__ — check type MRO and the instance dict
+        // pypy/objspace/descroperation.py:330-346 `def iter(space, w_obj)`
+        // — `space.lookup(w_obj, '__iter__')` is type-MRO-only; PyPy never
+        // consults the instance dict for special-method lookup (CPython
+        // issue 5985 / typeobject `__iter__` slot resolution).  Earlier
+        // pyre revisions also walked `getdict(obj)` and `ATTR_TABLE`,
+        // which surfaced per-instance `__iter__` writes (e.g.
+        // `obj.__iter__ = method`); those paths are non-orthodox in
+        // both CPython and PyPy and have been removed.
         if is_instance(obj) {
-            // Check type MRO first (PyPy: type(obj).__iter__)
             let w_type = w_instance_get_type(obj);
             if let Some(method) = lookup_in_type_where(w_type, "__iter__") {
-                return Ok(crate::call_function(method, &[obj]));
-            }
-            // Per-instance __iter__ in the live W_DictObject backing
-            // store. PyPy looks this up via space.finditem_str on
-            // w_obj.getdict(space) (baseobjspace.py:46-50 getdictvalue).
-            let w_dict = getdict(obj);
-            if !w_dict.is_null() {
-                if let Some(method) = pyre_object::w_dict_getitem_str(w_dict, "__iter__") {
-                    return Ok(crate::call_function(method, &[obj]));
+                // descroperation.py:339-341 — explicit `__iter__ = None`
+                // marks the type as non-iterable even though the lookup
+                // succeeds.
+                if is_none(method) {
+                    return Err(PyError::type_error(format!(
+                        "'{}' object is not iterable",
+                        (*(*obj).ob_type).name
+                    )));
                 }
-            }
-            // Plus legacy ATTR_TABLE entries.
-            let inst_iter = ATTR_TABLE.with(|t| {
-                t.borrow()
-                    .get(&(obj as usize))
-                    .and_then(|d| d.get("__iter__").copied())
-            });
-            if let Some(method) = inst_iter {
                 return Ok(crate::call_function(method, &[obj]));
             }
-            // Fallback: __getitem__ protocol — if object has __getitem__,
-            // iterate by calling __getitem__(0), __getitem__(1), ...
-            // until IndexError is raised. Use __len__ to determine bound.
-            let w_type = w_instance_get_type(obj);
-            if lookup_in_type_where(w_type, "__getitem__").is_some()
-                || getattr(obj, "__getitem__").is_ok()
+            // descroperation.py:333-334 — `__getitem__` fallback only when
+            // `space.type(w_obj).flag_map_or_seq != 'M'`.  Mapping types
+            // without `__iter__` are reported as non-iterable.  Read off
+            // the user `W_TypeObject` (typeobject.py:169) so heap-type
+            // dict/list/tuple subclasses inherit the marker — see
+            // `is_iterable` at baseobjspace.rs:5343 for the same pattern.
+            let w_user_type = crate::typedef::r#type(obj).unwrap_or(std::ptr::null_mut());
+            let is_mapping =
+                pyre_object::typeobject::w_type_get_flag_map_or_seq(w_user_type) == b'M';
+            if !is_mapping
+                && (lookup_in_type_where(w_type, "__getitem__").is_some()
+                    || getattr(obj, "__getitem__").is_ok())
             {
                 // Try to use __len__ to bound the iteration.
                 let mut items = Vec::new();
@@ -5891,6 +6395,131 @@ mod tests {
         let yes = super::issubclass(outer, inner).expect("issubclass should succeed");
         assert!(yes);
     }
+
+    /// pypy/interpreter/baseobjspace.py:983 `unpackiterable` known-length:
+    /// `[1, 2, 3]` with expected_length=3 yields the unpacked items.
+    #[test]
+    fn unpackiterable_known_length_match() {
+        let lst = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let items = unpackiterable(lst, 3).expect("unpack should succeed");
+        assert_eq!(items.len(), 3);
+        unsafe {
+            assert_eq!(w_int_get_value(items[0]), 1);
+            assert_eq!(w_int_get_value(items[1]), 2);
+            assert_eq!(w_int_get_value(items[2]), 3);
+        }
+    }
+
+    /// pypy/interpreter/baseobjspace.py:1049-1052 — `not enough values
+    /// to unpack` ValueError when iterator yields fewer items than
+    /// expected.
+    #[test]
+    fn unpackiterable_too_few() {
+        let lst = w_list_new(vec![w_int_new(1)]);
+        let err = unpackiterable(lst, 3).expect_err("expected ValueError");
+        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        assert!(err.message.contains("not enough values"));
+    }
+
+    /// pypy/interpreter/baseobjspace.py:1043-1046 — `too many values
+    /// to unpack` ValueError when iterator yields more items than
+    /// expected.
+    #[test]
+    fn unpackiterable_too_many() {
+        let lst = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
+        let err = unpackiterable(lst, 3).expect_err("expected ValueError");
+        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
+        assert!(err.message.contains("too many values"));
+    }
+
+    /// pypy/interpreter/baseobjspace.py:983-994 — expected_length=-1
+    /// accepts any length without validation.
+    #[test]
+    fn unpackiterable_unknown_length_accepts_any() {
+        let lst = w_list_new(vec![w_int_new(10), w_int_new(20)]);
+        let items = unpackiterable(lst, -1).expect("unpack should succeed");
+        assert_eq!(items.len(), 2);
+    }
+
+    /// pypy/interpreter/baseobjspace.py:1110-1116 `fixedview` is a
+    /// thin wrapper over `unpackiterable`; verify it dispatches.
+    #[test]
+    fn fixedview_delegates_to_unpackiterable() {
+        let lst = w_list_new(vec![w_int_new(7), w_int_new(8)]);
+        let items = fixedview(lst, 2).expect("fixedview should succeed");
+        assert_eq!(items.len(), 2);
+        unsafe {
+            assert_eq!(w_int_get_value(items[0]), 7);
+            assert_eq!(w_int_get_value(items[1]), 8);
+        }
+    }
+
+    /// pypy/objspace/descroperation.py:319-326 `is_iterable`:
+    /// list / tuple / dict / str return true via builtin shortcuts.
+    #[test]
+    fn is_iterable_true_for_builtin_types() {
+        assert!(is_iterable(w_list_new(vec![])));
+        assert!(is_iterable(pyre_object::w_tuple_new(vec![])));
+        assert!(is_iterable(pyre_object::w_str_new("hello")));
+    }
+
+    /// pypy/objspace/descroperation.py:319-326 `is_iterable`:
+    /// scalar types (int) without `__iter__` / `__getitem__` return false.
+    #[test]
+    fn is_iterable_false_for_scalar() {
+        assert!(!is_iterable(w_int_new(42)));
+        assert!(!is_iterable(w_none()));
+    }
+
+    /// pypy/objspace/std/objspace.py:609-617 + dictmultiobject.py:307
+    /// — exact `dict` with all string keys takes the
+    /// strategy-specific fast path and returns parallel
+    /// `(Some(keys), Some(values))`.  An empty exact dict goes
+    /// through the same path and returns `(Some([]), Some([]))`.
+    #[test]
+    fn view_as_kwargs_empty_dict_returns_some_empty() {
+        let d = pyre_object::dictobject::w_dict_new();
+        let (names, values) = view_as_kwargs(d);
+        assert_eq!(names.as_ref().map(|v| v.len()), Some(0));
+        assert_eq!(values.as_ref().map(|v| v.len()), Some(0));
+    }
+
+    /// pypy/objspace/std/dictmultiobject.py:1325 — kwargs strategy
+    /// only succeeds when every key is a unicode string; the base
+    /// `(None, None)` is returned for non-string keys (e.g. int).
+    #[test]
+    fn view_as_kwargs_int_key_returns_none() {
+        unsafe {
+            let d = pyre_object::dictobject::w_dict_new();
+            pyre_object::dictobject::w_dict_store(d, w_int_new(1), w_int_new(2));
+            let (names, values) = view_as_kwargs(d);
+            assert!(names.is_none());
+            assert!(values.is_none());
+        }
+    }
+
+    /// pypy/objspace/std/objspace.py:615 `isinstance(w_dict,
+    /// W_DictObject)` — non-dict (e.g. `int`) returns the base
+    /// `(None, None)`.
+    #[test]
+    fn view_as_kwargs_non_dict_returns_none() {
+        let (names, values) = view_as_kwargs(w_int_new(42));
+        assert!(names.is_none());
+        assert!(values.is_none());
+    }
+
+    /// pypy/interpreter/baseobjspace.py:2137-2140 `object_functionstr`
+    /// fallback path: scalars without `__qualname__` go through
+    /// `space.str(w_function)`, which dispatches to the type's
+    /// `__str__` slot via `lookup`.  Pyre's `lookup` walks the
+    /// W_TypeObject MRO, which is only populated after
+    /// `init_typeobjects()` runs.
+    #[test]
+    fn object_functionstr_scalar_fallback() {
+        crate::typedef::init_typeobjects();
+        let s = object_functionstr(w_int_new(42)).expect("scalar fallback never propagates async");
+        assert_eq!(s, "42");
+    }
 }
 
 /// `in` operator: check if `needle` is in `haystack`.
@@ -5965,7 +6594,8 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
 }
 
 /// Compare two objects for equality (returns bool, not PyObjectRef).
-fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
+/// baseobjspace.py:823-825 `eq_w`: identity first, then `==` truth.
+pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
     if a == b {
         return true;
     }

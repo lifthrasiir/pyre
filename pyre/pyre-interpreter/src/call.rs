@@ -1774,7 +1774,7 @@ fn collect_slot_names(w_slots: pyre_object::PyObjectRef) -> Result<Vec<String>, 
         let slot_names_w = if pyre_object::is_str(w_slots) {
             vec![w_slots]
         } else {
-            crate::baseobjspace::unpackiterable(w_slots)?
+            crate::baseobjspace::unpackiterable(w_slots, -1)?
         };
         let mut names = Vec::new();
         for w_slot_name in slot_names_w {

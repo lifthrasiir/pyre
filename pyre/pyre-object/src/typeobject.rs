@@ -99,6 +99,17 @@ pub struct W_TypeObject {
     pub hasdict: bool,
     /// typeobject.py:181 `weakrefable` — True when instances support weakrefs.
     pub weakrefable: bool,
+    /// typeobject.py:169 `flag_map_or_seq` (`'?'`, `'M'`, `'S'`).
+    ///
+    /// Default `'?'` per typeobject.py:216.  Inherited from base
+    /// classes during heap-type construction (typeobject.py:1495):
+    /// when self's flag is `'?'` and a base's flag is non-`'?'`, copy.
+    /// Used by `descroperation.py:319-326 is_iterable` and `:330-346
+    /// iter` to skip the `__getitem__` fallback for mapping-typed
+    /// classes.  Stored on `W_TypeObject` (not the low-level
+    /// `PyType`) so user-defined `dict`/`list`/`tuple` subclasses
+    /// inherit the marker the same way PyPy does.
+    pub flag_map_or_seq: std::sync::atomic::AtomicU8,
 }
 
 /// Field offset of `bases` within `W_TypeObject`.
@@ -137,7 +148,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(bases);
 
-    crate::lltype::malloc_typed(W_TypeObject {
+    let w_self = crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
@@ -150,7 +161,64 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-    }) as PyObjectRef
+        // typeobject.py:216 default — inheritance walk below may
+        // overwrite from a non-`?` base.
+        flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
+    }) as PyObjectRef;
+    // typeobject.py:1493-1496 — `for w_base in w_self.bases_w: if
+    // w_self.flag_map_or_seq == '?': w_self.flag_map_or_seq =
+    // w_base.flag_map_or_seq`.  Heap-type construction inherits the
+    // marker from the first non-`?` base so user-defined dict / list
+    // / tuple subclasses see PyPy's `M` / `S` flag.
+    unsafe { inherit_flag_map_or_seq(w_self, bases) };
+    w_self
+}
+
+/// typeobject.py:1493-1496 — copy `flag_map_or_seq` from the first
+/// W_TypeObject base whose flag is non-`?`.  No-op if self's flag is
+/// already non-`?` (explicit value wins) or if no base has a non-`?`
+/// flag.
+unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
+    if w_self.is_null() || bases.is_null() {
+        return;
+    }
+    let self_ref = &*(w_self as *const W_TypeObject);
+    if self_ref
+        .flag_map_or_seq
+        .load(std::sync::atomic::Ordering::Acquire)
+        != b'?'
+    {
+        return;
+    }
+    let n = crate::w_tuple_len(bases);
+    for i in 0..n as i64 {
+        let Some(w_base) = crate::w_tuple_getitem(bases, i) else {
+            continue;
+        };
+        if w_base.is_null() || !is_w_type(w_base) {
+            continue;
+        }
+        let base_ref = &*(w_base as *const W_TypeObject);
+        let base_flag = base_ref
+            .flag_map_or_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        if base_flag != b'?' {
+            self_ref
+                .flag_map_or_seq
+                .store(base_flag, std::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Identity test mirroring `pyre_object::is_type` (the user-facing
+/// helper in `pyobject.rs`).  Inlined here to avoid a circular module
+/// dependency.
+unsafe fn is_w_type(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    std::ptr::eq((*obj).ob_type, &TYPE_TYPE as *const PyType)
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = false`.
@@ -180,7 +248,34 @@ pub fn w_type_new_builtin(
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
+        // typeobject.py:216 default; built-in dict/list/tuple
+        // override via `w_type_set_flag_map_or_seq` at typedef
+        // registration time (see `typedef.rs`).
+        flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
     }) as PyObjectRef
+}
+
+/// typeobject.py:169 — `flag_map_or_seq` accessor on a `W_TypeObject`.
+/// Returns `'?'` if `w_type` is null, not a type object, or never had
+/// the marker assigned.
+pub unsafe fn w_type_get_flag_map_or_seq(w_type: PyObjectRef) -> u8 {
+    if w_type.is_null() || !is_w_type(w_type) {
+        return b'?';
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// typeobject.py:169 — `flag_map_or_seq` setter.  Used by
+/// `init_typeobjects` to mark dict / list / tuple W_TypeObjects at
+/// registration time (objspace.py:104-108).
+pub unsafe fn w_type_set_flag_map_or_seq(w_type: PyObjectRef, flag: u8) {
+    if w_type.is_null() || !is_w_type(w_type) {
+        return;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_map_or_seq
+        .store(flag, std::sync::atomic::Ordering::Release);
 }
 
 // ── Layout accessors ─────────────────────────────────────────────────

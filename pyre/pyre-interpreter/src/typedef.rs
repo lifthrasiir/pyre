@@ -453,6 +453,25 @@ pub fn init_typeobjects() {
             let w_typeobject = w_typeobject_addr as PyObjectRef;
             pyre_object::pyobject::set_instantiate(tp, w_typeobject);
         }
+        // pypy/objspace/std/objspace.py:104-108 — set
+        // `flag_map_or_seq` on W_TypeObject for dict / list / tuple.
+        // PyPy stores this marker on `W_TypeObject` (typeobject.py:169),
+        // not on the low-level OBJECT_VTABLE / PyType.  Heap types copy
+        // it from their bases in `inherit_flag_map_or_seq`, mirroring
+        // typeobject.py:1495.
+        for (pytype, flag) in [
+            (&pyre_object::pyobject::DICT_TYPE, b'M'),
+            (&pyre_object::pyobject::LIST_TYPE, b'S'),
+            (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as *const PyType as usize))
+                .expect("built-in type object must be registered before flag_map_or_seq init")
+                as PyObjectRef;
+            unsafe {
+                pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
+            }
+        }
         // Set w_class on all built-in type objects to `type`.
         // baseobjspace.py:76 getclass() — for type objects, the class
         // is the metatype (default: `type`).
