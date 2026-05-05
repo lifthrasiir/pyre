@@ -3683,12 +3683,14 @@ impl TraceCtx {
     /// call_loopinvariant_known_result` / `call_loopinvariant_now_known`)
     /// stores the *result* op, but `_record_helper_varargs`
     /// (`pyjitpl.py:2655-2663`) returns `None` for void calls — so the
-    /// cached "known result" is `None`, the lookup always misses, and
-    /// every void loop-invariant call re-executes the concrete C
-    /// function.  The previous bool-returning helper short-circuited
-    /// the bh_call_v dispatch on hit, which was a regression vs both
-    /// upstream and main's legacy void path.  Match upstream by
-    /// recording + invalidating only — no cache lookup, no skip.
+    /// cached "known result" lookup at `pyjitpl.py:2088` returns `None`
+    /// and the `if res is not None: return res` early-out always misses.
+    /// `pyjitpl.py:2109` still calls `call_loopinvariant_now_known(allboxes,
+    /// descr, res)` with `res = None`, which evicts whatever prior typed
+    /// result shared the (descr, arg0) slot.  The void-overload
+    /// `call_loopinvariant_now_known_void` (heapcache.rs) stores
+    /// `loopinvariant_result = None` so the next typed lookup correctly
+    /// misses the stale slot.
     pub fn call_loopinvariant_void_typed_with_effect(
         &mut self,
         func_ptr: *const (),
@@ -3700,6 +3702,8 @@ impl TraceCtx {
         let opcode = OpCode::call_loopinvariant_for_type(Type::Void);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, Type::Void, effect_info);
+        let descr_index = descr.index();
+        let arg0_int = func_ptr as usize as i64;
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
         let _ = self
@@ -3715,6 +3719,12 @@ impl TraceCtx {
                 &call_args,
             );
         }
+        // pyjitpl.py:2109 `call_loopinvariant_now_known(allboxes, descr, res)`
+        // with `res = None` for void.  Evicts any prior typed entry sharing
+        // this (descr, arg0) key so subsequent typed loop-invariant lookups
+        // do not return a stale OpRef.
+        self.heap_cache
+            .call_loopinvariant_now_known_void(descr_index, arg0_int);
     }
 
     pub fn call_may_force_int_typed(

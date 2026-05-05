@@ -3883,6 +3883,14 @@ impl<'c> Lowerer<'c> {
                                 3u8 => {
                                     __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
+                                // call.py:299 _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
+                                19u8 => {
+                                    __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
+                                }
+                                // call.py:295 _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
+                                20u8 => {
+                                    __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
+                                }
                                 4u8 => {
                                     let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
                                         unsafe { std::mem::transmute(__inline_builder) };
@@ -3945,6 +3953,14 @@ impl<'c> Lowerer<'c> {
                                 }
                                 3u8 => {
                                     __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
+                                }
+                                // call.py:299 _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
+                                19u8 => {
+                                    __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
+                                }
+                                // call.py:295 _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
+                                20u8 => {
+                                    __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
                                 4u8 => {
                                 let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =

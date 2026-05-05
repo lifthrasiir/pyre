@@ -518,6 +518,17 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
             write_descrs_interiorfields: u64::MAX,
             ..EffectInfo::default()
         },
+        // EF_CANNOT_RAISE — `call.py:303 getcalldescr`'s `else` branch
+        // (non-elidable callee whose `_canraise(op) == False`).
+        // `pyjitpl.py:2111 do_residual_call` reads `exc =
+        // effectinfo.check_can_raise()` (`effectinfo.py:236`,
+        // `extraeffect > EF_CANNOT_RAISE`) which is false for
+        // `extraeffect == 2`, so the canonical walker skips the trailing
+        // `GUARD_NO_EXCEPTION`.  Same `read/write_descrs_*` saturation
+        // as `Plain` — pyre's analyzer port (Task #64) is the upstream
+        // replacement; producers select this flavor today only when the
+        // callee is statically known not to raise.
+        CallFlavor::PlainCannotRaise => majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
         // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `effectinfo.py:23`.
         // `optimize_CALL_MAY_FORCE_*` branch.
         CallFlavor::MayForce => EffectInfo {
@@ -638,6 +649,8 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
         ExtraEffect::ElidableCannotRaise => CallFlavor::PureCannotRaise,
         ExtraEffect::ElidableOrMemoryError => CallFlavor::PureOrMemerror,
         ExtraEffect::ElidableCanRaise => CallFlavor::PureCanRaise,
+        // `call.py:303 getcalldescr`'s non-elidable cannot-raise branch.
+        ExtraEffect::CannotRaise => CallFlavor::PlainCannotRaise,
         _ => CallFlavor::Plain,
     }
 }
@@ -659,10 +672,19 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
 /// would push the wrong path back into the residual_call shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallFlavor {
-    /// Plain residual call with no extra effect
-    /// (`rpython/jit/codewriter/effectinfo.py EF_CANNOT_RAISE` /
-    /// `EF_CAN_RAISE`).
+    /// Plain residual call, conservative `EF_CAN_RAISE` default
+    /// (`rpython/jit/codewriter/effectinfo.py:22`). `call.py:301
+    /// getcalldescr` picks this when the analyzer reports the callee
+    /// can raise but is not elidable / loop-invariant / forces.
     Plain,
+    /// `EF_CANNOT_RAISE` (`effectinfo.py:19`). `call.py:303 getcalldescr`
+    /// picks this on the non-elidable `else` branch when
+    /// `_canraise(op) == False` — `pyjitpl.py:2111 do_residual_call`
+    /// then drops the trailing `GUARD_NO_EXCEPTION`. pyre's analyzer
+    /// port (Task #64) is the upstream replacement; producers select
+    /// this flavor today only when the callee is statically known not
+    /// to raise.
+    PlainCannotRaise,
     /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`. The builder emits
     /// `call_may_force_*` so the metainterp forces virtualizable state
     /// before the call. Maps to `JitCodeBuilder::call_may_force_*_typed`.
@@ -1960,6 +1982,44 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 mod tests {
     use super::*;
     use crate::jit::flow::{FlowListOfKind, VariableId};
+
+    #[test]
+    fn call_flavor_round_trip_through_effect_info() {
+        // call.py:282-303 maps each ExtraEffect to one CallFlavor; the
+        // round-trip property is `dispatch_kind_for_effect_info(
+        // effect_info_for_call_flavor(f)) == f` for every flavor.
+        for flavor in [
+            CallFlavor::Plain,
+            CallFlavor::PlainCannotRaise,
+            CallFlavor::MayForce,
+            CallFlavor::LoopInvariant,
+            CallFlavor::ReleaseGil,
+            CallFlavor::PureCannotRaise,
+            CallFlavor::PureOrMemerror,
+            CallFlavor::PureCanRaise,
+        ] {
+            let ei = effect_info_for_call_flavor(flavor);
+            assert_eq!(
+                dispatch_kind_for_effect_info(&ei),
+                flavor,
+                "round-trip mismatch for {flavor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_cannot_raise_skips_check_can_raise() {
+        // effectinfo.py:236 `check_can_raise(self, ignore_memoryerror=False)`:
+        //   `return self.extraeffect > self.EF_CANNOT_RAISE`
+        // EF_CANNOT_RAISE == 2, so plain cannot-raise must read False —
+        // the canonical walker uses this to drop GUARD_NO_EXCEPTION
+        // (`pyjitpl.py:2111-2115 do_residual_call`).
+        let ei = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+        assert!(!ei.check_can_raise(false));
+        // Plain (EF_CAN_RAISE) keeps the guard.
+        let ei_plain = effect_info_for_call_flavor(CallFlavor::Plain);
+        assert!(ei_plain.check_can_raise(false));
+    }
 
     #[test]
     fn register_repr_matches_rpython() {

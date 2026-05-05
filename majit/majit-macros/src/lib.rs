@@ -333,6 +333,14 @@ fn helper_policy_tokens_for_fn(
             "elidable" => quote! {
                 (3u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
+            // call.py:299 elidable && _canraise(op) == False — EF_ELIDABLE_CANNOT_RAISE.
+            "elidable_cannot_raise" => quote! {
+                (19u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            // call.py:295 elidable && _canraise(op) == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
+            "elidable_or_memerror" => quote! {
+                (20u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
             "dont_look_inside" => quote! {
                 (2u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
@@ -352,7 +360,12 @@ fn helper_policy_tokens_for_fn(
             // Our infer path cannot recover a static ref-return BindingKind,
             // so keep the call targets for explicit wrapped policies but do
             // not advertise a value-call policy code here.
-            "elidable" | "dont_look_inside" | "jit_may_force" | "jit_release_gil"
+            "elidable"
+            | "elidable_cannot_raise"
+            | "elidable_or_memerror"
+            | "dont_look_inside"
+            | "jit_may_force"
+            | "jit_release_gil"
             | "jit_loop_invariant" => quote! {
                 (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
@@ -362,7 +375,12 @@ fn helper_policy_tokens_for_fn(
             // Same restriction as ref-return helpers: explicit wrapped float
             // policies consume these targets directly, but inferred value-call
             // lowering cannot model the static float result bank.
-            "elidable" | "dont_look_inside" | "jit_may_force" | "jit_release_gil"
+            "elidable"
+            | "elidable_cannot_raise"
+            | "elidable_or_memerror"
+            | "dont_look_inside"
+            | "jit_may_force"
+            | "jit_release_gil"
             | "jit_loop_invariant" => quote! {
                 (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
@@ -634,8 +652,41 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// The JIT can eliminate calls to this function when all arguments are constants.
 /// Adds `#[inline(never)]` to prevent inlining, and a hidden `#[majit_elidable]`
 /// marker attribute that the tracer can detect at compile time.
+///
+/// `#[elidable]` is the conservative `EF_ELIDABLE_CAN_RAISE` form
+/// (`rpython/jit/codewriter/effectinfo.py:21`), matching `call.py:297
+/// getcalldescr` where `_canraise(op) == True`.  Use
+/// `#[elidable_cannot_raise]` / `#[elidable_or_memerror]` for the
+/// other two branches of `call.py:292-299`'s 3-way pick.
 #[proc_macro_attribute]
 pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_elidable_attribute(item, "elidable")
+}
+
+/// `#[elidable_cannot_raise]` — `call.py:299 getcalldescr`'s
+/// `else` branch (`_canraise(op) == False`).  Maps to
+/// `EF_ELIDABLE_CANNOT_RAISE` (`effectinfo.py:17`).  The canonical
+/// walker (`pyjitpl.py:2126 do_residual_call`) records `CALL_PURE_*`
+/// without the trailing `GUARD_NO_EXCEPTION` because
+/// `effectinfo.check_can_raise(False)` (`effectinfo.py:236`) is false
+/// for `extraeffect == 0`.
+#[proc_macro_attribute]
+pub fn elidable_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_elidable_attribute(item, "elidable_cannot_raise")
+}
+
+/// `#[elidable_or_memerror]` — `call.py:295 getcalldescr`'s
+/// `cr == "mem"` branch.  Maps to `EF_ELIDABLE_OR_MEMORYERROR`
+/// (`effectinfo.py:20`).  Same dispatch as `#[elidable]` (the
+/// trailing `GUARD_NO_EXCEPTION` is recorded — `check_can_raise(False)`
+/// is true for `extraeffect == 3`) but distinguishes memory-only
+/// failure modes for the optimizer.
+#[proc_macro_attribute]
+pub fn elidable_or_memerror(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_elidable_attribute(item, "elidable_or_memerror")
+}
+
+fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
     let attrs = &func.attrs;
     let vis = &func.vis;
@@ -654,7 +705,7 @@ pub fn elidable(_attr: TokenStream, item: TokenStream) -> TokenStream {
         &policy_path,
         match helper_policy_tokens_for_fn(
             &func,
-            "elidable",
+            attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
         ) {

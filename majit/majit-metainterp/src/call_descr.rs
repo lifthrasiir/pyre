@@ -206,6 +206,34 @@ pub const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
     call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
 };
 
+/// `EF_CANNOT_RAISE` (effectinfo.py:19). Selected by `call.py:303
+/// getcalldescr`'s `else` branch (non-elidable callee whose
+/// `_canraise(op) == False`).  `pyjitpl.py:2111-2115 do_residual_call`
+/// reads `exc = effectinfo.check_can_raise()` (effectinfo.py:236) which
+/// is false for `extraeffect == 2`, so the canonical walker omits the
+/// trailing `GUARD_NO_EXCEPTION`.
+///
+/// Same `read/write_descrs_*` saturation as [`DEFAULT_EFFECT_INFO`] —
+/// pyre's analyzer port (Task #64) is the upstream replacement; in the
+/// meantime the conservative full-bitset preserves `force_from_effectinfo`'s
+/// per-cached-descr flush behaviour for callees that mutate heap state
+/// but never raise.
+pub const CANNOT_RAISE_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::CannotRaise,
+    oopspecindex: OopSpecIndex::None,
+    readonly_descrs_fields: u64::MAX,
+    write_descrs_fields: u64::MAX,
+    readonly_descrs_arrays: u64::MAX,
+    write_descrs_arrays: u64::MAX,
+    readonly_descrs_interiorfields: u64::MAX,
+    write_descrs_interiorfields: u64::MAX,
+    can_invalidate: false,
+    can_collect: true,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
 /// `EF_ELIDABLE_CANNOT_RAISE` (effectinfo.py:17). Selected by
 /// `call.py:299 getcalldescr` when `_canraise(op) == False` for an
 /// elidable callee — `pyjitpl.py:2126 do_residual_call` records

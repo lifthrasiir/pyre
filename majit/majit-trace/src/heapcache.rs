@@ -1701,6 +1701,20 @@ impl HeapCache {
         self.loopinvariant_resvalue = Some(resvalue);
     }
 
+    /// Void overload of `call_loopinvariant_now_known` — `pyjitpl.py:2109`
+    /// invokes `heapcache.call_loopinvariant_now_known(allboxes, descr, res)`
+    /// for `tp == 'v'` with `res = None` (`_record_helper_varargs` returns
+    /// None for void).  Upstream stores `res = None` in the slot, evicting
+    /// any prior typed result that shared the (descr, arg0) key.  The Rust
+    /// split between symbolic `OpRef` and concrete `i64` requires a separate
+    /// entry point; semantics match the upstream `res = None` store.
+    pub fn call_loopinvariant_now_known_void(&mut self, descr_index: u32, arg0_int: i64) {
+        self.loopinvariant_descr = Some(descr_index);
+        self.loopinvariant_arg0 = Some(arg0_int);
+        self.loopinvariant_result = None;
+        self.loopinvariant_resvalue = None;
+    }
+
     /// Internal alias retained for older callsites.
     pub fn call_loopinvariant_cache(
         &mut self,
@@ -2110,5 +2124,32 @@ mod tests {
         // GUARD_NONNULL makes nullity known
         cache.notify_op(OpCode::GuardNonnull, &[obj], OpRef::NONE);
         assert_eq!(cache.is_nullity_known(obj, |_| None), Some(true));
+    }
+
+    #[test]
+    fn test_loopinvariant_void_evicts_typed_slot() {
+        let mut cache = HeapCache::new();
+        let descr_index: u32 = 7;
+        let arg0_int: i64 = 0xC0FFEE;
+
+        // Prime with a typed entry — pyjitpl.py:2087-2110 tp == 'i' branch.
+        let typed_result = OpRef::ref_op(42);
+        cache.call_loopinvariant_now_known(descr_index, arg0_int, typed_result, 99);
+        assert_eq!(
+            cache.call_loopinvariant_known_result(descr_index, arg0_int),
+            Some((typed_result, 99))
+        );
+
+        // pyjitpl.py:2103-2109 tp == 'v' branch: res = None,
+        // call_loopinvariant_now_known(allboxes, descr, None).
+        cache.call_loopinvariant_now_known_void(descr_index, arg0_int);
+
+        // heapcache.py:629-634: subsequent lookup returns None — the
+        // (descr, arg0) slot is still owned but its result is None,
+        // so `if res is not None: return res` short-circuit misses.
+        assert_eq!(
+            cache.call_loopinvariant_known_result(descr_index, arg0_int),
+            None
+        );
     }
 }
