@@ -1970,6 +1970,29 @@ fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
                 // RPython-parity names (rlib/jit.py)
                 "elidable" | "jit_elidable" => hints.push("elidable".into()),
                 "elidable_promote" => hints.push("elidable".into()),
+                // `call.py:292-299 getcalldescr` runs `self._canraise(op)`
+                // *separately* from the binary `_elidable_function_` flag
+                // (`getattr(func, "_elidable_function_", False)` at
+                // `call.py:247`).  RPython hands the funcobj's elidable
+                // boolean to `getcalldescr`, then `_canraise` analyzes the
+                // callee graph to pick between `EF_ELIDABLE_CANNOT_RAISE` /
+                // `EF_ELIDABLE_OR_MEMORYERROR` / `EF_ELIDABLE_CAN_RAISE`.
+                // Pyre mirrors that two-step chain: this hint feeds
+                // `mark_elidable(path)` (the binary flag) and the 3-way
+                // pick is recovered by `_canraise` at
+                // `jit_codewriter/call.rs:2773-2782` + the matching match
+                // at `call.rs:2969-2979`.  Collapsing the two attribute
+                // spellings to a single `"elidable"` hint is therefore
+                // parity-correct, not a lossy adaptation — the
+                // `EF_ELIDABLE_*` distinction is still produced per
+                // callsite by `getcalldescr`.  The proc-macro layer keeps
+                // the spellings distinct via
+                // `majit-macros::helper_policy_tokens_for_fn` (policy
+                // codes 19/20) for its own dispatch wiring, which is
+                // independent of this translate-layer hint stream.
+                "elidable_cannot_raise" | "elidable_or_memerror" => {
+                    hints.push("elidable".into());
+                }
                 "dont_look_inside" => hints.push("dont_look_inside".into()),
                 "unroll_safe" => hints.push("unroll_safe".into()),
                 "loop_invariant" | "jit_loop_invariant" => {

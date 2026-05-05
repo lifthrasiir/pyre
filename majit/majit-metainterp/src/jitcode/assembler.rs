@@ -3007,6 +3007,22 @@ impl JitCodeBuilder {
         self.add_call_target(ptr, ptr)
     }
 
+    /// `add_fn_ptr` variant carrying a per-callee
+    /// [`crate::call_descr::EffectInfoSlot`] classification
+    /// (`call.py:282-303 getcalldescr`'s `extraeffect` selection).
+    /// Producers that statically know the helper's
+    /// `_canraise` / `_elidable_function_` / `_jit_loop_invariant_`
+    /// flags pick the matching slot; the dispatcher then threads the
+    /// slot into `make_call_descr_from_target_slot` so the recorded
+    /// trace descr carries the right `EffectInfo`.
+    pub fn add_fn_ptr_with_slot(
+        &mut self,
+        ptr: *const (),
+        slot: crate::call_descr::EffectInfoSlot,
+    ) -> u16 {
+        self.add_call_target_with_slot(ptr, ptr, slot)
+    }
+
     /// Append a function target descriptor and return its runtime
     /// `descrs` index. Mirrors RPython `Assembler._encode_descr(calldescr)`
     /// (assembler.py:140) where the 2-byte operand downstream resolves
@@ -3014,7 +3030,27 @@ impl JitCodeBuilder {
     /// `(trace_ptr, concrete_ptr)` pairs to match
     /// `Assembler._encode_descr` memoisation.
     pub fn add_call_target(&mut self, trace_ptr: *const (), concrete_ptr: *const ()) -> u16 {
-        let target = JitCallTarget::new(trace_ptr, concrete_ptr);
+        self.add_call_target_with_slot(
+            trace_ptr,
+            concrete_ptr,
+            crate::call_descr::EffectInfoSlot::CanRaise,
+        )
+    }
+
+    /// `add_call_target` variant carrying a per-callee
+    /// [`crate::call_descr::EffectInfoSlot`] classification.  Dedup
+    /// matches the full `(trace_ptr, concrete_ptr, slot)` triple so the
+    /// same fn pointer registered with two different slots produces two
+    /// distinct entries; in practice the same helper is registered with
+    /// a single classification and the dedup matches the `add_call_target`
+    /// path verbatim.
+    pub fn add_call_target_with_slot(
+        &mut self,
+        trace_ptr: *const (),
+        concrete_ptr: *const (),
+        slot: crate::call_descr::EffectInfoSlot,
+    ) -> u16 {
+        let target = JitCallTarget::with_effect_info_slot(trace_ptr, concrete_ptr, slot);
         for (idx, entry) in self.descrs.iter().enumerate() {
             if let RuntimeBhDescr::Call(existing) = entry {
                 if *existing == target {

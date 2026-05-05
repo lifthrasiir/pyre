@@ -6,7 +6,7 @@
 use crate::state::*;
 
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
-use majit_metainterp::{DEFAULT_EFFECT_INFO, TraceAction, TraceCtx};
+use majit_metainterp::{CANNOT_RAISE_EFFECT_INFO, DEFAULT_EFFECT_INFO, TraceAction, TraceCtx};
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
@@ -6951,19 +6951,29 @@ impl OpcodeStepExecutor for MIFrame {
         // runtime (pyopcode.py:786 / eval.rs:1220-1229). Folding a
         // trace-time `ctx.const_ref(prev_exc as i64)` into the bridge
         // silently breaks nested exception state on re-entry.
+        // `trace_get_current_exception_jit` (line 165) is a flat TLS read
+        // of `CURRENT_EXCEPTION` — `EF_CANNOT_RAISE` (`call.py:303 else`
+        // branch). Matches the codewriter-side classification of
+        // `get_current_exception_fn` at
+        // `pyre-jit/src/jit/codewriter.rs:2159-2163 PlainCannotRaise`.
         let prev_exc_opref = self.with_ctx(|_this, ctx| {
             ctx.call_ref_typed_with_effect(
                 trace_get_current_exception_jit as *const (),
                 &[],
                 &[],
-                DEFAULT_EFFECT_INFO,
+                CANNOT_RAISE_EFFECT_INFO,
             )
         });
+        // `trace_set_current_exception_jit` (line 172) is a flat TLS
+        // write — same `EF_CANNOT_RAISE` rationale, mirroring
+        // `set_current_exception_fn` at `codewriter.rs:2165-2168
+        // PlainCannotRaise`.
         self.with_ctx(|_this, ctx| {
-            ctx.call_void_typed(
+            ctx.call_void_typed_with_effect(
                 trace_set_current_exception_jit as *const (),
                 &[exc.opref],
                 &[Type::Ref],
+                CANNOT_RAISE_EFFECT_INFO,
             );
         });
         let prev_exc = get_current_exception();
@@ -6990,11 +7000,15 @@ impl OpcodeStepExecutor for MIFrame {
         let prev_exc = <Self as SharedOpcodeHandler>::pop_value(self)?;
         // Emit the residual restore so the compiled bridge writes back the
         // saved sys_exc_info at runtime (pyopcode.py:778 / eval.rs:1243-1249).
+        // Flat TLS write — `EF_CANNOT_RAISE` matching the codewriter-side
+        // `set_current_exception_fn` at `codewriter.rs:2165-2168
+        // PlainCannotRaise`.
         self.with_ctx(|_this, ctx| {
-            ctx.call_void_typed(
+            ctx.call_void_typed_with_effect(
                 trace_set_current_exception_jit as *const (),
                 &[prev_exc.opref],
                 &[Type::Ref],
+                CANNOT_RAISE_EFFECT_INFO,
             );
         });
         set_current_exception(prev_exc.concrete.to_pyobj());

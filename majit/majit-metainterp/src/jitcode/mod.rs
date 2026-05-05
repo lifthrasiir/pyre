@@ -110,10 +110,21 @@ pub use majit_translate::jitcode::enumerate_vars;
 /// trace-side and concrete (non-JIT) function pointers into a single
 /// descriptor slot because the runtime emitter wires both pointers
 /// through one indirection.
+///
+/// `effect_info_slot` is the per-target analyzer-result classification
+/// (`call.py:282-303 getcalldescr`'s `extraeffect` selection without
+/// the graph-based analyzer chain — see
+/// [`crate::call_descr::EffectInfoSlot`]).  Callers that have a
+/// resolved `JitCallTarget` thread the slot through
+/// `make_call_descr_from_target_slot` so the recorded descr carries
+/// the right `EffectInfo` instead of the `DEFAULT_EFFECT_INFO`
+/// fallback.  The default ([`EffectInfoSlot::CanRaise`]) preserves the
+/// pre-G-2 behaviour for every existing construction site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitCallTarget {
     pub trace_ptr: *const (),
     pub concrete_ptr: *const (),
+    pub effect_info_slot: crate::call_descr::EffectInfoSlot,
 }
 
 impl JitCallTarget {
@@ -121,6 +132,24 @@ impl JitCallTarget {
         Self {
             trace_ptr,
             concrete_ptr,
+            effect_info_slot: crate::call_descr::EffectInfoSlot::CanRaise,
+        }
+    }
+
+    /// Construct a target with an explicit
+    /// [`crate::call_descr::EffectInfoSlot`] classification.  Used by
+    /// the macro-time helper registration paths that statically know
+    /// the callee's `_canraise` / `_elidable_function_` /
+    /// `_jit_loop_invariant_` flags.
+    pub fn with_effect_info_slot(
+        trace_ptr: *const (),
+        concrete_ptr: *const (),
+        effect_info_slot: crate::call_descr::EffectInfoSlot,
+    ) -> Self {
+        Self {
+            trace_ptr,
+            concrete_ptr,
+            effect_info_slot,
         }
     }
 }

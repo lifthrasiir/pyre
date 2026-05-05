@@ -34,7 +34,9 @@ use majit_trace::heapcache::HeapCache;
 
 use majit_backend::JitCellToken;
 
-use crate::call_descr::{make_call_descr, make_call_may_force_descr};
+use crate::call_descr::{
+    EffectInfoSlot, make_call_descr, make_call_descr_from_target_slot, make_call_may_force_descr,
+};
 use crate::constant_pool::ConstantPool;
 use crate::jitcode::JitArgKind;
 // `make_resume_guard_descr*` is no longer needed at the tracer side —
@@ -3238,16 +3240,22 @@ impl TraceCtx {
     // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
 
     /// RPython pyjitpl.py opimpl_conditional_call_ir_v: emit CondCallN.
+    ///
+    /// `slot` carries the per-callee `EffectInfo` classification produced
+    /// by the macro-time analyzer-equivalent at
+    /// `pyre-jit/src/jit/codewriter.rs::register_helper_fn_pointers`,
+    /// mirroring `call.py:282-303 getcalldescr`'s analyzer chain output.
     pub fn cond_call_void_typed(
         &mut self,
         condition: i64,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        slot: EffectInfoSlot,
     ) {
         let cond_ref = self.constants.get_or_insert(condition);
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
-        let descr = make_call_descr(arg_types, Type::Void);
+        let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
         let mut call_args = vec![cond_ref, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
@@ -3261,10 +3269,11 @@ impl TraceCtx {
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        slot: EffectInfoSlot,
     ) -> OpRef {
         let value_ref = self.constants.get_or_insert(value);
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
-        let descr = make_call_descr(arg_types, Type::Int);
+        let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
         let mut call_args = vec![value_ref, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
@@ -3272,16 +3281,26 @@ impl TraceCtx {
     }
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_r: emit CondCallValueR.
+    ///
+    /// `blackhole.py:1271-1276 bhimpl_conditional_call_value_ir_r` declares
+    /// `@arguments("cpu", "r", "i", "I", "R", "d", returns="r")` — the
+    /// leading `value` is a Ref-typed argbox, so the recorded op's first
+    /// arg must be a `ConstPtr` rather than a `ConstInt`.  Routing the
+    /// raw pointer-as-i64 through `get_or_insert` would produce a
+    /// `ConstInt` slot that aliases with any int constant of the same
+    /// numeric value (`history.py:220` `ConstInt` vs `:307 ConstPtr`
+    /// pin distinct types at construction).
     pub fn cond_call_value_ref_typed(
         &mut self,
         value: i64,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        slot: EffectInfoSlot,
     ) -> OpRef {
-        let value_ref = self.constants.get_or_insert(value);
+        let value_ref = self.constants.get_or_insert_typed(value, Type::Ref);
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
-        let descr = make_call_descr(arg_types, Type::Ref);
+        let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
         let mut call_args = vec![value_ref, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
@@ -3289,20 +3308,61 @@ impl TraceCtx {
     }
 
     /// RPython pyjitpl.py opimpl_record_known_result_i / _r: emit RecordKnownResult.
+    ///
+    /// Mirrors `blackhole.py:620-628 bhimpl_record_known_result_{i,r}_ir_v`'s
+    /// `(cpu, res, func, args_i, args_r, calldescr)` signature: the
+    /// trailing `d` argcode carries the per-callee calldescr that
+    /// `jtransform.py:299-310 rewrite_op_jit_record_known_result` builds
+    /// from `getcalldescr`.  `OptPure.optimize_record_known_result`
+    /// (`optimizeopt/pure.py:211-220`, ported at
+    /// `optimizeopt/pure.rs:1028-1036`) keys its `known_result_call_pure`
+    /// table off `descr_identity`, so a missing descr would let two
+    /// distinct elidable callees with matching argument shapes collide
+    /// at the later `CALL_PURE_*` lookup.
+    ///
+    /// `result_type` is the result kind of the underlying `CALL_PURE_*`
+    /// the recorded entry will later match.  `jtransform.py:296` uses
+    /// `op.args[0]` as a "fake result var, which is correct with
+    /// regards to the concretetype, the only thing that getcalldescr
+    /// accesses": the calldescr's result type follows the known-result
+    /// box's concretetype (int or ref), even though the recorded
+    /// `record_known_result_*_ir_v` op itself produces no result
+    /// register.  `CallDescrKey` (`call_descr.rs:54`) hashes
+    /// `result_type` into the descr identity, so passing `Type::Void`
+    /// here would never match the `Type::Int` / `Type::Ref` descr that
+    /// `getcalldescr` (`jit_codewriter/call.rs:2799+`) builds for the
+    /// matching `CALL_PURE_*` op.
+    ///
+    /// `slot` is the per-callee classification chosen at producer time
+    /// (`call.py:282-303 getcalldescr`'s `extraeffect` selection); see
+    /// `make_call_descr_from_target_slot` for the resolution rule.
     pub fn record_known_result_typed(
         &mut self,
         result_value: i64,
         func_ptr: *const (),
         args: &[OpRef],
         arg_types: &[Type],
+        result_type: Type,
+        slot: EffectInfoSlot,
     ) {
-        let result_ref = self.constants.get_or_insert(result_value);
+        // `blackhole.py:620-628` declares the two opcodes as
+        //   @arguments("cpu", "i", "i", "I", "R", "d")  # _i_ir_v
+        //   @arguments("cpu", "r", "i", "I", "R", "d")  # _r_ir_v
+        // so the leading known-result argbox is Ref-typed for
+        // `record_known_result_r_ir_v` and Int-typed for `_i_ir_v`.
+        // Use `get_or_insert_typed(result_value, result_type)` so the
+        // recorded constant lands as `ConstPtr` for Ref results,
+        // matching `history.py:307 ConstPtr` and preventing alias with
+        // `ConstInt` slots of the same raw value.
+        let result_ref = self
+            .constants
+            .get_or_insert_typed(result_value, result_type);
         let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
-        let _descr = make_call_descr(arg_types, Type::Void);
+        let descr = make_call_descr_from_target_slot(arg_types, result_type, slot);
         let mut call_args = vec![result_ref, func_ref];
         call_args.extend_from_slice(args);
         self.recorder
-            .record_op(OpCode::RecordKnownResult, &call_args);
+            .record_op_with_descr(OpCode::RecordKnownResult, &call_args, descr);
     }
 
     pub fn call_int_typed(

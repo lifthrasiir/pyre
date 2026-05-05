@@ -87,8 +87,30 @@ impl SSAReprEmitter {
         self.builder.add_const_r(value)
     }
 
+    /// Register a helper fn pointer without a slot classification —
+    /// used by `register_helper_fn_pointers::bind` for `MayForce` /
+    /// `ReleaseGil` flavors whose runtime-resolved EI cannot be
+    /// represented as an [`majit_metainterp::EffectInfoSlot`]
+    /// (`pyjitpl.py:2128-2132 do_conditional_call` asserts forces
+    /// never reach the slot-reading dispatcher).  The descriptor
+    /// stays at the analyzer-absent default
+    /// [`majit_metainterp::EffectInfoSlot::CanRaise`].
     pub fn add_fn_ptr(&mut self, ptr: *const ()) -> u16 {
         self.builder.add_fn_ptr(ptr)
+    }
+
+    /// Register a helper fn pointer with its per-callee
+    /// [`majit_metainterp::EffectInfoSlot`] classification — used by
+    /// `register_helper_fn_pointers` to thread each helper's
+    /// `CallFlavor` into the [`majit_metainterp::JitCallTarget`]
+    /// runtime descriptor so the trace dispatcher can pick the
+    /// matching `EffectInfo` (`call.py:282-303 getcalldescr` parity).
+    pub fn add_fn_ptr_with_slot(
+        &mut self,
+        ptr: *const (),
+        slot: majit_metainterp::EffectInfoSlot,
+    ) -> u16 {
+        self.builder.add_fn_ptr_with_slot(ptr, slot)
     }
 
     pub fn has_abort_flag(&self) -> bool {

@@ -124,6 +124,53 @@ enum ValueKind {
     Float,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CondCallEffectSlot {
+    CanRaise,
+    ElidableCanRaise,
+    ElidableCannotRaise,
+    ElidableOrMemerror,
+    LoopInvariant,
+}
+
+impl CondCallEffectSlot {
+    fn token(self) -> TokenStream {
+        match self {
+            Self::CanRaise => quote! { majit_metainterp::EffectInfoSlot::CanRaise },
+            Self::ElidableCanRaise => quote! { majit_metainterp::EffectInfoSlot::ElidableCanRaise },
+            Self::ElidableCannotRaise => {
+                quote! { majit_metainterp::EffectInfoSlot::ElidableCannotRaise }
+            }
+            Self::ElidableOrMemerror => {
+                quote! { majit_metainterp::EffectInfoSlot::ElidableOrMemerror }
+            }
+            Self::LoopInvariant => quote! { majit_metainterp::EffectInfoSlot::LoopInvariant },
+        }
+    }
+
+    fn can_raise(self) -> bool {
+        matches!(
+            self,
+            Self::CanRaise | Self::ElidableCanRaise | Self::ElidableOrMemerror
+        )
+    }
+
+    fn is_elidable(self) -> bool {
+        matches!(
+            self,
+            Self::ElidableCanRaise | Self::ElidableCannotRaise | Self::ElidableOrMemerror
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallResultKind {
+    Void,
+    Int,
+    Ref,
+    Float,
+}
+
 impl ValueKind {
     fn from_ident(ident: &Ident) -> Self {
         match ident.to_string().as_str() {
@@ -132,6 +179,140 @@ impl ValueKind {
             _ => Self::Int,
         }
     }
+}
+
+fn call_policy_effect_slot(kind: crate::jit_interp::CallPolicyKind) -> Option<CondCallEffectSlot> {
+    use crate::jit_interp::CallPolicyKind as K;
+    match kind {
+        K::ResidualVoid
+        | K::ResidualVoidWrapped
+        | K::ResidualInt
+        | K::ResidualIntWrapped
+        | K::ResidualRefWrapped
+        | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
+
+        K::LoopInvariantVoid
+        | K::LoopInvariantVoidWrapped
+        | K::LoopInvariantInt
+        | K::LoopInvariantIntWrapped
+        | K::LoopInvariantRefWrapped
+        | K::LoopInvariantFloatWrapped => Some(CondCallEffectSlot::LoopInvariant),
+
+        K::ElidableInt
+        | K::ElidableIntWrapped
+        | K::ElidableRefWrapped
+        | K::ElidableFloatWrapped => Some(CondCallEffectSlot::ElidableCanRaise),
+        K::ElidableIntCannotRaise
+        | K::ElidableIntCannotRaiseWrapped
+        | K::ElidableRefCannotRaiseWrapped
+        | K::ElidableFloatCannotRaiseWrapped => Some(CondCallEffectSlot::ElidableCannotRaise),
+        K::ElidableIntOrMemerror
+        | K::ElidableIntOrMemerrorWrapped
+        | K::ElidableRefOrMemerrorWrapped
+        | K::ElidableFloatOrMemerrorWrapped => Some(CondCallEffectSlot::ElidableOrMemerror),
+
+        K::MayForceVoid
+        | K::MayForceVoidWrapped
+        | K::MayForceInt
+        | K::MayForceIntWrapped
+        | K::MayForceRefWrapped
+        | K::MayForceFloatWrapped
+        | K::ReleaseGilVoid
+        | K::ReleaseGilVoidWrapped
+        | K::ReleaseGilInt
+        | K::ReleaseGilIntWrapped
+        | K::ReleaseGilFloatWrapped
+        | K::InlineInt
+        | K::InlineRef
+        | K::InlineFloat => None,
+    }
+}
+
+fn call_policy_result_kind(kind: crate::jit_interp::CallPolicyKind) -> Option<CallResultKind> {
+    use crate::jit_interp::CallPolicyKind as K;
+    match kind {
+        K::ResidualVoid
+        | K::ResidualVoidWrapped
+        | K::MayForceVoid
+        | K::MayForceVoidWrapped
+        | K::ReleaseGilVoid
+        | K::ReleaseGilVoidWrapped
+        | K::LoopInvariantVoid
+        | K::LoopInvariantVoidWrapped => Some(CallResultKind::Void),
+
+        K::ResidualInt
+        | K::ResidualIntWrapped
+        | K::MayForceInt
+        | K::MayForceIntWrapped
+        | K::ReleaseGilInt
+        | K::ReleaseGilIntWrapped
+        | K::LoopInvariantInt
+        | K::LoopInvariantIntWrapped
+        | K::ElidableInt
+        | K::ElidableIntWrapped
+        | K::ElidableIntCannotRaise
+        | K::ElidableIntCannotRaiseWrapped
+        | K::ElidableIntOrMemerror
+        | K::ElidableIntOrMemerrorWrapped
+        | K::InlineInt => Some(CallResultKind::Int),
+
+        K::ResidualRefWrapped
+        | K::MayForceRefWrapped
+        | K::LoopInvariantRefWrapped
+        | K::ElidableRefWrapped
+        | K::ElidableRefCannotRaiseWrapped
+        | K::ElidableRefOrMemerrorWrapped
+        | K::InlineRef => Some(CallResultKind::Ref),
+
+        K::ResidualFloatWrapped
+        | K::MayForceFloatWrapped
+        | K::ReleaseGilFloatWrapped
+        | K::LoopInvariantFloatWrapped
+        | K::ElidableFloatWrapped
+        | K::ElidableFloatCannotRaiseWrapped
+        | K::ElidableFloatOrMemerrorWrapped
+        | K::InlineFloat => Some(CallResultKind::Float),
+    }
+}
+
+fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) -> bool {
+    use crate::jit_interp::CallPolicyKind as K;
+    matches!(
+        kind,
+        K::ResidualVoidWrapped
+            | K::MayForceVoidWrapped
+            | K::ReleaseGilVoidWrapped
+            | K::LoopInvariantVoidWrapped
+            | K::ResidualIntWrapped
+            | K::MayForceIntWrapped
+            | K::ReleaseGilIntWrapped
+            | K::LoopInvariantIntWrapped
+            | K::ElidableIntWrapped
+            | K::ElidableIntCannotRaiseWrapped
+            | K::ElidableIntOrMemerrorWrapped
+            | K::ResidualRefWrapped
+            | K::MayForceRefWrapped
+            | K::LoopInvariantRefWrapped
+            | K::ElidableRefWrapped
+            | K::ElidableRefCannotRaiseWrapped
+            | K::ElidableRefOrMemerrorWrapped
+            | K::ResidualFloatWrapped
+            | K::MayForceFloatWrapped
+            | K::ReleaseGilFloatWrapped
+            | K::LoopInvariantFloatWrapped
+            | K::ElidableFloatWrapped
+            | K::ElidableFloatCannotRaiseWrapped
+            | K::ElidableFloatOrMemerrorWrapped
+    )
+}
+
+fn call_result_matches_binding(result_kind: CallResultKind, binding_kind: BindingKind) -> bool {
+    matches!(
+        (result_kind, binding_kind),
+        (CallResultKind::Int, BindingKind::Int)
+            | (CallResultKind::Ref, BindingKind::Ref)
+            | (CallResultKind::Float, BindingKind::Float)
+    )
 }
 
 impl LowererConfig {
@@ -1159,6 +1340,82 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    fn explicit_cond_call_policy(
+        &self,
+        func: &Expr,
+        macro_name: &str,
+    ) -> crate::jit_interp::CallPolicyKind {
+        match self.resolve_call_policy(func) {
+            Some(CallPolicySpec::Explicit(kind)) => kind,
+            Some(CallPolicySpec::Infer) => {
+                panic!(
+                    "{macro_name} requires an explicit calls={{ helper => ... }} policy; \
+                     inferred helper policy is resolved too late to decide the RPython \
+                     calldescr_canraise live marker statically"
+                );
+            }
+            None => {
+                panic!(
+                    "{macro_name} requires a calls={{ helper => ... }} policy so the \
+                     lowered JitCode can carry the RPython calldescr EffectInfoSlot"
+                );
+            }
+        }
+    }
+
+    fn cond_call_slot_for_policy(
+        &self,
+        kind: crate::jit_interp::CallPolicyKind,
+        macro_name: &str,
+    ) -> CondCallEffectSlot {
+        call_policy_effect_slot(kind).unwrap_or_else(|| {
+            panic!(
+                "{macro_name} cannot lower helper policy {kind:?}: RPython \
+                 jtransform.py:1677 rejects conditional_call / record_known_result \
+                 callees whose calldescr forces virtuals or uses release-gil, and \
+                 inline helpers do not have a direct-call calldescr"
+            )
+        })
+    }
+
+    fn call_target_registration_tokens(
+        &self,
+        func: &Expr,
+        kind: crate::jit_interp::CallPolicyKind,
+        slot: CondCallEffectSlot,
+    ) -> TokenStream {
+        let slot_token = slot.token();
+        if call_policy_is_wrapped(kind) {
+            let policy_path =
+                helper_policy_path(func).expect("wrapped helper policy requires a path expression");
+            quote! {
+                let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                if __trace_target.is_null() && __concrete_target.is_null() {
+                    panic!("wrapped helper policy requires generated call-target wrappers");
+                }
+                let __trace_target = if __trace_target.is_null() {
+                    __concrete_target
+                } else {
+                    __trace_target
+                };
+                let __concrete_target = if __concrete_target.is_null() {
+                    __trace_target
+                } else {
+                    __concrete_target
+                };
+                let __fn_idx = __builder.add_call_target_with_slot(
+                    __trace_target,
+                    __concrete_target,
+                    #slot_token,
+                );
+            }
+        } else {
+            quote! {
+                let __fn_idx = __builder.add_fn_ptr_with_slot(#func as *const (), #slot_token);
+            }
+        }
+    }
+
     fn lower_stmt(&mut self, stmt: &Stmt) -> Option<()> {
         match stmt {
             Stmt::Local(local) => {
@@ -1544,13 +1801,47 @@ impl<'c> Lowerer<'c> {
             typed_arg_tokens.push(token);
         }
         let func_path = args[1];
+        let policy = self.explicit_cond_call_policy(func_path, "conditional_call!");
+        let Some(result_kind) = call_policy_result_kind(policy) else {
+            panic!("conditional_call! helper policy {policy:?} has no direct-call result kind");
+        };
+        if result_kind != CallResultKind::Void {
+            panic!("conditional_call! requires a void-return helper policy, got {policy:?}");
+        }
+        let slot = self.cond_call_slot_for_policy(policy, "conditional_call!");
+        // `call.py:249-251 getcalldescr`:
+        //   if loopinvariant:
+        //       assert not NON_VOID_ARGS, ("arguments not supported for "
+        //                                  "loop-invariant function!")
+        // The canonical `call_loopinvariant_*_canonical_via_target`
+        // builders enforce the same invariant via `arg_regs.is_empty()`
+        // (`jitcode/assembler.rs:1849`), but the cond_call helper
+        // dispatch routes through `conditional_call_ir_v_typed_args`
+        // which doesn't share that assert. Mirror the check here so
+        // a `conditional_call!(cond, loop_invariant_helper, arg)`
+        // panics at expansion time instead of silently registering a
+        // bytecode shape RPython would reject at calldescr build.
+        if matches!(slot, CondCallEffectSlot::LoopInvariant) && !func_args.is_empty() {
+            panic!(
+                "conditional_call!: arguments not supported for loop-invariant function (policy {policy:?})",
+            );
+        }
+        let register_target = self.call_target_registration_tokens(func_path, policy, slot);
         self.emit_op(
             OpMeta::linear(OpKind::Call, arg_regs, vec![]),
             quote! {
-                let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                #register_target
                 __builder.conditional_call_ir_v_typed_args(__fn_idx, #cond_reg, &[#(#typed_arg_tokens),*]);
             },
         );
+        // `jtransform.py:1681-1683`: append `-live-` exactly when
+        // `calldescr_canraise(calldescr)` for the slot selected above.
+        if slot.can_raise() {
+            self.emit_op(
+                OpMeta::live_marker(),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        }
         Some(())
     }
 
@@ -1617,6 +1908,29 @@ impl<'c> Lowerer<'c> {
                 __builder.conditional_call_value_ir_i_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
         };
+        let policy = self.explicit_cond_call_policy(func_path, "conditional_call_elidable!");
+        let Some(result_kind) = call_policy_result_kind(policy) else {
+            panic!(
+                "conditional_call_elidable! helper policy {policy:?} has no direct-call result kind"
+            );
+        };
+        if !call_result_matches_binding(result_kind, value_kind) {
+            panic!(
+                "conditional_call_elidable! value/result kind mismatch for helper policy {policy:?}"
+            );
+        }
+        let slot = self.cond_call_slot_for_policy(policy, "conditional_call_elidable!");
+        // `call.py:249-251 getcalldescr`'s loop-invariant non-void-args
+        // assert (see plain `conditional_call!` lowerer for the citation).
+        // `conditional_call_elidable!` accepts non-elidable cache-computing
+        // helpers per `rlib/jit.py:1334-1336`, so a `LoopInvariant` slot is
+        // legal in principle and must enforce the same args-empty rule.
+        if matches!(slot, CondCallEffectSlot::LoopInvariant) && !func_args.is_empty() {
+            panic!(
+                "conditional_call_elidable!: arguments not supported for loop-invariant function (policy {policy:?})",
+            );
+        }
+        let register_target = self.call_target_registration_tokens(func_path, policy, slot);
         self.emit_op(
             OpMeta::linear(
                 OpKind::Call,
@@ -1624,10 +1938,21 @@ impl<'c> Lowerer<'c> {
                 vec![Register::new(value_kind, result_reg)],
             ),
             quote! {
-                let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                #register_target
                 #builder_call
             },
         );
+        // `jtransform.py:1681-1683`: append `-live-` exactly when
+        // `calldescr_canraise(calldescr)`.  `conditional_call_elidable`
+        // still accepts non-elidable cache-computing helpers per
+        // `rlib/jit.py:1334-1336`; their explicit policy maps to
+        // `EffectInfoSlot::CanRaise` and therefore keeps the marker.
+        if slot.can_raise() {
+            self.emit_op(
+                OpMeta::live_marker(),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        }
         Some(Binding {
             reg: result_reg,
             kind: value_kind,
@@ -1694,6 +2019,18 @@ impl<'c> Lowerer<'c> {
         // RPython pyjitpl.py:413-419 passes the known result box as
         // `prepend_box=resbox`; record_known_result reads that box and
         // produces no result (`_v` suffix).
+        let policy = self.explicit_cond_call_policy(func_path, "record_known_result!");
+        let Some(result_kind) = call_policy_result_kind(policy) else {
+            panic!("record_known_result! helper policy {policy:?} has no direct-call result kind");
+        };
+        if !call_result_matches_binding(result_kind, result_binding.kind) {
+            panic!("record_known_result! result kind mismatch for helper policy {policy:?}");
+        }
+        let slot = self.cond_call_slot_for_policy(policy, "record_known_result!");
+        if !slot.is_elidable() {
+            panic!("record_known_result! requires an elidable helper policy, got {policy:?}");
+        }
+        let register_target = self.call_target_registration_tokens(func_path, policy, slot);
         let result_typed = Register::new(result_binding.kind, result_reg);
         let mut reads = Vec::with_capacity(arg_regs.len() + 1);
         reads.push(result_typed);
@@ -1701,10 +2038,18 @@ impl<'c> Lowerer<'c> {
         self.emit_op(
             OpMeta::linear(OpKind::RecordKnownResult, reads, Vec::new()),
             quote! {
-                let __fn_idx = __builder.add_fn_ptr(#func_path as *const ());
+                #register_target
                 #builder_call
             },
         );
+        // `jtransform.py:311-312`: append `-live-` exactly when the
+        // elidable calldescr can raise.
+        if slot.can_raise() {
+            self.emit_op(
+                OpMeta::live_marker(),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        }
         Some(())
     }
 
@@ -5211,6 +5556,21 @@ mod tests {
         inline_policy_with_kind(path, crate::jit_interp::CallPolicyKind::InlineInt)
     }
 
+    fn lowerer_with_call_policy(
+        path: &str,
+        kind: crate::jit_interp::CallPolicyKind,
+    ) -> Lowerer<'static> {
+        let path: Path = syn::parse_str(path).expect("failed to parse path");
+        Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                canonical_path_segments(&path),
+                CallPolicySpec::Explicit(kind),
+            )],
+            InferenceFailureMode::ReturnNone,
+        )
+    }
+
     fn parse_call(code: &str) -> ExprCall {
         syn::parse_str(code).expect("failed to parse call")
     }
@@ -5242,7 +5602,8 @@ mod tests {
 
     #[test]
     fn record_known_result_metadata_reads_known_result_and_writes_nothing() {
-        let mut lowerer = Lowerer::new(None);
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ElidableInt);
         lowerer
             .bindings
             .insert("known".to_string(), binding(0, BindingKind::Int));
@@ -5256,10 +5617,169 @@ mod tests {
             .lower_record_known_result(&expr)
             .expect("record_known_result should lower");
 
-        let meta = lowerer.op_metadata.last().expect("metadata emitted");
-        assert!(matches!(meta.kind, OpKind::RecordKnownResult));
-        assert_eq!(meta.reads, Register::ints(&[0, 1]));
-        assert!(meta.writes.is_empty());
+        let record = lowerer
+            .op_metadata
+            .iter()
+            .find(|m| matches!(m.kind, OpKind::RecordKnownResult))
+            .expect("RecordKnownResult metadata emitted");
+        assert_eq!(record.reads, Register::ints(&[0, 1]));
+        assert!(record.writes.is_empty());
+        // `jtransform.py:311-312` trailing `-live-` after a can-raise
+        // record_known_result call.
+        let last = lowerer.op_metadata.last().expect("metadata emitted");
+        assert!(matches!(last.kind, OpKind::LiveMarker));
+        let tokens = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(tokens.contains("add_fn_ptr_with_slot"));
+        assert!(tokens.contains("ElidableCanRaise"));
+    }
+
+    #[test]
+    fn record_known_result_cannot_raise_elidable_omits_live_marker() {
+        let mut lowerer = lowerer_with_call_policy(
+            "helper",
+            crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise,
+        );
+        lowerer
+            .bindings
+            .insert("known".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("record_known_result!(known, helper, arg)").expect("parse macro expr");
+
+        lowerer
+            .lower_record_known_result(&expr)
+            .expect("record_known_result should lower");
+
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        assert!(matches!(
+            lowerer.op_metadata[0].kind,
+            OpKind::RecordKnownResult
+        ));
+        let tokens = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(tokens.contains("ElidableCannotRaise"));
+        assert!(!tokens.contains("live_placeholder"));
+    }
+
+    #[test]
+    #[should_panic(expected = "record_known_result! requires an elidable helper policy")]
+    fn record_known_result_rejects_non_elidable_policy() {
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualInt);
+        lowerer
+            .bindings
+            .insert("known".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("record_known_result!(known, helper, arg)").expect("parse macro expr");
+
+        let _ = lowerer.lower_record_known_result(&expr);
+    }
+
+    #[test]
+    fn conditional_call_loopinvariant_omits_live_marker() {
+        // `call.py:249-251 getcalldescr` forbids non-void args for
+        // loop-invariant direct_call, so the cond_call shape must
+        // also have no func args when the slot is `LoopInvariant`.
+        let mut lowerer = lowerer_with_call_policy(
+            "helper",
+            crate::jit_interp::CallPolicyKind::LoopInvariantVoid,
+        );
+        lowerer
+            .bindings
+            .insert("cond".to_string(), binding(0, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("conditional_call!(cond, helper)").expect("parse macro expr");
+
+        lowerer
+            .lower_conditional_call(&expr)
+            .expect("conditional_call should lower");
+
+        assert_eq!(lowerer.op_metadata.len(), 1);
+        assert!(matches!(lowerer.op_metadata[0].kind, OpKind::Call));
+        let tokens = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(tokens.contains("LoopInvariant"));
+        assert!(!tokens.contains("live_placeholder"));
+    }
+
+    #[test]
+    #[should_panic(expected = "arguments not supported for loop-invariant function")]
+    fn conditional_call_loopinvariant_rejects_func_args() {
+        // `call.py:249-251 getcalldescr` asserts `not NON_VOID_ARGS`
+        // for loop-invariant direct_call.  The cond_call macro path
+        // mirrors that assert at expansion time.
+        let mut lowerer = lowerer_with_call_policy(
+            "helper",
+            crate::jit_interp::CallPolicyKind::LoopInvariantVoid,
+        );
+        lowerer
+            .bindings
+            .insert("cond".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("conditional_call!(cond, helper, arg)").expect("parse macro expr");
+
+        let _ = lowerer.lower_conditional_call(&expr);
+    }
+
+    #[test]
+    #[should_panic(expected = "conditional_call! cannot lower helper policy MayForceVoid")]
+    fn conditional_call_rejects_may_force_policy() {
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::MayForceVoid);
+        lowerer
+            .bindings
+            .insert("cond".to_string(), binding(0, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("conditional_call!(cond, helper)").expect("parse macro expr");
+
+        let _ = lowerer.lower_conditional_call(&expr);
+    }
+
+    #[test]
+    fn conditional_call_elidable_residual_policy_keeps_live_marker() {
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualInt);
+        lowerer
+            .bindings
+            .insert("value".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr = syn::parse_str("conditional_call_elidable!(value, helper, arg)")
+            .expect("parse macro expr");
+
+        let result = lowerer
+            .lower_conditional_call_elidable(&expr)
+            .expect("conditional_call_elidable should lower");
+
+        assert_eq!(result.kind, BindingKind::Int);
+        let last = lowerer.op_metadata.last().expect("metadata emitted");
+        assert!(matches!(last.kind, OpKind::LiveMarker));
+        let tokens = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(tokens.contains("CanRaise"));
+        assert!(tokens.contains("live_placeholder"));
     }
 
     #[test]

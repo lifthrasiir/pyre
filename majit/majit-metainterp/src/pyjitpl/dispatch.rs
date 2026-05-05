@@ -3109,13 +3109,14 @@ where
                 } else {
                     target.concrete_ptr
                 };
+                let slot = target.effect_info_slot;
                 match bytecode {
                     jitcode::BC_COND_CALL_VOID => {
                         // RPython pyjitpl.py opimpl_conditional_call_ir_v:
                         //   if condition != 0: call func(args)
                         let first_val =
                             self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
-                        ctx.cond_call_void_typed(first_val, trace_ptr, &args, &arg_types);
+                        ctx.cond_call_void_typed(first_val, trace_ptr, &args, &arg_types, slot);
                         if first_val != 0 {
                             call_void_function(concrete_ptr, &concrete_args);
                             // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
@@ -3128,8 +3129,9 @@ where
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
                         let first_val =
                             self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
-                        let result =
-                            ctx.cond_call_value_int_typed(first_val, trace_ptr, &args, &arg_types);
+                        let result = ctx.cond_call_value_int_typed(
+                            first_val, trace_ptr, &args, &arg_types, slot,
+                        );
                         let concrete_result = if first_val == 0 {
                             let result = call_int_function(concrete_ptr, &concrete_args);
                             // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
@@ -3151,10 +3153,16 @@ where
                         // value is a ref — read from ref register bank.
                         let first_val =
                             self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
-                        let result =
-                            ctx.cond_call_value_ref_typed(first_val, trace_ptr, &args, &arg_types);
+                        let result = ctx.cond_call_value_ref_typed(
+                            first_val, trace_ptr, &args, &arg_types, slot,
+                        );
                         let concrete_result = if first_val == 0 {
-                            let result = call_int_function(concrete_ptr, &concrete_args);
+                            // `blackhole.py:1113 bhimpl_residual_call_*_r` →
+                            // `cpu.bh_call_r`. Pyre routes through the
+                            // structurally-distinct `call_ref_function`
+                            // even though it currently aliases the int
+                            // ABI.
+                            let result = call_ref_function(concrete_ptr, &concrete_args);
                             // Always record concrete_ptr (see BC_RESIDUAL_CALL_VOID).
                             // Ref-shaped result: queue entry uses the Ref
                             // variant so a wrapped Ref policy's
@@ -3173,16 +3181,36 @@ where
                         let _ = result;
                     }
                     jitcode::BC_RECORD_KNOWN_RESULT_INT => {
-                        // RPython pyjitpl.py opimpl_record_known_result_i:
+                        // RPython pyjitpl.py opimpl_record_known_result_i.
+                        // `jtransform.py:296` uses op.args[0] (the
+                        // known-result var) as the fake result var for
+                        // `getcalldescr`; here that maps to `Type::Int`
+                        // because the bytecode is `_i_ir_v`.
                         let result_val =
                             self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
-                        ctx.record_known_result_typed(result_val, trace_ptr, &args, &arg_types);
+                        ctx.record_known_result_typed(
+                            result_val,
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Int,
+                            slot,
+                        );
                     }
                     jitcode::BC_RECORD_KNOWN_RESULT_REF => {
-                        // RPython pyjitpl.py opimpl_record_known_result_r:
+                        // RPython pyjitpl.py opimpl_record_known_result_r —
+                        // `_r_ir_v` opname, calldescr result type is
+                        // `Type::Ref`.
                         let result_val =
                             self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
-                        ctx.record_known_result_typed(result_val, trace_ptr, &args, &arg_types);
+                        ctx.record_known_result_typed(
+                            result_val,
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Ref,
+                            slot,
+                        );
                     }
                     _ => unreachable!(),
                 }
@@ -4118,6 +4146,20 @@ pub(crate) fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
             ),
         }
     }
+}
+
+/// `bh_call_r` parity (`backend/model.py:268`, `blackhole.py:1113`).
+///
+/// Pyre's GC ref is a `*const PyObject` carried as `i64` via the
+/// pointer-size ABI alias, so `call_ref_function` shares the same
+/// underlying `extern "C" fn(...) -> i64` signature with
+/// [`call_int_function`].  The function exists as a structurally
+/// distinct name so the ref-result dispatch site reads as the upstream
+/// `bh_call_r` rather than a re-use of `bh_call_i` — when the GC handle
+/// shape diverges from `i64` the call site can pick the right ABI by
+/// switching here without touching the caller.
+pub(crate) fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
+    call_int_function(func_ptr, args)
 }
 
 pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {

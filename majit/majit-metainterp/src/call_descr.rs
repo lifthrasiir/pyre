@@ -213,11 +213,18 @@ pub const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
 /// is false for `extraeffect == 2`, so the canonical walker omits the
 /// trailing `GUARD_NO_EXCEPTION`.
 ///
-/// Same `read/write_descrs_*` saturation as [`DEFAULT_EFFECT_INFO`] —
-/// pyre's analyzer port (Task #64) is the upstream replacement; in the
-/// meantime the conservative full-bitset preserves `force_from_effectinfo`'s
-/// per-cached-descr flush behaviour for callees that mutate heap state
-/// but never raise.
+/// PRE-EXISTING-ADAPTATION: same `read/write_descrs_*` and `can_collect`
+/// saturation as [`DEFAULT_EFFECT_INFO`].  `call.py:320-324
+/// effectinfo_from_writeanalyze` builds those bitsets from the
+/// `readwrite_analyzer` and `collect_analyzer` results; pyre has no
+/// analyzers ported yet (Task #64), so a conservative full-bitset is
+/// the line-by-line equivalent of "no analyzer ran" — it preserves
+/// `force_from_effectinfo`'s per-cached-descr flush behaviour for
+/// callees that mutate heap state but never raise, matching the same
+/// fallback semantics `DEFAULT_EFFECT_INFO` uses for raising callees.
+/// When the analyzers land, this constant becomes the no-callee-info
+/// default and producers thread per-callee `EffectInfo` values through
+/// `make_call_descr_with_effect`.
 pub const CANNOT_RAISE_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::CannotRaise,
     oopspecindex: OopSpecIndex::None,
@@ -266,6 +273,60 @@ pub const ELIDABLE_EFFECT_INFO: EffectInfo =
 pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
     EffectInfo::const_new(ExtraEffect::LoopInvariant, OopSpecIndex::None);
 
+/// Per-callee analyzer-result slot.  Mirrors `call.py:282-303 getcalldescr`'s
+/// `extraeffect` selection without the `raise_analyzer` /
+/// `readwrite_analyzer` / `collect_analyzer` / `randomeffects_analyzer`
+/// graph-based machinery (the analyzers operate on RPython low-level
+/// graphs, which pyre does not have).  Producers that statically know
+/// the callee's classification — typically because the helper carries
+/// a `#[elidable]` / `#[elidable_cannot_raise]` / `#[dont_look_inside]`
+/// attribute — pick the matching slot at registration time;
+/// [`effect_info_for_slot`] resolves it to the corresponding
+/// [`EffectInfo`] const at descr construction.
+///
+/// `MayForce` (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`) and `ReleaseGil`
+/// (`EF_RANDOM_EFFECTS` + non-zero `call_release_gil_target`) are
+/// deliberately omitted — those EI values carry runtime-resolved
+/// `target.concrete_ptr` / `save_err` slots that the const factory at
+/// `jitcode/assembler.rs:emit_canonical_call_*_via_target` constructs
+/// inline.  Adding them here would require duplicating the
+/// `(1, 0)` sentinel + `resolve_call_release_gil_target` substitution,
+/// which is out of scope for the slot enum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EffectInfoSlot {
+    /// `EF_CAN_RAISE` — `call.py:301` `elif self._canraise(op)`.
+    /// Conservative analyzer-absent default; matches `DEFAULT_EFFECT_INFO`.
+    #[default]
+    CanRaise,
+    /// `EF_CANNOT_RAISE` — `call.py:303` `else` branch.
+    CannotRaise,
+    /// `EF_ELIDABLE_CAN_RAISE` — `call.py:297` `elif cr:` branch.
+    ElidableCanRaise,
+    /// `EF_ELIDABLE_CANNOT_RAISE` — `call.py:299` `else` branch under
+    /// `elif elidable:`.
+    ElidableCannotRaise,
+    /// `EF_ELIDABLE_OR_MEMORYERROR` — `call.py:295` `if cr == "mem":`.
+    ElidableOrMemerror,
+    /// `EF_LOOPINVARIANT` — `call.py:291` `elif loopinvariant:`.
+    LoopInvariant,
+}
+
+/// Resolve a [`EffectInfoSlot`] to its matching [`EffectInfo`] const.
+///
+/// `call.py:320 effectinfo_from_writeanalyze` constructs the final EI
+/// from the `extraeffect` plus the analyzer outputs; pyre's per-slot
+/// const captures the analyzer-absent fallback for that `extraeffect`.
+pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
+    match slot {
+        EffectInfoSlot::CanRaise => DEFAULT_EFFECT_INFO,
+        EffectInfoSlot::CannotRaise => CANNOT_RAISE_EFFECT_INFO,
+        EffectInfoSlot::ElidableCanRaise => ELIDABLE_EFFECT_INFO,
+        EffectInfoSlot::ElidableCannotRaise => ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+        EffectInfoSlot::ElidableOrMemerror => ELIDABLE_OR_MEMERROR_EFFECT_INFO,
+        EffectInfoSlot::LoopInvariant => LOOPINVARIANT_EFFECT_INFO,
+    }
+}
+
 /// Pick the upstream-equivalent default effect for an opcode whose
 /// callee has not been write-analyzed.
 ///
@@ -284,7 +345,28 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
     }
 }
 
-/// Create a CallDescr with the given argument types and result type.
+/// Create a CallDescr with the conservative
+/// [`DEFAULT_EFFECT_INFO`] (`EF_CAN_RAISE` + all-ones field/array
+/// bitsets).  This is the analyzer-absent fallback that mirrors RPython's
+/// behaviour when `call.py:296-326 getcalldescr` runs against a callee
+/// graph that the readwrite/raise analyzers haven't visited yet.
+///
+/// Production producers should prefer one of the more specific factories
+/// so the per-callee classification reaches the trace IR:
+///
+/// * [`make_call_descr_from_target_slot`] when a resolved
+///   [`crate::jitcode::JitCallTarget`] is available — threads the
+///   macro-time [`EffectInfoSlot`] (`call.py:282-303 getcalldescr` parity).
+/// * [`make_call_descr_for_opcode`] when only the call opcode family is
+///   known (`pyjitpl.py:1991-1995 do_residual_or_indirect_call`'s
+///   `EF_LOOPINVARIANT` / `EF_ELIDABLE_*` reverse-mapping).
+/// * [`make_call_descr_with_effect`] when an explicit `EffectInfo` has
+///   been hand-built (release-gil targets, oopspec specializations).
+///
+/// Remaining direct callers of this fallback are restricted to
+/// `#[cfg(test)]` fixtures (pyjitpl/optimizeopt/backend test stubs)
+/// where the conservative descr is the test's intent — matching the
+/// "no analyzer ran" path the production fallbacks above subsume.
 pub fn make_call_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
     make_call_descr_with_effect(arg_types, result_type, DEFAULT_EFFECT_INFO)
 }
@@ -296,6 +378,21 @@ pub fn make_call_descr_for_opcode(
     result_type: Type,
 ) -> DescrRef {
     make_call_descr_with_effect(arg_types, result_type, default_effect_for_opcode(opcode))
+}
+
+/// Create a CallDescr from a per-target [`EffectInfoSlot`] classification.
+///
+/// `call.py:282-303 getcalldescr` selects `extraeffect` per callsite
+/// from the analyzer chain; pyre's analyzer-absent equivalent is the
+/// `JitCallTarget.effect_info_slot` macro-time classification.  This
+/// factory is the per-target entry point — callers that have a
+/// resolved [`crate::jitcode::JitCallTarget`] thread its slot through.
+pub fn make_call_descr_from_target_slot(
+    arg_types: &[Type],
+    result_type: Type,
+    slot: EffectInfoSlot,
+) -> DescrRef {
+    make_call_descr_with_effect(arg_types, result_type, effect_info_for_slot(slot))
 }
 
 /// call.py:320 `effectinfo_from_writeanalyze` parity. Create a

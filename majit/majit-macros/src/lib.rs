@@ -1488,6 +1488,9 @@ pub fn jit_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
 const JIT_HELPER_ATTRS: &[&str] = &[
     "jit_inline",
     "elidable",
+    // call.py:292-299 _canraise(op) 3-way pick on the elidable branch.
+    "elidable_cannot_raise",
+    "elidable_or_memerror",
     "elidable_promote",
     "dont_look_inside",
     "unroll_safe",

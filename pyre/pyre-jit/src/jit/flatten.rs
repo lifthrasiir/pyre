@@ -496,6 +496,61 @@ pub struct CallDescrStub {
 /// callee needs a specific EI field set (e.g. an oopspec-specialized
 /// helper), construct the `EffectInfo` directly at the call site
 /// rather than extending this `CallFlavor` mnemonic.
+/// Producer-side macro-time map from a [`CallFlavor`] to the
+/// matching [`majit_metainterp::EffectInfoSlot`] entry that
+/// `JitCallTarget` carries.
+///
+/// `call.py:282-303 getcalldescr` selects `extraeffect` at codewriter
+/// time from the analyzer chain (raise / loopinvariant / elidable);
+/// pyre's macro-time `CallFlavor` already encodes the same per-helper
+/// classification, so this function picks the matching slot const so
+/// the runtime [`JitCallTarget`] descriptor carries the same
+/// `extraeffect` the producer used when registering the helper.
+///
+/// **Panics for `MayForce` and `ReleaseGil`** — mirroring
+/// `jtransform.py:1677` (`assert not
+/// calldescr.get_extra_info().check_forces_virtual_or_virtualizable()`)
+/// and `pyjitpl.py:2128-2132 do_conditional_call`'s identical assertion.
+/// Those flavors carry runtime-resolved EI fields
+/// (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` without analyzer outputs,
+/// `EF_RANDOM_EFFECTS` + non-zero `call_release_gil_target` per
+/// `effectinfo.py:249`) that the const factory at
+/// `jitcode/assembler.rs::emit_canonical_call_typed_via_target*`
+/// constructs inline (saturated read/write bitsets, `(1, 0)`
+/// release-gil sentinel).  Code paths that register helpers for
+/// residual_call dispatch (which never reads
+/// `JitCallTarget.effect_info_slot`) must classify them through a
+/// flavor-aware split — see `register_helper_fn_pointers::bind` for
+/// the canonical pattern — instead of routing through this function.
+pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoSlot {
+    use majit_metainterp::EffectInfoSlot;
+    match flavor {
+        // `call.py:301 getcalldescr` — `EF_CAN_RAISE`.
+        CallFlavor::Plain => EffectInfoSlot::CanRaise,
+        // `call.py:303 getcalldescr` — `EF_CANNOT_RAISE` (`else` branch).
+        CallFlavor::PlainCannotRaise => EffectInfoSlot::CannotRaise,
+        // `call.py:291 getcalldescr` — `EF_LOOPINVARIANT`.
+        CallFlavor::LoopInvariant => EffectInfoSlot::LoopInvariant,
+        // `call.py:292-299 getcalldescr` 3-way elidable pick.
+        CallFlavor::PureCannotRaise => EffectInfoSlot::ElidableCannotRaise,
+        CallFlavor::PureOrMemerror => EffectInfoSlot::ElidableOrMemerror,
+        CallFlavor::PureCanRaise => EffectInfoSlot::ElidableCanRaise,
+        // `jtransform.py:1677 _rewrite_op_cond_call`'s assert and
+        // `pyjitpl.py:2128-2132 do_conditional_call`'s `assert not
+        // check_forces_virtual_or_virtualizable()` are violated by
+        // these flavors. Crashing here instead of silently lowering
+        // to `CanRaise` keeps the assertion semantics intact.
+        CallFlavor::MayForce | CallFlavor::ReleaseGil => panic!(
+            "slot_for_call_flavor: {flavor:?} cannot be encoded as an \
+             EffectInfoSlot; cond_call / record_known_result reject \
+             this flavor per jtransform.py:1677. The caller must \
+             dispatch on CallFlavor pattern and register \
+             slot-irrelevant residual_call helpers via \
+             SSAReprEmitter::add_fn_ptr instead."
+        ),
+    }
+}
+
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
@@ -531,8 +586,28 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         CallFlavor::PlainCannotRaise => majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
         // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `effectinfo.py:23`.
         // `optimize_CALL_MAY_FORCE_*` branch.
+        //
+        // PRE-EXISTING-ADAPTATION (Slice γ): saturate the
+        // `read/write_descrs_*` bitsets to `u64::MAX`, matching the
+        // `Plain` / `CANNOT_RAISE_EFFECT_INFO` analyzer-absent
+        // fallback (`call_descr.rs:175-207 DEFAULT_EFFECT_INFO`).
+        // RPython's `effectinfo.py:172-177` only clears
+        // `_write_descrs_*` for elidable / loopinvariant extraeffects;
+        // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` keeps the analyzer's
+        // results, which without an analyzer means `effectinfo.py:285`
+        // `top_set` saturation.  The previous `..default()` left the
+        // bitsets at 0, so `force_from_effectinfo`
+        // (`heap.rs:712 force_lazy_setfields_and_arrayitems_from_effectinfo`)
+        // skipped the cached descr flush after a MayForce call —
+        // a NEW-DEVIATION the reviewer flagged as #4.
         CallFlavor::MayForce => EffectInfo {
             extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
+            readonly_descrs_fields: u64::MAX,
+            write_descrs_fields: u64::MAX,
+            readonly_descrs_arrays: u64::MAX,
+            write_descrs_arrays: u64::MAX,
+            readonly_descrs_interiorfields: u64::MAX,
+            write_descrs_interiorfields: u64::MAX,
             ..EffectInfo::default()
         },
         // EF_LOOPINVARIANT — `effectinfo.py:18`.
@@ -610,6 +685,21 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
             // arraycopy / arraymove fast-paths for traces whose
             // release-gil descr came from this producer.
             can_invalidate: true,
+            // PRE-EXISTING-ADAPTATION (Slice γ): RPython
+            // `effectinfo.py:149-155` keeps `readonly_descrs_*` and
+            // `write_descrs_*` as `None` for `EF_RANDOM_EFFECTS`
+            // (the optimizer reads `None` as "any descr touched").
+            // Pyre's `EffectInfo` uses bare `u64`, so the
+            // semantically-equivalent representation is `u64::MAX` —
+            // `force_from_effectinfo` (`heap.rs:712`) iterates per
+            // descr index and flushes every bit-set entry, matching
+            // upstream's "anything is touched" guarantee.
+            readonly_descrs_fields: u64::MAX,
+            write_descrs_fields: u64::MAX,
+            readonly_descrs_arrays: u64::MAX,
+            write_descrs_arrays: u64::MAX,
+            readonly_descrs_interiorfields: u64::MAX,
+            write_descrs_interiorfields: u64::MAX,
             call_release_gil_target: (1, 0),
             ..EffectInfo::default()
         },

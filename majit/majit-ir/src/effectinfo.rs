@@ -345,16 +345,23 @@ impl EffectInfo {
     }
 
     /// effectinfo.py:271-273: MOST_GENERAL
-    /// `EffectInfo(None, None, None, None, None, None, EF_RANDOM_EFFECTS, can_invalidate=True)`
+    /// `EffectInfo(None, None, None, None, None, None, EF_RANDOM_EFFECTS, can_invalidate=True)`.
+    ///
+    /// RPython encodes the `descrs=None` arguments as "any descr can
+    /// be touched" — `effectinfo.py:149-155` keeps the bitsets as
+    /// `None` for `EF_RANDOM_EFFECTS` and the consumer reads `None`
+    /// as a wildcard.  Pyre's bare-`u64` bitset has no `None` slot,
+    /// so the parity-equivalent representation is `u64::MAX`
+    /// (`force_from_effectinfo` flushes every bit-set descr index).
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
         oopspecindex: OopSpecIndex::None,
-        readonly_descrs_fields: 0,
-        write_descrs_fields: 0,
-        readonly_descrs_arrays: 0,
-        write_descrs_arrays: 0,
-        readonly_descrs_interiorfields: 0,
-        write_descrs_interiorfields: 0,
+        readonly_descrs_fields: u64::MAX,
+        write_descrs_fields: u64::MAX,
+        readonly_descrs_arrays: u64::MAX,
+        write_descrs_arrays: u64::MAX,
+        readonly_descrs_interiorfields: u64::MAX,
+        write_descrs_interiorfields: u64::MAX,
         single_write_descr_array: None,
         extradescrs: None,
         can_invalidate: true,

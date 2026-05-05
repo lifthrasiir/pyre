@@ -26,7 +26,7 @@ use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
     CallFlavor, DescrOperand, GraphFlattener, Insn, Kind, ListOfKind, Operand, Register, ResKind,
-    SSARepr, TLabel,
+    SSARepr, TLabel, slot_for_call_flavor,
 };
 
 // ---------------------------------------------------------------------------
@@ -1957,11 +1957,29 @@ impl RegisterLayout {
     }
 }
 
-/// Indices returned by `assembler.add_fn_ptr` for every blackhole
-/// helper fn pointer the dispatch loop references. Mirrors the slot
-/// shape of RPython's `_callinfo_for_oopspec`-derived index table —
-/// the helpers are interned in a fixed order so the dispatch handlers
-/// can capture the indices once and reuse them across emit sites.
+/// Per-helper `(idx, flavor)` pair returned by
+/// `register_helper_fn_pointers`.  RPython's `getcalldescr`
+/// (`call.py:282-330`) derives the analogous information from a chain
+/// of graph analyzers (`raise_analyzer`, `readwrite_analyzer`,
+/// `collect_analyzer`, `virtualizable_analyzer`,
+/// `quasiimmut_analyzer`, `randomeffects_analyzer`); pyre lacks the
+/// flow-graph + rtyper infrastructure those analyzers need.  Until the
+/// analyzer port lands, we mirror RPython's `effects is top_set`
+/// fallback (`effectinfo.py:285`) at helper granularity: each helper
+/// carries a hand-classified `CallFlavor` that the codewriter consults
+/// instead of hardcoding `Plain` / `MayForce` per emit site.
+#[derive(Clone, Copy, Debug)]
+struct HelperHandle {
+    idx: u16,
+    flavor: CallFlavor,
+}
+
+/// Indices + per-helper `CallFlavor` returned by
+/// `assembler.add_fn_ptr` for every blackhole helper fn pointer the
+/// dispatch loop references. Mirrors the slot shape of RPython's
+/// `_callinfo_for_oopspec`-derived index table — the helpers are
+/// interned in a fixed order so the dispatch handlers can capture the
+/// indices once and reuse them across emit sites.
 ///
 /// PRE-EXISTING-ADAPTATION: the order matches the historical
 /// inline sequence (`call_fn`, then the per-opcode helpers, then the
@@ -1970,31 +1988,57 @@ impl RegisterLayout {
 /// path has the same constraint.
 #[derive(Clone, Copy, Debug)]
 struct FnPtrIndices {
-    call_fn: u16,
-    load_global_fn: u16,
-    compare_fn: u16,
-    binary_op_fn: u16,
-    box_int_fn: u16,
-    truth_fn: u16,
-    load_const_fn: u16,
-    store_subscr_fn: u16,
-    build_list_fn: u16,
-    normalize_raise_varargs_fn: u16,
-    call_fn_0: u16,
-    call_fn_2: u16,
-    call_fn_3: u16,
-    call_fn_4: u16,
-    call_fn_5: u16,
-    call_fn_6: u16,
-    call_fn_7: u16,
-    call_fn_8: u16,
-    get_current_exception_fn: u16,
-    set_current_exception_fn: u16,
+    call_fn: HelperHandle,
+    load_global_fn: HelperHandle,
+    compare_fn: HelperHandle,
+    binary_op_fn: HelperHandle,
+    box_int_fn: HelperHandle,
+    truth_fn: HelperHandle,
+    load_const_fn: HelperHandle,
+    store_subscr_fn: HelperHandle,
+    build_list_fn: HelperHandle,
+    normalize_raise_varargs_fn: HelperHandle,
+    call_fn_0: HelperHandle,
+    call_fn_2: HelperHandle,
+    call_fn_3: HelperHandle,
+    call_fn_4: HelperHandle,
+    call_fn_5: HelperHandle,
+    call_fn_6: HelperHandle,
+    call_fn_7: HelperHandle,
+    call_fn_8: HelperHandle,
+    get_current_exception_fn: HelperHandle,
+    set_current_exception_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
-/// the canonical order. Returns the per-helper index table used by
+/// the canonical order. Returns the per-helper handle table used by
 /// the dispatch loop.
+///
+/// CallFlavor classification per helper (RPython parity:
+/// `call.py:282-330` + `effectinfo.py:13-52`):
+///
+/// * `get_current_exception_fn` / `set_current_exception_fn`: TLS
+///   read/write of `CURRENT_EXCEPTION`; never raises.  RPython's
+///   `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s `else` branch) →
+///   `PlainCannotRaise`.
+/// * `compare_fn` / `binary_op_fn` / `store_subscr_fn` / `call_fn` /
+///   `call_fn_n` / `truth_fn` / `normalize_raise_varargs_fn`:
+///   dispatch into user Python code (`__add__` / `__eq__` /
+///   `__setitem__` / arbitrary callable / `__bool__` /
+///   exception-class `__init__`); arbitrary user code that observes
+///   virtualizables.  Matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+///   (`effectinfo.py:23`) → `MayForce`.
+/// * `load_global_fn` / `build_list_fn`: namespace dict lookup +
+///   list allocation; can raise (`NameError` / `MemoryError`) but do
+///   not force virtuals — `EF_CAN_RAISE` → `Plain`.
+/// * `box_int_fn` / `load_const_fn`: kept on `Plain` until the
+///   upstream `@jit.elidable_promote` decorator is wired
+///   (`rpython/rlib/jit.py:180`) and pyre's constant storage shape
+///   matches PyPy's pre-wrapped `co_consts_w`
+///   (`pypy/interpreter/pyopcode.py:516` vs
+///   `pyre-interpreter/src/pyframe.rs:1748-1768`).  Hand-pure
+///   classification without those prerequisites would be a
+///   NEW-DEVIATION.
 fn register_helper_fn_pointers(
     assembler: &mut SSAReprEmitter,
     cpu: &super::cpu::Cpu,
@@ -2002,28 +2046,118 @@ fn register_helper_fn_pointers(
     // RPython: CallControl manages fn addresses; assembler.finished()
     // writes them into callinfocollection. pyre adds them inline so
     // each handler can capture the index it needs.
-    let call_fn = assembler.add_fn_ptr(cpu.call_fn as *const ());
-    let load_global_fn = assembler.add_fn_ptr(cpu.load_global_fn as *const ());
-    let compare_fn = assembler.add_fn_ptr(cpu.compare_fn as *const ());
-    let binary_op_fn = assembler.add_fn_ptr(cpu.binary_op_fn as *const ());
-    let box_int_fn = assembler.add_fn_ptr(cpu.box_int_fn as *const ());
-    let truth_fn = assembler.add_fn_ptr(cpu.truth_fn as *const ());
-    let load_const_fn = assembler.add_fn_ptr(cpu.load_const_fn as *const ());
-    let store_subscr_fn = assembler.add_fn_ptr(cpu.store_subscr_fn as *const ());
-    let build_list_fn = assembler.add_fn_ptr(cpu.build_list_fn as *const ());
-    let normalize_raise_varargs_fn =
-        assembler.add_fn_ptr(cpu.normalize_raise_varargs_fn as *const ());
+    //
+    // `bind` registers a helper fn pointer with its per-callee
+    // [`majit_metainterp::EffectInfoSlot`] (`call.py:282-303
+    // getcalldescr` parity, see [`slot_for_call_flavor`]) so the runtime
+    // [`majit_metainterp::JitCallTarget`] descriptor carries the
+    // matching `extraeffect`.  The dispatcher then threads
+    // `target.effect_info_slot` through
+    // `make_call_descr_from_target_slot` (`call_descr.rs:390`) so the
+    // recorded trace descr's `EffectInfo` matches the producer's
+    // hand-classified flavor.
+    let mut bind = |assembler: &mut SSAReprEmitter, ptr: *const (), flavor: CallFlavor| {
+        // `MayForce` / `ReleaseGil` are dispatched via the
+        // `call_may_force_*` / `call_release_gil_*` paths whose EI is
+        // resolved inline by the const factory at
+        // `jitcode/assembler.rs::emit_canonical_call_typed_via_target*`
+        // (saturated bitsets, `(1, 0)` release-gil sentinel —
+        // `effectinfo.py:249`).  The `JitCallTarget.effect_info_slot`
+        // is unread for those families, so we register without a slot;
+        // routing them through `slot_for_call_flavor` would trip its
+        // `jtransform.py:1677` assert.  Every other flavor goes through
+        // the slot path so the runtime descriptor carries the matching
+        // `extraeffect`.
+        let idx = match flavor {
+            CallFlavor::MayForce | CallFlavor::ReleaseGil => assembler.add_fn_ptr(ptr),
+            _ => assembler.add_fn_ptr_with_slot(ptr, slot_for_call_flavor(flavor)),
+        };
+        HelperHandle { idx, flavor }
+    };
+    let call_fn = bind(assembler, cpu.call_fn as *const (), CallFlavor::MayForce);
+    // `bh_load_global_fn` is a flat `DictStorage::get(name)` lookup
+    // followed by `NameError` synthesis on miss — no
+    // `__getattr__`-style user dispatch (`call_jit.rs:3215-3242`).
+    // Matches `EF_CAN_RAISE` (`call.py:301` `elif self._canraise(op)`):
+    // can raise but does not force virtuals.
+    let load_global_fn = bind(
+        assembler,
+        cpu.load_global_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let compare_fn = bind(assembler, cpu.compare_fn as *const (), CallFlavor::MayForce);
+    let binary_op_fn = bind(
+        assembler,
+        cpu.binary_op_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `pypy/objspace/std/intobject.py:wrap_int` is NOT decorated
+    // with `@jit.elidable_promote` (the upstream decorator lives
+    // at `rpython/rlib/jit.py:180`; the local PyPy intobject
+    // declaration omits it).  Without an analyzer or a matching
+    // upstream decorator, hand-classifying `box_int_fn` as
+    // `Pure*` would be a NEW-DEVIATION; stay on `Plain` until the
+    // decorator path or a per-callee analyzer landing produces
+    // an upstream-cited pure flavor.
+    let box_int_fn = bind(assembler, cpu.box_int_fn as *const (), CallFlavor::Plain);
+    // `bh_truth_fn` delegates to `opcode_ops::truth_value(obj)`,
+    // which invokes Python `__bool__` and may run arbitrary user
+    // code that observes (and therefore forces) virtualizables.
+    // Matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+    // (`effectinfo.py:23`) → `MayForce` per Slice α-2.
+    let truth_fn = bind(assembler, cpu.truth_fn as *const (), CallFlavor::MayForce);
+    // PyPy's `LOAD_CONST` reads pre-wrapped `co_consts_w`
+    // (`pypy/interpreter/pyopcode.py:516`); pyre's
+    // `pyre_interpreter::pyframe::load_const_from_code`
+    // (`pyre-interpreter/src/pyframe.rs:1748-1768`)
+    // re-materializes int / float / str / bool constants on every
+    // call, so the helper is NOT observably idempotent. Stay on
+    // `Plain` until the constant-storage shape converges to the
+    // PyPy pre-wrapped representation.
+    let load_const_fn = bind(assembler, cpu.load_const_fn as *const (), CallFlavor::Plain);
+    let store_subscr_fn = bind(
+        assembler,
+        cpu.store_subscr_fn as *const (),
+        CallFlavor::MayForce,
+    );
+    // `bh_build_list_fn` is allocation-only — `build_list_from_refs`
+    // wraps the supplied PyObjectRefs; items are pre-existing heap
+    // refs, no user `__init__` invocation (`call_jit.rs:3452-3464`).
+    // Matches `EF_CAN_RAISE` (allocation can `MemoryError`) without
+    // virtual-force.
+    let build_list_fn = bind(assembler, cpu.build_list_fn as *const (), CallFlavor::Plain);
+    // `bh_normalize_raise_varargs_fn` walks the exception class /
+    // value pair and instantiates user `__init__` — arbitrary
+    // user code that may observe virtualizables.  Matches
+    // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (`effectinfo.py:23`)
+    // → `MayForce` per Slice α-2.
+    let normalize_raise_varargs_fn = bind(
+        assembler,
+        cpu.normalize_raise_varargs_fn as *const (),
+        CallFlavor::MayForce,
+    );
     // Per-arity call helpers (appended AFTER existing fn_ptrs to preserve indices).
-    let call_fn_0 = assembler.add_fn_ptr(cpu.call_fn_0 as *const ());
-    let call_fn_2 = assembler.add_fn_ptr(cpu.call_fn_2 as *const ());
-    let call_fn_3 = assembler.add_fn_ptr(cpu.call_fn_3 as *const ());
-    let call_fn_4 = assembler.add_fn_ptr(cpu.call_fn_4 as *const ());
-    let call_fn_5 = assembler.add_fn_ptr(cpu.call_fn_5 as *const ());
-    let call_fn_6 = assembler.add_fn_ptr(cpu.call_fn_6 as *const ());
-    let call_fn_7 = assembler.add_fn_ptr(cpu.call_fn_7 as *const ());
-    let call_fn_8 = assembler.add_fn_ptr(cpu.call_fn_8 as *const ());
-    let get_current_exception_fn = assembler.add_fn_ptr(cpu.get_current_exception_fn as *const ());
-    let set_current_exception_fn = assembler.add_fn_ptr(cpu.set_current_exception_fn as *const ());
+    let call_fn_0 = bind(assembler, cpu.call_fn_0 as *const (), CallFlavor::MayForce);
+    let call_fn_2 = bind(assembler, cpu.call_fn_2 as *const (), CallFlavor::MayForce);
+    let call_fn_3 = bind(assembler, cpu.call_fn_3 as *const (), CallFlavor::MayForce);
+    let call_fn_4 = bind(assembler, cpu.call_fn_4 as *const (), CallFlavor::MayForce);
+    let call_fn_5 = bind(assembler, cpu.call_fn_5 as *const (), CallFlavor::MayForce);
+    let call_fn_6 = bind(assembler, cpu.call_fn_6 as *const (), CallFlavor::MayForce);
+    let call_fn_7 = bind(assembler, cpu.call_fn_7 as *const (), CallFlavor::MayForce);
+    let call_fn_8 = bind(assembler, cpu.call_fn_8 as *const (), CallFlavor::MayForce);
+    // TLS read of `CURRENT_EXCEPTION`; cannot raise.  Matches
+    // `EF_CANNOT_RAISE` (`call.py:303` `else` branch).
+    let get_current_exception_fn = bind(
+        assembler,
+        cpu.get_current_exception_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
+    // TLS write; void return; cannot raise.
+    let set_current_exception_fn = bind(
+        assembler,
+        cpu.set_current_exception_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -2829,26 +2963,106 @@ impl CodeWriter {
         // returned struct names every index so the dispatch handlers
         // below can reference them by field instead of an opaque local.
         let FnPtrIndices {
-            call_fn: call_fn_idx,
-            load_global_fn: load_global_fn_idx,
-            compare_fn: compare_fn_idx,
-            binary_op_fn: binary_op_fn_idx,
-            box_int_fn: box_int_fn_idx,
-            truth_fn: truth_fn_idx,
-            load_const_fn: load_const_fn_idx,
-            store_subscr_fn: store_subscr_fn_idx,
-            build_list_fn: build_list_fn_idx,
-            normalize_raise_varargs_fn: normalize_raise_varargs_fn_idx,
-            call_fn_0: call_fn_0_idx,
-            call_fn_2: call_fn_2_idx,
-            call_fn_3: call_fn_3_idx,
-            call_fn_4: call_fn_4_idx,
-            call_fn_5: call_fn_5_idx,
-            call_fn_6: call_fn_6_idx,
-            call_fn_7: call_fn_7_idx,
-            call_fn_8: call_fn_8_idx,
-            get_current_exception_fn: get_current_exception_fn_idx,
-            set_current_exception_fn: set_current_exception_fn_idx,
+            call_fn:
+                HelperHandle {
+                    idx: call_fn_idx,
+                    flavor: call_fn_flavor,
+                },
+            load_global_fn:
+                HelperHandle {
+                    idx: load_global_fn_idx,
+                    flavor: load_global_fn_flavor,
+                },
+            compare_fn:
+                HelperHandle {
+                    idx: compare_fn_idx,
+                    flavor: compare_fn_flavor,
+                },
+            binary_op_fn:
+                HelperHandle {
+                    idx: binary_op_fn_idx,
+                    flavor: binary_op_fn_flavor,
+                },
+            box_int_fn:
+                HelperHandle {
+                    idx: box_int_fn_idx,
+                    flavor: box_int_fn_flavor,
+                },
+            truth_fn:
+                HelperHandle {
+                    idx: truth_fn_idx,
+                    flavor: truth_fn_flavor,
+                },
+            load_const_fn:
+                HelperHandle {
+                    idx: load_const_fn_idx,
+                    flavor: load_const_fn_flavor,
+                },
+            store_subscr_fn:
+                HelperHandle {
+                    idx: store_subscr_fn_idx,
+                    flavor: store_subscr_fn_flavor,
+                },
+            build_list_fn:
+                HelperHandle {
+                    idx: build_list_fn_idx,
+                    flavor: build_list_fn_flavor,
+                },
+            normalize_raise_varargs_fn:
+                HelperHandle {
+                    idx: normalize_raise_varargs_fn_idx,
+                    flavor: normalize_raise_varargs_fn_flavor,
+                },
+            call_fn_0:
+                HelperHandle {
+                    idx: call_fn_0_idx,
+                    flavor: call_fn_0_flavor,
+                },
+            call_fn_2:
+                HelperHandle {
+                    idx: call_fn_2_idx,
+                    flavor: call_fn_2_flavor,
+                },
+            call_fn_3:
+                HelperHandle {
+                    idx: call_fn_3_idx,
+                    flavor: call_fn_3_flavor,
+                },
+            call_fn_4:
+                HelperHandle {
+                    idx: call_fn_4_idx,
+                    flavor: call_fn_4_flavor,
+                },
+            call_fn_5:
+                HelperHandle {
+                    idx: call_fn_5_idx,
+                    flavor: call_fn_5_flavor,
+                },
+            call_fn_6:
+                HelperHandle {
+                    idx: call_fn_6_idx,
+                    flavor: call_fn_6_flavor,
+                },
+            call_fn_7:
+                HelperHandle {
+                    idx: call_fn_7_idx,
+                    flavor: call_fn_7_flavor,
+                },
+            call_fn_8:
+                HelperHandle {
+                    idx: call_fn_8_idx,
+                    flavor: call_fn_8_flavor,
+                },
+            get_current_exception_fn:
+                HelperHandle {
+                    idx: get_current_exception_fn_idx,
+                    flavor: get_current_exception_fn_flavor,
+                },
+            set_current_exception_fn:
+                HelperHandle {
+                    idx: set_current_exception_fn_idx,
+                    flavor: set_current_exception_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // RPython flatten.py: pre-create labels for each block.
@@ -4503,7 +4717,7 @@ impl CodeWriter {
                         // (assembler.rs:1736-1784) without a scratch register.
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            box_int_fn_flavor,
                             box_int_fn_idx,
                             &[CallArgInput::ConstInt(val)],
                             ResKind::Ref,
@@ -4552,7 +4766,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            load_const_fn_flavor,
                             load_const_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -4840,7 +5054,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            store_subscr_fn_flavor,
                             store_subscr_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -4913,7 +5127,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            binary_op_fn_flavor,
                             binary_op_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -4959,7 +5173,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            compare_fn_flavor,
                             compare_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -5015,7 +5229,7 @@ impl CodeWriter {
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            truth_fn_flavor,
                             truth_fn_idx,
                             &[CallArgInput::Reg(
                                 majit_metainterp::jitcode::JitArgKind::Ref,
@@ -5063,7 +5277,7 @@ impl CodeWriter {
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            truth_fn_flavor,
                             truth_fn_idx,
                             &[CallArgInput::Reg(
                                 majit_metainterp::jitcode::JitArgKind::Ref,
@@ -5157,7 +5371,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            load_global_fn_flavor,
                             load_global_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -5265,20 +5479,20 @@ impl CodeWriter {
                         if nargs > 8 {
                             emit_abort_permanent!(ssarepr);
                         } else {
-                            let fn_idx = match nargs {
-                                0 => call_fn_0_idx,
-                                1 => call_fn_idx,
-                                2 => call_fn_2_idx,
-                                3 => call_fn_3_idx,
-                                4 => call_fn_4_idx,
-                                5 => call_fn_5_idx,
-                                6 => call_fn_6_idx,
-                                7 => call_fn_7_idx,
-                                _ => call_fn_8_idx,
+                            let (fn_idx, fn_flavor) = match nargs {
+                                0 => (call_fn_0_idx, call_fn_0_flavor),
+                                1 => (call_fn_idx, call_fn_flavor),
+                                2 => (call_fn_2_idx, call_fn_2_flavor),
+                                3 => (call_fn_3_idx, call_fn_3_flavor),
+                                4 => (call_fn_4_idx, call_fn_4_flavor),
+                                5 => (call_fn_5_idx, call_fn_5_flavor),
+                                6 => (call_fn_6_idx, call_fn_6_flavor),
+                                7 => (call_fn_7_idx, call_fn_7_flavor),
+                                _ => (call_fn_8_idx, call_fn_8_flavor),
                             };
                             emit_residual_call(
                                 &mut ssarepr,
-                                CallFlavor::MayForce,
+                                fn_flavor,
                                 fn_idx,
                                 &call_args,
                                 ResKind::Ref,
@@ -5314,7 +5528,7 @@ impl CodeWriter {
                         let scratch_zero = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            box_int_fn_flavor,
                             box_int_fn_idx,
                             &[CallArgInput::ConstInt(0)],
                             ResKind::Ref,
@@ -5322,7 +5536,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            binary_op_fn_flavor,
                             binary_op_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -5425,7 +5639,7 @@ impl CodeWriter {
                         };
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            build_list_fn_flavor,
                             build_list_fn_idx,
                             &[CallArgInput::ConstInt(argc as i64), item0, item1],
                             ResKind::Ref,
@@ -5492,7 +5706,7 @@ impl CodeWriter {
                             // (Call/UnaryNegative/CheckExcMatch input-side).
                             emit_residual_call(
                                 &mut ssarepr,
-                                CallFlavor::Plain,
+                                normalize_raise_varargs_fn_flavor,
                                 normalize_raise_varargs_fn_idx,
                                 &[
                                     CallArgInput::Reg(
@@ -5540,7 +5754,7 @@ impl CodeWriter {
                         let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            get_current_exception_fn_flavor,
                             get_current_exception_fn_idx,
                             &[],
                             ResKind::Ref,
@@ -5548,7 +5762,7 @@ impl CodeWriter {
                         );
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            set_current_exception_fn_flavor,
                             set_current_exception_fn_idx,
                             &[CallArgInput::Reg(
                                 majit_metainterp::jitcode::JitArgKind::Ref,
@@ -5581,7 +5795,7 @@ impl CodeWriter {
                         let scratch_match = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::MayForce,
+                            compare_fn_flavor,
                             compare_fn_idx,
                             &[
                                 CallArgInput::Reg(
@@ -5616,7 +5830,7 @@ impl CodeWriter {
                         let _ = current_state.stack.pop();
                         emit_residual_call(
                             &mut ssarepr,
-                            CallFlavor::Plain,
+                            set_current_exception_fn_flavor,
                             set_current_exception_fn_idx,
                             &[CallArgInput::Reg(
                                 majit_metainterp::jitcode::JitArgKind::Ref,
@@ -5996,7 +6210,7 @@ impl CodeWriter {
                 // the exception slot, retiring obj_tmp0 → exc_slot copy.
                 emit_residual_call(
                     &mut ssarepr,
-                    CallFlavor::Plain,
+                    box_int_fn_flavor,
                     box_int_fn_idx,
                     &[CallArgInput::ConstInt(site.lasti_py_pc as i64)],
                     ResKind::Ref,
