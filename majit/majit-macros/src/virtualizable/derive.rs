@@ -7,6 +7,44 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Ident, Meta};
 
+/// Inputarg field type tag, mirroring RPython's `box.type` ('i'/'r'/'f') from
+/// `resoperation.py:719/727/739` `InputArgInt/InputArgRef/InputArgFloat`. Used
+/// by `#[vable(inputarg, type = int|ref|float)]` to pick the matching
+/// `OpRef::input_arg_*` variant at index minting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputargType {
+    Int,
+    Ref,
+    Float,
+}
+
+impl InputargType {
+    fn as_majit_ir_type(self) -> TokenStream {
+        match self {
+            InputargType::Int => quote! { majit_ir::Type::Int },
+            InputargType::Ref => quote! { majit_ir::Type::Ref },
+            InputargType::Float => quote! { majit_ir::Type::Float },
+        }
+    }
+
+    fn as_input_arg_factory(self, idx_expr: TokenStream) -> TokenStream {
+        match self {
+            InputargType::Int => quote! { majit_ir::OpRef::input_arg_int(#idx_expr) },
+            InputargType::Ref => quote! { majit_ir::OpRef::input_arg_ref(#idx_expr) },
+            InputargType::Float => quote! { majit_ir::OpRef::input_arg_float(#idx_expr) },
+        }
+    }
+}
+
+fn parse_inputarg_type(s: &str) -> Option<InputargType> {
+    match s.trim() {
+        "int" | "i" => Some(InputargType::Int),
+        "ref" | "r" => Some(InputargType::Ref),
+        "float" | "f" => Some(InputargType::Float),
+        _ => None,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // #[vable(...)] attribute parsing
 // ═══════════════════════════════════════════════════════════════
@@ -40,6 +78,12 @@ struct VableField {
     role: VableRole,
     /// For `#[vable(static_field = N)]`: the VirtualizableInfo field index.
     static_field_index: Option<usize>,
+    /// For `#[vable(inputarg, type = ...)]`: the RPython `InputArg*` class
+    /// (`InputArgInt/Ref/Float`, resoperation.py:719/727/739) the slot at
+    /// the assigned `flat_input_idx` should mint. `None` falls back to
+    /// `Ref` because pyre's pre-typing era treated all OpRef inputargs as
+    /// W_Root (the dominant case from interp_jit.py's static-fields list).
+    inputarg_type: Option<InputargType>,
 }
 
 fn parse_vable_role(s: &str) -> Option<VableRole> {
@@ -62,16 +106,19 @@ fn parse_vable_role(s: &str) -> Option<VableRole> {
 struct ParsedVableAttr {
     role: VableRole,
     static_field_index: Option<usize>,
+    inputarg_type: Option<InputargType>,
 }
 
 /// Parse `#[vable(...)]` attribute content. Supports:
 /// - Simple keyword: `#[vable(frame)]`, `#[vable(inputarg)]`
 /// - Key-value: `#[vable(static_field = 0)]`
-/// - Multi key-value: `#[vable(static_field = 0, type = ref)]`
+/// - Multi key-value: `#[vable(static_field = 0, type = ref)]`,
+///   `#[vable(inputarg, type = int)]`
 fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
     let s = tokens_str.trim();
     // Check if it contains '=' (key-value pairs)
-    if s.contains('=') {
+    if s.contains('=') && !s.contains(',') {
+        // Pure key-value, no leading keyword (e.g. `static_field = 0`).
         let mut static_idx = None;
         for part in s.split(',') {
             let part = part.trim();
@@ -89,33 +136,45 @@ fn parse_vable_attr(tokens_str: &str) -> Option<ParsedVableAttr> {
             return Some(ParsedVableAttr {
                 role: VableRole::Frame, // overridden below
                 static_field_index: static_idx,
+                inputarg_type: None,
             });
         }
         return None;
     }
-    // Simple keyword (possibly with commas for combined: "inputarg, type = ref")
+    // Mixed keyword + key-value (e.g. `inputarg, type = ref`,
+    // `static_field = 0, type = int`).
     if s.contains(',') {
-        let parts: Vec<&str> = s.splitn(2, ',').collect();
-        let keyword = parts[0].trim();
-        let rest = parts.get(1).copied().unwrap_or("");
-        if let Some(role) = parse_vable_role(keyword) {
-            for part in rest.split(',') {
-                let part = part.trim();
-                if let Some((key, val)) = part.split_once('=') {
-                    if key.trim() == "type" {
-                        let _ = val.trim();
-                    }
+        let parts: Vec<&str> = s.split(',').collect();
+        let mut role = None;
+        let mut static_idx = None;
+        let mut inputarg_type = None;
+        for part in &parts {
+            let part = part.trim();
+            if let Some((key, val)) = part.split_once('=') {
+                let key = key.trim();
+                let val = val.trim();
+                match key {
+                    "static_field" => static_idx = val.parse().ok(),
+                    "type" => inputarg_type = parse_inputarg_type(val),
+                    _ => {}
                 }
+            } else if role.is_none() {
+                role = parse_vable_role(part);
             }
+        }
+        if role.is_some() || static_idx.is_some() {
             return Some(ParsedVableAttr {
-                role,
-                static_field_index: None,
+                role: role.unwrap_or(VableRole::Frame), // overridden if static_field
+                static_field_index: static_idx,
+                inputarg_type,
             });
         }
+        return None;
     }
     parse_vable_role(s).map(|role| ParsedVableAttr {
         role,
         static_field_index: None,
+        inputarg_type: None,
     })
 }
 
@@ -148,6 +207,7 @@ fn extract_vable_fields(input: &DeriveInput) -> Vec<VableField> {
                     ident: ident.clone(),
                     role: parsed.role,
                     static_field_index: parsed.static_field_index,
+                    inputarg_type: parsed.inputarg_type,
                 });
             }
         }
@@ -168,11 +228,11 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .find(|f| f.role == VableRole::Frame)
         .map(|f| &f.ident);
     // Inputarg fields: included in jump/fail args and OpRef index assignment.
-    let inputarg_fields: Vec<&Ident> = vable_fields
+    let inputarg_fields: Vec<&VableField> = vable_fields
         .iter()
         .filter(|f| f.role == VableRole::Inputarg)
-        .map(|f| &f.ident)
         .collect();
+    let inputarg_field_idents: Vec<&Ident> = inputarg_fields.iter().map(|f| &f.ident).collect();
     // All static fields (inputarg + info_only): included in flush and oprefs.
     let all_static_fields: Vec<&Ident> = vable_fields
         .iter()
@@ -244,13 +304,23 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     // The caller supplies the start because root inputargs are
     // [frame, extra_reds..., vable_scalars..., array...], while resume
     // virtualizable payloads are [vable, vable_scalars..., array...].
+    //
+    // Each slot mints the typed `OpRef::input_arg_*` variant matching its
+    // RPython `InputArg{Int,Ref,Float}` class (resoperation.py:719/727/739).
+    // The earlier `#[vable(inputarg)]` validator rejects fields without an
+    // explicit `type = ...`, so `inputarg_type` is `Some` here.
     let init_inputarg_fields: Vec<TokenStream> = inputarg_fields
         .iter()
         .enumerate()
         .map(|(i, field)| {
             let offset = i as u32;
+            let ident = &field.ident;
+            let tp = field
+                .inputarg_type
+                .expect("validator rejects #[vable(inputarg)] without type = ...");
+            let factory = tp.as_input_arg_factory(quote! { first_vable_scalar_idx + #offset });
             quote! {
-                self.#field = majit_ir::OpRef::from_raw(first_vable_scalar_idx + #offset);
+                self.#ident = #factory;
             }
         })
         .collect();
@@ -264,8 +334,9 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .enumerate()
         .map(|(i, field)| {
             let offset = i;
+            let ident = &field.ident;
             quote! {
-                self.#field = oprefs[first_vable_scalar_idx + #offset];
+                self.#ident = oprefs[first_vable_scalar_idx + #offset];
             }
         })
         .collect();
@@ -310,7 +381,7 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     let collect_frame = frame_field
         .map(|f| quote! { __args.push(self.#f); })
         .unwrap_or_default();
-    let collect_inputargs: Vec<TokenStream> = inputarg_fields
+    let collect_inputargs: Vec<TokenStream> = inputarg_field_idents
         .iter()
         .map(|f| quote! { __args.push(self.#f); })
         .collect();
@@ -392,11 +463,19 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         quote! {}
     };
 
-    // Typed inputargs for collect_typed_jump_args (inputargs are always Int)
+    // Typed inputargs for collect_typed_jump_args. Each field uses the
+    // type tag declared via `#[vable(inputarg, type = ...)]`. The earlier
+    // validator rejects fields without an explicit `type = ...`, so
+    // `inputarg_type` is `Some` here.
     let collect_typed_inputargs: Vec<TokenStream> = inputarg_fields
         .iter()
         .map(|f| {
-            quote! { __args.push((self.#f, majit_ir::Type::Int)); }
+            let ident = &f.ident;
+            let tp = f
+                .inputarg_type
+                .expect("validator rejects #[vable(inputarg)] without type = ...")
+                .as_majit_ir_type();
+            quote! { __args.push((self.#ident, #tp)); }
         })
         .collect();
 
@@ -589,6 +668,25 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 &f.ident,
                 "#[vable(static_field = N)] is no longer supported in VirtualizableState. \
                  Heap is the single source of truth; use heap accessors instead.",
+            )
+            .to_compile_error();
+        }
+    }
+
+    // resoperation.py:719/727/739 InputArgInt/Ref/Float require an explicit
+    // `box.type`. RPython annotates `_virtualizable_` fields directly
+    // (`['x', 'y[*]']` plus per-class type annotations), never via an
+    // implicit default. Reject `#[vable(inputarg)]` without `type = ...` so
+    // pyre cannot silently mint Untyped-Ref slots when the upstream class
+    // would have minted InputArgInt or InputArgFloat.
+    for f in &vable_fields {
+        if f.role == VableRole::Inputarg && f.inputarg_type.is_none() {
+            return syn::Error::new_spanned(
+                &f.ident,
+                "#[vable(inputarg)] requires `type = int|ref|float` to pin the RPython \
+                 InputArg{Int,Ref,Float} class (resoperation.py:719/727/739). \
+                 Annotate the field as `#[vable(inputarg, type = ref)]` (or `int`/`float`) \
+                 to match the box.type the upstream _virtualizable_ slot expects.",
             )
             .to_compile_error();
         }

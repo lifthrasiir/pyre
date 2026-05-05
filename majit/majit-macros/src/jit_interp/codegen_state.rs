@@ -463,8 +463,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             quote! {
                 let #fname: Vec<majit_ir::OpRef> = (0..meta.#len_name)
                     .map(|i| {
-                        let r = majit_ir::OpRef::from_raw((__offset + i) as u32);
-                        r
+                        // Array-typed sym storage is the i64 register
+                        // bank; each cell mints `InputArgInt`
+                        // (resoperation.py:719) consistent with the
+                        // scalar i64 sym above and the typed inputarg
+                        // produced by `TraceCtx::new`.
+                        majit_ir::OpRef::input_arg_int((__offset + i) as u32)
                     })
                     .collect();
                 let #value_name: Vec<i64> = vec![0; meta.#len_name];

@@ -3501,11 +3501,14 @@ impl MIFrame {
                 .unwrap_or(majit_ir::Type::Int);
             majit_metainterp::recorder::SnapshotTagged::Const(val, tp)
         } else {
-            // resume.py:211,214: box.type for _number_boxes TAGVIRTUAL/TAGBOX.
+            // resume.py:211,214: box.type lives on the Box itself; the
+            // typed `OpRef` carries the matching variant tag and the
+            // explicit `tp` is the lockstep authority for any
+            // transitional `Untyped` opref (resoperation.py:719/727/739).
             let tp = ctx
                 .get_opref_type(opref)
                 .unwrap_or_else(|| panic!("missing snapshot box type for {:?}", opref));
-            majit_metainterp::recorder::SnapshotTagged::Box(opref.raw(), tp)
+            majit_metainterp::recorder::SnapshotTagged::Box(opref, tp)
         }
     }
 
@@ -3799,7 +3802,7 @@ impl MIFrame {
                     let tp = types.get(i).copied().unwrap_or_else(|| {
                         panic!("missing fail-arg box type at index {} for {:?}", i, opref)
                     });
-                    majit_metainterp::recorder::SnapshotTagged::Box(opref.raw(), tp)
+                    majit_metainterp::recorder::SnapshotTagged::Box(opref, tp)
                 }
             })
             .collect()

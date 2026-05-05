@@ -6529,7 +6529,7 @@ mod tests {
             assert!(
                 active_boxes.iter().any(|b| matches!(
                     b,
-                    SnapshotTagged::Box(li, _) if *li == lower_stack.raw()
+                    SnapshotTagged::Box(li, _) if *li == lower_stack
                 )),
                 "pre-pop snapshot must capture lower stack slot: {:?}",
                 active_boxes
@@ -6537,7 +6537,7 @@ mod tests {
             assert!(
                 active_boxes.iter().any(|b| matches!(
                     b,
-                    SnapshotTagged::Box(ti, _) if *ti == truth.raw()
+                    SnapshotTagged::Box(ti, _) if *ti == truth
                 )),
                 "pre-pop snapshot must capture truth slot: {:?}",
                 active_boxes
@@ -6659,7 +6659,7 @@ mod tests {
         assert!(
             active_boxes.iter().any(|b| matches!(
                 b,
-                SnapshotTagged::Box(li, _) if *li == lower_stack.raw()
+                SnapshotTagged::Box(li, _) if *li == lower_stack
             )),
             "mixed-bank guard must capture lower stack slot: {:?}",
             active_boxes
@@ -6667,7 +6667,7 @@ mod tests {
         assert!(
             active_boxes.iter().any(|b| matches!(
                 b,
-                SnapshotTagged::Box(ti, _) if *ti == truth.raw()
+                SnapshotTagged::Box(ti, _) if *ti == truth
             )),
             "mixed-bank guard must capture truth slot: {:?}",
             active_boxes
@@ -6841,7 +6841,7 @@ mod tests {
         let mut saw_len_field = false;
         let mut saw_new = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             if op.opcode == OpCode::New {
@@ -6908,7 +6908,7 @@ mod tests {
         let mut saw_raw_field = false;
         let mut saw_raw_array = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             match op.opcode {
@@ -6978,7 +6978,7 @@ mod tests {
             let mut saw_call = false;
             let mut saw_new = false;
             for pos in 2..(2 + recorder.num_ops() as u32) {
-                let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+                let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                     continue;
                 };
                 if matches!(
@@ -7090,7 +7090,7 @@ mod tests {
         let mut saw_new = false;
         let mut saw_optional_guard = false;
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             match op.opcode {

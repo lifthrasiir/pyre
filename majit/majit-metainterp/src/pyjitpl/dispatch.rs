@@ -4551,25 +4551,25 @@ mod tests {
         // Pyre's canonical may_force walker mirrors that 5-op shape.
         assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(0)).unwrap().opcode,
             OpCode::ForceToken
         );
-        let set_token = recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap();
+        let set_token = recorder.get_op_by_pos(OpRef::void_op(1)).unwrap();
         assert_eq!(set_token.opcode, OpCode::SetfieldGc);
         assert_eq!(
             set_token.descr.as_ref().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(2)).unwrap().opcode,
             OpCode::CallMayForceN
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(4)).unwrap().opcode,
             OpCode::GuardNoException
         );
     }
@@ -4606,15 +4606,15 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 3);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(2)).unwrap().opcode,
             OpCode::CallMayForceN
         );
     }
@@ -4757,19 +4757,19 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::int_op(2)).unwrap().opcode,
             OpCode::CallMayForceI
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
         assert_eq!(
@@ -4810,19 +4810,19 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(2)).unwrap().opcode,
             OpCode::CallMayForceR
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
         assert_eq!(
@@ -4863,19 +4863,19 @@ mod tests {
         let recorder = ctx.into_recorder();
         assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(0)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(0)).unwrap().opcode,
             OpCode::ForceToken
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(1)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(1)).unwrap().opcode,
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::float_op(2)).unwrap().opcode,
             OpCode::CallMayForceF
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(3)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(3)).unwrap().opcode,
             OpCode::GuardNotForced
         );
         assert_eq!(
@@ -5225,9 +5225,9 @@ mod tests {
         assert_eq!(
             snap.frames[0].boxes,
             vec![
-                crate::recorder::SnapshotTagged::Box(50, Type::Int),
-                crate::recorder::SnapshotTagged::Box(51, Type::Int),
-                crate::recorder::SnapshotTagged::Box(52, Type::Int),
+                crate::recorder::SnapshotTagged::Box(OpRef::from_raw(50), majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(OpRef::from_raw(51), majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(OpRef::from_raw(52), majit_ir::Type::Int),
             ],
             "snapshot boxes must match populate_frame_int_regs output",
         );
@@ -5328,11 +5328,26 @@ mod tests {
         assert_eq!(
             f.boxes,
             vec![
-                crate::recorder::SnapshotTagged::Box(10, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(11, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(20, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(21, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(22, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(10),
+                    majit_ir::Type::Int
+                ),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(11),
+                    majit_ir::Type::Int
+                ),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(20),
+                    majit_ir::Type::Int
+                ),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(21),
+                    majit_ir::Type::Int
+                ),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(22),
+                    majit_ir::Type::Int
+                ),
             ]
         );
     }
@@ -5367,7 +5382,7 @@ mod tests {
         assert_eq!(
             f.boxes,
             vec![crate::recorder::SnapshotTagged::Box(
-                42,
+                majit_ir::OpRef::from_raw(42),
                 majit_ir::Type::Int
             )]
         );
@@ -5433,9 +5448,18 @@ mod tests {
         assert_eq!(
             sub_frame.boxes,
             vec![
-                crate::recorder::SnapshotTagged::Box(11, majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(22, majit_ir::Type::Ref),
-                crate::recorder::SnapshotTagged::Box(33, majit_ir::Type::Float),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(11),
+                    majit_ir::Type::Int
+                ),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(22),
+                    majit_ir::Type::Ref
+                ),
+                crate::recorder::SnapshotTagged::Box(
+                    majit_ir::OpRef::from_raw(33),
+                    majit_ir::Type::Float
+                ),
             ],
             "top sub-frame boxes must come from live_i/live_r/live_f in bank order"
         );

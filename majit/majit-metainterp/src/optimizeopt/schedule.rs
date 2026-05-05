@@ -968,8 +968,8 @@ pub fn unpack_from_vector(
     count: usize,
 ) -> OpRef {
     assert!(count > 0);
-    let index_const = OpRef::from_const(index as u32);
-    let count_const = OpRef::from_const(count as u32);
+    let index_const = OpRef::const_int(index as u32);
+    let count_const = OpRef::const_int(count as u32);
     let is_float = state.is_float_vector(vec_ref);
     let unpack_opcode = if is_float {
         OpCode::VecUnpackF
@@ -1168,8 +1168,8 @@ fn pack_into_vector(
     } else {
         OpCode::VecPackI
     };
-    let tidx_const = OpRef::from_const(tidx as u32);
-    let scount_const = OpRef::from_const(scount as u32);
+    let tidx_const = OpRef::const_int(tidx as u32);
+    let scount_const = OpRef::const_int(scount as u32);
     // schedule.py:494-497: forwarded_vecinfo(tgt).bytesize/signed, newcount
     let tgt_count = get_vec_count(state, tgt);
     let newcount = tgt_count + scount;
@@ -1229,7 +1229,7 @@ fn crop_vector(
     if arg_bytesize > 0 && op_bytesize > 0 && arg_bytesize != op_bytesize {
         // schedule.py:411-417: integer type → VEC_INT_SIGNEXT
         if first_op.opcode.result_type() != majit_ir::Type::Float {
-            let newsize_const = OpRef::from_const(op_bytesize as u32);
+            let newsize_const = OpRef::const_int(op_bytesize as u32);
             let vec_count = get_vec_count(state, arg);
             // schedule.py:414-415: VecOperationNew with proper vecinfo
             let signext_op = state.create_vec_op(
@@ -1368,8 +1368,8 @@ fn expand(
         OpCode::VecPackI
     };
     for (i, &member_arg) in expandargs.iter().enumerate() {
-        let i_const = OpRef::from_const(i as u32);
-        let one_const = OpRef::from_const(1);
+        let i_const = OpRef::const_int(i as u32);
+        let one_const = OpRef::const_int(1);
         // schedule.py:575: create_vec_pack(type, args, bytesize, signed, count+1)
         let pack_op = state.create_vec_op(
             pack_opcode,

@@ -827,7 +827,7 @@ impl MIFrame {
                     if opref.is_constant() {
                         SnapshotTagged::Const(value, Type::Int)
                     } else {
-                        SnapshotTagged::Box(opref.raw(), Type::Int)
+                        SnapshotTagged::Box(opref, Type::Int)
                     }
                 } else {
                     SnapshotTagged::Const(self.jitcode.constants_i[idx - num_regs_i], Type::Int)
@@ -851,7 +851,7 @@ impl MIFrame {
                     if opref.is_constant() {
                         SnapshotTagged::Const(value, Type::Ref)
                     } else {
-                        SnapshotTagged::Box(opref.raw(), Type::Ref)
+                        SnapshotTagged::Box(opref, Type::Ref)
                     }
                 } else {
                     SnapshotTagged::Const(self.jitcode.constants_r[idx - num_regs_r], Type::Ref)
@@ -875,7 +875,7 @@ impl MIFrame {
                     if opref.is_constant() {
                         SnapshotTagged::Const(value, Type::Float)
                     } else {
-                        SnapshotTagged::Box(opref.raw(), Type::Float)
+                        SnapshotTagged::Box(opref, Type::Float)
                     }
                 } else {
                     SnapshotTagged::Const(self.jitcode.constants_f[idx - num_regs_f], Type::Float)
@@ -909,17 +909,22 @@ impl MIFrame {
     ///             registers[i] = newbox
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython reads `oldbox.type` directly off
-    /// the Box.  pyre's OpRef does not carry a type tag, so the bank is
-    /// selected by an explicit `oldbox_type` parameter that the caller
-    /// (`MetaInterp::replace_box`) resolves once via
-    /// `TraceCtx::get_opref_type`.
+    /// pyjitpl.py:240 dispatches on `oldbox.type` — `'i'` / `'r'` / `'f'`
+    /// pick the matching register bank, the `else` arm is `assert 0,
+    /// oldbox`. Pyre's OpRef does not carry a type tag at the call
+    /// boundary, so the bank is selected by an explicit `oldbox_type`
+    /// parameter that the caller (`MetaInterp::replace_box`) resolves
+    /// once via `TraceCtx::get_opref_type`. `Type::Void` panics with the
+    /// upstream assertion message.
     pub fn replace_active_box_in_frame(&mut self, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
         let registers = match oldbox_type {
             Type::Int => &mut self.int_regs,
             Type::Ref => &mut self.ref_regs,
             Type::Float => &mut self.float_regs,
-            Type::Void => return,
+            Type::Void => panic!(
+                "replace_active_box_in_frame: void oldbox {:?} (pyjitpl.py:240 `assert 0, oldbox`)",
+                oldbox
+            ),
         };
         if registers.is_empty() {
             return;
@@ -1426,15 +1431,14 @@ mod tests {
     }
 
     /// Type::Void is not a valid box type (pyjitpl.py:246 `assert 0,
-    /// oldbox`).  The Rust port returns silently rather than panic so a
-    /// stale void OpRef does not bring down tracing in release.
+    /// oldbox`).
     #[test]
-    fn replace_active_box_in_frame_void_type_is_noop() {
+    #[should_panic(expected = "replace_active_box_in_frame: void oldbox")]
+    fn replace_active_box_in_frame_void_type_panics_like_rpython() {
         let jitcode = make_jitcode_with_regs(1, 1, 1);
         let mut frame = MIFrame::new(jitcode, 0);
         frame.int_regs[0] = Some(OpRef::from_raw(7));
         frame.replace_active_box_in_frame(OpRef::from_raw(7), OpRef::from_raw(42), Type::Void);
-        assert_eq!(frame.int_regs[0], Some(OpRef::from_raw(7)));
     }
 
     #[test]

@@ -128,6 +128,18 @@ pub struct ResumeDataResult {
     /// Python-style negative indexing into the parent guard's liveboxes
     /// array; the decoder normalizes via `val + num_failargs`).
     pub num_failargs: i32,
+    /// compile.py:797 ResumeGuardDescr.fail_arg_types — the type tag of
+    /// each parent-guard failarg, in order.
+    ///
+    /// resume.py:1247-1264 decode_box reads `self.liveboxes[num]` and
+    /// returns the actual Box object whose `.type` is intrinsic
+    /// (history.py:220). For the bridge tracer, those liveboxes ARE the
+    /// bridge's `InputArg{Int,Ref,Float}` slots — pyre mints them via
+    /// `OpRef::input_arg_typed(idx, fail_arg_types[idx])`.
+    /// `materialize_bridge_virtual::decode_fieldnum` indexes into this
+    /// vector so the recovered TAGBOX OpRef matches the typed variant
+    /// the optimizer / heap-cache later see.
+    pub fail_arg_types: Vec<Type>,
 }
 
 /// Interpreter-specific JIT state contract.

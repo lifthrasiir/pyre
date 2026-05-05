@@ -74,163 +74,6 @@ impl Default for BridgeKnowledge {
 }
 
 impl BridgeKnowledge {
-    /// bridgeopt.py: serialize_optimizer_knowledge(numb_state, liveboxes, ...)
-    /// Serialize knowledge into a compact byte representation for embedding
-    /// in resume data. This allows bridges to inherit optimization knowledge
-    /// from the loop that spawned them.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        // Format: [num_constants, (opref, value)*, num_nonnull, opref*,
-        //          num_classes, (opref, class_ptr)*, num_bounds, (opref, lo, hi)*]
-        buf.extend_from_slice(&(self.known_constants.len() as u32).to_le_bytes());
-        for (&opref, &value) in &self.known_constants {
-            buf.extend_from_slice(&opref.raw().to_le_bytes());
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-        buf.extend_from_slice(&(self.known_nonnull.len() as u32).to_le_bytes());
-        for opref in &self.known_nonnull {
-            buf.extend_from_slice(&opref.raw().to_le_bytes());
-        }
-        buf.extend_from_slice(&(self.known_classes.len() as u32).to_le_bytes());
-        for (&opref, &class) in &self.known_classes {
-            buf.extend_from_slice(&opref.raw().to_le_bytes());
-            buf.extend_from_slice(&(class.0 as u64).to_le_bytes());
-        }
-        buf.extend_from_slice(&(self.known_bounds.len() as u32).to_le_bytes());
-        for (&opref, &(lo, hi)) in &self.known_bounds {
-            buf.extend_from_slice(&opref.raw().to_le_bytes());
-            buf.extend_from_slice(&lo.to_le_bytes());
-            buf.extend_from_slice(&hi.to_le_bytes());
-        }
-        // Serialize known_fields
-        buf.extend_from_slice(&(self.known_fields.len() as u32).to_le_bytes());
-        for (&(obj, field_idx), &value) in &self.known_fields {
-            buf.extend_from_slice(&obj.raw().to_le_bytes());
-            buf.extend_from_slice(&field_idx.to_le_bytes());
-            buf.extend_from_slice(&value.raw().to_le_bytes());
-        }
-        // Serialize known_arrayitems
-        buf.extend_from_slice(&(self.known_arrayitems.len() as u32).to_le_bytes());
-        for (&(array, index, descr_idx), &value) in &self.known_arrayitems {
-            buf.extend_from_slice(&array.raw().to_le_bytes());
-            buf.extend_from_slice(&index.to_le_bytes());
-            buf.extend_from_slice(&descr_idx.to_le_bytes());
-            buf.extend_from_slice(&value.raw().to_le_bytes());
-        }
-        buf
-    }
-
-    /// bridgeopt.py: deserialize_optimizer_knowledge(numb_state, liveboxes, ...)
-    /// Reconstruct knowledge from serialized bytes.
-    pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        let mut pos = 0;
-        let mut k = BridgeKnowledge::new();
-
-        if buf.len() < 4 {
-            return None;
-        }
-        let n_const = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-        pos += 4;
-        for _ in 0..n_const {
-            if pos + 12 > buf.len() {
-                return None;
-            }
-            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-            pos += 4;
-            let value = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            k.known_constants.insert(opref, value);
-        }
-
-        if pos + 4 > buf.len() {
-            return None;
-        }
-        let n_nonnull = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-        pos += 4;
-        for _ in 0..n_nonnull {
-            if pos + 4 > buf.len() {
-                return None;
-            }
-            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-            pos += 4;
-            k.known_nonnull.push(opref);
-        }
-
-        if pos + 4 > buf.len() {
-            return None;
-        }
-        let n_class = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-        pos += 4;
-        for _ in 0..n_class {
-            if pos + 12 > buf.len() {
-                return None;
-            }
-            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-            pos += 4;
-            let class_val = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            k.known_classes.insert(opref, GcRef(class_val as usize));
-        }
-
-        if pos + 4 > buf.len() {
-            return None;
-        }
-        let n_bounds = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-        pos += 4;
-        for _ in 0..n_bounds {
-            if pos + 20 > buf.len() {
-                return None;
-            }
-            let opref = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-            pos += 4;
-            let lo = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            let hi = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
-            pos += 8;
-            k.known_bounds.insert(opref, (lo, hi));
-        }
-
-        // Deserialize known_fields (if present — backwards compatible)
-        if pos + 4 <= buf.len() {
-            let n_fields = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-            pos += 4;
-            for _ in 0..n_fields {
-                if pos + 12 > buf.len() {
-                    break;
-                }
-                let obj = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-                pos += 4;
-                let field_idx = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
-                pos += 4;
-                let value = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-                pos += 4;
-                k.known_fields.insert((obj, field_idx), value);
-            }
-        }
-
-        // Deserialize known_arrayitems (if present)
-        if pos + 4 <= buf.len() {
-            let n_items = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-            pos += 4;
-            for _ in 0..n_items {
-                if pos + 20 > buf.len() {
-                    break;
-                }
-                let array = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-                pos += 4;
-                let index = i64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
-                pos += 8;
-                let descr_idx = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?);
-                pos += 4;
-                let value = OpRef::from_raw(u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?));
-                pos += 4;
-                k.known_arrayitems.insert((array, index, descr_idx), value);
-            }
-        }
-
-        Some(k)
-    }
-
     /// Whether this knowledge has any useful facts.
     pub fn is_empty(&self) -> bool {
         self.known_constants.is_empty()
@@ -452,37 +295,13 @@ impl Optimization for OptBridgeOpt {
     }
 }
 
-// ── bridgeopt.py: tag/decode helpers ──
-
-/// bridgeopt.py: TAGCONST / TAGINT / TAGBOX constants for resume data encoding.
-pub const TAGCONST: u8 = 0;
-pub const TAGINT: u8 = 1;
-pub const TAGBOX: u8 = 2;
-
-/// bridgeopt.py: tag_box(box, liveboxes_from_env, memo)
-/// Tag a live box reference for serialization in resume data.
-/// Constants get TAGCONST, live boxes get their index with TAGBOX.
-pub fn tag_box(opref: OpRef, liveboxes: &[OpRef]) -> u16 {
-    if let Some(pos) = liveboxes.iter().position(|r| *r == opref) {
-        ((pos as u16) << 2) | (TAGBOX as u16)
-    } else {
-        // Assume constant — encode as TAGINT with the raw value
-        ((opref.raw() as u16) << 2) | (TAGINT as u16)
-    }
-}
-
-/// bridgeopt.py: decode_box(tagged, liveboxes)
-/// Decode a tagged reference back to an OpRef.
-pub fn decode_box(tagged: u16, liveboxes: &[OpRef]) -> OpRef {
-    let tag = (tagged & 0x3) as u8;
-    let num = (tagged >> 2) as usize;
-    match tag {
-        TAGBOX => liveboxes.get(num).copied().unwrap_or(OpRef::NONE),
-        TAGINT => OpRef::from_raw(num as u32),
-        TAGCONST => OpRef::NONE, // constant pool lookup needed
-        _ => OpRef::NONE,
-    }
-}
+// bridgeopt.py:34-50 TAGCONST / TAGINT / TAGBOX dispatch is exposed via
+// `crate::resume::decode_box` (see import at the deserialize call site
+// below). The full-fidelity decoder consults `rd_consts` for TAGCONST,
+// returning a typed `Const{Int,Float,Ptr}` Box that
+// `decoded_box_to_opref` then folds into the optimizer constant pool.
+// Earlier inline `tag_box` / `decode_box` stubs were never wired into
+// the deserialize path and have been removed.
 
 #[cfg(test)]
 mod tests {
@@ -864,40 +683,6 @@ mod tests {
             ),
         }
     }
-
-    #[test]
-    fn test_serialize_deserialize_roundtrip() {
-        let mut k = BridgeKnowledge::new();
-        k.known_constants.insert(OpRef::from_raw(10), 42);
-        k.known_constants.insert(OpRef::from_raw(20), -1);
-        k.known_nonnull.push(OpRef::from_raw(30));
-        k.known_classes.insert(OpRef::from_raw(40), GcRef(0x1000));
-        k.known_bounds.insert(OpRef::from_raw(50), (0, 100));
-        k.add_known_field(OpRef::from_raw(60), 5, OpRef::from_raw(70));
-        k.add_known_arrayitem(OpRef::from_raw(80), 3, 7, OpRef::from_raw(90));
-
-        let serialized = k.serialize();
-        let deserialized = BridgeKnowledge::deserialize(&serialized).unwrap();
-
-        assert_eq!(deserialized.known_constants.len(), 2);
-        assert_eq!(deserialized.known_constants[&OpRef::from_raw(10)], 42);
-        assert_eq!(deserialized.known_constants[&OpRef::from_raw(20)], -1);
-        assert_eq!(deserialized.known_nonnull.len(), 1);
-        assert_eq!(deserialized.known_classes.len(), 1);
-        assert_eq!(deserialized.known_bounds.len(), 1);
-        assert_eq!(deserialized.known_fields.len(), 1);
-        assert_eq!(deserialized.known_arrayitems.len(), 1);
-        assert_eq!(deserialized.num_facts(), k.num_facts());
-    }
-
-    #[test]
-    fn test_serialize_empty() {
-        let k = BridgeKnowledge::new();
-        assert!(k.is_empty());
-        let serialized = k.serialize();
-        let deserialized = BridgeKnowledge::deserialize(&serialized).unwrap();
-        assert!(deserialized.is_empty());
-    }
 }
 
 /// bridgeopt.py:124-185 deserialize_optimizer_knowledge.
@@ -941,7 +726,7 @@ pub fn serialize_optimizer_knowledge(
     let available_boxes: std::collections::HashMap<OpRef, ()> = liveboxes
         .iter()
         .filter_map(|opt| *opt)
-        .filter(|opref| numb_state.liveboxes.contains_key(opref.raw()))
+        .filter(|opref| numb_state.liveboxes.contains_key(*opref))
         .map(|opref| (opref, ()))
         .collect();
 

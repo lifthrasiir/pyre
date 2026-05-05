@@ -2623,9 +2623,12 @@ mod tests {
     fn compile_loop_records_token_inputarg_types() {
         let mut backend = DynasmBackend::new();
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        // Match the typed `InputArg{Ref,Int}` boxes registered by the
+        // backend regalloc — variant-aware Eq makes Untyped(N) and
+        // InputArg{Ref,Int}(N) distinct keys.
         let ops = vec![mk_op(
             OpCode::Finish,
-            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
             OpRef::NONE.raw(),
         )];
 

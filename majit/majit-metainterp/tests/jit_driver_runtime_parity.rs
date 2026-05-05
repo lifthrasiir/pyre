@@ -8,6 +8,20 @@ use majit_metainterp::{
     virtualizable::VirtualizableInfo,
 };
 
+/// resoperation.py:719/727/739 `inputarg_from_tp(tp)` parity: mint a
+/// sequence of typed `InputArg{Int,Float,Ref}` OpRefs for a test's
+/// `JitState::create_sym`. The caller passes the same `Type` slice
+/// that `extract_live_values` produces values for, so the sym entries
+/// match the production typed inputargs the tracer would record.
+#[allow(dead_code)]
+fn typed_inputarg_sym(types: &[Type]) -> Vec<OpRef> {
+    types
+        .iter()
+        .enumerate()
+        .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
+        .collect()
+}
+
 #[allow(dead_code)]
 fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Type)]) {
     let snapshot_id = ctx.capture_resumedata(Snapshot {
@@ -16,7 +30,7 @@ fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Ty
             pc,
             boxes: boxes
                 .iter()
-                .map(|(opref, tp)| SnapshotTagged::Box(opref.raw(), *tp))
+                .map(|(opref, tp)| SnapshotTagged::Box(*opref, *tp))
                 .collect(),
         }],
         vable_boxes: Vec::new(),
@@ -157,7 +171,7 @@ impl JitState for TestState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -205,7 +219,7 @@ impl JitState for BadLiveState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0)]
+        typed_inputarg_sym(&[Type::Ref])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -253,7 +267,7 @@ impl JitState for ExtraLiveState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -298,7 +312,7 @@ impl JitState for TypedState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Float])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -354,7 +368,7 @@ impl JitState for MismatchedTypedState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Int, Type::Float])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -393,7 +407,7 @@ impl JitState for TypedRestoreOnlyState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Float])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -451,7 +465,7 @@ impl JitState for VirtualizableSyncState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -611,7 +625,7 @@ impl JitState for NamedVirtualizableSyncState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -682,7 +696,7 @@ impl JitState for AutoVirtualizableState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -784,7 +798,7 @@ impl JitState for ResumeMappedState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -838,7 +852,7 @@ impl JitState for VirtualResumeState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -901,7 +915,7 @@ impl JitState for PendingWriteState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -965,7 +979,7 @@ impl JitState for PendingArrayWriteState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -1030,7 +1044,7 @@ impl JitState for MultiFrameResumeState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -1102,7 +1116,7 @@ impl JitState for GenericMultiFrameResumeState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -1210,7 +1224,7 @@ impl JitState for LayoutTypedFrameRestoreState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Int])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -1288,7 +1302,7 @@ impl JitState for PendingVirtualWriteState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1)]
+        typed_inputarg_sym(&[Type::Ref, Type::Ref])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -1377,7 +1391,7 @@ impl JitState for NestedVirtualResumeState {
     }
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        vec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)]
+        typed_inputarg_sym(&[Type::Ref, Type::Ref, Type::Ref])
     }
 
     fn is_compatible(&self, _meta: &Self::Meta) -> bool {
@@ -1672,7 +1686,7 @@ fn declarative_driver_preserves_typed_red_inputargs_on_trace_start() {
 
     let (trace, _) = driver
         .meta_interp_mut()
-        .finish_trace_for_parity(&[OpRef::from_raw(0), OpRef::from_raw(1)])
+        .finish_trace_for_parity(&typed_inputarg_sym(&[Type::Ref, Type::Float]))
         .expect("trace should be finishable for parity");
     assert_eq!(trace.inputargs.len(), 2);
     assert_eq!(trace.inputargs[0].tp, Type::Ref);

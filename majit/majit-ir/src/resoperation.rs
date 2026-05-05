@@ -21,11 +21,10 @@ use crate::value::{Const, GcRef, Type};
 /// audits each `from_raw` call site and specializes it to a typed
 /// factory.
 ///
-/// `PartialEq` / `Eq` / `Hash` are implemented manually on `.raw()` so
-/// that two OpRefs with the same raw u32 but different variant tags
-/// (e.g. `Untyped(x)` vs `ConstInt(x)`) compare equal — preserving
-/// pre-Phase-3 equality semantics until Phase 5 migrates HashMap keys
-/// from u32 to OpRef.
+/// `PartialEq` / `Eq` / `Hash` include the enum variant, not just `.raw()`.
+/// This keeps the disjoint RPython Box classes disjoint even when Pyre's
+/// flat encoding reuses the same raw position across InputArg / ResOp /
+/// Const namespaces.
 #[derive(Clone, Copy, Debug)]
 pub enum OpRef {
     /// Sentinel for missing/absent reference; `OpRef::NONE` aliases this.
@@ -278,22 +277,19 @@ impl OpRef {
     }
 }
 
-/// PRE-EXISTING-ADAPTATION: Eq/Hash use only `.raw()`, so
-/// `ConstInt(x) == ConstFloat(x) == ConstPtr(x) == Untyped(x)` when raw
-/// payloads coincide. RPython's `AbstractValue.same_box` is `self is
-/// other` (object identity); `ConstInt.same_constant` rejects against
-/// `ConstFloat` (history.py:244, history.py:285). Variant-aware Eq/Hash
-/// is the correct port but cascades into ~45 test fixture assertions
-/// (`assert_eq!(typed, from_raw)`) and at least one regalloc round-trip
-/// path that reconstructs OpRefs via `from_raw(stored_raw)` and looks
-/// them up in `HashMap<OpRef, V>` storage. Convergence requires a
-/// dedicated slice that (a) flips fixtures to typed factories and (b)
-/// audits every storage round-trip site for typed reconstruction —
-/// most likely co-landing with the Phase 5 `HashMap<u32, V> →
-/// HashMap<OpRef, V>` migration that retires the `Untyped` variant.
+/// `PartialEq` / `Hash` are variant-aware: the enum discriminant
+/// participates so `ConstInt(x) != ConstFloat(x) != ConstPtr(x) !=
+/// Untyped(x)` even when raw payloads coincide. Mirrors RPython's
+/// `AbstractValue.same_box` (resoperation.py:38 `self is other`) and
+/// `ConstInt.same_constant` (history.py:244) which reject across the
+/// disjoint Const / InputArg / ResOp sub-hierarchies.
+///
+/// Hand-written rather than `#[derive]` so that `Self::None` collapses
+/// onto a single hash bucket — the variant is a sentinel and its
+/// `raw()` value of `u32::MAX` is encoding-internal, not semantic.
 impl PartialEq for OpRef {
     fn eq(&self, other: &Self) -> bool {
-        self.raw() == other.raw()
+        std::mem::discriminant(self) == std::mem::discriminant(other) && self.raw() == other.raw()
     }
 }
 
@@ -301,6 +297,7 @@ impl Eq for OpRef {}
 
 impl std::hash::Hash for OpRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
         self.raw().hash(state);
     }
 }
@@ -4610,29 +4607,59 @@ mod tests {
     // ── Typed OpRef constructors (Phase 2A) ──
 
     #[test]
-    fn test_typed_const_constructors_match_legacy() {
+    fn typed_const_constructors_share_raw_with_legacy_but_keep_variant_distinct() {
+        // history.py:244 `ConstInt.same_constant` rejects `ConstFloat` /
+        // `ConstPtr` — Const sub-classes are disjoint identities even
+        // at matching raw payloads.
         for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
-            assert_eq!(OpRef::const_int(idx), OpRef::from_const(idx));
-            assert_eq!(OpRef::const_float(idx), OpRef::from_const(idx));
-            assert_eq!(OpRef::const_ptr(idx), OpRef::from_const(idx));
+            assert_eq!(OpRef::const_int(idx).raw(), OpRef::from_const(idx).raw());
+            assert_eq!(OpRef::const_float(idx).raw(), OpRef::from_const(idx).raw());
+            assert_eq!(OpRef::const_ptr(idx).raw(), OpRef::from_const(idx).raw());
+            assert_ne!(OpRef::const_int(idx), OpRef::from_const(idx));
+            assert_ne!(OpRef::const_float(idx), OpRef::from_const(idx));
+            assert_ne!(OpRef::const_ptr(idx), OpRef::from_const(idx));
+            assert_ne!(OpRef::const_int(idx), OpRef::const_float(idx));
+            assert_ne!(OpRef::const_int(idx), OpRef::const_ptr(idx));
+            assert_ne!(OpRef::const_float(idx), OpRef::const_ptr(idx));
         }
     }
 
     #[test]
-    fn test_typed_input_arg_constructors_match_legacy() {
+    fn typed_input_arg_constructors_share_raw_with_legacy_but_keep_variant_distinct() {
+        // resoperation.py:719/727/739 `InputArg{Int,Float,Ref}` are
+        // disjoint Box classes; the enum discriminant rejects
+        // cross-variant identity even at matching raw payloads.
         for pos in [0u32, 1, 7, 100] {
-            assert_eq!(OpRef::input_arg_int(pos), OpRef::from_raw(pos));
-            assert_eq!(OpRef::input_arg_float(pos), OpRef::from_raw(pos));
-            assert_eq!(OpRef::input_arg_ref(pos), OpRef::from_raw(pos));
+            assert_eq!(OpRef::input_arg_int(pos).raw(), OpRef::from_raw(pos).raw());
+            assert_eq!(
+                OpRef::input_arg_float(pos).raw(),
+                OpRef::from_raw(pos).raw()
+            );
+            assert_eq!(OpRef::input_arg_ref(pos).raw(), OpRef::from_raw(pos).raw());
+            assert_ne!(OpRef::input_arg_int(pos), OpRef::from_raw(pos));
+            assert_ne!(OpRef::input_arg_float(pos), OpRef::from_raw(pos));
+            assert_ne!(OpRef::input_arg_ref(pos), OpRef::from_raw(pos));
+            assert_ne!(OpRef::input_arg_int(pos), OpRef::input_arg_float(pos));
+            assert_ne!(OpRef::input_arg_int(pos), OpRef::input_arg_ref(pos));
+            assert_ne!(OpRef::input_arg_float(pos), OpRef::input_arg_ref(pos));
         }
     }
 
     #[test]
-    fn test_typed_op_result_constructors_match_legacy() {
+    fn typed_op_result_constructors_share_raw_with_legacy_but_keep_variant_distinct() {
+        // resoperation.py:564-638 `IntOp` / `FloatOp` / `RefOp` mixins:
+        // each ResOp's `.type` is fixed by the mixin class, so the typed
+        // factories must not collapse onto type-erased `from_raw`.
         for pos in [0u32, 1, 7, 100, 1_000_000] {
-            assert_eq!(OpRef::int_op(pos), OpRef::from_raw(pos));
-            assert_eq!(OpRef::float_op(pos), OpRef::from_raw(pos));
-            assert_eq!(OpRef::ref_op(pos), OpRef::from_raw(pos));
+            assert_eq!(OpRef::int_op(pos).raw(), OpRef::from_raw(pos).raw());
+            assert_eq!(OpRef::float_op(pos).raw(), OpRef::from_raw(pos).raw());
+            assert_eq!(OpRef::ref_op(pos).raw(), OpRef::from_raw(pos).raw());
+            assert_ne!(OpRef::int_op(pos), OpRef::from_raw(pos));
+            assert_ne!(OpRef::float_op(pos), OpRef::from_raw(pos));
+            assert_ne!(OpRef::ref_op(pos), OpRef::from_raw(pos));
+            assert_ne!(OpRef::int_op(pos), OpRef::float_op(pos));
+            assert_ne!(OpRef::int_op(pos), OpRef::ref_op(pos));
+            assert_ne!(OpRef::float_op(pos), OpRef::ref_op(pos));
         }
     }
 

@@ -3717,11 +3717,14 @@ mod tests {
     #[test]
     fn test_explicit_result_positions_are_preserved_through_rewrite() {
         let rw = make_rewriter();
-        let ops = vec![
-            mk_op_with_descr(OpCode::New, &[], 2, size_descr(24, 1)),
-            mk_op_with_descr(OpCode::New, &[], 3, size_descr(16, 2)),
-            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], 4),
-        ];
+        // `OpCode::New` produces a Ref result (resoperation.py:469
+        // `RefOp` mixin), so the test mints typed `RefOp` pos rather
+        // than the default `Untyped` minted by `mk_op_with_descr`.
+        let mut new_a = Op::with_descr(OpCode::New, &[], size_descr(24, 1));
+        new_a.pos = OpRef::ref_op(2);
+        let mut new_b = Op::with_descr(OpCode::New, &[], size_descr(16, 2));
+        new_b.pos = OpRef::ref_op(3);
+        let ops = vec![new_a, new_b, mk_op(OpCode::Finish, &[OpRef::ref_op(3)], 4)];
 
         let result = rw.rewrite_for_gc(&ops);
 

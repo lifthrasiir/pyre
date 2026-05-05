@@ -428,11 +428,10 @@ impl TreeLoop {
                 let remap_tagged =
                     |t: &crate::recorder::SnapshotTagged| -> crate::recorder::SnapshotTagged {
                         match t {
-                            crate::recorder::SnapshotTagged::Box(n, tp) => {
-                                let old_ref = OpRef::from_raw(*n);
-                                if let Some(&new_ref) = remap.get(&old_ref) {
-                                    crate::recorder::SnapshotTagged::Box(new_ref.raw(), *tp)
-                                } else if !Self::is_runtime_opref(old_ref) {
+                            crate::recorder::SnapshotTagged::Box(old_ref, tp) => {
+                                if let Some(&new_ref) = remap.get(old_ref) {
+                                    crate::recorder::SnapshotTagged::Box(new_ref, *tp)
+                                } else if !Self::is_runtime_opref(*old_ref) {
                                     // Constants and NONE pass through unchanged.
                                     t.clone()
                                 } else {
@@ -441,7 +440,7 @@ impl TreeLoop {
                                     // Box has no entry in the post-cut namespace.
                                     // Map to NONE so _number_boxes emits
                                     // UNINITIALIZED rather than a stale TAGBOX.
-                                    crate::recorder::SnapshotTagged::Box(OpRef::NONE.raw(), *tp)
+                                    crate::recorder::SnapshotTagged::Box(OpRef::NONE, *tp)
                                 }
                             }
                             other => other.clone(),
@@ -470,6 +469,18 @@ impl TreeLoop {
 mod tests {
     use super::*;
     use majit_ir::Type;
+
+    fn iarg(pos: u32) -> OpRef {
+        OpRef::input_arg_int(pos)
+    }
+
+    fn iop(pos: u32) -> OpRef {
+        OpRef::int_op(pos)
+    }
+
+    fn vop(pos: u32) -> OpRef {
+        OpRef::void_op(pos)
+    }
 
     #[test]
     fn test_empty_trace() {
@@ -1023,20 +1034,20 @@ mod tests {
         // opencoder.py:848-850 Trace.get_iter() — produce a TraceIterator
         // that walks the trace producing fresh boxes per visited op.
         // The trace must reference its own inputargs at OpRef positions
-        // [0, num_inputargs); a malformed trace that references OpRef::from_raw(0)
+        // [0, num_inputargs); a malformed trace that references raw 0
         // without a matching inputarg would cache-miss in `_get`.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut add = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        add.pos = OpRef::from_raw(2);
-        let ops = vec![add, Op::new(OpCode::Jump, &[OpRef::from_raw(2)])];
+        let mut add = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
+        add.pos = iop(2);
+        let ops = vec![add, Op::new(OpCode::Jump, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         let mut iter = trace.get_iter();
         assert!(!iter.done());
         // Walk one op via TraceIterator.next() — opencoder.py:362-406.
         let r = iter.next().unwrap();
-        assert_eq!(r.pos, OpRef::from_raw(2));
-        assert_eq!(r.args[0], OpRef::from_raw(0));
-        assert_eq!(r.args[1], OpRef::from_raw(1));
+        assert_eq!(r.pos, iop(2));
+        assert_eq!(r.args[0], iarg(0));
+        assert_eq!(r.args[1], iarg(1));
         assert_eq!(iter.pos, 1);
     }
 
@@ -1071,31 +1082,31 @@ mod tests {
         // or defined after the cut.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
-        // Pre-cut ops (2 inputargs → first op is OpRef::from_raw(2))
-        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        op0.pos = OpRef::from_raw(2);
+        // Pre-cut ops (2 inputargs → first op is BoxInt at position 2)
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
+        op0.pos = iop(2);
         ops.push(op0);
         // Post-cut ops
-        let mut op1 = Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        op1.pos = OpRef::from_raw(3);
+        let mut op1 = Op::new(OpCode::IntMul, &[iarg(0), iarg(1)]);
+        op1.pos = iop(3);
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[OpRef::from_raw(3)]);
-        op2.pos = OpRef::from_raw(4);
+        let mut op2 = Op::new(OpCode::Jump, &[iop(3)]);
+        op2.pos = vop(4);
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(1); // cut after op0
-        let original_boxes = vec![OpRef::from_raw(0), OpRef::from_raw(1)];
+        let original_boxes = vec![iarg(0), iarg(1)];
         let original_box_types = vec![Type::Int, Type::Int];
 
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
         assert_eq!(cut.inputargs.len(), 2);
         assert_eq!(cut.ops.len(), 2); // IntMul + Jump
         assert_eq!(cut.ops[0].opcode, OpCode::IntMul);
-        assert_eq!(cut.ops[0].args[0], OpRef::from_raw(0)); // remapped from OpRef::from_raw(0)
-        assert_eq!(cut.ops[0].args[1], OpRef::from_raw(1)); // remapped from OpRef::from_raw(1)
+        assert_eq!(cut.ops[0].args[0], iarg(0)); // remapped from iarg(0)
+        assert_eq!(cut.ops[0].args[1], iarg(1)); // remapped from iarg(1)
         assert_eq!(cut.ops[1].opcode, OpCode::Jump);
-        assert_eq!(cut.ops[1].args[0], OpRef::from_raw(2)); // remapped from OpRef::from_raw(3) → new idx 2
+        assert_eq!(cut.ops[1].args[0], iop(2)); // remapped from iop(3) → new idx 2
     }
 
     #[test]
@@ -1105,21 +1116,21 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut ops = Vec::new();
         // op0: v2 = int_add(v0, v1) — before cut
-        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        op0.pos = OpRef::from_raw(2);
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
+        op0.pos = iop(2);
         ops.push(op0);
         // op1: v3 = int_mul(v2, v0) — after cut, references v2 (escaped!)
-        let mut op1 = Op::new(OpCode::IntMul, &[OpRef::from_raw(2), OpRef::from_raw(0)]);
-        op1.pos = OpRef::from_raw(3);
+        let mut op1 = Op::new(OpCode::IntMul, &[iop(2), iarg(0)]);
+        op1.pos = iop(3);
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[OpRef::from_raw(3)]);
-        op2.pos = OpRef::from_raw(4);
+        let mut op2 = Op::new(OpCode::Jump, &[iop(3)]);
+        op2.pos = vop(4);
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(1); // cut after op0
         // original_boxes only has v0 — v2 is escaped
-        let original_boxes = vec![OpRef::from_raw(0)];
+        let original_boxes = vec![iarg(0)];
         let original_box_types = vec![Type::Int];
 
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
@@ -1136,21 +1147,21 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         // pre-cut: noop
-        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]);
-        op0.pos = OpRef::from_raw(1);
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        op0.pos = iop(1);
         ops.push(op0);
         // post-cut: uses a constant
-        let const_ref = OpRef::from_const(0);
-        let mut op1 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), const_ref]);
-        op1.pos = OpRef::from_raw(2);
+        let const_ref = OpRef::const_int(0);
+        let mut op1 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
+        op1.pos = iop(2);
         ops.push(op1);
-        let mut op2 = Op::new(OpCode::Jump, &[OpRef::from_raw(2)]);
-        op2.pos = OpRef::from_raw(3);
+        let mut op2 = Op::new(OpCode::Jump, &[iop(2)]);
+        op2.pos = vop(3);
         ops.push(op2);
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(1);
-        let original_boxes = vec![OpRef::from_raw(0)];
+        let original_boxes = vec![iarg(0)];
         let original_box_types = vec![Type::Int];
 
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
@@ -1165,24 +1176,24 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
         // v1 = int_add(v0, v0) — before cut
-        let mut op0 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]);
-        op0.pos = OpRef::from_raw(1);
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        op0.pos = iop(1);
         ops.push(op0);
         // v2 = int_mul(v1, v0) — before cut
-        let mut op1 = Op::new(OpCode::IntMul, &[OpRef::from_raw(1), OpRef::from_raw(0)]);
-        op1.pos = OpRef::from_raw(2);
+        let mut op1 = Op::new(OpCode::IntMul, &[iop(1), iarg(0)]);
+        op1.pos = iop(2);
         ops.push(op1);
         // v3 = int_sub(v2, v0) — after cut, references v2 (escaped, depends on v1)
-        let mut op2 = Op::new(OpCode::IntSub, &[OpRef::from_raw(2), OpRef::from_raw(0)]);
-        op2.pos = OpRef::from_raw(3);
+        let mut op2 = Op::new(OpCode::IntSub, &[iop(2), iarg(0)]);
+        op2.pos = iop(3);
         ops.push(op2);
-        let mut op3 = Op::new(OpCode::Jump, &[OpRef::from_raw(3)]);
-        op3.pos = OpRef::from_raw(4);
+        let mut op3 = Op::new(OpCode::Jump, &[iop(3)]);
+        op3.pos = vop(4);
         ops.push(op3);
         let trace = TreeLoop::new(inputargs, ops);
 
         let start = TreeLoopCutPosition::new(2); // cut after op0 and op1
-        let original_boxes = vec![OpRef::from_raw(0)];
+        let original_boxes = vec![iarg(0)];
         let original_box_types = vec![Type::Int];
 
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
@@ -1194,6 +1205,6 @@ mod tests {
         assert_eq!(cut.ops[2].opcode, OpCode::IntSub);
         assert_eq!(cut.ops[3].opcode, OpCode::Jump);
         // Verify remapping chain: v2's arg should reference re-emitted v1
-        assert_eq!(cut.ops[1].args[0], OpRef::from_raw(1)); // v1 → prefix idx 0 → OpRef::from_raw(1)
+        assert_eq!(cut.ops[1].args[0], iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
     }
 }

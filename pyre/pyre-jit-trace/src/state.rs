@@ -1420,18 +1420,22 @@ pub struct PyreSym {
     pub(crate) bridge_local_types: Option<Vec<Type>>,
     // virtualizable.py:86-93: ALL static fields in declared order.
     // RPython's unroll_static_fields includes every field from
-    // _virtualizable_; ALL must be inputarg (not info_only).
-    #[vable(inputarg)]
+    // _virtualizable_; ALL must be inputarg (not info_only). The `type`
+    // tag below mirrors pyframe.py's static-field declared types so the
+    // macro mints `OpRef::input_arg_int/ref` matching the RPython
+    // `InputArgInt`/`InputArgRef` class for that slot
+    // (resoperation.py:719/739).
+    #[vable(inputarg, type = int)]
     pub(crate) vable_last_instr: OpRef,
-    #[vable(inputarg)]
+    #[vable(inputarg, type = ref)]
     pub(crate) vable_pycode: OpRef,
-    #[vable(inputarg)]
+    #[vable(inputarg, type = int)]
     pub(crate) vable_valuestackdepth: OpRef,
-    #[vable(inputarg)]
+    #[vable(inputarg, type = ref)]
     pub(crate) vable_debugdata: OpRef,
-    #[vable(inputarg)]
+    #[vable(inputarg, type = ref)]
     pub(crate) vable_lastblock: OpRef,
-    #[vable(inputarg)]
+    #[vable(inputarg, type = ref)]
     pub(crate) vable_w_globals: OpRef,
     #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
@@ -3830,22 +3834,40 @@ fn materialize_bridge_virtual(
         let (val, tagbits) = untag(tagged);
         match tagbits {
             TAGBOX => {
-                // resume.py:1556-1564 decode_box parity:
+                // resume.py:1247-1264 decode_box parity:
                 //   if num < 0: num += len(liveboxes)
-                //   return liveboxes[num]
-                // Negative `val` is Python-style indexing into the parent
-                // guard's liveboxes array (`num_failargs` long). For
-                // bridges, the boxes are inputargs at OpRef::from_raw(0..n_inputargs).
+                //   return self.liveboxes[num]
+                // The returned Box object carries `box.type` intrinsically
+                // (history.py:220). For the bridge tracer, those liveboxes
+                // are the bridge's `InputArg{Int,Ref,Float}` slots, so we
+                // mint the typed `OpRef::input_arg_typed` variant matching
+                // `fail_arg_types[idx]` rather than a bare untyped raw
+                // OpRef — variant-aware Eq (resoperation.rs:290) requires
+                // the optimizer/heap-cache key to be the same typed variant
+                // the bridge inputarg list produces.
                 let idx = if val < 0 {
                     val + resume_data.num_failargs
                 } else {
                     val
                 };
-                if idx < 0 {
-                    OpRef::NONE
-                } else {
-                    OpRef::from_raw(idx as u32)
-                }
+                // resume.py:1261 `box = self.liveboxes[num]` — direct
+                // indexing, IndexError on out-of-range. Encoder /
+                // decoder asymmetry is a bug, not a silent fallback;
+                // mirror the upstream fail-loud contract.
+                let tp = *resume_data
+                    .fail_arg_types
+                    .get(idx as usize)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "decode_fieldnum TAGBOX out-of-range: idx={} num_failargs={} \
+                             fail_arg_types.len()={} (encoder/decoder mismatch — see \
+                             resume.py:1245-1264 decode_box)",
+                            idx,
+                            resume_data.num_failargs,
+                            resume_data.fail_arg_types.len()
+                        )
+                    });
+                OpRef::input_arg_typed(idx as u32, tp)
             }
             TAGINT => ctx.const_int(val as i64),
             TAGCONST => {
@@ -5011,6 +5033,12 @@ impl JitState for PyreJitState {
             // bridge virtual materialization (resume.py:1556-1564 decode_box
             // negative-index normalization: `num + len(liveboxes)`).
             num_failargs,
+            // compile.py:797 ResumeGuardDescr.fail_arg_types — kept so
+            // `materialize_bridge_virtual::decode_fieldnum` can mint typed
+            // `OpRef::input_arg_typed(idx, fail_arg_types[idx])` per
+            // resume.py:1247-1264 (`return self.liveboxes[num]` whose Box
+            // carries history.py:220 `box.type`).
+            fail_arg_types: fail_arg_types.to_vec(),
         })
     }
 
@@ -6803,14 +6831,19 @@ mod tests {
 
         let sym = PyreJitState::pypyjit_create_sym(&meta, 0);
 
-        assert_eq!(sym.frame, OpRef::from_raw(0));
-        assert_eq!(sym.execution_context, OpRef::from_raw(1));
-        assert_eq!(sym.vable_last_instr, OpRef::from_raw(2));
-        assert_eq!(sym.vable_pycode, OpRef::from_raw(3));
-        assert_eq!(sym.vable_valuestackdepth, OpRef::from_raw(4));
-        assert_eq!(sym.vable_debugdata, OpRef::from_raw(5));
-        assert_eq!(sym.vable_lastblock, OpRef::from_raw(6));
-        assert_eq!(sym.vable_w_globals, OpRef::from_raw(7));
+        // virtualizable derive `init_vable_indices` mints typed
+        // `OpRef::input_arg_*` variants per `#[vable(inputarg, type = ...)]`
+        // (state.rs:1428-1438). The expected slot variants must match those
+        // exact types so variant-aware OpRef Eq (resoperation.rs:290)
+        // compares correctly against later optimizer/heap-cache keys.
+        assert_eq!(sym.frame, OpRef::input_arg_ref(0));
+        assert_eq!(sym.execution_context, OpRef::input_arg_ref(1));
+        assert_eq!(sym.vable_last_instr, OpRef::input_arg_int(2));
+        assert_eq!(sym.vable_pycode, OpRef::input_arg_ref(3));
+        assert_eq!(sym.vable_valuestackdepth, OpRef::input_arg_int(4));
+        assert_eq!(sym.vable_debugdata, OpRef::input_arg_ref(5));
+        assert_eq!(sym.vable_lastblock, OpRef::input_arg_ref(6));
+        assert_eq!(sym.vable_w_globals, OpRef::input_arg_ref(7));
         assert_eq!(sym.vable_array_base, Some(8));
         assert_eq!(sym.symbolic_local_types.len(), 2);
         assert_eq!(sym.symbolic_stack_types.len(), 2);
@@ -6944,7 +6977,7 @@ mod tests {
         let mut saw_guard_nonnull_class = false;
         let mut saw_pure_payload = false;
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             if op.opcode == OpCode::GuardNonnullClass {
@@ -6997,7 +7030,7 @@ mod tests {
             .expect("payload op should be present");
         assert_eq!(payload_op.opcode, OpCode::GetfieldGcPureI);
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             assert_ne!(
@@ -7077,7 +7110,7 @@ mod tests {
         assert_eq!(sym.locals_cells_stack_array_ref, OpRef::NONE);
         let recorder = ctx.into_recorder();
         for pos in 1..(1 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             assert_ne!(
@@ -7582,8 +7615,12 @@ mod tests {
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
-        let lhs = OpRef::from_raw(0);
-        let rhs = OpRef::from_raw(1);
+        // Typed `InputArgInt` inputarg slots — `compare_value_direct`
+        // routes through `is_int_typed` lookups (history.py:220
+        // box.type) and Untyped slots silently fall through to the
+        // boxed-bool path under variant-aware Eq.
+        let lhs = OpRef::input_arg_int(0);
+        let rhs = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
@@ -7618,7 +7655,7 @@ mod tests {
         let mut saw_bool_call = false;
         let mut saw_bool_unbox = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             if op.opcode == OpCode::IntLt {
@@ -7637,7 +7674,9 @@ mod tests {
         );
         assert_eq!(
             result,
-            OpRef::from_raw(2),
+            // IntLt at op pos 2 — `IntOp` mixin (resoperation.py:564),
+            // `box.type='i'` (history.py:220).
+            OpRef::int_op(2),
             "with two input args, the immediate branch consumer should receive the raw comparison truth"
         );
         assert!(
@@ -7664,8 +7703,12 @@ mod tests {
         let _frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
         let mut ctx = TraceCtx::for_test(2);
-        let lhs = OpRef::from_raw(0);
-        let rhs = OpRef::from_raw(1);
+        // Typed `InputArgInt` inputarg slots — `compare_value_direct`
+        // routes through `is_int_typed` lookups (history.py:220
+        // box.type) and Untyped slots silently fall through to the
+        // boxed-bool path under variant-aware Eq.
+        let lhs = OpRef::input_arg_int(0);
+        let rhs = OpRef::input_arg_int(1);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.valuestackdepth = 0;
         sym.jitcode = jitcode_for(code_ref);
@@ -7698,7 +7741,7 @@ mod tests {
         let recorder = ctx.into_recorder();
         let mut saw_bool_call = false;
         for pos in 2..(2 + recorder.num_ops() as u32) {
-            let Some(op) = recorder.get_op_by_pos(OpRef::from_raw(pos)) else {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
                 continue;
             };
             if op.opcode == OpCode::CallR {
@@ -8040,6 +8083,7 @@ mod tests {
             virtualref_values: Vec::new(),
             storage: None,
             num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.to_vec(),
         };
 
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
@@ -8052,13 +8096,22 @@ mod tests {
         );
 
         assert_eq!(sym.valuestackdepth, 3);
+        // setup_bridge_sym now restores typed `InputArg*` OpRefs from
+        // `RebuiltValue::Box(idx, tp)` per state.rs:4647. The resolve
+        // closure produces `OpRef::input_arg_typed(idx, tp)`; expectations
+        // must match so variant-aware Eq lines up with the resolved
+        // bridge inputarg list.
         assert_eq!(
             sym.registers_r,
-            vec![OpRef::from_raw(8), OpRef::from_raw(9), OpRef::from_raw(10)]
+            vec![
+                OpRef::input_arg_ref(8),
+                OpRef::input_arg_ref(9),
+                OpRef::input_arg_ref(10)
+            ]
         );
         assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
         assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
-        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::from_raw(8)]));
+        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::input_arg_ref(8)]));
     }
 
     #[test]
@@ -8081,17 +8134,29 @@ mod tests {
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
-        let mut sym = PyreSym::new_uninit(OpRef::from_raw(0));
-        sym.execution_context = OpRef::from_raw(1);
+        // The vable static-field types come from `state.rs:1428-1438`
+        // `#[vable(inputarg, type = ...)]` annotations: int/ref/int/ref/
+        // ref/ref. Mint typed `OpRef::input_arg_*` variants matching
+        // those tags so variant-aware Eq (resoperation.rs:290) lines up
+        // with what the production `init_vable_indices` produces.
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.execution_context = OpRef::input_arg_ref(1);
         sym.nlocals = 1;
         sym.valuestackdepth = 3;
-        sym.vable_last_instr = OpRef::from_raw(2);
-        sym.vable_pycode = OpRef::from_raw(3);
-        sym.vable_valuestackdepth = OpRef::from_raw(4);
-        sym.vable_debugdata = OpRef::from_raw(5);
-        sym.vable_lastblock = OpRef::from_raw(6);
-        sym.vable_w_globals = OpRef::from_raw(7);
-        sym.registers_r = vec![OpRef::from_raw(8), OpRef::from_raw(9), OpRef::from_raw(10)];
+        sym.vable_last_instr = OpRef::input_arg_int(2);
+        sym.vable_pycode = OpRef::input_arg_ref(3);
+        sym.vable_valuestackdepth = OpRef::input_arg_int(4);
+        sym.vable_debugdata = OpRef::input_arg_ref(5);
+        sym.vable_lastblock = OpRef::input_arg_ref(6);
+        sym.vable_w_globals = OpRef::input_arg_ref(7);
+        // local0 / stack0 / stack1 are Ref-typed per `symbolic_local_types`
+        // / `symbolic_stack_types` below — the macro mints the matching
+        // `InputArgRef` variant.
+        sym.registers_r = vec![
+            OpRef::input_arg_ref(8),
+            OpRef::input_arg_ref(9),
+            OpRef::input_arg_ref(10),
+        ];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
         sym.concrete_stack = vec![ConcreteValue::Null, ConcreteValue::Null];
@@ -8112,13 +8177,17 @@ mod tests {
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
 
         assert_eq!(jump_args.len(), 11);
-        assert_eq!(jump_args[0], OpRef::from_raw(0));
-        assert_eq!(jump_args[1], OpRef::from_raw(1));
+        assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
+        assert_eq!(jump_args[1], OpRef::input_arg_ref(1));
         assert_eq!(
             &jump_args[8..],
-            &[OpRef::from_raw(8), OpRef::from_raw(9), OpRef::from_raw(10)]
+            &[
+                OpRef::input_arg_ref(8),
+                OpRef::input_arg_ref(9),
+                OpRef::input_arg_ref(10)
+            ]
         );
-        assert_eq!(state.sym().execution_context, OpRef::from_raw(1));
+        assert_eq!(state.sym().execution_context, OpRef::input_arg_ref(1));
     }
 
     #[test]

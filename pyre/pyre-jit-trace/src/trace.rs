@@ -58,10 +58,17 @@ pub fn trace_bytecode(
     // the loop instead of unrolling it as a first-visit inner loop.
     let start_key = crate::driver::make_green_key(w_code, start_pc);
     {
-        let input_args: Vec<majit_ir::OpRef> = (0..ctx.num_inputs())
-            .map(|i| majit_ir::OpRef::from_raw(i as u32))
-            .collect();
+        // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each input
+        // arg's typed Box is intrinsic to its `box.type`. Mint typed
+        // OpRefs from `inputarg_types()` so the merge-point's args carry
+        // RPython Box identity (variant-aware Eq) rather than collapsing
+        // through an Untyped position (history.py:182 `box.type`).
         let input_types = ctx.inputarg_types();
+        let input_args: Vec<majit_ir::OpRef> = input_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| majit_ir::OpRef::input_arg_typed(i as u32, tp))
+            .collect();
         ctx.add_merge_point(start_key, input_args, input_types, start_pc);
     }
 

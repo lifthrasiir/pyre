@@ -144,22 +144,33 @@ impl<'a> OpTypeIndex<'a> {
         if opref.is_none() {
             return None;
         }
+        // history.py:182 / resoperation.py:29: `box.type` lives on the Box
+        // object itself; pyre's typed OpRef variants (`Const{Int,Float,Ptr}`
+        // / `InputArg{Int,Float,Ref}` / `{Int,Float,Ref,Void}Op`) carry the
+        // matching type tag intrinsically. Trust the variant first; the
+        // side indexes are reserved for the transitional `Untyped` variant.
+        if let Some(tp) = opref.ty() {
+            return (tp != Type::Void).then_some(tp);
+        }
         if opref.is_constant() {
-            // PyPy `ConstInt.type=='i'` / `ConstFloat.type=='f'` /
-            // `ConstPtr.type=='r'` are object attributes, always set
-            // (history.py:220).  When `constant_types` is unseeded
-            // (synthetic / empty-map callers), fall back to Int — the
-            // statically-most-common Const flavour — so the helper still
-            // satisfies the "Const always has a type" invariant rather
-            // than returning None and diverging from PyPy.
+            // history.py:220/261/307: `Const*` boxes pin `box.type` at
+            // construction. Typed `OpRef::ConstInt/ConstFloat/ConstPtr`
+            // variants short-circuit at the `opref.ty()` arm above, so
+            // this branch only fires for `Untyped(x | CONST_BIT)` —
+            // legacy `OpRef::from_const` / `OpRef::from_raw` reconstructs
+            // produced before producer-side typing was complete.
             //
             // PRE-EXISTING-ADAPTATION: cranelift backend has callsites
             // that build `OpTypeIndex` with a partial `constant_types`
             // snapshot, so a strict miss-panic here triggers caught
             // unwinds that silently mis-execute (`fib_recursive`,
-            // `nested_loop`, `fannkuch` regress on cranelift).  Closing
-            // this requires each cranelift caller to seed the full pool
-            // — multi-session work, see audit "Section 2.1".
+            // `nested_loop`, `fannkuch` regress on cranelift). Fall back
+            // to `Type::Int` — the statically-most-common Const flavour —
+            // so the helper still satisfies the "Const always has a
+            // type" invariant rather than returning None.  Closing this
+            // requires every legacy `from_const` / `from_raw` const
+            // producer to be migrated to typed factories (#171) AND each
+            // cranelift caller to seed the full pool.
             return Some(
                 self.constant_types
                     .get(&opref.raw())

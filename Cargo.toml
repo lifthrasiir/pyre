@@ -74,6 +74,7 @@ malachite-bigint = "0.9"
 num-traits = "0.2"
 num-integer = "0.1"
 vecset = "0.0.4"
+indexmap = "2.14"
 
 # The profile that 'dist' will build with
 [profile.dist]

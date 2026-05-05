@@ -51,7 +51,6 @@ fn test_simple_int_add() {
 
     // Simple trace: i1 = int_add(i0, CONST_1)
     // finish(i1)  [fail_arg_types: [Int], fail_args: [i1]]
-    let i0 = OpRef::from_raw(0);
     let const_1 = OpRef::from_const(1);
 
     // Set constant: OpRef::from_const(1) = 1
@@ -63,6 +62,7 @@ fn test_simple_int_add() {
         tp: Type::Int,
         index: 0,
     }];
+    let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
     add_op.pos = OpRef::from_raw(1); // result is OpRef::from_raw(1)
@@ -96,7 +96,6 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(11);
 
-    let i0 = OpRef::from_raw(0);
     let const_1 = OpRef::from_const(1);
 
     let mut constants = HashMap::new();
@@ -107,6 +106,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
         tp: Type::Int,
         index: 0,
     }];
+    let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
     add_op.pos = OpRef::from_raw(1);
@@ -181,8 +181,6 @@ fn test_setarrayitem_raw_float_roundtrip() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(23);
 
-    let base = OpRef::from_raw(0);
-    let value = OpRef::from_raw(1);
     let const_index = OpRef::from_const(3);
 
     let mut constants = HashMap::new();
@@ -201,6 +199,8 @@ fn test_setarrayitem_raw_float_roundtrip() {
             index: 1,
         },
     ];
+    let base = inputargs[0].opref();
+    let value = inputargs[1].opref();
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, const_index, value]);
     set_op.pos = OpRef::from_raw(2);
@@ -235,10 +235,6 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(24);
 
-    let base = OpRef::from_raw(0);
-    let index = OpRef::from_raw(1);
-    let value = OpRef::from_raw(2);
-
     let array_descr = make_array_descr(0, 8, Type::Float);
 
     let inputargs = vec![
@@ -255,6 +251,9 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
             index: 2,
         },
     ];
+    let base = inputargs[0].opref();
+    let index = inputargs[1].opref();
+    let value = inputargs[2].opref();
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, index, value]);
     set_op.pos = OpRef::from_raw(3);
@@ -451,21 +450,19 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
         tp: Type::Ref,
         index: 0,
     }];
+    let i0 = inputargs[0].opref();
 
-    let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[OpRef::from_raw(0), const_child_tid]);
+    let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
     guard_gc_type.pos = OpRef::from_raw(1);
     guard_gc_type.fail_arg_types = Some(vec![]);
     guard_gc_type.fail_args = Some(vec![].into());
 
-    let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[OpRef::from_raw(0)]);
+    let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
     guard_is_object.pos = OpRef::from_raw(2);
     guard_is_object.fail_arg_types = Some(vec![]);
     guard_is_object.fail_args = Some(vec![].into());
 
-    let mut guard_subclass = Op::new(
-        OpCode::GuardSubclass,
-        &[OpRef::from_raw(0), const_root_vtable],
-    );
+    let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_vtable]);
     guard_subclass.pos = OpRef::from_raw(3);
     guard_subclass.fail_arg_types = Some(vec![]);
     guard_subclass.fail_args = Some(vec![].into());
@@ -508,11 +505,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             tp: Type::Ref,
             index: 0,
         }];
-        let mut guard_gc_type =
-            Op::new(OpCode::GuardGcType, &[OpRef::from_raw(0), const_child_tid]);
+        let i0 = inputargs[0].opref();
+        let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
         guard_gc_type.pos = OpRef::from_raw(1);
         guard_gc_type.fail_arg_types = Some(vec![Type::Ref]);
-        guard_gc_type.fail_args = Some(vec![OpRef::from_raw(0)].into());
+        guard_gc_type.fail_args = Some(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
         finish_op.pos = OpRef::from_raw(2);
         finish_op.fail_arg_types = Some(vec![]);
@@ -542,10 +539,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             tp: Type::Ref,
             index: 0,
         }];
-        let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[OpRef::from_raw(0)]);
+        let i0 = inputargs[0].opref();
+        let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
         guard_is_object.pos = OpRef::from_raw(1);
         guard_is_object.fail_arg_types = Some(vec![Type::Ref]);
-        guard_is_object.fail_args = Some(vec![OpRef::from_raw(0)].into());
+        guard_is_object.fail_args = Some(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
         finish_op.pos = OpRef::from_raw(2);
         finish_op.fail_arg_types = Some(vec![]);
@@ -585,13 +583,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             tp: Type::Ref,
             index: 0,
         }];
-        let mut guard_subclass = Op::new(
-            OpCode::GuardSubclass,
-            &[OpRef::from_raw(0), const_root_a_vtable],
-        );
+        let i0 = inputargs[0].opref();
+        let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_a_vtable]);
         guard_subclass.pos = OpRef::from_raw(1);
         guard_subclass.fail_arg_types = Some(vec![Type::Ref]);
-        guard_subclass.fail_args = Some(vec![OpRef::from_raw(0)].into());
+        guard_subclass.fail_args = Some(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
         finish_op.pos = OpRef::from_raw(2);
         finish_op.fail_arg_types = Some(vec![]);

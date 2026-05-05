@@ -1366,6 +1366,15 @@ impl OptContext {
         opref
     }
 
+    fn const_ref_for_value(const_idx: u32, value: &Value) -> OpRef {
+        match value {
+            Value::Int(_) => OpRef::const_int(const_idx),
+            Value::Float(_) => OpRef::const_float(const_idx),
+            Value::Ref(_) => OpRef::const_ptr(const_idx),
+            Value::Void => panic!("constant pool cannot contain a ConstVoid"),
+        }
+    }
+
     /// info.py:148,226 emit during force_box: routes through emit_extra
     /// normally, or direct emit when in_final_emission is true.
     pub fn emit_for_force(&mut self, op: Op) -> OpRef {
@@ -1745,8 +1754,8 @@ impl OptContext {
             &produced,
             short_inputargs,
         );
-        for (&const_idx, _) in &self.const_pool {
-            builder.note_known_constant(OpRef::from_const(const_idx));
+        for (&const_idx, value) in &self.const_pool {
+            builder.note_known_constant(Self::const_ref_for_value(const_idx, value));
         }
         self.imported_short_preamble_builder = Some(builder);
         self.imported_short_preamble_used.clear();
@@ -2059,8 +2068,8 @@ impl OptContext {
         }
 
         let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
-        for (&const_idx, _) in &self.const_pool {
-            builder.note_known_constant(OpRef::from_const(const_idx));
+        for (&const_idx, value) in &self.const_pool {
+            builder.note_known_constant(Self::const_ref_for_value(const_idx, value));
         }
         for &opref in imported_constants.values() {
             builder.note_known_constant(opref);
@@ -2690,7 +2699,7 @@ impl OptContext {
                 let mut loop_constants: HashMap<u32, i64> = self
                     .const_pool
                     .iter()
-                    .map(|(&i, val)| (OpRef::from_const(i).raw(), value_to_raw(val)))
+                    .map(|(&i, val)| (Self::const_ref_for_value(i, val).raw(), value_to_raw(val)))
                     .collect();
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
@@ -2713,7 +2722,7 @@ impl OptContext {
                 let mut loop_constant_types = self.constant_types_for_numbering.clone();
                 for (&i, val) in &self.const_pool {
                     loop_constant_types
-                        .entry(OpRef::from_const(i).raw())
+                        .entry(Self::const_ref_for_value(i, val).raw())
                         .or_insert(value_to_type(val));
                 }
                 for (idx, slot) in self.constants.iter().enumerate() {
@@ -4353,6 +4362,21 @@ impl OptContext {
         if idx >= ni {
             return None;
         }
+        let tp = *self.inputarg_types.get(idx)?;
+        if tp == majit_ir::Type::Void {
+            None
+        } else {
+            Some(tp)
+        }
+    }
+
+    /// Look up the declared type of inputarg slot `idx` (zero-based) from
+    /// the `inputarg_types` Vec seeded by `setup_optimizations`. Returns
+    /// `None` if the slot is out of range, the type is `Void`, or the Vec
+    /// has not been populated. Mirrors the per-Box `box.type` lookup that
+    /// `init_virtualizable` and other consumers use to mint typed
+    /// `OpRef::input_arg_*` matching the producer side.
+    pub fn inputarg_type_at(&self, idx: usize) -> Option<majit_ir::Type> {
         let tp = *self.inputarg_types.get(idx)?;
         if tp == majit_ir::Type::Void {
             None

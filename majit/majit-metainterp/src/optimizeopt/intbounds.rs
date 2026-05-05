@@ -99,21 +99,27 @@ impl OptIntBounds {
         ctx.make_constant(opref, Value::Int(value));
     }
 
-    /// Get or create a constant OpRef for the given value.
+    /// intbounds.py:107 `inv_arg1 = ConstInt(-i1)` parity — synthesise a
+    /// fresh `ConstInt` for the inverted constant used by INT_ADD / INT_SUB
+    /// pure-cache rewriting.
+    ///
+    /// RPython mints a fresh `ConstInt(value)` here without consulting any
+    /// existing Box; `same_box` later does the value-aware match on the
+    /// pure cache side (history.py:204). The previous Rust port searched
+    /// `ctx.constants` (op-namespace value cache, populated by
+    /// `make_constant(box, ConstInt(...))` on arbitrary Boxes — not just
+    /// op results) and returned `OpRef::int_op(idx)` on hit, which mints
+    /// the wrong Box family when the original Box at slot `idx` was an
+    /// `InputArgInt(idx)` constant-folded via `optimizer.py:410`. Under
+    /// variant-aware OpRef Eq (resoperation.rs:290) `IntOp(idx) ==
+    /// InputArgInt(idx)` is false, so cache keys silently key-mismatch.
+    ///
+    /// Mint via `make_constant_int` (constant namespace, CONST_BIT set,
+    /// typed `OpRef::const_int(idx)` per history.py:220 ConstInt.type).
+    /// Constants minted at this site land in a namespace disjoint from
+    /// any op/inputarg Box family, so no aliasing hazard remains.
     fn get_or_make_const(&self, value: i64, ctx: &mut OptContext) -> OpRef {
-        // Search existing constants
-        for (idx, slot) in ctx.constants.iter().enumerate() {
-            if let Some(Value::Int(v)) = slot {
-                if *v == value {
-                    return OpRef::from_raw(idx as u32);
-                }
-            }
-        }
-        // Create a new constant via a SameAs op
-        let op = Op::new(OpCode::SameAsI, &[]);
-        let opref = ctx.emit(op);
-        ctx.make_constant(opref, Value::Int(value));
-        opref
+        ctx.make_constant_int(value)
     }
 
     // ── Comparison optimizations ──

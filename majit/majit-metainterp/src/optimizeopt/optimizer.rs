@@ -667,7 +667,17 @@ impl Optimizer {
                 // For Phase 1 / standalone runs `inputarg_base == 0`, so
                 // the shift is a no-op and the legacy raw-position path
                 // still works.
-                let raw = OpRef::from_raw(ctx.inputarg_base + iv.inputarg_index as u32);
+                //
+                // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: mint a
+                // typed variant from `inputarg_types` so the OpRef carries
+                // RPython `box.type` (history.py:220) and matches the
+                // typed `OpRef::input_arg_typed` minted at trace start
+                // (pyre/pyre-jit-trace/src/trace.rs) under variant-aware Eq.
+                let pos = ctx.inputarg_base + iv.inputarg_index as u32;
+                let raw = match ctx.inputarg_type_at(iv.inputarg_index) {
+                    Some(tp) => OpRef::input_arg_typed(pos, tp),
+                    None => OpRef::from_raw(pos),
+                };
                 let virtual_head = ctx.get_box_replacement(raw);
                 walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
@@ -1993,12 +2003,27 @@ impl Optimizer {
             let inputarg_base = ctx.inputarg_base;
             let nia = &exported_state.next_iteration_args;
             let n = nia.len();
-            let source_set: std::collections::HashSet<OpRef> = (0..n)
-                .map(|i| OpRef::from_raw(inputarg_base + i as u32))
+            // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: mint typed
+            // variants for each Phase 2 source slot from `inputarg_types`
+            // (history.py:220 box.type). Variant-aware Eq requires the
+            // OpRef minted here to match the typed `OpRef::input_arg_typed`
+            // emitted at trace start (pyre/pyre-jit-trace/src/trace.rs);
+            // an `Untyped` variant here would silently break replacement /
+            // forwarding lookups against typed maps.
+            let typed_inputargs: Vec<OpRef> = (0..n)
+                .map(|i| {
+                    let pos = inputarg_base + i as u32;
+                    match ctx.inputarg_type_at(i) {
+                        Some(tp) => OpRef::input_arg_typed(pos, tp),
+                        None => OpRef::from_raw(pos),
+                    }
+                })
                 .collect();
+            let source_set: std::collections::HashSet<OpRef> =
+                typed_inputargs.iter().copied().collect();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
-                    let source = OpRef::from_raw(inputarg_base + i as u32);
+                    let source = typed_inputargs[i];
                     let target = nia[i];
                     // Constants don't participate in forwarding.
                     if ctx.is_constant(target) {
@@ -2512,8 +2537,19 @@ impl Optimizer {
             // the iteration into a disjoint range.  Use `num_inputs` (the
             // external loop-entry contract count) rather than `ctx.num_inputs`
             // (which may be widened by virtualizable expansion).
+            // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each
+            // renamed inputarg's Box carries `.type` intrinsically
+            // (history.py:220). Mint typed variants from `inputarg_types`
+            // so the exported state's OpRefs match what Phase 2 will see
+            // under variant-aware Eq.
             let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
-                .map(|i| OpRef::from_raw(ctx.inputarg_base + i as u32))
+                .map(|i| {
+                    let pos = ctx.inputarg_base + i as u32;
+                    match ctx.inputarg_type_at(i) {
+                        Some(tp) => OpRef::input_arg_typed(pos, tp),
+                        None => OpRef::from_raw(pos),
+                    }
+                })
                 .collect();
             crate::optimizeopt::unroll::export_state(
                 &original_jump_args,

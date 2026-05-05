@@ -989,7 +989,7 @@ impl TraceCtx {
                     );
                     crate::recorder::SnapshotTagged::Const(value, tp)
                 } else {
-                    crate::recorder::SnapshotTagged::Box(opref.raw(), tp)
+                    crate::recorder::SnapshotTagged::Box(*opref, tp)
                 }
             })
             .collect();
@@ -1238,7 +1238,11 @@ impl TraceCtx {
             Type::Float => JitArgKind::Float,
             Type::Void => return None,
         };
-        Some((kind, OpRef::from_raw(index as u32), bits))
+        // resoperation.py:719/727/739 InputArg{Int,Float,Ref}: the
+        // inputarg Box carries `box.type` directly. Mint the typed
+        // variant here so callers see the same {Int,Float,Ref} discrimination
+        // RPython's original_boxes[index] would produce.
+        Some((kind, OpRef::input_arg_typed(index as u32, tp), bits))
     }
 
     /// JitCode setup argbox for the standard virtualizable.
@@ -1334,19 +1338,31 @@ impl TraceCtx {
     }
 
     /// Get the result type of an OpRef from the recorded trace.
-    /// RPython parity: boxes carry their own type. Here we check
-    /// inputargs, constant pool (constant_type + numbering overrides),
-    /// and recorded ops to determine the type.
     ///
-    /// resoperation.py Box.type parity: a Box's type is always one of
-    /// `'i'` / `'r'` / `'f'`. Void is NOT a valid Box type — only
-    /// value-producing ops have Boxes. pyre's recorder assigns `pos`
-    /// to every op (including void ops like SetfieldGc and guards),
-    /// so a stale lookup of a void op's pos would otherwise return
-    /// `Type::Void`. Filter that case out and return `None` so callers
-    /// fall back to a safe default rather than letting Void leak into
-    /// `livebox_types` / `fail_arg_types`.
+    /// resoperation.py:567 / history.py:220 Box.type parity: every typed
+    /// Box (`InputArg{Int,Ref,Float}`, `IntOp`/`RefOp`/`FloatOp`,
+    /// `Const{Int,Ref,Float}`) carries `box.type` intrinsically on the
+    /// object itself. pyre encodes that on the typed `OpRef` variant via
+    /// `opref.ty()`, so the variant tag IS the authoritative answer when
+    /// it is present. Trust it first; the inputarg / constant_pool /
+    /// recorded-op fallbacks remain for the transitional `Untyped`
+    /// variant produced by legacy `OpRef::from_raw` / `OpRef::from_const`
+    /// callers (closing them is tracked under the typed-OpRef migration).
+    ///
+    /// Box.type is always one of `'i'` / `'r'` / `'f'`. Void is NOT a
+    /// valid Box type — only value-producing ops have Boxes. pyre's
+    /// recorder assigns `pos` to every op (including void ops like
+    /// `SetfieldGc` and guards), so a stale lookup of a void op's pos
+    /// would otherwise return `Type::Void`; filter that out and return
+    /// `None` so callers fall back to a safe default rather than letting
+    /// Void leak into `livebox_types` / `fail_arg_types`.
     pub fn get_opref_type(&self, opref: OpRef) -> Option<Type> {
+        // resoperation.py:29 / history.py:220: typed Box's `.type` is
+        // intrinsic. Trust the variant tag before consulting any side
+        // table.
+        if let Some(tp) = opref.ty() {
+            return (tp != Type::Void).then_some(tp);
+        }
         if (opref.raw() as usize) < self.recorder.num_inputargs() {
             return Some(self.recorder.inputarg_types()[opref.raw() as usize]);
         }

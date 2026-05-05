@@ -80,11 +80,12 @@ fn render_op(op: &Op, constants: &HashMap<u32, i64>, vars: &mut VarRenumbering) 
 /// assume the inputarg slot numbering is the canonical prefix).
 pub fn normalize_trace(trace: &TreeLoop, constants: &HashMap<u32, i64>) -> Vec<String> {
     let mut vars = VarRenumbering::default();
-    for i in 0..trace.inputargs.len() {
-        // Pre-allocate v0..vN for the inputarg slots. Inputargs occupy
-        // `OpRef::from_raw(0)..OpRef::from_raw(num_inputargs)` per `record_input_arg` in
-        // `recorder.rs`; any later render_arg hit reuses these IDs.
-        vars.id_for(OpRef::from_raw(i as u32));
+    for inputarg in &trace.inputargs {
+        // Pre-allocate v0..vN for the inputarg slots. RPython inputargs
+        // are concrete InputArgInt/InputArgFloat/InputArgRef instances;
+        // pre-number the matching typed OpRef so later render_arg hits
+        // reuse these IDs.
+        vars.id_for(OpRef::input_arg_typed(inputarg.index as u32, inputarg.tp));
     }
     trace
         .ops

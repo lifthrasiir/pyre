@@ -2281,7 +2281,7 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
         // Use constant-namespace OpRef (as the actual import process does).
-        let const_opref = OpRef::from_const(10);
+        let const_opref = OpRef::const_int(10);
         ctx.seed_constant(const_opref, majit_ir::Value::Int(7));
         ctx.imported_short_pure_ops
             .push(crate::optimizeopt::ImportedShortPureOp::new(
@@ -2323,7 +2323,7 @@ mod tests {
     fn test_imported_short_call_pure_result_replays_into_pure_cache() {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(8, 0);
-        let const_opref = OpRef::from_const(10);
+        let const_opref = OpRef::const_int(10);
         ctx.seed_constant(const_opref, majit_ir::Value::Int(0x1234));
         let call_descr = majit_ir::descr::make_call_descr_full(
             77,

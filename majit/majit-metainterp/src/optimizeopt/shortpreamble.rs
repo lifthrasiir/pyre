@@ -549,12 +549,19 @@ impl ShortBoxes {
 
     pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::optimizeopt::OptContext) {
         // RPython shortpreamble.py only exposes real `Const` objects here.
-        // In majit those live in the constant namespace (`OpRef::from_const`).
+        // In majit those live in the constant namespace as typed Const*
+        // OpRefs, preserving history.py:220/261/307 `box.type`.
         // Ordinary OpRefs that happen to be known-constant for the current
         // iteration must stay trace-local boxes, or short-preamble import can
         // leak one iteration's guard knowledge into the next.
-        for (&const_idx, _) in &ctx.const_pool {
-            self.note_known_constant(OpRef::from_const(const_idx));
+        for (&const_idx, value) in &ctx.const_pool {
+            let tp = match value {
+                majit_ir::Value::Int(_) => majit_ir::Type::Int,
+                majit_ir::Value::Float(_) => majit_ir::Type::Float,
+                majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
+                majit_ir::Value::Void => panic!("short preamble cannot import a ConstVoid"),
+            };
+            self.note_known_constant(OpRef::const_typed(const_idx, tp));
         }
     }
 

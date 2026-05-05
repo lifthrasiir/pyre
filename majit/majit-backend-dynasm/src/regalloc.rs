@@ -6015,7 +6015,11 @@ mod tests {
 
     #[test]
     fn test_j2_deopt_only_failarg_spilled_before_guard() {
-        let i0 = OpRef::from_raw(0);
+        // i0 is the typed inputarg slot 0 (Int) that the regalloc
+        // registers from `inputargs.opref()`. i1/i2 are op result
+        // positions; their variant tag is unconstrained, so plain
+        // `from_raw` is fine.
+        let i0 = OpRef::input_arg_int(0);
         let i1 = OpRef::from_raw(1);
         let i2 = OpRef::from_raw(2);
         let c1 = OpRef::from_const(0);
@@ -6069,7 +6073,9 @@ mod tests {
 
     #[test]
     fn test_walk_operations_dispatches_from_j2_lir() {
-        let i0 = OpRef::from_raw(0);
+        // i0 is the typed Ref inputarg slot 0; the regalloc keys boxes
+        // by typed `OpRef::input_arg_ref` (variant-aware Eq).
+        let i0 = OpRef::input_arg_ref(0);
         let c0 = OpRef::from_const(0);
         let inputargs = vec![InputArg {
             index: i0.raw(),
@@ -6253,9 +6259,12 @@ mod tests {
 
     #[test]
     fn test_j2_store_dispatch_uses_lir_operands() {
-        let i0 = OpRef::from_raw(0);
-        let i1 = OpRef::from_raw(1);
-        let i2 = OpRef::from_raw(2);
+        // i0/i1 are typed Ref inputarg slots; i2 is typed Int. The
+        // regalloc registers boxes via `inputargs.opref()` so each typed
+        // OpRef variant must match (variant-aware Eq).
+        let i0 = OpRef::input_arg_ref(0);
+        let i1 = OpRef::input_arg_ref(1);
+        let i2 = OpRef::input_arg_int(2);
         let c0 = OpRef::from_const(0);
         let c8 = OpRef::from_const(8);
 

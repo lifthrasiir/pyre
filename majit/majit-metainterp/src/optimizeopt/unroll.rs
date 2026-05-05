@@ -2790,7 +2790,21 @@ impl OptUnroll {
                 majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(val as u64)),
                 majit_ir::Type::Void => majit_ir::Value::Int(val),
             };
-            ctx.make_constant(majit_ir::OpRef::from_raw(idx), value);
+            // history.py:220/261/307: ConstInt/ConstFloat/ConstPtr are
+            // disjoint Box subclasses pinned to `box.type` at construction.
+            // Mint the typed `OpRef::const_*` variant so the imported
+            // preamble const slot collides with the bridge's intra-pool
+            // dedup (`get_or_insert_typed` returns the same typed OpRef
+            // when value+type match) under variant-aware OpRef Eq
+            // (resoperation.rs:290) — `Untyped(idx)` from this loop and
+            // `ConstInt(idx)` from the bridge's `get_or_insert` would
+            // otherwise hash as separate keys for the same slot.
+            let typed_opref = match tp {
+                majit_ir::Type::Int | majit_ir::Type::Void => majit_ir::OpRef::const_int(idx),
+                majit_ir::Type::Ref => majit_ir::OpRef::const_ptr(idx),
+                majit_ir::Type::Float => majit_ir::OpRef::const_float(idx),
+            };
+            ctx.make_constant(typed_opref, value);
             optimizer.constant_types.entry(idx).or_insert(tp);
         }
 
@@ -3652,9 +3666,21 @@ fn assemble_peeled_trace_with_jump_args(
 
     // Collect preamble-defined OpRefs BEFORE adding extra label args,
     // so we can filter out virtual remnants (removed New ops).
+    //
+    // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: preamble-defined
+    // inputargs carry `box.type` intrinsically (history.py:220). Mint
+    // typed variants from `inputarg_types` so this set's OpRefs match the
+    // typed mints used at trace start / Phase 2 import under variant-aware
+    // Eq.
     let preamble_defs: std::collections::HashSet<OpRef> = {
         let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
-            .map(|i| OpRef::from_raw(inputarg_base + i as u32))
+            .map(|i| {
+                let pos = inputarg_base + i as u32;
+                match ctx.inputarg_type_at(i) {
+                    Some(tp) => OpRef::input_arg_typed(pos, tp),
+                    None => OpRef::from_raw(pos),
+                }
+            })
             .collect();
         for op in &result {
             if !op.pos.is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void {
@@ -5192,9 +5218,9 @@ mod tests {
         // trace's slot index — majit OpRef is a trace-local index, not
         // a Python identity. The fresh slot is the first one allocated
         // by `reserve_const_ref` in ctx2.
-        let fresh_const = OpRef::from_const(0);
+        let fresh_const = OpRef::const_ptr(0);
         assert_eq!(ctx2.get_constant(fresh_const), Some(&Value::Ref(ptr)));
-        assert_eq!(ctx2.get_constant(OpRef::from_const(23)), None);
+        assert_eq!(ctx2.get_constant(OpRef::const_ptr(23)), None);
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp::new(

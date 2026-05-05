@@ -4005,12 +4005,12 @@ mod tests {
         // Use input arg as guard condition so optimizer cannot constant-fold.
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let i0 = OpRef::from_raw(0); // input arg
+            let i0 = OpRef::input_arg_int(0); // input arg
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         };
-        driver.meta.compile_loop(&[OpRef::from_raw(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(key));
 
         let mut state = TypedRestoreState {
@@ -4059,20 +4059,19 @@ mod tests {
         // Optimizer cannot constant-fold an input arg.
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
+            let r1 = OpRef::input_arg_ref(1);
+            let f2 = OpRef::input_arg_float(2);
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
-                0,
-                0,
-            );
-            ctx.set_fail_args(
-                g,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
-            );
+            ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
+            ctx.set_fail_args(g, &[i0, r1, f2]);
         };
         driver.meta.compile_loop(
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_float(2),
+            ],
             (),
         );
         assert!(driver.has_compiled_loop(key));
@@ -4119,20 +4118,19 @@ mod tests {
         // Input 0 is Int(1) — nonzero so GuardFalse fails at runtime.
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
+            let r1 = OpRef::input_arg_ref(1);
+            let f2 = OpRef::input_arg_float(2);
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
-                0,
-                0,
-            );
-            ctx.set_fail_args(
-                g,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
-            );
+            ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
+            ctx.set_fail_args(g, &[i0, r1, f2]);
         };
         driver.meta.compile_loop(
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_float(2),
+            ],
             (),
         );
         assert!(driver.has_compiled_loop(key));
@@ -4228,13 +4226,13 @@ mod tests {
         // Record minimal trace and compile.
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
             ctx.const_int(42);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::from_raw(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(key));
 
         let stats = driver.get_stats();
@@ -4344,7 +4342,7 @@ mod tests {
         // Record a real trace: IntAdd + GuardTrue(input) + JUMP(sum)
         let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef::from_raw(0); // input arg from on_back_edge
+            let i0 = OpRef::input_arg_int(0); // input arg from on_back_edge
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
@@ -4385,14 +4383,14 @@ mod tests {
             ));
             {
                 let ctx = driver.meta.trace_ctx().expect("should be tracing");
-                let i0 = OpRef::from_raw(0);
+                let i0 = OpRef::input_arg_int(0);
                 let c1 = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
                 let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
-            driver.meta.compile_loop(&[OpRef::from_raw(0)], ());
+            driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
             assert!(driver.has_compiled_loop(key));
         }
 
@@ -4426,7 +4424,7 @@ mod tests {
         ));
         let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef::from_raw(0); // input arg (non-constant = won't be folded)
+            let i0 = OpRef::input_arg_int(0); // input arg (non-constant = won't be folded)
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
@@ -4447,14 +4445,15 @@ mod tests {
         // Step 3: Record a bridge trace and compile it via close_bridge.
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
-            let i0 = OpRef::from_raw(0); // bridge input from start_retrace
+            let i0 = OpRef::input_arg_int(0); // bridge input from start_retrace
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
         let trace_id = 0u64; // will be normalized to root_trace_id
-        let result = driver
-            .meta
-            .close_bridge(key, trace_id, fail_index, &[OpRef::from_raw(0)]);
+        let result =
+            driver
+                .meta
+                .close_bridge(key, trace_id, fail_index, &[OpRef::input_arg_int(0)]);
         assert_eq!(
             result,
             crate::pyjitpl::BridgeCompileResult::Compiled,
@@ -4493,12 +4492,12 @@ mod tests {
             // Use input arg so optimizer cannot fold. Input is 0 (falsy)
             // at runtime → GuardTrue fails.
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(g, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::from_raw(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(green_key));
         let failure = driver
             .meta
@@ -4582,7 +4581,7 @@ mod tests {
 
         let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);

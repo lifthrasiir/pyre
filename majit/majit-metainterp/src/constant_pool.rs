@@ -197,6 +197,54 @@ impl ConstantPool {
         })
     }
 
+    /// history.py:204 / :244 `Const.same_constant` — true when two
+    /// constant OpRefs name the same `(type, value)` pair. RPython
+    /// `Const.same_box` is `same_constant` (history.py:182), i.e. value
+    /// equality, not Python `is`. pyre's `OpRef::eq` compares
+    /// `(variant, raw)`, so within a single `ConstantPool` insertion-time
+    /// dedup (`get_or_insert{,_typed}` lookup-by-value) keeps `==`
+    /// equivalent to `same_constant`. This helper is the explicit
+    /// value-equality path for callers that may compose OpRefs from
+    /// heterogeneous sources (cross-pool comparisons, deserialised
+    /// constants) where insertion-time dedup cannot run.
+    ///
+    /// Returns `false` for any non-constant OpRef. RPython's
+    /// `Const.same_constant` is defined only on the `Const` hierarchy
+    /// (history.py:204-208 — base `raise NotImplementedError`); calling
+    /// it on a non-constant Box is a type error upstream. We mirror
+    /// that contract by short-circuiting non-constants to `false` even
+    /// when `a == b` (e.g. `OpRef::NONE == OpRef::NONE`).
+    pub fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
+        if !a.is_constant() || !b.is_constant() {
+            return false;
+        }
+        if a == b {
+            return true;
+        }
+        // history.py:220/261/307: ConstInt/ConstFloat/ConstPtr are
+        // disjoint subclasses; same_constant returns false across them.
+        let a_tp = self.constant_types.get(&a.raw()).copied();
+        let b_tp = self.constant_types.get(&b.raw()).copied();
+        if a_tp != b_tp {
+            return false;
+        }
+        // Typed Const* variants carry the type in the discriminant; if
+        // both are typed and disagree, `a == b` already returned and we
+        // would not be here. Cross-check via discriminant for the
+        // mixed-Untyped case.
+        if let (Some(at), Some(bt)) = (a.ty(), b.ty()) {
+            if at != bt {
+                return false;
+            }
+        }
+        let av = self.constants.get(&a.raw()).copied();
+        let bv = self.constants.get(&b.raw()).copied();
+        match (av, bv) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+
     /// Mark an existing constant with a specific type for resume data only.
     /// RPython parity: GcRef pointers stored via const_int() need Ref type
     /// for correct resume data encoding, but Cranelift must treat them as Int
@@ -295,5 +343,77 @@ impl Default for ConstantPool {
 impl Drop for ConstantPool {
     fn drop(&mut self) {
         self.release_roots();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_constant_dedup_within_pool_makes_eq_equivalent() {
+        // history.py:204 same_constant on a single ConstantPool: the
+        // dedup loop in get_or_insert returns the SAME OpRef for the
+        // same value, so OpRef::eq is already same_constant.
+        let mut pool = ConstantPool::new();
+        let a = pool.get_or_insert(42);
+        let b = pool.get_or_insert(42);
+        assert_eq!(a, b, "dedup must reuse the same OpRef for equal values");
+        assert!(pool.same_constant(a, b));
+    }
+
+    #[test]
+    fn same_constant_value_aware_across_independent_inserts() {
+        // history.py:244 ConstInt.same_constant: two ConstInt instances
+        // with the same value compare equal even though they're distinct
+        // Box objects in RPython. This helper extends that semantics to
+        // pyre OpRefs that may have been minted at different ConstantPool
+        // indices (cross-pool deserialisation).
+        let mut pool = ConstantPool::new();
+        let a = pool.get_or_insert(42);
+        // Manually insert a second slot with the same value, bypassing
+        // the dedup path (simulates cross-pool composition).
+        let b_idx = pool.next_const_idx;
+        pool.next_const_idx += 1;
+        let b = OpRef::const_int(b_idx);
+        pool.constants.insert(b.raw(), 42);
+        pool.constant_types.insert(b.raw(), Type::Int);
+        assert_ne!(a, b, "different idx slots must be != under variant Eq");
+        assert!(
+            pool.same_constant(a, b),
+            "same_constant must be value-aware",
+        );
+    }
+
+    #[test]
+    fn same_constant_disjoint_subclasses_are_unequal() {
+        // history.py:220 / :261 / :307: ConstInt and ConstPtr are
+        // disjoint Const subclasses; same_constant returns false across
+        // type boundaries even when the underlying value matches.
+        let mut pool = ConstantPool::new();
+        let i = pool.get_or_insert_typed(0, Type::Int);
+        let p = pool.get_or_insert_typed(0, Type::Ref);
+        assert_ne!(i, p);
+        assert!(!pool.same_constant(i, p));
+    }
+
+    #[test]
+    fn same_constant_rejects_non_constants() {
+        let pool = ConstantPool::new();
+        let inputarg = OpRef::input_arg_int(3);
+        let op = OpRef::int_op(7);
+        assert!(!pool.same_constant(inputarg, op));
+        assert!(!pool.same_constant(inputarg, inputarg.with_raw(99)));
+    }
+
+    #[test]
+    fn same_constant_handles_none() {
+        // history.py:204-208 — `Const.same_constant` is defined only on
+        // the Const hierarchy. `OpRef::NONE` is not a constant, so the
+        // helper must return false even when both operands compare
+        // equal under variant-aware Eq.
+        let pool = ConstantPool::new();
+        assert!(!pool.same_constant(OpRef::NONE, OpRef::NONE));
+        assert!(!pool.same_constant(OpRef::NONE, OpRef::const_int(0)));
     }
 }

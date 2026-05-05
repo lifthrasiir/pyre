@@ -278,8 +278,14 @@ fn snapshot_map_from_trace_snapshots(
     // two recorder-side cases.
     let mut tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
         match t {
-            crate::recorder::SnapshotTagged::Box(n, tp) => {
-                SnapshotBox::typed(majit_ir::OpRef::from_raw(*n), *tp)
+            crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
+                // history.py:182/220/261/307 + resoperation.py:719/727/739/
+                // 564-638: `box.type` lives on the Box. Pyre's typed
+                // OpRef variants carry it intrinsically; the explicit
+                // `fallback_tp` is the lockstep authority for residual
+                // `OpRef::Untyped` cases (legacy from_raw producers).
+                let tp = opref.ty().unwrap_or(*fallback_tp);
+                SnapshotBox::typed(*opref, tp)
             }
             crate::recorder::SnapshotTagged::Const(val, tp) => {
                 // resume.py:173-176: null Ref → NULLREF via getconst.
@@ -300,14 +306,30 @@ fn snapshot_map_from_trace_snapshots(
                             }) == *tp
                     })
                     .map(|(k, _)| *k);
-                let key = existing.unwrap_or_else(|| {
-                    let opref = majit_ir::OpRef::from_const(next_const_idx);
-                    next_const_idx += 1;
-                    constants.insert(opref.raw(), *val);
-                    constant_types.insert(opref.raw(), *tp);
-                    opref.raw()
-                });
-                SnapshotBox::typed(majit_ir::OpRef::from_raw(key), *tp)
+                let opref = match existing {
+                    // Re-mint via the typed factory rather than poking the
+                    // cached `raw` straight into a variant: a CONST_BIT-less
+                    // key (would only arise from a producer bypassing the
+                    // `OpRef::const_typed` factory) must not manufacture a
+                    // malformed `OpRef::ConstInt(raw)`.
+                    Some(raw) => {
+                        let cached = majit_ir::OpRef::from_raw(raw);
+                        debug_assert!(
+                            cached.is_constant(),
+                            "constants map key {} missing CONST_BIT",
+                            raw
+                        );
+                        majit_ir::OpRef::const_typed(cached.const_index(), *tp)
+                    }
+                    None => {
+                        let opref = majit_ir::OpRef::const_typed(next_const_idx, *tp);
+                        next_const_idx += 1;
+                        constants.insert(opref.raw(), *val);
+                        constant_types.insert(opref.raw(), *tp);
+                        opref
+                    }
+                };
+                SnapshotBox::typed(opref, *tp)
             }
         }
     };
@@ -1987,7 +2009,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let vable_oprefs: Vec<OpRef> = if has_expanded_tail {
             (0..total_vable)
-                .map(|i| OpRef::from_raw((num_reds + i) as u32))
+                .map(|i| OpRef::input_arg_typed((num_reds + i) as u32, vable_values[i].get_type()))
                 .collect()
         } else {
             vable_values
@@ -7513,10 +7535,16 @@ impl<M: Clone> MetaInterp<M> {
         // fail_descr has the UPDATED types; exit_layout.exit_types may have
         // the ORIGINAL MetaFailDescr types (before optimizer update).
         // Prefer the backend's types when available.
-        let fail_arg_types = backend_layout
-            .as_ref()
-            .map(|layout| layout.fail_arg_types.clone())
-            .or_else(|| exit_layout.map(|layout| layout.exit_types.clone()))?;
+        let fail_arg_types = match (backend_layout.as_ref(), exit_layout) {
+            (Some(backend), Some(layout))
+                if backend.fail_arg_types.is_empty() && !layout.exit_types.is_empty() =>
+            {
+                layout.exit_types.clone()
+            }
+            (Some(backend), _) => backend.fail_arg_types.clone(),
+            (None, Some(layout)) => layout.exit_types.clone(),
+            (None, None) => return None,
+        };
         let gc_ref_slots = backend_layout
             .as_ref()
             .map(|layout| layout.gc_ref_slots.clone())
@@ -8161,9 +8189,14 @@ impl<M: Clone> MetaInterp<M> {
                     .exit_layouts
                     .get(&fail_index)
                     .and_then(|layout| layout.storage.clone())?;
-                let liveboxes: Vec<OpRef> = (0..bridge_inputargs.len())
-                    .map(|i| OpRef::from_raw(i as u32))
-                    .collect();
+                // Each bridge inputarg carries its `box.type`
+                // (resoperation.py:719/727/739 InputArg{Int,Ref,Float});
+                // mint the typed `OpRef::input_arg_*` variant via
+                // `InputArg::opref()` so that variant-aware Eq/Hash
+                // matches against the producer-side typed OpRefs threaded
+                // through the trace (history.py:182 `box.type`
+                // intrinsic).
+                let liveboxes: Vec<OpRef> = bridge_inputargs.iter().map(|ia| ia.opref()).collect();
                 // bridgeopt.py parity: the deserializer's `liveboxes` type
                 // filter (box.type == "r") is driven by the type each box
                 // carried when the parent guard was finalized — that is
@@ -8713,11 +8746,12 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         // compile.py:988-991: resolve metainterp_sd, vinfo, ginfo
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let norm_tid = Self::normalize_trace_id(compiled, trace_id);
-        let (_, trace) = Self::trace_for_exit(compiled, norm_tid)?;
+        let norm_tid = {
+            let compiled = self.compiled_loops.get(&green_key)?;
+            Self::normalize_trace_id(compiled, trace_id)
+        };
         let exit_layout =
-            Self::compiled_exit_layout_from_trace(trace, green_key, norm_tid, fail_index)?;
+            self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?;
 
         // compile.py:973-985 don't interrupt me! If the stack runs out
         // in force_from_resumedata() then we have seen cpu.force() but
@@ -16337,13 +16371,21 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef::from_raw(pos);
+        op.pos = if pos == OpRef::NONE.raw() {
+            OpRef::NONE
+        } else {
+            OpRef::op_typed(pos, opcode.result_type())
+        };
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
         let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = OpRef::from_raw(pos);
+        op.pos = if pos == OpRef::NONE.raw() {
+            OpRef::NONE
+        } else {
+            OpRef::op_typed(pos, opcode.result_type())
+        };
         op
     }
 
@@ -16423,11 +16465,15 @@ mod tests {
     fn test_prepare_bridge_trace_for_optimizer_freshens_inputargs_and_snapshots() {
         let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
         let bridge_ops = vec![
-            mk_op(OpCode::SameAsR, &[OpRef::from_raw(1)], 2),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)], 3),
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(1)], 2),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+                3,
+            ),
             mk_op(
                 OpCode::Jump,
-                &[OpRef::from_raw(2), OpRef::from_raw(3)],
+                &[OpRef::ref_op(2), OpRef::int_op(3)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -16436,21 +16482,21 @@ mod tests {
             &mut snapshot_boxes,
             0,
             vec![
-                OpRef::from_raw(0).into(),
-                OpRef::from_raw(2).into(),
-                OpRef::from_raw(3).into(),
+                OpRef::input_arg_int(0).into(),
+                OpRef::ref_op(2).into(),
+                OpRef::int_op(3).into(),
             ],
         );
         let mut snapshot_vable_boxes = Vec::new();
         snapshot_insert(
             &mut snapshot_vable_boxes,
             0,
-            vec![OpRef::from_raw(1).into(), OpRef::from_raw(2).into()],
+            vec![OpRef::input_arg_ref(1).into(), OpRef::ref_op(2).into()],
         );
         let pending_bridge_rd = PendingBridgeRd {
             storage: crate::resume::ResumeStorage::new(vec![1, 2, 3], vec![], vec![], vec![]),
             frontend_boxes: vec![11, 22],
-            liveboxes: vec![OpRef::from_raw(0), OpRef::from_raw(1)],
+            liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
             all_descrs: vec![],
             cls_of_box: None,
@@ -16476,16 +16522,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
-        assert_eq!(prepared.ops[0].pos, OpRef::from_raw(12));
-        assert_eq!(prepared.ops[0].args.to_vec(), vec![OpRef::from_raw(11)]);
-        assert_eq!(prepared.ops[1].pos, OpRef::from_raw(13));
+        assert_eq!(prepared.ops[0].pos, OpRef::ref_op(12));
+        assert_eq!(
+            prepared.ops[0].args.to_vec(),
+            vec![OpRef::input_arg_ref(11)]
+        );
+        assert_eq!(prepared.ops[1].pos, OpRef::int_op(13));
         assert_eq!(
             prepared.ops[1].args.to_vec(),
-            vec![OpRef::from_raw(10), OpRef::from_raw(10)]
+            vec![OpRef::input_arg_int(10), OpRef::input_arg_int(10)]
         );
         assert_eq!(
             prepared.ops[2].args.to_vec(),
-            vec![OpRef::from_raw(12), OpRef::from_raw(13)]
+            vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
         assert_eq!(
             snapshot_get(&prepared.snapshot_boxes, 0)
@@ -16494,9 +16543,9 @@ mod tests {
                 .map(|boxref| boxref.opref)
                 .collect::<Vec<_>>(),
             vec![
-                OpRef::from_raw(10),
-                OpRef::from_raw(12),
-                OpRef::from_raw(13)
+                OpRef::input_arg_int(10),
+                OpRef::ref_op(12),
+                OpRef::int_op(13)
             ]
         );
         assert_eq!(
@@ -16505,7 +16554,7 @@ mod tests {
                 .iter()
                 .map(|boxref| boxref.opref)
                 .collect::<Vec<_>>(),
-            vec![OpRef::from_raw(11), OpRef::from_raw(12)]
+            vec![OpRef::input_arg_ref(11), OpRef::ref_op(12)]
         );
         assert_eq!(
             prepared
@@ -16514,7 +16563,7 @@ mod tests {
                 .unwrap()
                 .liveboxes
                 .clone(),
-            vec![OpRef::from_raw(10), OpRef::from_raw(11)]
+            vec![OpRef::input_arg_int(10), OpRef::input_arg_ref(11)]
         );
     }
 
@@ -16947,12 +16996,20 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 30;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -16960,11 +17017,7 @@ mod tests {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
             let trace_id = entry.root_trace_id;
             let trace = entry.traces.get(&trace_id).expect("compiled trace");
-            let fail_index = *trace
-                .exit_layouts
-                .keys()
-                .next()
-                .expect("compiled guard exit");
+            let fail_index = guard_fail_index(trace);
             (trace_id, fail_index)
         };
 
@@ -17161,29 +17214,43 @@ mod tests {
         );
     }
 
+    fn guard_fail_index(trace: &CompiledTrace) -> u32 {
+        *trace
+            .exit_layouts
+            .iter()
+            .find(|(_, layout)| !layout.is_finish)
+            .map(|(fail_index, _)| fail_index)
+            .expect("compiled guard exit")
+    }
+
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
     #[test]
     fn guard_exit_getters_fall_back_to_previous_token_backend_layouts() {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 77;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
         let (trace_id, fail_index) = {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
             let trace_id = entry.root_trace_id;
-            let fail_index = *entry
-                .traces
-                .get(&trace_id)
-                .and_then(|trace| trace.exit_layouts.keys().next())
-                .expect("compiled guard exit");
+            let trace = entry.traces.get(&trace_id).expect("compiled trace");
+            let fail_index = guard_fail_index(trace);
             (trace_id, fail_index)
         };
 
@@ -17225,12 +17292,20 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 87;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17276,12 +17351,20 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 88;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17289,11 +17372,7 @@ mod tests {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
             let trace_id = entry.root_trace_id;
             let trace = entry.traces.get(&trace_id).expect("compiled trace");
-            let fail_index = *trace
-                .exit_layouts
-                .keys()
-                .next()
-                .expect("compiled guard exit");
+            let fail_index = guard_fail_index(trace);
             let layout = trace
                 .exit_layouts
                 .get(&fail_index)
@@ -17360,12 +17439,20 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         let green_key = 89;
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, HashMap::new());
 
@@ -17373,11 +17460,7 @@ mod tests {
             let entry = meta.compiled_loops.get(&green_key).expect("compiled entry");
             let trace_id = entry.root_trace_id;
             let trace = entry.traces.get(&trace_id).expect("compiled trace");
-            let fail_index = *trace
-                .exit_layouts
-                .keys()
-                .next()
-                .expect("compiled guard exit");
+            let fail_index = guard_fail_index(trace);
             (trace_id, fail_index)
         };
 
@@ -17534,7 +17617,10 @@ mod tests {
     fn take_recorded_ops(meta: &mut MetaInterp<()>) -> Vec<Op> {
         let mut ctx = meta.tracing.take().expect("expected active trace context");
         let num_inputs = ctx.num_inputargs();
-        let jump_args: Vec<OpRef> = (0..num_inputs).map(|i| OpRef::from_raw(i as u32)).collect();
+        let input_types = ctx.inputarg_types();
+        let jump_args: Vec<OpRef> = (0..num_inputs)
+            .map(|i| OpRef::input_arg_typed(i as u32, input_types[i]))
+            .collect();
         ctx.close_loop(&jump_args);
         let trace = ctx.into_tree_loop();
         trace
@@ -17555,7 +17641,10 @@ mod tests {
                 frames: vec![crate::recorder::SnapshotFrame {
                     jitcode_index: 0,
                     pc: 123,
-                    boxes: vec![crate::recorder::SnapshotTagged::Box(0, Type::Int)],
+                    boxes: vec![crate::recorder::SnapshotTagged::Box(
+                        OpRef::from_raw(0),
+                        majit_ir::Type::Int,
+                    )],
                 }],
                 vable_boxes: Vec::new(),
                 vref_boxes: Vec::new(),
@@ -17632,11 +17721,11 @@ mod tests {
         assert_eq!(ctx.inputarg_types(), vec![Type::Ref, Type::Int]);
         assert_eq!(
             ctx.collect_virtualizable_boxes().unwrap(),
-            vec![OpRef::from_raw(1), OpRef::from_raw(0)]
+            vec![OpRef::input_arg_int(1), OpRef::input_arg_ref(0)]
         );
         assert_eq!(
             ctx.virtualizable_entry_at(0),
-            Some((OpRef::from_raw(1), Value::Int(41)))
+            Some((OpRef::input_arg_int(1), Value::Int(41)))
         );
     }
 
@@ -17652,8 +17741,8 @@ mod tests {
             Vec::new(),
         );
 
-        let (result, _) = meta.opimpl_getfield_vable_int(OpRef::from_raw(0), fd8);
-        assert_eq!(result, OpRef::from_raw(1));
+        let (result, _) = meta.opimpl_getfield_vable_int(OpRef::input_arg_ref(0), fd8);
+        assert_eq!(result, OpRef::input_arg_int(1));
 
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.num_ops(), 0);
@@ -17675,7 +17764,7 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.const_int(99)
         };
-        meta.opimpl_setfield_vable_int(OpRef::from_raw(0), fd8, new_val, Value::Int(99));
+        meta.opimpl_setfield_vable_int(OpRef::input_arg_ref(0), fd8, new_val, Value::Int(99));
 
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
@@ -17707,8 +17796,8 @@ mod tests {
             ctx.const_int(1)
         };
         let (result, _) =
-            meta.opimpl_getarrayitem_vable_int(OpRef::from_raw(0), index, 1, fd24, adesc);
-        assert_eq!(result, OpRef::from_raw(2));
+            meta.opimpl_getarrayitem_vable_int(OpRef::input_arg_ref(0), index, 1, fd24, adesc);
+        assert_eq!(result, OpRef::input_arg_int(2));
 
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.num_ops(), 0);
@@ -17727,7 +17816,7 @@ mod tests {
             vec![2],
         );
 
-        let len_ref = meta.opimpl_arraylen_vable(OpRef::from_raw(0), fd24, adesc);
+        let len_ref = meta.opimpl_arraylen_vable(OpRef::input_arg_ref(0), fd24, adesc);
         let ctx = meta.trace_ctx().unwrap();
         assert_eq!(ctx.const_value(len_ref), Some(2));
         assert_eq!(ctx.num_ops(), 0);
@@ -17815,8 +17904,8 @@ mod tests {
             Vec::new(),
         );
 
-        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
-        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
         assert_eq!(ops.len(), 2);
@@ -17877,7 +17966,7 @@ mod tests {
             )
             .expect("should resolve to standard virtualizable");
 
-        assert_eq!(result.0, OpRef::from_raw(0));
+        assert_eq!(result.0, OpRef::input_arg_ref(0));
         assert_eq!(
             result.1,
             (&mut obj as *mut ResidualCallVableObj) as usize as i64
@@ -17901,7 +17990,7 @@ mod tests {
         let ctx = meta.trace_ctx().unwrap();
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(ctx.const_value(boxes[0]), Some(99));
-        assert_eq!(boxes[1], OpRef::from_raw(0));
+        assert_eq!(boxes[1], OpRef::input_arg_ref(0));
     }
 
     #[test]
@@ -18064,7 +18153,7 @@ mod tests {
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
         let _ = meta.finish_trace_for_parity(&[]);
 
         start_tracing_with_virtualizable(
@@ -18073,7 +18162,7 @@ mod tests {
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
         assert_eq!(ops.len(), 2);
@@ -18093,9 +18182,9 @@ mod tests {
             Vec::new(),
         );
 
-        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
-        let _ = meta.opimpl_getfield_vable_int(OpRef::from_raw(0), fd8);
-        meta.opimpl_hint_force_virtualizable(OpRef::from_raw(0));
+        meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
+        let _ = meta.opimpl_getfield_vable_int(OpRef::input_arg_ref(0), fd8);
+        meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
         assert_eq!(ops.len(), 4);
@@ -18131,21 +18220,33 @@ mod tests {
             ctx.const_int(1)
         };
         let (item, _) =
-            meta.opimpl_getarrayitem_vable_int(OpRef::from_raw(0), index, 1, fd24, adesc);
+            meta.opimpl_getarrayitem_vable_int(OpRef::input_arg_ref(0), index, 1, fd24, adesc);
         if let Some(ctx) = meta.trace_ctx() {
             let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
             ctx.capture_snapshot_for_last_guard(
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 0,
                 0,
             );
             ctx.set_fail_args(
                 g,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
             );
         }
         meta.compile_loop(
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+            ],
             (),
         );
 
@@ -18172,7 +18273,7 @@ mod tests {
             "standard virtualizable loop should use vable boxes, not raw heap ops: {}",
             majit_ir::format_trace(&trace.ops, &trace.constants)
         );
-        assert_eq!(item, OpRef::from_raw(2));
+        assert_eq!(item, OpRef::input_arg_int(2));
     }
 
     #[test]
@@ -18251,14 +18352,14 @@ mod tests {
 
         // Record a simple operation and close the trace
         if let Some(ctx) = meta.trace_ctx() {
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::from_raw(0)], ());
+        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
 
         let events = compile_events.lock().unwrap();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
@@ -18347,14 +18448,14 @@ mod tests {
             meta.on_back_edge(green_key2, &[0]);
         }
         if let Some(ctx) = meta.trace_ctx() {
-            let i0 = OpRef::from_raw(0);
+            let i0 = OpRef::input_arg_int(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::from_raw(0)], ());
+        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert_eq!(
             *compile_count.lock().unwrap(),
             1,
@@ -18384,8 +18485,8 @@ mod tests {
                 meta.on_back_edge(green_key, &[0, 0]);
             }
             if let Some(ctx) = meta.trace_ctx() {
-                let i0 = OpRef::from_raw(0);
-                let i1 = OpRef::from_raw(1);
+                let i0 = OpRef::input_arg_int(0);
+                let i1 = OpRef::input_arg_int(1);
                 let const_one = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
                 let sum2 = ctx.record_op(OpCode::IntAdd, &[sum, const_one]);
@@ -18393,7 +18494,7 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }
-            meta.compile_loop(&[OpRef::from_raw(0), OpRef::from_raw(1)], ());
+            meta.compile_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)], ());
         }
 
         let events = events.lock().unwrap();
