@@ -127,6 +127,10 @@ enum ValueKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CondCallEffectSlot {
     CanRaise,
+    /// `EF_CANNOT_RAISE` — `call.py:303 getcalldescr`'s non-elidable
+    /// `else` branch.  Selected by a `residual_*_cannot_raise` policy
+    /// when the producer statically knows the callee cannot raise.
+    CannotRaise,
     ElidableCanRaise,
     ElidableCannotRaise,
     ElidableOrMemerror,
@@ -137,6 +141,7 @@ impl CondCallEffectSlot {
     fn token(self) -> TokenStream {
         match self {
             Self::CanRaise => quote! { majit_metainterp::EffectInfoSlot::CanRaise },
+            Self::CannotRaise => quote! { majit_metainterp::EffectInfoSlot::CannotRaise },
             Self::ElidableCanRaise => quote! { majit_metainterp::EffectInfoSlot::ElidableCanRaise },
             Self::ElidableCannotRaise => {
                 quote! { majit_metainterp::EffectInfoSlot::ElidableCannotRaise }
@@ -191,6 +196,10 @@ fn call_policy_effect_slot(kind: crate::jit_interp::CallPolicyKind) -> Option<Co
         | K::ResidualRefWrapped
         | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
 
+        K::ResidualVoidCannotRaise | K::ResidualVoidCannotRaiseWrapped => {
+            Some(CondCallEffectSlot::CannotRaise)
+        }
+
         K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
         | K::LoopInvariantInt
@@ -233,6 +242,8 @@ fn call_policy_result_kind(kind: crate::jit_interp::CallPolicyKind) -> Option<Ca
     match kind {
         K::ResidualVoid
         | K::ResidualVoidWrapped
+        | K::ResidualVoidCannotRaise
+        | K::ResidualVoidCannotRaiseWrapped
         | K::MayForceVoid
         | K::MayForceVoidWrapped
         | K::ReleaseGilVoid
@@ -280,6 +291,7 @@ fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) -> bool {
     matches!(
         kind,
         K::ResidualVoidWrapped
+            | K::ResidualVoidCannotRaiseWrapped
             | K::MayForceVoidWrapped
             | K::ReleaseGilVoidWrapped
             | K::LoopInvariantVoidWrapped
@@ -1340,24 +1352,33 @@ impl<'c> Lowerer<'c> {
         }
     }
 
-    fn explicit_cond_call_policy(
+    /// Resolve the cond_call / record_known_result helper policy for
+    /// `func`, falling back to `inferred_default` when the helper has a
+    /// `helper_policy_path` but no explicit `calls={{ helper => ... }}`
+    /// entry — RPython's `getcalldescr` (`call.py:282-303`) derives
+    /// `extraeffect` from the call graph regardless of any user
+    /// annotation, so a missing explicit policy must not crash.  The
+    /// `inferred_default` is the macro's analyzer-absent fallback (e.g.
+    /// `ResidualVoidWrapped` for `conditional_call!`); the trailing
+    /// `-live-` emission will still be correct because the default's
+    /// slot is `CanRaise`, which `slot.can_raise()` reports true.
+    ///
+    /// Panics only when no helper-policy path exists at all — in that
+    /// case the macro literally cannot register the function pointer.
+    fn cond_call_policy_or_inferred_default(
         &self,
         func: &Expr,
         macro_name: &str,
+        inferred_default: crate::jit_interp::CallPolicyKind,
     ) -> crate::jit_interp::CallPolicyKind {
         match self.resolve_call_policy(func) {
             Some(CallPolicySpec::Explicit(kind)) => kind,
-            Some(CallPolicySpec::Infer) => {
-                panic!(
-                    "{macro_name} requires an explicit calls={{ helper => ... }} policy; \
-                     inferred helper policy is resolved too late to decide the RPython \
-                     calldescr_canraise live marker statically"
-                );
-            }
+            Some(CallPolicySpec::Infer) => inferred_default,
             None => {
                 panic!(
-                    "{macro_name} requires a calls={{ helper => ... }} policy so the \
-                     lowered JitCode can carry the RPython calldescr EffectInfoSlot"
+                    "{macro_name} cannot resolve a helper policy for the callee — \
+                     no `calls={{ helper => ... }}` entry and no `_jit_helper_policy` \
+                     accessor on the function path"
                 );
             }
         }
@@ -1801,7 +1822,16 @@ impl<'c> Lowerer<'c> {
             typed_arg_tokens.push(token);
         }
         let func_path = args[1];
-        let policy = self.explicit_cond_call_policy(func_path, "conditional_call!");
+        // `conditional_call!` always lowers to a void residual_call.
+        // Default to `ResidualVoidWrapped` for `Infer` so the
+        // analyzer-absent CanRaise slot is the lowering's static slot;
+        // the runtime helper-policy lookup overrides this for callees
+        // whose flavor turns out otherwise.
+        let policy = self.cond_call_policy_or_inferred_default(
+            func_path,
+            "conditional_call!",
+            crate::jit_interp::CallPolicyKind::ResidualVoidWrapped,
+        );
         let Some(result_kind) = call_policy_result_kind(policy) else {
             panic!("conditional_call! helper policy {policy:?} has no direct-call result kind");
         };
@@ -1908,7 +1938,21 @@ impl<'c> Lowerer<'c> {
                 __builder.conditional_call_value_ir_i_typed_args(__fn_idx, #value_reg, &[#(#typed_arg_tokens),*], #result_reg);
             },
         };
-        let policy = self.explicit_cond_call_policy(func_path, "conditional_call_elidable!");
+        // `conditional_call_elidable!` is the elidable cache helper; per
+        // `rlib/jit.py:1334-1336` the callee need not be `@elidable` but
+        // the cond_call_value op itself caches the result.  Default to
+        // `Elidable*Wrapped` based on the leading value-kind so an
+        // inferred policy still classifies as elidable.
+        let inferred_default = match value_kind {
+            BindingKind::Ref => crate::jit_interp::CallPolicyKind::ElidableRefWrapped,
+            BindingKind::Float => crate::jit_interp::CallPolicyKind::ElidableFloatWrapped,
+            BindingKind::Int => crate::jit_interp::CallPolicyKind::ElidableIntWrapped,
+        };
+        let policy = self.cond_call_policy_or_inferred_default(
+            func_path,
+            "conditional_call_elidable!",
+            inferred_default,
+        );
         let Some(result_kind) = call_policy_result_kind(policy) else {
             panic!(
                 "conditional_call_elidable! helper policy {policy:?} has no direct-call result kind"
@@ -2019,7 +2063,21 @@ impl<'c> Lowerer<'c> {
         // RPython pyjitpl.py:413-419 passes the known result box as
         // `prepend_box=resbox`; record_known_result reads that box and
         // produces no result (`_v` suffix).
-        let policy = self.explicit_cond_call_policy(func_path, "record_known_result!");
+        // `record_known_result!` requires an elidable callee — the
+        // `slot.is_elidable()` assert below catches non-elidable
+        // policies.  Default `Infer` to `Elidable*Wrapped` so the
+        // assert succeeds when the helper is registered through the
+        // wrapped policy path.
+        let inferred_default = match result_binding.kind {
+            BindingKind::Ref => crate::jit_interp::CallPolicyKind::ElidableRefWrapped,
+            BindingKind::Float => crate::jit_interp::CallPolicyKind::ElidableFloatWrapped,
+            BindingKind::Int => crate::jit_interp::CallPolicyKind::ElidableIntWrapped,
+        };
+        let policy = self.cond_call_policy_or_inferred_default(
+            func_path,
+            "record_known_result!",
+            inferred_default,
+        );
         let Some(result_kind) = call_policy_result_kind(policy) else {
             panic!("record_known_result! helper policy {policy:?} has no direct-call result kind");
         };
@@ -2151,7 +2209,30 @@ impl<'c> Lowerer<'c> {
         let func = &call.func;
         match policy {
             CallPolicySpec::Explicit(kind) => match kind {
-                crate::jit_interp::CallPolicyKind::ResidualVoid => {
+                crate::jit_interp::CallPolicyKind::ResidualVoid
+                | crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise => {
+                    // `call.py:301-303 getcalldescr`: `EF_CAN_RAISE` for the
+                    // analyzer-absent default, `EF_CANNOT_RAISE` when
+                    // `_canraise(op) == False` on the non-elidable `else`
+                    // branch.  Both share the residual_call dispatch byte
+                    // family; only the descr's `EffectInfo` differs.
+                    let cannot_raise = matches!(
+                        kind,
+                        crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise,
+                    );
+                    let call_stmt = if cannot_raise {
+                        quote! {
+                            __builder.residual_call_void_canonical_via_target_with_effect_info(
+                                __fn_idx,
+                                __typed_args,
+                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                            );
+                        }
+                    } else {
+                        quote! {
+                            __builder.residual_call_void_canonical_via_target(__fn_idx, __typed_args);
+                        }
+                    };
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         let typed_args = quote! {
                             &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
@@ -2160,7 +2241,8 @@ impl<'c> Lowerer<'c> {
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
+                                let __typed_args = #typed_args;
+                                #call_stmt
                             },
                         );
                     } else {
@@ -2171,7 +2253,8 @@ impl<'c> Lowerer<'c> {
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
                                 let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                                __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
+                                let __typed_args = #typed_args;
+                                #call_stmt
                             },
                         );
                     }
@@ -2361,12 +2444,29 @@ impl<'c> Lowerer<'c> {
                         },
                     );
                 }
-                crate::jit_interp::CallPolicyKind::ResidualVoidWrapped => {
+                crate::jit_interp::CallPolicyKind::ResidualVoidWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaiseWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
-                    let call_stmt = quote! { __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args); };
+                    // `call.py:301-303 getcalldescr`: descr's `EffectInfo`
+                    // differs by the analyzer's `_canraise` result, but the
+                    // residual_call dispatch family is the same.
+                    let call_stmt = if matches!(
+                        kind,
+                        crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaiseWrapped,
+                    ) {
+                        quote! {
+                            __builder.residual_call_void_canonical_via_target_with_effect_info(
+                                __fn_idx,
+                                #typed_args,
+                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                            );
+                        }
+                    } else {
+                        quote! { __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args); }
+                    };
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                         quote! {

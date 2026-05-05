@@ -221,6 +221,13 @@ pub struct CallEntry {
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
     ResidualVoidWrapped,
+    /// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable
+    /// `else` branch).  Producers pick this when they statically know
+    /// the callee cannot raise but is otherwise neither elidable nor
+    /// loop-invariant — e.g. flat TLS / buffer shims.  Maps to
+    /// [`CondCallEffectSlot::CannotRaise`].
+    ResidualVoidCannotRaise,
+    ResidualVoidCannotRaiseWrapped,
     MayForceVoid,
     MayForceVoidWrapped,
     ReleaseGilVoid,
@@ -274,6 +281,8 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
     Some(match kind.to_string().as_str() {
         "residual_void" => CallPolicyKind::ResidualVoid,
         "residual_void_wrapped" => CallPolicyKind::ResidualVoidWrapped,
+        "residual_void_cannot_raise" => CallPolicyKind::ResidualVoidCannotRaise,
+        "residual_void_cannot_raise_wrapped" => CallPolicyKind::ResidualVoidCannotRaiseWrapped,
         "may_force_void" => CallPolicyKind::MayForceVoid,
         "may_force_void_wrapped" => CallPolicyKind::MayForceVoidWrapped,
         "release_gil_void" => CallPolicyKind::ReleaseGilVoid,
@@ -946,10 +955,12 @@ fn rewrite_body(
         // frame, never reaches call_*_function.
         match kind {
             CallPolicyKind::ResidualVoid
+            | CallPolicyKind::ResidualVoidCannotRaise
             | CallPolicyKind::MayForceVoid
             | CallPolicyKind::ReleaseGilVoid
             | CallPolicyKind::LoopInvariantVoid
             | CallPolicyKind::ResidualVoidWrapped
+            | CallPolicyKind::ResidualVoidCannotRaiseWrapped
             | CallPolicyKind::MayForceVoidWrapped
             | CallPolicyKind::ReleaseGilVoidWrapped
             | CallPolicyKind::LoopInvariantVoidWrapped => Some(ObserverReplayKind::Void),
@@ -983,6 +994,7 @@ fn rewrite_body(
         matches!(
             kind,
             CallPolicyKind::ResidualVoidWrapped
+                | CallPolicyKind::ResidualVoidCannotRaiseWrapped
                 | CallPolicyKind::MayForceVoidWrapped
                 | CallPolicyKind::ReleaseGilVoidWrapped
                 | CallPolicyKind::LoopInvariantVoidWrapped
