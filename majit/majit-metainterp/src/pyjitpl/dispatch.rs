@@ -4773,7 +4773,7 @@ mod tests {
             OpCode::GuardNotForced
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(4)).unwrap().opcode,
             OpCode::GuardNoException
         );
     }
@@ -4826,7 +4826,7 @@ mod tests {
             OpCode::GuardNotForced
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(4)).unwrap().opcode,
             OpCode::GuardNoException
         );
     }
@@ -4879,7 +4879,7 @@ mod tests {
             OpCode::GuardNotForced
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::from_raw(4)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::void_op(4)).unwrap().opcode,
             OpCode::GuardNoException
         );
     }
