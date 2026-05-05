@@ -6,10 +6,15 @@
 
 N = 300000
 
-lst = [0, 1, 2, 3, 4]
-i = 0
-while i < N:
-    lst.append(i)
-    lst.pop()
-    i = i + 1
-print(len(lst), lst[0])
+
+def main():
+    lst = [0, 1, 2, 3, 4]
+    i = 0
+    while i < N:
+        lst.append(i)
+        lst.pop()
+        i = i + 1
+    print(len(lst), lst[0])
+
+
+main()

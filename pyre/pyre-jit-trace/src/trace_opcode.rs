@@ -182,6 +182,7 @@ use pyre_interpreter::{
 
 use pyre_object::PyObjectRef;
 use pyre_object::listobject::w_list_getitem;
+use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
     FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list, is_tuple,
 };
@@ -4537,6 +4538,47 @@ impl MIFrame {
         self.trace_list_append(list, value)
     }
 
+    /// Mirror of `list_append_value` for `lst.pop()`. Caller has already
+    /// verified `concrete_len > 0`; this function picks a strategy fast
+    /// path or falls back to generic call dispatch.
+    ///
+    /// `callable` is the bound `W_MethodObject` OpRef: fallback paths pass
+    /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
+    /// on the *method*, not on the receiver (calling the list itself would be
+    /// a TypeError).
+    pub(crate) fn list_pop_value(
+        &mut self,
+        callable: OpRef,
+        list: OpRef,
+        concrete_list: PyObjectRef,
+        concrete_len: usize,
+    ) -> Result<OpRef, PyError> {
+        if concrete_list.is_null() || concrete_len == 0 {
+            // Caller's guard ensures concrete_len > 0; defensive fallback.
+            return self.trace_call_callable(callable, &[]);
+        }
+        unsafe {
+            if is_list(concrete_list) {
+                let strategy_id = if w_list_uses_object_storage(concrete_list) {
+                    Some(0i64)
+                } else if w_list_uses_int_storage(concrete_list) {
+                    Some(1i64)
+                } else if w_list_uses_float_storage(concrete_list) {
+                    Some(2i64)
+                } else {
+                    None
+                };
+                if let Some(sid) = strategy_id {
+                    let is_inline = w_list_is_inline_storage(concrete_list);
+                    return Ok(self.with_ctx(|this, ctx| {
+                        crate::generated_list_pop_by_strategy(this, ctx, list, sid, is_inline)
+                    }));
+                }
+            }
+        }
+        self.trace_call_callable(callable, &[])
+    }
+
     pub(crate) fn concrete_iter_continues(
         &self,
         concrete_iter: PyObjectRef,
@@ -4674,6 +4716,94 @@ impl MIFrame {
                 "concrete_callable should always be available during tracing"
             );
             return self.trace_call_callable(callable, args);
+        }
+
+        // PRE-EXISTING-ADAPTATION. In RPython the `lst.append(i)` /
+        // `lst.pop()` lowering goes through rtyper helpers in
+        // `rpython/rtyper/rlist.py`: `ll_append` (rlist.py:588) is
+        // documented "no oopspec — inlined by the JIT", and the pop
+        // path picks `ll_pop_nonneg` / `ll_pop_zero` (which carry
+        // `oopspec = 'list.pop(l, index)'` / `'list.pop(l, 0)'`) over
+        // `ll_pop_default` based on the index sign. By the time the
+        // metainterp sees the trace, those helpers have already been
+        // inlined or oopspec'd into direct array operations. Pyre's
+        // codewriter is `partial` (per `majit/COMPATIBILITY_MATRIX.md`)
+        // and does not run that pass, so the analogous specialization
+        // happens here at trace recording time instead. Convergence
+        // path: port the rtyper/codewriter inlining + oopspec
+        // recognition and remove this arm.
+        //
+        // `baseobjspace::getattr` returns a fresh `W_MethodObject` per
+        // iteration, so the receiver is pushed by `load_method` as
+        // `null_value` (load_method:6334) and call sees
+        // `concrete_callable = W_MethodObject`, with the receiver missing
+        // from `args`. Recover the receiver via `GetfieldGcR(callable,
+        // w_self)` after guarding the method object's class. The function
+        // pointer inside the method object IS stable across iterations
+        // (unlike the freshly-allocated method-object pointer itself), so
+        // a `guard_value` on the `w_function` slot pins the specialization
+        // without invalidating on the next iteration's fresh allocation.
+        if unsafe { is_method(concrete_callable) } {
+            let inner_func = unsafe { w_method_get_func(concrete_callable) };
+            let inner_self = unsafe { w_method_get_self(concrete_callable) };
+            // `is_builtin_code` gate plus canonical-method identity check:
+            // a list subclass overriding `append` or `pop` with a Python
+            // `def` would still produce `is_function(inner_func) == true`
+            // and may reuse the same name, which must not silently rewire
+            // the call to builtin list IR.
+            // PyPy's `_Method` dispatch (`baseobjspace.py:1252` →
+            // `function.py:566`) just unwraps and calls `w_function`
+            // generically, so the user override runs. Restrict the spec
+            // arm to builtin-coded functions; Python overrides fall
+            // through to `trace_call_callable` below.
+            if !inner_func.is_null()
+                && !inner_self.is_null()
+                && unsafe { is_function(inner_func) }
+                && unsafe {
+                    is_builtin_code(
+                        pyre_interpreter::getcode(inner_func) as pyre_object::PyObjectRef
+                    )
+                }
+                && unsafe { is_list(inner_self) }
+            {
+                let canonical_list_method = |name: &str| {
+                    let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
+                    unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
+                };
+                let recover_self = |this: &mut Self| {
+                    this.with_ctx(|this, ctx| {
+                        this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
+                        let func_ref = ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldGcR,
+                            &[callable],
+                            crate::descr::method_w_function_descr(),
+                        );
+                        this.implement_guard_value(ctx, func_ref, inner_func as i64);
+                        ctx.record_op_with_descr(
+                            majit_ir::OpCode::GetfieldGcR,
+                            &[callable],
+                            crate::descr::method_w_self_descr(),
+                        )
+                    })
+                };
+                if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
+                    let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
+                    let self_ref = recover_self(self);
+                    self.list_append_value(self_ref, args[0], inner_self, c_arg)?;
+                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                }
+                if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
+                    let concrete_len = unsafe { w_list_len(inner_self) };
+                    // Empty-list pop raises IndexError; let the generic
+                    // dispatcher handle that. Strategy-unknown lists also
+                    // fall through; `list_pop_value` mirrors the strategy
+                    // detection from `list_append_value`.
+                    if concrete_len > 0 {
+                        let self_ref = recover_self(self);
+                        return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
+                    }
+                }
+            }
         }
 
         unsafe {

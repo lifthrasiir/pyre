@@ -1,7 +1,7 @@
 use std::ops::{Index, IndexMut};
 
 /// Small-buffer capacity. Arrays up to this size avoid heap allocation.
-const INLINE_CAP: usize = 8;
+pub const INT_ARRAY_INLINE_CAP: usize = 8;
 
 /// Fixed-size i64 array with small-buffer optimization.
 #[repr(C)]
@@ -9,7 +9,7 @@ pub struct IntArray {
     pub ptr: *mut i64,
     len: usize,
     heap_cap: usize,
-    inline_buf: [i64; INLINE_CAP],
+    inline_buf: [i64; INT_ARRAY_INLINE_CAP],
 }
 
 pub const INT_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(IntArray, ptr);
@@ -19,8 +19,8 @@ pub const INT_ARRAY_HEAP_CAP_OFFSET: usize = std::mem::offset_of!(IntArray, heap
 impl IntArray {
     pub fn from_vec(mut values: Vec<i64>) -> Self {
         let len = values.len();
-        if len <= INLINE_CAP {
-            let mut inline_buf = [0; INLINE_CAP];
+        if len <= INT_ARRAY_INLINE_CAP {
+            let mut inline_buf = [0; INT_ARRAY_INLINE_CAP];
             inline_buf[..len].copy_from_slice(&values);
             let mut arr = Self {
                 ptr: std::ptr::null_mut(),
@@ -38,7 +38,7 @@ impl IntArray {
                 ptr,
                 len,
                 heap_cap: cap,
-                inline_buf: [0; INLINE_CAP],
+                inline_buf: [0; INT_ARRAY_INLINE_CAP],
             }
         }
     }
@@ -48,7 +48,7 @@ impl IntArray {
         if self.heap_cap > 0 {
             self.heap_cap
         } else {
-            INLINE_CAP
+            INT_ARRAY_INLINE_CAP
         }
     }
 
@@ -63,7 +63,7 @@ impl IntArray {
     }
 
     fn grow_to_heap(&mut self, min_cap: usize) {
-        let target_cap = min_cap.max(INLINE_CAP * 2);
+        let target_cap = min_cap.max(INT_ARRAY_INLINE_CAP * 2);
         let mut values = Vec::with_capacity(target_cap);
         values.extend_from_slice(&self.inline_buf[..self.len]);
         self.ptr = values.as_mut_ptr();

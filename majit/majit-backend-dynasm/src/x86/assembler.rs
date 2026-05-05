@@ -398,9 +398,9 @@ impl<'a> Assembler386<'a> {
             return None;
         }
         if opref.is_constant() {
-            return self.constant_types.get(&opref.0).copied();
+            return self.constant_types.get(&opref.raw()).copied();
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.operations[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -409,10 +409,10 @@ impl<'a> Assembler386<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.0) {
+        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.0) {
+        if let Some(&idx) = self.op_index.get(&opref.raw()) {
             let tp = self.operations[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
