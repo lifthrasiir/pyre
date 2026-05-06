@@ -3355,7 +3355,7 @@ impl<'a> AssemblerARM64<'a> {
                 op_index,
                 op.opcode,
                 op.fail_args.as_ref(),
-                &descr.fail_arg_types,
+                descr.fail_arg_types(),
                 faillocs
             );
         }
@@ -3416,7 +3416,7 @@ impl<'a> AssemblerARM64<'a> {
         // (compile.rs:1596) with a resume_layout-derived layout whose
         // jitcode_index originates from `Snapshot::single_frame`.
         let recovery_layout = {
-            let slot_types = &descr.fail_arg_types;
+            let slot_types = descr.fail_arg_types();
             ExitRecoveryLayout {
                 vable_array: vec![],
                 vref_array: vec![],
@@ -3429,7 +3429,7 @@ impl<'a> AssemblerARM64<'a> {
                     slots: (0..slot_types.len())
                         .map(ExitValueSourceLayout::ExitValue)
                         .collect(),
-                    slot_types: Some(slot_types.clone()),
+                    slot_types: Some(slot_types.to_vec()),
                 }],
                 virtual_layouts: vec![],
                 pending_field_layouts: vec![],
@@ -3453,7 +3453,7 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index, &descr.fail_arg_locs, &descr.rd_locs
             );
         }
-        let gcmap = self.guard_gcmap_from_faillocs(&descr.fail_arg_types, faillocs);
+        let gcmap = self.guard_gcmap_from_faillocs(descr.fail_arg_types(), faillocs);
 
         self.pending_guard_tokens.push(GuardToken {
             fail_label,

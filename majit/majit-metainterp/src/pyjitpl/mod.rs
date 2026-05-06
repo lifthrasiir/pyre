@@ -4231,7 +4231,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge — record this loop's
                 // CALL_ASSEMBLER / JUMP keepalive targets.
-                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
+                self.record_loop_or_bridge(&token, &mut compiled_ops, trace_id);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -5040,7 +5040,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &combined_ops, trace_id);
+                self.record_loop_or_bridge(&token, &mut combined_ops, trace_id);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -5538,7 +5538,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
+                self.record_loop_or_bridge(&token, &mut optimized_ops, trace_id);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -5881,7 +5881,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
+                self.record_loop_or_bridge(&token, &mut compiled_ops, trace_id);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -7139,7 +7139,7 @@ impl<M: Clone> MetaInterp<M> {
     fn record_loop_or_bridge(
         &self,
         original: &Arc<JitCellToken>,
-        ops: &[majit_ir::Op],
+        ops: &mut [majit_ir::Op],
         trace_id: u64,
     ) {
         // `compile.py:178-179` `assert original_jitcell_token.generation > 0`.
@@ -7158,11 +7158,15 @@ impl<M: Clone> MetaInterp<M> {
         }
         //
         // `compile.py:183` `for op in loop.operations`.
-        for op in ops.iter() {
-            let Some(descr) = op.descr.as_ref() else {
-                // `compile.py:184 descr = op.getdescr()` returns `None`
-                // for ops without a descr; the subsequent `isinstance`
-                // checks all fail.
+        for op in ops.iter_mut() {
+            // `compile.py:184 descr = op.getdescr()`. Clone the Arc
+            // (single atomic bump) so the rest of this loop iteration
+            // can hold the descr value while still freely mutating
+            // `op.descr` to land the `compile.py:191/202 cleardescr()`
+            // calls on the JitCellToken/TargetToken branches below.
+            let Some(descr) = op.descr.clone() else {
+                // `compile.py:184` returns `None` for ops without a
+                // descr; the subsequent `isinstance` checks all fail.
                 continue;
             };
             // `compile.py:185-186` line-by-line port:
@@ -7287,13 +7291,16 @@ impl<M: Clone> MetaInterp<M> {
                         };
                         original.record_jump_to(target);
                     }
-                    // `compile.py:191` `op.cleardescr()`.
-                    //
-                    // PARITY BY CONSTRUCTION: pyre's `Loop` value drops at
-                    // end-of-compile, releasing every descr it held.
-                    // Upstream `cleardescr` exists primarily to keep
-                    // `history.Stats` from holding the loop alive across
-                    // tests; pyre has no equivalent test infrastructure.
+                    // `compile.py:191` `op.cleardescr()`.  Clears the
+                    // descr reference unconditionally — both the
+                    // `descr is original_jitcell_token` short-circuit
+                    // and the `record_jump_to` branch fall through
+                    // here.  The keepalive is now on `original` (via
+                    // `record_jump_to`), so the descr-on-op pointer is
+                    // no longer needed and is released to break any
+                    // loop ↔ JitCellToken cycle a downstream consumer
+                    // (e.g., debug/tests) might form.
+                    op.descr = None;
                     continue;
                 }
             }
@@ -7340,10 +7347,16 @@ impl<M: Clone> MetaInterp<M> {
                         );
                         original.record_jump_to(target);
                     }
-                    // `compile.py:200-202` `op._descr_wref =
-                    // weakref.ref(op._descr); op.cleardescr()` — PARITY
-                    // BY CONSTRUCTION (Loop value drops at end-of-compile,
-                    // releasing the descr without explicit cleardescr).
+                    // `compile.py:202` `op.cleardescr()`.  Clears the
+                    // TargetToken descr reference unconditionally —
+                    // both the `descr.original_jitcell_token is
+                    // original_jitcell_token` short-circuit and the
+                    // `record_jump_to` branch fall through here.  The
+                    // `compile.py:200-201` `_descr_wref` capture is
+                    // `if not we_are_translated()` (test-only debug
+                    // aid); pyre has no consumer of that weakref so
+                    // the cleardescr stands alone.
+                    op.descr = None;
                 }
             }
         }
@@ -8106,7 +8119,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
@@ -8163,7 +8176,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
-                self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
+                self.record_loop_or_bridge(&token, &mut optimized_ops, trace_id);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         bridge_inputargs,
@@ -8592,7 +8605,7 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants = constants.clone();
@@ -8695,7 +8708,7 @@ impl<M: Clone> MetaInterp<M> {
                 // (could be a previous_tokens entry on cross-loop or
                 // post-recompile failures), not the current running loop's
                 // latest token.
-                self.record_loop_or_bridge(&source_jct, &optimized_ops, bridge_trace_id);
+                self.record_loop_or_bridge(&source_jct, &mut optimized_ops, bridge_trace_id);
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     // pyjitpl.py:1049 — `fail_descr.trace_id()` is the

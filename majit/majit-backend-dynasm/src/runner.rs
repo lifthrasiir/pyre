@@ -1210,7 +1210,7 @@ impl DynasmBackend {
         if let Some(found) = compiled
             .fail_descrs
             .iter()
-            .find(|d| d.trace_id == trace_id && d.fail_index == fail_index)
+            .find(|d| d.trace_id() == trace_id && d.fail_index == fail_index)
         {
             return Some(found.clone());
         }
@@ -1220,7 +1220,7 @@ impl DynasmBackend {
                 if let Some(found) = bridge
                     .fail_descrs
                     .iter()
-                    .find(|d| d.trace_id == trace_id && d.fail_index == fail_index)
+                    .find(|d| d.trace_id() == trace_id && d.fail_index == fail_index)
                 {
                     return Some(found.clone());
                 }
@@ -1606,7 +1606,10 @@ impl Backend for DynasmBackend {
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[dynasm-bridge] patch: trace_id={} fail_index={} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
-                guard_descr.trace_id, guard_descr.fail_index, ajo, bridge_addr
+                guard_descr.trace_id(),
+                guard_descr.fail_index,
+                ajo,
+                bridge_addr
             );
         }
         if ajo != 0 {
@@ -1755,7 +1758,7 @@ impl Backend for DynasmBackend {
                 "[dynasm] descr: fi={} finish={} types={} locs={:?}",
                 descr.fail_index,
                 descr.is_finish,
-                descr.fail_arg_types.len(),
+                descr.fail_arg_types().len(),
                 &descr.fail_arg_locs
             );
         }
@@ -1836,7 +1839,8 @@ impl Backend for DynasmBackend {
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
 
-        let num_fail_args = descr.fail_arg_types.len();
+        let fail_arg_types = descr.fail_arg_types();
+        let num_fail_args = fail_arg_types.len();
         let mut outputs: Vec<i64> = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
             outputs.push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
@@ -1848,7 +1852,7 @@ impl Backend for DynasmBackend {
                 Some(None) => 0,
                 None => outputs.get(i).copied().unwrap_or(0),
             };
-            typed_outputs.push(match descr.fail_arg_types[i] {
+            typed_outputs.push(match fail_arg_types[i] {
                 Type::Ref => Value::Ref(GcRef(raw as usize)),
                 Type::Float => Value::Float(f64::from_bits(raw as u64)),
                 _ => Value::Int(raw),
@@ -1867,7 +1871,7 @@ impl Backend for DynasmBackend {
             savedata: None,
             exception_value: GcRef::NULL,
             fail_index: descr.fail_index,
-            trace_id: descr.trace_id,
+            trace_id: descr.trace_id(),
             is_finish: descr.is_finish,
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception,
             status: descr.get_status(),

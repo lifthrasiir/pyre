@@ -522,26 +522,63 @@ impl CraneliftFailDescr {
         self.force_token_slots.binary_search(&slot).is_ok()
     }
 
+    /// `compile.py:185` `isinstance(descr, ResumeDescr)` gate for
+    /// back-pointer forwarding.  Returns the metainterp `FailDescr`
+    /// Arc only when the metainterp class hierarchy says it is a
+    /// `ResumeDescr` family member (`is_resume_guard()` returns true
+    /// for `ResumeGuardDescr`/`ResumeAtPositionDescr`/
+    /// `ResumeGuardForcedDescr`/`ResumeGuardExcDescr`/
+    /// `CompileLoopVersionDescr`; `is_resume_guard_copied()` returns
+    /// true for the `ResumeGuardCopiedDescr` sibling that chases
+    /// `prev`).
+    ///
+    /// `DoneWithThisFrame*` (`compile.py:623`),
+    /// `ExitFrameWithExceptionDescrRef` (`compile.py:658-662`),
+    /// `PropagateExceptionDescr` (`compile.py:1092`), and
+    /// external-JUMP backend descrs are NOT `ResumeDescr` upstream —
+    /// they inherit `AbstractFailDescr` directly — so the
+    /// `record_loop_or_bridge` walker (`compile.py:183-185`) never
+    /// stamps them.  Backend fields the optimizer ports stamp through
+    /// `op.descr` (`trace_id`, `fail_arg_types`, `rd_numb`,
+    /// `rd_consts`, `rd_virtuals`, `rd_pendingfields`) therefore
+    /// cannot read them from a non-`ResumeDescr` `meta_descr`; doing
+    /// so returns the trait defaults (e.g. `trace_id() -> 0`) rather
+    /// than the construction-time backend-local values.  When this
+    /// gate returns `None`, callers fall back to the backend-local
+    /// field set at descr construction.
+    #[inline]
+    fn meta_resume_fd(&self) -> Option<&dyn FailDescr> {
+        let d = self.meta_descr.as_ref()?;
+        if d.is_resume_guard() || d.is_resume_guard_copied() {
+            d.as_fail_descr()
+        } else {
+            None
+        }
+    }
+
     pub fn layout(&self) -> FailDescrLayout {
-        let gc_ref_slots = self
-            .fail_arg_types
+        // resume.py:450-488 propagate rd_* for post-eviction reconstruction.
+        // Read through the metainterp ResumeGuardDescr Arc gated by
+        // isinstance(descr, ResumeDescr) — single source of truth for
+        // resume-guard descrs; falls back to backend-local fields
+        // otherwise (synthetic FINISH / external-JUMP descrs and
+        // Done*/ExitExc/PropagateException meta descrs that are not
+        // ResumeDescr upstream).
+        let meta_fd = self.meta_resume_fd();
+        let fail_arg_types = <Self as FailDescr>::fail_arg_types(self);
+        let gc_ref_slots = fail_arg_types
             .iter()
             .enumerate()
             .filter_map(|(slot, _)| self.gc_map.is_ref(slot).then_some(slot))
             .collect();
         let recovery = unsafe { &*self.recovery_layout.get() }.clone();
         let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
-        // resume.py:450-488 propagate rd_* for post-eviction reconstruction.
-        // Read through the metainterp ResumeGuardDescr Arc (Session 5b
-        // back-pointer) — single source of truth.
-        let meta_fd = self.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
         FailDescrLayout {
             fail_index: self.fail_index,
             source_op_index: self.source_op_index,
-            // Session 5c: read trace_id through meta_descr too.
-            trace_id: meta_fd.map_or(self.trace_id, |fd| fd.trace_id()),
+            trace_id: <Self as FailDescr>::trace_id(self),
             trace_info: unsafe { &*self.trace_info.get() }.clone(),
-            fail_arg_types: self.fail_arg_types.clone(),
+            fail_arg_types: fail_arg_types.to_vec(),
             is_finish: self.is_finish,
             gc_ref_slots,
             force_token_slots: self.force_token_slots.clone(),
@@ -575,19 +612,28 @@ impl majit_ir::Descr for CraneliftFailDescr {
     /// `ResumeDescr` in upstream; finish descrs and `TargetToken`s are
     /// distinct class hierarchies and `compile.py:185` skips them.
     ///
-    /// Session 5d: forward through metainterp ResumeGuardDescr Arc when
-    /// available.  `is_external_jump` short-circuits to false because
+    /// Session 5d/5e parity audit fix: gate forwarding on
+    /// `meta_resume_fd()` so non-`ResumeDescr` meta descrs
+    /// (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef` /
+    /// `PropagateExceptionDescr`) do not flip the backend's role
+    /// reading.  `is_external_jump` short-circuits to false because
     /// cranelift's external-JUMP descrs are backend-only synthetic
-    /// objects with no metainterp counterpart (meta_descr is None for
-    /// them anyway, but the early-return makes the intent explicit).
+    /// objects with no metainterp counterpart.
     fn is_resume_guard(&self) -> bool {
         if self.is_external_jump {
             return false;
         }
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .map_or(!self.is_finish, |fd| fd.is_resume_guard())
+        // When meta_descr is a ResumeDescr family member, return true.
+        // When it is set but not a ResumeDescr (Done*/ExitExc/
+        // PropagateException), the upstream class is not a
+        // ResumeDescr → return false.  When meta_descr is None (synthetic
+        // descr), fall back to !is_finish (matching the construction-time
+        // class: guard descrs have is_finish=false, FINISH descrs have
+        // is_finish=true).
+        match self.meta_descr.as_ref() {
+            Some(d) => d.is_resume_guard() || d.is_resume_guard_copied(),
+            None => !self.is_finish,
+        }
     }
 }
 
@@ -609,32 +655,36 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn fail_arg_types(&self) -> &[Type] {
-        &self.fail_arg_types
+        // Session 5c + post-audit: forward through `meta_resume_fd()`
+        // (gated on `isinstance(descr, ResumeDescr)`) so the optimizer's
+        // `store_final_boxes_in_guard` (compile.py:869) stamp on the
+        // metainterp side is the single source of truth for guard
+        // descrs.  Fallback to backend-local field when meta_descr is
+        // None (synthetic FINISH / ExitFrameWithExceptionDescr /
+        // external-JUMP) OR when meta_descr is set to a non-ResumeDescr
+        // (Done*/ExitExc/PropagateException — these carry their own
+        // construction-time `fail_arg_types` on the metainterp side
+        // which happens to coincide, but the canonical-source rule
+        // applies only to ResumeDescr per `record_loop_or_bridge`).
+        self.meta_resume_fd()
+            .map_or(&*self.fail_arg_types, |fd| fd.fail_arg_types())
     }
 
     fn is_finish(&self) -> bool {
-        // Session 5d: forward through metainterp ResumeGuardDescr Arc.
-        // DoneWithThisFrame{Void,Int,Ref,Float} and ExitFrameWithExceptionDescrRef
-        // override `is_finish() -> true` on the metainterp side; the rest
-        // — including `PropagateExceptionDescr` (`compile.py:1092`
-        // `class PropagateExceptionDescr(AbstractFailDescr)` inherits
-        // `final_descr = False`, see `compile.rs:2314`) — take the trait
-        // default `false`.
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .map_or(self.is_finish, |fd| fd.is_finish())
+        // Class-hierarchy property — backend-local field set at
+        // construction matches the meta_descr's class.  Read the
+        // local field directly to avoid forwarding through
+        // non-ResumeDescr meta descrs (which would still give the
+        // correct answer here, but keeping the rule consistent: only
+        // ResumeDescr fields go through meta_resume_fd, the rest
+        // come from local).
+        self.is_finish
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
-        // Session 5d: forward through metainterp ResumeGuardDescr Arc.
-        // ExitFrameWithExceptionDescrRef overrides on the metainterp side.
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .map_or(self.is_exit_frame_with_exception, |fd| {
-                fd.is_exit_frame_with_exception()
-            })
+        // Same rationale as `is_finish` — the backend's local field is
+        // set at construction to match the meta_descr's class.
+        self.is_exit_frame_with_exception
     }
 
     fn is_external_jump(&self) -> bool {
@@ -649,15 +699,15 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn trace_id(&self) -> u64 {
-        // Session 5c: forward through metainterp ResumeGuardDescr Arc
-        // (Session 5a back-pointer).  Single source of truth — the
-        // metainterp side stamps trace_id in record_loop_or_bridge
-        // (compile.py:185 line-by-line counterpart).  Fallback to
-        // local field for synthetic test descrs that bypass the
-        // assembler-time meta_descr stamp.
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
+        // Post-audit: gate forwarding on `meta_resume_fd()`.  PyPy's
+        // `record_loop_or_bridge` (compile.py:183-185) stamps trace_id
+        // only on `ResumeDescr` family members; `DoneWithThisFrame*`
+        // and `ExitFrameWithExceptionDescrRef` do not override
+        // `trace_id()` upstream and would return the trait default 0
+        // — masking the backend-local construction-time trace_id.
+        // Fallback to backend-local field when meta_descr is absent
+        // or non-ResumeDescr.
+        self.meta_resume_fd()
             .map_or(self.trace_id, |fd| fd.trace_id())
     }
 
@@ -700,32 +750,24 @@ impl FailDescr for CraneliftFailDescr {
         self.is_compiling()
     }
 
-    // resume.py:450-488 readers: forward to the metainterp ResumeGuardDescr
-    // Arc captured at assembly time (Session 5a back-pointer).  Single
-    // source of truth — drops the duplicated local rd_* copies.
+    // resume.py:450-488 readers gated on `meta_resume_fd()` —
+    // `isinstance(descr, ResumeDescr)` per `record_loop_or_bridge`.
+    // Non-ResumeDescr meta descrs return None for these by trait
+    // default (compile.rs Done*/ExitExc/PropagateException don't
+    // override the rd_* setters), but the gate keeps the rule
+    // explicit so future readers don't accidentally pull None from a
+    // FINISH meta descr when a real `Some` was expected.
     fn rd_numb(&self) -> Option<&[u8]> {
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .and_then(|fd| fd.rd_numb())
+        self.meta_resume_fd().and_then(|fd| fd.rd_numb())
     }
     fn rd_consts(&self) -> Option<&[majit_ir::Const]> {
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .and_then(|fd| fd.rd_consts())
+        self.meta_resume_fd().and_then(|fd| fd.rd_consts())
     }
     fn rd_virtuals(&self) -> Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]> {
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .and_then(|fd| fd.rd_virtuals())
+        self.meta_resume_fd().and_then(|fd| fd.rd_virtuals())
     }
     fn rd_pendingfields(&self) -> Option<&[majit_ir::GuardPendingFieldEntry]> {
-        self.meta_descr
-            .as_ref()
-            .and_then(|m| m.as_fail_descr())
-            .and_then(|fd| fd.rd_pendingfields())
+        self.meta_resume_fd().and_then(|fd| fd.rd_pendingfields())
     }
 }
 

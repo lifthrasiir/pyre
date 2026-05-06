@@ -2506,7 +2506,7 @@ fn register_call_assembler_target(
         .find(|d| d.is_finish() && !d.is_exit_frame_with_exception)
     {
         let result_type = finish_descr
-            .fail_arg_types
+            .fail_arg_types()
             .first()
             .copied()
             .unwrap_or(Type::Void);
@@ -2602,7 +2602,7 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
         .iter()
         .find(|d| d.is_finish() && !d.is_exit_frame_with_exception)
         .map(|d| {
-            let result_type = d.fail_arg_types.first().copied().unwrap_or(Type::Void);
+            let result_type = d.fail_arg_types().first().copied().unwrap_or(Type::Void);
             attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
         })
         .unwrap_or(CA_FINISH_INDEX_UNKNOWN as i64);
@@ -2687,9 +2687,9 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
             majit_backend::descr_owning_jct(fail_descr.as_ref())
                 .map(|jct| jct.green_key)
                 .unwrap_or(0),
-            fail_descr.trace_id,
+            fail_descr.trace_id(),
             fail_descr.fail_index,
-            fail_descr.fail_arg_types.clone(),
+            fail_descr.fail_arg_types().to_vec(),
         )
     };
     if is_normal_finish {
@@ -2900,7 +2900,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 let bridge_frame = CraneliftBackend::execute_bridge(
                     bridge,
                     &raw_outputs,
-                    &fail_descr.fail_arg_types,
+                    fail_descr.fail_arg_types(),
                     &attachments,
                 );
                 let _ = bridge_guard;
@@ -2933,14 +2933,14 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             let mut mat_outputs = outputs.clone();
             rebuild_state_after_failure(
                 &mut mat_outputs,
-                &fail_descr.fail_arg_types,
+                fail_descr.fail_arg_types(),
                 fail_descr.recovery_layout_ref().as_ref(),
                 bridge.num_inputs,
             );
             return CraneliftBackend::execute_bridge(
                 bridge,
                 &mat_outputs,
-                &fail_descr.fail_arg_types,
+                fail_descr.fail_arg_types(),
                 &attachments,
             );
         }
@@ -3110,12 +3110,12 @@ fn call_assembler_guard_failure_inner(
     // code jumps to the bridge instead of re-entering the guard helper.
     let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
     if let Some(ref bridge) = *fail_descr_ref.bridge_ref() {
-        let raw_num = fail_descr_ref.fail_arg_types.len();
+        let raw_num = fail_descr_ref.fail_arg_types().len();
         let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) };
         let frame = CraneliftBackend::execute_bridge(
             bridge,
             parent_outputs,
-            &fail_descr_ref.fail_arg_types,
+            fail_descr_ref.fail_arg_types(),
             attachments,
         );
         if let Some(result) = call_assembler_finish_or_blackhole_deadframe(frame) {
@@ -3145,7 +3145,7 @@ fn call_assembler_guard_failure_inner(
     // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
     // (pyjitpl/mod.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
-    let trace_id = fail_descr.trace_id;
+    let trace_id = fail_descr.trace_id();
     fail_descr.increment_fail_count();
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
@@ -3153,7 +3153,7 @@ fn call_assembler_guard_failure_inner(
     // compile bridge. The bridge is attached to fail_descr for fast
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
     if let (Some(jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
-        let raw_num = fail_descr.fail_arg_types.len();
+        let raw_num = fail_descr.fail_arg_types().len();
         if bridge_fn(
             jct.green_key,
             trace_id,
@@ -3196,7 +3196,7 @@ fn call_assembler_guard_failure_inner(
     // (call_jit.rs:1293), which previously drove the force_fn fallback
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let raw_num = fail_descr.fail_arg_types.len();
+        let raw_num = fail_descr.fail_arg_types().len();
         if let Some(result) = bh_fn(
             green_key,
             trace_id,
@@ -3312,14 +3312,14 @@ fn call_assembler_fast_path_heap(
         let mut bridge_outputs = outputs;
         rebuild_state_after_failure(
             &mut bridge_outputs,
-            &fail_descr.fail_arg_types,
+            fail_descr.fail_arg_types(),
             fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
         let mut frame = CraneliftBackend::execute_bridge(
             bridge,
             &bridge_outputs,
-            &fail_descr.fail_arg_types,
+            fail_descr.fail_arg_types(),
             &attachments,
         );
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
@@ -3345,12 +3345,12 @@ fn call_assembler_fast_path_heap(
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let green_key = target.green_key;
         let trace_id = target.trace_id;
-        let raw_num = fail_descr.fail_arg_types.len();
+        let raw_num = fail_descr.fail_arg_types().len();
         let raw_outputs = outputs.to_vec();
         let mut bh_outputs = outputs.to_vec();
         rebuild_state_after_failure(
             &mut bh_outputs,
-            &fail_descr.fail_arg_types,
+            fail_descr.fail_arg_types(),
             fail_descr.recovery_layout_ref().as_ref(),
             raw_num,
         );
@@ -5914,7 +5914,7 @@ fn find_fail_descr_in_fail_descrs(
     fail_index: u32,
 ) -> Option<Arc<CraneliftFailDescr>> {
     for descr in fail_descrs {
-        if descr.trace_id == trace_id && descr.fail_index == fail_index {
+        if descr.trace_id() == trace_id && descr.fail_index == fail_index {
             return Some(descr.clone());
         }
         let bridge_guard = descr.bridge_ref();
@@ -6331,7 +6331,7 @@ fn patch_fail_descr_recovery_layout(
     recovery_layout: &ExitRecoveryLayout,
 ) -> bool {
     for descr in fail_descrs {
-        if descr.trace_id == trace_id && descr.fail_index == fail_index {
+        if descr.trace_id() == trace_id && descr.fail_index == fail_index {
             descr.set_recovery_layout(recovery_layout.clone());
             return true;
         }
@@ -6608,7 +6608,7 @@ impl CraneliftBackend {
                 for prev_d in &prev_compiled.fail_descrs {
                     if prev_d.has_bridge() {
                         let fi = prev_d.fail_index();
-                        let tid = prev_d.trace_id;
+                        let tid = prev_d.trace_id();
                         if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi) {
                             if !new_d.has_bridge() {
                                 let bridge = prev_d.bridge_ref();
@@ -7117,7 +7117,7 @@ impl CraneliftBackend {
             return Self::execute_bridge(
                 next_bridge,
                 &outputs,
-                &fail_descr.fail_arg_types,
+                fail_descr.fail_arg_types(),
                 attachments,
             );
         }
@@ -13012,7 +13012,7 @@ fn collect_guards(
                 op_idx,
                 op.opcode,
                 op.fail_args.as_ref(),
-                descr.fail_arg_types,
+                descr.fail_arg_types(),
             );
         }
         // store_hash is called after compile_loop by pyjitpl.rs using
@@ -13025,7 +13025,7 @@ fn collect_guards(
             if let Some(fa) = op.fail_args.as_ref() {
                 let arg0 = op.arg(0);
                 if let Some(idx) = fa.iter().position(|&r| r == arg0) {
-                    let type_tag = match descr.fail_arg_types.get(idx) {
+                    let type_tag = match descr.fail_arg_types().get(idx) {
                         Some(majit_ir::Type::Ref) => CraneliftFailDescr::TY_REF,
                         Some(majit_ir::Type::Float) => CraneliftFailDescr::TY_FLOAT,
                         _ => CraneliftFailDescr::TY_INT,
@@ -13050,7 +13050,11 @@ fn collect_guards(
             if descr.is_exit_frame_with_exception {
                 attached_descrs.exit_frame_with_exception_descr_ref as i64
             } else {
-                let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
+                let result_type = descr
+                    .fail_arg_types()
+                    .first()
+                    .copied()
+                    .unwrap_or(Type::Void);
                 attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
             }
         } else {
@@ -13619,7 +13623,7 @@ impl majit_backend::Backend for CraneliftBackend {
             // find_fail_descr_in_fail_descrs and BridgeData.source_guard.
             let target = find_fail_descr_in_fail_descrs(
                 &new.fail_descrs,
-                old_fd.trace_id,
+                old_fd.trace_id(),
                 old_fd.fail_index,
             );
             if let Some(new_fd) = target {
@@ -14032,7 +14036,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .as_ref()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
-            descr.fail_index == source_fail_index && descr.trace_id == source_trace_id
+            descr.fail_index == source_fail_index && descr.trace_id() == source_trace_id
         })?;
         let bridge = source_descr.bridge_ref();
         let bridge = bridge.as_ref()?;

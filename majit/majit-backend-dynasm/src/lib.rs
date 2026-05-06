@@ -560,9 +560,9 @@ fn handle_fail_resume_guard(
     frame_ptr: *mut jitframe::JitFrame,
     _outer_green_key: u64,
 ) -> i64 {
-    let trace_id = descr.trace_id;
+    let trace_id = <guard::DynasmFailDescr as majit_ir::FailDescr>::trace_id(descr);
     let fail_index = descr.fail_index;
-    let n_fail_args = descr.fail_arg_types.len();
+    let n_fail_args = <guard::DynasmFailDescr as majit_ir::FailDescr>::fail_arg_types(descr).len();
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
         let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
@@ -801,8 +801,8 @@ mod tests {
             3,
             17,
             vec![Type::Int],
-            false,
-            true,
+            false, // is_finish
+            true,  // is_resume_guard
         ));
         descr.set_bridge_addr(test_bridge_finish_int as *const () as usize);
         let descr_ptr = Arc::as_ptr(&descr) as usize;
