@@ -135,8 +135,8 @@ pub fn copy_str_content(
                     };
                     // vstring.py:496-503: virtual Plain/Concat dispatch
                     let from_info = resolved_idx.and_then(|idx| {
-                        ctx.getptrinfo(srcbox)
-                            .and_then(|info| info.as_ref().strgetitem(idx, &*ctx))
+                        ctx.getptrinfo_via_box(srcbox)
+                            .and_then(|info| info.strgetitem(idx, &*ctx))
                     });
                     if let Some(ch) = from_info {
                         ch
@@ -219,8 +219,8 @@ pub fn string_copy_parts(
         NonVirtual,
     }
 
-    let action = match ctx.getptrinfo(resolved) {
-        Some(info) => match info.as_ref() {
+    let action = match ctx.getptrinfo_via_box(resolved) {
+        Some(info) => match info {
             PtrInfo::Str(sinfo) if sinfo.is_virtual() => match &sinfo.variant {
                 VStringVariant::Plain(p) => Action::Plain(p._chars.clone()),
                 VStringVariant::Slice(s) => Action::Slice {
@@ -287,7 +287,7 @@ pub fn string_copy_parts(
 /// base class path (vstring.py:138: srcbox = self.force_box(op, optstring)).
 fn force_child_for_string(opref: OpRef, ctx: &mut OptContext) -> OpRef {
     let resolved = ctx.get_box_replacement(opref);
-    if ctx.get_ptr_info(resolved).is_some_and(|i| i.is_virtual()) {
+    if ctx.is_virtual_via_box(resolved) {
         let mut info = ctx.take_ptr_info(resolved).unwrap();
         let forced = info.force_box(resolved, ctx);
         return ctx.get_box_replacement(forced);
@@ -306,14 +306,10 @@ impl OptString {
         OptString
     }
 
-    fn get_plain_info<'a>(
-        &self,
-        opref: OpRef,
-        ctx: &'a OptContext,
-    ) -> Option<&'a VStringPlainInfo> {
+    fn get_plain_info(&self, opref: OpRef, ctx: &OptContext) -> Option<VStringPlainInfo> {
         let resolved = ctx.get_box_replacement(opref);
-        match ctx.get_ptr_info(resolved) {
-            Some(PtrInfo::Str(sinfo)) => match &sinfo.variant {
+        match ctx.peek_ptr_info_via_box(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
                 VStringVariant::Plain(info) => Some(info),
                 _ => None,
             },
@@ -321,33 +317,36 @@ impl OptString {
         }
     }
 
-    fn get_plain_info_mut<'a>(
+    /// Run `f` against the VStringPlainInfo of `opref`, auto-mirroring the
+    /// BoxRef snapshot after mutation via OptContext::with_ptr_info_mut.
+    /// Returns `None` if the box has no PtrInfo, is not Str, or its variant
+    /// is not Plain.
+    fn with_plain_info_mut<R>(
         &self,
         opref: OpRef,
-        ctx: &'a mut OptContext,
-    ) -> Option<&'a mut VStringPlainInfo> {
+        ctx: &mut OptContext,
+        f: impl FnOnce(&mut VStringPlainInfo) -> R,
+    ) -> Option<R> {
         let resolved = ctx.get_box_replacement(opref);
-        match ctx.get_ptr_info_mut(resolved) {
-            Some(PtrInfo::Str(sinfo)) => match &mut sinfo.variant {
-                VStringVariant::Plain(info) => Some(info),
-                _ => None,
-            },
-            _ => None,
-        }
+        ctx.with_ptr_info_mut(resolved, |info| {
+            if let PtrInfo::Str(sinfo) = info {
+                if let VStringVariant::Plain(plain) = &mut sinfo.variant {
+                    return Some(f(plain));
+                }
+            }
+            None
+        })
+        .flatten()
     }
 
     fn is_virtual_plain(&self, opref: OpRef, ctx: &OptContext) -> bool {
         self.get_plain_info(opref, ctx).is_some()
     }
 
-    fn get_concat_info<'a>(
-        &self,
-        opref: OpRef,
-        ctx: &'a OptContext,
-    ) -> Option<&'a VStringConcatInfo> {
+    fn get_concat_info(&self, opref: OpRef, ctx: &OptContext) -> Option<VStringConcatInfo> {
         let resolved = ctx.get_box_replacement(opref);
-        match ctx.get_ptr_info(resolved) {
-            Some(PtrInfo::Str(sinfo)) => match &sinfo.variant {
+        match ctx.peek_ptr_info_via_box(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
                 VStringVariant::Concat(info) => Some(info),
                 _ => None,
             },
@@ -359,14 +358,10 @@ impl OptString {
         self.get_concat_info(opref, ctx).is_some()
     }
 
-    fn get_slice_info<'a>(
-        &self,
-        opref: OpRef,
-        ctx: &'a OptContext,
-    ) -> Option<&'a VStringSliceInfo> {
+    fn get_slice_info(&self, opref: OpRef, ctx: &OptContext) -> Option<VStringSliceInfo> {
         let resolved = ctx.get_box_replacement(opref);
-        match ctx.get_ptr_info(resolved) {
-            Some(PtrInfo::Str(sinfo)) => match &sinfo.variant {
+        match ctx.peek_ptr_info_via_box(resolved) {
+            Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
                 VStringVariant::Slice(info) => Some(info),
                 _ => None,
             },
@@ -384,7 +379,7 @@ impl OptString {
     /// the mode is not observable and defaulting to string is harmless.
     fn get_mode(&self, opref: OpRef, ctx: &OptContext) -> u8 {
         let resolved = ctx.get_box_replacement(opref);
-        match ctx.get_ptr_info(resolved) {
+        match ctx.peek_ptr_info_via_box(resolved) {
             Some(PtrInfo::Str(sinfo)) => sinfo.mode,
             _ => 0,
         }
@@ -393,7 +388,7 @@ impl OptString {
     /// vstring.py:76-103 StrPtrInfo.force_box — delegate to PtrInfo::force_box.
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        if ctx.get_ptr_info(resolved).is_some_and(|i| i.is_virtual()) {
+        if ctx.is_virtual_via_box(resolved) {
             let mut info = ctx.take_ptr_info(resolved).unwrap();
             let forced = info.force_box(resolved, ctx);
             return ctx.get_box_replacement(forced);
@@ -428,16 +423,16 @@ impl OptString {
     fn getstrlen_if_known(&self, opref: OpRef, ctx: &mut OptContext) -> Option<OpRef> {
         let resolved = ctx.get_box_replacement(opref);
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
-        if let Some(info) = ctx.getptrinfo(resolved) {
-            if let Some(lgtop) = info.as_ref().get_cached_lgtop() {
+        if let Some(info) = ctx.getptrinfo_via_box(resolved) {
+            if let Some(lgtop) = info.get_cached_lgtop() {
                 return Some(lgtop);
             }
         }
         // vstring.py:174: self.lgtop = ConstInt(len(self._chars))
         // RPython creates a pure ConstInt — no op emission.
-        let known_len = ctx.getptrinfo(resolved).and_then(|info| {
+        let known_len = ctx.getptrinfo_via_box(resolved).and_then(|info| {
             let mode = self.get_mode(resolved, ctx);
-            info.as_ref().get_known_str_length(ctx, mode)
+            info.get_known_str_length(ctx, mode)
         });
         if let Some(len) = known_len {
             let len_opref = ctx.make_constant_int(len);
@@ -456,8 +451,8 @@ impl OptString {
         let resolved = ctx.get_box_replacement(opref);
         // Virtual dispatch: PtrInfo::Str → VStringInfo.strgetitem
         let from_virtual = ctx
-            .getptrinfo(resolved)
-            .and_then(|info| info.as_ref().strgetitem(index, &*ctx));
+            .getptrinfo_via_box(resolved)
+            .and_then(|info| info.strgetitem(index, &*ctx));
         if from_virtual.is_some() {
             return from_virtual;
         }
@@ -482,9 +477,9 @@ impl OptString {
     /// variants. Matches vstring.py:171/251/281 `getstrlen()` per-variant.
     fn get_known_length(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
         let resolved = ctx.get_box_replacement(opref);
-        let info = ctx.getptrinfo(resolved)?;
+        let info = ctx.getptrinfo_via_box(resolved)?;
         let mode = self.get_mode(resolved, ctx);
-        info.as_ref().get_known_str_length(ctx, mode)
+        info.get_known_str_length(ctx, mode)
     }
 
     /// vstring.py:440-453 `_optimize_NEWSTR(self, op, mode)`. Virtualize if
@@ -534,12 +529,18 @@ impl OptString {
         let char_resolved = ctx.get_box_replacement(char_ref);
 
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
-            if let Some(info) = self.get_plain_info_mut(str_ref, ctx) {
-                let i = idx as usize;
-                if i < info._chars.len() {
-                    info._chars[i] = Some(char_resolved);
-                    return OptimizationResult::Remove;
-                }
+            let i = idx as usize;
+            let did_write = self
+                .with_plain_info_mut(str_ref, ctx, |info| {
+                    if i < info._chars.len() {
+                        info._chars[i] = Some(char_resolved);
+                        return true;
+                    }
+                    false
+                })
+                .unwrap_or(false);
+            if did_write {
+                return OptimizationResult::Remove;
             }
         }
         // Not virtual or index not constant -> force and emit.
@@ -573,7 +574,7 @@ impl OptString {
         };
         // vstring.py:526-527
         let arg1 = ctx.get_box_replacement(op.arg(0));
-        let has_info = ctx.getptrinfo(arg1).is_some();
+        let has_info = ctx.getptrinfo_via_box(arg1).is_some();
         if has_info {
             // vstring.py:529: lgtop = opinfo.getstrlen(arg1, self, mode)
             let lgtop = ctx.getstrlen_opref(arg1, mode);
@@ -605,10 +606,10 @@ impl OptString {
         let src_start_ref = op.arg(2);
         let dst_start_ref = op.arg(3);
         let length_ref = op.arg(4);
-        let src_info = ctx.getptrinfo(src_ref);
+        let src_info = ctx.getptrinfo_via_box(src_ref);
         let src_is_virtual_or_constant = src_info
             .as_ref()
-            .is_some_and(|info| info.as_ref().is_virtual() || info.as_ref().is_constant());
+            .is_some_and(|info| info.is_virtual() || info.is_constant());
         let dst_virtual = self.is_virtual_plain(dst_ref, ctx);
         let src_start = self.get_constant_int_bound(src_start_ref, ctx);
         let dst_start = self.get_constant_int_bound(dst_start_ref, ctx);
@@ -657,14 +658,14 @@ impl OptString {
                     }
                 }
                 if dst_virtual {
-                    if let Some(info) = self.get_plain_info_mut(dst_ref, ctx) {
+                    self.with_plain_info_mut(dst_ref, ctx, |info| {
                         for (index, ch_ref) in dst_chars.into_iter().enumerate() {
                             let dst_index = (dst_start as usize) + index;
                             if dst_index < info._chars.len() {
                                 info._chars[dst_index] = ch_ref;
                             }
                         }
-                    }
+                    });
                 }
                 return OptimizationResult::Remove;
             }
@@ -697,7 +698,7 @@ impl OptString {
     #[allow(dead_code)]
     fn is_virtual(&self, opref: OpRef, ctx: &OptContext) -> bool {
         let resolved = ctx.get_box_replacement(opref);
-        ctx.get_ptr_info(resolved)
+        ctx.peek_ptr_info_via_box(resolved)
             .is_some_and(|info| info.is_virtual())
     }
 
@@ -860,8 +861,8 @@ impl OptString {
         // vstring.py:693-696
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let arg2 = ctx.get_box_replacement(op.arg(2));
-        let i1 = ctx.getptrinfo(arg1).is_some();
-        let i2 = ctx.getptrinfo(arg2).is_some();
+        let i1 = ctx.getptrinfo_via_box(arg1).is_some();
+        let i2 = ctx.getptrinfo_via_box(arg2).is_some();
         // vstring.py:698-705: l1box = i1.getstrlen(arg1, self, mode)
         let l1box = if i1 {
             Some(ctx.getstrlen_opref(arg1, mode))
@@ -935,7 +936,7 @@ impl OptString {
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         // vstring.py:740-741: l2box = i2.getstrlen(arg2, self, mode)
-        let i2 = ctx.getptrinfo(arg2).is_some();
+        let i2 = ctx.getptrinfo_via_box(arg2).is_some();
         let l2box = if i2 {
             Some(ctx.getstrlen_opref(arg2, mode))
         } else {
@@ -959,7 +960,7 @@ impl OptString {
             }
             if l2val == 1 {
                 // vstring.py:758-759: l1box = i1.getstrlen(arg1, self, mode)
-                let i1 = ctx.getptrinfo(arg1).is_some();
+                let i1 = ctx.getptrinfo_via_box(arg1).is_some();
                 let l1box = if i1 {
                     Some(ctx.getstrlen_opref(arg1, mode))
                 } else {
@@ -1023,7 +1024,7 @@ impl OptString {
     ) -> Option<OptimizationResult> {
         // vstring.py:792-794: l2box = i2.getstrlen(arg1, self, mode)
         // RPython calls getstrlen on i2 (arg2's info) with arg1 as the op.
-        let i2 = ctx.getptrinfo(arg2).is_some();
+        let i2 = ctx.getptrinfo_via_box(arg2).is_some();
         let l2box = if i2 {
             Some(ctx.getstrlen_for(arg2, arg1, mode))
         } else {
@@ -1064,7 +1065,7 @@ impl OptString {
     /// vstring.py:776 `i2 and i2.is_null()` — uses getptrinfo which
     /// synthesizes ConstPtrInfo for constant refs.
     fn is_known_null(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        if let Some(info) = ctx.getptrinfo(opref) {
+        if let Some(info) = ctx.getptrinfo_via_box(opref) {
             return info.is_null();
         }
         false
@@ -1073,7 +1074,7 @@ impl OptString {
     /// vstring.py:777,800,808 `i1 and i1.is_nonnull()` — uses getptrinfo
     /// which synthesizes ConstPtrInfo for constant refs.
     fn is_known_nonnull(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        if let Some(info) = ctx.getptrinfo(opref) {
+        if let Some(info) = ctx.getptrinfo_via_box(opref) {
             return info.is_nonnull() || info.is_virtual();
         }
         false
@@ -1116,8 +1117,8 @@ impl OptString {
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let arg2 = ctx.get_box_replacement(op.arg(2));
         // vstring.py:819-822: bail out if either info is missing
-        let i1 = ctx.getptrinfo(arg1).is_some();
-        let i2 = ctx.getptrinfo(arg2).is_some();
+        let i1 = ctx.getptrinfo_via_box(arg1).is_some();
+        let i2 = ctx.getptrinfo_via_box(arg2).is_some();
         if !i1 || !i2 {
             self.force_args_if_virtual(op, ctx);
             return OptimizationResult::PassOn;
@@ -1183,14 +1184,22 @@ impl OptString {
             // vstring.py:844-845: i2.is_constant() && i1.is_virtual() &&
             // isinstance(i1, VStringPlainInfo)
             if let Some(length) = length {
-                if let Some(PtrInfo::Str(sinfo)) = ctx.get_ptr_info_mut(arg1) {
-                    if matches!(sinfo.variant, VStringVariant::Plain(_)) {
-                        // vstring.py:847: i1.shrink(length)
-                        Self::vstring_plain_shrink(sinfo, length as usize);
-                        // vstring.py:849: self.make_equal_to(op, op.getarg(1))
-                        ctx.replace_op(op.pos, arg1);
-                        return OptimizationResult::Remove;
-                    }
+                let did_shrink = ctx
+                    .with_ptr_info_mut(arg1, |info| {
+                        if let PtrInfo::Str(sinfo) = info {
+                            if matches!(sinfo.variant, VStringVariant::Plain(_)) {
+                                // vstring.py:847: i1.shrink(length)
+                                Self::vstring_plain_shrink(sinfo, length as usize);
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .unwrap_or(false);
+                if did_shrink {
+                    // vstring.py:849: self.make_equal_to(op, op.getarg(1))
+                    ctx.replace_op(op.pos, arg1);
+                    return OptimizationResult::Remove;
                 }
             }
         }

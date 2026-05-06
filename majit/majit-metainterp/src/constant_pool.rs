@@ -150,18 +150,6 @@ impl ConstantPool {
         opref
     }
 
-    /// Root an Int-typed constant on the shadow stack for GC safety.
-    /// The constant stays Int-typed (optimizer sees Value::Int), but
-    /// the referenced object won't be freed by GC.
-    pub fn root_int_as_ref(&mut self, opref: OpRef) {
-        if let Some(&value) = self.constants.get(&opref.raw()) {
-            if value != 0 {
-                let ss_idx = shadow_stack::push(GcRef(value as usize));
-                self.rooted_refs.push((opref.raw(), ss_idx));
-            }
-        }
-    }
-
     /// Get the type of a constant, if recorded.
     pub fn constant_type(&self, opref: OpRef) -> Option<Type> {
         self.constant_types.get(&opref.raw()).copied()
@@ -258,7 +246,11 @@ impl ConstantPool {
 
     /// Update HashMap from shadow stack — GC may have moved Ref objects.
     /// gcreftracer.py:gcrefs_trace parity.
-    fn refresh_from_gc(&mut self) {
+    ///
+    /// `rooted_refs` is populated only by `get_or_insert_typed` under
+    /// `tp == Type::Ref`, so every entry here is Ref-typed by
+    /// construction (`history.py:307 ConstPtr.type = REF`).
+    pub(crate) fn refresh_from_gc(&mut self) {
         for &(opref_key, ss_idx) in &self.rooted_refs {
             let current = shadow_stack::get(ss_idx);
             self.constants.insert(opref_key, current.0 as i64);
@@ -415,5 +407,19 @@ mod tests {
         let pool = ConstantPool::new();
         assert!(!pool.same_constant(OpRef::NONE, OpRef::NONE));
         assert!(!pool.same_constant(OpRef::NONE, OpRef::const_int(0)));
+    }
+
+    /// `get_or_insert(0)` and `get_or_insert_typed(0, Ref)` must NOT alias —
+    /// `history.py:220/307` ConstInt(0) and ConstPtr(NULL) are different
+    /// classes. Distinct OpRef discriminates the two paths even when the
+    /// raw value is identical.
+    #[test]
+    fn int_ref_zero_does_not_alias() {
+        let mut pool = ConstantPool::new();
+        let i_zero = pool.get_or_insert(0);
+        let r_null = pool.get_or_insert_typed(0, Type::Ref);
+        assert_ne!(i_zero, r_null);
+        assert_eq!(pool.constant_type(i_zero), Some(Type::Int));
+        assert_eq!(pool.constant_type(r_null), Some(Type::Ref));
     }
 }

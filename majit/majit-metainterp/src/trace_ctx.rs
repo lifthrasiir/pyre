@@ -832,13 +832,6 @@ impl TraceCtx {
         self.constants.as_ref().get(&opref.raw()).copied()
     }
 
-    /// Root an Int-typed constant on the GC shadow stack.
-    /// Keeps the constant's type as Int (optimizer sees Value::Int),
-    /// but prevents GC from freeing the referenced object.
-    pub fn root_const_for_gc(&mut self, opref: OpRef) {
-        self.constants.root_int_as_ref(opref);
-    }
-
     /// Constant-fold a pure field read on a constant object pointer.
     /// If `obj` is a constant and `descr` is immutable, reads the field
     /// at runtime and returns the value as a constant OpRef.
@@ -1193,10 +1186,14 @@ impl TraceCtx {
     /// `recorder::Trace`); the recorder contributes only inputargs + ops.
     pub fn into_tree_loop(self) -> crate::history::TreeLoop {
         let recorder_trace = self.recorder.get_trace();
-        crate::history::TreeLoop::with_snapshots(
+        // H-3.0a: forward the recorder's BoxRef pool so the optimizer
+        // sees the same `Rc<Box>` allocations created during tracing —
+        // RPython parity for `AbstractValue` object identity.
+        crate::history::TreeLoop::with_box_pool(
             recorder_trace.inputargs,
             recorder_trace.ops,
             self.snapshots,
+            recorder_trace.box_pool,
         )
     }
 

@@ -628,7 +628,7 @@ impl OptPure {
                     crate::optimizeopt::ImportedShortPureArg::Const(expected_value, _source) => {
                         let query = ctx.get_box_replacement(arg);
                         match ctx.get_constant(query) {
-                            Some(v) if v == expected_value => {}
+                            Some(v) if v == *expected_value => {}
                             _ => {
                                 args_match = false;
                                 break;
@@ -839,6 +839,19 @@ fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
     let ia_base = ctx.inputarg_base as usize;
     let ia_end = ia_base + ctx.num_inputs();
     if (resolved.raw() as usize) >= ia_base && (resolved.raw() as usize) < ia_end {
+        // BoxRef-routing reader (H-3.2c slice 58). `resolved` is already
+        // the Vec chain terminal; BoxRef walk advances at most one step to
+        // the make_constant-mirrored fresh `BoxRef::new_const(value)`.
+        // Empty box_pool (test/retrace baselines) falls back to legacy
+        // `Forwarded::Const` Vec read.
+        if let Some(b) = ctx.get_box_replacement_box(resolved) {
+            if let Some(Value::Ref(ptr)) = b.const_value() {
+                if !ptr.is_null() {
+                    return Some(ptr.as_usize());
+                }
+            }
+            return None;
+        }
         use crate::optimizeopt::info::Forwarded;
         if let Some(Forwarded::Const(Value::Ref(ptr))) = ctx.forwarded.get(resolved.raw() as usize)
         {
@@ -912,7 +925,7 @@ impl Default for OptPure {
 impl OptPure {
     fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        if ctx.get_ptr_info(resolved).is_some_and(|i| i.is_virtual()) {
+        if ctx.is_virtual_via_box(resolved) {
             let mut info = ctx.take_ptr_info(resolved).unwrap();
             let forced = info.force_box(resolved, ctx);
             return ctx.get_box_replacement(forced);
@@ -937,7 +950,7 @@ impl OptPure {
             let Some(const_value) = ctx.get_constant(forced) else {
                 return None;
             };
-            arg_consts.push(*const_value);
+            arg_consts.push(const_value);
         }
         self.call_pure_results.get(&arg_consts).cloned()
     }
@@ -2152,7 +2165,7 @@ mod tests {
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_constant(OpRef::from_raw(0)),
-            Some(&Value::Ref(GcRef(0x1234_5678usize)))
+            Some(Value::Ref(GcRef(0x1234_5678usize)))
         );
 
         unsafe {
@@ -2230,10 +2243,7 @@ mod tests {
         let c5_a = ctx.make_constant_int(5);
         let c5_b = ctx.make_constant_int(5);
         assert_ne!(c5_a, c5_b, "make_constant_int must mint fresh slots");
-        assert_eq!(
-            ctx.get_constant(c5_a).copied(),
-            ctx.get_constant(c5_b).copied()
-        );
+        assert_eq!(ctx.get_constant(c5_a), ctx.get_constant(c5_b));
 
         // Cache `IntAdd(c5_a, x)` and look up `IntAdd(c5_b, x)`.
         let x = OpRef::int_op(7);

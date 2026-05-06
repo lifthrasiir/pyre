@@ -151,9 +151,7 @@ impl CachedField {
         // descriptor object.
         for &obj in &self.cached_structs {
             let resolved = ctx.get_box_replacement(obj);
-            if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                info.clear_field(descr_idx);
-            }
+            ctx.with_ptr_info_mut(resolved, |info| info.clear_field(descr_idx));
             // Clear existing const_infos slot if present; do NOT create.
             if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                 info.clear_field(descr_idx);
@@ -175,7 +173,7 @@ impl CachedField {
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
         // info.py:212-214: return self._fields[fielddescr.get_index()]
-        if let Some(info) = ctx.get_ptr_info(struct_opref) {
+        if let Some(info) = ctx.peek_ptr_info_via_box(struct_opref) {
             if let Some(entry) = info.getfield(field_idx) {
                 return Some(entry);
             }
@@ -218,16 +216,22 @@ impl CachedField {
         // info.py:880 get_known_class. PyPy: opinfo1.get_known_class(cpu)
         // / opinfo2.get_known_class(cpu); CANNOT_ALIAS iff both are
         // known and not the same constant.
-        let class1 = ctx.getptrinfo(opref1).and_then(|i| i.get_known_class());
-        let class2 = ctx.getptrinfo(opref2).and_then(|i| i.get_known_class());
+        let class1 = ctx
+            .getptrinfo_via_box(opref1)
+            .and_then(|i| i.get_known_class());
+        let class2 = ctx
+            .getptrinfo_via_box(opref2)
+            .and_then(|i| i.get_known_class());
         matches!((class1, class2), (Some(c1), Some(c2)) if c1 != c2)
     }
 
     /// heap.py:206-226 CachedField._cannot_alias_via_content
     fn _cannot_alias_via_content(opref1: OpRef, opref2: OpRef, ctx: &mut OptContext) -> bool {
         // heap.py:207-210: both must be AbstractStructPtrInfo
-        let (Some(info1), Some(info2)) = (ctx.get_ptr_info(opref1), ctx.get_ptr_info(opref2))
-        else {
+        let (Some(info1), Some(info2)) = (
+            ctx.peek_ptr_info_via_box(opref1),
+            ctx.peek_ptr_info_via_box(opref2),
+        ) else {
             return false;
         };
         // heap.py:211-216: all_items() may be None
@@ -270,9 +274,7 @@ impl CachedField {
             } else {
                 self.cached_structs.swap_remove(i);
                 let resolved = ctx.get_box_replacement(obj);
-                if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                    info.clear_field(descr_idx);
-                }
+                ctx.with_ptr_info_mut(resolved, |info| info.clear_field(descr_idx));
                 if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                     info.clear_field(descr_idx);
                 }
@@ -322,7 +324,7 @@ impl CachedField {
                 continue;
             }
             let cached_val = match ctx
-                .get_ptr_info(structbox)
+                .peek_ptr_info_via_box(structbox)
                 .and_then(|info| info.getfield(descr_idx))
                 .map(|entry| entry.as_seen_opref())
                 .or_else(|| {
@@ -399,11 +401,11 @@ impl ArrayCachedItem {
     ) -> bool {
         use crate::optimizeopt::info::PtrInfo;
         // heap.py:269-274: both must be ArrayPtrInfo with known_ne lenbounds
-        let len1 = match ctx.get_ptr_info(opref1) {
+        let len1 = match ctx.peek_ptr_info_via_box(opref1) {
             Some(PtrInfo::Array(v)) => v.lenbound.clone(),
             _ => return false,
         };
-        let len2 = match ctx.get_ptr_info(opref2) {
+        let len2 = match ctx.peek_ptr_info_via_box(opref2) {
             Some(PtrInfo::Array(v)) => v.lenbound.clone(),
             _ => return false,
         };
@@ -416,11 +418,11 @@ impl ArrayCachedItem {
         // heap.py:279-282: isinstance(opinfo, ArrayPtrInfo)
         // info.py:530 all_items() returns _items (the dense list, None slots included).
         // Clone to avoid borrow conflict with ctx below.
-        let items1: Vec<FieldEntry> = match ctx.get_ptr_info(opref1) {
+        let items1: Vec<FieldEntry> = match ctx.peek_ptr_info_via_box(opref1) {
             Some(PtrInfo::Array(a)) => a.items.clone(),
             _ => return false,
         };
-        let items2: Vec<FieldEntry> = match ctx.get_ptr_info(opref2) {
+        let items2: Vec<FieldEntry> = match ctx.peek_ptr_info_via_box(opref2) {
             Some(PtrInfo::Array(a)) => a.items.clone(),
             _ => return false,
         };
@@ -459,15 +461,14 @@ impl ArrayCachedItem {
     /// performed by the caller (`ArrayCacheSubMap::invalidate_index`)
     /// because Rust forbids the back-pointer.
     fn invalidate(&mut self, ctx: &mut OptContext) {
+        let index = self.index as usize;
         for &obj in &self.cached_structs {
             let resolved = ctx.get_box_replacement(obj);
-            if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                info.clear_item(self.index as usize);
-            }
+            ctx.with_ptr_info_mut(resolved, |info| info.clear_item(index));
             // info.py:728 ConstPtrInfo._get_array_info — only clear
             // an existing ArrayPtrInfo slot; do NOT create on miss.
             if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
-                info.clear_item(self.index as usize);
+                info.clear_item(index);
             }
         }
         self.cached_structs.clear();
@@ -489,7 +490,7 @@ impl ArrayCachedItem {
             return None;
         }
         let idx = self.index as usize;
-        if let Some(info) = ctx.get_ptr_info(array_opref) {
+        if let Some(info) = ctx.peek_ptr_info_via_box(array_opref) {
             if let Some(entry) = info.getitem(idx) {
                 return Some(entry);
             }
@@ -542,7 +543,7 @@ impl ArrayCachedItem {
                 continue;
             }
             let cached_val = match ctx
-                .get_ptr_info(arraybox)
+                .peek_ptr_info_via_box(arraybox)
                 .and_then(|info| info.getitem(self.index as usize))
                 .map(|entry| entry.as_seen_opref())
                 .or_else(|| {
@@ -581,9 +582,7 @@ impl ArrayCachedItem {
             } else {
                 self.cached_structs.swap_remove(i);
                 let resolved = ctx.get_box_replacement(obj);
-                if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                    info.clear_item(idx);
-                }
+                ctx.with_ptr_info_mut(resolved, |info| info.clear_item(idx));
                 if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                     info.clear_item(idx);
                 }
@@ -967,10 +966,8 @@ impl OptHeap {
         // heap.py:136: emit_extra(op, emit=False) re-processes through passes.
         // Virtual values are skipped — handled by rd_pendingfields at guard
         // time or dropped at JUMP.
-        if let Some(info) = ctx.get_ptr_info(orig_val) {
-            if info.is_virtual() {
-                return false;
-            }
+        if ctx.is_virtual_via_box(orig_val) {
+            return false;
         }
 
         // Non-virtual path: resolve forwarding and route after heap
@@ -1119,10 +1116,7 @@ impl OptHeap {
         for (field_idx, descr, obj, mut op) in field_entries {
             // heap.py:617-618: val = op.getarg(1); if is_virtual(val)
             let value_ref = ctx.get_box_replacement(op.arg(1));
-            let is_virtual = matches!(
-                ctx.get_ptr_info(value_ref),
-                Some(info) if info.is_virtual()
-            );
+            let is_virtual = ctx.is_virtual_via_box(value_ref);
             if is_virtual {
                 // heap.py:618-619: virtual value → pendingfields
                 pendingfields.push(op);
@@ -1175,10 +1169,7 @@ impl OptHeap {
         for (descr_idx, index, _obj, mut op) in array_entries {
             // heap.py:631-633: assert container not virtual; check value virtual
             let value_ref = ctx.get_box_replacement(op.arg(2));
-            let is_virtual = matches!(
-                ctx.get_ptr_info(value_ref),
-                Some(info) if info.is_virtual()
-            );
+            let is_virtual = ctx.is_virtual_via_box(value_ref);
             if is_virtual {
                 // heap.py:634: pendingfields.append(op)
                 pendingfields.push(op);
@@ -1304,9 +1295,7 @@ impl OptHeap {
                 .retain(|obj| vb_get(&unescaped_snapshot, obj.raw()));
             for obj in escaped_opref {
                 let resolved = ctx.get_box_replacement(obj);
-                if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                    info.clear_field(field_idx);
-                }
+                ctx.with_ptr_info_mut(resolved, |info| info.clear_field(field_idx));
                 if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                     info.clear_field(field_idx);
                 }
@@ -1352,9 +1341,7 @@ impl OptHeap {
                 if let Some(idx) = idx {
                     for obj in escaped_opref {
                         let resolved = ctx.get_box_replacement(obj);
-                        if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                            info.clear_item(idx);
-                        }
+                        ctx.with_ptr_info_mut(resolved, |info| info.clear_item(idx));
                         if let Some(info) = ctx.get_const_info_mut_if_exists(resolved) {
                             info.clear_item(idx);
                         }
@@ -1415,11 +1402,10 @@ impl OptHeap {
                     cai.cached_structs.retain(|obj| *obj != dest_ref);
                 }
                 if index >= 0 {
-                    if let Some(info) = ctx.get_ptr_info_mut(dest_resolved) {
-                        info.clear_item(index as usize);
-                    }
+                    let idx = index as usize;
+                    ctx.with_ptr_info_mut(dest_resolved, |info| info.clear_item(idx));
                     if let Some(info) = ctx.get_const_info_mut_if_exists(dest_resolved) {
-                        info.clear_item(index as usize);
+                        info.clear_item(idx);
                     }
                 }
             }
@@ -1752,9 +1738,7 @@ impl OptHeap {
         if descr.is_always_pure() {
             if ctx.get_constant_box(op.arg(0)).is_some() {
                 if let Some(value) = ctx.constant_fold(&op) {
-                    let const_pos = ctx.alloc_op_position_typed(value.get_type());
-                    ctx.make_constant(const_pos, value);
-                    ctx.replace_op(op.pos, const_pos);
+                    ctx.make_constant(op.pos, value);
                     return OptimizationResult::Remove;
                 }
             }
@@ -2233,8 +2217,8 @@ impl OptHeap {
             // setarrayitem/call invalidates cached_arrayitems, the stale preamble
             // value cannot re-populate the cache on a subsequent getarrayitem.
             let pop = ctx
-                .get_ptr_info_mut(array)
-                .and_then(|info| info.take_preamble_item(const_index as usize))
+                .with_ptr_info_mut(array, |info| info.take_preamble_item(const_index as usize))
+                .flatten()
                 .or_else(|| {
                     ctx.get_const_info_mut_if_exists(array)
                         .and_then(|info| info.take_preamble_item(const_index as usize))
@@ -2301,13 +2285,16 @@ impl OptHeap {
             let array_ref = ctx.get_box_replacement(op.arg(0));
             vb_set(&mut self.known_nonnull, array_ref.raw());
             if const_index >= 0 {
-                let mut arrayinfo = ctx.ensure_ptr_info_arg0(op);
-                if let Some(mut bound) = arrayinfo.getlenbound(None) {
-                    let _ = bound.make_gt_const(const_index);
-                    if let Some(crate::optimizeopt::info::PtrInfo::Array(a)) = arrayinfo.as_mut() {
-                        a.lenbound = bound;
+                ctx.with_ensured_ptr_info_arg0(op, |mut arrayinfo| {
+                    if let Some(mut bound) = arrayinfo.getlenbound(None) {
+                        let _ = bound.make_gt_const(const_index);
+                        if let Some(crate::optimizeopt::info::PtrInfo::Array(a)) =
+                            arrayinfo.as_mut()
+                        {
+                            a.lenbound = bound;
+                        }
                     }
-                }
+                });
             }
             ctx.arrayinfo_setitem(op, const_index as usize, op.pos);
             return OptimizationResult::Emit(op.clone());
@@ -3107,7 +3094,7 @@ impl Optimization for OptHeap {
                 //                  box2 = structinfo.getfield(descr)
                 let resolved = ctx.get_box_replacement(obj);
                 let Some(val) = ctx
-                    .get_ptr_info(resolved)
+                    .peek_ptr_info_via_box(resolved)
                     .and_then(|info| info.getfield(*field_idx))
                     .map(|entry| entry.as_seen_opref())
                     .or_else(|| {
@@ -3163,11 +3150,7 @@ impl Optimization for OptHeap {
             //             structinfo = info.InstancePtrInfo(parent_descr)
             //             structinfo.init_fields(parent_descr, descr.get_index())
             //             box1.set_forwarded(structinfo)
-            let needs_install = !ctx.is_constant(resolved)
-                && match ctx.get_ptr_info(resolved) {
-                    Some(info) => !info.is_virtual(),
-                    None => true,
-                };
+            let needs_install = !ctx.is_constant(resolved) && !ctx.is_virtual_via_box(resolved);
             if needs_install {
                 // info.py:175-188 InstancePtrInfo + init_fields
                 ctx.set_ptr_info(resolved, PtrInfo::instance(parent_descr.clone(), None));
@@ -3179,8 +3162,9 @@ impl Optimization for OptHeap {
                 if let Some(info) = ctx.get_const_info_mut(resolved, parent_descr.clone()) {
                     info.setfield(field_idx, *box2);
                 }
-            } else if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                info.setfield(field_idx, *box2);
+            } else {
+                let box2 = *box2;
+                ctx.with_ptr_info_mut(resolved, |info| info.setfield(field_idx, box2));
             }
         }
     }
@@ -3219,7 +3203,7 @@ impl Optimization for OptHeap {
                     let resolved = ctx.get_box_replacement(obj);
                     // heap.py:860: box2 = arrayinfo.getitem(descr, index)
                     let Some(val) = ctx
-                        .get_ptr_info(resolved)
+                        .peek_ptr_info_via_box(resolved)
                         .and_then(|info| info.getitem(index as usize))
                         .map(|entry| entry.as_seen_opref())
                         .or_else(|| {
@@ -3267,11 +3251,7 @@ impl Optimization for OptHeap {
             //         if not isinstance(arrayinfo, info.AbstractVirtualPtrInfo):
             //             arrayinfo = info.ArrayPtrInfo(descr)
             //             box1.set_forwarded(arrayinfo)
-            let needs_install = !ctx.is_constant(resolved)
-                && match ctx.get_ptr_info(resolved) {
-                    Some(info) => !info.is_virtual(),
-                    None => true,
-                };
+            let needs_install = !ctx.is_constant(resolved) && !ctx.is_virtual_via_box(resolved);
             if needs_install {
                 ctx.set_ptr_info(
                     resolved,
@@ -3290,8 +3270,10 @@ impl Optimization for OptHeap {
                 if let Some(info) = ctx.get_const_info_array_mut(resolved, descr.clone()) {
                     info.setitem(*index as usize, *box2);
                 }
-            } else if let Some(info) = ctx.get_ptr_info_mut(resolved) {
-                info.setitem(*index as usize, *box2);
+            } else {
+                let idx = *index as usize;
+                let box2 = *box2;
+                ctx.with_ptr_info_mut(resolved, |info| info.setitem(idx, box2));
             }
         }
     }
@@ -3957,7 +3939,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
         assert_eq!(
-            ctx.get_ptr_info(OpRef::from_raw(100))
+            ctx.peek_ptr_info_via_box(OpRef::from_raw(100))
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
             Some(OpRef::from_raw(200))
@@ -4004,7 +3986,7 @@ mod tests {
         // becomes the rhs value via put_field_back_to_info.
         pass.flush(&mut ctx);
         assert_eq!(
-            ctx.get_ptr_info(OpRef::from_raw(100))
+            ctx.peek_ptr_info_via_box(OpRef::from_raw(100))
                 .and_then(|info| info.getitem(3))
                 .and_then(|e| e.as_opref()),
             Some(OpRef::from_raw(101))

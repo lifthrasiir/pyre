@@ -668,10 +668,9 @@ impl VirtualStateInfo {
 /// aliased loop-carried variables (two jump args resolving to the same
 /// box) share a single state object — matching RPython's
 /// `VirtualStateConstructor.create_state` cache where the same box always
-/// returns the same `AbstractVirtualStateInfo` instance. The dedup walkers
-/// (`build_sequential_slot_schedule`, `enum_forced_boxes_for_entry`, etc.)
-/// use `Rc::as_ptr` identity to short-circuit revisits, mirroring
-/// `state.position > self.position`.
+/// returns the same `AbstractVirtualStateInfo` instance. The dedup walker
+/// `enum_forced_boxes_for_entry` uses each node's `position` cell to
+/// short-circuit revisits, mirroring `state.position > self.position`.
 #[derive(Debug)]
 pub struct VirtualState {
     /// Abstract info for each loop-carried variable, in order matching Label/Jump args.
@@ -679,14 +678,8 @@ pub struct VirtualState {
     /// virtualstate.py: renum — maps virtual OpRef to numbering index.
     /// Used to ensure consistent virtual identity across loop iterations.
     pub renum: std::collections::HashMap<OpRef, usize>,
-    /// RPython virtualstate.py: position_in_notvirtuals encoded as a flat
-    /// traversal schedule. Each non-virtual leaf occurrence in `state`
-    /// records the slot it should write in `boxes[...]`.
-    slot_schedule: Vec<usize>,
     /// virtualstate.py:631 `VirtualState.numnotvirtuals`. Maintained by
-    /// [`Self::enum_top_level`] (RPython parity) but kept identical to
-    /// the legacy `build_sequential_slot_schedule` count via debug_assert
-    /// during Phase A1.
+    /// [`Self::enum_top_level`].
     numnotvirtuals: usize,
     /// virtualstate.py:630 `VirtualState.info_counter`. Increments through
     /// `enum_into` to assign per-instance positions.
@@ -707,39 +700,13 @@ impl VirtualState {
     /// the same `Rc<VirtualStateInfoNode>` (matching RPython's
     /// `VirtualStateConstructor.create_state` box-keyed cache).
     pub fn from_shared_rcs(state: Vec<Rc<VirtualStateInfoNode>>) -> Self {
-        let (slot_schedule, legacy_numnotvirtuals) = build_sequential_slot_schedule(&state);
         let mut vs = VirtualState {
             state,
             renum: std::collections::HashMap::new(),
-            slot_schedule,
             numnotvirtuals: 0,
             info_counter: -1,
         };
         vs.enum_top_level();
-        debug_assert_eq!(
-            vs.numnotvirtuals, legacy_numnotvirtuals,
-            "Phase A1 parity: enum-derived numnotvirtuals diverged from legacy slot_schedule count",
-        );
-        vs
-    }
-
-    fn new_with_slot_schedule(
-        state: Vec<Rc<VirtualStateInfoNode>>,
-        slot_schedule: Vec<usize>,
-        numnotvirtuals: usize,
-    ) -> Self {
-        let mut vs = VirtualState {
-            state,
-            renum: std::collections::HashMap::new(),
-            slot_schedule,
-            numnotvirtuals: 0,
-            info_counter: -1,
-        };
-        vs.enum_top_level();
-        debug_assert_eq!(
-            vs.numnotvirtuals, numnotvirtuals,
-            "Phase A1 parity: enum-derived numnotvirtuals diverged from caller-supplied count",
-        );
         vs
     }
 
@@ -752,9 +719,9 @@ impl VirtualState {
     ///         s.enum(self)
     /// ```
     /// Resets per-instance position cells before walking so that repeated
-    /// calls (e.g., `rebuild_slot_schedule` after `refresh_from_gc`) start
-    /// from a clean RPython-equivalent state.
-    fn enum_top_level(&mut self) {
+    /// calls (e.g., after `refresh_from_gc`) start from a clean
+    /// RPython-equivalent state.
+    pub fn enum_top_level(&mut self) {
         self.info_counter = -1;
         self.numnotvirtuals = 0;
         Self::reset_positions(&self.state);
@@ -818,28 +785,13 @@ impl VirtualState {
         }
     }
 
-    /// Recompute the slot schedule + numnotvirtuals after structural
-    /// mutations (e.g., refresh_from_gc replacing entries with fresh
-    /// `Rc`s that may have broken sharing). Mirrors RPython's invariant
-    /// that `numnotvirtuals` always reflects the current state graph.
-    pub fn rebuild_slot_schedule(&mut self) {
-        let (slot_schedule, legacy_numnotvirtuals) = build_sequential_slot_schedule(&self.state);
-        self.slot_schedule = slot_schedule;
-        self.enum_top_level();
-        debug_assert_eq!(
-            self.numnotvirtuals, legacy_numnotvirtuals,
-            "Phase A1 parity: rebuild numnotvirtuals diverged from legacy slot_schedule count",
-        );
-    }
-
     /// Counts the leaves in a single top-level state entry, deduping shared
     /// `Rc<VirtualStateInfoNode>` subtrees via the caller-supplied visited map.
     /// The visited map (Rc::as_ptr → first imported OpRef, NONE for the
     /// counting path) must be threaded across all top-level state entries
     /// in a single VirtualState walk so cross-entry shared substates are
-    /// counted exactly once, matching the
-    /// `build_sequential_slot_schedule` dedup. Both the top-level Rc
-    /// identity and the recursive nested Rcs participate in the dedup.
+    /// counted exactly once. Both the top-level Rc identity and the
+    /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
         visited: &mut std::collections::HashMap<usize, OpRef>,
@@ -984,48 +936,22 @@ impl VirtualState {
         // RPython writes into the SAME `boxes` array on both passes; the
         // values converge after force because subsequent
         // `get_box_replacement` reads return the forced opref.
-        // `visited` tracks Rc::as_ptr identity across the whole walk to
-        // mirror RPython's `state.position > self.position` shared-substate
-        // dedup (virtualstate.py:196, 274, 352). It is recreated per pass
-        // because each pass walks the full state from scratch.
+        // Shared-substate dedup uses `position` cells assigned during
+        // `enum_top_level` (virtualstate.py:196, 274, 352).
         if force_boxes {
-            let mut next_slot = 0usize;
-            let mut slot_cursor = 0usize;
-            let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for (idx, info) in self.state.iter().enumerate() {
+            for (idx, node) in self.state.iter().enumerate() {
                 let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
                 Self::enum_forced_boxes_for_entry(
-                    info,
-                    opref,
-                    optimizer,
-                    ctx,
-                    &mut boxes,
-                    &mut next_slot,
-                    /* force_boxes */ true,
-                    &self.slot_schedule,
-                    &mut slot_cursor,
-                    &mut visited,
+                    node, opref, optimizer, ctx, &mut boxes, /* force_boxes */ true,
                 )?;
             }
         }
         // virtualstate.py:668-669 — second pass with `force_boxes=False`,
         // unconditional. Mirrors RPython exactly.
-        let mut next_slot = 0usize;
-        let mut slot_cursor = 0usize;
-        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for (idx, info) in self.state.iter().enumerate() {
+        for (idx, node) in self.state.iter().enumerate() {
             let opref = concrete_refs.get(idx).copied().unwrap_or(OpRef::NONE);
             Self::enum_forced_boxes_for_entry(
-                info,
-                opref,
-                optimizer,
-                ctx,
-                &mut boxes,
-                &mut next_slot,
-                /* force_boxes */ false,
-                &self.slot_schedule,
-                &mut slot_cursor,
-                &mut visited,
+                node, opref, optimizer, ctx, &mut boxes, /* force_boxes */ false,
             )?;
         }
         Ok(boxes)
@@ -1083,27 +1009,18 @@ impl VirtualState {
     /// **Shared-substate dedup**: RPython's `state.position > self.position`
     /// guard (virtualstate.py:196, 274, 352) skips revisiting a shared
     /// `AbstractVirtualStateInfo` so each unique state object's
-    /// `NotVirtualStateInfo` gets exactly one slot. The Rust port wraps
-    /// nested children in `Rc<VirtualStateInfoNode>` and dedups via
-    /// `Rc::as_ptr` identity (carried in `visited`) — when
-    /// `export_single_value` returns the SAME `Rc` for an aliased box,
-    /// the second visit short-circuits in `enum_forced_boxes_recurse`,
-    /// matching `if self.position != -1: return` semantics.
-    /// `build_sequential_slot_schedule` shares the same dedup logic so
-    /// the slot count and the walk stay in lockstep.
+    /// `NotVirtualStateInfo` gets exactly one slot. The Rust port carries
+    /// `position` on each `VirtualStateInfoNode` (set by `enum_top_level`)
+    /// and applies the same comparison at every recursive call site.
     fn enum_forced_boxes_for_entry(
-        info: &VirtualStateInfo,
+        node: &VirtualStateInfoNode,
         opref: OpRef,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
         boxes: &mut [OpRef],
-        next_slot: &mut usize,
         force_boxes: bool,
-        slot_schedule: &[usize],
-        slot_cursor: &mut usize,
-        visited: &mut std::collections::HashSet<usize>,
     ) -> Result<(), ()> {
-        match info {
+        match &node.info {
             VirtualStateInfo::Constant(_) => Ok(()),
             VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
                 // virtualstate.py:182-188:
@@ -1114,17 +1031,18 @@ impl VirtualState {
                 //     else:
                 //         assert isinstance(info, AbstractStructPtrInfo)
                 let resolved = ctx.get_box_replacement(opref);
-                let is_virtual = ctx
-                    .get_ptr_info(resolved)
-                    .map_or(false, |pi| pi.is_virtual());
+                // BoxRef-routing reader; cached once so the per-field walk below
+                // doesn't re-clone PtrInfo per iteration.
+                let info_snapshot = ctx.peek_ptr_info_via_box(resolved);
+                let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
                 }
                 // virtualstate.py:192-198: walk min(len(fielddescrs),
                 // len(info._fields)) entries — RPython explicitly comments
                 // that the min() guards against unvalidated callers.
-                let info_field_count = ctx
-                    .get_ptr_info(resolved)
+                let info_field_count = info_snapshot
+                    .as_ref()
                     .map(|pi| match pi {
                         PtrInfo::Virtual(vinfo) => vinfo.fields.len(),
                         PtrInfo::VirtualStruct(vinfo) => vinfo.fields.len(),
@@ -1136,7 +1054,8 @@ impl VirtualState {
                     .iter()
                     .take(walk_count)
                     .map(|(field_idx, _)| {
-                        ctx.get_ptr_info(resolved)
+                        info_snapshot
+                            .as_ref()
                             .and_then(|info| info.getfield(*field_idx))
                             .and_then(|e| e.as_opref())
                             .map(|f| ctx.get_box_replacement(f))
@@ -1146,35 +1065,35 @@ impl VirtualState {
                 for ((_, field_state), field_ref) in
                     fields.iter().take(walk_count).zip(field_refs.iter())
                 {
-                    Self::enum_forced_boxes_recurse(
-                        field_state,
-                        *field_ref,
-                        optimizer,
-                        ctx,
-                        boxes,
-                        next_slot,
-                        force_boxes,
-                        slot_schedule,
-                        slot_cursor,
-                        visited,
-                    )?;
+                    // virtualstate.py:196 `if state.position > self.position`
+                    if field_state.position.get() > node.position.get() {
+                        Self::enum_forced_boxes_for_entry(
+                            field_state,
+                            *field_ref,
+                            optimizer,
+                            ctx,
+                            boxes,
+                            force_boxes,
+                        )?;
+                    }
                 }
                 Ok(())
             }
             VirtualStateInfo::VArray { items, .. } => {
                 // virtualstate.py:263-275 VArrayStateInfo.enum_forced_boxes
                 let resolved = ctx.get_box_replacement(opref);
-                let is_virtual = ctx
-                    .get_ptr_info(resolved)
-                    .map_or(false, |pi| pi.is_virtual());
+                // BoxRef-routing reader; cached once so the per-item walk
+                // below doesn't re-clone PtrInfo per iteration.
+                let info_snapshot = ctx.peek_ptr_info_via_box(resolved);
+                let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
                 }
                 // virtualstate.py:268-269: explicit length check.
                 //     if len(self.fieldstate) > info.getlength():
                 //         raise VirtualStatesCantMatch
-                let array_len = ctx
-                    .get_ptr_info(resolved)
+                let array_len = info_snapshot
+                    .as_ref()
                     .map(|pi| match pi {
                         PtrInfo::VirtualArray(ainfo) => ainfo.items.len(),
                         _ => 0,
@@ -1184,23 +1103,22 @@ impl VirtualState {
                     return Err(());
                 }
                 for (index, item_state) in items.iter().enumerate() {
-                    let item_ref = ctx
-                        .get_ptr_info(resolved)
+                    let item_ref = info_snapshot
+                        .as_ref()
                         .and_then(|info| info.getitem(index))
                         .and_then(|e| e.as_opref())
                         .unwrap_or(OpRef::NONE);
-                    Self::enum_forced_boxes_recurse(
-                        item_state,
-                        item_ref,
-                        optimizer,
-                        ctx,
-                        boxes,
-                        next_slot,
-                        force_boxes,
-                        slot_schedule,
-                        slot_cursor,
-                        visited,
-                    )?;
+                    // virtualstate.py:274 `if state.position > self.position`
+                    if item_state.position.get() > node.position.get() {
+                        Self::enum_forced_boxes_for_entry(
+                            item_state,
+                            item_ref,
+                            optimizer,
+                            ctx,
+                            boxes,
+                            force_boxes,
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -1225,12 +1143,13 @@ impl VirtualState {
                 // runtime's vinfo but absent from the state's element_fields,
                 // which signals a schema mismatch.
                 let resolved = ctx.get_box_replacement(opref);
-                let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx.get_ptr_info(resolved) {
-                    Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
-                        vinfo.element_fields.clone()
-                    }
-                    _ => return Err(()),
-                };
+                let runtime_fields: Vec<Vec<(u32, OpRef)>> =
+                    match ctx.peek_ptr_info_via_box(resolved) {
+                        Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => {
+                            vinfo.element_fields
+                        }
+                        _ => return Err(()),
+                    };
                 if runtime_fields.len() != element_fields.len() {
                     return Err(());
                 }
@@ -1254,18 +1173,17 @@ impl VirtualState {
                             .find(|(fdidx, _)| fdidx == field_idx)
                             .map(|(_, op)| *op)
                             .unwrap_or(OpRef::NONE);
-                        Self::enum_forced_boxes_recurse(
-                            field_state,
-                            item_ref,
-                            optimizer,
-                            ctx,
-                            boxes,
-                            next_slot,
-                            force_boxes,
-                            slot_schedule,
-                            slot_cursor,
-                            visited,
-                        )?;
+                        // virtualstate.py:352 `if state.position > self.position`
+                        if field_state.position.get() > node.position.get() {
+                            Self::enum_forced_boxes_for_entry(
+                                field_state,
+                                item_ref,
+                                optimizer,
+                                ctx,
+                                boxes,
+                                force_boxes,
+                            )?;
+                        }
                     }
                 }
                 Ok(())
@@ -1273,32 +1191,33 @@ impl VirtualState {
             VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
                 // majit-only: VirtualRawBuffer mirrors VStruct semantics.
                 let resolved = ctx.get_box_replacement(opref);
-                let is_virtual = ctx
-                    .get_ptr_info(resolved)
-                    .map_or(false, |pi| pi.is_virtual());
+                // BoxRef-routing reader; cached once so the per-entry walk
+                // below doesn't re-clone PtrInfo per iteration.
+                let info_snapshot = ctx.peek_ptr_info_via_box(resolved);
+                let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
                 }
                 for (index, (_, _, entry_state)) in entries.iter().enumerate() {
-                    let entry_ref = ctx
-                        .get_ptr_info(resolved)
+                    let entry_ref = info_snapshot
+                        .as_ref()
                         .and_then(|info| match info {
                             PtrInfo::VirtualRawBuffer(vinfo) => vinfo.values.get(index).copied(),
                             _ => None,
                         })
                         .unwrap_or(OpRef::NONE);
-                    Self::enum_forced_boxes_recurse(
-                        entry_state,
-                        entry_ref,
-                        optimizer,
-                        ctx,
-                        boxes,
-                        next_slot,
-                        force_boxes,
-                        slot_schedule,
-                        slot_cursor,
-                        visited,
-                    )?;
+                    // virtualstate.py:196/274/352 parity for the
+                    // VirtualRawBuffer adaptation.
+                    if entry_state.position.get() > node.position.get() {
+                        Self::enum_forced_boxes_for_entry(
+                            entry_state,
+                            entry_ref,
+                            optimizer,
+                            ctx,
+                            boxes,
+                            force_boxes,
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -1320,7 +1239,7 @@ impl VirtualState {
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
                 let resolved = ctx.get_box_replacement(opref);
-                let forced = match ctx.get_ptr_info(resolved) {
+                let forced = match ctx.peek_ptr_info_via_box(resolved) {
                     // RPython: Virtualizable refs stay virtual across iterations.
                     Some(PtrInfo::Virtualizable(_)) => resolved,
                     Some(ptr_info) if ptr_info.is_virtual() => {
@@ -1332,14 +1251,17 @@ impl VirtualState {
                     _ => resolved,
                 };
                 // boxes[self.position_in_notvirtuals] = box
-                // majit's `slot_schedule` (precomputed via `compute_renum`)
-                // plays the role of `position_in_notvirtuals`: each leaf
-                // entry has a deterministic slot index that may collapse
-                // aliased boxes onto the same slot.
-                let slot = slot_schedule
-                    .get(*slot_cursor)
-                    .copied()
-                    .unwrap_or(*next_slot);
+                // virtualstate.py:421 — each non-constant NotVirtual leaf
+                // has its `position_in_notvirtuals` assigned during
+                // `enum_top_level` / `_enum`, so the slot is deterministic
+                // and aliased nodes naturally collapse onto the same slot.
+                let slot_i32 = node.position_in_notvirtuals.get();
+                debug_assert!(
+                    slot_i32 >= 0,
+                    "NotVirtual leaf reached enum_forced_boxes without position_in_notvirtuals \
+                     assigned by enum_top_level"
+                );
+                let slot = slot_i32 as usize;
                 let resolved_for_store = ctx.get_box_replacement(forced);
                 // virtualstate.py:417 NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,
@@ -1351,7 +1273,7 @@ impl VirtualState {
                 // trace falls back to `jump_to_preamble` exactly as RPython
                 // raises VirtualStatesCantMatch.
                 if let (Some(expected), Some(actual)) =
-                    (info.info_type(), ctx.opref_type(resolved_for_store))
+                    (node.info.info_type(), ctx.opref_type(resolved_for_store))
                 {
                     if expected != actual {
                         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -1367,47 +1289,9 @@ impl VirtualState {
                 if let Some(dst) = boxes.get_mut(slot) {
                     *dst = resolved_for_store;
                 }
-                *slot_cursor += 1;
-                *next_slot += 1;
                 Ok(())
             }
         }
-    }
-
-    /// virtualstate.py:111-116 `enum` parity for the
-    /// `enum_forced_boxes_for_entry` recursion: dedup nested
-    /// `Rc<VirtualStateInfoNode>` references via pointer identity so a shared
-    /// substate is enumerated only once. The first call writes its leaves
-    /// into `boxes`; subsequent visits short-circuit, mirroring
-    /// `if self.position != -1: return`.
-    fn enum_forced_boxes_recurse(
-        rc: &Rc<VirtualStateInfoNode>,
-        opref: OpRef,
-        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
-        ctx: &mut OptContext,
-        boxes: &mut [OpRef],
-        next_slot: &mut usize,
-        force_boxes: bool,
-        slot_schedule: &[usize],
-        slot_cursor: &mut usize,
-        visited: &mut std::collections::HashSet<usize>,
-    ) -> Result<(), ()> {
-        let key = Rc::as_ptr(rc) as usize;
-        if !visited.insert(key) {
-            return Ok(());
-        }
-        Self::enum_forced_boxes_for_entry(
-            rc,
-            opref,
-            optimizer,
-            ctx,
-            boxes,
-            next_slot,
-            force_boxes,
-            slot_schedule,
-            slot_cursor,
-            visited,
-        )
     }
 
     /// Check if another VirtualState is compatible (can reuse the optimized loop body).
@@ -1487,7 +1371,7 @@ impl VirtualState {
             ) {
                 if std::env::var_os("MAJIT_LOG_JTET").is_some() {
                     let runtime_value =
-                        runtime_box.and_then(|runtime_box| ctx.get_constant(runtime_box).cloned());
+                        runtime_box.and_then(|runtime_box| ctx.get_constant(runtime_box));
                     eprintln!(
                         "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
                     );
@@ -1601,7 +1485,7 @@ impl VirtualState {
                 // `self.constbox.same_constant(runtime_box.constbox())`.
                 if runtime_box
                     .and_then(|runtime_box| ctx.get_constant(runtime_box))
-                    .is_some_and(|runtime_value| runtime_value == val)
+                    .is_some_and(|runtime_value| runtime_value == *val)
                 {
                     guards.push(GuardRequirement::GuardValue {
                         arg_index: arg_idx,
@@ -1900,9 +1784,10 @@ impl VirtualState {
                 count += 1;
             }
         }
-        // Forcing breaks any prior Rc sharing, so the slot schedule
-        // (which keys on Rc::as_ptr) must be recomputed.
-        self.rebuild_slot_schedule();
+        // Forcing breaks any prior Rc sharing, so position cells
+        // assigned to the previous instance graph must be re-derived
+        // against the rewritten state.
+        self.enum_top_level();
         count
     }
 
@@ -2170,11 +2055,7 @@ impl GuardRequirement {
 /// create a VirtualState snapshot for the given OpRefs (typically the Jump args).
 ///
 /// virtualstate.py: VirtualStateConstructor.make_virtual_state()
-pub fn export_state(
-    oprefs: &[OpRef],
-    ctx: &OptContext,
-    _forwarded: &[crate::optimizeopt::info::Forwarded],
-) -> VirtualState {
+pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
     // virtualstate.py:712-728 VirtualStateConstructor.create_state caches by
     // resolved box: if two different oprefs (or two field references) resolve
     // to the same target, they share the SAME `VirtualStateInfo` Python
@@ -2191,10 +2072,9 @@ pub fn export_state(
         .map(|opref| export_single_value(*opref, ctx, &mut cache))
         .collect();
     // virtualstate.py:627-634 VirtualState.__init__ assigns positions via
-    // _enum so build_sequential_slot_schedule can dedup shared Rc'd
-    // subtrees, matching RPython's `state.position > self.position`.
-    let (slot_schedule, numnotvirtuals) = build_sequential_slot_schedule(&state);
-    VirtualState::new_with_slot_schedule(state, slot_schedule, numnotvirtuals)
+    // _enum so subsequent walks dedup shared Rc'd subtrees via
+    // `state.position > self.position`.
+    VirtualState::from_shared_rcs(state)
 }
 
 /// Bookkeeping shared across `export_single_value` recursion: the DAG cache
@@ -2251,9 +2131,8 @@ fn export_single_value(
     // lookup, so two field references that forward to the same target
     // collapse onto the same VirtualStateInfo. Without this normalization,
     // distinct field-side OpRefs that resolve to the same forwarded box
-    // would each receive their own Rc, breaking the dedup invariant the
-    // walker (`build_sequential_slot_schedule`, `enum_forced_boxes`) and
-    // RPython matching rely on.
+    // would each receive their own Rc, breaking the dedup invariant
+    // `enum_forced_boxes` and RPython matching rely on.
     let opref = ctx.get_box_replacement(opref);
     // virtualstate.py:714-716: cache hit returns the cached state directly.
     if let Some(cached) = cache.finished.get(&opref) {
@@ -2311,13 +2190,13 @@ fn export_single_value_inner(
             .get(&opref.raw())
             .is_some_and(|&t| t == majit_ir::Type::Ref);
         if opref.raw() >= 10000 || has_ref_override {
-            let export_val = if has_ref_override && matches!(value, Value::Int(v) if *v != 0) {
+            let export_val = if has_ref_override && matches!(value, Value::Int(v) if v != 0) {
                 Value::Ref(majit_ir::GcRef(match value {
-                    Value::Int(v) => *v as usize,
+                    Value::Int(v) => v as usize,
                     _ => 0,
                 }))
             } else {
-                value.clone()
+                value
             };
             return VirtualStateInfo::Constant(export_val);
         }
@@ -2331,8 +2210,8 @@ fn export_single_value_inner(
         return VirtualStateInfo::Unknown(value.get_type());
     }
 
-    // Check PtrInfo — use ctx.get_ptr_info which follows forwarding
-    if let Some(info) = ctx.get_ptr_info(opref) {
+    // Check PtrInfo via BoxRef-routing reader (mirror-aware; legacy fallback for empty box pool).
+    if let Some(info) = ctx.peek_ptr_info_via_box(opref) {
         match info {
             PtrInfo::Virtual(vinfo) => {
                 // RPython parity: heaptracker.py:66-67 excludes typeptr from
@@ -2435,7 +2314,7 @@ fn export_single_value_inner(
                 return VirtualStateInfo::NonNull;
             }
             PtrInfo::Constant(gcref) => {
-                return VirtualStateInfo::Constant(Value::Ref(*gcref));
+                return VirtualStateInfo::Constant(Value::Ref(gcref));
             }
             PtrInfo::Virtualizable(_) => {
                 // Virtualizable objects are treated as non-null in virtual state
@@ -2479,100 +2358,6 @@ fn export_single_value_inner(
         Type::Int
     });
     VirtualStateInfo::Unknown(tp)
-}
-
-/// virtualstate.py:627-634 VirtualState.__init__:
-///
-/// ```python
-/// def __init__(self, state):
-///     self.state = state
-///     self.info_counter = -1
-///     self.numnotvirtuals = 0
-///     for s in state:
-///         if s:
-///             s.enum(self)
-/// ```
-///
-/// `enum` (line 111-119) walks the state graph and assigns each unique
-/// `AbstractVirtualStateInfo` a `position`; each non-constant
-/// `NotVirtualStateInfo` also gets a `position_in_notvirtuals` slot
-/// (line 427-431). Shared sub-states get the SAME position because
-/// `if self.position != -1: return` short-circuits revisits.
-///
-/// majit's flat `slot_schedule + numnotvirtuals` plays the role of the
-/// `position_in_notvirtuals` array: each leaf occurrence in DFS order
-/// records the slot it should write into `boxes[...]`. With
-/// `Rc<VirtualStateInfoNode>` shared subtrees the dedup walks each unique
-/// `Rc` only once via `Rc::as_ptr` identity, mirroring RPython's
-/// `if self.position != -1: return` cycle break.
-fn build_sequential_slot_schedule(state: &[Rc<VirtualStateInfoNode>]) -> (Vec<usize>, usize) {
-    let mut schedule = Vec::new();
-    let mut next_slot = 0usize;
-    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    // Top-level entries also dedup via Rc::as_ptr identity so two jump
-    // args resolving to the same box (sharing the same top-level Rc)
-    // collapse onto a single set of slots — matching RPython's
-    // VirtualStateConstructor sharing.
-    for rc in state {
-        append_sequential_slots_rc(rc, &mut schedule, &mut next_slot, &mut visited);
-    }
-    (schedule, next_slot)
-}
-
-fn append_sequential_slots(
-    info: &VirtualStateInfo,
-    schedule: &mut Vec<usize>,
-    next_slot: &mut usize,
-    visited: &mut std::collections::HashSet<usize>,
-) {
-    match info {
-        VirtualStateInfo::Constant(_) => {}
-        VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
-            for (_, child) in fields {
-                append_sequential_slots_rc(child, schedule, next_slot, visited);
-            }
-        }
-        VirtualStateInfo::VArray { items, .. } => {
-            for child in items {
-                append_sequential_slots_rc(child, schedule, next_slot, visited);
-            }
-        }
-        VirtualStateInfo::VArrayStruct { element_fields, .. } => {
-            for fields in element_fields {
-                for (_, child) in fields {
-                    append_sequential_slots_rc(child, schedule, next_slot, visited);
-                }
-            }
-        }
-        VirtualStateInfo::VirtualRawBuffer { entries, .. } => {
-            for (_, _, child) in entries {
-                append_sequential_slots_rc(child, schedule, next_slot, visited);
-            }
-        }
-        VirtualStateInfo::KnownClass { .. }
-        | VirtualStateInfo::NonNull
-        | VirtualStateInfo::IntBounded(_)
-        | VirtualStateInfo::Unknown(_) => {
-            schedule.push(*next_slot);
-            *next_slot += 1;
-        }
-    }
-}
-
-/// virtualstate.py:111-116 `enum` parity: dedup via `Rc::as_ptr` so a
-/// shared `Rc<VirtualStateInfoNode>` is enumerated exactly once, matching
-/// `if self.position != -1: return` on the Python side.
-fn append_sequential_slots_rc(
-    rc: &Rc<VirtualStateInfoNode>,
-    schedule: &mut Vec<usize>,
-    next_slot: &mut usize,
-    visited: &mut std::collections::HashSet<usize>,
-) {
-    let key = Rc::as_ptr(rc) as usize;
-    if !visited.insert(key) {
-        return;
-    }
-    append_sequential_slots(rc, schedule, next_slot, visited);
 }
 
 #[cfg(test)]
@@ -2819,7 +2604,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(guard.opcode, OpCode::GuardValue);
-        assert_eq!(ctx.get_constant(guard.arg(1)), Some(&Value::Ref(expected)));
+        assert_eq!(ctx.get_constant(guard.arg(1)), Some(Value::Ref(expected)));
     }
 
     // ── Export/Import tests ──

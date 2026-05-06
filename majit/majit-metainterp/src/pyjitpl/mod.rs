@@ -3796,6 +3796,10 @@ impl<M: Clone> MetaInterp<M> {
         let trace_snapshots = trace.snapshots.clone();
 
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+        // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
+        // sees the post-GC addresses for any object that moved since the last
+        // `get_or_insert_typed`.
+        ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = trace.ops.clone();
@@ -3920,6 +3924,10 @@ impl<M: Clone> MetaInterp<M> {
                         simple_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
                         simple_opt.snapshot_frame_pcs = snapshot_pc_map.clone();
                         simple_opt.call_pure_results = call_pure_results.clone();
+                        // H-3.0b: forward the recorder's BoxRef pool — the
+                        // retry path uses the same upstream `Rc<Box>`
+                        // allocations from the original trace.
+                        simple_opt.set_pending_box_pool(trace.box_pool.clone());
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.optimize_with_constants_and_inputs(
@@ -5308,6 +5316,9 @@ impl<M: Clone> MetaInterp<M> {
         let trace_snapshots = trace.snapshots.clone();
 
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+        // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
+        // sees the post-GC addresses for any object that moved.
+        ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = trace.ops.clone();
@@ -5356,6 +5367,11 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        // H-3.0b: hand the recorder's BoxRef pool to the optimizer so
+        // mirror writes (H-3.1) reach the same `Rc<Box>` allocations.
+        // RPython parity: PyPy's `AbstractValue` objects from tracing
+        // flow unchanged into optimization.
+        optimizer.set_pending_box_pool(trace.box_pool.clone());
 
         // Wrap in catch_unwind — InvalidLoop during optimization should
         // abort the trace, not crash the process. Matches compile_loop.
@@ -5693,6 +5709,9 @@ impl<M: Clone> MetaInterp<M> {
         let trace_snapshots = trace.snapshots.clone();
 
         let numbering_overrides = ctx.constants.numbering_type_overrides().clone();
+        // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
+        // sees the post-GC addresses for any object that moved.
+        ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
 
         let trace_ops = trace.ops.clone();
@@ -5735,6 +5754,9 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vable_boxes = snapshot_vable_map;
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_pc_map;
+        // H-3.0b: simple-loop path — same recorder BoxRef pool plumb as
+        // the unrolled loop entry above.
+        optimizer.set_pending_box_pool(trace.box_pool.clone());
 
         let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

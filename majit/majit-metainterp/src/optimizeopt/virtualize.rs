@@ -134,7 +134,7 @@ impl OptVirtualize {
         class_ptr: majit_ir::GcRef,
         ctx: &mut OptContext,
     ) {
-        let updated = match ctx.get_ptr_info(obj_ref).cloned() {
+        let updated = match ctx.peek_ptr_info_via_box(obj_ref) {
             Some(PtrInfo::Virtual(mut vinfo)) => {
                 if vinfo.known_class.is_none() {
                     vinfo.known_class = Some(class_ptr);
@@ -306,8 +306,7 @@ impl OptVirtualize {
 
     fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
         let resolved = ctx.get_box_replacement(opref);
-        ctx.get_ptr_info(resolved)
-            .is_some_and(|info| info.is_virtual())
+        ctx.is_virtual_via_box(resolved)
     }
 
     fn is_standard_virtualizable_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
@@ -315,7 +314,7 @@ impl OptVirtualize {
         // virtualizable identity (history.py:307 ConstPtr / InputArgRef).
         self.vable_config.is_some()
             && opref == ctx.get_box_replacement(OpRef::input_arg_ref(0))
-            && matches!(ctx.get_ptr_info(opref), Some(PtrInfo::Virtualizable(_)))
+            && ctx.is_virtualizable_via_box(opref)
     }
 
     /// Apply deferred virtualizable setup if needed.
@@ -325,9 +324,9 @@ impl OptVirtualize {
     fn ensure_vable_setup(&mut self, ctx: &mut OptContext) {
         if self.needs_vable_setup {
             self.needs_vable_setup = false;
-            if ctx.get_ptr_info(OpRef::input_arg_ref(0)).is_none() {
+            if !ctx.has_ptr_info_via_box(OpRef::input_arg_ref(0)) {
                 self.init_virtualizable(ctx);
-                if ctx.get_ptr_info(OpRef::input_arg_ref(0)).is_none() {
+                if !ctx.has_ptr_info_via_box(OpRef::input_arg_ref(0)) {
                     ctx.set_ptr_info(
                         OpRef::input_arg_ref(0),
                         PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -352,7 +351,7 @@ impl OptVirtualize {
     /// Virtualizable is Rust-specific and stays here.
     fn force_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        let info = match ctx.get_ptr_info(resolved) {
+        let info = match ctx.peek_ptr_info_via_box(resolved) {
             Some(info) if info.is_virtual() => info,
             _ => return resolved, // not virtual, nothing to do
         };
@@ -472,7 +471,7 @@ impl OptVirtualize {
         let mut current = ctx.get_box_replacement(opref);
         let mut total_offset = 0usize;
         loop {
-            match ctx.get_ptr_info(current) {
+            match ctx.peek_ptr_info_via_box(current) {
                 Some(PtrInfo::VirtualRawSlice(slice)) => {
                     total_offset = total_offset.checked_add(slice.offset)?;
                     current = ctx.get_box_replacement(slice.parent);
@@ -591,7 +590,7 @@ impl OptVirtualize {
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
         let value_as_constant: Option<usize> = ctx.get_constant(value_ref).and_then(|v| match v {
-            majit_ir::Value::Int(i) => Some(*i as usize),
+            majit_ir::Value::Int(i) => Some(i as usize),
             majit_ir::Value::Ref(gc) => Some(gc.as_usize()),
             _ => None,
         });
@@ -608,8 +607,12 @@ impl OptVirtualize {
         // it as a lazy_set. The virtual value is NOT forced — OptHeap delays
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
-        if let Some(info) = ctx.get_ptr_info_mut(struct_ref) {
-            if info.is_virtual() {
+        let descr_for_vstate = op.descr.clone();
+        let early = ctx
+            .with_ptr_info_mut(struct_ref, |info| {
+                if !info.is_virtual() {
+                    return None;
+                }
                 if offset != Some(0) {
                     let parent_descr = field_descr.get_parent_descr().expect(
                         "optimize_setfield_gc: non-typeptr FieldDescr.get_parent_descr() returned None",
@@ -633,7 +636,7 @@ impl OptVirtualize {
                                     vinfo.known_class = Some(majit_ir::GcRef(class_val));
                                 }
                             }
-                            return OptimizationResult::Remove;
+                            return Some(OptimizationResult::Remove);
                         }
                         set_field(&mut vinfo.fields, field_idx, value_ref);
                         debug_assert!((field_idx as usize) < vinfo.field_descrs.len());
@@ -641,30 +644,33 @@ impl OptVirtualize {
                             &vinfo.fields,
                             "optimize_setfield_gc::Virtual",
                         );
-                        return OptimizationResult::Remove;
+                        Some(OptimizationResult::Remove)
                     }
                     PtrInfo::VirtualStruct(vinfo) => {
                         set_field(&mut vinfo.fields, field_idx, value_ref);
                         debug_assert!((field_idx as usize) < vinfo.field_descrs.len());
-                        return OptimizationResult::Remove;
+                        Some(OptimizationResult::Remove)
                     }
                     PtrInfo::Virtualizable(vstate) => {
                         set_field(&mut vstate.fields, field_idx, value_ref);
                         // Store original descr for force path
-                        if let Some(d) = op.descr.clone() {
+                        if let Some(d) = descr_for_vstate {
                             set_field_descr(&mut vstate.field_descrs, field_idx, d);
                         }
-                        return OptimizationResult::Remove;
+                        Some(OptimizationResult::Remove)
                     }
-                    _ => {}
+                    _ => None,
                 }
-            }
+            })
+            .flatten();
+        if let Some(result) = early {
+            return result;
         }
         // RPython: virtual value is NOT forced in optimize_SETFIELD_GC.
         // It's forced by _emit_operation (optimizer.py:623-625) at final emit.
         // In majit, this is handled by emit_operation or force_all_lazy_sets.
         // virtualize.py:204: self.make_nonnull(op.getarg(0))
-        if ctx.get_ptr_info(struct_ref).is_none() {
+        if !ctx.has_ptr_info_via_box(struct_ref) {
             ctx.set_ptr_info(struct_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
@@ -701,7 +707,7 @@ impl OptVirtualize {
             return OptimizationResult::PassOn;
         }
 
-        if let Some(info) = ctx.get_ptr_info(struct_ref).cloned() {
+        if let Some(info) = ctx.peek_ptr_info_via_box(struct_ref) {
             // info.py:212-214 getfield: return _fields[fielddescr.get_index()].
             // For Virtual, ob_type (offset 0) is not in fields — fold from
             // known_class (info.py:324-325 get_known_class).
@@ -756,9 +762,7 @@ impl OptVirtualize {
                         _ => None,
                     };
                     if let Some(vtable) = vtable {
-                        let const_pos = ctx.alloc_op_position_typed(majit_ir::Type::Int);
-                        ctx.make_constant(const_pos, Value::Int(vtable as i64));
-                        ctx.replace_op(op.pos, const_pos);
+                        ctx.make_constant(op.pos, Value::Int(vtable as i64));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -766,7 +770,7 @@ impl OptVirtualize {
         }
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
-        if ctx.get_ptr_info(struct_ref).is_none() {
+        if !ctx.has_ptr_info_via_box(struct_ref) {
             ctx.set_ptr_info(struct_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
@@ -784,24 +788,30 @@ impl OptVirtualize {
         let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
-                if let PtrInfo::VirtualArray(vinfo) = info {
-                    let idx = index as usize;
-                    if idx < vinfo.items.len() {
-                        vinfo.items[idx] = value_ref;
-                        if probe {
-                            eprintln!(
-                                "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → VirtualArray.items[{}] = value (REMOVE)",
-                                op.pos.raw(),
-                                array_ref,
-                                idx,
-                                value_ref,
-                                idx,
-                            );
+            let idx = index as usize;
+            let did_virtual_write = ctx
+                .with_ptr_info_mut(array_ref, |info| {
+                    if let PtrInfo::VirtualArray(vinfo) = info {
+                        if idx < vinfo.items.len() {
+                            vinfo.items[idx] = value_ref;
+                            return true;
                         }
-                        return OptimizationResult::Remove;
                     }
+                    false
+                })
+                .unwrap_or(false);
+            if did_virtual_write {
+                if probe {
+                    eprintln!(
+                        "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → VirtualArray.items[{}] = value (REMOVE)",
+                        op.pos.raw(),
+                        array_ref,
+                        idx,
+                        value_ref,
+                        idx,
+                    );
                 }
+                return OptimizationResult::Remove;
             }
             // virtualizable.py:134-137 write-back parity: mirror writes to
             // the virtualizable heap arrays into `PtrInfo::Virtualizable`
@@ -822,9 +832,11 @@ impl OptVirtualize {
                         elem_idx,
                     );
                 }
-                if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
-                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
-                }
+                ctx.with_ptr_info_mut(frame_ref, |info| {
+                    if let PtrInfo::Virtualizable(vstate) = info {
+                        set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
+                    }
+                });
             } else if probe {
                 eprintln!(
                     "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → no vable mirror (passthrough)",
@@ -847,7 +859,7 @@ impl OptVirtualize {
         // Virtual value-arg is NOT forced here; _emit_operation
         // (optimizer.py:623-625) forces it at final emission time so the
         // SetfieldGc init ops precede this SetarrayitemGc in _newoperations.
-        if ctx.get_ptr_info(array_ref).is_none() {
+        if !ctx.has_ptr_info_via_box(array_ref) {
             ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
@@ -863,7 +875,7 @@ impl OptVirtualize {
         let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(info) = ctx.get_ptr_info(array_ref).cloned() {
+            if let Some(info) = ctx.peek_ptr_info_via_box(array_ref) {
                 if let PtrInfo::VirtualArray(vinfo) = info {
                     let idx = index as usize;
                     if idx < vinfo.items.len() {
@@ -907,7 +919,7 @@ impl OptVirtualize {
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
 
-        if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.get_ptr_info(array_ref) {
+        if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
             let len = vinfo.items.len() as i64;
             ctx.make_constant(op.pos, Value::Int(len));
             return OptimizationResult::Remove;
@@ -918,7 +930,7 @@ impl OptVirtualize {
     fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let str_ref = ctx.get_box_replacement(op.arg(0));
 
-        if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.get_ptr_info(str_ref) {
+        if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.peek_ptr_info_via_box(str_ref) {
             let len = vinfo.items.len() as i64;
             ctx.make_constant(op.pos, Value::Int(len));
             return OptimizationResult::Remove;
@@ -936,7 +948,7 @@ impl OptVirtualize {
         let field_idx = descr_index(&op.descr);
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.get_ptr_info(array_ref) {
+            if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
                 let elem_idx = index as usize;
                 if elem_idx < vinfo.element_fields.len() {
                     if let Some(val) = get_field(&vinfo.element_fields[elem_idx], field_idx) {
@@ -960,17 +972,23 @@ impl OptVirtualize {
         let field_idx = descr_index(&op.descr);
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
-                if let PtrInfo::VirtualArrayStruct(vinfo) = info {
-                    // info.py:658-661: setinteriorfield_virtual
-                    // index = self._compute_index(index, fielddescr)
-                    // if index >= 0: self._items[index] = fld
-                    let elem_idx = index as usize;
-                    if elem_idx < vinfo.element_fields.len() {
-                        set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
-                        return OptimizationResult::Remove;
+            let elem_idx = index as usize;
+            let did_write = ctx
+                .with_ptr_info_mut(array_ref, |info| {
+                    if let PtrInfo::VirtualArrayStruct(vinfo) = info {
+                        // info.py:658-661: setinteriorfield_virtual
+                        // index = self._compute_index(index, fielddescr)
+                        // if index >= 0: self._items[index] = fld
+                        if elem_idx < vinfo.element_fields.len() {
+                            set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
+                            return true;
+                        }
                     }
-                }
+                    false
+                })
+                .unwrap_or(false);
+            if did_write {
+                return OptimizationResult::Remove;
             }
         }
         OptimizationResult::PassOn
@@ -1005,7 +1023,7 @@ impl OptVirtualize {
         let Some(offset) = ctx.get_constant_int(op.arg(1)) else {
             return OptimizationResult::PassOn;
         };
-        let info = ctx.get_ptr_info(arg0).cloned();
+        let info = ctx.peek_ptr_info_via_box(arg0);
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
                 self.make_virtual_raw_slice(offset as usize, arg0, op, ctx);
@@ -1025,7 +1043,7 @@ impl OptVirtualize {
             let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
                 Some((p, o)) => (p, o),
                 None if matches!(
-                    ctx.get_ptr_info(buf_ref),
+                    ctx.peek_ptr_info_via_box(buf_ref),
                     Some(PtrInfo::VirtualRawBuffer(_))
                 ) =>
                 {
@@ -1033,7 +1051,7 @@ impl OptVirtualize {
                 }
                 None => return OptimizationResult::PassOn,
             };
-            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info(parent) {
+            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.peek_ptr_info_via_box(parent) {
                 let lookup_offset = base_offset + offset as usize;
                 let Some(descr) = op.descr.as_ref() else {
                     return OptimizationResult::PassOn;
@@ -1061,7 +1079,7 @@ impl OptVirtualize {
             let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
                 Some((p, o)) => (p, o),
                 None if matches!(
-                    ctx.get_ptr_info(buf_ref),
+                    ctx.peek_ptr_info_via_box(buf_ref),
                     Some(PtrInfo::VirtualRawBuffer(_))
                 ) =>
                 {
@@ -1069,24 +1087,31 @@ impl OptVirtualize {
                 }
                 None => return OptimizationResult::PassOn,
             };
-            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.get_ptr_info_mut(parent) {
-                let store_offset = base_offset + offset as usize;
-                let Some(descr) = op.descr.clone() else {
-                    return OptimizationResult::PassOn;
-                };
-                let Some(ad) = descr.as_array_descr() else {
-                    return OptimizationResult::PassOn;
-                };
-                // virtualize.py:374-381: try setitem_raw → return (remove);
-                // except InvalidRawOperation → pass → emit(op)
-                if vinfo
-                    .write_value(store_offset, ad.item_size(), descr, value_ref)
-                    .is_ok()
-                {
-                    return OptimizationResult::Remove;
-                }
-                // write_value failed (overlap, incompatible descr) → emit original op
+            let store_offset = base_offset + offset as usize;
+            let Some(descr) = op.descr.clone() else {
                 return OptimizationResult::PassOn;
+            };
+            let Some(ad) = descr.as_array_descr() else {
+                return OptimizationResult::PassOn;
+            };
+            // virtualize.py:374-381: try setitem_raw → return (remove);
+            // except InvalidRawOperation → pass → emit(op)
+            let item_size = ad.item_size();
+            let outcome = ctx.with_ptr_info_mut(parent, |info| {
+                if let PtrInfo::VirtualRawBuffer(vinfo) = info {
+                    Some(
+                        vinfo
+                            .write_value(store_offset, item_size, descr.clone(), value_ref)
+                            .is_ok(),
+                    )
+                } else {
+                    None
+                }
+            });
+            match outcome {
+                Some(Some(true)) => return OptimizationResult::Remove,
+                Some(Some(false)) => return OptimizationResult::PassOn,
+                _ => {}
             }
         }
         OptimizationResult::PassOn
@@ -1185,22 +1210,33 @@ impl OptVirtualize {
 
         // If vref is still virtual, update the virtual struct fields directly
         // (majit in-place absorption, see doc comment above).
-        if let Some(info) = ctx.get_ptr_info_mut(vref_ref) {
-            if info.is_virtual() {
+        // virtualize.py:150-153: set 'forced' to point to the real object
+        // (skipped when objbox is CONST_NULL).
+        let did_forced_write = ctx
+            .with_ptr_info_mut(vref_ref, |info| {
+                if !info.is_virtual() {
+                    return false;
+                }
                 if let PtrInfo::VirtualStruct(vinfo) = info {
-                    // virtualize.py:150-153: set 'forced' to point to the real
-                    // object (skipped when objbox is CONST_NULL).
                     if !obj_is_null {
                         set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
                     }
-                    // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-                    let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
-                    if let Some(PtrInfo::VirtualStruct(vinfo)) = ctx.get_ptr_info_mut(vref_ref) {
-                        set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
-                    }
-                    return OptimizationResult::Remove;
+                    return true;
                 }
-            }
+                false
+            })
+            .unwrap_or(false);
+        if did_forced_write {
+            // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
+            // emit_constant_ref needs a ctx reborrow, hence two sequential
+            // with_ptr_info_mut calls.
+            let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
+            ctx.with_ptr_info_mut(vref_ref, |info| {
+                if let PtrInfo::VirtualStruct(vinfo) = info {
+                    set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
+                }
+            });
+            return OptimizationResult::Remove;
         }
 
         // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops.
@@ -1255,7 +1291,7 @@ impl OptVirtualize {
         }
         let vref = ctx.get_box_replacement(op.arg(1));
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
-        let (token_ref, forced_ref) = match ctx.get_ptr_info(vref) {
+        let (token_ref, forced_ref) = match ctx.peek_ptr_info_via_box(vref) {
             Some(PtrInfo::VirtualStruct(vinfo)) => {
                 // tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
                 // if tokenop is None: return False
@@ -1283,7 +1319,7 @@ impl OptVirtualize {
             _ => return false,
         };
         let forced_resolved = ctx.get_box_replacement(forced_ref);
-        let forced_ok = match ctx.get_ptr_info(forced_resolved) {
+        let forced_ok = match ctx.peek_ptr_info_via_box(forced_resolved) {
             Some(info) => !info.is_null(),
             None => false,
         };
@@ -1305,7 +1341,7 @@ impl OptVirtualize {
             let resolved = ctx.get_box_replacement(*arg);
             if self.vable_config.is_some()
                 && resolved == frame_ref
-                && matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Virtualizable(_)))
+                && ctx.is_virtualizable_via_box(resolved)
             {
                 *arg = resolved;
                 continue;
@@ -1617,7 +1653,7 @@ impl Optimization for OptVirtualize {
             // Enables subsequent GUARD_CLASS elimination.
             OpCode::RecordExactClass => {
                 let ref_opref = ctx.get_box_replacement(op.arg(0));
-                if let Some(&Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
+                if let Some(Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
                     self.record_known_class(ref_opref, class_ref, ctx);
                 }
                 OptimizationResult::Remove
@@ -2545,7 +2581,9 @@ mod tests {
         pass.setup();
         pass.ensure_vable_setup(&mut ctx);
 
-        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef::input_arg_ref(0)) else {
+        let Some(PtrInfo::Virtualizable(vstate)) =
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
+        else {
             panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
         };
         let seeded = get_field_descr(&vstate.field_descrs, virtualizable_field_index(8))
@@ -2694,7 +2732,9 @@ mod tests {
             OptimizationResult::PassOn
         ));
 
-        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef::input_arg_ref(0)) else {
+        let Some(PtrInfo::Virtualizable(vstate)) =
+            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
+        else {
             panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
         };
         assert_eq!(
@@ -2845,7 +2885,7 @@ mod tests {
         ));
 
         let info = ctx
-            .get_ptr_info(OpRef::input_arg_ref(0))
+            .peek_ptr_info_via_box(OpRef::input_arg_ref(0))
             .expect("virtual info missing");
         let PtrInfo::Virtual(vinfo) = info else {
             panic!("expected Virtual ptr info, got {info:?}");

@@ -494,10 +494,10 @@ impl StrPtrInfo {
             VStringVariant::Slice(info) => ctx.get_constant_int_or_bound(info.lgtop),
             // vstring.py:281-295: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
-                let left = ctx.getptrinfo(info.vleft)?;
-                let right = ctx.getptrinfo(info.vright)?;
-                let len1 = left.as_ref().get_known_str_length(ctx, mode)?;
-                let len2 = right.as_ref().get_known_str_length(ctx, mode)?;
+                let left = ctx.getptrinfo_via_box(info.vleft)?;
+                let right = ctx.getptrinfo_via_box(info.vright)?;
+                let len1 = left.get_known_str_length(ctx, mode)?;
+                let len2 = right.get_known_str_length(ctx, mode)?;
                 Some(len1 + len2)
             }
         }
@@ -528,8 +528,8 @@ impl StrPtrInfo {
             }
             VStringVariant::Slice(info) => {
                 // vstring.py:236-248: use getintbound().is_constant()
-                let source = ctx.getptrinfo(info.s)?;
-                let source_chars = source.as_ref().get_constant_string_spec(ctx, mode)?;
+                let source = ctx.getptrinfo_via_box(info.s)?;
+                let source_chars = source.get_constant_string_spec(ctx, mode)?;
                 let start = usize::try_from(ctx.get_constant_int_or_bound(info.start)?).ok()?;
                 let length = usize::try_from(ctx.get_constant_int_or_bound(info.lgtop)?).ok()?;
                 let stop = start.checked_add(length)?;
@@ -539,10 +539,10 @@ impl StrPtrInfo {
                 Some(source_chars[start..stop].to_vec())
             }
             VStringVariant::Concat(info) => {
-                let left = ctx.getptrinfo(info.vleft)?;
-                let right = ctx.getptrinfo(info.vright)?;
-                let mut chars = left.as_ref().get_constant_string_spec(ctx, mode)?;
-                chars.extend(right.as_ref().get_constant_string_spec(ctx, mode)?);
+                let left = ctx.getptrinfo_via_box(info.vleft)?;
+                let right = ctx.getptrinfo_via_box(info.vright)?;
+                let mut chars = left.get_constant_string_spec(ctx, mode)?;
+                chars.extend(right.get_constant_string_spec(ctx, mode)?);
                 Some(chars)
             }
         }
@@ -559,18 +559,17 @@ impl StrPtrInfo {
                 // vstring.py:491: index = _int_add(sinfo.start, index)
                 // Accept intbound-constant starts, not just literal constants.
                 let start = ctx.get_constant_int_or_bound(info.start)?;
-                let source = ctx.getptrinfo(info.s)?;
-                source.as_ref().strgetitem(index as i64 + start, ctx)
+                let source = ctx.getptrinfo_via_box(info.s)?;
+                source.strgetitem(index as i64 + start, ctx)
             }
             VStringVariant::Concat(info) => {
-                let left = ctx.getptrinfo(info.vleft)?;
-                let left_len =
-                    usize::try_from(left.as_ref().get_known_str_length(ctx, self.mode)?).ok()?;
+                let left = ctx.getptrinfo_via_box(info.vleft)?;
+                let left_len = usize::try_from(left.get_known_str_length(ctx, self.mode)?).ok()?;
                 if index < left_len {
-                    left.as_ref().strgetitem(index as i64, ctx)
+                    left.strgetitem(index as i64, ctx)
                 } else {
-                    let right = ctx.getptrinfo(info.vright)?;
-                    right.as_ref().strgetitem((index - left_len) as i64, ctx)
+                    let right = ctx.getptrinfo_via_box(info.vright)?;
+                    right.strgetitem((index - left_len) as i64, ctx)
                 }
             }
         }
@@ -1317,7 +1316,7 @@ impl PtrInfo {
 
         fn force_child(value_ref: OpRef, ctx: &mut crate::optimizeopt::OptContext) -> OpRef {
             let value_ref = ctx.get_box_replacement(value_ref);
-            if ctx.get_ptr_info(value_ref).is_some_and(|i| i.is_virtual()) {
+            if ctx.is_virtual_via_box(value_ref) {
                 let mut info = ctx.take_ptr_info(value_ref).unwrap();
                 let forced = info.force_box_impl(value_ref, ctx);
                 return ctx.get_box_replacement(forced);
@@ -1365,7 +1364,7 @@ impl PtrInfo {
                                             Value::Int(v) => unsafe {
                                                 let dest =
                                                     (ptr.0 as *mut u8).add(offset) as *mut i64;
-                                                *dest = *v;
+                                                *dest = v;
                                             },
                                             Value::Ref(r) => unsafe {
                                                 let dest =
@@ -2251,7 +2250,7 @@ impl PtrInfo {
             let resolved = ctx.get_box_replacement(val);
             if !ctx.is_constant(resolved) {
                 // Check if it's a virtual that is also immutable+constant
-                if let Some(info) = ctx.get_ptr_info(resolved) {
+                if let Some(info) = ctx.peek_ptr_info_via_box(resolved) {
                     if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
                         continue;
                     }

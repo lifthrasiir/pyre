@@ -1135,7 +1135,7 @@ pub(crate) fn classify_short_arg(
     if let Some(value) = short_box_const_values
         .get(&arg)
         .cloned()
-        .or_else(|| ctx.get_constant(arg).cloned())
+        .or_else(|| ctx.get_constant(arg))
     {
         let const_opref = imported_const_opref(ctx, imported_constants, arg, &value);
         return Some(crate::optimizeopt::ImportedShortPureArg::Const(
@@ -1418,14 +1418,16 @@ impl ProducedShortOp {
             info.set_preamble_field(descr_idx, pop.clone());
         }
         // shortpreamble.py:72-74: ensure_ptr_info_arg0 + setfield(pop)
-        let mut struct_info = ctx.ensure_ptr_info_arg0(&getfield_op);
-        if let Some(info) = struct_info.as_mut() {
-            debug_assert!(
-                !info.is_virtual(),
-                "shortpreamble.py:74: imported heap field on virtual"
-            );
-            info.set_preamble_field(descr_idx, pop.clone());
-        }
+        let pop_for_field = pop.clone();
+        ctx.with_ensured_ptr_info_arg0(&getfield_op, |mut struct_info| {
+            if let Some(info) = struct_info.as_mut() {
+                debug_assert!(
+                    !info.is_virtual(),
+                    "shortpreamble.py:74: imported heap field on virtual"
+                );
+                info.set_preamble_field(descr_idx, pop_for_field);
+            }
+        });
         // Cat-2.2 alignment: forward `source -> result_opref` after the
         // PtrInfo / const-info side tables have been seeded (so the seeds
         // see the unforwarded source key consistent with `pop.op = source`).
@@ -1517,21 +1519,23 @@ impl ProducedShortOp {
                 info.set_preamble_item(index as usize, pop.clone());
             }
         } else {
-            let mut array_info = ctx.ensure_ptr_info_arg0(&getarrayitem_op);
-            if let Some(info) = array_info.as_mut() {
-                if let crate::optimizeopt::info::PtrInfo::Array(array_info) = info {
-                    let _ = array_info.lenbound.make_gt_const(index);
-                    let idx = index as usize;
-                    if idx >= array_info.items.len() {
-                        array_info.items.resize(
-                            idx + 1,
-                            crate::optimizeopt::info::FieldEntry::Value(OpRef::NONE),
-                        );
+            let pop_for_array = pop.clone();
+            ctx.with_ensured_ptr_info_arg0(&getarrayitem_op, |mut array_info| {
+                if let Some(info) = array_info.as_mut() {
+                    if let crate::optimizeopt::info::PtrInfo::Array(array_info) = info {
+                        let _ = array_info.lenbound.make_gt_const(index);
+                        let idx = index as usize;
+                        if idx >= array_info.items.len() {
+                            array_info.items.resize(
+                                idx + 1,
+                                crate::optimizeopt::info::FieldEntry::Value(OpRef::NONE),
+                            );
+                        }
+                        array_info.items[idx] =
+                            crate::optimizeopt::info::FieldEntry::Preamble(pop_for_array);
                     }
-                    array_info.items[idx] =
-                        crate::optimizeopt::info::FieldEntry::Preamble(pop.clone());
                 }
-            }
+            });
         }
         // Cat-2.2 alignment: forward `source -> result_opref` after the
         // const-info / ArrayPtrInfo side tables have been seeded.

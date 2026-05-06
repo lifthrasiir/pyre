@@ -1543,7 +1543,6 @@ pub fn generated_list_append_by_strategy(
     ctx: &mut majit_metainterp::TraceCtx,
     list: majit_ir::OpRef,
     value: majit_ir::OpRef,
-    _concrete_len: usize,
     strategy_id: i64,
     is_inline: bool,
 ) {

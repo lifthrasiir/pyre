@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
+use crate::r#box::BoxRef;
 use crate::constant_pool::ConstantPool;
 use crate::history::TreeLoop;
 
@@ -236,6 +237,28 @@ pub struct TraceIterator<'a> {
     /// the same trace produce disjoint OpRef ranges by passing different
     /// `start_fresh` values.
     pub _fresh: u32,
+    /// Epic H H-3.4 slice 77b.A: per-iter `BoxRef` pool that mirrors PyPy
+    /// `trace.get_iter()`'s per-call `inputarg_from_tp(...)` and `cls()`
+    /// allocations. Each `TraceIterator` instance owns its own fresh
+    /// `Rc<Box>` set so Phase 1 / Phase 2 sub-Optimizers do not share
+    /// `Box._forwarded` cells (which would split-brain when one phase's
+    /// mutation leaks into another phase's fresh `forwarded` Vec).
+    ///
+    /// Layout: dense `Vec<BoxRef>` indexed by raw OpRef value. Indices
+    /// `[0..start_fresh)` are placeholder `BoxRef::new_resop(Type::Void)`
+    /// padding (this iter's namespace starts at `start_fresh`; the
+    /// placeholders are never the target of meaningful reads — their
+    /// `_forwarded = None` makes any incidental routing equivalent to
+    /// "no entry" semantics). Inputargs at
+    /// `[start_fresh..start_fresh + num_inputargs)`. Op results pushed
+    /// in `next()` for both void and non-void ops to keep `box_pool[i]`
+    /// aligned with `_fresh = i + 1` after each allocation.
+    ///
+    /// Read-only at slice 77b.A — no consumer wires through to the
+    /// optimizer yet. Slice 77b.B introduces
+    /// `UnrollOptimizer.set_pending_box_pool(p1_iter.box_pool.clone())`
+    /// so Phase 1 / Phase 2 each receive disjoint pools.
+    pub box_pool: Vec<BoxRef>,
 }
 
 impl<'a> TraceIterator<'a> {
@@ -276,6 +299,80 @@ impl<'a> TraceIterator<'a> {
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
+        // Slice 77b.A: per-iter BoxRef pool. Pre-pad indices `[0..start_fresh)`
+        // with placeholder `BoxRef::new_resop(Type::Void)` so dense indexing by
+        // raw OpRef stays consistent for Phase 2 (start_fresh = phase2_inputarg_base).
+        // Placeholder `_forwarded = None` makes any incidental routing return
+        // "no info" — equivalent to a sparse "missing entry" sentinel.
+        //
+        // PRE-EXISTING-ADAPTATION (slice 77b.A) — placeholder semantics for
+        // Phase 1 emit positions when this is Phase 2's iter.
+        //
+        // Phase 1's emitted ops (raw indices in `[num_inputs..start_fresh)` at
+        // Phase 2 since `start_fresh = phase2_inputarg_base = max(next_global_opref,
+        // body_num_inputs)`) do not appear in the trace bytes Phase 2's iter
+        // walks, so Phase 2's iter has no `cls()` allocation for them. PyPy
+        // resolves this via Phase 1's actual `Box` object surviving into Phase 2
+        // through stable Python identity. pyre's per-iter Box model cannot do
+        // the same — see "Why not preserve Phase 1 BoxRef" below — so the
+        // placeholder is the pragmatic stand-in.
+        //
+        // Why not preserve Phase 1 BoxRef in `[0..start_fresh)`:
+        //
+        // - **Rc-share** (clone the same `Rc<Box>` from P1's pool into P2's
+        //   prefix) re-introduces the first-77b crash: P1 mutations to
+        //   `_forwarded` propagate through the shared Rc into P2's view,
+        //   producing the `ensure_ptr_info_arg0 forwarded[N] None` panic on
+        //   10/14 dynasm benches.
+        // - **Deep-clone** (allocate fresh Boxes that copy P1's `_forwarded`
+        //   field) breaks chain pointers: a P1 box whose `_forwarded =
+        //   Box(other_p1_box)` deep-clones into a P2 box pointing at the
+        //   original P1 `other_p1_box`, which is not in P2's pool. Subsequent
+        //   chain walks reach into P1 territory and tear the per-iter
+        //   identity model.
+        // - **Sparse fallback** (`Option<BoxRef>::None` at placeholder slots,
+        //   fall-through to legacy Vec on read) is no closer to PyPy: P2's
+        //   legacy Vec also starts fresh (Forwarded::None at every Phase 1
+        //   emit slot), so fall-through yields None — identical to what the
+        //   placeholder returns.
+        //
+        // Why the placeholder is functionally PyPy-equivalent:
+        //
+        // The unroll import path (`unroll.rs::import_state` → `replace_op`
+        // mirror → `setinfo_from_preamble` walks chain to target via
+        // `get_box_replacement` at mod.rs:2538 → terminal `set_ptr_info` on
+        // target) writes info onto **whatever Box source forwards to**.
+        // PyPy: that's P1's actual Box. Pyre: that's the P2-local placeholder.
+        // Either way, post-import reads via `peek_ptr_info_via_box(source)` or
+        // `get_box_replacement(source) → forwarded` see the same info value.
+        //
+        // The contract this rests on: `ExportedState.exported_infos` (PyPy
+        // canonical field, `unroll.py:529`) carries every Phase 1 op info
+        // that Phase 2 might consult. PyPy's Phase 2 imports through this map
+        // too; relying on it makes pyre's path structurally narrower (no
+        // implicit Phase 1 Box state visibility) but functionally complete.
+        //
+        // Two probes pin the equivalence under
+        // `optimizeopt::h3_1_mirror_tests`:
+        //   - `h3_4_phase2_placeholder_forwarding_yields_consistent_reads`:
+        //     post-import, BoxRef-routing reader and legacy Vec reader both
+        //     see the imported PtrInfo; placeholder absorbs the mirror write.
+        //   - `h3_4_phase2_placeholder_without_import_returns_none_consistently`:
+        //     pre-import (no `setinfo_from_preamble` call), both readers
+        //     return None — consistent within pyre. PyPy parity here depends
+        //     on `exported_infos` containing every info Phase 2 needs; the
+        //     placeholder cannot fabricate Phase 1 info that wasn't exported.
+        //
+        // TODO (held 2026-05-06): structural-parity replacement is to
+        // `Rc::clone` Phase 1 emit-op BoxRefs from `opt_p1.final_ctx.box_pool
+        // [num_inputs..next_global_opref]` into Phase 2's prefix instead of
+        // padding with placeholders. After Phase 1 finishes, Phase 2 is the
+        // sole writer of those Rcs, mirroring PyPy's pattern. See
+        // `memory/todo_phase2_p1_emit_boxref_prefix_transfer.md` for the full
+        // analysis (RPython mechanism, sketch, risks 1-4 to validate).
+        let mut box_pool: Vec<BoxRef> = (0..start_fresh)
+            .map(|_| BoxRef::new_resop(Type::Void))
+            .collect();
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
             // opencoder.py:259-262 self.inputargs =
@@ -296,6 +393,8 @@ impl<'a> TraceIterator<'a> {
                         )
                     });
                     let r = OpRef::input_arg_typed(_fresh, tp);
+                    // Slice 77b.A: companion BoxRef per inputarg, fresh per iter.
+                    box_pool.push(BoxRef::new_inputarg(tp, Some(_fresh)));
                     _fresh += 1;
                     r
                 })
@@ -316,6 +415,8 @@ impl<'a> TraceIterator<'a> {
                 .iter()
                 .map(|&tp| {
                     let r = OpRef::input_arg_typed(_fresh, tp);
+                    // Slice 77b.A: companion BoxRef per inputarg, fresh per iter.
+                    box_pool.push(BoxRef::new_inputarg(tp, Some(_fresh)));
                     _fresh += 1;
                     r
                 })
@@ -335,6 +436,7 @@ impl<'a> TraceIterator<'a> {
             start_index: start as u32,
             end,
             _fresh,
+            box_pool,
         }
     }
 
@@ -444,6 +546,9 @@ impl<'a> TraceIterator<'a> {
             // mixin (resoperation.py:564-638); pyre uses
             // `opcode.result_type()`.
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
+            // Slice 77b.A: companion BoxRef for the fresh op result.
+            self.box_pool
+                .push(BoxRef::new_resop(src.opcode.result_type()));
             self._fresh += 1;
             self._cache[orig] = Some(fresh);
             res.pos = fresh;
@@ -462,6 +567,9 @@ impl<'a> TraceIterator<'a> {
             // never reference it. `AbstractResOp.type = 'v'`
             // (resoperation.py:260) → VoidOp variant.
             let f = OpRef::void_op(self._fresh);
+            // Slice 77b.A: companion Void-typed BoxRef placeholder so
+            // `box_pool[idx]` indexing stays dense.
+            self.box_pool.push(BoxRef::new_resop(Type::Void));
             self._fresh += 1;
             res.pos = f;
         } else {

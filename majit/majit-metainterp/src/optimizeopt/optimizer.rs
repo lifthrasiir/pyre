@@ -197,6 +197,16 @@ pub struct Optimizer {
     pub(crate) opt_ops_emitted: usize,
     pub(crate) opt_guards_emitted: usize,
     pub(crate) opt_guards_shared_emitted: usize,
+    /// Epic H H-3.0b: per-position BoxRef pool inherited from
+    /// `TreeLoop.box_pool` (= `recorder::Trace.box_pool`). Set via
+    /// `set_pending_box_pool` before calling
+    /// `optimize_with_constants_and_inputs_at`; the entry transfers
+    /// ownership to `OptContext.box_pool`.
+    ///
+    /// Empty for callers that never set the pool (tests, retrace
+    /// helpers without recorder); mirror writes installed in H-3.1
+    /// fall back to legacy `forwarded` Vec only.
+    pending_box_pool: Vec<crate::r#box::BoxRef>,
 }
 
 fn value_from_backend_constant_bits_typed(
@@ -632,9 +642,8 @@ impl Optimizer {
             .unwrap_or(&[]);
         // virtualstate.py:111-116 `enum` parity: a single visited map
         // tracked via `Rc::as_ptr` dedups shared subtrees across all
-        // top-level state entries, matching the
-        // `build_sequential_slot_schedule` dedup so `label_slot` advances
-        // by the same number of leaves as `imported_label_args.len()`.
+        // top-level state entries so `label_slot` advances by the same
+        // number of leaves as `imported_label_args.len()`.
         // The map value caches the imported Phase 2 OpRef for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
@@ -694,9 +703,7 @@ impl Optimizer {
                     if ctx.skip_flush_mode
                         && !field_ref.is_none()
                         && !ctx.is_constant(field_ref)
-                        && ctx
-                            .get_ptr_info(field_ref)
-                            .map_or(true, |info| !info.is_virtual())
+                        && !ctx.is_virtual_via_box(field_ref)
                         && ctx.get_constant(field_ref).is_none()
                     {
                         same_as_targets.push((field_ref, entries.len(), field_idx));
@@ -1129,7 +1136,17 @@ impl Optimizer {
             opt_ops_emitted: 0,
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
+            pending_box_pool: Vec::new(),
         }
+    }
+
+    /// H-3.0b: stage the recorder's BoxRef pool so the next
+    /// `optimize_with_constants_and_inputs_at` call transfers it into
+    /// `OptContext.box_pool`. Production callers invoke this after
+    /// extracting `treeloop.box_pool`. Calling it more than once before
+    /// optimization replaces the staged pool.
+    pub fn set_pending_box_pool(&mut self, box_pool: Vec<crate::r#box::BoxRef>) {
+        self.pending_box_pool = box_pool;
     }
 
     /// Record a CALL_PURE result for cross-iteration constant folding.
@@ -1401,10 +1418,7 @@ impl Optimizer {
                 builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
             }
         }
-        if ctx
-            .get_ptr_info(resolved)
-            .is_some_and(|info| info.is_virtual())
-        {
+        if ctx.is_virtual_via_box(resolved) {
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
@@ -1445,10 +1459,7 @@ impl Optimizer {
         match ctx.opref_type(resolved) {
             // optimizer.py:307-313 — `box.type == 'r'` path.
             Some(majit_ir::Type::Ref) => {
-                let is_virtual = ctx
-                    .get_ptr_info(resolved)
-                    .is_some_and(|info| info.is_virtual());
-                if is_virtual {
+                if ctx.is_virtual_via_box(resolved) {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
                 opref
@@ -1461,7 +1472,7 @@ impl Optimizer {
             // registry, so the presence check fires on any PtrInfo
             // attached to an Int-typed OpRef.
             Some(majit_ir::Type::Int) => {
-                if ctx.get_ptr_info(resolved).is_some() {
+                if ctx.has_ptr_info_via_box(resolved) {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
                 opref
@@ -1487,7 +1498,7 @@ impl Optimizer {
         rec: &mut std::collections::HashSet<OpRef>,
     ) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
-        let Some(mut info) = ctx.get_ptr_info(resolved).cloned() else {
+        let Some(mut info) = ctx.peek_ptr_info_via_box(resolved) else {
             return resolved;
         };
 
@@ -1582,13 +1593,6 @@ impl Optimizer {
         ctx.new_operations.last()
     }
 
-    /// optimizer.py: _clean_optimization_info(ops)
-    /// Reset forwarding pointers on all ops before re-optimization.
-    /// Called when re-optimizing a trace (e.g., retrace).
-    pub fn clean_optimization_info(ctx: &mut OptContext) {
-        ctx.forwarded.clear();
-    }
-
     /// optimizer.py: get_count_of_ops()
     /// Count operations emitted so far.
     pub fn get_count_of_ops(ctx: &OptContext) -> usize {
@@ -1662,22 +1666,23 @@ impl Optimizer {
         // instances (`is_virtual` is a field). Rust splits those states into
         // PtrInfo::Instance and PtrInfo::Virtual, so both arms must preserve
         // the existing object info and only update `_known_class`.
-        let updated_existing = match ctx.get_ptr_info_mut(resolved) {
-            Some(PtrInfo::Instance(iinfo)) => {
-                iinfo.known_class = Some(class_ptr);
-                true
-            }
-            Some(PtrInfo::Virtual(vinfo)) => {
-                vinfo.known_class = Some(class_ptr);
-                true
-            }
-            _ => false,
-        };
+        let updated_existing = ctx
+            .with_ptr_info_mut(resolved, |info| match info {
+                PtrInfo::Instance(iinfo) => {
+                    iinfo.known_class = Some(class_ptr);
+                    true
+                }
+                PtrInfo::Virtual(vinfo) => {
+                    vinfo.known_class = Some(class_ptr);
+                    true
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
         if !updated_existing {
             // optimizer.py:142-148: preserve last_guard_pos from old info
             let old_guard_pos = ctx
-                .get_ptr_info(resolved)
-                .and_then(|i| i.get_last_guard_pos())
+                .last_guard_pos_via_box(resolved)
                 .map(|p| p as i32)
                 .unwrap_or(-1);
             let mut new_info = PtrInfo::known_class(class_ptr, true);
@@ -1815,6 +1820,11 @@ impl Optimizer {
         );
         ctx.skip_flush_mode = self.skip_flush;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
+        // H-3.0b: hand the pending BoxRef pool to the OptContext so
+        // mirror writes (H-3.1) can reach the same `Rc<Box>` allocations
+        // the recorder produced. RPython parity: the optimizer sees the
+        // identical AbstractValue objects flowing in from the tracer.
+        ctx.box_pool = std::mem::take(&mut self.pending_box_pool);
         ctx.string_length_resolver = self.string_length_resolver.clone();
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
@@ -2193,9 +2203,9 @@ impl Optimizer {
                 // op/value_types chain. PtrInfo presence is an additional
                 // Ref-only side channel for inputargs not in `new_operations`.
                 let resolved_is_ref = ctx.opref_type(resolved) == Some(majit_ir::Type::Ref)
-                    || ctx.get_ptr_info(resolved).is_some();
+                    || ctx.has_ptr_info_via_box(resolved);
                 if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
-                    if ctx.get_ptr_info(*arg).is_some_and(|i| i.is_virtual()) {
+                    if ctx.is_virtual_via_box(*arg) {
                         force_needed.push(i);
                     } else {
                         // RPython Box parity: a ref-typed box never forwards to
@@ -2363,7 +2373,7 @@ impl Optimizer {
                     // past the already-sent terminal JUMP and force the
                     // loop-tail relocation workaround below.
                     extra_same_as_aliases.push(op);
-                    if let Some(info) = ctx.get_ptr_info(orig).cloned() {
+                    if let Some(info) = ctx.peek_ptr_info_via_box(orig) {
                         let fresh_info = match info {
                             crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
                                 for field in &mut vinfo.fields {
@@ -2431,11 +2441,8 @@ impl Optimizer {
                 .iter()
                 .map(|&a| ctx.get_box_replacement(a))
                 .collect();
-            let preview_virtual_state = crate::optimizeopt::virtualstate::export_state(
-                &post_force_args,
-                &ctx,
-                &ctx.forwarded,
-            );
+            let preview_virtual_state =
+                crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
             let vs_args = &post_force_args;
             let (preview_label_args, preview_virtuals) = preview_virtual_state
                 .make_inputargs_and_virtuals(vs_args, self, &mut ctx, false)
@@ -2610,39 +2617,40 @@ impl Optimizer {
                 .collect();
             for opref in all_refs {
                 let resolved = ctx.get_box_replacement(opref);
-                if let Some(info) = ctx.get_ptr_info(resolved) {
-                    if info.is_virtual() {
-                        self.force_box_for_end_of_preamble(resolved, &mut ctx);
-                    }
+                if ctx.is_virtual_via_box(resolved) {
+                    self.force_box_for_end_of_preamble(resolved, &mut ctx);
                 }
             }
         }
 
-        // Resolve forwarding BEFORE remap.
-        // RPython get_box_replacement: follow chain, stop at ptr_info terminal.
+        // Resolve forwarding BEFORE remap (RPython get_box_replacement: follow
+        // chain, stop at ptr_info terminal). H-3.4 slice 72: route through
+        // canonical `ctx.get_box_replacement` instead of cloning `forwarded`
+        // and re-walking. Two-pass to satisfy the borrow checker — collect
+        // referenced OpRefs under `&ctx`, then mutate `&mut ctx.new_operations`.
         {
-            let fwd = ctx.forwarded.clone();
-            let resolve = |opref: OpRef| -> OpRef {
-                use crate::optimizeopt::info::Forwarded;
-                let mut cur = opref;
-                loop {
-                    let idx = cur.raw() as usize;
-                    if idx >= fwd.len() {
-                        return cur;
-                    }
-                    match &fwd[idx] {
-                        Forwarded::Op(next) => cur = *next,
-                        _ => return cur,
-                    }
+            let mut refs: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+            for op in &ctx.new_operations {
+                refs.extend(op.args.iter().copied());
+                if let Some(ref fa) = op.fail_args {
+                    refs.extend(fa.iter().copied());
                 }
-            };
+            }
+            let resolved: std::collections::HashMap<OpRef, OpRef> = refs
+                .into_iter()
+                .map(|r| (r, ctx.get_box_replacement(r)))
+                .collect();
             for op in &mut ctx.new_operations {
                 for arg in &mut op.args {
-                    *arg = resolve(*arg);
+                    if let Some(&r) = resolved.get(arg) {
+                        *arg = r;
+                    }
                 }
                 if let Some(ref mut fa) = op.fail_args {
                     for arg in fa.iter_mut() {
-                        *arg = resolve(*arg);
+                        if let Some(&r) = resolved.get(arg) {
+                            *arg = r;
+                        }
                     }
                 }
             }
@@ -2659,30 +2667,32 @@ impl Optimizer {
         self.drain_extra_operations_from(0, &mut ctx);
         // Extra operations can introduce new forwarding (for example Heap/Pure
         // forwarding a recently-emitted boxed-field read to its raw payload).
-        // Resolve forwarding again with ptr_info stop.
+        // Resolve forwarding again with ptr_info stop. H-3.4 slice 72: same
+        // two-pass `ctx.get_box_replacement` migration as the pre-remap
+        // resolution above.
         {
-            let fwd = ctx.forwarded.clone();
-            let resolve = |opref: OpRef| -> OpRef {
-                use crate::optimizeopt::info::Forwarded;
-                let mut cur = opref;
-                loop {
-                    let idx = cur.raw() as usize;
-                    if idx >= fwd.len() {
-                        return cur;
-                    }
-                    match &fwd[idx] {
-                        Forwarded::Op(next) => cur = *next,
-                        _ => return cur,
-                    }
+            let mut refs: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+            for op in &ctx.new_operations {
+                refs.extend(op.args.iter().copied());
+                if let Some(ref fa) = op.fail_args {
+                    refs.extend(fa.iter().copied());
                 }
-            };
+            }
+            let resolved: std::collections::HashMap<OpRef, OpRef> = refs
+                .into_iter()
+                .map(|r| (r, ctx.get_box_replacement(r)))
+                .collect();
             for op in &mut ctx.new_operations {
                 for arg in &mut op.args {
-                    *arg = resolve(*arg);
+                    if let Some(&r) = resolved.get(arg) {
+                        *arg = r;
+                    }
                 }
                 if let Some(ref mut fa) = op.fail_args {
                     for arg in fa.iter_mut() {
-                        *arg = resolve(*arg);
+                        if let Some(&r) = resolved.get(arg) {
+                            *arg = r;
+                        }
                     }
                 }
             }
@@ -2730,19 +2740,6 @@ impl Optimizer {
             }
 
             // Op positions: reassign ALL ops to start from final_num_inputs.
-            if crate::optimizeopt::majit_log_enabled() {
-                let fwd_1995 = if 1995 < ctx.forwarded.len() {
-                    format!("{:?}", ctx.forwarded[1995])
-                } else {
-                    "None".to_string()
-                };
-                let in_ops = ctx.new_operations.iter().any(|o| o.pos.raw() == 1995);
-                let in_args = ctx
-                    .new_operations
-                    .iter()
-                    .any(|o| o.args.iter().any(|a| a.raw() == 1995));
-                eprintln!("[remap] v1995: fwd={fwd_1995:?} in_ops={in_ops} in_args={in_args}");
-            }
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
                 if !op.pos.is_none() {
@@ -3043,8 +3040,7 @@ impl Optimizer {
         // objects whose PtrInfo reflects the pre-flush optimizer state.
         // flush() may force pending virtuals, changing their PtrInfo to
         // non-virtual. Capture the virtual state before any forcing.
-        let pre_force_vs =
-            crate::optimizeopt::virtualstate::export_state(&jump_args, &ctx, &ctx.forwarded);
+        let pre_force_vs = crate::optimizeopt::virtualstate::export_state(&jump_args, &ctx);
 
         self.flush(&mut ctx);
 
@@ -3566,7 +3562,7 @@ impl Optimizer {
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
         if op.result_type() == majit_ir::Type::Int {
             let replaced = ctx.get_box_replacement(emitted);
-            if let Some(bound) = ctx.peek_intbound(replaced) {
+            if let Some(bound) = ctx.peek_intbound_via_box(replaced) {
                 if bound.is_constant() {
                     let const_val = bound.get_constant_int();
                     ctx.make_constant(replaced, majit_ir::Value::Int(const_val));
@@ -3610,8 +3606,8 @@ impl Optimizer {
             // `optimizer.py:137-151` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
             let old_guard_pos = ctx
-                .get_ptr_info(pp.obj)
-                .and_then(|info| info.last_guard_pos())
+                .last_guard_pos_via_box(pp.obj)
+                .map(|p| p as i32)
                 .unwrap_or(-1);
             let update_last_guard =
                 old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
@@ -4085,6 +4081,29 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    /// H-3.0b invariant: `set_pending_box_pool` stages a pool that is
+    /// transferred into `OptContext.box_pool` on the next call to
+    /// `optimize_with_constants_and_inputs_at`. The Optimizer's own
+    /// pending field is drained (`take`) so a second optimization run
+    /// without setting the pool again starts with an empty `ctx.box_pool`.
+    #[test]
+    fn h3_0b_pending_box_pool_transfers_to_ctx() {
+        use crate::r#box::BoxRef;
+        let mut opt = Optimizer::default_pipeline();
+        let b0 = BoxRef::new_inputarg(Type::Int, Some(0));
+        let pool = vec![b0.clone()];
+        opt.set_pending_box_pool(pool);
+        let ops: Vec<Op> = Vec::new();
+        let mut constants = std::collections::HashMap::new();
+        let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+        // Pending pool drained.
+        assert!(opt.pending_box_pool.is_empty());
+        // Final ctx (if observable) would have held the box; here we just
+        // confirm the take semantics by running a second pass with no set.
+        let _ = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 0);
+        assert!(opt.pending_box_pool.is_empty());
+    }
 
     /// A trivial pass that removes INT_ADD(x, 0) -> x
     struct AddZeroElimination;
@@ -5361,7 +5380,7 @@ mod tests {
         assert_eq!(result, ctx.get_box_replacement(OpRef::from_raw(10)));
         // After forcing, the struct's ptr_info reflects that field 1
         // (originally OpRef::from_raw(11), forwarded to OpRef::from_raw(20)) has been recursively forced.
-        match ctx.get_ptr_info(result) {
+        match ctx.peek_ptr_info_via_box(result) {
             Some(PtrInfo::VirtualStruct(info)) => {
                 // The inner virtual (OpRef::from_raw(20)) was also forced; its allocation
                 // ref is whatever force_box assigned.

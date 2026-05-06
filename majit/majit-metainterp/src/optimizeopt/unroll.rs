@@ -365,6 +365,18 @@ impl UnrollOptimizer {
                 .rfind(|op| op.opcode == OpCode::Jump)
                 .map(|op| op.args.to_vec())
                 .unwrap_or_default();
+            // Slice 77b.B: hand opt_p1 the per-iter BoxRef pool that p1_iter
+            // allocated (slice 77b.A). trace.get_iter() per-call
+            // inputarg_from_tp(...) / cls() — each phase optimizes against a
+            // fresh Box identity set so _forwarded mutations cannot alias
+            // across phases.
+            //
+            // Const BoxRefs are NOT cached: `mirror_forwarded_to_box` and
+            // `get_box_replacement_box` allocate `BoxRef::new_const(value)`
+            // per call from `const_pool` (`history.py:220` ConstInt(value)
+            // per-call-site parity). opt_p1's entry path seeds `const_pool`
+            // from the shared `constants` map (`optimizer.rs:1944`).
+            opt_p1.set_pending_box_pool(p1_iter.box_pool.clone());
             let p1_ops =
                 opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
@@ -678,6 +690,15 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_emit_ops` untranslated.
+        // Slice 77b.B: hand opt_p2 the per-iter BoxRef pool that the Phase 2
+        // iter allocated. Disjoint from opt_p1's pool — _forwarded mutations
+        // recorded against Phase 1 boxes do not alias Phase 2 boxes for the
+        // same OpRef raw index, fixing the Rc<Box> split-brain that broke
+        // the first 77b attempt.
+        //
+        // Const BoxRefs: see opt_p1 plumb above — fresh per-call from
+        // `const_pool` via `BoxRef::new_const(value)`, no dedup.
+        opt_p2.set_pending_box_pool(iter.box_pool.clone());
         let mut p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
@@ -860,7 +881,6 @@ impl UnrollOptimizer {
                     let current_vs = crate::optimizeopt::virtualstate::export_state(
                         &forced_jump_args,
                         &final_ctx,
-                        &final_ctx.forwarded,
                     );
                     let mut target_states: Vec<crate::optimizeopt::virtualstate::VirtualState> =
                         self.target_tokens
@@ -972,7 +992,7 @@ impl UnrollOptimizer {
         if let Some(ref final_ctx) = opt_p2.final_ctx {
             let mut infos = Vec::with_capacity(initial_sp.inputargs.len());
             for &inputarg in &initial_sp.inputargs {
-                infos.push(final_ctx.get_ptr_info(inputarg).cloned());
+                infos.push(final_ctx.peek_ptr_info_via_box(inputarg));
             }
             initial_sp.inputarg_infos = infos;
         }
@@ -1413,9 +1433,8 @@ impl UnrollOptimizer {
     pub fn get_virtual_state(
         args: &[OpRef],
         ctx: &crate::optimizeopt::OptContext,
-        forwarded: &[crate::optimizeopt::info::Forwarded],
     ) -> crate::optimizeopt::virtualstate::VirtualState {
-        crate::optimizeopt::virtualstate::export_state(args, ctx, forwarded)
+        crate::optimizeopt::virtualstate::export_state(args, ctx)
     }
 }
 
@@ -1811,8 +1830,8 @@ impl ExportedState {
     /// share one VirtualStateInfo" invariant. Rust's `Rc<...>` is immutable
     /// after construction, so each per-slot GcRef refresh would otherwise
     /// allocate an independent new `Rc` for every shared slot, breaking
-    /// the `Rc::as_ptr` dedup that `build_sequential_slot_schedule` relies
-    /// on. Snapshot the original `Rc::as_ptr` per slot, group slots that
+    /// the `Rc::as_ptr` dedup the walker relies on. Snapshot the original
+    /// `Rc::as_ptr` per slot, group slots that
     /// originally shared an `Rc`, and after the GcRef updates re-clone a
     /// single canonical `Rc` into every slot of each group so the
     /// post-refresh tree preserves the pre-GC aliasing.
@@ -1911,9 +1930,9 @@ impl ExportedState {
                     self.virtual_state.state[slot_idx] = Rc::clone(entry);
                 }
             }
-            // Rc identities have shifted, so the dedup walkers'
-            // numnotvirtuals / slot_schedule need to be recomputed.
-            self.virtual_state.rebuild_slot_schedule();
+            // Rc identities have shifted, so position cells must be
+            // re-derived against the canonical state graph.
+            self.virtual_state.enum_top_level();
         }
     }
 
@@ -2191,8 +2210,7 @@ impl OptUnroll {
         // `flush()`. The caller (`Optimizer::optimize_with_constants_and_inputs_at`)
         // already ran both passes before invoking us, so `end_args` is in
         // the same post-force, post-flush state RPython feeds in.
-        let virtual_state =
-            crate::optimizeopt::virtualstate::export_state(&end_args, ctx, &ctx.forwarded);
+        let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
         let mut infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo> = HashMap::new();
         for &arg in &end_args {
@@ -2343,7 +2361,7 @@ impl OptUnroll {
                 if state.short_box_const_values.contains_key(&arg) {
                     continue;
                 }
-                if let Some(value) = ctx.get_constant(arg).cloned() {
+                if let Some(value) = ctx.get_constant(arg) {
                     state.short_box_const_values.insert(arg, value);
                 }
             }
@@ -2385,7 +2403,7 @@ impl OptUnroll {
         let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
             return;
         };
-        let has_fields = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
+        let has_fields = matches!(ctx.peek_ptr_info_via_box(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
         infos.insert(resolved, info.clone());
         // Also store under the original (unresolved) key.
         if arg != resolved {
@@ -2404,7 +2422,7 @@ impl OptUnroll {
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
         infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
-        let fields: Vec<OpRef> = match ctx.get_ptr_info(opref) {
+        let fields: Vec<OpRef> = match ctx.peek_ptr_info_via_box(opref) {
             Some(crate::optimizeopt::info::PtrInfo::Virtual(v)) => {
                 v.fields.iter().map(|(_, r)| *r).collect()
             }
@@ -2528,9 +2546,8 @@ impl OptUnroll {
         runtime_boxes: Option<&[OpRef]>,
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        let mut virtual_state = pre_vs.unwrap_or_else(|| {
-            crate::optimizeopt::virtualstate::export_state(jump_args, ctx, &ctx.forwarded)
-        });
+        let mut virtual_state = pre_vs
+            .unwrap_or_else(|| crate::optimizeopt::virtualstate::export_state(jump_args, ctx));
         let mut args: Vec<OpRef> = jump_args
             .iter()
             .map(|&a| ctx.get_box_replacement(a))
@@ -2600,7 +2617,7 @@ impl OptUnroll {
                         let arg_values: Vec<_> = guard_op
                             .args
                             .iter()
-                            .map(|&arg| (arg, ctx.get_constant(arg).cloned()))
+                            .map(|&arg| (arg, ctx.get_constant(arg)))
                             .collect();
                         eprintln!(
                             "[jit][jte] target_token #{tt_idx} emit guard {:?} from {:?} args={:?}",
@@ -2636,11 +2653,7 @@ impl OptUnroll {
                             .iter()
                             .map(|&a| ctx.get_box_replacement(a))
                             .collect();
-                        virtual_state = crate::optimizeopt::virtualstate::export_state(
-                            &args,
-                            ctx,
-                            &ctx.forwarded,
-                        );
+                        virtual_state = crate::optimizeopt::virtualstate::export_state(&args, ctx);
                     }
                     continue;
                 }
@@ -2655,10 +2668,10 @@ impl OptUnroll {
             if let Some(label) = current_label_args {
                 for (i, &jump_arg) in short_jump_args.iter().enumerate() {
                     let resolved = ctx.get_box_replacement(jump_arg);
-                    if ctx.get_ptr_info(resolved).is_none() {
+                    if !ctx.has_ptr_info_via_box(resolved) {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
-                            if let Some(info) = ctx.get_ptr_info(label_arg).cloned() {
+                            if let Some(info) = ctx.peek_ptr_info_via_box(label_arg) {
                                 ctx.ensure_ptr_info_preserve_forwarding(resolved, info);
                             }
                         }
@@ -2824,11 +2837,10 @@ impl OptUnroll {
                 // shortpreamble.py:414-425 parity: propagate PtrInfo from
                 // Phase 1 export to jump_args so guards are redundant.
                 let resolved = ctx.get_box_replacement(jump_arg);
-                if ctx.get_ptr_info(resolved).is_none() {
+                if !ctx.has_ptr_info_via_box(resolved) {
                     let info = ctx
-                        .get_ptr_info(jump_arg)
-                        .cloned()
-                        .or_else(|| ctx.get_ptr_info(short_inputarg).cloned())
+                        .peek_ptr_info_via_box(jump_arg)
+                        .or_else(|| ctx.peek_ptr_info_via_box(short_inputarg))
                         .or_else(|| {
                             short_preamble
                                 .inputarg_infos
@@ -3300,14 +3312,14 @@ impl OptUnroll {
                     // ConstPtrInfo parity: RPython stores Ref constants as
                     // ConstPtrInfo (a `PtrInfo` subclass). `setinfo_from_preamble`
                     // at unroll.py:65-68 dispatches through `is_constant()`.
-                    Value::Ref(gcref) => Some(OpInfo::Ptr(PtrInfo::Constant(*gcref))),
+                    Value::Ref(gcref) => Some(OpInfo::Ptr(PtrInfo::Constant(gcref))),
                     // FloatConstInfo parity: unroll.py:97-98 handles
                     // `isinstance(preamble_info, info.FloatConstInfo)` with
                     // `op.set_forwarded(preamble_info._const)`.
-                    Value::Float(f) => Some(OpInfo::FloatConst(*f)),
+                    Value::Float(f) => Some(OpInfo::FloatConst(f)),
                     // Int constants: RPython uses IntBound with lower==upper.
                     Value::Int(v) => Some(OpInfo::IntBound(
-                        crate::optimizeopt::intutils::IntBound::from_constant(*v),
+                        crate::optimizeopt::intutils::IntBound::from_constant(v),
                     )),
                     Value::Void => None,
                 };
@@ -3319,7 +3331,7 @@ impl OptUnroll {
         // `OptIntBounds::export_arg_int_bounds`, which already filters by
         // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
         // lookup here cannot pull a bound for a ref/float box.
-        if let Some(ptr_info) = ctx.get_ptr_info(resolved).cloned() {
+        if let Some(ptr_info) = ctx.peek_ptr_info_via_box(resolved) {
             // Drop `PtrInfo::Constant` synthesized for non-constant OpRefs —
             // the per-iteration constant-forwarding shouldn't leak into the
             // next iteration's imported state (see `get_box_replacement` note).
@@ -5224,7 +5236,7 @@ mod tests {
         // a Python identity. The fresh slot is the first one allocated
         // by `reserve_const_ref` in ctx2.
         let fresh_const = OpRef::const_ptr(0);
-        assert_eq!(ctx2.get_constant(fresh_const), Some(&Value::Ref(ptr)));
+        assert_eq!(ctx2.get_constant(fresh_const), Some(Value::Ref(ptr)));
         assert_eq!(ctx2.get_constant(OpRef::const_ptr(23)), None);
         assert_eq!(
             ctx2.imported_short_pure_ops,
@@ -5281,7 +5293,7 @@ mod tests {
         assert_eq!(ctx2.get_constant(func), None);
         assert_eq!(
             ctx2.get_constant(OpRef::from_const(0)),
-            Some(&Value::Int(func_ptr))
+            Some(Value::Int(func_ptr))
         );
     }
 

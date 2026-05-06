@@ -1205,8 +1205,8 @@ impl OptRewrite {
             ctx.make_constant(op.pos, Value::Int((same ^ expect_isnot) as i64));
             return OptimizationResult::Remove;
         }
-        let info0 = ctx.getptrinfo(arg0);
-        let info1 = ctx.getptrinfo(arg1);
+        let info0 = ctx.getptrinfo_via_box(arg0);
+        let info1 = ctx.getptrinfo_via_box(arg1);
 
         let is_virtual0 = info0.as_ref().is_some_and(|i| i.is_virtual());
         let is_virtual1 = info1.as_ref().is_some_and(|i| i.is_virtual());
@@ -1256,8 +1256,8 @@ impl OptRewrite {
             // rewrite.py:550-553: non-instance array pointer comparison.
             // If both are ArrayPtrInfo with known-different length bounds,
             // they cannot be the same object.
-            let lb0 = info0.clone().and_then(|i| i.into_owned().getlenbound(None));
-            let lb1 = info1.clone().and_then(|i| i.into_owned().getlenbound(None));
+            let lb0 = info0.clone().and_then(|mut i| i.getlenbound(None));
+            let lb1 = info1.clone().and_then(|mut i| i.getlenbound(None));
             if let (Some(lb0), Some(lb1)) = (lb0, lb1) {
                 if lb0.known_ne(&lb1) {
                     ctx.make_constant(op.pos, Value::Int(expect_isnot as i64));
@@ -1511,7 +1511,7 @@ impl OptRewrite {
         // getptrinfo synthesizes ConstPtrInfo for constant Refs, matching
         // `if info:` in RPython (which is True for ConstPtrInfo too).
         let obj = ctx.get_box_replacement(arg0);
-        if let Some(info) = ctx.getptrinfo(obj) {
+        if let Some(info) = ctx.getptrinfo_via_box(obj) {
             if info.is_virtual() {
                 raise_invalid_loop("promote of a virtual");
             }
@@ -1522,7 +1522,7 @@ impl OptRewrite {
                 // previous gating on get_constant_int dropped the Ref
                 // case entirely so prior GUARD_NONNULL/GUARD_CLASS were
                 // never strengthened to GUARD_VALUE for Ref-typed args.
-                if let Some(c_value) = ctx.get_constant(arg1).copied() {
+                if let Some(c_value) = ctx.get_constant(arg1) {
                     // rewrite.py:321-323: c_value.nonnull(). ConstInt.nonnull
                     // == (value != 0); ConstPtr.nonnull == (gcref != null).
                     let c_nonnull = match c_value {
@@ -1559,8 +1559,7 @@ impl OptRewrite {
                     // rewrite.py:339-340: old descr must not be ResumeAtPositionDescr
                     // — RPython's fresh ResumeGuardDescr() at line 335 must
                     // not overwrite a RAPD marker.
-                    if let Some(old_idx) =
-                        ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos())
+                    if let Some(old_idx) = ctx.last_guard_pos_via_box(obj)
                         && !ctx.is_resume_at_position_guard(old_idx as i32)
                     {
                         // rewrite.py:335-338 + resoperation.py:498-503
@@ -1578,9 +1577,7 @@ impl OptRewrite {
                         // rewrite.py:343: self.optimizer.replace_guard(op, info)
                         ctx.new_operations[old_idx] = replacement;
                         // rewrite.py:345-346: info.reset_last_guard_pos()
-                        if let Some(info_mut) = ctx.get_ptr_info_mut(obj) {
-                            info_mut.reset_last_guard_pos();
-                        }
+                        ctx.with_ptr_info_mut(obj, |info_mut| info_mut.reset_last_guard_pos());
                         // postprocess_GUARD_VALUE (rewrite.py:303-305): make_constant
                         // with the actual c_value (preserving Int vs Ref typing).
                         ctx.make_constant(arg0, c_value);
@@ -1596,7 +1593,6 @@ impl OptRewrite {
         let box_ref = ctx.get_box_replacement(arg0);
         let v = ctx
             .get_constant(arg1)
-            .cloned()
             .expect("postprocess_GUARD_VALUE requires const arg1");
         ctx.make_constant(box_ref, v);
         OptimizationResult::PassOn
@@ -1621,7 +1617,10 @@ impl OptRewrite {
         // info: ConstPtrInfo.get_known_class(cpu) (info.py:763-772) reads
         // the typeptr at offset 0 via cls_of_box and compares against
         // expectedclassbox. Mismatch → proven-fail guard → InvalidLoop.
-        if let Some(known_class) = ctx.getptrinfo(obj).and_then(|i| i.get_known_class()) {
+        if let Some(known_class) = ctx
+            .getptrinfo_via_box(obj)
+            .and_then(|i| i.get_known_class())
+        {
             if op.num_args() >= 2 {
                 // Class pointer may be Value::Int or Value::Ref.
                 let expected = ctx.get_constant_int(op.arg(1)).or_else(|| {
@@ -1653,7 +1652,7 @@ impl OptRewrite {
                 && ctx.can_replace_guards
             {
                 // last_guard_pos is a _newoperations index.
-                let old_guard_idx = ctx.get_ptr_info(obj).and_then(|i| i.get_last_guard_pos());
+                let old_guard_idx = ctx.last_guard_pos_via_box(obj);
                 if let Some(old_idx) = old_guard_idx
                     && !ctx.is_resume_at_position_guard(old_idx as i32)
                 {
@@ -1764,7 +1763,10 @@ impl OptRewrite {
         if ctx.opref_type(opref) == Some(majit_ir::Type::Ref) {
             return true;
         }
-        ctx.get_ptr_info(opref).is_some()
+        // H-3.2c slice 9: consolidate the BoxRef-routing PtrInfo presence
+        // probe into `OptContext::has_ptr_info_via_box`. The helper keeps
+        // the legacy fallback semantics in one place.
+        ctx.has_ptr_info_via_box(opref)
     }
 
     /// rewrite.py:95-101: _optimize_CALL_INT_UDIV
@@ -1956,8 +1958,8 @@ impl OptRewrite {
 
         let source_box = ctx.get_box_replacement(source_box);
         let dest_box = ctx.get_box_replacement(dest_box);
-        let source_is_virtual = ctx.get_ptr_info(source_box).is_some_and(|i| i.is_virtual());
-        let dest_is_virtual = ctx.get_ptr_info(dest_box).is_some_and(|i| i.is_virtual());
+        let source_is_virtual = ctx.is_virtual_via_box(source_box);
+        let dest_is_virtual = ctx.is_virtual_via_box(dest_box);
 
         // rewrite.py:610-611: constant start indices required
         let source_start = match ctx.get_constant_int(source_start_box) {
@@ -2016,16 +2018,17 @@ impl OptRewrite {
                 .map(|fds| fds.iter().map(|d| d.index()).collect())
                 .or_else(|| {
                     // Fallback: get from virtual's metadata
-                    ctx.get_ptr_info(source_box).and_then(|info| match info {
-                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
-                            if v.fielddescrs.is_empty() {
-                                None
-                            } else {
-                                Some(v.fielddescrs.iter().map(|d| d.index()).collect())
+                    ctx.peek_ptr_info_via_box(source_box)
+                        .and_then(|info| match info {
+                            crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                                if v.fielddescrs.is_empty() {
+                                    None
+                                } else {
+                                    Some(v.fielddescrs.iter().map(|d| d.index()).collect())
+                                }
                             }
-                        }
-                        _ => None,
-                    })
+                            _ => None,
+                        })
                 })
                 .unwrap_or_default();
             if all_fdescr_indices.is_empty() {
@@ -2034,17 +2037,14 @@ impl OptRewrite {
             // rewrite.py:631-634: copy interior fields element by element
             for index in 0..length_int {
                 for &fdescr_idx in &all_fdescr_indices {
-                    let val = ctx.get_ptr_info(source_box).and_then(|info| {
+                    let val = ctx.peek_ptr_info_via_box(source_box).and_then(|info| {
                         info.getinteriorfield_virtual((index + source_start) as usize, fdescr_idx)
                     });
                     if let Some(val) = val {
-                        if let Some(info) = ctx.get_ptr_info_mut(dest_box) {
-                            info.setinteriorfield_virtual(
-                                (index + dest_start) as usize,
-                                fdescr_idx,
-                                val,
-                            );
-                        }
+                        let idx = (index + dest_start) as usize;
+                        ctx.with_ptr_info_mut(dest_box, |info| {
+                            info.setinteriorfield_virtual(idx, fdescr_idx, val);
+                        });
                     }
                 }
             }
@@ -2075,7 +2075,7 @@ impl OptRewrite {
             // Read source element
             let val = if source_is_virtual {
                 // rewrite.py:650-651: source_info.getitem(arraydescr, index + source_start)
-                ctx.get_ptr_info(source_box)
+                ctx.peek_ptr_info_via_box(source_box)
                     .and_then(|info| info.getitem((index + source_start) as usize))
                     .and_then(|e| e.as_opref())
             } else {
@@ -2101,9 +2101,8 @@ impl OptRewrite {
             // Write to destination
             if dest_is_virtual {
                 // rewrite.py:662-665: dest_info.setitem(...)
-                if let Some(info) = ctx.get_ptr_info_mut(dest_box) {
-                    info.setitem((index + dest_start) as usize, val);
-                }
+                let idx = (index + dest_start) as usize;
+                ctx.with_ptr_info_mut(dest_box, |info| info.setitem(idx, val));
             } else {
                 // rewrite.py:666-670: emit SETARRAYITEM_GC
                 let idx_const = ctx.make_constant_int(index + dest_start);
@@ -2533,7 +2532,7 @@ impl Optimization for OptRewrite {
                 //         elif opinfo.is_null(): raise InvalidLoop(...)
                 //     return self.emit(op)
                 let obj = ctx.get_box_replacement(op.arg(0));
-                if let Some(info) = ctx.getptrinfo(obj) {
+                if let Some(info) = ctx.getptrinfo_via_box(obj) {
                     if info.is_nonnull() {
                         return OptimizationResult::Remove;
                     }
@@ -2544,7 +2543,7 @@ impl Optimization for OptRewrite {
                 // rewrite.py:280-282 postprocess_GUARD_NONNULL:
                 // make_nonnull runs immediately; mark_last_guard deferred
                 // until emit adds the guard to new_operations.
-                if ctx.get_ptr_info(obj).is_none() {
+                if !ctx.has_ptr_info_via_box(obj) {
                     ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
                 }
                 // rewrite.py:282: mark_last_guard deferred to emit_operation
@@ -2559,7 +2558,7 @@ impl Optimization for OptRewrite {
                 //         elif info.is_nonnull(): raise InvalidLoop(...)
                 //     return self.emit(op)
                 let obj = ctx.get_box_replacement(op.arg(0));
-                if let Some(info) = ctx.getptrinfo(obj) {
+                if let Some(info) = ctx.getptrinfo_via_box(obj) {
                     if info.is_null() {
                         return OptimizationResult::Remove;
                     }
@@ -2584,7 +2583,7 @@ impl Optimization for OptRewrite {
                 //     if info and info.is_null():
                 //         raise InvalidLoop(...)
                 //     return self.optimize_GUARD_CLASS(op)
-                if let Some(info) = ctx.getptrinfo(op.arg(0)) {
+                if let Some(info) = ctx.getptrinfo_via_box(op.arg(0)) {
                     if info.is_null() {
                         raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
                     }
@@ -2870,7 +2869,7 @@ impl Optimization for OptRewrite {
             OpCode::AssertNotNone => {
                 // RPython: self.make_nonnull(op.getarg(0))
                 let obj = ctx.get_box_replacement(op.arg(0));
-                if ctx.get_ptr_info(obj).is_none() {
+                if !ctx.has_ptr_info_via_box(obj) {
                     ctx.set_ptr_info(obj, crate::optimizeopt::info::PtrInfo::nonnull());
                 }
                 OptimizationResult::Remove
@@ -2892,14 +2891,17 @@ impl Optimization for OptRewrite {
                     // ConstClass is Value::Ref in majit (not Value::Int).
                     let expected_class: Option<i64> =
                         ctx.get_constant(op.arg(1)).and_then(|v| match v {
-                            &Value::Ref(r) => Some(r.0 as i64),
-                            &Value::Int(i) => Some(i),
+                            Value::Ref(r) => Some(r.0 as i64),
+                            Value::Int(i) => Some(i),
                             _ => None,
                         });
                     if let Some(expected_class) = expected_class {
                         // getptrinfo synthesizes ConstPtrInfo for constant
                         // Refs so `get_known_class` reads cls_of_box for them.
-                        if let Some(known) = ctx.getptrinfo(obj).and_then(|i| i.get_known_class()) {
+                        if let Some(known) = ctx
+                            .getptrinfo_via_box(obj)
+                            .and_then(|i| i.get_known_class())
+                        {
                             debug_assert_eq!(known.0 as i64, expected_class);
                             return OptimizationResult::Remove;
                         }
@@ -3014,7 +3016,7 @@ impl Optimization for OptRewrite {
             OpCode::GuardValue => {
                 if op.num_args() >= 2 {
                     let box_ = ctx.get_box_replacement(op.arg(0));
-                    if let Some(val) = ctx.get_constant(op.arg(1)).cloned() {
+                    if let Some(val) = ctx.get_constant(op.arg(1)) {
                         ctx.make_constant(box_, val);
                     }
                 }

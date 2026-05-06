@@ -7,6 +7,8 @@
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
 use majit_ir::{InputArg, Op, OpCode, OpRef};
 
+use crate::r#box::BoxRef;
+
 /// RPython `History` parity alias for `TreeLoop`.
 ///
 /// The Rust implementation keeps the historical `TreeLoop` name for naming
@@ -41,6 +43,19 @@ pub struct TreeLoop {
     /// opencoder.py parity: per-guard snapshots captured during tracing.
     /// Indexed by the guard op's `rd_resume_position`.
     pub snapshots: Vec<crate::recorder::Snapshot>,
+    /// Epic H H-3.0a: per-position BoxRef pool inherited from the
+    /// `recorder::Trace` that produced this loop. `box_pool[i]` is the
+    /// `AbstractValue` mirror of the operation at `op_count == i`
+    /// (inputargs followed by ops, in record order). Empty for tests
+    /// that synthesize a `TreeLoop` directly without going through the
+    /// recorder.
+    ///
+    /// RPython parity: PyPy's `AbstractResOp` / `AbstractInputArg`
+    /// objects created during tracing flow unchanged into the optimizer
+    /// (same Python objects, same `_forwarded` slot). The Rust pool
+    /// preserves that identity by carrying the same `Rc<Box>` allocations
+    /// from the recorder through to the optimizer.
+    pub box_pool: Vec<BoxRef>,
 }
 
 impl TreeLoop {
@@ -55,6 +70,7 @@ impl TreeLoop {
             inputargs,
             ops,
             snapshots: Vec::new(),
+            box_pool: Vec::new(),
         }
     }
 
@@ -68,6 +84,25 @@ impl TreeLoop {
             inputargs,
             ops,
             snapshots,
+            box_pool: Vec::new(),
+        }
+    }
+
+    /// H-3.0a: build with explicit BoxRef pool inherited from a recorder.
+    /// Production path: `recorder::Trace::get_trace` uses this so the
+    /// optimizer receives the same `Rc<Box>` allocations that were
+    /// created during tracing.
+    pub fn with_box_pool(
+        inputargs: Vec<InputArg>,
+        ops: Vec<Op>,
+        snapshots: Vec<crate::recorder::Snapshot>,
+        box_pool: Vec<BoxRef>,
+    ) -> Self {
+        TreeLoop {
+            inputargs,
+            ops,
+            snapshots,
+            box_pool,
         }
     }
 
@@ -344,6 +379,28 @@ impl TreeLoop {
             })
             .collect();
 
+        // H-3.4 prep (Epic H slice 60): build a fresh `box_pool` mirroring
+        // the new namespace. Inputargs go first (fresh `BoxRef::new_inputarg`
+        // with type/position), followed by prefix re-emitted ops and
+        // post-cut ops (fresh `BoxRef::new_resop` with result type). Without
+        // this, retrace baselines reach the optimizer with empty box_pool
+        // and every BoxRef-routing reader fell back to the legacy Vec read
+        // even after H-3.0a/b plumbed production. Total length:
+        // `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
+        let mut box_pool: Vec<BoxRef> =
+            Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len());
+        for (i, &tp) in new_ia_types.iter().enumerate() {
+            box_pool.push(BoxRef::new_inputarg(tp, Some(i as u32)));
+        }
+        for &r in op_escaped.iter() {
+            let op_idx = (r.raw() - num_original_inputargs) as usize;
+            let result_tp = self.ops[op_idx].opcode.result_type();
+            box_pool.push(BoxRef::new_resop(result_tp));
+        }
+        for op in cut_ops.iter() {
+            box_pool.push(BoxRef::new_resop(op.opcode.result_type()));
+        }
+
         // Phase 5: Re-emit escaped ops as prefix, assigning fresh OpRefs.
         // Result type comes from the original op's opcode so the new OpRef
         // variant matches RPython's IntOp/FloatOp/RefOp dispatch.
@@ -461,7 +518,7 @@ impl TreeLoop {
                 }
             })
             .collect();
-        TreeLoop::with_snapshots(new_inputargs, new_ops, remapped_snapshots)
+        TreeLoop::with_box_pool(new_inputargs, new_ops, remapped_snapshots, box_pool)
     }
 }
 

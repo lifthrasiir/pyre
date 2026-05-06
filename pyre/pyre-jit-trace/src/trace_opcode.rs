@@ -4519,17 +4519,10 @@ impl MIFrame {
                     None
                 };
                 if let Some(sid) = strategy_id {
-                    let concrete_len = w_list_len(concrete_list);
                     let is_inline = w_list_is_inline_storage(concrete_list);
                     return self.with_ctx(|this, ctx| {
                         crate::generated_list_append_by_strategy(
-                            this,
-                            ctx,
-                            list,
-                            value,
-                            concrete_len,
-                            sid,
-                            is_inline,
+                            this, ctx, list, value, sid, is_inline,
                         );
                         Ok(())
                     });

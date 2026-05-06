@@ -2883,7 +2883,7 @@ impl Optimization for OptIntBounds {
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
                 continue;
             }
-            if let Some(bound) = ctx.peek_intbound(resolved) {
+            if let Some(bound) = ctx.peek_intbound_via_box(resolved) {
                 if bound.is_unbounded() {
                     continue;
                 }
