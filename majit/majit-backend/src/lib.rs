@@ -1398,19 +1398,21 @@ pub trait Backend: Send {
     /// operations, original_loop_token, log, memo)` — RPython's upstream
     /// signature carries one token (`original_loop_token`), reached via
     /// `metainterp.resumekey_original_loop_token = resumedescr.rd_loop_token
-    /// .loop_token_wref()` (`pyjitpl.py:2897`).  PyPy's x86 backend resolves
-    /// the source FailDescr against that single token because it patches the
-    /// running machine code in place.
+    /// .loop_token_wref()` (`pyjitpl.py:2897`).  Pyre's caller resolves the
+    /// owning JCT through `descr_owning_jct(fail_descr)` (Phase E.3+,
+    /// `lib.rs:969`) and passes it as `original_token`, so the source descr
+    /// is always reachable from `original_token.compiled.fail_descrs`.
     ///
-    /// **NEW-DEVIATION (fix queue):** the second `previous_tokens` slice is
+    /// **PRE-EXISTING-ADAPTATION:** the second `previous_tokens` slice is
     /// pyre-only.  Cranelift recompiles bridges as fresh modules instead of
-    /// patching existing machine code, so when the source guard lives in a
-    /// retired token (post-recompile), the owning `CompiledLoop.fail_descrs`
-    /// table is no longer reachable from `original_token` alone.  Backend
-    /// descrs keep a one-way pointer to the source metainterp descr; once
-    /// bridge compilation can resolve source descr identity without scanning
-    /// predecessor tokens, this parameter must be deleted to converge on
-    /// `compile.py:484`.  Dynasm already ignores it (in-place patching).
+    /// patching live machine code, so after a retrace the RUNNING machine
+    /// code still references descrs in retired predecessor tokens — the
+    /// cranelift impl must attach the freshly-compiled bridge to those
+    /// predecessor descrs so the running code can still dispatch to it.
+    /// Dynasm patches in place and ignores the slice.  Convergence requires
+    /// either a cranelift-side registry of running predecessor descrs (so
+    /// the parameter can come off the trait), or moving to RPython-style
+    /// in-place patching.
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,

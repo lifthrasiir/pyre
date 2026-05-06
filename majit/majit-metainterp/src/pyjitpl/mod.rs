@@ -7136,17 +7136,13 @@ impl<M: Clone> MetaInterp<M> {
         }
         //
         // `compile.py:183` `for op in loop.operations`.
-        for (op_idx, op) in ops.iter().enumerate() {
+        for op in ops.iter() {
             let Some(descr) = op.descr.as_ref() else {
                 // `compile.py:184 descr = op.getdescr()` returns `None`
                 // for ops without a descr; the subsequent `isinstance`
                 // checks all fail.
                 continue;
             };
-            // Phase E op.descr Arc-survival probe: log strong_count
-            // for resume guards at the metainterp walker. Compares
-            // against backend stamp-site count to determine whether
-            // op.descr survives past `backend.compile_loop` drop.
             // `compile.py:185-186` line-by-line port:
             // ```python
             // if isinstance(descr, ResumeDescr):
@@ -7164,8 +7160,7 @@ impl<M: Clone> MetaInterp<M> {
             //
             // Also push the metainterp ResumeGuardDescr Arc onto the
             // JitCellToken keepalive so it outlives the IR Loop drop
-            // (~29% of guards reach refcount 0 otherwise per the
-            // MAJIT_PROBE_OP_DESCR_ALIVE measurement).
+            // (without the keepalive, ~29% of guards reach refcount 0).
             // compile.py:185 `if isinstance(descr, ResumeDescr): ...` —
             // ResumeDescr is the union of `ResumeGuardDescr`-family + the
             // `ResumeGuardCopiedDescr` sibling (compile.py:832).  Pyre
@@ -7175,14 +7170,6 @@ impl<M: Clone> MetaInterp<M> {
             // metainterp descrs that override `set_rd_loop_token_clt`
             // (mod.rs:632 audit).
             if descr.is_resume_guard() || descr.is_resume_guard_copied() {
-                let probe_before = if std::env::var_os("MAJIT_PROBE_OP_DESCR_ALIVE").is_some() {
-                    Some((
-                        std::sync::Arc::strong_count(descr),
-                        std::sync::Arc::weak_count(descr),
-                    ))
-                } else {
-                    None
-                };
                 // Pyre-only owning-trace stamp.  RPython resolves descr
                 // identity by `id(descr)` (`history.py:125`); pyre's
                 // runtime exit paths look up by `(trace_id, fail_index)`,
@@ -7205,19 +7192,6 @@ impl<M: Clone> MetaInterp<M> {
                                  every ResumeDescr-family descr is a FailDescr",
                         )
                         .set_rd_loop_token_clt(any_arc);
-                }
-                if let Some((sc_before, wc_before)) = probe_before {
-                    let sc_after = std::sync::Arc::strong_count(descr);
-                    let wc_after = std::sync::Arc::weak_count(descr);
-                    eprintln!(
-                        "[probe op_descr] metainterp/walker op_idx={} fail_index={:?} strong={}->{} weak={}->{}",
-                        op_idx,
-                        descr.as_fail_descr().map(|fd| fd.fail_index()),
-                        sc_before,
-                        sc_after,
-                        wc_before,
-                        wc_after,
-                    );
                 }
             }
 
@@ -7354,9 +7328,21 @@ impl<M: Clone> MetaInterp<M> {
 
         // `compile.py:204-207` quasi-immutable_deps register_loop_token.
         //
-        // PRE-EXISTING-ADAPTATION: pyre's QuasiImmut tracking is not yet
-        // ported, and the wref-keyed registration depends on
-        // `loop_token_wref` (above) also being available.
+        // PRE-EXISTING-ADAPTATION (crate-boundary): the registration walker
+        // is ported in `pyre/pyre-jit/src/eval.rs::register_quasi_immutable_deps`
+        // and called at the post-compile sites that follow `compile_loop`
+        // / `compile_bridge` in `eval.rs:2513` / `eval.rs:3059`.  It cannot
+        // live inside this method because the dependency target is a
+        // `pyre_interpreter::DictStorage` slot watcher; majit-metainterp
+        // sits below the pyre/* crates and may not import them
+        // (`/parity` crate boundary invariant).  Convergence requires a
+        // backend-resident watcher trait plumbed through `MetaInterp` so
+        // that the registration walker can execute here without the
+        // pyre-interpreter import.  `last_quasi_immutable_deps` (the
+        // pyre-side analog of `loop.quasi_immutable_deps`) is populated
+        // by the optimizer (`pyjitpl/mod.rs:5407` / `:5774`) and drained
+        // by the eval.rs walker at the same call-graph depth as
+        // `compile.py:204-207`.
 
         // `compile.py:210` `loop.original_jitcell_token = None`.
         //
@@ -8619,6 +8605,9 @@ impl<M: Clone> MetaInterp<M> {
             // current running loop's token.  Pass `source_jct` so backend
             // stamping (`runner.rs:1670`, `compiler.rs:13352`) reaches the
             // correct CLT for newly compiled bridge-internal guards.
+            // `previous_tokens` lets cranelift attach the bridge to retired
+            // predecessor descrs whose machine code is still running (it
+            // cannot patch in place); see `compile_bridge` trait doc.
             let previous_tokens = &compiled.previous_tokens;
             if crate::majit_log_enabled() {
                 eprintln!(

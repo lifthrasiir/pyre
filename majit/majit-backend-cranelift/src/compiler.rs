@@ -13288,23 +13288,15 @@ impl majit_backend::Backend for CraneliftBackend {
         );
     }
 
-    /// `compile.py:484 do_compile_bridge(metainterp_sd, faildescr,
-    /// inputargs, operations, original_loop_token, log, memo)` — RPython's
-    /// upstream signature has *one* token: `original_loop_token`, derived
-    /// from `metainterp.resumekey_original_loop_token` (= the source
-    /// descr's `rd_loop_token.loop_token_wref()`, `pyjitpl.py:2897`).
-    /// PyPy's x86 backend can resolve the source FailDescr against that
-    /// single token because it patches the source machine code directly.
-    ///
-    /// **NEW-DEVIATION (fix queue):** the second `previous_tokens` slice
-    /// is pyre-only.  Cranelift recompiles the bridge as a fresh module
-    /// rather than patching live machine code, so when the source guard
-    /// lives in a retired token (post-recompile, post-eviction), the
-    /// owning `CompiledLoop.fail_descrs` table is no longer reachable
-    /// from `original_token` alone.  The backend descr now keeps a one-way
-    /// pointer to the source metainterp descr; once bridge compilation can
-    /// resolve the source descr identity without scanning predecessor tokens,
-    /// this parameter must be deleted to converge on `compile.py:484`.
+    /// `compile.py:484 do_compile_bridge` — line-by-line.  Phase E.3+:
+    /// the caller resolves `source_jct = descr_owning_jct(fail_descr)`
+    /// (`majit-backend/src/lib.rs:969`) and passes it as `original_token`,
+    /// so the source descr is always reachable from
+    /// `original_token.compiled.fail_descrs` (no source-descr predecessor
+    /// scan).  `previous_tokens` is still consumed below to attach the
+    /// freshly compiled bridge to retired predecessor descrs whose machine
+    /// code remains live (cranelift cannot patch in place); see the trait
+    /// definition for the convergence path.
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
@@ -13327,31 +13319,20 @@ impl majit_backend::Backend for CraneliftBackend {
         // `send_bridge_to_backend` the actual `faildescr` object;
         // `fail_descr.trace_id()` is the bridge origin's allocated id
         // (`alloc_trace_id` starts at 1, no sentinel) and identifies the
-        // owning trace whether the descr lives on the current token or a
-        // predecessor in `previous_tokens` (post-recompile, the running
-        // machine code still holds the OLD descr).  Search current +
-        // previous tokens; do NOT short-circuit to root-trace when the
-        // descr is found in a predecessor.
+        // owning trace.  Phase E.3+ introduced
+        // `descr_owning_jct(fail_descr)` (`majit-backend/src/lib.rs:969`),
+        // which resolves the descr's owning JCT directly via
+        // `rd_loop_token_clt`.  The metainterp caller now passes that
+        // owning JCT as `original_token`, so the matching backend descr
+        // is always reachable inside `original_compiled.fail_descrs` —
+        // the prior `previous_tokens` scan was a NEW-DEVIATION compensating
+        // for the absence of `descr_owning_jct` and has been retired.
         let source_trace_id = fail_descr.trace_id();
         let source_descr = find_fail_descr_in_fail_descrs(
             &original_compiled.fail_descrs,
             source_trace_id,
             fail_descr.fail_index_per_trace(),
-        )
-        .or_else(|| {
-            previous_tokens.iter().find_map(|t| {
-                t.compiled
-                    .as_ref()
-                    .and_then(|c| c.downcast_ref::<CompiledLoop>())
-                    .and_then(|c| {
-                        find_fail_descr_in_fail_descrs(
-                            &c.fail_descrs,
-                            source_trace_id,
-                            fail_descr.fail_index_per_trace(),
-                        )
-                    })
-            })
-        });
+        );
         if source_descr.is_none() {
             // RPython compile.py:569: send_bridge_to_backend always has a
             // valid faildescr. If source_descr is not found, the bridge
