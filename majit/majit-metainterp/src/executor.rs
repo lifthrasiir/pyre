@@ -52,17 +52,22 @@ impl TraceValues {
     }
 
     pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
+        // Index-keyed pool namespace probe (Slice P3 category E):
+        // raw u32 keys carry the constant-namespace bit directly, so use
+        // the bit-helpers instead of round-tripping through
+        // `OpRef::from_raw(k)` which lands on the to-be-retired
+        // `OpRef::Untyped` variant.
         let max_op = map
             .keys()
-            .filter(|&&k| !OpRef::from_raw(k).is_constant())
+            .filter(|&&k| !OpRef::raw_is_constant(k))
             .max()
             .copied()
             .unwrap_or(0) as usize;
         let max_const = map
             .keys()
-            .filter(|&&k| OpRef::from_raw(k).is_constant())
+            .filter(|&&k| OpRef::raw_is_constant(k))
             .max()
-            .map(|&k| OpRef::from_raw(k).const_index() as usize)
+            .map(|&k| OpRef::raw_const_index(k) as usize)
             .unwrap_or(0);
         let mut tv = Self::new(max_op + 1, max_const + 1);
         for (&k, &v) in map {
@@ -73,9 +78,8 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn get(&self, idx: u32) -> i64 {
-        let opref = OpRef::from_raw(idx);
-        if opref.is_constant() {
-            let ci = opref.const_index() as usize;
+        if OpRef::raw_is_constant(idx) {
+            let ci = OpRef::raw_const_index(idx) as usize;
             if ci < self.constants.len() {
                 self.constants[ci]
             } else {
@@ -93,9 +97,8 @@ impl TraceValues {
 
     #[inline(always)]
     pub fn set(&mut self, idx: u32, value: i64) {
-        let opref = OpRef::from_raw(idx);
-        if opref.is_constant() {
-            let ci = opref.const_index() as usize;
+        if OpRef::raw_is_constant(idx) {
+            let ci = OpRef::raw_const_index(idx) as usize;
             if ci >= self.constants.len() {
                 self.constants.resize(ci + 1, 0);
             }

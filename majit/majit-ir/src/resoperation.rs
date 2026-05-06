@@ -142,6 +142,27 @@ impl OpRef {
         }
     }
 
+    /// Bit-helper variant of `is_constant()` for callers that hold a raw
+    /// u32 from an index-keyed pool (constant pool key, opencoder tag,
+    /// etc.) and only need to test the constant-namespace bit.  Avoids
+    /// the `OpRef::from_raw(raw).is_constant()` round-trip which would
+    /// land on `OpRef::Untyped(_)` and is being retired (see plan
+    /// `untyped-opref-retirement-epic.md` Slice P3).
+    ///
+    /// Stays raw u32 because the underlying pool (`HashMap<u32, V>`) is
+    /// genuinely index-keyed (Slice P3 category E — keep raw u32).
+    pub const fn raw_is_constant(raw: u32) -> bool {
+        raw & Self::CONST_BIT != 0 && raw < Self::SENTINEL_BASE
+    }
+
+    /// Bit-helper variant of `const_index()` for callers that hold a raw
+    /// u32 known to be a constant-namespace key.  See `raw_is_constant`
+    /// for context.
+    pub const fn raw_const_index(raw: u32) -> u32 {
+        debug_assert!(Self::raw_is_constant(raw));
+        raw & !Self::CONST_BIT
+    }
+
     // ── Typed constructors mirroring RPython AbstractValue variants ──
     //
     // Each factory produces the matching enum variant carrying the
@@ -4742,5 +4763,29 @@ mod tests {
             assert_eq!(OpRef::const_float(idx).const_index(), idx);
             assert_eq!(OpRef::const_ptr(idx).const_index(), idx);
         }
+    }
+
+    /// Locks in the bit-helper byte-equivalence with the OpRef-construction
+    /// path so callers in index-keyed pools (Slice P3 cat E) can replace
+    /// `OpRef::from_raw(raw).is_constant()` / `.const_index()` with the
+    /// raw helpers without semantic drift.
+    #[test]
+    fn test_raw_is_constant_matches_opref_path() {
+        for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
+            let raw = OpRef::const_int(idx).raw();
+            assert!(OpRef::raw_is_constant(raw));
+            assert_eq!(OpRef::raw_const_index(raw), idx);
+            assert_eq!(
+                OpRef::raw_const_index(raw),
+                OpRef::const_int(idx).const_index()
+            );
+        }
+        // Non-constant raw values: op positions, inputarg positions, plain numbers.
+        for raw in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
+            assert!(!OpRef::raw_is_constant(raw));
+        }
+        // Sentinel range stays out of the constant namespace.
+        assert!(!OpRef::raw_is_constant(u32::MAX));
+        assert!(!OpRef::raw_is_constant(u32::MAX - 1));
     }
 }

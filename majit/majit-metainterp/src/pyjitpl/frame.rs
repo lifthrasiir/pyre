@@ -1035,23 +1035,23 @@ mod tests {
         let mut frame = MIFrame::new(jitcode.clone(), 5);
         frame.pc = 99;
         frame.setup_call(&[
-            (JitArgKind::Int, OpRef::from_raw(10), 100),
-            (JitArgKind::Ref, OpRef::from_raw(20), 200),
-            (JitArgKind::Int, OpRef::from_raw(11), 101),
-            (JitArgKind::Float, OpRef::from_raw(30), 300),
-            (JitArgKind::Ref, OpRef::from_raw(21), 201),
+            (JitArgKind::Int, OpRef::int_op(10), 100),
+            (JitArgKind::Ref, OpRef::ref_op(20), 200),
+            (JitArgKind::Int, OpRef::int_op(11), 101),
+            (JitArgKind::Float, OpRef::float_op(30), 300),
+            (JitArgKind::Ref, OpRef::ref_op(21), 201),
         ]);
 
         assert_eq!(frame.pc, 0);
-        assert_eq!(frame.int_regs[0], Some(OpRef::from_raw(10)));
+        assert_eq!(frame.int_regs[0], Some(OpRef::int_op(10)));
         assert_eq!(frame.int_values[0], Some(100));
-        assert_eq!(frame.int_regs[1], Some(OpRef::from_raw(11)));
+        assert_eq!(frame.int_regs[1], Some(OpRef::int_op(11)));
         assert_eq!(frame.int_values[1], Some(101));
-        assert_eq!(frame.ref_regs[0], Some(OpRef::from_raw(20)));
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(20)));
         assert_eq!(frame.ref_values[0], Some(200));
-        assert_eq!(frame.ref_regs[1], Some(OpRef::from_raw(21)));
+        assert_eq!(frame.ref_regs[1], Some(OpRef::ref_op(21)));
         assert_eq!(frame.ref_values[1], Some(201));
-        assert_eq!(frame.float_regs[0], Some(OpRef::from_raw(30)));
+        assert_eq!(frame.float_regs[0], Some(OpRef::float_op(30)));
         assert_eq!(frame.float_values[0], Some(300));
     }
 
@@ -1085,8 +1085,8 @@ mod tests {
         let all_liveness: Vec<u8> = vec![1, 1, 0, 0b0000_0001, 0b0000_0001];
 
         let mut frame = MIFrame::new(jitcode, 0);
-        // int_regs[0] non-constant OpRef::from_raw(5) → Box::ResOp(5).
-        frame.int_regs[0] = Some(OpRef::from_raw(5));
+        // int_regs[0] non-constant OpRef::int_op(5) → Box::ResOp(5).
+        frame.int_regs[0] = Some(OpRef::int_op(5));
         frame.int_values[0] = Some(0);
         // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
         frame.ref_regs[0] = Some(OpRef::from_const(7));
@@ -1169,7 +1169,7 @@ mod tests {
         let mut frame = MIFrame::new(jitcode_arc, live_pc);
         frame._result_argcode = b'i';
         // Pre-call stale contents — must NOT leak into the snapshot.
-        frame.int_regs[0] = Some(OpRef::from_raw(777));
+        frame.int_regs[0] = Some(OpRef::int_op(777));
         frame.int_values[0] = Some(666);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1225,7 +1225,7 @@ mod tests {
 
         let mut frame = MIFrame::new(jitcode_arc, live_pc);
         frame._result_argcode = b'i';
-        frame.int_regs[0] = Some(OpRef::from_raw(777));
+        frame.int_regs[0] = Some(OpRef::int_op(777));
         frame.int_values[0] = Some(666);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1279,9 +1279,9 @@ mod tests {
 
         let mut frame = MIFrame::new(jitcode_arc, live_pc);
         frame._result_argcode = b'i';
-        frame.int_regs[0] = Some(OpRef::from_raw(10)); // cleared — not listed.
+        frame.int_regs[0] = Some(OpRef::int_op(10)); // cleared — not listed.
         frame.int_values[0] = Some(999);
-        frame.int_regs[1] = Some(OpRef::from_raw(11)); // live — recorded as ResOp(11).
+        frame.int_regs[1] = Some(OpRef::int_op(11)); // live — recorded as ResOp(11).
         frame.int_values[1] = Some(42);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1303,7 +1303,7 @@ mod tests {
         let (tag0, _) = crate::opencoder::decode_varint_signed(
             &trace._snapshot_array_data[storage as usize + consumed..],
         );
-        // OpRef::from_raw(11) encodes as `tag(TAGBOX, 11) = 11 << 2 | 3 = 47`.
+        // OpRef::int_op(11) encodes as `tag(TAGBOX, 11) = 11 << 2 | 3 = 47`.
         assert_eq!(tag0, TraceRecordBuffer::_encode_box_position(11));
     }
 
@@ -1341,7 +1341,7 @@ mod tests {
         let all_liveness: Vec<u8> = vec![1, 0, 0, 0b0000_0010];
 
         let mut frame = MIFrame::new(jitcode_arc, current_pc);
-        frame.int_regs[0] = Some(OpRef::from_raw(5)); // real register — not referenced.
+        frame.int_regs[0] = Some(OpRef::int_op(5)); // real register — not referenced.
         frame.int_values[0] = Some(99);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1371,20 +1371,20 @@ mod tests {
     fn cleanup_registers_clears_ref_slots_and_pushed_box() {
         let jitcode = make_jitcode_with_regs(2, 2, 1);
         let mut frame = MIFrame::new(jitcode.clone(), 0);
-        frame.int_regs[0] = Some(OpRef::from_raw(1));
+        frame.int_regs[0] = Some(OpRef::int_op(1));
         frame.int_values[0] = Some(11);
-        frame.ref_regs[0] = Some(OpRef::from_raw(2));
+        frame.ref_regs[0] = Some(OpRef::ref_op(2));
         frame.ref_values[0] = Some(22);
-        frame.float_regs[0] = Some(OpRef::from_raw(3));
+        frame.float_regs[0] = Some(OpRef::float_op(3));
         frame.float_values[0] = Some(33);
-        frame.pushed_box = Some(OpRef::from_raw(99));
+        frame.pushed_box = Some(OpRef::int_op(99));
 
         frame.cleanup_registers();
 
         // pyjitpl.py:121-127: int and float slots are untouched.
-        assert_eq!(frame.int_regs[0], Some(OpRef::from_raw(1)));
+        assert_eq!(frame.int_regs[0], Some(OpRef::int_op(1)));
         assert_eq!(frame.int_values[0], Some(11));
-        assert_eq!(frame.float_regs[0], Some(OpRef::from_raw(3)));
+        assert_eq!(frame.float_regs[0], Some(OpRef::float_op(3)));
         assert_eq!(frame.float_values[0], Some(33));
         // pyjitpl.py:124-126: ref slots [0, num_regs_r()) are cleared.
         assert!(frame.ref_regs.iter().all(|r| r.is_none()));
@@ -1403,20 +1403,20 @@ mod tests {
     fn replace_active_box_in_frame_replaces_only_matching_oprefs() {
         let jitcode = make_jitcode_with_regs(3, 2, 1);
         let mut frame = MIFrame::new(jitcode, 0);
-        frame.int_regs[0] = Some(OpRef::from_raw(7));
-        frame.int_regs[1] = Some(OpRef::from_raw(8));
-        frame.int_regs[2] = Some(OpRef::from_raw(7)); // duplicate — must also flip.
-        frame.ref_regs[0] = Some(OpRef::from_raw(7)); // same OpRef but different bank.
-        frame.float_regs[0] = Some(OpRef::from_raw(7));
+        frame.int_regs[0] = Some(OpRef::int_op(7));
+        frame.int_regs[1] = Some(OpRef::int_op(8));
+        frame.int_regs[2] = Some(OpRef::int_op(7)); // duplicate — must also flip.
+        frame.ref_regs[0] = Some(OpRef::ref_op(7)); // same raw u32 but different bank/variant.
+        frame.float_regs[0] = Some(OpRef::float_op(7));
 
-        frame.replace_active_box_in_frame(OpRef::from_raw(7), OpRef::from_raw(42), Type::Int);
+        frame.replace_active_box_in_frame(OpRef::int_op(7), OpRef::int_op(42), Type::Int);
 
-        assert_eq!(frame.int_regs[0], Some(OpRef::from_raw(42)));
-        assert_eq!(frame.int_regs[1], Some(OpRef::from_raw(8)));
-        assert_eq!(frame.int_regs[2], Some(OpRef::from_raw(42)));
+        assert_eq!(frame.int_regs[0], Some(OpRef::int_op(42)));
+        assert_eq!(frame.int_regs[1], Some(OpRef::int_op(8)));
+        assert_eq!(frame.int_regs[2], Some(OpRef::int_op(42)));
         // Ref / float banks untouched — bank dispatch is by oldbox.type.
-        assert_eq!(frame.ref_regs[0], Some(OpRef::from_raw(7)));
-        assert_eq!(frame.float_regs[0], Some(OpRef::from_raw(7)));
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
+        assert_eq!(frame.float_regs[0], Some(OpRef::float_op(7)));
     }
 
     /// Empty bank short-circuit: pyjitpl.py:248 `if not count: return`.
@@ -1424,10 +1424,10 @@ mod tests {
     fn replace_active_box_in_frame_returns_early_when_bank_empty() {
         let jitcode = make_jitcode_with_regs(0, 1, 0);
         let mut frame = MIFrame::new(jitcode, 0);
-        frame.ref_regs[0] = Some(OpRef::from_raw(7));
-        frame.replace_active_box_in_frame(OpRef::from_raw(7), OpRef::from_raw(42), Type::Int);
+        frame.ref_regs[0] = Some(OpRef::ref_op(7));
+        frame.replace_active_box_in_frame(OpRef::int_op(7), OpRef::int_op(42), Type::Int);
         // Int bank empty — ref bank stays untouched.
-        assert_eq!(frame.ref_regs[0], Some(OpRef::from_raw(7)));
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
     }
 
     /// Type::Void is not a valid box type (pyjitpl.py:246 `assert 0,
@@ -1437,8 +1437,8 @@ mod tests {
     fn replace_active_box_in_frame_void_type_panics_like_rpython() {
         let jitcode = make_jitcode_with_regs(1, 1, 1);
         let mut frame = MIFrame::new(jitcode, 0);
-        frame.int_regs[0] = Some(OpRef::from_raw(7));
-        frame.replace_active_box_in_frame(OpRef::from_raw(7), OpRef::from_raw(42), Type::Void);
+        frame.int_regs[0] = Some(OpRef::int_op(7));
+        frame.replace_active_box_in_frame(OpRef::int_op(7), OpRef::int_op(42), Type::Void);
     }
 
     #[test]
@@ -1447,18 +1447,18 @@ mod tests {
         let mut frame = MIFrame::new(jitcode.clone(), 0);
 
         frame.pc = 0;
-        frame.make_result_of_lastop(JitArgKind::Int, 1, OpRef::from_raw(7), 77);
-        assert_eq!(frame.int_regs[1], Some(OpRef::from_raw(7)));
+        frame.make_result_of_lastop(JitArgKind::Int, 1, OpRef::int_op(7), 77);
+        assert_eq!(frame.int_regs[1], Some(OpRef::int_op(7)));
         assert_eq!(frame.int_values[1], Some(77));
 
         frame.pc = 1;
-        frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef::from_raw(8), 88);
-        assert_eq!(frame.ref_regs[0], Some(OpRef::from_raw(8)));
+        frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef::ref_op(8), 88);
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(8)));
         assert_eq!(frame.ref_values[0], Some(88));
 
         frame.pc = 2;
-        frame.make_result_of_lastop(JitArgKind::Float, 0, OpRef::from_raw(9), 99);
-        assert_eq!(frame.float_regs[0], Some(OpRef::from_raw(9)));
+        frame.make_result_of_lastop(JitArgKind::Float, 0, OpRef::float_op(9), 99);
+        assert_eq!(frame.float_regs[0], Some(OpRef::float_op(9)));
         assert_eq!(frame.float_values[0], Some(99));
     }
 
@@ -1492,8 +1492,8 @@ mod tests {
         let mut frame = MIFrame::new(jitcode.clone(), 0);
         frame.pc = post_call_pc;
         // Matching kind — assertion passes silently.
-        frame.make_result_of_lastop(JitArgKind::Int, 0, OpRef::from_raw(7), 77);
-        assert_eq!(frame.int_regs[0], Some(OpRef::from_raw(7)));
+        frame.make_result_of_lastop(JitArgKind::Int, 0, OpRef::int_op(7), 77);
+        assert_eq!(frame.int_regs[0], Some(OpRef::int_op(7)));
     }
 
     #[test]
@@ -1511,7 +1511,7 @@ mod tests {
 
         let mut frame = MIFrame::new(jitcode.clone(), 0);
         frame.pc = post_call_pc;
-        frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef::from_raw(7), 77);
+        frame.make_result_of_lastop(JitArgKind::Ref, 0, OpRef::ref_op(7), 77);
     }
 
     #[test]
@@ -1594,8 +1594,8 @@ mod tests {
     fn verify_green_args_rejects_non_const_opref() {
         use majit_ir::Type;
         let jd = crate::jitdriver::JitDriverStaticData::new(vec![("g0", Type::Int)], vec![]);
-        // Plain OpRef::from_raw(0) is in the operation namespace (no CONST_BIT) —
+        // Plain OpRef::int_op(0) is in the operation namespace (no CONST_BIT) —
         // upstream pyjitpl.py:1534 asserts isinstance(varargs[i], Const).
-        MIFrame::verify_green_args(&jd, &[OpRef::from_raw(0)]);
+        MIFrame::verify_green_args(&jd, &[OpRef::int_op(0)]);
     }
 }

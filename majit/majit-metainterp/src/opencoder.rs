@@ -4059,7 +4059,8 @@ mod tests {
         actual.record_input_arg(Type::Int);
         actual.record_input_arg(Type::Int);
         let pos_e = expected.record_op(OpCode::Jump, &[Box::ResOp(0), Box::ResOp(1)], None);
-        let pos_a = actual.close_loop_oprefs(&[OpRef::from_raw(0), OpRef::from_raw(1)], &pool);
+        let pos_a =
+            actual.close_loop_oprefs(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)], &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -4076,7 +4077,8 @@ mod tests {
         expected.record_input_arg(Type::Int);
         actual.record_input_arg(Type::Int);
         let pos_e = expected.record_op(OpCode::Jump, &[Box::ResOp(0)], Some(&descr));
-        let pos_a = actual.close_loop_oprefs_with_descr(&[OpRef::from_raw(0)], Some(&descr), &pool);
+        let pos_a =
+            actual.close_loop_oprefs_with_descr(&[OpRef::input_arg_int(0)], Some(&descr), &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -4092,7 +4094,7 @@ mod tests {
         expected.record_input_arg(Type::Int);
         actual.record_input_arg(Type::Int);
         let pos_e = expected.record_op(OpCode::Finish, &[Box::ResOp(0)], Some(&descr));
-        let pos_a = actual.finish_oprefs(&[OpRef::from_raw(0)], &descr, &pool);
+        let pos_a = actual.finish_oprefs(&[OpRef::input_arg_int(0)], &descr, &pool);
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
@@ -4106,7 +4108,7 @@ mod tests {
         let c = pool.get_or_insert_typed(42, Type::Int);
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
         buf.record_input_arg(Type::Int);
-        buf.record_op_oprefs(OpCode::IntAdd, &[OpRef::from_raw(0), c], None, &pool);
+        buf.record_op_oprefs(OpCode::IntAdd, &[OpRef::input_arg_int(0), c], None, &pool);
         let ops = buf.ops(Some(&mut pool));
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::IntAdd);
@@ -4132,8 +4134,12 @@ mod tests {
         let mut expected = TraceRecordBuffer::new(1, empty_sd());
         let mut actual = TraceRecordBuffer::new(1, empty_sd());
         let pos_e = expected.record_op(OpCode::CallN, &[Box::ResOp(0)], Some(&descr));
-        let pos_a =
-            actual.record_op_oprefs(OpCode::CallN, &[OpRef::from_raw(0)], Some(&descr), &pool);
+        let pos_a = actual.record_op_oprefs(
+            OpCode::CallN,
+            &[OpRef::input_arg_int(0)],
+            Some(&descr),
+            &pool,
+        );
         assert_eq!(pos_e, pos_a);
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
         assert_eq!(expected._descrs.len(), actual._descrs.len());
@@ -4236,7 +4242,7 @@ mod tests {
 
         let mut frame = crate::pyjitpl::MIFrame::new(jc, 0);
         frame.pc = 0;
-        frame.int_regs[0] = Some(majit_ir::OpRef::from_raw(1));
+        frame.int_regs[0] = Some(majit_ir::OpRef::int_op(1));
         frame.int_values[0] = Some(123);
 
         let mut stack = vec![frame];

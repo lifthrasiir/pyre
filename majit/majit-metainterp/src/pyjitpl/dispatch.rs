@@ -5098,7 +5098,7 @@ mod tests {
         let mut frame = MIFrame::new(jitcode, 0);
         // Pre-fill regs with sentinels so a stray write would surface.
         for slot in &mut frame.int_regs {
-            *slot = Some(majit_ir::OpRef::from_raw(99));
+            *slot = Some(majit_ir::OpRef::int_op(99));
         }
         for slot in &mut frame.int_values {
             *slot = Some(0xDEAD);
@@ -5117,10 +5117,10 @@ mod tests {
     fn populate_frame_int_regs_writes_scalars_and_arrays() {
         // Hand-rolled override that mirrors the macro emit
         // (`majit-macros/src/jit_interp/codegen_state.rs`):
-        //   - 2 scalar slots (idx 0, 1) → `(OpRef::from_raw(10), 100)`,
-        //     `(OpRef::from_raw(11), 101)`.
+        //   - 2 scalar slots (idx 0, 1) → `(OpRef::int_op(10), 100)`,
+        //     `(OpRef::int_op(11), 101)`.
         //   - 1 array slot of length 3 (idx 2..5) →
-        //     `(OpRef::from_raw(20+i), 200+i)` for `i in 0..3`.
+        //     `(OpRef::int_op(20+i), 200+i)` for `i in 0..3`.
         // Asserts the canonical liveness slot layout from
         // `live_slots_for_state_field_jit(num_scalars=2,
         // array_lens=&[3], num_virt_arrays=0)` is honored.
@@ -5138,15 +5138,15 @@ mod tests {
             fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
                 let mut slot = 0;
                 // scalars
-                frame.int_regs[slot] = Some(majit_ir::OpRef::from_raw(10));
+                frame.int_regs[slot] = Some(majit_ir::OpRef::int_op(10));
                 frame.int_values[slot] = Some(100);
                 slot += 1;
-                frame.int_regs[slot] = Some(majit_ir::OpRef::from_raw(11));
+                frame.int_regs[slot] = Some(majit_ir::OpRef::int_op(11));
                 frame.int_values[slot] = Some(101);
                 slot += 1;
                 // array (len 3)
                 for i in 0..3 {
-                    frame.int_regs[slot + i] = Some(majit_ir::OpRef::from_raw(20 + i as u32));
+                    frame.int_regs[slot + i] = Some(majit_ir::OpRef::int_op(20 + i as u32));
                     frame.int_values[slot + i] = Some(200 + i as i64);
                 }
             }
@@ -5162,14 +5162,14 @@ mod tests {
         let sym = StateFieldLikeSym;
         sym.populate_frame_int_regs(&mut frame);
 
-        assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef::from_raw(10)));
+        assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef::int_op(10)));
         assert_eq!(frame.int_values[0], Some(100));
-        assert_eq!(frame.int_regs[1], Some(majit_ir::OpRef::from_raw(11)));
+        assert_eq!(frame.int_regs[1], Some(majit_ir::OpRef::int_op(11)));
         assert_eq!(frame.int_values[1], Some(101));
         for i in 0..3 {
             assert_eq!(
                 frame.int_regs[2 + i],
-                Some(majit_ir::OpRef::from_raw(20 + i as u32))
+                Some(majit_ir::OpRef::int_op(20 + i as u32))
             );
             assert_eq!(frame.int_values[2 + i], Some(200 + i as i64));
         }
@@ -5239,15 +5239,11 @@ mod tests {
         // — the actual values are arbitrary; the snapshot must mirror
         // them slot-for-slot post-`populate_frame_int_regs`.
         let mut sym = StateFieldLikeSym {
-            fail_args: vec![
-                OpRef::from_raw(50),
-                OpRef::from_raw(51),
-                OpRef::from_raw(52),
-            ],
+            fail_args: vec![OpRef::int_op(50), OpRef::int_op(51), OpRef::int_op(52)],
             populated: vec![
-                (0, OpRef::from_raw(50), 500),
-                (1, OpRef::from_raw(51), 510),
-                (2, OpRef::from_raw(52), 520),
+                (0, OpRef::int_op(50), 500),
+                (1, OpRef::int_op(51), 510),
+                (2, OpRef::int_op(52), 520),
             ],
         };
 
@@ -5267,9 +5263,9 @@ mod tests {
         assert_eq!(
             snap.frames[0].boxes,
             vec![
-                crate::recorder::SnapshotTagged::Box(OpRef::from_raw(50), majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(OpRef::from_raw(51), majit_ir::Type::Int),
-                crate::recorder::SnapshotTagged::Box(OpRef::from_raw(52), majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(OpRef::int_op(50), majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(OpRef::int_op(51), majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(OpRef::int_op(52), majit_ir::Type::Int),
             ],
             "snapshot boxes must match populate_frame_int_regs output",
         );
@@ -5340,12 +5336,12 @@ mod tests {
         let jitcode = std::sync::Arc::new(builder.finish());
         jitcode.set_index(7);
         let mut frame = MIFrame::new(jitcode, pc);
-        frame.int_regs[0] = Some(majit_ir::OpRef::from_raw(10));
+        frame.int_regs[0] = Some(majit_ir::OpRef::int_op(10));
         frame.int_values[0] = Some(100);
-        frame.int_regs[1] = Some(majit_ir::OpRef::from_raw(11));
+        frame.int_regs[1] = Some(majit_ir::OpRef::int_op(11));
         frame.int_values[1] = Some(101);
         for i in 0..3 {
-            frame.int_regs[2 + i] = Some(majit_ir::OpRef::from_raw(20 + i as u32));
+            frame.int_regs[2 + i] = Some(majit_ir::OpRef::int_op(20 + i as u32));
             frame.int_values[2 + i] = Some(200 + i as i64);
         }
         let mut stack = MIFrameStack::empty();
@@ -5371,23 +5367,23 @@ mod tests {
             f.boxes,
             vec![
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(10),
+                    majit_ir::OpRef::int_op(10),
                     majit_ir::Type::Int
                 ),
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(11),
+                    majit_ir::OpRef::int_op(11),
                     majit_ir::Type::Int
                 ),
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(20),
+                    majit_ir::OpRef::int_op(20),
                     majit_ir::Type::Int
                 ),
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(21),
+                    majit_ir::OpRef::int_op(21),
                     majit_ir::Type::Int
                 ),
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(22),
+                    majit_ir::OpRef::int_op(22),
                     majit_ir::Type::Int
                 ),
             ]
@@ -5405,7 +5401,7 @@ mod tests {
         let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, pc);
-        frame.int_regs[1] = Some(majit_ir::OpRef::from_raw(42));
+        frame.int_regs[1] = Some(majit_ir::OpRef::int_op(42));
         frame.int_values[1] = Some(420);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);
@@ -5424,7 +5420,7 @@ mod tests {
         assert_eq!(
             f.boxes,
             vec![crate::recorder::SnapshotTagged::Box(
-                majit_ir::OpRef::from_raw(42),
+                majit_ir::OpRef::int_op(42),
                 majit_ir::Type::Int
             )]
         );
@@ -5440,7 +5436,7 @@ mod tests {
             root_builder.current_pos() - (majit_translate::liveness::OFFSET_SIZE + 1);
         let root_jitcode = std::sync::Arc::new(root_builder.finish());
         let mut root = MIFrame::new(root_jitcode, root_live_pc);
-        root.int_regs[0] = Some(majit_ir::OpRef::from_raw(100));
+        root.int_regs[0] = Some(majit_ir::OpRef::int_op(100));
         root.int_values[0] = Some(1000);
         root._result_argcode = b'i';
         root.result_arg_index = Some(0);
@@ -5454,11 +5450,11 @@ mod tests {
         let sub_jitcode = std::sync::Arc::new(sub_builder.finish());
         let mut sub = MIFrame::new(sub_jitcode, sub_pc);
         sub.parent_descr_idx = 3;
-        sub.int_regs[0] = Some(majit_ir::OpRef::from_raw(11));
+        sub.int_regs[0] = Some(majit_ir::OpRef::int_op(11));
         sub.int_values[0] = Some(110);
-        sub.ref_regs[0] = Some(majit_ir::OpRef::from_raw(22));
+        sub.ref_regs[0] = Some(majit_ir::OpRef::ref_op(22));
         sub.ref_values[0] = Some(220);
-        sub.float_regs[0] = Some(majit_ir::OpRef::from_raw(33));
+        sub.float_regs[0] = Some(majit_ir::OpRef::float_op(33));
         sub.float_values[0] = Some(330);
 
         let mut stack = MIFrameStack::empty();
@@ -5491,15 +5487,15 @@ mod tests {
             sub_frame.boxes,
             vec![
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(11),
+                    majit_ir::OpRef::int_op(11),
                     majit_ir::Type::Int
                 ),
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(22),
+                    majit_ir::OpRef::ref_op(22),
                     majit_ir::Type::Ref
                 ),
                 crate::recorder::SnapshotTagged::Box(
-                    majit_ir::OpRef::from_raw(33),
+                    majit_ir::OpRef::float_op(33),
                     majit_ir::Type::Float
                 ),
             ],
@@ -5517,7 +5513,7 @@ mod tests {
         let pc = builder.current_pos();
         let jitcode = std::sync::Arc::new(builder.finish());
         let mut frame = MIFrame::new(jitcode, pc);
-        frame.int_regs[0] = Some(majit_ir::OpRef::from_raw(5));
+        frame.int_regs[0] = Some(majit_ir::OpRef::int_op(5));
         frame.int_values[0] = Some(50);
         let mut stack = MIFrameStack::empty();
         stack.frames.push(frame);

@@ -449,10 +449,14 @@ impl RewriteState {
     }
 
     fn with_constants(hint: usize, next_pos: u32, constants: HashMap<u32, i64>) -> Self {
+        // P3 category E — `constants` is an index-keyed constant pool
+        // (raw u32 key), not a Box-identity dict.  Bit-helpers replace
+        // the `OpRef::from_raw(k).is_constant()` round-trip that would
+        // land on the to-be-retired `OpRef::Untyped` variant.
         let next_const_idx = constants
             .keys()
-            .filter(|&&k| OpRef::from_raw(k).is_constant())
-            .map(|&k| OpRef::from_raw(k).const_index())
+            .filter(|&&k| OpRef::raw_is_constant(k))
+            .map(|&k| OpRef::raw_const_index(k))
             .max()
             .map_or(0, |m| m + 1);
         let mut s = Self::new(hint, next_pos);

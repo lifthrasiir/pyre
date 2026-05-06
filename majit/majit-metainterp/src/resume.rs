@@ -4587,7 +4587,7 @@ mod tests {
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::from_const(1), OpRef::from_raw(1), OpRef::from_raw(2)],
+            vec![OpRef::from_const(1), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
@@ -4609,11 +4609,11 @@ mod tests {
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
-        // items[7] = OpRef::from_raw(1) tagged as TAGBOX(0) — first live box
+        // items[7] = OpRef::int_op(1) tagged as TAGBOX(0) — first live box
         let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[8] = OpRef::from_raw(2) tagged as TAGBOX(1) — second live box
+        // items[8] = OpRef::int_op(2) tagged as TAGBOX(1) — second live box
         let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
@@ -4629,7 +4629,7 @@ mod tests {
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::from_const(1), OpRef::from_raw(1), OpRef::from_raw(2)],
+            vec![OpRef::from_const(1), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
@@ -4662,12 +4662,12 @@ mod tests {
         use majit_ir::OpRef;
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
-        env.virtuals.insert(2); // OpRef::from_raw(2) is virtual (Ref type)
+        env.virtuals.insert(2); // OpRef::ref_op(2) is virtual (Ref type)
         env.types.insert(2, majit_ir::Type::Ref);
         let snapshot = Snapshot::single_frame(
             0,
             10,
-            vec![OpRef::from_raw(1), OpRef::from_raw(2), OpRef::from_raw(3)],
+            vec![OpRef::int_op(1), OpRef::ref_op(2), OpRef::int_op(3)],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: finish() patches with len(newboxes) which is num_boxes
@@ -4678,7 +4678,7 @@ mod tests {
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
         let (num_failargs, _vable_values, _vref_values, rebuilt_frames) =
             rebuild_from_numbering(&rd_numb, memo.consts(), &fail_arg_types, None);
-        assert_eq!(num_failargs, 2); // OpRef::from_raw(1) and OpRef::from_raw(3) are boxes
+        assert_eq!(num_failargs, 2); // OpRef::int_op(1) and OpRef::int_op(3) are boxes
         assert_eq!(rebuilt_frames[0].values.len(), 3);
         assert_eq!(
             rebuilt_frames[0].values[0],
@@ -4701,21 +4701,21 @@ mod tests {
         let snapshot = Snapshot::single_frame(
             0,
             10,
-            vec![OpRef::from_raw(1), OpRef::from_raw(2), OpRef::from_raw(3)],
+            vec![OpRef::int_op(1), OpRef::ref_op(2), OpRef::int_op(3)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
         // items[1] = num_failargs: 0 (not patched — RPython patches in finish())
         assert_eq!(items[1], 0);
-        // items[6] = OpRef::from_raw(1) → TAGBOX(0)
+        // items[6] = OpRef::int_op(1) → TAGBOX(0)
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 0);
-        // items[7] = OpRef::from_raw(2) → TAGVIRTUAL(0)
+        // items[7] = OpRef::ref_op(2) → TAGVIRTUAL(0)
         let (val, tagbits) = untag(items[7] as i16);
         assert_eq!(tagbits, TAGVIRTUAL);
         assert_eq!(val, 0);
-        // items[8] = OpRef::from_raw(3) → TAGBOX(1)
+        // items[8] = OpRef::int_op(3) → TAGBOX(1)
         let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
@@ -4736,12 +4736,12 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef::from_raw(1).into(), OpRef::from_const(0).into()],
+                    boxes: vec![OpRef::int_op(1).into(), OpRef::from_const(0).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
                     pc: 20,
-                    boxes: vec![OpRef::from_raw(2).into(), OpRef::from_raw(3).into()],
+                    boxes: vec![OpRef::int_op(2).into(), OpRef::int_op(3).into()],
                 },
             ],
         };
@@ -4801,19 +4801,19 @@ mod tests {
             8,
             vec![
                 OpRef::from_const(1),
-                OpRef::from_raw(1),
-                OpRef::from_raw(2),
-                OpRef::from_raw(3),
+                OpRef::int_op(1),
+                OpRef::ref_op(2),
+                OpRef::int_op(3),
             ],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None);
 
-        // liveboxes should contain only TAGBOX entries: OpRef::from_raw(1) and OpRef::from_raw(3)
+        // liveboxes should contain only TAGBOX entries: OpRef::int_op(1) and OpRef::int_op(3)
         assert_eq!(liveboxes.len(), 2);
-        assert_eq!(liveboxes[0], OpRef::from_raw(1)); // box #0
-        assert_eq!(liveboxes[1], OpRef::from_raw(3)); // box #1
+        assert_eq!(liveboxes[0], OpRef::int_op(1)); // box #0
+        assert_eq!(liveboxes[1], OpRef::int_op(3)); // box #1
 
         // rd_numb should be valid
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
@@ -4848,12 +4848,12 @@ mod tests {
         let snapshot = Snapshot {
             // pyjitpl.py:3302-3306 parity: payload slots first,
             // virtualizable identity (`virtualizable_boxes[-1]`) last.
-            vable_array: vec![OpRef::from_raw(1).into(), OpRef::from_raw(7).into()],
+            vable_array: vec![OpRef::int_op(1).into(), OpRef::ref_op(7).into()],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                boxes: vec![OpRef::from_raw(1).into()],
+                boxes: vec![OpRef::int_op(1).into()],
             }],
         };
 

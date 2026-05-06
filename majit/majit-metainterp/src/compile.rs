@@ -1722,12 +1722,14 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     let mut next_opref = max_runtime_ref + 1;
 
     // Allocate fresh const indices above the existing max.
+    // Index-keyed pool namespace probe (Slice P3 category E):
+    // raw u32 keys carry the constant-namespace bit directly, so use
+    // the bit-helpers instead of round-tripping through
+    // `OpRef::from_raw(k)` which lands on the to-be-retired
+    // `OpRef::Untyped` variant.
     let mut next_const_idx = constants
         .keys()
-        .filter_map(|&k| {
-            let opref = OpRef::from_raw(k);
-            opref.is_constant().then(|| opref.const_index())
-        })
+        .filter_map(|&k| OpRef::raw_is_constant(k).then(|| OpRef::raw_const_index(k)))
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
@@ -2668,7 +2670,7 @@ mod tests {
 
         let snapshot = Snapshot {
             vable_array: vec![
-                OpRef::from_raw(0).into(),
+                OpRef::input_arg_ref(0).into(),
                 OpRef::from_const(1).into(),
                 OpRef::from_const(2).into(),
                 OpRef::from_const(3).into(),
@@ -2678,7 +2680,7 @@ mod tests {
             framestack: vec![SnapshotFrame {
                 jitcode_index: 0,
                 pc: 8,
-                boxes: vec![OpRef::from_raw(1).into()],
+                boxes: vec![OpRef::input_arg_int(1).into()],
             }],
         };
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
@@ -2687,14 +2689,17 @@ mod tests {
         let rd_consts = memo.consts().to_vec();
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(1)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
         guard.descr = Some(descr);
-        guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]);
+        guard.fail_args = Some(smallvec::smallvec![
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1)
+        ]);
         guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
 
         let (_resume_data, _guard_indices, exit_layouts) =
@@ -2732,7 +2737,7 @@ mod tests {
             InputArg::new_ref(2),
             InputArg::new_ref(3),
         ];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_ref(0)]);
         let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
         let descr = make_fail_descr_with_index(0, fail_arg_types.len());
         descr
@@ -2741,10 +2746,10 @@ mod tests {
             .set_fail_arg_types(fail_arg_types.clone());
         guard.descr = Some(descr);
         guard.fail_args = Some(smallvec::smallvec![
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
-            OpRef::from_raw(3)
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_ref(2),
+            OpRef::input_arg_ref(3)
         ]);
         guard.fail_arg_types = Some(fail_arg_types);
 
@@ -2766,14 +2771,14 @@ mod tests {
 
         let mut ops = vec![
             {
-                let mut op = Op::new(OpCode::SameAsR, &[OpRef::from_raw(1)]);
-                op.pos = OpRef::from_raw(10);
+                let mut op = Op::new(OpCode::SameAsR, &[OpRef::input_arg_ref(1)]);
+                op.pos = OpRef::ref_op(10);
                 op
             },
-            Op::new(OpCode::Label, &[OpRef::from_raw(0), OpRef::from_raw(10)]),
+            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0), OpRef::ref_op(10)]),
             {
-                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::from_raw(10)]);
-                op.pos = OpRef::from_raw(11);
+                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)]);
+                op.pos = OpRef::int_op(11);
                 op.descr = Some(majit_ir::descr::make_field_descr(
                     16,
                     8,
@@ -2806,12 +2811,12 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::SameAsR);
         assert_eq!(ops[1].args.as_slice(), &[vable_field]);
         let forwarded_same_as = ops[1].pos;
-        assert_ne!(forwarded_same_as, OpRef::from_raw(10));
+        assert_ne!(forwarded_same_as, OpRef::ref_op(10));
 
         assert_eq!(ops[2].opcode, OpCode::Label);
         assert_eq!(
             ops[2].args.as_slice(),
-            &[OpRef::from_raw(0), forwarded_same_as]
+            &[OpRef::input_arg_ref(0), forwarded_same_as]
         );
 
         assert_eq!(ops[3].opcode, OpCode::GetfieldGcPureI);
@@ -2834,7 +2839,11 @@ mod tests {
 
         let mut ops = vec![Op::new(
             OpCode::Label,
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_ref(2),
+            ],
         )];
         let mut inputargs = vec![
             InputArg::new_ref(0),
@@ -2867,7 +2876,7 @@ mod tests {
         assert_eq!(ops[4].opcode, OpCode::Label);
         assert_eq!(
             ops[4].args.as_slice(),
-            &[OpRef::from_raw(0), ops[2].pos, ops[3].pos]
+            &[OpRef::input_arg_ref(0), ops[2].pos, ops[3].pos]
         );
     }
 }
