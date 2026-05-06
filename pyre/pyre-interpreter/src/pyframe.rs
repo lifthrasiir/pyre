@@ -96,6 +96,24 @@ pub struct PyFrame {
     pub w_yielding_from: PyObjectRef,
     /// PyPy: `f_backref = jit.vref_None`.
     pub f_backref: *mut PyFrame,
+    /// pyframe.py:90 / pyframe.py:115-116 — `self.builtin = space.builtin
+    /// .pick_builtin(w_globals)` (gated under `honor__builtins__` upstream;
+    /// pyre runs as if the option were always on, matching CPython's
+    /// unconditional `__builtins__` honoring).  Cached at frame creation
+    /// from `globals['__builtins__']` and consulted by LOAD_GLOBAL's
+    /// builtins fallback (`pyopcode.py:918-927`).  PyPy stores this as a
+    /// `Module` reference; pyre keeps a `*mut DictStorage` because (a)
+    /// `EC.builtins` is already storage-shaped, not a `Module`, and (b)
+    /// `frame.w_globals` follows the same `*mut DictStorage` convention,
+    /// so the LOAD_GLOBAL fallback path is one `dict_storage_get` call.
+    pub builtin: *mut DictStorage,
+    /// Companion to `builtin`: the picked `PyObjectRef` (Module or user
+    /// dict) returned by `pick_builtin_w(w_globals)`.  This mirrors PyPy
+    /// `frame.builtin`'s identity — `frame.get_builtin()` returns this
+    /// directly so callers (e.g. `exec` 's `setdefault('__builtins__',
+    /// self.get_builtin())` at `pyopcode.py:773-774`) see the picked
+    /// object, not the EC's default builtin module.
+    pub w_builtin: PyObjectRef,
 }
 
 /// GC type id for `PyFrame`. Reserved ahead of any callsite that allocates
@@ -307,6 +325,14 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
 pub struct FrameDebugData {
     /// pyframe.py:44
     pub w_locals: *mut DictStorage,
+    /// pyframe.py:44 — non-dict mapping locals (`exec(src, g, mapping)`).
+    /// PyPy stores `w_locals` as a generic `w_obj`; pyre keeps the
+    /// `*mut DictStorage` fast path for the common dict case and falls
+    /// back to this `PyObjectRef` when the caller hands a non-dict
+    /// mapping with `__getitem__` per pyopcode.py:2003-2013 ensure_ns.
+    /// `STORE/LOAD/DELETE_NAME` route through `space.setitem/getitem
+    /// /delitem(w_locals_object, ...)` when this field is non-null.
+    pub w_locals_object: PyObjectRef,
     /// pyframe.py:49 — set in __init__ from pycode.w_globals
     pub w_globals: *mut DictStorage,
     /// pyframe.py:37
@@ -331,6 +357,7 @@ impl FrameDebugData {
     pub fn new(pycode: *const (), init_lineno: isize) -> Self {
         Self {
             w_locals: std::ptr::null_mut(),
+            w_locals_object: pyre_object::PY_NULL,
             w_globals: unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) },
             w_f_trace: pyre_object::PY_NULL,
             is_being_profiled: false,
@@ -454,6 +481,11 @@ pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 /// reachable through this pointer.
 pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
 
+/// Byte offset of `w_builtin` in `PyFrame` (the picked builtin Module).
+/// Read by the descr GC walker so a collection survives across the
+/// guard exit / re-entry edge.
+pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_builtin);
+
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
@@ -554,11 +586,13 @@ impl PyFrame {
             .map_or(std::ptr::null_mut(), |data| data.w_locals)
     }
 
-    /// pyframe.py:583-588 getdictscope
+    /// pyframe.py:540-545 getdictscope — runs `fast2locals` then returns
+    /// `self.debugdata.w_locals`.  PyPy exposes the failure of
+    /// `fast2locals` as an exception; pyre propagates the same way.
     #[inline]
-    pub fn getdictscope(&mut self) -> *mut DictStorage {
-        self.fast2locals();
-        self.get_w_locals()
+    pub fn getdictscope(&mut self) -> Result<*mut DictStorage, crate::PyError> {
+        self.fast2locals()?;
+        Ok(self.get_w_locals())
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -622,7 +656,7 @@ impl PyFrame {
 
     /// PyPy-compatible `fget_getdictscope`.
     #[inline]
-    pub fn fget_getdictscope(&mut self) -> *mut DictStorage {
+    pub fn fget_getdictscope(&mut self) -> Result<*mut DictStorage, crate::PyError> {
         self.getdictscope()
     }
 
@@ -714,15 +748,85 @@ impl PyFrame {
 
     /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
     #[inline]
-    pub fn setdictscope(&mut self, w_locals: *mut DictStorage) {
-        self.setdictscope_with_options(w_locals, false);
+    pub fn setdictscope(&mut self, w_locals: *mut DictStorage) -> Result<(), crate::PyError> {
+        self.setdictscope_with_options(w_locals, false)
     }
 
     /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False)
     #[inline]
-    pub fn setdictscope_with_options(&mut self, w_locals: *mut DictStorage, skip_free_vars: bool) {
-        self.getorcreate_debug_data(-1).w_locals = w_locals;
-        self.locals2fast(skip_free_vars);
+    pub fn setdictscope_with_options(
+        &mut self,
+        w_locals: *mut DictStorage,
+        skip_free_vars: bool,
+    ) -> Result<(), crate::PyError> {
+        let data = self.getorcreate_debug_data(-1);
+        data.w_locals = w_locals;
+        data.w_locals_object = pyre_object::PY_NULL;
+        self.locals2fast(skip_free_vars)
+    }
+
+    /// pyframe.py:547-552 setdictscope path for non-dict mapping locals.
+    ///
+    /// `pypy/interpreter/pyopcode.py:2003-2013 ensure_ns` admits any
+    /// object exposing `__getitem__` as locals.  Pyre's frame keeps the
+    /// `*mut DictStorage` fast path zeroed in this branch and stores
+    /// the mapping object so `STORE_NAME` / `LOAD_NAME` / `DELETE_NAME`
+    /// route through `space.setitem` / `space.getitem` /
+    /// `space.delitem` directly — matching PyPy's in-place mutation
+    /// visibility on the original mapping object.
+    ///
+    /// `locals2fast(skip_free_vars=false)` runs after the slot install
+    /// so any pre-populated entries on the mapping reflect into the
+    /// frame's fastlocals, mirroring `pyframe.py:551 self.locals2fast`.
+    #[inline]
+    pub fn setdictscope_object(
+        &mut self,
+        w_locals_object: PyObjectRef,
+    ) -> Result<(), crate::PyError> {
+        let data = self.getorcreate_debug_data(-1);
+        data.w_locals = std::ptr::null_mut();
+        data.w_locals_object = w_locals_object;
+        self.locals2fast(false)
+    }
+
+    /// Read the optional non-dict mapping locals registered by
+    /// `setdictscope_object`.  Returns `PY_NULL` when locals are
+    /// either absent or a plain `*mut DictStorage` dict.
+    #[inline]
+    pub fn get_w_locals_object(&self) -> PyObjectRef {
+        self.getdebug_data()
+            .map_or(pyre_object::PY_NULL, |data| data.w_locals_object)
+    }
+
+    /// pyframe.py:540-545 getdictscope returning the wrapped locals
+    /// namespace as a `PyObjectRef` (PyPy's generic w_obj contract).
+    ///
+    /// * Mapping case (`setdictscope_object`): returns `w_locals_object`
+    ///   directly so callers (`IMPORT_STAR`, `locals()`) operate on the
+    ///   live mapping with `space.setitem` / `space.getitem`.
+    /// * Dict case (`setdictscope`): wraps the live `*mut DictStorage`
+    ///   as a `W_DictObject` aliasing the same storage via
+    ///   `pyre_object::w_dict_new_with_dict_storage`, so subsequent
+    ///   mutations (e.g. `IMPORT_STAR` writes) land in the original
+    ///   `DictStorage` that `STORE_NAME` / `LOAD_NAME` also see.
+    /// * Empty case: forces `fast2locals` to materialise a fresh
+    ///   `DictStorage` (matching pyframe.py:557-562 `w_locals = self
+    ///   .space.newdict(instance=True)` followed by `d.w_locals =
+    ///   w_locals`) and wraps it as above.
+    #[inline]
+    pub fn getdictscope_w(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let w_locals_object = self.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            return Ok(w_locals_object);
+        }
+        self.fast2locals()?;
+        let w_locals = self.get_w_locals();
+        if w_locals.is_null() {
+            return Ok(pyre_object::PY_NULL);
+        }
+        Ok(pyre_object::w_dict_new_with_dict_storage(
+            w_locals as *mut u8,
+        ))
     }
 
     /// Create a minimal frame stub for passing to call dispatch.
@@ -756,6 +860,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
+            builtin: crate::baseobjspace::pick_builtin(w_globals, execution_context),
+            w_builtin: crate::baseobjspace::pick_builtin_w(w_globals, execution_context),
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -811,6 +917,16 @@ impl PyFrame {
             "__name__",
             pyre_object::w_str_new("__main__"),
         );
+        // pypy/interpreter/main.py:45 — `space.setitem(w_globals,
+        // '__builtins__', space.builtin)` for top-level frame globals so
+        // `pick_builtin` sees the canonical builtins Module.  Without
+        // this, `pick_builtin` falls back to the empty default
+        // (`moduledef.py:106-108`) and module-entry code can't see
+        // `len`, `print`, …
+        let w_builtin = execution_context.get_builtin();
+        if !w_builtin.is_null() {
+            crate::dict_storage_store(&mut w_globals, "__builtins__", w_builtin);
+        }
         let w_globals = Box::into_raw(w_globals);
         let code_ptr = Box::into_raw(Box::new(code));
         let w_code = crate::w_code_new(code_ptr as *const ());
@@ -859,6 +975,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
+            builtin: crate::baseobjspace::pick_builtin(w_globals, execution_context),
+            w_builtin: crate::baseobjspace::pick_builtin_w(w_globals, execution_context),
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -894,6 +1012,8 @@ impl PyFrame {
             f_generator_nowref: self.f_generator_nowref,
             w_yielding_from: self.w_yielding_from,
             f_backref: self.f_backref,
+            builtin: self.builtin,
+            w_builtin: self.w_builtin,
         });
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
@@ -1298,9 +1418,17 @@ impl PyFrame {
         self.escaped = true;
     }
 
-    /// pyframe.py:200-204 get_builtin → space.builtin (same dict every call).
+    /// pyframe.py:216-220 `get_builtin` — returns `self.builtin` (the
+    /// per-frame picked builtin Module / dict, set at frame creation by
+    /// `pick_builtin(w_globals)`).  Pyre stashes the picked PyObjectRef
+    /// on `w_builtin`; falls back to the EC's default builtin when the
+    /// frame was constructed without globals (e.g. `PyFrame::new_minimal`
+    /// stub frames).
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
+        if !self.w_builtin.is_null() {
+            return self.w_builtin;
+        }
         if self.execution_context.is_null() {
             return pyre_object::PY_NULL;
         }
@@ -1457,8 +1585,13 @@ impl PyFrame {
     }
 
     /// pyframe.py:601-636 locals2fast(skip_free_vars=False)
-    pub fn locals2fast(&mut self, skip_free_vars: bool) {
-        let w_locals = self.getorcreate_debug_data(-1).w_locals;
+    pub fn locals2fast(&mut self, skip_free_vars: bool) -> Result<(), crate::PyError> {
+        let d = self.getorcreate_debug_data(-1);
+        let w_locals_object = d.w_locals_object;
+        if !w_locals_object.is_null() {
+            return self.locals2fast_object(w_locals_object, skip_free_vars);
+        }
+        let w_locals = d.w_locals;
         assert!(!w_locals.is_null());
         let w_locals_ref = unsafe { &*w_locals };
 
@@ -1502,6 +1635,56 @@ impl PyFrame {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// pyframe.py:601-636 locals2fast — non-dict mapping branch.
+    ///
+    /// Reads each varname / cellvar / freevar from the mapping via
+    /// `space.finditem_str` (KeyError → missing) and populates the
+    /// corresponding fast slot.  Non-KeyError errors propagate.
+    fn locals2fast_object(
+        &mut self,
+        w_locals_object: PyObjectRef,
+        skip_free_vars: bool,
+    ) -> Result<(), crate::PyError> {
+        let code_ptr = unsafe { pyframe_get_pycode(self) };
+        let code = unsafe { &*code_ptr };
+        let numlocals = code.varnames.len();
+
+        let mut new_fastlocals_w = vec![PY_NULL; numlocals];
+        for i in 0..numlocals {
+            let name = &code.varnames[i];
+            if let Some(w_value) = finditem_str_object(w_locals_object, name)? {
+                new_fastlocals_w[i] = w_value;
+            }
+        }
+        self.setfastscope(&new_fastlocals_w);
+
+        let ncellvars = code.cellvars.len();
+        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
+        let freevarnames_len = if include_freevars {
+            ncellvars + code.freevars.len()
+        } else {
+            ncellvars
+        };
+        for i in 0..freevarnames_len {
+            let (name, idx) = if i < ncellvars {
+                (&code.cellvars[i], numlocals + i)
+            } else {
+                (&code.freevars[i - ncellvars], numlocals + i)
+            };
+            if idx < self.locals_w().len() {
+                let w_value = finditem_str_object(w_locals_object, name)?.unwrap_or(PY_NULL);
+                let slot = self.locals_w()[idx];
+                if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                    unsafe { pyre_object::w_cell_set(slot, w_value) };
+                } else {
+                    self.locals_w_mut()[idx] = w_value;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// pyframe.py:640-651 init_cells
@@ -1534,8 +1717,12 @@ impl PyFrame {
     }
 
     /// pyframe.py:554-598 fast2locals
-    pub fn fast2locals(&mut self) {
+    pub fn fast2locals(&mut self) -> Result<(), crate::PyError> {
         let d = self.getorcreate_debug_data(-1);
+        let w_locals_object = d.w_locals_object;
+        if !w_locals_object.is_null() {
+            return self.fast2locals_object(w_locals_object);
+        }
         let mut w_locals = d.w_locals;
         let mut write = false;
         if w_locals.is_null() {
@@ -1598,6 +1785,61 @@ impl PyFrame {
         if write {
             self.getorcreate_debug_data(-1).w_locals = w_locals;
         }
+        Ok(())
+    }
+
+    /// pyframe.py:554-598 fast2locals — non-dict mapping branch.
+    ///
+    /// Writes each fastlocal / cellvar / freevar to the mapping via
+    /// `space.setitem_str` (`pyframe.py:568`) and uses `space.delitem`
+    /// for missing slots (`pyframe.py:571-574`).  Errors propagate to
+    /// the caller; `delitem`'s `KeyError` is silently dropped (matches
+    /// `pyframe.py:573-574 if not e.match(self.space, w_KeyError):
+    /// raise`).
+    fn fast2locals_object(&mut self, w_locals_object: PyObjectRef) -> Result<(), crate::PyError> {
+        let code_ptr = unsafe { pyframe_get_pycode(self) };
+        let code = unsafe { &*code_ptr };
+        let varnames = &code.varnames;
+        let numlocals = varnames.len();
+
+        for i in 0..numlocals {
+            let name = &varnames[i];
+            let w_value = self.locals_w()[i];
+            if !w_value.is_null() {
+                setitem_str_object(w_locals_object, name, w_value)?;
+            } else {
+                delitem_str_object(w_locals_object, name)?;
+            }
+        }
+
+        let ncellvars = code.cellvars.len();
+        let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED);
+        let freevarnames_len = if include_freevars {
+            ncellvars + code.freevars.len()
+        } else {
+            ncellvars
+        };
+        for i in 0..freevarnames_len {
+            let (name, idx) = if i < ncellvars {
+                (&code.cellvars[i], numlocals + i)
+            } else {
+                (&code.freevars[i - ncellvars], numlocals + i)
+            };
+            if idx < self.locals_w().len() {
+                let slot = self.locals_w()[idx];
+                let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+                    unsafe { pyre_object::w_cell_get(slot) }
+                } else {
+                    slot
+                };
+                if !w_value.is_null() {
+                    setitem_str_object(w_locals_object, name, w_value)?;
+                } else {
+                    delitem_str_object(w_locals_object, name)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// PyPy-compatible `make_arguments`.
@@ -1706,6 +1948,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
+            builtin: crate::baseobjspace::pick_builtin(globals, execution_context),
+            w_builtin: crate::baseobjspace::pick_builtin_w(globals, execution_context),
         };
         frame.init_cells();
         if stores_global {
@@ -1929,6 +2173,8 @@ pub fn createframe(
         f_generator_nowref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
+        builtin: crate::baseobjspace::pick_builtin(w_globals, execution_context),
+        w_builtin: crate::baseobjspace::pick_builtin_w(w_globals, execution_context),
     });
     if stores_global {
         frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -1944,6 +2190,47 @@ pub fn createframe(
     frame.initialize_frame_scopes(outer_ref, code)?;
 
     Ok(frame)
+}
+
+/// `space.finditem_str(w_obj, key)` — `space.getitem` with KeyError
+/// remapped to `None`.  Non-KeyError errors propagate unchanged so
+/// `fast2locals`/`locals2fast` raise as PyPy does at `pyframe.py:613` /
+/// `pyframe.py:632` (`pypy/objspace/std/objspace.py finditem_str` re-
+/// raises everything except `KeyError`).
+fn finditem_str_object(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let key = unsafe { pyre_object::w_str_new(name) };
+    match crate::baseobjspace::getitem(w_obj, key) {
+        Ok(v) if !v.is_null() => Ok(Some(v)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `space.setitem(w_obj, w_str_new(name), value)` — every error
+/// propagates (PyPy `pyframe.py:568` `space.setitem_str` does not
+/// swallow exceptions).
+fn setitem_str_object(
+    w_obj: PyObjectRef,
+    name: &str,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let key = unsafe { pyre_object::w_str_new(name) };
+    crate::baseobjspace::setitem(w_obj, key, value).map(|_| ())
+}
+
+/// `space.delitem(w_obj, w_str_new(name))` — `pyframe.py:571-574 /
+/// 589-593` ignores `KeyError` only; other errors propagate.
+fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyError> {
+    let key = unsafe { pyre_object::w_str_new(name) };
+    match crate::baseobjspace::delitem(w_obj, key) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

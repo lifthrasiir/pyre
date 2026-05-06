@@ -1041,6 +1041,15 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            (
+                "PyFrame.w_builtin",
+                crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
     )
 });

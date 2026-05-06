@@ -46,6 +46,15 @@ pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 /// Byte offset of `f_backref` in `PyFrame`.
 pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
 
+/// Byte offset of `w_builtin` in `PyFrame`.
+///
+/// `frame.w_builtin` carries the picked builtin Module (`pick_builtin_w`
+/// result) so `frame.get_builtin()` returns the same identity PyPy would.
+/// The slot is a GCREF and must be visible to the descr GC walker so a
+/// collection between guard exit and re-entry doesn't leave a dangling
+/// pointer.
+pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_builtin);
+
 // Backward-compat aliases used by JIT descriptor helpers.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
@@ -73,6 +82,7 @@ const _: () = {
         PYFRAME_W_YIELDING_FROM_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET
     );
     assert!(PYFRAME_F_BACKREF_OFFSET == pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET);
+    assert!(PYFRAME_W_BUILTIN_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_BUILTIN_OFFSET);
 };
 
 /// Build the virtualizable layout description for `PyFrame`.

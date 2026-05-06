@@ -4350,43 +4350,155 @@ pub fn import_from(
 }
 
 // ── import_all_from ──────────────────────────────────────────────────
-// PyPy equivalent: pyopcode.py `import_all_from(module, into_locals)`
-//
-// Merge all public names from a module into the current namespace.
-// If __all__ exists, use it; otherwise copy all names not starting with '_'.
+// PyPy equivalent: pyopcode.py:2221-2258 `import_all_from(module,
+// into_locals)` (applevel function called by IMPORT_STAR).
 
-pub fn import_all_from(module: PyObjectRef, into_namespace: *mut DictStorage) {
-    if !unsafe { is_module(module) } {
-        return;
+fn type_name_for_err(w_obj: PyObjectRef) -> String {
+    unsafe {
+        match crate::typedef::r#type(w_obj) {
+            Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+            None => (*(*w_obj).ob_type).name.to_string(),
+        }
     }
+}
 
-    let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
-    if ns_ptr.is_null() {
-        return;
+/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` — applevel
+/// driver.  Iterates `for name in all:` lazily via `space.iter` /
+/// `space.next`, applies the per-name str check + leading-underscore
+/// filter, and invokes `write` once per accepted name.  Used by the
+/// `*mut DictStorage` and generic-mapping wrappers below.
+///
+/// ```python
+/// try:
+///     all = module.__all__
+/// except AttributeError:
+///     try:
+///         dict = module.__dict__
+///     except AttributeError:
+///         raise ImportError("from-import-* object has no __dict__ "
+///                           "and no __all__")
+///     all = dict.keys()
+///     skip_leading_underscores = True
+/// else:
+///     skip_leading_underscores = False
+///
+/// module_name = module.__name__
+/// if not isinstance(module_name, str):
+///     raise TypeError("module __name__ must be a string, not %s",
+///                     type(module_name).__name__)
+///
+/// for name in all:
+///     if not isinstance(name, str):
+///         ...  # raise TypeError ("Item in <m>.__all__ ..." or
+///              #                  "Key in <m>.__dict__ ...")
+///     if skip_leading_underscores and name and name[0] == '_':
+///         continue
+///     into_locals[name] = getattr(module, name)
+/// ```
+fn import_all_from_each<F>(module: PyObjectRef, mut write: F) -> Result<(), crate::PyError>
+where
+    F: FnMut(&str, PyObjectRef) -> Result<(), crate::PyError>,
+{
+    let (w_iterable, skip_leading_underscores) =
+        match crate::baseobjspace::getattr(module, "__all__") {
+            Ok(w_all) => (w_all, false),
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                // pyopcode.py:2225-2230 — `dict = module.__dict__; all = dict.keys()`.
+                // `space.getattr(module, '__dict__')` so any object exposing
+                // `__dict__` (Module, class, instance with `__dict__`,
+                // bytes-keyed proxies, ...) participates.
+                match crate::baseobjspace::getattr(module, "__dict__") {
+                    Ok(w_dict) => {
+                        let w_keys_method = crate::baseobjspace::getattr(w_dict, "keys")?;
+                        // pyopcode.py:2230 `all = dict.keys()` — pyre's
+                        // `call_function` stashes errors as PY_NULL; use
+                        // `call_and_check` so a misbehaving `keys()` (or
+                        // `__getattr__`-installed override) raises here
+                        // rather than handing a bogus iterable to
+                        // `space.iter` below.
+                        let w_keys = crate::builtins::call_and_check(w_keys_method, &[])?;
+                        (w_keys, true)
+                    }
+                    Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {
+                        return Err(crate::PyError::new(
+                            crate::PyErrorKind::ImportError,
+                            "from-import-* object has no __dict__ and no __all__".to_string(),
+                        ));
+                    }
+                    Err(e2) => return Err(e2),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+    // pyopcode.py:2235-2237 — `module_name = module.__name__` with str check.
+    let module_name_w = crate::baseobjspace::getattr(module, "__name__")?;
+    if !unsafe { is_str(module_name_w) } {
+        return Err(crate::PyError::type_error(format!(
+            "module __name__ must be a string, not {}",
+            type_name_for_err(module_name_w),
+        )));
     }
+    let module_name = unsafe { pyre_object::w_str_get_value(module_name_w) }.to_string();
 
-    let src_ns = unsafe { &*ns_ptr };
-    let dst_ns = unsafe { &mut *into_namespace };
-
-    // Check for __all__ (PyPy: try module.__all__)
-    let has_all = src_ns.get("__all__").is_some();
-
-    if has_all {
-        // TODO: iterate __all__ list and copy named entries.
-        // For now, fall through to copying all non-underscore names.
-    }
-
-    // Copy all names not starting with '_' (PyPy: skip_leading_underscores)
-    for name in src_ns.keys() {
-        if name.starts_with('_') {
+    // pyopcode.py:2239 — `for name in all:` lazy iteration.
+    let w_iter = crate::baseobjspace::iter(w_iterable)?;
+    loop {
+        let w_name = match crate::baseobjspace::next(w_iter) {
+            Ok(v) => v,
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        };
+        // pyopcode.py:2240-2255 — per-name str check.
+        if !unsafe { is_str(w_name) } {
+            let (container, accessor) = if skip_leading_underscores {
+                ("__dict__", "Key")
+            } else {
+                ("__all__", "Item")
+            };
+            return Err(crate::PyError::type_error(format!(
+                "{accessor} in {module_name}.{container} must be str, not {}",
+                type_name_for_err(w_name),
+            )));
+        }
+        let name = unsafe { pyre_object::w_str_get_value(w_name) }.to_string();
+        // pyopcode.py:2256-2257 — leading-underscore filter (only for
+        // the `__dict__.keys()` fallback).
+        if skip_leading_underscores && name.starts_with('_') {
             continue;
         }
-        if let Some(&value) = src_ns.get(name) {
-            if !value.is_null() {
-                dict_storage_store(dst_ns, name, value);
-            }
-        }
+        // pyopcode.py:2258 — `into_locals[name] = getattr(module, name)`.
+        let value = crate::baseobjspace::getattr(module, &name)?;
+        write(&name, value)?;
     }
+    Ok(())
+}
+
+/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` —
+/// `*mut DictStorage` (dict locals fast path) target variant.
+pub fn import_all_from(
+    module: PyObjectRef,
+    into_namespace: *mut DictStorage,
+) -> Result<(), crate::PyError> {
+    let dst_ns = unsafe { &mut *into_namespace };
+    import_all_from_each(module, |name, value| {
+        dict_storage_store(dst_ns, name, value);
+        Ok(())
+    })
+}
+
+/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` — generic
+/// mapping (`PyObjectRef`) target variant.  Errors from `__setitem__`
+/// propagate (CPython behaviour: a misbehaving mapping surfaces its
+/// TypeError / KeyError to the caller).
+pub fn import_all_from_w(
+    module: PyObjectRef,
+    into_locals: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    import_all_from_each(module, |name, value| {
+        crate::baseobjspace::setitem(into_locals, unsafe { pyre_object::w_str_new(name) }, value)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]

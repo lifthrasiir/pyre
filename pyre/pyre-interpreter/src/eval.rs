@@ -233,7 +233,22 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
                 let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
                 visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
-
+                // pyframe.py:91-92 `self.builtin = ...` — the picked
+                // builtin Module is a GC root.  Pyre stashes its identity
+                // on `frame.w_builtin` so `frame.get_builtin()` returns
+                // the same object PyPy would.
+                let w_builtin_slot = &mut (*(frame)).w_builtin as *mut PyObjectRef;
+                visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
+                // pyframe.py:147 `debugdata.w_locals` (and the pyre-only
+                // `w_locals_object` companion for non-dict mapping
+                // locals) carry GCREFs that survive the frame.
+                if !(*frame).debugdata.is_null() {
+                    let d = &mut *(*frame).debugdata;
+                    let w_locals_object_slot = &mut d.w_locals_object as *mut PyObjectRef;
+                    visitor(&mut *(w_locals_object_slot as *mut majit_ir::GcRef));
+                    let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
+                    visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
+                }
                 let f = &*frame;
                 let next_frame = (*frame).f_backref;
                 if f.locals_cells_stack_w.is_null() {
@@ -768,8 +783,30 @@ impl LocalOpcodeHandler for PyFrame {
 }
 
 impl NamespaceOpcodeHandler for PyFrame {
-    /// PyPy: LOAD_NAME checks locals first (class body), then globals.
+    /// PyPy: LOAD_NAME checks locals first (class body), then globals,
+    /// then `__builtins__` via `load_global_value`'s fallback chain
+    /// (pypy/interpreter/pyopcode.py:526-555 LOAD_NAME → load_global).
+    ///
+    /// Non-dict mapping locals (`exec(src, g, mapping)`,
+    /// `pypy/interpreter/pyopcode.py:2003 ensure_ns`) bypass the
+    /// `*mut DictStorage` fast path and route through
+    /// `space.getitem(w_locals_object, name)` directly per PyPy
+    /// `pyopcode.py:LOAD_NAME` `space.finditem_str(w_locals, name)`.
     fn load_name_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
+        let w_locals_object = self.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            let key = unsafe { pyre_object::w_str_new(name) };
+            match crate::baseobjspace::getitem(w_locals_object, key) {
+                Ok(value) => return Ok(value),
+                Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
+                    // pyopcode.py:LOAD_NAME `if not w_value: w_value =
+                    // ec.space.finditem_str(self.w_globals, name)` —
+                    // a missing locals entry falls through to globals.
+                }
+                Err(err) => return Err(err),
+            }
+            return self.load_global_value(name);
+        }
         let w_locals = self.get_w_locals();
         if !w_locals.is_null() {
             let locals = unsafe { &*w_locals };
@@ -777,15 +814,54 @@ impl NamespaceOpcodeHandler for PyFrame {
                 return Ok(value);
             }
         }
-        let ns = unsafe { &*self.get_w_globals() };
-        dict_storage_load(ns, name)
+        self.load_global_value(name)
     }
 
     /// PyPy: STORE_NAME writes to locals (class body) or globals.
+    ///
+    /// Non-dict mapping locals route through
+    /// `space.setitem(w_locals_object, name, value)` matching
+    /// `pyopcode.py:STORE_NAME` `space.setitem(w_locals, ...)`.
     fn store_name_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
-        let ns = unsafe { &mut *self.getdictscope() };
+        let w_locals_object = self.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            let key = unsafe { pyre_object::w_str_new(name) };
+            crate::baseobjspace::setitem(w_locals_object, key, value)?;
+            return Ok(());
+        }
+        let ns = unsafe { &mut *self.getdictscope()? };
         dict_storage_store(ns, name, value);
         Ok(())
+    }
+
+    /// pypy/interpreter/pyopcode.py:567 STORE_GLOBAL — bypasses w_locals
+    /// and writes directly into w_globals so `exec("global x; x = 1", g, l)`
+    /// lands `x` in `g` even when `l != g`.
+    fn store_global_value(&mut self, name: &str, value: Self::Value) -> Result<(), PyError> {
+        let ns = unsafe { &mut *self.get_w_globals() };
+        dict_storage_store(ns, name, value);
+        Ok(())
+    }
+
+    /// pypy/interpreter/pyopcode.py:918-927 `_load_global` — first reads
+    /// `w_globals`, then falls back to `self.get_builtin().getdictvalue
+    /// (space, varname)`.  PyPy's `get_builtin()` returns the `Module`
+    /// chosen at frame-creation time by `pick_builtin(w_globals)`
+    /// (`pyframe.py:115-116` + `pypy/module/__builtin__/moduledef.py:89`),
+    /// so `exec("x = len", {"__builtins__": {}})` raises `NameError`
+    /// because the empty dict is the picked builtin.  Pyre caches the
+    /// picked storage in `frame.builtin`.
+    fn load_global_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
+        let ns = unsafe { &*self.get_w_globals() };
+        if let Some(value) = crate::dict_storage_get(ns, name) {
+            return Ok(value);
+        }
+        if !self.builtin.is_null() {
+            if let Some(value) = crate::dict_storage_get(unsafe { &*self.builtin }, name) {
+                return Ok(value);
+            }
+        }
+        dict_storage_load(ns, name)
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
@@ -1193,7 +1269,7 @@ impl OpcodeStepExecutor for PyFrame {
     /// pyre-equivalent flow runs the bytecode opcode and writes into
     /// the class_locals namespace just like CPython).
     fn setup_annotations(&mut self) -> Result<(), Self::Error> {
-        let ns = self.getdictscope();
+        let ns = self.getdictscope()?;
         if ns.is_null() {
             return Ok(());
         }
@@ -1857,6 +1933,21 @@ impl OpcodeStepExecutor for PyFrame {
     // ── delete_name ──
     // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
     fn delete_name(&mut self, name: &str) -> Result<(), Self::Error> {
+        let w_locals_object = self.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            let key = unsafe { pyre_object::w_str_new(name) };
+            crate::baseobjspace::delitem(w_locals_object, key).map_err(|err| {
+                if matches!(err.kind, PyErrorKind::KeyError) {
+                    PyError::new(
+                        PyErrorKind::NameError,
+                        format!("name '{name}' is not defined"),
+                    )
+                } else {
+                    err
+                }
+            })?;
+            return Ok(());
+        }
         let mut ns = self.get_w_locals();
         if ns.is_null() {
             ns = self.get_w_globals();
@@ -1884,11 +1975,22 @@ impl OpcodeStepExecutor for PyFrame {
     // ── import_star ──
     // pypy/interpreter/pyopcode.py:1076 IMPORT_STAR — merge module's public names into
     // the locals mapping (class body / exec-with-locals), not globals.
+    //
+    // Non-dict mapping locals route through `import_all_from_w` so each
+    // `from module import *` entry lands via `space.setitem(w_locals,
+    // name, value)` rather than the `*mut DictStorage` fast path,
+    // matching `pyopcode.py:1078 self.getdictscope()` returning a
+    // generic `w_obj`.
     fn import_star(&mut self) -> Result<(), Self::Error> {
         let module = self.pop();
-        let w_locals = self.getdictscope();
-        crate::importing::import_all_from(module, w_locals);
-        self.setdictscope(w_locals);
+        let w_locals_object = self.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            crate::importing::import_all_from_w(module, w_locals_object)?;
+            return Ok(());
+        }
+        let w_locals = self.getdictscope()?;
+        crate::importing::import_all_from(module, w_locals)?;
+        self.setdictscope(w_locals)?;
         Ok(())
     }
 

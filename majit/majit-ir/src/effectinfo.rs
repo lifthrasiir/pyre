@@ -370,34 +370,65 @@ impl EffectInfo {
     };
 
     // ── Bitstring check methods (effectinfo.py parity) ──
+    //
+    // effectinfo.py:149-156 — `EF_RANDOM_EFFECTS` keeps every readonly /
+    // write descr set as `None`, the wildcard for "anything could happen".
+    // PyPy's optimizer guards `check_*` with `has_random_effects()` (heap.py:460)
+    // so the None-set is never actually queried; pyre's caller is
+    // similarly guarded (`call_has_random_effects` in heap.rs:2602).  The
+    // `RandomEffects` short-circuit below preserves the semantic for any
+    // unguarded reader: when the bitsets stand in for None, any descr
+    // index is reported as touched.
+
+    fn random_effects(&self) -> bool {
+        matches!(self.extraeffect, ExtraEffect::RandomEffects)
+    }
 
     /// effectinfo.py:211-213: check_readonly_descr_field(fielddescr)
     pub fn check_readonly_descr_field(&self, descr_idx: u32) -> bool {
+        if self.random_effects() {
+            return true;
+        }
         descr_idx < 64 && (self.readonly_descrs_fields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:214-216: check_write_descr_field(fielddescr)
     pub fn check_write_descr_field(&self, descr_idx: u32) -> bool {
+        if self.random_effects() {
+            return true;
+        }
         descr_idx < 64 && (self.write_descrs_fields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:217-219: check_readonly_descr_array(arraydescr)
     pub fn check_readonly_descr_array(&self, descr_idx: u32) -> bool {
+        if self.random_effects() {
+            return true;
+        }
         descr_idx < 64 && (self.readonly_descrs_arrays & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:220-222: check_write_descr_array(arraydescr)
     pub fn check_write_descr_array(&self, descr_idx: u32) -> bool {
+        if self.random_effects() {
+            return true;
+        }
         descr_idx < 64 && (self.write_descrs_arrays & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:223-226: check_readonly_descr_interiorfield (NOTE: not used so far)
     pub fn check_readonly_descr_interiorfield(&self, descr_idx: u32) -> bool {
+        if self.random_effects() {
+            return true;
+        }
         descr_idx < 64 && (self.readonly_descrs_interiorfields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:227-230: check_write_descr_interiorfield (NOTE: not used so far)
     pub fn check_write_descr_interiorfield(&self, descr_idx: u32) -> bool {
+        if self.random_effects() {
+            return true;
+        }
         descr_idx < 64 && (self.write_descrs_interiorfields & (1u64 << descr_idx)) != 0
     }
 

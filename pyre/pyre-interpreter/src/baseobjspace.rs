@@ -2841,9 +2841,11 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
             }
             Err(PyError::type_error("bytearray indices must be integers"))
         } else if is_instance(obj) {
-            // PyPy: descroperation.py __setitem__
+            // PyPy: descroperation.py __setitem__ — `space.get_and_call_function`
+            // raises on instance error.  pyre `call_function` stashes errors
+            // as PY_NULL; `call_and_check` recovers them.
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__setitem__") {
-                crate::call_function(method, &[obj, index, value]);
+                crate::builtins::call_and_check(method, &[obj, index, value])?;
                 return Ok(w_none());
             }
             Err(PyError::type_error(format!(
@@ -5051,31 +5053,332 @@ pub fn unpackiterable(
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let w_iterator = iter(w_iterable)?;
     if expected_length == -1 {
-        // PRE-EXISTING-ADAPTATION: PyPy `baseobjspace.py:988-994` branches on
-        // `is_generator(w_iterator)` and calls `w_iterator.unpack_into(lst_w)`
-        // (`generator.py:322-343`, jitdriver-backed) for generators, then
-        // `_unpackiterable_unknown_length` (`baseobjspace.py:1000-1021`) which
-        // preallocates with `length_hint(w_iterable, 0)` (`:1080-1108`) and
-        // runs the loop under `unpackiterable_driver.jit_merge_point`.
-        // Pyre lacks (a) `len_w` and `get_and_call_function` (length_hint
-        // dependencies), (b) `GeneratorIterator.unpack_into`, (c) the
-        // `unpackiterable_driver` JitDriver wiring.  Functionally correct
-        // (`next()` loop produces the same items) but loses preallocation
-        // and the generator fast-path; convergence requires porting the
-        // three helpers above.
-        let mut items = Vec::new();
-        loop {
-            match next(w_iterator) {
-                Ok(w_item) => items.push(w_item),
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(items)
+        _unpackiterable_unknown_length(w_iterator, w_iterable)
     } else {
         // baseobjspace.py:996-998 — known-length path with shape validation.
         _unpackiterable_known_length_jitlook(w_iterator, expected_length as usize)
     }
+}
+
+/// pypy/interpreter/baseobjspace.py:1000-1021
+/// `_unpackiterable_unknown_length`.
+///
+/// ```python
+/// def _unpackiterable_unknown_length(self, w_iterator, w_iterable):
+///     try:
+///         items = newlist_hint(self.length_hint(w_iterable, 0))
+///     except MemoryError:
+///         items = []
+///     greenkey = self.iterator_greenkey(w_iterator)
+///     while True:
+///         unpackiterable_driver.jit_merge_point(greenkey=greenkey)
+///         try:
+///             w_item = self.next(w_iterator)
+///         except OperationError as e:
+///             if not e.match(self, self.w_StopIteration):
+///                 raise
+///             break
+///         items.append(w_item)
+///     return items
+/// ```
+///
+/// PRE-EXISTING-ADAPTATION (residual): the `unpackiterable_driver`
+/// JitDriver merge-point and `iterator_greenkey` are Pyre-side
+/// JIT-tracing scaffolding that pyre handles through its own dispatch
+/// loop — no observable semantics change; performance contribution
+/// folds into the regular trace.  The PyPy `is_generator(w_iterator) →
+/// GeneratorIterator.unpack_into` fast path at baseobjspace.py:988-994
+/// is also a perf hack (generator.py:322-343 says "This is a hack for
+/// performance"); the body is functionally identical to the next()
+/// loop here, so a port would buy nothing for a non-translated
+/// runtime.
+fn _unpackiterable_unknown_length(
+    w_iterator: PyObjectRef,
+    w_iterable: PyObjectRef,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    // baseobjspace.py:1005-1008 — `try: items = newlist_hint(length_hint(...))
+    // except MemoryError: items = []`.  Mirror with try_reserve_exact so a
+    // hostile / huge `__length_hint__` does not turn into a Rust panic
+    // (Vec::with_capacity aborts on capacity overflow).
+    let hint = length_hint(w_iterable, 0)?;
+    let mut items: Vec<PyObjectRef> = Vec::new();
+    if hint > 0 {
+        let _ = items.try_reserve_exact(hint as usize);
+    }
+    loop {
+        match next(w_iterator) {
+            Ok(w_item) => items.push(w_item),
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(items)
+}
+
+/// pypy/interpreter/baseobjspace.py:1080-1108 `length_hint`.
+///
+/// Returns the length of an object, consulting its `__length_hint__`
+/// method if necessary.  Errors mirror the upstream contract:
+/// `len_w`'s TypeError / AttributeError are absorbed; an
+/// `__length_hint__` that raises TypeError / AttributeError returns
+/// `default`; a NotImplemented return also yields `default`; a
+/// negative return raises ValueError "__length_hint__() should return
+/// >= 0"; any other exception propagates.
+pub fn length_hint(w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyError> {
+    match len_w(w_obj) {
+        Ok(n) => return Ok(n),
+        Err(e)
+            if e.kind == crate::PyErrorKind::TypeError
+                || e.kind == crate::PyErrorKind::AttributeError => {}
+        Err(e) => return Err(e),
+    }
+    // baseobjspace.py:1093 `w_descr = space.lookup(w_obj, '__length_hint__')`
+    // — generic class-MRO lookup, not instance-restricted.
+    let w_descr = match unsafe { lookup(w_obj, "__length_hint__") } {
+        Some(descr) => descr,
+        None => return Ok(default),
+    };
+    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` —
+    // pyre's `call_function_impl_result` returns a Result directly,
+    // matching the upstream raise/return discipline without going through
+    // the legacy `take_call_error` pending-error stash.
+    let w_hint = match crate::call::call_function_impl_result(w_descr, &[w_obj]) {
+        Ok(v) => v,
+        Err(err) => {
+            if err.kind == crate::PyErrorKind::TypeError
+                || err.kind == crate::PyErrorKind::AttributeError
+            {
+                return Ok(default);
+            }
+            return Err(err);
+        }
+    };
+    if is_w(w_hint, pyre_object::noneobject::w_not_implemented()) {
+        return Ok(default);
+    }
+    let hint = int_w(w_hint)?;
+    if hint < 0 {
+        return Err(crate::PyError::value_error(
+            "__length_hint__() should return >= 0",
+        ));
+    }
+    Ok(hint)
+}
+
+/// pypy/objspace/descroperation.py:310-317 `_check_len_result`.
+///
+/// ```python
+/// def _check_len_result(space, w_int):
+///     # Will complain if result is too big.
+///     assert space.isinstance_w(w_int, space.w_int)
+///     if space.is_true(space.lt(w_int, space.newint(0))):
+///         raise oefmt(space.w_ValueError, "__len__() should return >= 0")
+///     result = space.getindex_w(w_int, space.w_OverflowError)
+///     assert result >= 0
+///     return result
+/// ```
+///
+/// `int_w` already mirrors `getindex_w(w_int, w_OverflowError)` for the
+/// already-int caller contract here: long values that do not fit `i64`
+/// raise `OverflowError` ("int too large to convert to int") via
+/// `intobject.py:558` / `longobject.py` `_int_w`.
+fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
+    let n = int_w(w_int)?;
+    if n < 0 {
+        return Err(crate::PyError::value_error("__len__() should return >= 0"));
+    }
+    Ok(n)
+}
+
+/// pypy/objspace/descroperation.py:300-302 `len_w`.
+///
+/// ```python
+/// def len_w(space, w_obj):
+///     w_res = space._len(w_obj)
+///     return space._check_len_result(space.index(w_res))
+/// ```
+///
+/// pyre's `len()` covers `_len`; the result is then funnelled through
+/// `space.index` (descroperation.py:599 `_index` + line 622 `index`)
+/// before `_check_len_result` so `__index__` is consulted but `__int__`
+/// is NOT — matching PyPy's stricter contract.
+pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let w_res = len(w_obj)?;
+    let w_index = space_index(w_res)?;
+    _check_len_result(w_index)
+}
+
+/// pypy/objspace/descroperation.py:599-620 `_index` + line 622-627 `index`.
+///
+/// ```python
+/// def _index(space, w_obj):
+///     if space.isinstance_w(w_obj, space.w_int):
+///         return w_obj
+///     w_impl = space.lookup(w_obj, '__index__')
+///     if w_impl is None:
+///         raise oefmt(space.w_TypeError,
+///                     "'%T' object cannot be interpreted as an integer", w_obj)
+///     w_result = space.get_and_call_function(w_impl, w_obj)
+///     if space.is_w(space.type(w_result), space.w_int):
+///         return w_result
+///     if not space.isinstance_w(w_result, space.w_int):
+///         raise oefmt(space.w_TypeError,
+///                 "__index__ returned non-int (type %T)", w_result)
+///     ...  # subclass-of-int deprecation warning, then return
+///     return w_result
+/// ```
+///
+/// `space.index` (line 622) wraps `_index` and additionally re-wraps
+/// strict subclass-of-int results into a fresh `W_IntObject` /
+/// `W_LongObject`.  Pyre's `int`/`long` are leaf types so the wrap is a
+/// no-op; the body below is `_index` line-for-line.
+pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    if obj.is_null() {
+        return Err(PyError::type_error("space.index: null object"));
+    }
+    if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
+        return Ok(obj);
+    }
+    let Some(method) = (unsafe { lookup(obj, "__index__") }) else {
+        return Err(PyError::type_error(format!(
+            "'{}' object cannot be interpreted as an integer",
+            unsafe { (*(*obj).ob_type).name },
+        )));
+    };
+    let w_result = crate::builtins::call_and_check(method, &[obj])?;
+    if unsafe { pyre_object::pyobject::is_int_or_long(w_result) } {
+        return Ok(w_result);
+    }
+    Err(PyError::type_error(format!(
+        "__index__ returned non-int (type {})",
+        unsafe { (*(*w_result).ob_type).name },
+    )))
+}
+
+/// pyframe.py:115-116 — `self.builtin = space.builtin.pick_builtin(w_globals)`.
+/// Body ports `pypy/module/__builtin__/moduledef.py:89-109 pick_builtin`:
+///   1. `space.getitem(w_globals, '__builtins__')` (`KeyError` ⇒ default)
+///   2. recognise `Module` ⇒ return that Module
+///   3. recognise dict (incl. dict subclass) ⇒ wrap as
+///      `module.Module(space, None, w_builtin)` (a fresh Module per call,
+///      with `module.w_dict = w_builtin`).  Pyre's storage model needs
+///      a `DictStorage` mirror of the dict's contents; lazy-allocate
+///      and attach via `dict_storage_proxy` so subsequent dict mutations
+///      sync into the storage (and `w_dict_delitem_str` removes from it).
+///   4. absent / not Module-or-dict ⇒ build a default empty Module
+///      with only `None=w_None` defined — matches `moduledef.py:106-108`
+///      `builtin = module.Module(space, None); space.setitem(builtin
+///      .w_dict, 'None', w_None); return builtin`.  Pyre previously
+///      fell back to the EC's full builtins, exposing strictly more
+///      names than PyPy in `exec("...", {"__builtins__": 42})`-style
+///      cases.
+///
+/// Returns the `*mut DictStorage` that pyre's interpreter consults for
+/// `LOAD_GLOBAL`'s builtins fallback.  The companion `pick_builtin_w`
+/// returns the picked `PyObjectRef` (Module wrapping the dict, or the
+/// default Module) for callers that need the Module form
+/// (`frame.get_builtin()`, `exec`'s `__builtins__` setdefault).
+pub fn pick_builtin(
+    w_globals: *mut crate::DictStorage,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> *mut crate::DictStorage {
+    pick_builtin_pair(w_globals, exec_ctx).0
+}
+
+/// Companion to `pick_builtin` returning the picked `PyObjectRef` — the
+/// `Module` (PyPy `space.builtin`, the wrapping `Module(space, None,
+/// w_builtin)`, or the empty default Module).  Used by
+/// `frame.get_builtin()` and by `exec()` when seeding the
+/// `__builtins__` global.
+pub fn pick_builtin_w(
+    w_globals: *mut crate::DictStorage,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    pick_builtin_pair(w_globals, exec_ctx).1
+}
+
+/// Allocate the `moduledef.py:106-108` default Module — empty backing
+/// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
+/// `Module.__init__`; pyre's `w_module_new` requires a `&str` so use
+/// the empty string as the anonymous-name sentinel).
+fn build_default_pick_builtin_module() -> (*mut crate::DictStorage, PyObjectRef) {
+    let mut ns = Box::new(crate::DictStorage::new());
+    crate::dict_storage_store(&mut ns, "None", unsafe { pyre_object::w_none() });
+    ns.fix_ptr();
+    let storage: *mut crate::DictStorage = Box::into_raw(ns);
+    let w_builtin = pyre_object::w_module_new("", storage as *mut u8);
+    (storage, w_builtin)
+}
+
+fn pick_builtin_pair(
+    w_globals: *mut crate::DictStorage,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> (*mut crate::DictStorage, PyObjectRef) {
+    if !w_globals.is_null() {
+        if let Some(w_builtin) = crate::dict_storage_get(unsafe { &*w_globals }, "__builtins__") {
+            if !w_builtin.is_null() {
+                // moduledef.py:100-101 `if w_builtin is space.builtin: return
+                // space.builtin` — Module identity short-circuit.
+                if !exec_ctx.is_null() {
+                    let space_builtin = unsafe { (*exec_ctx).get_builtin() };
+                    if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
+                        let storage = unsafe { (*exec_ctx).builtins_storage_ptr() };
+                        return (storage, w_builtin);
+                    }
+                }
+                // moduledef.py:104 `isinstance(w_builtin, module.Module)`.
+                if unsafe { pyre_object::is_module(w_builtin) } {
+                    let storage = unsafe { pyre_object::w_module_get_dict_ptr(w_builtin) };
+                    if !storage.is_null() {
+                        return (storage as *mut crate::DictStorage, w_builtin);
+                    }
+                }
+                // moduledef.py:102-103 `space.isinstance_w(w_builtin, w_dict)`.
+                let backing = crate::type_methods::resolve_dict_backing(w_builtin);
+                if !backing.is_null() {
+                    let mut storage =
+                        unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) };
+                    if storage.is_null() {
+                        // Lazy-allocate the DictStorage mirror and attach
+                        // it to the dict so subsequent stores/deletes
+                        // sync via `maybe_sync_dict_storage_*`.
+                        let mut ns = Box::new(crate::DictStorage::new());
+                        unsafe {
+                            for (k, v) in pyre_object::w_dict_items(backing) {
+                                if !v.is_null() && pyre_object::is_str(k) {
+                                    crate::dict_storage_store(
+                                        &mut ns,
+                                        pyre_object::w_str_get_value(k),
+                                        v,
+                                    );
+                                }
+                            }
+                        }
+                        ns.fix_ptr();
+                        let leaked: *mut crate::DictStorage = Box::into_raw(ns);
+                        unsafe {
+                            pyre_object::w_dict_set_dict_storage_proxy(backing, leaked as *mut u8);
+                        }
+                        storage = leaked as *mut u8;
+                    }
+                    // moduledef.py:103 `return module.Module(space, None,
+                    // w_builtin)` — wrap a fresh Module per call so
+                    // `frame.get_builtin()` returns a Module identity (PyPy
+                    // contract) instead of the raw dict.
+                    let w_module = pyre_object::w_module_new("", storage);
+                    return (storage as *mut crate::DictStorage, w_module);
+                }
+                // Fall through — `__builtins__` is not Module/dict (e.g.
+                // `42`, a list, ...).  PyPy moduledef.py:106-108 builds
+                // the default empty Module here.
+            }
+        }
+    }
+    // moduledef.py:106-108 default — anonymous Module with only
+    // `None=w_None`.  This is reached when (a) `w_globals` is null,
+    // (b) `__builtins__` is absent from globals, or (c) `__builtins__`
+    // is not Module/dict.
+    build_default_pick_builtin_module()
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053
@@ -6663,13 +6966,16 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
             return dict_delitem(obj, index);
         }
     }
-    // Instance __delitem__ — PyPy: descroperation.py delitem
+    // Instance __delitem__ — PyPy: descroperation.py delitem.  Errors from
+    // user `__delitem__` propagate (PyPy `space.delitem` raises directly);
+    // pyre's `call_function` stashes errors as PY_NULL so use
+    // `call_and_check` to recover them.
     unsafe {
         if pyre_object::is_instance(obj) {
             if let Some(method) =
                 lookup_in_type_where(pyre_object::w_instance_get_type(obj), "__delitem__")
             {
-                crate::call_function(method, &[obj, index]);
+                crate::builtins::call_and_check(method, &[obj, index])?;
                 return Ok(());
             }
         }
@@ -6677,7 +6983,11 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     Err(PyError::type_error("object does not support item deletion"))
 }
 
-/// Delete item from dict by key.
+/// Delete item from dict by key.  When the dict has a `dict_storage_proxy`
+/// attached (`pick_builtin` lazy-mirror, live `globals()` view, etc.) the
+/// deletion must sync to the storage so subsequent storage-keyed lookups
+/// (LOAD_GLOBAL builtins fallback) see the removal.  PyPy stores both
+/// shapes in the same W_DictMultiObject so the question doesn't arise.
 fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
@@ -6696,6 +7006,11 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
             if eq {
                 entries.remove(i);
                 dict.len -= 1;
+                let proxy = w_dict_get_dict_storage_proxy(obj);
+                if !proxy.is_null() && is_str(key) {
+                    let ns = &mut *(proxy as *mut crate::DictStorage);
+                    ns.remove(w_str_get_value(key));
+                }
                 return Ok(());
             }
         }

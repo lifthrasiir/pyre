@@ -1168,7 +1168,7 @@ impl ExecutionContext {
                 !d.w_locals.is_null()
             };
             if had_locals {
-                unsafe { (*frame).fast2locals() };
+                unsafe { (*frame).fast2locals()? };
             }
             let (prev_line_tracing, old_lineno) = unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
@@ -1232,7 +1232,7 @@ impl ExecutionContext {
                 !d.w_locals.is_null()
             };
             if post_had_locals {
-                unsafe { (*frame).locals2fast(false) };
+                unsafe { (*frame).locals2fast(false)? };
             }
             // executioncontext.py:392-395 — re-raise the callback's
             // exception after restoring trace bookkeeping. Caller chain
@@ -1332,6 +1332,24 @@ impl ExecutionContext {
         let dict = pyre_object::dictobject::w_dict_new_with_dict_storage(ns_ptr);
         self.builtin_dict_cache.set(dict);
         dict
+    }
+
+    /// Direct lookup into the builtins storage, bypassing the dict-object
+    /// wrapper (whose internal hash table does not see entries inserted
+    /// through `install_default_builtins` on the underlying DictStorage).
+    /// Used by `LOAD_GLOBAL` / `LOAD_NAME` to reach builtins like `print`
+    /// when the frame's `w_globals` lacks the name (pypy/interpreter/
+    /// pyopcode.py:558-565 LOAD_GLOBAL builtin fallback).
+    pub fn lookup_builtin(&self, name: &str) -> Option<PyObjectRef> {
+        crate::dict_storage_get(&self.builtins, name)
+    }
+
+    /// Default storage that `pick_builtin` selects when `globals
+    /// ['__builtins__']` is absent — equivalent to PyPy's
+    /// `space.builtin` fallback in `pick_builtin` (`pypy/module/
+    /// __builtin__/moduledef.py:107-109`).
+    pub fn builtins_storage_ptr(&self) -> *mut DictStorage {
+        &self.builtins as *const DictStorage as *mut DictStorage
     }
 }
 

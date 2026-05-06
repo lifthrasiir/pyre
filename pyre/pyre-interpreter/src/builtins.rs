@@ -1978,111 +1978,224 @@ fn exec_or_eval(
         }
     }
 
-    // Build a DictStorage from the supplied globals dict (or fall back to
-    // the caller's frame globals when None / missing). Mutations made by
-    // the executed code propagate back to the original dict via the
-    // dict-namespace sync helpers.
-    let (ns_box, sync_back_dict) = if !globals_arg.is_null()
-        && unsafe { pyre_object::is_dict(globals_arg) }
-    {
-        let mut ns = Box::new(crate::DictStorage::new());
+    // pypy/interpreter/eval.py:28-33 Code.exec_code keeps w_globals and
+    // w_locals as separate dict references — STORE_GLOBAL writes to
+    // w_globals and STORE_NAME writes to w_locals.  Pyre mirrors this by
+    // building a fresh DictStorage per role and syncing each back to the
+    // caller's dict on exit.  When `locals is globals` (module-level exec
+    // / dataclasses), both sides reuse the same storage so semantics
+    // collapse to PyPy's `space.createframe(self, w_globals)` followed by
+    // a same-dict setdictscope.
+    fn is_none_or_null(w_obj: PyObjectRef) -> bool {
+        w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) }
+    }
+
+    fn type_name_of(w_obj: PyObjectRef) -> String {
         unsafe {
-            for (key, value) in pyre_object::w_dict_items(globals_arg) {
-                if !value.is_null() && pyre_object::is_str(key) {
-                    crate::dict_storage_store(&mut ns, pyre_object::w_str_get_value(key), value);
-                }
+            match crate::typedef::r#type(w_obj) {
+                Some(tp) => pyre_object::w_type_get_name(tp).to_string(),
+                None => (*(*w_obj).ob_type).name.to_string(),
             }
         }
-        ns.fix_ptr();
-        (ns, Some(globals_arg))
-    } else {
-        // Inherit caller globals.
+    }
+
+    fn is_dict_w(w_obj: PyObjectRef) -> bool {
+        unsafe {
+            let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+            crate::baseobjspace::isinstance_w(w_obj, w_dict_type)
+        }
+    }
+
+    fn build_storage_from_dict(d: pyre_object::PyObjectRef) -> Box<crate::DictStorage> {
         let mut ns = Box::new(crate::DictStorage::new());
-        crate::eval::CURRENT_FRAME.with(|current| {
-            let frame = current.get();
-            if !frame.is_null() {
-                let parent_ns = unsafe { (*frame).get_w_globals() };
-                if !parent_ns.is_null() {
-                    for (k, &v) in unsafe { &*parent_ns }.entries() {
-                        if !v.is_null() {
-                            crate::dict_storage_store(&mut ns, k, v);
-                        }
+        unsafe {
+            let backing = crate::type_methods::resolve_dict_backing(d);
+            if !backing.is_null() {
+                for (key, value) in pyre_object::w_dict_items(backing) {
+                    if !value.is_null() && pyre_object::is_str(key) {
+                        crate::dict_storage_store(
+                            &mut ns,
+                            pyre_object::w_str_get_value(key),
+                            value,
+                        );
                     }
                 }
             }
-        });
+        }
         ns.fix_ptr();
-        (ns, None)
-    };
-    // If a separate `locals` dict was passed, layer its bindings on top
-    // of the globals namespace. Module-level execs in dataclasses pass
-    // the same dict for both, so this also covers `exec(src, g, l)` where
-    // `l is g`. Track which dict to write back into.
-    let mut ns_box = ns_box;
-    let locals_sync = if !locals_arg.is_null()
-        && unsafe { pyre_object::is_dict(locals_arg) }
-        && !std::ptr::eq(locals_arg, globals_arg)
-    {
+        ns
+    }
+
+    fn ensure_builtins(
+        ns: &mut crate::DictStorage,
+        caller_frame: *const crate::PyFrame,
+        exec_ctx: *const crate::PyExecutionContext,
+    ) {
+        // pypy/interpreter/pyopcode.py:773-774
+        //   space.call_method(w_globals, 'setdefault',
+        //                     '__builtins__', self.get_builtin())
+        // — `self` is the caller frame, so `get_builtin()` returns the
+        // builtin picked at caller-frame creation (`pyframe.py:115-116`),
+        // not the EC's default.  When the caller frame's picked builtin
+        // is unavailable (e.g. exec called from outside any frame), fall
+        // through to the EC default.
+        if crate::dict_storage_get(ns, "__builtins__").is_some() {
+            return;
+        }
+        let w_builtin = if !caller_frame.is_null() {
+            unsafe { (*caller_frame).get_builtin() }
+        } else if !exec_ctx.is_null() {
+            unsafe { (*exec_ctx).get_builtin() }
+        } else {
+            pyre_object::PY_NULL
+        };
+        if !w_builtin.is_null() {
+            crate::dict_storage_store(ns, "__builtins__", w_builtin);
+        }
+    }
+
+    fn sync_storage_to_dict(target: PyObjectRef, source: *mut crate::DictStorage) {
+        if source.is_null() {
+            return;
+        }
         unsafe {
-            for (key, value) in pyre_object::w_dict_items(locals_arg) {
-                if !value.is_null() && pyre_object::is_str(key) {
-                    crate::dict_storage_store(
-                        &mut ns_box,
-                        pyre_object::w_str_get_value(key),
-                        value,
-                    );
+            let backing = crate::type_methods::resolve_dict_backing(target);
+            if backing.is_null() {
+                return;
+            }
+            for (k, &v) in (*source).entries() {
+                if !v.is_null() {
+                    pyre_object::w_dict_store(backing, pyre_object::w_str_new(k), v);
                 }
             }
         }
-        Some(locals_arg)
+    }
+
+    // pypy/interpreter/pyopcode.py:2003-2013 ensure_ns —
+    //   globals: not None ⇒ isinstance_w(w_dict) else TypeError
+    //   locals : not None ⇒ space.lookup(__getitem__) is not None
+    //                       else TypeError "must be a mapping or None"
+    let funcname = if is_eval { "eval" } else { "exec" };
+    if !is_none_or_null(globals_arg) && !is_dict_w(globals_arg) {
+        return Err(crate::PyError::type_error(format!(
+            "{funcname}() arg 2 must be a dict, not {}",
+            type_name_of(globals_arg)
+        )));
+    }
+    if !is_none_or_null(locals_arg)
+        && unsafe { crate::baseobjspace::lookup(locals_arg, "__getitem__").is_none() }
+    {
+        return Err(crate::PyError::type_error(format!(
+            "{funcname}() arg 3 must be a mapping or None, not {}",
+            type_name_of(locals_arg)
+        )));
+    }
+
+    let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+    let exec_ctx = if caller_frame.is_null() {
+        std::ptr::null::<crate::PyExecutionContext>()
+    } else {
+        unsafe { (*caller_frame).execution_context }
+    };
+
+    let mut owned_globals: Option<Box<crate::DictStorage>> = None;
+    let sync_back_globals = if !is_none_or_null(globals_arg) {
+        owned_globals = Some(build_storage_from_dict(globals_arg));
+        Some(globals_arg)
     } else {
         None
     };
-    let ns_ptr = Box::into_raw(ns_box);
+    let mut globals_ptr = if let Some(storage) = owned_globals.as_deref_mut() {
+        storage as *mut crate::DictStorage
+    } else if !caller_frame.is_null() {
+        unsafe { (*caller_frame).get_w_globals() }
+    } else {
+        std::ptr::null_mut()
+    };
+    if globals_ptr.is_null() {
+        let mut storage = Box::new(crate::DictStorage::new());
+        storage.fix_ptr();
+        owned_globals = Some(storage);
+        globals_ptr = owned_globals
+            .as_deref_mut()
+            .map(|storage| storage as *mut crate::DictStorage)
+            .unwrap_or(std::ptr::null_mut());
+    }
+    if !globals_ptr.is_null() {
+        ensure_builtins(unsafe { &mut *globals_ptr }, caller_frame, exec_ctx);
+    }
 
-    let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            std::ptr::null::<crate::PyExecutionContext>()
-        } else {
-            unsafe { (*frame).execution_context }
+    let mut owned_locals: Option<Box<crate::DictStorage>> = None;
+    let mut locals_ptr = std::ptr::null_mut::<crate::DictStorage>();
+    let mut sync_back_locals = None;
+    // pypy/interpreter/pyopcode.py:2003-2013 ensure_ns: any object with
+    // `__getitem__` is legal locals.  Dict locals take the
+    // `*mut DictStorage` fast path with a setup-time copy + run-time
+    // sync-back; non-dict mappings are passed straight through to
+    // `frame.setdictscope_object(w_locals_object)` so STORE / LOAD /
+    // DELETE_NAME route through `space.setitem / getitem / delitem`
+    // directly — matching PyPy's in-place mutation visibility on the
+    // original mapping object during exec.
+    let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
+    if !is_none_or_null(locals_arg) {
+        let same_as_globals =
+            !is_none_or_null(globals_arg) && std::ptr::eq(locals_arg, globals_arg);
+        if !same_as_globals {
+            if is_dict_w(locals_arg) {
+                owned_locals = Some(build_storage_from_dict(locals_arg));
+                sync_back_locals = Some(locals_arg);
+                locals_ptr = owned_locals
+                    .as_deref_mut()
+                    .map(|storage| storage as *mut crate::DictStorage)
+                    .unwrap_or(std::ptr::null_mut());
+            } else {
+                locals_object_arg = locals_arg;
+            }
         }
-    });
+    }
+    let _keep_owned_locals_alive = &owned_locals;
     // eval.py:31-33 Code.exec_code → space.createframe(...) + frame.run().
     // For eval() with a code object that carries freevars, createframe
     // surfaces pyframe.py:242-246's TypeError "directly executed code
     // object may not contain free variables" directly — exec()'s
     // closure-mismatch TypeError was already raised above.
-    let mut frame = match crate::createframe(code_obj_ref as *const (), ns_ptr, exec_ctx, None) {
+    let mut frame = match crate::createframe(code_obj_ref as *const (), globals_ptr, exec_ctx, None)
+    {
         Ok(frame) => frame,
         Err(err) => {
-            let _ = unsafe { Box::from_raw(ns_ptr) };
             let _ = raw_code;
             return Err(err);
         }
     };
     frame.fix_array_ptrs();
+    // eval.py:32 frame.setdictscope(w_locals, ...) — only when locals
+    // were separately supplied.  Without this call, initialize_frame_scopes'
+    // module-code arm has already bound w_locals = w_globals, matching
+    // PyPy's `exec(src, g)` (and `exec(src, g, l)` where `l is g`).
+    if !locals_ptr.is_null() {
+        frame.setdictscope(locals_ptr)?;
+    } else if !locals_object_arg.is_null() {
+        frame.setdictscope_object(locals_object_arg)?;
+    }
     // run() rather than execute_frame so that
     // `eval(compile("(x for x in [])", ..., 'eval'))` of generator-flagged
     // code returns the wrapped generator object instead of executing the
     // body inline.
     let result = frame.run();
 
-    // Drain the namespace back into the dict the caller passed in so the
-    // exec'd module-level bindings are visible to subsequent code.
-    let writeback_target = locals_sync.or(sync_back_dict);
-    if let Some(target) = writeback_target {
-        unsafe {
-            for (k, &v) in (*ns_ptr).entries() {
-                if !v.is_null() {
-                    pyre_object::w_dict_store(target, pyre_object::w_str_new(k), v);
-                }
-            }
-        }
+    // Sync each storage back to the dict the caller passed in.  STORE_GLOBAL
+    // mutated globals_ptr, STORE_NAME mutated locals_ptr (or globals_ptr
+    // when locals were not separated) — matching PyPy's per-namespace
+    // routing rather than the merge-then-drain pattern that conflated the
+    // two.
+    if let Some(target) = sync_back_globals {
+        sync_storage_to_dict(target, globals_ptr);
+    }
+    if let Some(target) = sync_back_locals {
+        sync_storage_to_dict(target, locals_ptr);
     }
 
     let _ = raw_code; // keep raw_code alive until after exec for safety.
-    let _ = unsafe { Box::from_raw(ns_ptr) };
     match result {
         Ok(v) if is_eval => Ok(v),
         Ok(_) => Ok(pyre_object::w_none()),
@@ -2128,6 +2241,16 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             return Err(crate::PyError::runtime_error(
                 "locals() requires an active frame",
             ));
+        }
+        // pyframe.py:540 getdictscope: non-dict mapping locals are
+        // returned to caller as the live `w_locals_object` so
+        // `locals()['x'] = ...` goes through the mapping's
+        // `__setitem__` and reads observe the same object the
+        // exec/eval caller passed in.
+        let frame_mut = unsafe { &mut *frame };
+        let w_locals_object = frame_mut.get_w_locals_object();
+        if !w_locals_object.is_null() {
+            return Ok(w_locals_object);
         }
         let frame = unsafe { &*frame };
         let w_locals = frame.get_w_locals();

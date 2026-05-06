@@ -5752,6 +5752,9 @@ impl CodeWriter {
                         // src register. Pattern matches Sessions 1-3
                         // input-side retirements.
                         let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                        // get_current_exception / set_current_exception are TLS read/write —
+                        // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
+                        // getcalldescr's analyzer outcome for non-raising helpers).
                         emit_residual_call(
                             &mut ssarepr,
                             get_current_exception_fn_flavor,
@@ -5828,6 +5831,7 @@ impl CodeWriter {
                         // re-propagates it.
                         let prev_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let _ = current_state.stack.pop();
+                        // set_current_exception is a TLS write — EF_CANNOT_RAISE.
                         emit_residual_call(
                             &mut ssarepr,
                             set_current_exception_fn_flavor,

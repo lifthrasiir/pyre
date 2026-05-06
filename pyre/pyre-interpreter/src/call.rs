@@ -993,6 +993,10 @@ pub fn register_build_class() {
         let ns = &mut *(ns_ptr as *mut crate::DictStorage);
         crate::dict_storage_store(ns, name, value);
     });
+    pyre_object::dictobject::register_dict_storage_delete_hook(|ns_ptr, name| unsafe {
+        let ns = &mut *(ns_ptr as *mut crate::DictStorage);
+        ns.remove(name);
+    });
 }
 
 /// `ObjSpace.call_function(callable, *args)` — direct implementation.
@@ -1565,7 +1569,7 @@ fn build_class_inner(
     }
 
     let mut frame = PyFrame::new_for_call_with_closure(w_code, &[], globals, exec_ctx, closure);
-    frame.setdictscope(class_ns_ptr);
+    frame.setdictscope(class_ns_ptr)?;
 
     frame.execute_frame(None, None)?;
 

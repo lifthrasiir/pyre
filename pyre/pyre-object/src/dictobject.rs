@@ -193,7 +193,25 @@ unsafe fn maybe_sync_dict_storage_store(ns_ptr: *mut u8, key: PyObjectRef, value
     }
 }
 
+/// Mirror of `maybe_sync_dict_storage_store` for deletions.  When a dict
+/// with a backing storage drops a str-keyed entry, propagate the
+/// deletion so storage-keyed lookups (LOAD_GLOBAL builtins fallback)
+/// stop seeing the stale entry.  PyPy keeps everything in one
+/// `W_DictMultiObject` so this asymmetry is pyre-only.
+unsafe fn maybe_sync_dict_storage_delete(ns_ptr: *mut u8, key_str: &str) {
+    if ns_ptr.is_null() {
+        return;
+    }
+    if let Some(hook) = DICT_STORAGE_DELETE_HOOK
+        .load(std::sync::atomic::Ordering::Acquire)
+        .as_ref()
+    {
+        hook(ns_ptr, key_str);
+    }
+}
+
 type NamespaceStoreHook = unsafe fn(*mut u8, &str, PyObjectRef);
+type NamespaceDeleteHook = unsafe fn(*mut u8, &str);
 
 struct AtomicHookPtr(std::sync::atomic::AtomicPtr<NamespaceStoreHook>);
 
@@ -216,7 +234,25 @@ impl AtomicHookPtr {
     }
 }
 
+struct AtomicDeleteHookPtr(std::sync::atomic::AtomicPtr<NamespaceDeleteHook>);
+
+impl AtomicDeleteHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceDeleteHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceDeleteHook {
+        self.0.load(order) as *const NamespaceDeleteHook
+    }
+}
+
 static DICT_STORAGE_STORE_HOOK: AtomicHookPtr = AtomicHookPtr::new();
+static DICT_STORAGE_DELETE_HOOK: AtomicDeleteHookPtr = AtomicDeleteHookPtr::new();
 
 /// Register the interpreter-level hook that writes (name, value) into a
 /// DictStorage. Called once during interpreter startup.
@@ -224,10 +260,27 @@ pub fn register_dict_storage_store_hook(hook: NamespaceStoreHook) {
     DICT_STORAGE_STORE_HOOK.store(hook);
 }
 
+/// Register the interpreter-level hook that deletes `name` from a
+/// DictStorage. Called once during interpreter startup.
+pub fn register_dict_storage_delete_hook(hook: NamespaceDeleteHook) {
+    DICT_STORAGE_DELETE_HOOK.store(hook);
+}
+
 /// Get the dict_storage_proxy pointer from a dict (used by interpreter for
 /// live globals sync).
 pub unsafe fn w_dict_get_dict_storage_proxy(obj: PyObjectRef) -> *mut u8 {
     (*(obj as *const W_DictObject)).dict_storage_proxy
+}
+
+/// Attach a `DictStorage` proxy to an existing dict so subsequent
+/// mutations sync into the storage.  Used by interpreter-level
+/// `pick_builtin` (`pypy/module/__builtin__/moduledef.py:102-103`)
+/// to lift an arbitrary user-supplied `__builtins__` dict into pyre's
+/// storage-keyed lookup model — counterpart of the no-op assignment
+/// `module.Module(space, None, w_builtin)` does in PyPy by aliasing
+/// `module.w_dict = w_builtin`.
+pub unsafe fn w_dict_set_dict_storage_proxy(obj: PyObjectRef, ns: *mut u8) {
+    (*(obj as *mut W_DictObject)).dict_storage_proxy = ns;
 }
 
 /// Get a value by int key (convenience wrapper).
@@ -274,6 +327,9 @@ pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
     {
         entries.remove(idx);
         dict.len -= 1;
+        // Storage proxy sync: keep `pick_builtin`'s lazy mirror /
+        // `globals()` view in step with explicit `del dict[name]`.
+        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key);
         true
     } else {
         false
