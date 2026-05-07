@@ -814,10 +814,11 @@ impl Optimizer {
                     );
                 }
             }
-            if let Some(descr_idx) = entry.head_load_descr_index {
-                ctx.imported_virtual_heads
-                    .push((descr_idx as usize, entry.head));
-            }
+            // RPython parity: imported virtual heads are NOT looked up via
+            // a side table. inline_short_preamble replays the getfield ops
+            // through send_extra_operation, which populates OptHeap's cache.
+            // The body's getfield then folds naturally.
+            let _ = entry.head_load_descr_index; // consumed by shortpreamble replay
         }
     }
 

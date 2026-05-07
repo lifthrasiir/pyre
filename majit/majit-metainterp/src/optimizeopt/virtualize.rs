@@ -584,24 +584,6 @@ impl OptVirtualize {
         );
         let is_standard_vable_ref = self.is_standard_virtualizable_ref(struct_ref, ctx);
 
-        // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
-        // which was virtual in the preamble, forward to the imported virtual head.
-        //
-        // The import-state pool is not pyre's standard virtualizable frame.
-        // PyFrame is also inputarg 0, so applying this shortcut to v0 would
-        // corrupt virtualizable field loads such as locals_cells_stack_w.
-        if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
-            let pool_ref = ctx.get_box_replacement(OpRef::input_arg_ref(0)); // pool is always inputarg 0 (W_Root)
-            if struct_ref == pool_ref && !is_standard_vable_ref {
-                for &(descr_idx, virtual_head) in &ctx.imported_virtual_heads {
-                    if field_idx == descr_idx as u32 {
-                        ctx.replace_op(op.pos, virtual_head);
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-        }
-
         if is_raw_op && is_standard_vable_ref {
             return OptimizationResult::PassOn;
         }

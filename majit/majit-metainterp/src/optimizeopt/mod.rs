@@ -342,9 +342,6 @@ pub struct OptContext {
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
-    /// RPython import_state: maps original inputarg index → fresh virtual head OpRef.
-    /// Used by ensure_linked_list_head to return the imported virtual.
-    pub imported_virtual_heads: Vec<(usize, OpRef)>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     pub can_replace_guards: bool,
@@ -1272,7 +1269,7 @@ impl OptContext {
             potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
-            imported_virtual_heads: Vec::new(),
+
             imported_virtuals: Vec::new(),
             imported_label_args: None,
             can_replace_guards: true,
@@ -1353,7 +1350,7 @@ impl OptContext {
             potential_extra_ops: HashMap::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
-            imported_virtual_heads: Vec::new(),
+
             imported_virtuals: Vec::new(),
             imported_label_args: None,
             can_replace_guards: true,
