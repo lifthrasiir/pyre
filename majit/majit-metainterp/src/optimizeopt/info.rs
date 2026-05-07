@@ -180,6 +180,13 @@ impl OpInfo {
         }
     }
 
+    pub fn get_int_bound_mut(&mut self) -> Option<&mut IntBound> {
+        match self {
+            OpInfo::IntBound(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Whether this info is known non-null.
     /// info.py: is_nonnull()
     pub fn is_nonnull(&self) -> bool {
@@ -198,6 +205,13 @@ impl OpInfo {
 
     /// Get the PtrInfo if present.
     pub fn get_ptr_info(&self) -> Option<&PtrInfo> {
+        match self {
+            OpInfo::Ptr(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn get_ptr_info_mut(&mut self) -> Option<&mut PtrInfo> {
         match self {
             OpInfo::Ptr(p) => Some(p),
             _ => None,
@@ -340,8 +354,42 @@ pub enum EnsuredPtrInfo<'a> {
         string_length_resolver: Option<StringLengthResolver>,
     },
     /// `arg0.get_forwarded()` — direct mutable handle into the
-    /// `OptContext::forwarded` slot.
+    /// `OptContext::forwarded` slot. Used by empty-pool fixtures.
     Forwarded(&'a mut PtrInfo),
+    /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
+    /// `as_mut()` call re-borrows the inner `RefCell`. Produced when
+    /// `OptContext::box_pool` is populated (Epic H Phase C).
+    ForwardedBox(crate::r#box::BoxRef),
+}
+
+/// Wrapper handle that unifies the two backing storage layouts of
+/// [`EnsuredPtrInfo::as_mut`]. `Direct` returns a borrow into the
+/// `OptContext::forwarded` Vec slot (empty-pool fixtures); `Cell`
+/// returns a `RefMut` re-borrowed from a `BoxRef`'s inner `RefCell`
+/// (production / box_pool-seeded paths). `Deref` / `DerefMut` route
+/// method calls and pattern destructures uniformly across both.
+pub enum EnsuredMutHandle<'a> {
+    Direct(&'a mut PtrInfo),
+    Cell(std::cell::RefMut<'a, PtrInfo>),
+}
+
+impl std::ops::Deref for EnsuredMutHandle<'_> {
+    type Target = PtrInfo;
+    fn deref(&self) -> &PtrInfo {
+        match self {
+            EnsuredMutHandle::Direct(p) => &**p,
+            EnsuredMutHandle::Cell(c) => &**c,
+        }
+    }
+}
+
+impl std::ops::DerefMut for EnsuredMutHandle<'_> {
+    fn deref_mut(&mut self) -> &mut PtrInfo {
+        match self {
+            EnsuredMutHandle::Direct(p) => &mut **p,
+            EnsuredMutHandle::Cell(c) => &mut **c,
+        }
+    }
 }
 
 impl<'a> EnsuredPtrInfo<'a> {
@@ -400,17 +448,23 @@ impl<'a> EnsuredPtrInfo<'a> {
                 }
             }
             EnsuredPtrInfo::Forwarded(info) => info.getlenbound(mode),
+            EnsuredPtrInfo::ForwardedBox(bx) => {
+                bx.ptr_info_mut().and_then(|mut p| p.getlenbound(mode))
+            }
         }
     }
 
     /// Mutable access to the underlying `PtrInfo`. Returns `None` for the
     /// `Constant` variant — PyPy's `ConstPtrInfo.setfield/setitem` route
     /// through `optheap.const_infos`, not through the constant box's own
-    /// info slot (info.py:738-752).
-    pub fn as_mut(&mut self) -> Option<&mut PtrInfo> {
+    /// info slot (info.py:738-752). The `ForwardedBox` variant returns
+    /// `None` if the BoxRef's `_forwarded` slot does not currently hold
+    /// `Forwarded::Info(OpInfo::Ptr(_))`.
+    pub fn as_mut(&mut self) -> Option<EnsuredMutHandle<'_>> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
-            EnsuredPtrInfo::Forwarded(info) => Some(info),
+            EnsuredPtrInfo::Forwarded(info) => Some(EnsuredMutHandle::Direct(&mut **info)),
+            EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut().map(EnsuredMutHandle::Cell),
         }
     }
 

@@ -2288,10 +2288,10 @@ impl OptHeap {
                 ctx.with_ensured_ptr_info_arg0(op, |mut arrayinfo| {
                     if let Some(mut bound) = arrayinfo.getlenbound(None) {
                         let _ = bound.make_gt_const(const_index);
-                        if let Some(crate::optimizeopt::info::PtrInfo::Array(a)) =
-                            arrayinfo.as_mut()
-                        {
-                            a.lenbound = bound;
+                        if let Some(mut handle) = arrayinfo.as_mut() {
+                            if let crate::optimizeopt::info::PtrInfo::Array(a) = &mut *handle {
+                                a.lenbound = bound;
+                            }
                         }
                     }
                 });
@@ -3541,14 +3541,17 @@ mod tests {
             }],
         );
         ctx.set_ptr_info(object, PtrInfo::instance(None, None));
-        ctx.get_ptr_info_mut(object).unwrap().set_preamble_field(
-            OptHeap::field_slot_index(descr),
-            PreambleOp {
-                op: source,
-                invented_name: false,
-                preamble_op,
-            },
-        );
+        ctx.with_ptr_info_mut(object, |info| {
+            info.set_preamble_field(
+                OptHeap::field_slot_index(descr),
+                PreambleOp {
+                    op: source,
+                    invented_name: false,
+                    preamble_op,
+                },
+            );
+        })
+        .unwrap();
         let _ = resolved;
         heap.import_cached_fields(&[(object, descr.clone(), resolved)], ctx);
     }
@@ -3659,26 +3662,29 @@ mod tests {
     fn test_imported_short_cached_fields_replays_into_heap() {
         let d = object_descr(55);
         let mut heap = OptHeap::new();
-        let mut ctx = OptContext::with_num_inputs(4, 2);
+        // `inputarg_from_tp(arg.type)` per opencoder.py:259 — base is a Ref
+        // pointer, cached_value is the Int field result of GetfieldGcI.
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Int]);
+        let p0 = OpRef::input_arg_typed(0, Type::Ref);
+        let p1 = OpRef::input_arg_typed(1, Type::Int);
+        let cached_op_key = OpRef::from_raw(100);
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
-            OpRef::from_raw(0),
+            p0,
             &d,
-            OpRef::from_raw(100),
-            OpRef::from_raw(1),
+            cached_op_key,
+            p1,
             OpCode::GetfieldGcI,
         );
 
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d);
-        op.pos = OpRef::from_raw(2);
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0], d);
+        op.pos = pos2;
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::from_raw(2)),
-            OpRef::from_raw(1)
-        );
+        assert_eq!(ctx.get_box_replacement(pos2), p1);
     }
 
     /// After consuming an imported short field, a cache invalidation followed
@@ -3690,34 +3696,38 @@ mod tests {
     fn test_imported_short_field_not_reused_after_invalidation() {
         let d_head = object_descr(10); // head field
         let mut heap = OptHeap::new();
-        let mut ctx = OptContext::with_num_inputs(4, 4);
+        // `inputarg_from_tp(arg.type)` per opencoder.py:259 — base and
+        // cached_value are both Ref (GetfieldGcR result type).
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Ref]);
+        let p0 = OpRef::input_arg_typed(0, Type::Ref);
+        let p1 = OpRef::input_arg_typed(1, Type::Ref);
+        let cached_op_key = OpRef::from_raw(100);
         initialize_imported_short_heap_field(
             &mut heap,
             &mut ctx,
-            OpRef::from_raw(0),
+            p0,
             &d_head,
-            OpRef::from_raw(100),
-            OpRef::from_raw(1),
+            cached_op_key,
+            p1,
             OpCode::GetfieldGcR,
         );
 
         // First getfield on head: consumes the import, caches the value.
-        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(0)], d_head.clone());
-        op1.pos = OpRef::from_raw(2);
+        let pos2 = ctx.reserve_pos_typed(Type::Ref);
+        let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[p0], d_head.clone());
+        op1.pos = pos2;
         let result1 = heap.optimize_getfield(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::from_raw(2)),
-            OpRef::from_raw(1)
-        );
+        assert_eq!(ctx.get_box_replacement(pos2), p1);
 
         // A call invalidates all mutable field caches.
         heap.clean_caches(&mut ctx);
 
         // Second getfield on head after invalidation: must NOT return the
         // stale preamble value.  The import was consumed, so it should emit.
-        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[OpRef::from_raw(0)], d_head.clone());
-        op2.pos = OpRef::from_raw(3);
+        let pos3 = ctx.reserve_pos_typed(Type::Ref);
+        let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0], d_head.clone());
+        op2.pos = pos3;
         let result2 = heap.optimize_getfield(&op2, &mut ctx);
         assert!(
             matches!(result2, OptimizationResult::Emit(_)),
@@ -3729,18 +3739,19 @@ mod tests {
     fn test_getfield_does_not_deref_arbitrary_int_constant_base() {
         let d = immutable_descr(77);
         let mut heap = OptHeap::new();
-        let mut ctx = OptContext::with_num_inputs(4, 1);
-        ctx.make_constant(OpRef::from_raw(0), majit_ir::Value::Int(1));
+        // base is promoted to an Int constant via make_constant — Int input
+        // tag matches the constant value type.
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Int]);
+        let p0 = OpRef::input_arg_typed(0, Type::Int);
+        ctx.make_constant(p0, majit_ir::Value::Int(1));
 
-        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], d);
-        op.pos = OpRef::from_raw(1);
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0], d);
+        op.pos = pos1;
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::from_raw(1)),
-            OpRef::from_raw(1)
-        );
+        assert_eq!(ctx.get_box_replacement(pos1), pos1);
     }
 
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
@@ -4446,9 +4457,10 @@ mod tests {
         // produce_potential_short_preamble_ops read path can find it.
         use crate::optimizeopt::info::PtrInfo;
         ctx.set_ptr_info(OpRef::from_raw(100), PtrInfo::instance(None, None));
-        ctx.get_ptr_info_mut(OpRef::from_raw(100))
-            .unwrap()
-            .setfield(descr.index(), OpRef::from_raw(101));
+        ctx.with_ptr_info_mut(OpRef::from_raw(100), |info| {
+            info.setfield(descr.index(), OpRef::from_raw(101));
+        })
+        .unwrap();
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let produced = sb.produced_ops();
 
@@ -6080,11 +6092,13 @@ mod tests {
         use crate::optimizeopt::info::{ArrayPtrInfo, FieldEntry};
         use crate::optimizeopt::intutils::IntBound;
 
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(64, 4, 0, 4);
+        // `inputarg_from_tp(arg.type)` per opencoder.py:259 — both arrays are
+        // Ref-typed inputargs.
+        let mut ctx = OptContext::with_inputarg_types(64, &[Type::Ref, Type::Ref]);
 
         let arr_descr = descr(50);
-        let op1 = OpRef::from_raw(0);
-        let op2 = OpRef::from_raw(1);
+        let op1 = OpRef::input_arg_typed(0, Type::Ref);
+        let op2 = OpRef::input_arg_typed(1, Type::Ref);
 
         let const_10 = ctx.emit_constant_int(10);
         let const_20 = ctx.emit_constant_int(20);

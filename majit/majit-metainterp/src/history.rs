@@ -55,7 +55,7 @@ pub struct TreeLoop {
     /// (same Python objects, same `_forwarded` slot). The Rust pool
     /// preserves that identity by carrying the same `Rc<Box>` allocations
     /// from the recorder through to the optimizer.
-    pub box_pool: Vec<BoxRef>,
+    pub box_pool: crate::r#box::BoxPool,
 }
 
 impl TreeLoop {
@@ -70,7 +70,7 @@ impl TreeLoop {
             inputargs,
             ops,
             snapshots: Vec::new(),
-            box_pool: Vec::new(),
+            box_pool: crate::r#box::BoxPool::new(),
         }
     }
 
@@ -84,7 +84,7 @@ impl TreeLoop {
             inputargs,
             ops,
             snapshots,
-            box_pool: Vec::new(),
+            box_pool: crate::r#box::BoxPool::new(),
         }
     }
 
@@ -96,13 +96,13 @@ impl TreeLoop {
         inputargs: Vec<InputArg>,
         ops: Vec<Op>,
         snapshots: Vec<crate::recorder::Snapshot>,
-        box_pool: Vec<BoxRef>,
+        box_pool: impl Into<crate::r#box::BoxPool>,
     ) -> Self {
         TreeLoop {
             inputargs,
             ops,
             snapshots,
-            box_pool,
+            box_pool: box_pool.into(),
         }
     }
 
@@ -177,7 +177,15 @@ impl TreeLoop {
     /// directly with a higher `start_index`.
     pub fn get_iter(&self) -> crate::opencoder::TraceIterator<'_> {
         let inputarg_types = self.inputarg_types();
-        crate::opencoder::TraceIterator::new(&self.ops, 0, self.ops.len(), None, &inputarg_types, 0)
+        crate::opencoder::TraceIterator::new(
+            &self.ops,
+            0,
+            self.ops.len(),
+            None,
+            &inputarg_types,
+            0,
+            None,
+        )
     }
 
     /// history.py: check_consistency()
@@ -387,18 +395,20 @@ impl TreeLoop {
         // and every BoxRef-routing reader fell back to the legacy Vec read
         // even after H-3.0a/b plumbed production. Total length:
         // `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
-        let mut box_pool: Vec<BoxRef> =
-            Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len());
+        let mut box_pool: crate::r#box::BoxPool =
+            Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len()).into();
         for (i, &tp) in new_ia_types.iter().enumerate() {
             box_pool.push(BoxRef::new_inputarg(tp, Some(i as u32)));
         }
         for &r in op_escaped.iter() {
             let op_idx = (r.raw() - num_original_inputargs) as usize;
             let result_tp = self.ops[op_idx].opcode.result_type();
-            box_pool.push(BoxRef::new_resop(result_tp));
+            let position = box_pool.len() as u32;
+            box_pool.push(BoxRef::new_resop(result_tp, position));
         }
         for op in cut_ops.iter() {
-            box_pool.push(BoxRef::new_resop(op.opcode.result_type()));
+            let position = box_pool.len() as u32;
+            box_pool.push(BoxRef::new_resop(op.opcode.result_type(), position));
         }
 
         // Phase 5: Re-emit escaped ops as prefix, assigning fresh OpRefs.

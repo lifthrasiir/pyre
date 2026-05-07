@@ -125,7 +125,7 @@ pub struct Trace {
     /// H-2.1 functional no-op: pool is populated but no reader consumes
     /// it yet. H-3 will start routing `_forwarded` / info reads through
     /// `BoxRef.forwarded`. Const Box allocation is deferred to H-2.2.
-    box_pool: Vec<BoxRef>,
+    box_pool: crate::r#box::BoxPool,
 }
 
 impl Trace {
@@ -140,7 +140,7 @@ impl Trace {
             inputargs: Vec::new(),
             op_count: 0,
             box_count: 0,
-            box_pool: Vec::with_capacity(256),
+            box_pool: Vec::with_capacity(256).into(),
         }
     }
 
@@ -203,7 +203,8 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         // H-2.1 parallel BoxRef: `AbstractResOp` mirror.
-        self.box_pool.push(BoxRef::new_resop(opcode.result_type()));
+        self.box_pool
+            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -224,7 +225,8 @@ impl Trace {
         let mut op = Op::with_descr(opcode, args, descr);
         op.pos = opref;
         self.ops.push(op);
-        self.box_pool.push(BoxRef::new_resop(opcode.result_type()));
+        self.box_pool
+            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -253,7 +255,8 @@ impl Trace {
         };
         op.pos = opref;
         self.ops.push(op);
-        self.box_pool.push(BoxRef::new_resop(opcode.result_type()));
+        self.box_pool
+            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -280,7 +283,8 @@ impl Trace {
         op.pos = opref;
         op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
         self.ops.push(op);
-        self.box_pool.push(BoxRef::new_resop(opcode.result_type()));
+        self.box_pool
+            .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -349,7 +353,7 @@ impl Trace {
         op.pos = opref;
         self.ops.push(op);
         self.box_pool
-            .push(BoxRef::new_resop(OpCode::Jump.result_type()));
+            .push(BoxRef::new_resop(OpCode::Jump.result_type(), self.op_count));
         self.op_count += 1;
         if OpCode::Jump.result_type() != Type::Void {
             self.box_count += 1;
@@ -363,8 +367,10 @@ impl Trace {
         let mut op = Op::with_descr(OpCode::Finish, finish_args, descr);
         op.pos = opref;
         self.ops.push(op);
-        self.box_pool
-            .push(BoxRef::new_resop(OpCode::Finish.result_type()));
+        self.box_pool.push(BoxRef::new_resop(
+            OpCode::Finish.result_type(),
+            self.op_count,
+        ));
         self.op_count += 1;
         if OpCode::Finish.result_type() != Type::Void {
             self.box_count += 1;

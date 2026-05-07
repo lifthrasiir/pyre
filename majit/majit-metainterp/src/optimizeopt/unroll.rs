@@ -36,6 +36,12 @@ fn is_trace_runtime_ref(opref: OpRef, constants: &HashMap<u32, i64>) -> bool {
     !opref.is_none() && !is_trace_constant_ref(opref, constants)
 }
 
+fn p1_full_prefix_from_box_pool_snapshot(
+    snapshot: Option<&[crate::r#box::BoxRef]>,
+) -> Option<Vec<crate::r#box::BoxRef>> {
+    snapshot.map(|pool| pool.to_vec())
+}
+
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
 ///
 /// Wraps the streaming OptUnroll pass with RPython's UnrollOptimizer API:
@@ -279,7 +285,7 @@ impl UnrollOptimizer {
     ) -> (Vec<Op>, usize) {
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
-        let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
+        let (mut exported_state, consts_p1, p1_ops, p1_full_prefix) = if let Some(pre_imported) =
             self.imported_state.take()
         {
             // RPython uses object identity for Boxes, so a TraceIterator over a
@@ -297,7 +303,21 @@ impl UnrollOptimizer {
             if self.phase1_patchguardop.is_none() {
                 self.phase1_patchguardop = pre_imported.patchguardop.clone();
             }
-            (pre_imported, constants.clone(), Vec::new())
+            // compile_retrace has no `opt_p1.final_ctx` (Phase 1 was
+            // skipped), but the failed attempt's Phase 1 captured its full
+            // `box_pool` into `ExportedState.box_pool_snapshot` at export
+            // time (`export_state_with_bounds`). TraceIterator's
+            // `p1_full_prefix` contract: deliver the full Phase 1 box_pool
+            // including inputarg BoxRefs at `[0..num_inputs)`, so
+            // `import_state` setting `Forwarded::Box(target)` for
+            // `target.raw() < num_inputs` lands the chain on the same
+            // Phase 1 inputarg cell — PyPy Phase 2 reads Phase 1
+            // `_forwarded` through shared Box identity; preserving the full
+            // raw position alignment (inputargs + emit ops) reproduces
+            // that identity here.
+            let prefix =
+                p1_full_prefix_from_box_pool_snapshot(pre_imported.box_pool_snapshot.as_deref());
+            (pre_imported, constants.clone(), Vec::new(), prefix)
         } else {
             // ── Phase 1: PreambleCompileData.optimize() ──
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
@@ -353,7 +373,8 @@ impl UnrollOptimizer {
                 ops.len(),
                 None,
                 p1_inputarg_types,
-                0, // start_fresh = 0 — inputargs at [0..num_inputs)
+                0,    // start_fresh = 0 — inputargs at [0..num_inputs)
+                None, // p1_full_prefix — Phase 1 has no prior phase
             );
             let mut p1_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
             while let Some(op) = p1_iter.next() {
@@ -464,10 +485,34 @@ impl UnrollOptimizer {
                         runtime_boxes: Vec::new(),
                         patchguardop: None,
                         phase1_emit_high_water: state.phase1_emit_high_water,
+                        box_pool_snapshot: None,
                         rooted_refs: Vec::new(),
                         shadow_stack_base: 0,
                     });
-                    (state, consts_p1, p1_ops)
+                    // Codex plan step 3: snapshot Phase 1 emit-op slice as
+                    // Rc::clone vector. Phase 2's TraceIterator embeds these
+                    // BoxRefs at its placeholder prefix `[num_inputs..end)`
+                    // so chain walks via `Forwarded::Box(rc)` observe Phase 1's
+                    // accumulated `_forwarded` info naturally — `unroll.py`
+                    // Phase 2 reading Phase 1 box._forwarded through shared
+                    // Python identity parity. After Phase 1 finishes Phase 2
+                    // is the sole writer of these Rcs (audit memo Risk 1).
+                    //
+                    // Slice end is `box_pool.len()` to cover the full Phase 1
+                    // allocation high water — Phase 2's `next_global_opref` is
+                    // `max(next_pos, p1_iter_fresh_hw)` which can exceed
+                    // `next_pos` when Phase 1 dropped/folded ops (the iterator
+                    // advanced `_fresh` past those positions while
+                    // `OptContext::next_pos` only counts `new_operations`).
+                    // `p1_iter.box_pool` was seeded into opt_p1 via
+                    // `set_pending_box_pool` so `final_ctx.box_pool` carries
+                    // the iterator's full allocation range; transferring up to
+                    // `box_pool.len()` ensures Phase 2 chain walks observe the
+                    // real Phase 1 BoxRefs at every reachable position rather
+                    // than Type::Void placeholders.
+                    let p1_full_prefix: Option<Vec<crate::r#box::BoxRef>> =
+                        opt_p1.final_ctx.as_ref().map(|c| c.box_pool.to_vec());
+                    (state, consts_p1, p1_ops, p1_full_prefix)
                 }
                 None => {
                     *constants = consts_p1;
@@ -633,6 +678,7 @@ impl UnrollOptimizer {
             None,
             p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)
+            p1_full_prefix, // Codex plan step 3 slice B: full Phase 1 box_pool (inputargs + emit ops)
         );
         let mut p2_ops_in: Vec<Op> = Vec::with_capacity(ops.len());
         while let Some(op) = iter.next() {
@@ -1077,7 +1123,15 @@ impl UnrollOptimizer {
             let opt_unroll = OptUnroll::new();
             // Use Phase 2's final context for virtual state matching.
             let mut jump_ctx = opt_p2.final_ctx.take().unwrap_or_else(|| {
-                crate::optimizeopt::OptContext::with_num_inputs(32, body_num_inputs)
+                // opencoder.py:259 inputarg_from_tp parity — Phase 2 inputargs
+                // carry the same producer-side types as Phase 1's; fall back
+                // to Ref when types are unavailable.
+                let types: Vec<majit_ir::Type> = opt_p2
+                    .trace_inputarg_types
+                    .get(..body_num_inputs)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_else(|| vec![majit_ir::Type::Ref; body_num_inputs]);
+                crate::optimizeopt::OptContext::with_inputarg_types(32, &types)
             });
 
             // unroll.py:151-158: jump_to_existing_trace(force_boxes=False)
@@ -1540,6 +1594,18 @@ pub struct ExportedState {
     /// folded and never survive as an end_arg / short_op source.
     /// `0` when there are no Phase 1 emit positions to track.
     pub phase1_emit_high_water: u32,
+    /// Snapshot of Phase 1's `OptContext::box_pool` taken at export time.
+    /// Used by `compile_retrace`'s Phase 2 TraceIterator as the
+    /// `p1_full_prefix` (inputarg + emit BoxRefs) so chain walks via
+    /// `Forwarded::Box(rc)` observe the failed attempt's accumulated
+    /// `_forwarded` info on every Phase 1 position — `unroll.py` Phase 2
+    /// reading Phase 1 box.\_forwarded through Python identity parity.
+    ///
+    /// `None` for ExportedStates produced by paths that do not feed into a
+    /// retrace attempt (test fixtures, in-flight construction). Populated
+    /// only by `export_state_with_bounds` at the canonical Phase 1 export
+    /// site.
+    pub box_pool_snapshot: Option<Vec<crate::r#box::BoxRef>>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1574,6 +1640,16 @@ enum ExportedGcRefField {
     VirtualStateConstantRef(usize),
     /// short_box_const_values[OpRef] = Value::Ref(...)
     ShortBoxConstValue(OpRef),
+    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Constant(Value::Ref(_)))
+    BoxPoolInfoConstantRef(usize),
+    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Constant(_)))
+    BoxPoolInfoPtrInfoConstant(usize),
+    /// box_pool_snapshot[index].forwarded = Info(OpInfo::Ptr(PtrInfo::Instance{known_class: Some(_)}))
+    BoxPoolInfoPtrInfoKnownClass(usize),
+    /// box_pool_snapshot[index].forwarded = Box(target) where target is
+    /// `BoxKind::Const(Value::Ref(_))` — `make_constant` /
+    /// `replace_op(... const ...)` writer mirror shape.
+    BoxPoolBoxConstRef(usize),
 }
 
 impl ExportedState {
@@ -1614,6 +1690,7 @@ impl ExportedState {
             runtime_boxes: Vec::new(),
             patchguardop: None,
             phase1_emit_high_water: 0,
+            box_pool_snapshot: None,
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1815,6 +1892,61 @@ impl ExportedState {
                     .push((key, ExportedGcRefField::ShortBoxConstValue(key), ss_idx));
             }
         }
+        // ── box_pool_snapshot Forwarded::Info GcRef fields ──
+        // Phase 2 chain walks land on these BoxRef cells and read their
+        // _forwarded info; if GC moves a Ref between Phase 1 export and
+        // retrace those reads see a stale handle.
+        if let Some(snapshot) = &self.box_pool_snapshot {
+            for (i, b) in snapshot.iter().enumerate() {
+                let forwarded = b.get_forwarded();
+                if let crate::r#box::Forwarded::Info(opinfo) = &*forwarded {
+                    match opinfo {
+                        OpInfo::Constant(Value::Ref(gcref)) if !gcref.is_null() => {
+                            let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                            self.rooted_refs.push((
+                                dummy_key,
+                                ExportedGcRefField::BoxPoolInfoConstantRef(i),
+                                ss_idx,
+                            ));
+                        }
+                        OpInfo::Ptr(PtrInfo::Constant(gcref)) if !gcref.is_null() => {
+                            let ss_idx = majit_gc::shadow_stack::push(*gcref);
+                            self.rooted_refs.push((
+                                dummy_key,
+                                ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i),
+                                ss_idx,
+                            ));
+                        }
+                        OpInfo::Ptr(PtrInfo::Instance(iinfo)) => {
+                            if let Some(gcref) = iinfo.known_class {
+                                if !gcref.is_null() {
+                                    let ss_idx = majit_gc::shadow_stack::push(gcref);
+                                    self.rooted_refs.push((
+                                        dummy_key,
+                                        ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i),
+                                        ss_idx,
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let crate::r#box::Forwarded::Box(target) = &*forwarded {
+                    if target.is_constant() {
+                        if let Some(Value::Ref(gcref)) = target.const_value() {
+                            if !gcref.is_null() {
+                                let ss_idx = majit_gc::shadow_stack::push(gcref);
+                                self.rooted_refs.push((
+                                    dummy_key,
+                                    ExportedGcRefField::BoxPoolBoxConstRef(i),
+                                    ss_idx,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Update GcRef values from shadow stack — GC may have moved objects.
@@ -1836,7 +1968,7 @@ impl ExportedState {
     /// single canonical `Rc` into every slot of each group so the
     /// post-refresh tree preserves the pre-GC aliasing.
     pub fn refresh_from_gc(&mut self) {
-        use crate::optimizeopt::info::PtrInfo;
+        use crate::optimizeopt::info::{OpInfo, PtrInfo};
         use crate::optimizeopt::virtualstate::{VirtualStateInfo, VirtualStateInfoNode};
         use std::rc::Rc;
         // virtualstate.py:712 cache parity: snapshot original Rc identities
@@ -1914,6 +2046,94 @@ impl ExportedState {
                         *value = Value::Ref(updated);
                     }
                 }
+                ExportedGcRefField::BoxPoolInfoConstantRef(i) => {
+                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
+                        && let Some(b) = snapshot.get(*i)
+                    {
+                        let new_info = {
+                            let f = b.get_forwarded();
+                            if matches!(
+                                &*f,
+                                crate::r#box::Forwarded::Info(OpInfo::Constant(Value::Ref(_)))
+                            ) {
+                                Some(OpInfo::Constant(Value::Ref(updated)))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(info) = new_info {
+                            b.set_forwarded_info(info);
+                        }
+                    }
+                }
+                ExportedGcRefField::BoxPoolInfoPtrInfoConstant(i) => {
+                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
+                        && let Some(b) = snapshot.get(*i)
+                    {
+                        let new_info = {
+                            let f = b.get_forwarded();
+                            if matches!(
+                                &*f,
+                                crate::r#box::Forwarded::Info(OpInfo::Ptr(PtrInfo::Constant(_)))
+                            ) {
+                                Some(OpInfo::Ptr(PtrInfo::Constant(updated)))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(info) = new_info {
+                            b.set_forwarded_info(info);
+                        }
+                    }
+                }
+                ExportedGcRefField::BoxPoolInfoPtrInfoKnownClass(i) => {
+                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
+                        && let Some(b) = snapshot.get(*i)
+                    {
+                        let new_info = {
+                            let f = b.get_forwarded();
+                            if let crate::r#box::Forwarded::Info(OpInfo::Ptr(PtrInfo::Instance(
+                                iinfo,
+                            ))) = &*f
+                            {
+                                let mut new_iinfo = iinfo.clone();
+                                new_iinfo.known_class = Some(updated);
+                                Some(OpInfo::Ptr(PtrInfo::Instance(new_iinfo)))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(info) = new_info {
+                            b.set_forwarded_info(info);
+                        }
+                    }
+                }
+                ExportedGcRefField::BoxPoolBoxConstRef(i) => {
+                    if let Some(snapshot) = self.box_pool_snapshot.as_ref()
+                        && let Some(b) = snapshot.get(*i)
+                    {
+                        // BoxKind::Const is immutable, so swap in a fresh
+                        // ConstRef BoxRef carrying the updated handle.
+                        // `set_forwarded_box` enforces the AbstractValue
+                        // invariant (Const has no _forwarded slot of its
+                        // own) for the source, which is a non-Const ResOp
+                        // / InputArg here.
+                        let needs_swap = {
+                            let f = b.get_forwarded();
+                            if let crate::r#box::Forwarded::Box(target) = &*f {
+                                target.is_constant()
+                                    && matches!(target.const_value(), Some(Value::Ref(_)))
+                            } else {
+                                false
+                            }
+                        };
+                        if needs_swap {
+                            b.set_forwarded_box(crate::r#box::BoxRef::new_const(Value::Ref(
+                                updated,
+                            )));
+                        }
+                    }
+                }
             }
         }
         if virtual_state_dirty {
@@ -1973,6 +2193,7 @@ impl Clone for ExportedState {
             runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
             phase1_emit_high_water: self.phase1_emit_high_water,
+            box_pool_snapshot: self.box_pool_snapshot.clone(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2344,6 +2565,15 @@ impl OptUnroll {
             .map(|op| op.pos.raw().saturating_add(1))
             .max()
             .unwrap_or(0);
+        // Capture the full Phase 1 BoxRef pool so a subsequent
+        // `compile_retrace` attempt can hand it back to Phase 2 as
+        // `p1_full_prefix` (`unroll.rs:282-303`). PyPy `unroll.py` Phase 2
+        // observes Phase 1's `_forwarded` mutations through Python identity
+        // on the same Box objects; pyre needs the Rc::cloned BoxRef vector
+        // to recreate that observation across the in-memory ExportedState
+        // hand-off. Each entry is `Rc::clone` cheap; vec retention is
+        // bounded by `ExportedState` lifetime.
+        state.box_pool_snapshot = Some(ctx.box_pool.to_vec());
         // PRE-EXISTING-ADAPTATION: snapshot producer-side const values for
         // any const-namespace OpRef referenced by `short_boxes` op args.
         // Phase B.2 `ProducedShortOp::produce_op` reads raw OpRefs (not the
@@ -3546,7 +3776,11 @@ fn assemble_peeled_trace(
 
 #[cfg(test)]
 fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -> OptContext {
-    let mut ctx = OptContext::with_num_inputs(p1_ops.len() + p2_ops.len(), body_num_inputs);
+    // Test helper — caller provides only the body inputarg count, so seed
+    // every slot as Ref (matches the common loop-body shape; fixtures that
+    // need typed inputargs construct ctx directly).
+    let types = vec![Type::Ref; body_num_inputs];
+    let mut ctx = OptContext::with_inputarg_types(p1_ops.len() + p2_ops.len(), &types);
     for op in p1_ops.iter().chain(p2_ops.iter()) {
         if op.pos.is_none() || op.result_type() == Type::Void {
             continue;
@@ -4431,6 +4665,20 @@ mod tests {
     }
 
     #[test]
+    fn test_retrace_box_pool_snapshot_preserves_inputargs_for_p1_full_prefix() {
+        let input0 = crate::r#box::BoxRef::new_inputarg(Type::Ref, Some(0));
+        let input1 = crate::r#box::BoxRef::new_inputarg(Type::Int, Some(1));
+        let emit2 = crate::r#box::BoxRef::new_resop(Type::Ref, 2);
+        let emit3 = crate::r#box::BoxRef::new_resop(Type::Int, 3);
+        let snapshot = vec![input0.clone(), input1.clone(), emit2.clone(), emit3.clone()];
+
+        let prefix =
+            p1_full_prefix_from_box_pool_snapshot(Some(&snapshot)).expect("snapshot exists");
+
+        assert_eq!(prefix, vec![input0, input1, emit2, emit3]);
+    }
+
+    #[test]
     fn test_exported_state_high_water_covers_retrace_namespace() {
         let exported = ExportedState::new(
             vec![OpRef::from_raw(52)],
@@ -5114,7 +5362,7 @@ mod tests {
             Some((10, 20))
         );
 
-        let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 1);
+        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
         let label_args = import_state(&[OpRef::from_raw(0)], &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args, vec![OpRef::from_raw(21)]);
         // unroll.py:93-96: IntBound IS imported with widen() and stored
@@ -5128,7 +5376,7 @@ mod tests {
     #[test]
     fn test_export_state_uses_forced_end_args_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 1);
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.preamble_end_args = Some(vec![OpRef::from_raw(21)]);
 
         let exported = export_state(&[OpRef::from_raw(0)], &[], &mut optimizer, &mut ctx, None);
@@ -5175,7 +5423,8 @@ mod tests {
             &mut ctx,
             None,
         );
-        let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref, Type::Ref]);
         let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
@@ -5185,8 +5434,8 @@ mod tests {
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
         let obj_resolved = ctx2.get_box_replacement(OpRef::from_raw(10));
         let pop = ctx2
-            .get_ptr_info_mut(obj_resolved)
-            .and_then(|info| info.take_preamble_field(0));
+            .with_ptr_info_mut(obj_resolved, |info| info.take_preamble_field(0))
+            .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
         assert_eq!(pop.op, OpRef::from_raw(11)); // Phase 1 source — pop.op
@@ -5225,7 +5474,8 @@ mod tests {
             &mut ctx,
             None,
         );
-        let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref]);
         let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
@@ -5281,7 +5531,8 @@ mod tests {
             &mut ctx,
             None,
         );
-        let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref]);
         let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
@@ -5323,7 +5574,10 @@ mod tests {
             Vec::new(),
             vec![source],
         );
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 4);
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
+            8,
+            &[Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+        );
         ctx.seed_constant(func, Value::Int(func_ptr));
 
         import_short_preamble_state(&[OpRef::from_raw(0)], &[phase2_result], &exported, &mut ctx);
@@ -5345,7 +5599,10 @@ mod tests {
     /// `add_preamble_op` (`shortpreamble.py:432-440`) path.
     #[test]
     fn test_force_op_from_preamble_orthodox_does_not_record_used_boxes() {
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(10, 3);
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
+            10,
+            &[Type::Ref, Type::Ref, Type::Ref],
+        );
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
             &[
@@ -5419,7 +5676,10 @@ mod tests {
     /// when it runs `add_preamble_op`.
     #[test]
     fn test_force_op_from_preamble_returns_source_for_heap_variant() {
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(32, 4);
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(
+            32,
+            &[Type::Ref, Type::Ref, Type::Ref, Type::Ref],
+        );
         ctx.initialize_imported_short_preamble_builder(
             &[
                 OpRef::from_raw(0),
@@ -5528,7 +5788,11 @@ mod tests {
             &mut ctx,
             None,
         );
-        let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(6, 1024);
+        // Generous Ref-typed inputarg pool — the test only consumes slots 0..3
+        // as `targetargs` and walks `OpRef::from_raw(K)` for various large K
+        // as opaque opref handles. Ref matches the producer shape.
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Ref; 1024]);
         let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);

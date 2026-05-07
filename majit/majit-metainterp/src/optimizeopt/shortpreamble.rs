@@ -1420,7 +1420,7 @@ impl ProducedShortOp {
         // shortpreamble.py:72-74: ensure_ptr_info_arg0 + setfield(pop)
         let pop_for_field = pop.clone();
         ctx.with_ensured_ptr_info_arg0(&getfield_op, |mut struct_info| {
-            if let Some(info) = struct_info.as_mut() {
+            if let Some(mut info) = struct_info.as_mut() {
                 debug_assert!(
                     !info.is_virtual(),
                     "shortpreamble.py:74: imported heap field on virtual"
@@ -1521,8 +1521,8 @@ impl ProducedShortOp {
         } else {
             let pop_for_array = pop.clone();
             ctx.with_ensured_ptr_info_arg0(&getarrayitem_op, |mut array_info| {
-                if let Some(info) = array_info.as_mut() {
-                    if let crate::optimizeopt::info::PtrInfo::Array(array_info) = info {
+                if let Some(mut info) = array_info.as_mut() {
+                    if let crate::optimizeopt::info::PtrInfo::Array(array_info) = &mut *info {
                         let _ = array_info.lenbound.make_gt_const(index);
                         let idx = index as usize;
                         if idx >= array_info.items.len() {

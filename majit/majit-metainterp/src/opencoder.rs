@@ -237,28 +237,26 @@ pub struct TraceIterator<'a> {
     /// the same trace produce disjoint OpRef ranges by passing different
     /// `start_fresh` values.
     pub _fresh: u32,
-    /// Epic H H-3.4 slice 77b.A: per-iter `BoxRef` pool that mirrors PyPy
-    /// `trace.get_iter()`'s per-call `inputarg_from_tp(...)` and `cls()`
-    /// allocations. Each `TraceIterator` instance owns its own fresh
-    /// `Rc<Box>` set so Phase 1 / Phase 2 sub-Optimizers do not share
-    /// `Box._forwarded` cells (which would split-brain when one phase's
-    /// mutation leaks into another phase's fresh `forwarded` Vec).
+    /// Per-iter `BoxRef` pool mirroring `trace.get_iter()`'s per-call
+    /// `inputarg_from_tp(...)` and `cls()` allocations. Each `TraceIterator`
+    /// instance owns its own fresh `Rc<Box>` set so Phase 1 / Phase 2
+    /// sub-Optimizers do not share `Box._forwarded` cells.
     ///
-    /// Layout: dense `Vec<BoxRef>` indexed by raw OpRef value. Indices
-    /// `[0..start_fresh)` are placeholder `BoxRef::new_resop(Type::Void)`
-    /// padding (this iter's namespace starts at `start_fresh`; the
-    /// placeholders are never the target of meaningful reads — their
-    /// `_forwarded = None` makes any incidental routing equivalent to
-    /// "no entry" semantics). Inputargs at
-    /// `[start_fresh..start_fresh + num_inputargs)`. Op results pushed
-    /// in `next()` for both void and non-void ops to keep `box_pool[i]`
-    /// aligned with `_fresh = i + 1` after each allocation.
-    ///
-    /// Read-only at slice 77b.A — no consumer wires through to the
-    /// optimizer yet. Slice 77b.B introduces
-    /// `UnrollOptimizer.set_pending_box_pool(p1_iter.box_pool.clone())`
-    /// so Phase 1 / Phase 2 each receive disjoint pools.
-    pub box_pool: Vec<BoxRef>,
+    /// Layout: dense `Vec<BoxRef>` indexed by raw OpRef value.
+    /// `[0..p1_full_prefix.len())` are `Rc::clone`s of Phase 1's
+    /// `final_ctx.box_pool` (inputarg + emit BoxRefs) when
+    /// `p1_full_prefix` is `Some` — Phase 2 chain walks observe Phase 1's
+    /// accumulated `_forwarded` info naturally (`unroll.py` Phase 2 reads
+    /// Phase 1 `box._forwarded` through shared Python identity parity).
+    /// `import_state(targetargs, ...)` writes `Forwarded::Box(target)` on
+    /// each Phase 2 inputarg whose `target.raw() < num_inputs` — chain
+    /// walks land directly on Phase 1's inputarg BoxRef cell rather than a
+    /// Type::Void placeholder.
+    /// Remaining `[..start_fresh)` filled with placeholder
+    /// `BoxRef::new_resop(Type::Void)` for any unsnapshotted gap.
+    /// Inputargs at `[start_fresh..start_fresh + num_inputargs)`.
+    /// Op results pushed in `next()` for both void and non-void ops.
+    pub box_pool: crate::r#box::BoxPool,
 }
 
 impl<'a> TraceIterator<'a> {
@@ -278,6 +276,7 @@ impl<'a> TraceIterator<'a> {
         force_inputargs: Option<&[OpRef]>,
         inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
+        p1_full_prefix: Option<Vec<BoxRef>>,
     ) -> Self {
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
@@ -299,80 +298,28 @@ impl<'a> TraceIterator<'a> {
         let cache_size = ((max_pos as usize) + 1).max(num_inputargs);
         let mut _cache: Vec<Option<OpRef>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
-        // Slice 77b.A: per-iter BoxRef pool. Pre-pad indices `[0..start_fresh)`
-        // with placeholder `BoxRef::new_resop(Type::Void)` so dense indexing by
-        // raw OpRef stays consistent for Phase 2 (start_fresh = phase2_inputarg_base).
-        // Placeholder `_forwarded = None` makes any incidental routing return
-        // "no info" — equivalent to a sparse "missing entry" sentinel.
-        //
-        // PRE-EXISTING-ADAPTATION (slice 77b.A) — placeholder semantics for
-        // Phase 1 emit positions when this is Phase 2's iter.
-        //
-        // Phase 1's emitted ops (raw indices in `[num_inputs..start_fresh)` at
-        // Phase 2 since `start_fresh = phase2_inputarg_base = max(next_global_opref,
-        // body_num_inputs)`) do not appear in the trace bytes Phase 2's iter
-        // walks, so Phase 2's iter has no `cls()` allocation for them. PyPy
-        // resolves this via Phase 1's actual `Box` object surviving into Phase 2
-        // through stable Python identity. pyre's per-iter Box model cannot do
-        // the same — see "Why not preserve Phase 1 BoxRef" below — so the
-        // placeholder is the pragmatic stand-in.
-        //
-        // Why not preserve Phase 1 BoxRef in `[0..start_fresh)`:
-        //
-        // - **Rc-share** (clone the same `Rc<Box>` from P1's pool into P2's
-        //   prefix) re-introduces the first-77b crash: P1 mutations to
-        //   `_forwarded` propagate through the shared Rc into P2's view,
-        //   producing the `ensure_ptr_info_arg0 forwarded[N] None` panic on
-        //   10/14 dynasm benches.
-        // - **Deep-clone** (allocate fresh Boxes that copy P1's `_forwarded`
-        //   field) breaks chain pointers: a P1 box whose `_forwarded =
-        //   Box(other_p1_box)` deep-clones into a P2 box pointing at the
-        //   original P1 `other_p1_box`, which is not in P2's pool. Subsequent
-        //   chain walks reach into P1 territory and tear the per-iter
-        //   identity model.
-        // - **Sparse fallback** (`Option<BoxRef>::None` at placeholder slots,
-        //   fall-through to legacy Vec on read) is no closer to PyPy: P2's
-        //   legacy Vec also starts fresh (Forwarded::None at every Phase 1
-        //   emit slot), so fall-through yields None — identical to what the
-        //   placeholder returns.
-        //
-        // Why the placeholder is functionally PyPy-equivalent:
-        //
-        // The unroll import path (`unroll.rs::import_state` → `replace_op`
-        // mirror → `setinfo_from_preamble` walks chain to target via
-        // `get_box_replacement` at mod.rs:2538 → terminal `set_ptr_info` on
-        // target) writes info onto **whatever Box source forwards to**.
-        // PyPy: that's P1's actual Box. Pyre: that's the P2-local placeholder.
-        // Either way, post-import reads via `peek_ptr_info_via_box(source)` or
-        // `get_box_replacement(source) → forwarded` see the same info value.
-        //
-        // The contract this rests on: `ExportedState.exported_infos` (PyPy
-        // canonical field, `unroll.py:529`) carries every Phase 1 op info
-        // that Phase 2 might consult. PyPy's Phase 2 imports through this map
-        // too; relying on it makes pyre's path structurally narrower (no
-        // implicit Phase 1 Box state visibility) but functionally complete.
-        //
-        // Two probes pin the equivalence under
-        // `optimizeopt::h3_1_mirror_tests`:
-        //   - `h3_4_phase2_placeholder_forwarding_yields_consistent_reads`:
-        //     post-import, BoxRef-routing reader and legacy Vec reader both
-        //     see the imported PtrInfo; placeholder absorbs the mirror write.
-        //   - `h3_4_phase2_placeholder_without_import_returns_none_consistently`:
-        //     pre-import (no `setinfo_from_preamble` call), both readers
-        //     return None — consistent within pyre. PyPy parity here depends
-        //     on `exported_infos` containing every info Phase 2 needs; the
-        //     placeholder cannot fabricate Phase 1 info that wasn't exported.
-        //
-        // TODO (held 2026-05-06): structural-parity replacement is to
-        // `Rc::clone` Phase 1 emit-op BoxRefs from `opt_p1.final_ctx.box_pool
-        // [num_inputs..next_global_opref]` into Phase 2's prefix instead of
-        // padding with placeholders. After Phase 1 finishes, Phase 2 is the
-        // sole writer of those Rcs, mirroring PyPy's pattern. See
-        // `memory/todo_phase2_p1_emit_boxref_prefix_transfer.md` for the full
-        // analysis (RPython mechanism, sketch, risks 1-4 to validate).
-        let mut box_pool: Vec<BoxRef> = (0..start_fresh)
-            .map(|_| BoxRef::new_resop(Type::Void))
-            .collect();
+        // Per-iter BoxRef pool. When `p1_full_prefix` is `Some` (Phase 2
+        // path), `[0..p1_full_prefix.len())` is `Rc::clone`s of Phase 1's
+        // `final_ctx.box_pool` — inputarg BoxRefs at `[0..num_inputs)` plus
+        // emit BoxRefs at `[num_inputs..p1_iter_fresh_hw)`. Chain walks via
+        // `Forwarded::Box(rc)` observe Phase 1's accumulated `_forwarded`
+        // info naturally (`unroll.py` Phase 2 reads Phase 1 box._forwarded
+        // through shared Python identity); `import_state` setting
+        // `Forwarded::Box(target)` on Phase 2 inputargs lands the chain on
+        // the same Phase 1 inputarg cell rather than a Type::Void
+        // placeholder. Remaining `[p1_full_prefix.len()..start_fresh)` is
+        // filled with placeholder `BoxRef::new_resop(Type::Void)` only for
+        // any unsnapshotted gap (or all of `[..start_fresh)` when prefix is
+        // `None`). Phase 2 owns the Rc::cloned BoxRefs as its single-writer
+        // post-Phase-1-completion (audit memo Risk 1).
+        let p1_prefix = p1_full_prefix.unwrap_or_default();
+        let p1_end = p1_prefix.len().min(start_fresh as usize);
+        let mut box_pool: crate::r#box::BoxPool = p1_prefix
+            .into_iter()
+            .take(p1_end)
+            .chain((p1_end as u32..start_fresh).map(|i| BoxRef::new_resop(Type::Void, i)))
+            .collect::<Vec<_>>()
+            .into();
         let inputargs: Vec<OpRef>;
         if let Some(force) = force_inputargs {
             // opencoder.py:259-262 self.inputargs =
@@ -548,7 +495,7 @@ impl<'a> TraceIterator<'a> {
             let fresh = OpRef::op_typed(self._fresh, src.opcode.result_type());
             // Slice 77b.A: companion BoxRef for the fresh op result.
             self.box_pool
-                .push(BoxRef::new_resop(src.opcode.result_type()));
+                .push(BoxRef::new_resop(src.opcode.result_type(), self._fresh));
             self._fresh += 1;
             self._cache[orig] = Some(fresh);
             res.pos = fresh;
@@ -569,7 +516,8 @@ impl<'a> TraceIterator<'a> {
             let f = OpRef::void_op(self._fresh);
             // Slice 77b.A: companion Void-typed BoxRef placeholder so
             // `box_pool[idx]` indexing stays dense.
-            self.box_pool.push(BoxRef::new_resop(Type::Void));
+            self.box_pool
+                .push(BoxRef::new_resop(Type::Void, self._fresh));
             self._fresh += 1;
             res.pos = f;
         } else {
@@ -3024,7 +2972,7 @@ mod tests {
 
         // Phase 1 / legacy layout: start_fresh = 0 → inputargs allocated
         // as InputArgInt(0..2), op results follow as BoxInt(2..).
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         assert_eq!(iter.inputargs, vec![iarg(0), iarg(1)]);
         assert_eq!(iter._cache[0], Some(iarg(0)));
         assert_eq!(iter._cache[1], Some(iarg(1)));
@@ -3066,7 +3014,7 @@ mod tests {
 
         // Phase 1: start_fresh = 0 reproduces the legacy positional layout
         // (inputargs at [0, num_inputargs), op results at [num_inputargs, …)).
-        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
+        let mut p1 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         let mut p1_ops = Vec::new();
         while let Some(op) = p1.next() {
             p1_ops.push(op);
@@ -3079,7 +3027,15 @@ mod tests {
         assert_eq!(p1._index, 4);
 
         // Phase 2: start_fresh = phase1 high water → disjoint namespace.
-        let mut p2 = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, p1_high_water);
+        let mut p2 = TraceIterator::new(
+            &ops,
+            0,
+            ops.len(),
+            None,
+            &inputarg_types,
+            p1_high_water,
+            None,
+        );
         let mut p2_ops = Vec::new();
         while let Some(op) = p2.next() {
             p2_ops.push(op);
@@ -3115,7 +3071,7 @@ mod tests {
         let const_ref = OpRef::const_int(5);
         let ops = vec![op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), const_ref])];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 0, None);
         let r = iter.next().unwrap();
         assert_eq!(r.pos, iop(1));
         assert_eq!(r.args[0], iarg(0));
@@ -3140,7 +3096,7 @@ mod tests {
         // _index (raw trace position) and _fresh (fresh OpRef counter)
         // surfaces as an out-of-bounds panic or stale cache slot.
         let inputarg_types = vec![majit_ir::Type::Int; 1];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100, None);
         let r1 = iter.next().unwrap();
         // After writing raw pos 1, _index should be 2 (next slot).
         assert_eq!(iter._index, 2);
@@ -3171,7 +3127,7 @@ mod tests {
             guard,
         ];
         let inputarg_types = vec![majit_ir::Type::Int; 1];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 10, None);
         let r1 = iter.next().unwrap();
         assert_eq!(r1.pos, iop(11));
         assert_eq!(r1.args[0], iarg(10));
@@ -3198,7 +3154,7 @@ mod tests {
             majit_ir::Type::Int,
             majit_ir::Type::Int,
         ];
-        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100);
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &inputarg_types, 100, None);
 
         assert_eq!(
             iter.inputargs,

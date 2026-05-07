@@ -21,7 +21,7 @@
 //!   `box.set_forwarded(constbox)`. We do not introduce a separate `Const`
 //!   variant: RPython stores everything in a single `_forwarded` slot.
 
-use std::cell::{Ref, RefCell};
+use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 
 use majit_ir::{Type, Value};
@@ -52,12 +52,21 @@ pub struct Box {
 /// Enum mirror of the PyPy class hierarchy.
 pub enum BoxKind {
     /// `resoperation.py:250 AbstractResOp` — the operation object itself
-    /// is the result identity. The `Op` struct mapping is attached via
-    /// an adapter in H-6.1.
-    ResOp,
+    /// is the result identity. `position` is a pyre-only field with no
+    /// RPython counterpart on `AbstractResOpOrInputArg` (which carries
+    /// only `_forwarded`); it stores the index where the box lands in the
+    /// pool so debug formatters and a small number of recorder-side
+    /// fast paths can recover the OpRef without walking. PyPy threads the
+    /// equivalent through `FrontendOp.position_and_flags`
+    /// (resoperation.py:233) instead. Set by `opencoder.py Trace.record()`
+    /// (and the recorder's `record_op_*` family in pyre) at construction.
+    /// The `Op` struct mapping is attached via an adapter in H-6.1.
+    ResOp { position: u32 },
 
     /// `resoperation.py:699 AbstractInputArg`.
-    /// `position` mirrors `opencoder.py:710 AbstractInputArg.get_position`.
+    /// `position` mirrors `AbstractInputArg.position`
+    /// (resoperation.py:699) — `Optional` because pyre constructs
+    /// inputargs without an assigned slot in some test fixtures.
     InputArg { position: Option<u32> },
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
@@ -92,17 +101,26 @@ pub enum Forwarded {
 
 /// `Rc<Box>` newtype.
 ///
-/// `Eq` / `Hash` are pointer identity. `Rc::clone` shares the allocation,
-/// so it is a stable dict key.
+/// `Eq` / `Hash` are pointer identity for ALL variants — mirrors PyPy's
+/// `is`-based default `__eq__` on `AbstractValue` (covers `ResOp` /
+/// `InputArg` / `Const`). PyPy's value-based comparison for constants is
+/// the explicit `same_box` / `same_constant` method (`history.py:204`),
+/// not `__eq__`. Callers that need value comparison on constants must use
+/// `BoxRef::same_constant`.
 pub struct BoxRef(Rc<Box>);
 
 impl BoxRef {
     /// New `AbstractResOp` Box.
-    pub fn new_resop(type_: Type) -> Self {
+    ///
+    /// `position` mirrors `resoperation.py:233 AbstractResOpOrInputArg._pos`
+    /// — the index this box occupies in the pool (== raw value of the
+    /// matching OpRef). Construction-time assignment matches PyPy's
+    /// `Trace.record()`.
+    pub fn new_resop(type_: Type, position: u32) -> Self {
         Self(Rc::new(Box {
             forwarded: RefCell::new(Forwarded::None),
             type_,
-            kind: BoxKind::ResOp,
+            kind: BoxKind::ResOp { position },
         }))
     }
 
@@ -148,7 +166,21 @@ impl BoxRef {
     }
 
     pub fn is_resop(&self) -> bool {
-        matches!(self.0.kind, BoxKind::ResOp)
+        matches!(self.0.kind, BoxKind::ResOp { .. })
+    }
+
+    /// `resoperation.py:233 AbstractResOpOrInputArg._pos` accessor.
+    ///
+    /// Returns the index where this box resides in the pool for
+    /// `ResOp` / `InputArg` (which are the two PyPy classes that own
+    /// `_pos`). `Const` and the pyre-only `FrontendOp` transition variant
+    /// have no canonical position and return `None`.
+    pub fn position(&self) -> Option<u32> {
+        match &self.0.kind {
+            BoxKind::ResOp { position } => Some(*position),
+            BoxKind::InputArg { position } => *position,
+            BoxKind::Const(_) | BoxKind::FrontendOp { .. } => None,
+        }
     }
 
     /// Extract the constant value. Mirrors `history.py:233 ConstInt.getint`
@@ -278,6 +310,34 @@ impl BoxRef {
         .ok()
     }
 
+    /// Mutable counterpart of `ptr_info`.
+    ///
+    /// PyPy's `optimizer.py:99-113` mutates the `PtrInfo` returned from
+    /// `box.get_forwarded()` in place — Python objects are reference types,
+    /// so any `info.<method>(...)` call on the returned object mutates the
+    /// `_forwarded` slot's contents directly. The Rust mirror exposes that
+    /// through a `RefMut<'_, PtrInfo>` that aliases the inner `RefCell`.
+    ///
+    /// Holds the `RefCell` borrow for the lifetime of the returned guard;
+    /// callers must drop the guard before any other access to
+    /// `self.0.forwarded`.
+    pub fn ptr_info_mut(&self) -> Option<RefMut<'_, crate::optimizeopt::info::PtrInfo>> {
+        RefMut::filter_map(self.0.forwarded.borrow_mut(), |f| match f {
+            Forwarded::Info(info) => info.get_ptr_info_mut(),
+            _ => None,
+        })
+        .ok()
+    }
+
+    /// Mutable counterpart of `int_bound`. Same contract as `ptr_info_mut`.
+    pub fn int_bound_mut(&self) -> Option<RefMut<'_, crate::optimizeopt::intutils::IntBound>> {
+        RefMut::filter_map(self.0.forwarded.borrow_mut(), |f| match f {
+            Forwarded::Info(info) => info.get_int_bound_mut(),
+            _ => None,
+        })
+        .ok()
+    }
+
     /// `Rc::as_ptr` raw pointer — for debug / logging only.
     pub fn as_ptr(&self) -> *const Box {
         Rc::as_ptr(&self.0)
@@ -296,6 +356,9 @@ impl Clone for BoxRef {
 
 impl PartialEq for BoxRef {
     fn eq(&self, other: &Self) -> bool {
+        // PyPy `__eq__` on `AbstractValue` defaults to Python `is` for all
+        // box subclasses (ResOp / InputArg / Const). Value equality on
+        // constants is the explicit `same_constant` method, not `==`.
         Rc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -311,7 +374,7 @@ impl std::hash::Hash for BoxRef {
 impl std::fmt::Debug for BoxRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match &self.0.kind {
-            BoxKind::ResOp => "ResOp",
+            BoxKind::ResOp { .. } => "ResOp",
             BoxKind::InputArg { .. } => "InputArg",
             BoxKind::Const(_) => "Const",
             BoxKind::FrontendOp { .. } => "FrontendOp",
@@ -326,6 +389,51 @@ impl std::fmt::Debug for BoxRef {
     }
 }
 
+/// Encapsulated `BoxRef` storage for `OptContext` (Codex plan step 1).
+///
+/// Wraps `Vec<BoxRef>` as a newtype so consumers index by `OpRef` raw
+/// position. Future slices (Codex plan step 2-7) will move the
+/// representation to `Vec<Option<BoxRef>>` for sparse indexing — a
+/// prerequisite for retiring the legacy `forwarded: Vec<Forwarded>`
+/// fallback storage. `Deref` / `DerefMut` to `Vec<BoxRef>` keeps the
+/// migration backward-compatible: existing call sites keep working
+/// through auto-deref while the wrapper is rolled out.
+#[derive(Clone, Debug, Default)]
+pub struct BoxPool {
+    inner: Vec<BoxRef>,
+}
+
+impl BoxPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for BoxPool {
+    type Target = Vec<BoxRef>;
+    fn deref(&self) -> &Vec<BoxRef> {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for BoxPool {
+    fn deref_mut(&mut self) -> &mut Vec<BoxRef> {
+        &mut self.inner
+    }
+}
+
+impl From<Vec<BoxRef>> for BoxPool {
+    fn from(inner: Vec<BoxRef>) -> Self {
+        Self { inner }
+    }
+}
+
+impl From<BoxPool> for Vec<BoxRef> {
+    fn from(pool: BoxPool) -> Self {
+        pool.inner
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,9 +441,9 @@ mod tests {
 
     #[test]
     fn box_ref_identity_is_pointer_equality() {
-        let a = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
         let cloned = a.clone();
-        let other = BoxRef::new_resop(Type::Int);
+        let other = BoxRef::new_resop(Type::Int, 1);
         assert_eq!(a, cloned);
         assert_ne!(a, other);
     }
@@ -343,9 +451,9 @@ mod tests {
     #[test]
     fn forwarded_chain_walk_returns_terminal() {
         // a -> b -> c (all resop), all forwarded = None at c.
-        let a = BoxRef::new_resop(Type::Int);
-        let b = BoxRef::new_resop(Type::Int);
-        let c = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
+        let b = BoxRef::new_resop(Type::Int, 1);
+        let c = BoxRef::new_resop(Type::Int, 2);
         a.set_forwarded_box(b.clone());
         b.set_forwarded_box(c.clone());
         assert_eq!(a.get_box_replacement(false), c);
@@ -356,8 +464,8 @@ mod tests {
     #[test]
     fn forwarded_chain_stops_at_info() {
         // a -> b, then b._forwarded = Info(...).
-        let a = BoxRef::new_resop(Type::Int);
-        let b = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
+        let b = BoxRef::new_resop(Type::Int, 1);
         a.set_forwarded_box(b.clone());
         b.set_forwarded_info(OpInfo::Unknown);
         // Walker reaches b, sees Info, returns b.
@@ -367,8 +475,8 @@ mod tests {
     #[test]
     fn forwarded_chain_not_const_stops_before_const() {
         // a -> b (resop) -> c (const).
-        let a = BoxRef::new_resop(Type::Int);
-        let b = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
+        let b = BoxRef::new_resop(Type::Int, 1);
         let c = BoxRef::new_const(Value::Int(42));
         a.set_forwarded_box(b.clone());
         b.set_forwarded_box(c.clone());
@@ -391,6 +499,38 @@ mod tests {
         assert_eq!(f.type_(), Type::Float);
     }
 
+    /// PyPy `__eq__` defaults to `is` on `AbstractValue` for ALL box
+    /// subclasses (ResOp / InputArg / Const). Value comparison on constants
+    /// is the explicit `same_box` / `same_constant` method
+    /// (`history.py:204`), not `==`. `BoxRef::eq` therefore stays pointer
+    /// identity (`Rc::ptr_eq`) across every variant.
+    #[test]
+    fn boxref_eq_is_pointer_identity_for_every_variant() {
+        use std::collections::HashSet;
+
+        // Const: two fresh allocations of the same value compare unequal —
+        // identity (Rc pointer) differs. PyPy's value comparison is the
+        // explicit `same_constant` path, not `__eq__`.
+        let a = BoxRef::new_const(Value::Int(42));
+        let b = BoxRef::new_const(Value::Int(42));
+        assert_ne!(Rc::as_ptr(&a.0), Rc::as_ptr(&b.0));
+        assert_ne!(a, b);
+        // Clone preserves identity (Rc::clone shares the allocation).
+        assert_eq!(a, a.clone());
+
+        // HashSet keys by pointer identity for Const.
+        let mut set: HashSet<BoxRef> = HashSet::new();
+        set.insert(a.clone());
+        assert!(set.contains(&a));
+        assert!(!set.contains(&b));
+
+        // ResOp / InputArg: pointer identity (RPython `is` parity).
+        let r1 = BoxRef::new_resop(Type::Int, 0);
+        let r2 = BoxRef::new_resop(Type::Int, 0);
+        assert_ne!(r1, r2);
+        assert_eq!(r1, r1.clone());
+    }
+
     #[test]
     fn inputarg_position_preserved() {
         let arg = BoxRef::new_inputarg(Type::Ref, Some(3));
@@ -401,8 +541,8 @@ mod tests {
 
     #[test]
     fn clear_forwarded_resets_slot() {
-        let a = BoxRef::new_resop(Type::Int);
-        let b = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
+        let b = BoxRef::new_resop(Type::Int, 0);
         a.set_forwarded_box(b.clone());
         a.clear_forwarded();
         assert_eq!(a.get_box_replacement(false), a);
@@ -412,8 +552,8 @@ mod tests {
     #[test]
     fn boxref_used_as_hashmap_key() {
         use std::collections::HashMap;
-        let a = BoxRef::new_resop(Type::Int);
-        let b = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
+        let b = BoxRef::new_resop(Type::Int, 0);
         let mut m: HashMap<BoxRef, i32> = HashMap::new();
         m.insert(a.clone(), 1);
         m.insert(b.clone(), 2);
@@ -421,6 +561,30 @@ mod tests {
         assert_eq!(m.get(&b), Some(&2));
         // Clone shares the allocation, so it hashes to the same key.
         assert_eq!(m.get(&a.clone()), Some(&1));
+    }
+
+    #[test]
+    fn resop_position_round_trips() {
+        // `BoxKind::ResOp { position }` mirrors `AbstractResOpOrInputArg._pos`.
+        // Construction-time assignment must round-trip through `position()`.
+        let r = BoxRef::new_resop(Type::Int, 42);
+        assert_eq!(r.position(), Some(42));
+    }
+
+    #[test]
+    fn position_returns_inputarg_position_when_set() {
+        let arg = BoxRef::new_inputarg(Type::Ref, Some(7));
+        assert_eq!(arg.position(), Some(7));
+        let unset = BoxRef::new_inputarg(Type::Int, None);
+        assert_eq!(unset.position(), None);
+    }
+
+    #[test]
+    fn position_is_none_for_const_and_frontend_variants() {
+        let c = BoxRef::new_const(Value::Int(5));
+        assert_eq!(c.position(), None);
+        let fop = BoxRef::new_frontend_op(Type::Int, 0xdead);
+        assert_eq!(fop.position(), None);
     }
 
     #[test]
@@ -439,7 +603,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn set_forwarded_to_self_panics_in_debug() {
-        let a = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
         a.set_forwarded_box(a.clone());
     }
 
@@ -451,7 +615,7 @@ mod tests {
     #[test]
     fn ptr_info_returns_inner_when_forwarded_is_ptr_info() {
         use crate::optimizeopt::info::PtrInfo;
-        let a = BoxRef::new_resop(Type::Ref);
+        let a = BoxRef::new_resop(Type::Ref, 0);
         a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
         let pi = a.ptr_info().expect("ptr_info should return Some");
         assert!(pi.is_nonnull());
@@ -459,7 +623,7 @@ mod tests {
 
     #[test]
     fn ptr_info_returns_none_for_unset_box() {
-        let a = BoxRef::new_resop(Type::Ref);
+        let a = BoxRef::new_resop(Type::Ref, 0);
         assert!(a.ptr_info().is_none());
     }
 
@@ -468,8 +632,8 @@ mod tests {
         // Chain walk is the caller's responsibility, so when `_forwarded`
         // is `Forwarded::Box(_)` (i.e. a box, not info), `ptr_info()` must
         // return None.
-        let a = BoxRef::new_resop(Type::Ref);
-        let b = BoxRef::new_resop(Type::Ref);
+        let a = BoxRef::new_resop(Type::Ref, 0);
+        let b = BoxRef::new_resop(Type::Ref, 0);
         a.set_forwarded_box(b.clone());
         assert!(a.ptr_info().is_none());
     }
@@ -478,7 +642,7 @@ mod tests {
     fn ptr_info_returns_none_for_intbound_forwarded() {
         // `_forwarded` carries OpInfo::IntBound; ptr_info() must reject it.
         use crate::optimizeopt::intutils::IntBound;
-        let a = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
         a.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(7)));
         assert!(a.ptr_info().is_none());
     }
@@ -486,7 +650,7 @@ mod tests {
     #[test]
     fn int_bound_returns_inner_when_forwarded_is_intbound() {
         use crate::optimizeopt::intutils::IntBound;
-        let a = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
         a.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(42)));
         let ib = a.int_bound().expect("int_bound should return Some");
         assert!(ib.is_constant());
@@ -495,14 +659,14 @@ mod tests {
 
     #[test]
     fn int_bound_returns_none_for_unset_box() {
-        let a = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
         assert!(a.int_bound().is_none());
     }
 
     #[test]
     fn int_bound_returns_none_for_box_forwarded() {
-        let a = BoxRef::new_resop(Type::Int);
-        let b = BoxRef::new_resop(Type::Int);
+        let a = BoxRef::new_resop(Type::Int, 0);
+        let b = BoxRef::new_resop(Type::Int, 0);
         a.set_forwarded_box(b.clone());
         assert!(a.int_bound().is_none());
     }
@@ -510,8 +674,55 @@ mod tests {
     #[test]
     fn int_bound_returns_none_for_ptrinfo_forwarded() {
         use crate::optimizeopt::info::PtrInfo;
-        let a = BoxRef::new_resop(Type::Ref);
+        let a = BoxRef::new_resop(Type::Ref, 0);
         a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
         assert!(a.int_bound().is_none());
+    }
+
+    #[test]
+    fn ptr_info_mut_mutates_inner_in_place() {
+        use crate::optimizeopt::info::PtrInfo;
+        let a = BoxRef::new_resop(Type::Ref, 0);
+        a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
+        {
+            let mut pi = a.ptr_info_mut().expect("ptr_info_mut should return Some");
+            pi.set_last_guard_pos(7);
+        }
+        let pi = a
+            .ptr_info()
+            .expect("ptr_info should return Some after mutation");
+        assert_eq!(pi.last_guard_pos(), Some(7));
+    }
+
+    #[test]
+    fn ptr_info_mut_returns_none_for_intbound_forwarded() {
+        use crate::optimizeopt::intutils::IntBound;
+        let a = BoxRef::new_resop(Type::Int, 0);
+        a.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(7)));
+        assert!(a.ptr_info_mut().is_none());
+    }
+
+    #[test]
+    fn int_bound_mut_mutates_inner_in_place() {
+        use crate::optimizeopt::intutils::IntBound;
+        let a = BoxRef::new_resop(Type::Int, 0);
+        a.set_forwarded_info(OpInfo::IntBound(IntBound::unbounded()));
+        {
+            let mut ib = a.int_bound_mut().expect("int_bound_mut should return Some");
+            let _ = ib.make_eq_const(99);
+        }
+        let ib = a
+            .int_bound()
+            .expect("int_bound should return Some after mutation");
+        assert!(ib.is_constant());
+        assert_eq!(ib.get_constant_int(), 99);
+    }
+
+    #[test]
+    fn int_bound_mut_returns_none_for_ptrinfo_forwarded() {
+        use crate::optimizeopt::info::PtrInfo;
+        let a = BoxRef::new_resop(Type::Ref, 0);
+        a.set_forwarded_info(OpInfo::Ptr(PtrInfo::nonnull()));
+        assert!(a.int_bound_mut().is_none());
     }
 }

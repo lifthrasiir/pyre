@@ -1690,10 +1690,11 @@ impl OptIntBounds {
         // intbounds.py:503-505
         //     array = self.ensure_ptr_info_arg0(op)
         //     self.optimizer.setintbound(op, array.getlenbound(None))
-        let bound = {
-            let mut array = ctx.ensure_ptr_info_arg0(op);
-            array.getlenbound(None)
-        };
+        // `getlenbound` lazily fills `ArrayPtrInfo.lenbound` (`info.py:573`).
+        // Wrapper triggers `mirror_forwarded_to_box` so the BoxRef snapshot
+        // sees the populated lenbound — same rationale as STRLEN/UNICODELEN
+        // postprocessors below.
+        let bound = ctx.with_ensured_ptr_info_arg0(op, |mut array| array.getlenbound(None));
         if let Some(bound) = bound {
             ctx.setintbound(op.pos, &bound);
         }
@@ -1712,10 +1713,11 @@ impl OptIntBounds {
         // STRLEN per optimizer.py:490-491) and then invoking getlenbound on
         // the returned handle.
         ctx.make_nonnull_str(op.arg(0), 0);
-        let bound = {
-            let mut info = ctx.ensure_ptr_info_arg0(op);
-            info.getlenbound(Some(0))
-        };
+        // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
+        // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
+        // so `mirror_forwarded_to_box` re-syncs the BoxRef snapshot of
+        // the StrPtrInfo after the lenbound slot is populated.
+        let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
             ctx.setintbound(op.pos, &bound);
         }
@@ -1727,10 +1729,9 @@ impl OptIntBounds {
         //     array = getptrinfo(op.getarg(0))
         //     self.optimizer.setintbound(op, array.getlenbound(vstring.mode_unicode))
         ctx.make_nonnull_str(op.arg(0), 1);
-        let bound = {
-            let mut info = ctx.ensure_ptr_info_arg0(op);
-            info.getlenbound(Some(1))
-        };
+        // Same wrapper rationale as `postprocess_strlen` — lazy-fill
+        // mutation on StrPtrInfo.lenbound needs BoxRef mirror.
+        let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(1)));
         if let Some(bound) = bound {
             ctx.setintbound(op.pos, &bound);
         }
@@ -2973,7 +2974,8 @@ mod tests {
             .max()
             .unwrap_or(0);
         let num_inputs = (max_arg.max(max_pos).max(max_initial) as usize) + 1;
-        let mut ctx = OptContext::with_num_inputs(ops.len(), num_inputs);
+        let inputarg_types = vec![majit_ir::Type::Int; num_inputs];
+        let mut ctx = OptContext::with_inputarg_types(ops.len(), &inputarg_types);
 
         // resume.py:397 parity: each guard must have a snapshot indexed
         // by `rd_resume_position`.  This helper drives the optimizer

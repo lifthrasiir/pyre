@@ -2848,7 +2848,8 @@ mod tests {
         let descr = test_descr(12);
         let virtual_ref = OpRef::ref_op(20);
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
-        let mut ctx = OptContext::with_num_inputs(32, 1024);
+        // Generous Ref-typed inputarg pool for the test fixture.
+        let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
         ctx.set_ptr_info(
             virtual_ref,
             PtrInfo::VirtualStruct(VirtualStructInfo {

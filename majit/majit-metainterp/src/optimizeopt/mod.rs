@@ -458,7 +458,7 @@ pub struct OptContext {
     /// for free from object identity. H-3.1 adds the mirror writes
     /// (`set_ptr_info` / `make_constant` / `make_equal_to`) that consume
     /// this pool alongside the legacy `forwarded` Vec.
-    pub box_pool: Vec<crate::r#box::BoxRef>,
+    pub box_pool: crate::r#box::BoxPool,
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
@@ -873,13 +873,19 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // so a later equals-hit returns the SAME object.
         if let Some(cache) = info.cached_vinfo() {
             *cache.borrow_mut() = Some(std::rc::Rc::clone(&shared));
-            // H-3.2c mirror: `cache.borrow_mut()` replaced the canonical
-            // PtrInfo's `_cached_vinfo` Rc but `box_pool[idx].forwarded`
-            // still holds the pre-write PtrInfo clone with its own RefCell.
-            // Re-project so BoxRef-routing readers (e.g.
-            // `virtual_info_would_be_reused` at mod.rs:874 since slice 46)
-            // observe the freshly cached vinfo.
-            self.ctx.mirror_forwarded_to_box(resolved.raw() as usize);
+            // Phase B writer flip: `info` is a clone returned from
+            // `peek_ptr_info_via_box`; mutating its independent `cached_vinfo`
+            // RefCell does not feed back into either the Vec or BoxRef
+            // canonical slots. Project the cached Rc handle directly onto the
+            // BoxRef PtrInfo so subsequent BoxRef-routing readers
+            // (`virtual_info_would_be_reused`) observe the cached vinfo.
+            if let Some(b) = self.ctx.box_pool.get(resolved.raw() as usize).cloned() {
+                if let Some(mut pi) = b.ptr_info_mut() {
+                    if let Some(c) = pi.cached_vinfo() {
+                        *c.borrow_mut() = Some(std::rc::Rc::clone(&shared));
+                    }
+                }
+            }
         }
         Some(shared)
     }
@@ -1301,12 +1307,50 @@ impl OptContext {
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            box_pool: Vec::new(),
+            box_pool: crate::r#box::BoxPool::new(),
         }
     }
 
+    /// Test-only inputarg-free constructor. Production paths must always go
+    /// through [`Self::with_inputarg_types`] so every inputarg slot lands a
+    /// typed `BoxRef` matching `opencoder.py:259 inputarg_from_tp(arg.type)`;
+    /// passing `num_inputs > 0` here would silently drop the type tag and
+    /// produce `Type::Void` reads. Sealed under `#[cfg(test)]` to make the
+    /// rule structural rather than discipline-only.
+    #[cfg(test)]
     pub fn with_num_inputs(estimated_ops: usize, num_inputs: usize) -> Self {
-        Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32)
+        debug_assert_eq!(
+            num_inputs, 0,
+            "with_num_inputs(_, {num_inputs}) — non-zero M requires typed seeding; \
+             use `with_inputarg_types(estimated_ops, &[Type; M])` instead \
+             (opencoder.py:259 inputarg_from_tp parity)",
+        );
+        Self::with_inputarg_types(estimated_ops, &[])
+    }
+
+    /// Construct an `OptContext` and seed `box_pool` with one
+    /// `BoxRef::new_inputarg(tp, Some(i))` per entry of `inputarg_types`.
+    ///
+    /// Mirrors `TraceIterator::new` (`opencoder.rs:373-426`, parity with
+    /// `opencoder.py:259-262` `inputarg_from_tp(arg.type)`). Test fixtures
+    /// that construct via this helper exercise the optimizer's BoxRef-direct
+    /// routing — the production path — instead of the legacy empty-pool
+    /// Vec fallback.
+    ///
+    /// `inputarg_types` carries the type tags needed to round-trip
+    /// `OpRef::input_arg_typed(i, tp)` on read; `with_num_inputs` is the
+    /// untyped delegate that defaults every slot to `Type::Void`.
+    pub fn with_inputarg_types(estimated_ops: usize, inputarg_types: &[majit_ir::Type]) -> Self {
+        let num_inputs = inputarg_types.len();
+        let mut ctx =
+            Self::with_num_inputs_and_start_pos(estimated_ops, num_inputs, 0, num_inputs as u32);
+        let seed: Vec<crate::r#box::BoxRef> = inputarg_types
+            .iter()
+            .enumerate()
+            .map(|(i, &tp)| crate::r#box::BoxRef::new_inputarg(tp, Some(i as u32)))
+            .collect();
+        ctx.box_pool = seed.into();
+        ctx
     }
 
     /// Construct an `OptContext` whose inputarg / fresh-OpRef numbering is
@@ -1382,7 +1426,7 @@ impl OptContext {
             phase1_emit_ops: Vec::new(),
             last_guard_idx: None,
             last_seen_snapshot_pos: None,
-            box_pool: Vec::new(),
+            box_pool: crate::r#box::BoxPool::new(),
         }
     }
 
@@ -1609,12 +1653,18 @@ impl OptContext {
         // without skipping. Untyped allocation falls back to `Type::Void`.
         if !self.box_pool.is_empty() {
             while self.box_pool.len() < idx {
-                self.box_pool
-                    .push(crate::r#box::BoxRef::new_resop(majit_ir::Type::Void));
+                let position = self.box_pool.len() as u32;
+                self.box_pool.push(crate::r#box::BoxRef::new_resop(
+                    majit_ir::Type::Void,
+                    position,
+                ));
             }
             if self.box_pool.len() == idx {
-                self.box_pool
-                    .push(crate::r#box::BoxRef::new_resop(majit_ir::Type::Void));
+                let position = self.box_pool.len() as u32;
+                self.box_pool.push(crate::r#box::BoxRef::new_resop(
+                    majit_ir::Type::Void,
+                    position,
+                ));
             }
         }
         OpRef::from_raw(raw)
@@ -1645,11 +1695,16 @@ impl OptContext {
         // `constants` table).
         if !self.box_pool.is_empty() {
             while self.box_pool.len() < idx {
-                self.box_pool
-                    .push(crate::r#box::BoxRef::new_resop(majit_ir::Type::Void));
+                let position = self.box_pool.len() as u32;
+                self.box_pool.push(crate::r#box::BoxRef::new_resop(
+                    majit_ir::Type::Void,
+                    position,
+                ));
             }
             if self.box_pool.len() == idx {
-                self.box_pool.push(crate::r#box::BoxRef::new_resop(tp));
+                let position = self.box_pool.len() as u32;
+                self.box_pool
+                    .push(crate::r#box::BoxRef::new_resop(tp, position));
             }
             // else: `box_pool[idx]` already exists (recorder pre-populated).
         }
@@ -2426,6 +2481,10 @@ impl OptContext {
     /// short preamble ops. Store the same family of info values that RPython
     /// stores in `_forwarded`, without transforming them through
     /// `setinfo_from_preamble` yet.
+    ///
+    /// Phase B writer flip (slice 1): BoxRef-direct write is the authority;
+    /// the legacy `forwarded` Vec is updated as a reverse mirror so empty-pool
+    /// fallback readers still see the same state until Phase C drops the Vec.
     fn set_preamble_forwarded_info(
         &mut self,
         source: OpRef,
@@ -2436,6 +2495,14 @@ impl OptContext {
             return;
         }
         let idx = source.raw() as usize;
+        // BoxRef-direct write — authoritative.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            match info {
+                OpInfo::Unknown => b.clear_forwarded(),
+                other => b.set_forwarded_info(other.clone()),
+            }
+        }
+        // Reverse mirror to legacy Vec.
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
@@ -2446,7 +2513,6 @@ impl OptContext {
             OpInfo::Constant(value) => Forwarded::Const(value.clone()),
             OpInfo::Unknown => Forwarded::None,
         };
-        self.mirror_forwarded_to_box(idx);
     }
 
     /// shortpreamble.py:401-405 line-by-line:
@@ -2480,8 +2546,54 @@ impl OptContext {
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{Forwarded, OpInfo};
         let idx = source.raw() as usize;
+        // Phase C: BoxRef-first read. The Vec→BoxRef state map:
+        // `Vec::Info(p)` ↔ `Box::Info(OpInfo::Ptr(p))`,
+        // `Vec::IntBound(b)` ↔ `Box::Info(OpInfo::IntBound(b))`,
+        // `Vec::Const(Value::Float(_))` ↔ `Box::Info(OpInfo::FloatConst(_))`
+        //   for preamble import (FloatConstInfo); a separate path —
+        //   `make_constant` / `replace_op(... const ...)` — also produces
+        //   `Box::Box(const_box)` carrying the same value, so both shapes
+        //   are recognised on read.
+        // `Vec::Const(non-Float)` ↔ `Box::Info(OpInfo::Constant(v))` for
+        //   preamble import; `make_constant` style mirrors as
+        //   `Box::Box(const_box)`.
+        // `Vec::Op(_)` (forwarding redirect) maps to `Box::Box(target)`
+        // where `target` is non-constant — excluded by the matcher.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            let result = {
+                let fwd = b.get_forwarded();
+                match &*fwd {
+                    crate::r#box::Forwarded::Info(OpInfo::Ptr(p)) => Some(OpInfo::Ptr(p.clone())),
+                    crate::r#box::Forwarded::Info(OpInfo::IntBound(ib)) => {
+                        Some(OpInfo::IntBound(ib.clone()))
+                    }
+                    crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => {
+                        Some(OpInfo::FloatConst(*f))
+                    }
+                    crate::r#box::Forwarded::Info(OpInfo::Constant(v)) => {
+                        Some(OpInfo::Constant(v.clone()))
+                    }
+                    crate::r#box::Forwarded::Box(target) if target.is_constant() => {
+                        target.const_value().map(|v| match v {
+                            Value::Float(f) => OpInfo::FloatConst(f),
+                            v => OpInfo::Constant(v),
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            if result.is_some() {
+                // shortpreamble.py:401 preamble_op.set_forwarded(None).
+                b.clear_forwarded();
+                if idx < self.forwarded.len() {
+                    self.forwarded[idx] = Forwarded::None;
+                }
+            }
+            return result;
+        }
+        // Empty-pool fallback (test fixtures).
         let slot = self.forwarded.get_mut(idx)?;
-        let result = match slot {
+        match slot {
             Forwarded::Info(_) | Forwarded::IntBound(_) | Forwarded::Const(_) => {
                 match std::mem::replace(slot, Forwarded::None) {
                     Forwarded::Info(info) => Some(OpInfo::Ptr(info)),
@@ -2492,15 +2604,7 @@ impl OptContext {
                 }
             }
             Forwarded::None | Forwarded::Op(_) => None,
-        };
-        // shortpreamble.py:401 preamble_op.set_forwarded(None) — RPython has a
-        // single _forwarded slot, so the BoxRef view must observe the clear
-        // too. Without this mirror, peek_ptr_info_via_box / peek_intbound_via_box
-        // readers keep returning the consumed preamble info.
-        if result.is_some() {
-            self.mirror_forwarded_to_box(idx);
         }
-        result
     }
 
     /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
@@ -2750,83 +2854,17 @@ impl OptContext {
     }
 
     /// unroll.py:49: item.set_forwarded(None)
+    ///
+    /// Phase B writer flip: BoxRef-direct clear is authoritative; Vec slot
+    /// updated as reverse mirror.
     fn clear_forwarded(&mut self, opref: OpRef) {
         use crate::optimizeopt::info::Forwarded;
         let idx = opref.raw() as usize;
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            b.clear_forwarded();
+        }
         if idx < self.forwarded.len() {
             self.forwarded[idx] = Forwarded::None;
-        }
-        self.mirror_forwarded_to_box(idx);
-    }
-
-    /// H-3.2c safety: mirror `forwarded[idx]` onto `box_pool[idx].forwarded`.
-    ///
-    /// RPython has a single `box._forwarded` slot (`resoperation.py:53`).
-    /// The Rust port keeps a parallel `Vec<Forwarded>` for OpRef-indexed
-    /// lookup; this helper re-mirrors the legacy slot onto the BoxRef so
-    /// BoxRef-routing readers (`is_virtual_via_box`,
-    /// `peek_intbound_via_box`, `has_ptr_info_via_box`, ...) observe the
-    /// same state as legacy readers. Call AFTER mutating
-    /// `self.forwarded[idx]`. No-op when `box_pool` is empty (test /
-    /// retrace baselines).
-    fn mirror_forwarded_to_box(&self, idx: usize) {
-        use crate::optimizeopt::info::Forwarded;
-        let Some(this_box) = self.box_pool.get(idx).cloned() else {
-            return;
-        };
-        let slot = match self.forwarded.get(idx) {
-            Some(s) => s,
-            None => {
-                this_box.clear_forwarded();
-                return;
-            }
-        };
-        match slot {
-            Forwarded::None => this_box.clear_forwarded(),
-            Forwarded::Op(target_opref) => {
-                // `optimizer.py:387 make_equal_to` always sets
-                // `op._forwarded = newop`, where `newop` for constant targets
-                // is a freshly-constructed `ConstInt` / `ConstFloat` /
-                // `ConstPtr` (`history.py:220, 261, 307`) — no dedup, value
-                // equality via `same_constant` (`history.py:204`). The Rust
-                // mirror builds a fresh `BoxRef::new_const(value)` per call
-                // site to match: identity differs between calls but
-                // `BoxKind::Const(value)` is value-equivalent. The Value is
-                // sourced from `const_pool[const_index]`, which the caller
-                // must have seeded — silent skip would leave Vec carrying
-                // `Forwarded::Op(const)` while the BoxRef mirror stays None,
-                // exactly the split-brain that BoxRef-first readers cannot
-                // recover from. Panic if seeding is missing.
-                let target = if target_opref.is_constant() {
-                    let value = self
-                        .const_pool
-                        .get(&target_opref.const_index())
-                        .copied()
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "mirror_forwarded_to_box: constant target {target_opref:?} \
-                                 missing from const_pool — caller produced a Const OpRef \
-                                 that bypassed seeding"
-                            )
-                        });
-                    crate::r#box::BoxRef::new_const(value)
-                } else {
-                    let Some(b) = self.box_pool.get(target_opref.raw() as usize).cloned() else {
-                        return;
-                    };
-                    b
-                };
-                this_box.set_forwarded_box(target);
-            }
-            Forwarded::Const(value) => {
-                this_box.set_forwarded_box(crate::r#box::BoxRef::new_const(*value));
-            }
-            Forwarded::Info(pinfo) => {
-                this_box.set_forwarded_info(crate::optimizeopt::info::OpInfo::Ptr(pinfo.clone()));
-            }
-            Forwarded::IntBound(ib) => {
-                this_box.set_forwarded_info(crate::optimizeopt::info::OpInfo::IntBound(ib.clone()));
-            }
         }
     }
 
@@ -3001,20 +3039,125 @@ impl OptContext {
             }
         }
         use crate::optimizeopt::info::Forwarded;
+        // `optimizer.py:387 make_equal_to` walks `op` to terminal first via
+        // `get_box_replacement(op)` so the info read and the subsequent
+        // `_forwarded` write land on the chain's terminal box. Without this,
+        // a chain-resident `old` writes to a non-terminal slot and the
+        // terminal's accumulated info is invisible to the transfer.
+        //
+        // `new.is_none()` is the pyre-only clear-forwarding sentinel (PyPy
+        // has no `make_equal_to(op, None)`); it operates on `old`'s slot
+        // directly so the chain from `old` is broken at its root rather
+        // than walked to the terminal.
+        let old = if new.is_none() {
+            old
+        } else {
+            self.get_box_replacement(old)
+        };
+        if old == new || old.is_constant() {
+            return;
+        }
         let idx = old.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
+        // `optimizer.py:387 make_equal_to`:
+        //     opinfo = op.get_forwarded()
+        //     op.set_forwarded(newop)
+        //     if opinfo is not None and not newop.is_constant():
+        //         newop.set_forwarded(opinfo)
+        //
+        // Capture `old`'s `AbstractInfo` BEFORE overwriting so we can
+        // transfer it to `new` per PyPy `optimizer.py:400`. The pyre
+        // BoxRef stores three `AbstractInfo` variants: PtrInfo, IntBound,
+        // FloatConst (`info.py:851 FloatConstInfo(AbstractInfo)`).
+        // Forwarded::Op / Box(Const) / None have nothing to transfer.
+        // Phase C: BoxRef-direct read when box_pool is populated; Phase B
+        // made BoxRef authoritative for these slots so the Vec mirror is no
+        // longer the canonical source. Empty-pool callers (test fixtures
+        // before BoxRef migration) fall back to the legacy Vec slot —
+        // `optimizer.py:387` transfers `opinfo` unconditionally regardless
+        // of storage, so the symmetry must hold in both modes.
+        use crate::optimizeopt::info::OpInfo;
+        let info_to_transfer: Option<OpInfo> = if let Some(b) = self.box_pool.get(idx) {
+            match &*b.get_forwarded() {
+                crate::r#box::Forwarded::Info(
+                    opinfo @ (OpInfo::Ptr(_) | OpInfo::IntBound(_) | OpInfo::FloatConst(_)),
+                ) => Some(opinfo.clone()),
+                _ => None,
+            }
+        } else {
+            // Empty-pool fallback. Vec/BoxRef shape mismatch:
+            // `info::Forwarded::Info` carries `PtrInfo` directly while
+            // `r#box::Forwarded::Info` wraps `OpInfo`. Convert per the
+            // writer-side mirror convention below: PtrInfo → OpInfo::Ptr,
+            // IntBound → OpInfo::IntBound, Const(Float) → OpInfo::FloatConst.
+            match self.forwarded.get(idx) {
+                Some(Forwarded::Info(p)) => Some(OpInfo::Ptr(p.clone())),
+                Some(Forwarded::IntBound(ib)) => Some(OpInfo::IntBound(ib.clone())),
+                Some(Forwarded::Const(majit_ir::Value::Float(f))) => Some(OpInfo::FloatConst(*f)),
+                _ => None,
+            }
+        };
+        // Phase B writer flip: BoxRef-direct first.
+        // `optimizer.py:387 make_equal_to → set_forwarded(newop)`. For const
+        // targets we build a fresh `BoxRef::new_const(value)` per call site
+        // (history.py:220 ConstInt no-dedup parity). Non-const targets reuse
+        // the target's existing `Rc<Box>` so chain-walking observes identity.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            if new.is_none() {
+                b.clear_forwarded();
+            } else if new.is_constant() {
+                let value = self
+                    .const_pool
+                    .get(&new.const_index())
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "replace_op: constant target {new:?} missing from const_pool — \
+                             caller produced a Const OpRef that bypassed seeding"
+                        )
+                    });
+                b.set_forwarded_box(crate::r#box::BoxRef::new_const(value));
+            } else if let Some(target) = self.box_pool.get(new.raw() as usize).cloned() {
+                b.set_forwarded_box(target);
+            }
+        }
+        // Reverse mirror to legacy Vec.
         if new.is_none() {
             self.forwarded[idx] = Forwarded::None;
         } else {
             self.forwarded[idx] = Forwarded::Op(new);
         }
-        // H-3.1 mirror: `optimizer.py:387 make_equal_to → set_forwarded(newop)`.
-        // For const targets the mirror builds a fresh `BoxRef::new_const(value)`
-        // from `const_pool` per call site, matching `history.py:220`
-        // ConstInt construction (no dedup).
-        self.mirror_forwarded_to_box(idx);
+        // `optimizer.py:400`: transfer captured info to `new` when `new` is
+        // not constant. Const targets carry their value directly via the
+        // forwarding chain (`Forwarded::Op(const)` → mirror builds Const
+        // BoxRef); they are not legitimate `_forwarded` carriers for
+        // PtrInfo / IntBound. PyPy unconditionally overrides `new`'s slot,
+        // so we mirror that — last writer wins.
+        if let Some(opinfo) = info_to_transfer {
+            if !new.is_none() && !new.is_constant() {
+                let new_idx = new.raw() as usize;
+                if new_idx >= self.forwarded.len() {
+                    self.forwarded.resize(new_idx + 1, Forwarded::None);
+                }
+                // Phase B writer flip: BoxRef-direct first.
+                if let Some(b) = self.box_pool.get(new_idx).cloned() {
+                    b.set_forwarded_info(opinfo.clone());
+                }
+                // Reverse mirror to Vec. `OpInfo::FloatConst(f)` mirrors as
+                // `Forwarded::Const(Value::Float(f))` per the convention at
+                // the `take_preamble_forwarded_opinfo` writer.
+                self.forwarded[new_idx] = match opinfo {
+                    OpInfo::Ptr(p) => Forwarded::Info(p),
+                    OpInfo::IntBound(ib) => Forwarded::IntBound(ib),
+                    OpInfo::FloatConst(f) => Forwarded::Const(majit_ir::Value::Float(f)),
+                    OpInfo::Constant(_) | OpInfo::Unknown => unreachable!(
+                        "info_to_transfer captures only PtrInfo / IntBound / FloatConst"
+                    ),
+                };
+            }
+        }
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
@@ -3029,21 +3172,27 @@ impl OptContext {
     /// info.py:111-118: mark_last_guard.
     /// last_guard_pos = len(_newoperations) - 1.
     pub fn mark_last_guard(&mut self, opref: OpRef) {
+        use crate::optimizeopt::info::Forwarded;
         let pos = match self.new_operations.last() {
             Some(op) if op.opcode.is_guard() => (self.new_operations.len() - 1) as i32,
             _ => return,
         };
-        if let Some(info) = self.get_ptr_info_mut(opref) {
-            info.set_last_guard_pos(pos);
-        }
-        // H-3.2c safety: in-place mutation via `get_ptr_info_mut` doesn't
-        // touch `box_pool[idx].forwarded`. Re-project the legacy slot so
-        // BoxRef-routing readers (`last_guard_pos_via_box`) see the
-        // updated `last_guard_pos` instead of the stale snapshot from the
-        // previous `set_ptr_info` mirror.
         let resolved = self.get_box_replacement(opref);
         let idx = resolved.raw() as usize;
-        self.mirror_forwarded_to_box(idx);
+        // `info.py:111-118 mark_last_guard` mutates the single `_forwarded`
+        // PtrInfo slot. pyre's two-tier storage (BoxRef PtrInfo + legacy Vec
+        // `Forwarded::Info`) must stay in sync as long as Vec readers exist
+        // (`get_ptr_info` / `get_ptr_info_mut` / `last_guard_pos_via_box`
+        // empty-pool fallback). Mirror to both — Phase 5 retires Vec readers
+        // and this mirror collapses to the BoxRef-only branch.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            if let Some(mut info) = b.ptr_info_mut() {
+                info.set_last_guard_pos(pos);
+            }
+        }
+        if let Some(Forwarded::Info(info)) = self.forwarded.get_mut(idx) {
+            info.set_last_guard_pos(pos);
+        }
     }
 
     /// info.py:100-103: get_last_guard.
@@ -3196,37 +3345,70 @@ impl OptContext {
         use crate::optimizeopt::info::Forwarded;
         let r = self.get_box_replacement(opref);
         let idx = r.raw() as usize;
+        // Phase B writer flip: mutate BoxRef _forwarded PtrInfo in place
+        // (authoritative), then snapshot the post-state onto the Vec slot.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            if let Some(mut pi) = b.ptr_info_mut() {
+                let result = f(&mut *pi);
+                let snapshot = pi.clone();
+                drop(pi);
+                if idx >= self.forwarded.len() {
+                    self.forwarded.resize(idx + 1, Forwarded::None);
+                }
+                self.forwarded[idx] = Forwarded::Info(snapshot);
+                return Some(result);
+            }
+        }
+        // Empty-pool / no BoxRef PtrInfo: mutate Vec directly (legacy path).
         let result = match self.forwarded.get_mut(idx)? {
             Forwarded::Info(info) => Some(f(info)),
             _ => None,
         };
-        if result.is_some() {
-            self.mirror_forwarded_to_box(idx);
-        }
         result
     }
 
-    /// Closure-style wrapper around [`Self::ensure_ptr_info_arg0`] that
-    /// auto-mirrors `forwarded[arg0_idx]` to `box_pool[arg0_idx]` after the
-    /// closure returns. Keeps the BoxRef snapshot in sync when callers
-    /// mutate through `EnsuredPtrInfo::as_mut()`. Read-only callers (e.g.
-    /// `getlenbound`) get a redundant but cheap mirror.
+    /// Closure-style wrapper around [`Self::ensure_ptr_info_arg0`].
+    ///
+    /// On the `EnsuredPtrInfo::ForwardedBox` path, closure mutations through
+    /// `as_mut()` land on the BoxRef's `RefCell<Forwarded>` only. PyPy's
+    /// `_forwarded` is a single slot; pyre's two-tier storage requires the
+    /// Vec mirror to stay in sync as long as legacy Vec readers
+    /// (`get_ptr_info` / `get_box_replacement` chain walker /
+    /// `last_guard_pos_via_box` empty-pool fallback) exist. Snapshot the
+    /// post-closure BoxRef PtrInfo back to `forwarded[arg0_idx]`. The
+    /// `Forwarded(&mut Vec)` empty-pool path mutates the Vec slot in place
+    /// and the `Constant` path is read-only — both skip the mirror.
     pub fn with_ensured_ptr_info_arg0<R>(
         &mut self,
         op: &Op,
         f: impl FnOnce(crate::optimizeopt::info::EnsuredPtrInfo<'_>) -> R,
     ) -> R {
+        use crate::optimizeopt::info::Forwarded;
         let arg0 = self.get_box_replacement(op.arg(0));
-        let idx = arg0.raw() as usize;
+        let arg0_idx = arg0.raw() as usize;
+        let needs_mirror = !arg0.is_constant() && self.box_pool.get(arg0_idx).is_some();
         let result = f(self.ensure_ptr_info_arg0(op));
-        self.mirror_forwarded_to_box(idx);
+        if needs_mirror {
+            if let Some(b) = self.box_pool.get(arg0_idx).cloned() {
+                if let Some(p) = b.ptr_info() {
+                    let snapshot = (*p).clone();
+                    drop(p);
+                    if arg0_idx >= self.forwarded.len() {
+                        self.forwarded.resize(arg0_idx + 1, Forwarded::None);
+                    }
+                    self.forwarded[arg0_idx] = Forwarded::Info(snapshot);
+                }
+            }
+        }
         result
     }
 
     /// `info.py:91-103 PtrInfo.get_last_guard_pos` BoxRef-routing reader.
-    /// Routes through `BoxRef::ptr_info()` when the box pool is plumbed,
-    /// returning the inner `Option<usize>` directly. Empty-pool fallback
-    /// delegates to `get_ptr_info(opref).and_then(|i| i.get_last_guard_pos())`.
+    /// Routes through `BoxRef::ptr_info()` when a BoxRef exists at the
+    /// resolved position; empty-pool tests fall through to the legacy
+    /// `forwarded: Vec<Forwarded>` so that `mark_last_guard`'s Vec write
+    /// remains visible (PyPy single `_forwarded` slot parity:
+    /// `resoperation.py:233`).
     pub fn last_guard_pos_via_box(&self, opref: OpRef) -> Option<usize> {
         if let Some(b) = self.get_box_replacement_box(opref) {
             return b.ptr_info().and_then(|p| p.get_last_guard_pos());
@@ -3357,7 +3539,14 @@ impl OptContext {
     /// `box._forwarded` without materializing an unbounded one on first
     /// access. Returns `None` for boxes that have no IntBound forwarding.
     /// Used by exporters that take `&OptContext` and cannot mutate.
-    pub fn peek_intbound(&self, opref: OpRef) -> Option<crate::optimizeopt::intutils::IntBound> {
+    ///
+    /// Visibility `pub(crate)` — empty-pool fallback for the BoxRef-first
+    /// `peek_intbound_via_box` reader. New callers should route through the
+    /// `*_via_box` helper family instead.
+    pub(crate) fn peek_intbound(
+        &self,
+        opref: OpRef,
+    ) -> Option<crate::optimizeopt::intutils::IntBound> {
         use crate::optimizeopt::info::Forwarded;
         // optimizer.py:99-100: assert op.type == 'i'
         // None is allowed for test fixtures that don't seed value_types.
@@ -3399,8 +3588,11 @@ impl OptContext {
     /// optimizer.py:99-113: getintbound(op) — get or create IntBound for
     /// an int-typed box. Lazy: creates unbounded on first access and stores
     /// it in forwarded[].
-    pub fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
-        use crate::optimizeopt::info::Forwarded;
+    ///
+    /// Visibility `pub(crate)` — legacy Vec-first writer kept until the
+    /// authority flip (Step 7 of Vec retirement) lands.
+    pub(crate) fn getintbound(&mut self, opref: OpRef) -> crate::optimizeopt::intutils::IntBound {
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         // optimizer.py:100: assert op.type == 'i'
         assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
@@ -3448,18 +3640,22 @@ impl OptContext {
         }
         // optimizer.py:110-112: fw is None → create unbounded and store
         let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
+        // Phase B writer flip: BoxRef-direct write is authoritative.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            b.set_forwarded_info(OpInfo::IntBound(intbound.clone()));
+        }
+        // Reverse mirror to legacy Vec.
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
         self.forwarded[idx] = Forwarded::IntBound(intbound.clone());
-        self.mirror_forwarded_to_box(idx);
         intbound
     }
 
     /// optimizer.py:115-125: setintbound(op, bound) — intersect existing
     /// bound with new bound, or set if none exists.
     pub fn setintbound(&mut self, opref: OpRef, bound: &crate::optimizeopt::intutils::IntBound) {
-        use crate::optimizeopt::info::Forwarded;
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         // optimizer.py:116: assert op.type == 'i'
         assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
@@ -3481,30 +3677,39 @@ impl OptContext {
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        match &mut self.forwarded[idx] {
-            Forwarded::IntBound(cur) => {
-                let _ = cur.intersect(bound);
-            }
-            fwd @ Forwarded::None => *fwd = Forwarded::IntBound(bound.clone()),
-            _ => {}
-        }
-        // H-3.1 mirror: keep `Box.forwarded` aligned with the legacy
-        // `forwarded[idx]` slot so reads (added in H-3.2+) see the same
-        // IntBound. RPython `optimizer.py:115-125 setintbound` writes
-        // through the same `_forwarded` slot the legacy Vec stores.
-        if let Some(replaced_box) = self.box_pool.get(idx).cloned() {
-            // Snapshot the current (post-write) Forwarded slot, then
-            // re-mirror to keep both representations in lockstep with
-            // intersect / overwrite semantics already applied above.
-            let mirror = match &self.forwarded[idx] {
-                Forwarded::IntBound(b) => {
-                    Some(crate::optimizeopt::info::OpInfo::IntBound(b.clone()))
+        // Phase C: BoxRef-direct read of pre-existing slot. Phase B made
+        // BoxRef the authoritative carrier for `Forwarded::Info(IntBound)`;
+        // empty-pool tests fall back to Vec because no BoxRef exists at
+        // `idx` to consult.
+        let new_intbound = if let Some(b) = self.box_pool.get(idx) {
+            use crate::r#box::Forwarded as BoxFwd;
+            match &*b.get_forwarded() {
+                BoxFwd::Info(OpInfo::IntBound(cur)) => {
+                    let mut cur = cur.clone();
+                    let _ = cur.intersect(bound);
+                    Some(cur)
                 }
+                BoxFwd::None => Some(bound.clone()),
                 _ => None,
-            };
-            if let Some(info) = mirror {
-                replaced_box.set_forwarded_info(info);
             }
+        } else {
+            match &self.forwarded[idx] {
+                Forwarded::IntBound(cur) => {
+                    let mut cur = cur.clone();
+                    let _ = cur.intersect(bound);
+                    Some(cur)
+                }
+                Forwarded::None => Some(bound.clone()),
+                _ => None,
+            }
+        };
+        if let Some(intbound) = new_intbound {
+            // BoxRef-direct.
+            if let Some(b) = self.box_pool.get(idx).cloned() {
+                b.set_forwarded_info(OpInfo::IntBound(intbound.clone()));
+            }
+            // Reverse mirror to Vec.
+            self.forwarded[idx] = Forwarded::IntBound(intbound);
         }
     }
 
@@ -3532,7 +3737,7 @@ impl OptContext {
     where
         F: FnOnce(&mut crate::optimizeopt::intutils::IntBound) -> R,
     {
-        use crate::optimizeopt::info::Forwarded;
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         // optimizer.py:99: assert op.type == 'i'
         assert!(
             matches!(self.opref_type(opref), Some(majit_ir::Type::Int) | None),
@@ -3556,29 +3761,56 @@ impl OptContext {
             return f(&mut tmp);
         }
         let idx = replaced.raw() as usize;
-        if idx >= self.forwarded.len() {
-            self.forwarded.resize(idx + 1, Forwarded::None);
-        }
-        let (result, mirrored) = match &mut self.forwarded[idx] {
-            Forwarded::IntBound(b) => (f(b), true),
-            fwd @ Forwarded::None => {
+        // Phase C: BoxRef-first mutation (mirror of with_ptr_info_mut slice 61
+        // pattern). Phase B made BoxRef the authoritative carrier for
+        // `Forwarded::Info(IntBound)`; mutate via `int_bound_mut` in place,
+        // then snapshot to Vec.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            use crate::r#box::Forwarded as BoxFwd;
+            let needs_init = matches!(*b.get_forwarded(), BoxFwd::None);
+            if needs_init {
                 // optimizer.py:110-112 first-access: materialize unbounded.
                 let mut new_bound = crate::optimizeopt::intutils::IntBound::unbounded();
                 let result = f(&mut new_bound);
+                b.set_forwarded_info(OpInfo::IntBound(new_bound.clone()));
+                if idx >= self.forwarded.len() {
+                    self.forwarded.resize(idx + 1, Forwarded::None);
+                }
+                self.forwarded[idx] = Forwarded::IntBound(new_bound);
+                return result;
+            }
+            if let Some(mut bound) = b.int_bound_mut() {
+                let result = f(&mut *bound);
+                let snap = bound.clone();
+                drop(bound);
+                if idx >= self.forwarded.len() {
+                    self.forwarded.resize(idx + 1, Forwarded::None);
+                }
+                self.forwarded[idx] = Forwarded::IntBound(snap);
+                return result;
+            }
+            // BoxRef has Forwarded::Box(_) | Info(Ptr(_)) — RPython's "rare
+            // case" arm: return IntBound.unbounded() without overwriting.
+            let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
+            return f(&mut tmp);
+        }
+        // Empty-pool fallback: legacy Vec-mut path (no BoxRef to mirror to).
+        if idx >= self.forwarded.len() {
+            self.forwarded.resize(idx + 1, Forwarded::None);
+        }
+        match &mut self.forwarded[idx] {
+            Forwarded::IntBound(b) => f(b),
+            fwd @ Forwarded::None => {
+                let mut new_bound = crate::optimizeopt::intutils::IntBound::unbounded();
+                let result = f(&mut new_bound);
                 *fwd = Forwarded::IntBound(new_bound);
-                (result, true)
+                result
             }
             _ => {
-                // Forwarded::Const/Op/Info — RPython's "rare case" arm:
-                // return IntBound.unbounded() without overwriting forwarding.
                 let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
-                (f(&mut tmp), false)
+                f(&mut tmp)
             }
-        };
-        if mirrored {
-            self.mirror_forwarded_to_box(idx);
         }
-        result
     }
 
     /// optimizer.py:410-432 make_constant(box, constbox).
@@ -3594,7 +3826,20 @@ impl OptContext {
         // RPython checks ONE authoritative source: box._forwarded.
         if let Value::Int(intval) = value {
             let ridx = replaced.raw() as usize;
-            if ridx < self.forwarded.len() {
+            // Phase C: BoxRef-first read of IntBound for the contains() +
+            // make_eq_const() in-place mutation. Phase B made BoxRef the
+            // authoritative carrier; empty-pool tests fall back to Vec.
+            if let Some(b) = self.box_pool.get(ridx) {
+                if let Some(mut bound) = b.int_bound_mut() {
+                    if !bound.contains(intval as i64) {
+                        std::panic::panic_any(crate::optimize::InvalidLoop(
+                            "constant int is outside the range allowed for that box",
+                        ));
+                    }
+                    // optimizer.py:424-426: info.make_eq_const(value)
+                    let _ = bound.make_eq_const(intval as i64);
+                }
+            } else if ridx < self.forwarded.len() {
                 if let Forwarded::IntBound(bound) = &mut self.forwarded[ridx] {
                     if !bound.contains(intval as i64) {
                         std::panic::panic_any(crate::optimize::InvalidLoop(
@@ -3633,19 +3878,17 @@ impl OptContext {
         }
         self.constants[idx] = Some(value.clone());
         // optimizer.py:432: box.set_forwarded(constbox)
+        // Phase B writer flip: BoxRef-direct allocates a fresh
+        // BoxRef::new_const(value) per call site, matching PyPy's
+        // history.py:220 ConstInt(value) construction (no dedup).
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            b.set_forwarded_box(crate::r#box::BoxRef::new_const(value.clone()));
+        }
+        // Reverse mirror to legacy Vec.
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
         self.forwarded[idx] = Forwarded::Const(value);
-        // H-3.1 mirror: RPython `optimizer.py:432 box.set_forwarded(constbox)`.
-        // RPython allocates a fresh `Const*` object per `make_constant`
-        // call; the Rust mirror creates a fresh `BoxRef::new_const(value)`
-        // to match. Box.forwarded(idx) → Forwarded::Box(constbox), where
-        // constbox is `BoxKind::Const(value)`.
-        if let Some(replaced_box) = self.box_pool.get(idx).cloned() {
-            let const_box = crate::r#box::BoxRef::new_const(value);
-            replaced_box.set_forwarded_box(const_box);
-        }
     }
 
     /// info.py:194-198 (AbstractStructPtrInfo) + info.py:533-538 (ArrayPtrInfo)
@@ -4665,7 +4908,11 @@ impl OptContext {
     /// `ConstPtrInfo` for constant pointers. Callers that need the
     /// RPython-faithful lookup (which also sees constants as
     /// `ConstPtrInfo`) should use `getptrinfo` instead.
-    pub fn get_ptr_info(&self, opref: OpRef) -> Option<&PtrInfo> {
+    ///
+    /// Visibility `pub(crate)` — empty-pool fallback for `peek_ptr_info_via_box`
+    /// / `has_ptr_info_via_box`. New callers should route through the
+    /// `*_via_box` helper family instead.
+    pub(crate) fn get_ptr_info(&self, opref: OpRef) -> Option<&PtrInfo> {
         use crate::optimizeopt::info::Forwarded;
         let r = self.get_box_replacement(opref);
         match self.forwarded.get(r.raw() as usize)? {
@@ -5216,16 +5463,6 @@ impl OptContext {
         )
     }
 
-    /// info.py: getptrinfo(op) — mutable variant.
-    pub fn get_ptr_info_mut(&mut self, opref: OpRef) -> Option<&mut PtrInfo> {
-        use crate::optimizeopt::info::Forwarded;
-        let r = self.get_box_replacement(opref);
-        match self.forwarded.get_mut(r.raw() as usize)? {
-            Forwarded::Info(info) => Some(info),
-            _ => None,
-        }
-    }
-
     /// info.py: op.set_forwarded(info) — set PtrInfo for an OpRef.
     /// Ensure a PtrInfo exists for the given OpRef. Creates an empty
     /// Instance if none exists, so that set_field can store values.
@@ -5233,14 +5470,27 @@ impl OptContext {
         if opref.is_constant() {
             return;
         }
-        use crate::optimizeopt::info::Forwarded;
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         let idx = opref.raw() as usize;
+        // Phase C: BoxRef-first probe for "already set" state. Phase B
+        // made BoxRef the authoritative carrier; empty-pool fixtures fall
+        // back to Vec.
+        let already_set = if let Some(b) = self.box_pool.get(idx) {
+            !matches!(*b.get_forwarded(), crate::r#box::Forwarded::None)
+        } else {
+            idx < self.forwarded.len() && !matches!(self.forwarded[idx], Forwarded::None)
+        };
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        if matches!(self.forwarded[idx], Forwarded::None) {
-            self.forwarded[idx] = Forwarded::Info(PtrInfo::instance(None, None));
-            self.mirror_forwarded_to_box(idx);
+        if !already_set {
+            let info = PtrInfo::instance(None, None);
+            // BoxRef-direct write.
+            if let Some(b) = self.box_pool.get(idx).cloned() {
+                b.set_forwarded_info(OpInfo::Ptr(info.clone()));
+            }
+            // Reverse mirror to Vec.
+            self.forwarded[idx] = Forwarded::Info(info);
         }
     }
 
@@ -5250,18 +5500,28 @@ impl OptContext {
     /// `get_box_replacement(box)` then returns the terminal Box which has the info.
     /// In majit, we follow the Op chain to the terminal OpRef and set Info there.
     fn ensure_ptr_info_preserve_forwarding(&mut self, opref: OpRef, info: PtrInfo) {
-        use crate::optimizeopt::info::Forwarded;
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         let terminal = self.get_box_replacement(opref);
         if terminal.is_constant() {
             return;
         }
         let idx = terminal.raw() as usize;
+        // Phase C: BoxRef-first probe; empty-pool falls back to Vec.
+        let already_set = if let Some(b) = self.box_pool.get(idx) {
+            !matches!(*b.get_forwarded(), crate::r#box::Forwarded::None)
+        } else {
+            idx < self.forwarded.len() && !matches!(self.forwarded[idx], Forwarded::None)
+        };
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        if matches!(self.forwarded[idx], Forwarded::None) {
+        if !already_set {
+            // BoxRef-direct write.
+            if let Some(b) = self.box_pool.get(idx).cloned() {
+                b.set_forwarded_info(OpInfo::Ptr(info.clone()));
+            }
+            // Reverse mirror to Vec.
             self.forwarded[idx] = Forwarded::Info(info);
-            self.mirror_forwarded_to_box(idx);
         }
     }
 
@@ -5456,10 +5716,15 @@ impl OptContext {
             return;
         }
         // info.py:203-211 AbstractStructPtrInfo.setfield: mutate `_fields`.
-        let mut handle = self.ensure_ptr_info_arg0(op);
-        if let Some(pi) = handle.as_mut() {
-            pi.setfield(field_idx, value);
-        }
+        // Route through `with_ensured_ptr_info_arg0` so `mirror_forwarded_to_box`
+        // re-syncs the BoxRef after the legacy `PtrInfo::Struct.fields` slot
+        // is mutated. PyPy mirrors this via single `_forwarded` slot
+        // (`info.py:203` mutates the same object both readers see).
+        self.with_ensured_ptr_info_arg0(op, |mut handle| {
+            if let Some(mut pi) = handle.as_mut() {
+                pi.setfield(field_idx, value);
+            }
+        });
     }
 
     /// info.py:746-748 `ConstPtrInfo.setitem` + info.py: ArrayPtrInfo
@@ -5479,10 +5744,13 @@ impl OptContext {
             return;
         }
         // info.py: ArrayPtrInfo.setitem: mutate `_items`.
-        let mut handle = self.ensure_ptr_info_arg0(op);
-        if let Some(pi) = handle.as_mut() {
-            pi.setitem(index, value);
-        }
+        // Same wrapper rationale as `structinfo_setfield` above —
+        // `mirror_forwarded_to_box` keeps BoxRef in sync.
+        self.with_ensured_ptr_info_arg0(op, |mut handle| {
+            if let Some(mut pi) = handle.as_mut() {
+                pi.setitem(index, value);
+            }
+        });
     }
 
     /// RPython set_forwarded parity: setting Info on a box REPLACES
@@ -5642,10 +5910,13 @@ impl OptContext {
                     | PtrInfo::Str(_)
             )
         ) {
-            // optimizer.py:469: return opinfo. The mutable re-borrow on
-            // `self.forwarded[idx]` is fresh — owned PtrInfo from peek
-            // above does not hold a borrow into self.
+            // optimizer.py:469: return opinfo. With box_pool populated the
+            // BoxRef carries the authoritative PtrInfo (Phase B writer flip);
+            // empty-pool fixtures fall back to the Vec slot.
             let idx = arg0.raw() as usize;
+            if let Some(bx) = self.box_pool.get(idx).cloned() {
+                return EnsuredPtrInfo::ForwardedBox(bx);
+            }
             let info = match &mut self.forwarded[idx] {
                 Forwarded::Info(info) => info,
                 other => unreachable!(
@@ -5771,10 +6042,20 @@ impl OptContext {
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
+        // Phase B writer flip: BoxRef-direct first.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            use crate::optimizeopt::info::OpInfo;
+            b.set_forwarded_info(OpInfo::Ptr(new_info.clone()));
+        }
+        // Reverse mirror to Vec (defensive snapshot for empty-pool fallback
+        // readers; production reads route through BoxRef).
         self.forwarded[idx] = Forwarded::Info(new_info);
-        self.mirror_forwarded_to_box(idx);
-        // optimizer.py:499: return opinfo — re-borrow the freshly-installed
-        // PtrInfo so the caller can mutate it via Forwarded variant methods.
+        // optimizer.py:499: return opinfo. Production with populated box_pool
+        // hands back the BoxRef so subsequent mutations land on the
+        // authoritative slot; empty-pool fixtures re-borrow the Vec slot.
+        if let Some(bx) = self.box_pool.get(idx).cloned() {
+            return EnsuredPtrInfo::ForwardedBox(bx);
+        }
         let info = match &mut self.forwarded[idx] {
             Forwarded::Info(info) => info,
             _ => unreachable!(),
@@ -5822,14 +6103,29 @@ impl OptContext {
     /// Take ownership of PtrInfo, replacing with None.
     /// Used by force_box to mutate info in-place (RPython parity).
     pub fn take_ptr_info(&mut self, opref: OpRef) -> Option<PtrInfo> {
-        use crate::optimizeopt::info::Forwarded;
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         let r = self.get_box_replacement(opref);
         let idx = r.raw() as usize;
+        // Phase C: BoxRef-first read. Phase B made BoxRef the authoritative
+        // carrier for `Forwarded::Info(OpInfo::Ptr(_))`; empty-pool fixtures
+        // fall back to Vec `mem::replace`.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            let info = match &*b.get_forwarded() {
+                crate::r#box::Forwarded::Info(OpInfo::Ptr(p)) => Some(p.clone()),
+                _ => None,
+            };
+            if info.is_some() {
+                b.clear_forwarded();
+                if idx < self.forwarded.len() {
+                    self.forwarded[idx] = Forwarded::None;
+                }
+            }
+            return info;
+        }
         let slot = self.forwarded.get_mut(idx)?;
         match slot {
             Forwarded::Info(_) => {
                 let old = std::mem::replace(slot, Forwarded::None);
-                self.mirror_forwarded_to_box(idx);
                 match old {
                     Forwarded::Info(info) => Some(info),
                     _ => unreachable!(),
@@ -5843,19 +6139,17 @@ impl OptContext {
         if opref.is_constant() {
             return;
         }
-        use crate::optimizeopt::info::Forwarded;
+        use crate::optimizeopt::info::{Forwarded, OpInfo};
         let idx = opref.raw() as usize;
+        // Phase B writer flip: BoxRef-direct first.
+        if let Some(b) = self.box_pool.get(idx).cloned() {
+            b.set_forwarded_info(OpInfo::Ptr(info.clone()));
+        }
+        // Reverse mirror to legacy Vec.
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        self.forwarded[idx] = Forwarded::Info(info.clone());
-        // H-3.1 mirror: RPython `optimizer.py box.set_forwarded(PtrInfo)`.
-        // The Box's `_forwarded` slot stores the PtrInfo directly so
-        // chain walks reading via Box (H-3.2+) reach the same terminal
-        // info object the legacy Vec stores.
-        if let Some(target_box) = self.box_pool.get(idx).cloned() {
-            target_box.set_forwarded_info(crate::optimizeopt::info::OpInfo::Ptr(info));
-        }
+        self.forwarded[idx] = Forwarded::Info(info);
     }
 
     /// optimizer.py: replace_op_with(old, new_op, ctx)
@@ -6079,7 +6373,7 @@ mod h3_1_mirror_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         let b0 = BoxRef::new_inputarg(Type::Int, Some(0));
         let b1 = BoxRef::new_inputarg(Type::Int, Some(1));
-        ctx.box_pool = vec![b0.clone(), b1.clone()];
+        ctx.box_pool = vec![b0.clone(), b1.clone()].into();
         (ctx, b0, b1)
     }
 
@@ -6103,13 +6397,66 @@ mod h3_1_mirror_tests {
         assert!(matches!(*b0.get_forwarded(), BoxForwarded::None));
     }
 
+    /// `optimizer.py:387-400 make_equal_to` Info transfer parity: when
+    /// `old` carries `Forwarded::IntBound(_)` and is forwarded to a
+    /// non-constant `new`, the IntBound moves to `new`'s slot.
+    #[test]
+    fn h3_1_replace_op_transfers_int_bound_to_new() {
+        let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
+        let bound = IntBound::from_constant(7);
+        ctx.setintbound(OpRef::from_raw(0), &bound);
+        // Before: forwarded[0] = IntBound, forwarded[1] = None.
+        ctx.replace_op(OpRef::from_raw(0), OpRef::from_raw(1));
+        // After: old's IntBound transferred to new (PyPy:
+        // `newop.set_forwarded(opinfo)`). old now forwards to new.
+        match ctx.forwarded.get(1) {
+            Some(crate::optimizeopt::info::Forwarded::IntBound(b)) => {
+                assert_eq!(b.lower, 7);
+                assert_eq!(b.upper, 7);
+            }
+            other => panic!(
+                "expected new[1] to carry IntBound after transfer, got {:?}",
+                other
+            ),
+        }
+        // BoxRef snapshot is in sync via mirror_forwarded_to_box.
+        match &*b1.get_forwarded() {
+            BoxForwarded::Info(OpInfo::IntBound(b)) => assert_eq!(b.lower, 7),
+            other => panic!("BoxRef[1] should mirror IntBound, got {:?}", other),
+        }
+        // old's slot now points to new (forwarding chain head).
+        match &*b0.get_forwarded() {
+            BoxForwarded::Box(target) => assert_eq!(target, &b1),
+            other => panic!("expected b0 to forward to b1, got {:?}", other),
+        }
+    }
+
+    /// `optimizer.py:400` guard: transfer is **skipped** when `new` is
+    /// constant. PyPy short-circuits via `not newop.is_constant()`.
+    #[test]
+    fn h3_1_replace_op_skips_info_transfer_when_new_is_constant() {
+        use crate::optimizeopt::info::Forwarded;
+        let (mut ctx, _b0, _b1) = ctx_with_two_int_boxes();
+        // Seed an IntBound on old.
+        let bound = IntBound::from_constant(42);
+        ctx.setintbound(OpRef::from_raw(0), &bound);
+        // Forward to a Const target.
+        let const_opref = OpRef::const_int(0);
+        ctx.const_pool
+            .insert(const_opref.const_index(), Value::Int(42));
+        ctx.replace_op(OpRef::from_raw(0), const_opref);
+        // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
+        // Const targets do not carry transferred info — PyPy skips this case.
+        assert!(matches!(ctx.forwarded.get(0), Some(Forwarded::Op(_)),));
+    }
+
     /// `set_ptr_info(opref, info)` mirrors `box.set_forwarded(PtrInfo)`.
     #[test]
     fn h3_1_set_ptr_info_mirrors_box_info() {
         // PtrInfo applies to ref-typed boxes.
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let b = BoxRef::new_inputarg(Type::Ref, Some(0));
-        ctx.box_pool = vec![b.clone()];
+        ctx.box_pool = vec![b.clone()].into();
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
         ctx.set_ptr_info(OpRef::from_raw(0), info);
         match &*b.get_forwarded() {
@@ -6228,8 +6575,8 @@ mod h3_1_mirror_tests {
         // Layout: indices 0..2 are Phase 1 emit-position placeholders
         // (Void BoxRefs), indices 2..4 are Phase 2 inputarg BoxRefs (Ref).
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 4, 0, 4);
-        let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void);
-        let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void);
+        let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, 0);
+        let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, 1);
         let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(2));
         let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(3));
         ctx.box_pool = vec![
@@ -6237,7 +6584,8 @@ mod h3_1_mirror_tests {
             placeholder_other,
             source_box.clone(),
             other_box,
-        ];
+        ]
+        .into();
 
         let target_p1 = OpRef::from_raw(0);
         let source_p2 = OpRef::from_raw(2);
@@ -6296,8 +6644,8 @@ mod h3_1_mirror_tests {
     #[test]
     fn h3_4_phase2_placeholder_without_import_returns_none_consistently() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 4, 0, 4);
-        let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void);
-        let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void);
+        let placeholder_target = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, 0);
+        let placeholder_other = crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, 1);
         let source_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(2));
         let other_box = crate::r#box::BoxRef::new_inputarg(majit_ir::Type::Ref, Some(3));
         ctx.box_pool = vec![
@@ -6305,7 +6653,8 @@ mod h3_1_mirror_tests {
             placeholder_other,
             source_box,
             other_box,
-        ];
+        ]
+        .into();
 
         let target_p1 = OpRef::from_raw(0);
         let source_p2 = OpRef::from_raw(2);
@@ -6450,7 +6799,7 @@ mod h3_1_mirror_tests {
     fn ctx_with_one_ref_box() -> (OptContext, BoxRef) {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let b = BoxRef::new_inputarg(Type::Ref, Some(0));
-        ctx.box_pool = vec![b.clone()];
+        ctx.box_pool = vec![b.clone()].into();
         (ctx, b)
     }
 
@@ -6695,6 +7044,66 @@ mod h3_1_mirror_tests {
                 .and_then(|i| i.get_last_guard_pos()),
             Some(42)
         );
+    }
+
+    #[test]
+    fn h3_2c_with_ptr_info_mut_creates_legacy_mirror_from_boxref_only() {
+        let (mut ctx, b) = ctx_with_one_ref_box();
+        b.set_forwarded_info(OpInfo::Ptr(PtrInfo::NonNull { last_guard_pos: 1 }));
+        assert!(ctx.forwarded.is_empty());
+
+        ctx.with_ptr_info_mut(OpRef::from_raw(0), |info| {
+            info.set_last_guard_pos(17);
+        })
+        .expect("BoxRef PtrInfo exists");
+
+        match ctx.forwarded.get(0) {
+            Some(crate::optimizeopt::info::Forwarded::Info(info)) => {
+                assert_eq!(info.get_last_guard_pos(), Some(17));
+            }
+            other => panic!("expected Vec mirror Info after BoxRef mutation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h3_2c_with_ensured_ptr_info_arg0_creates_legacy_mirror_from_boxref_only() {
+        let (mut ctx, b) = ctx_with_one_ref_box();
+        b.set_forwarded_info(OpInfo::Ptr(PtrInfo::instance(None, None)));
+        assert!(ctx.forwarded.is_empty());
+
+        let op = majit_ir::Op::new(majit_ir::OpCode::GuardClass, &[OpRef::from_raw(0)]);
+        ctx.with_ensured_ptr_info_arg0(&op, |mut info| {
+            info.as_mut()
+                .expect("existing BoxRef PtrInfo returned by ensure_ptr_info_arg0")
+                .set_last_guard_pos(23);
+        });
+
+        match ctx.forwarded.get(0) {
+            Some(crate::optimizeopt::info::Forwarded::Info(info)) => {
+                assert_eq!(info.get_last_guard_pos(), Some(23));
+            }
+            other => panic!("expected Vec mirror Info after ensured mutation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h3_2c_with_intbound_mut_creates_legacy_mirror_from_boxref_only() {
+        let mut ctx = OptContext::with_inputarg_types(1, &[Type::Int]);
+        let b = ctx.box_pool.get(0).cloned().expect("inputarg BoxRef");
+        b.set_forwarded_info(OpInfo::IntBound(IntBound::from_constant(3)));
+        assert!(ctx.forwarded.is_empty());
+
+        ctx.with_intbound_mut(OpRef::from_raw(0), |bound| {
+            bound.upper = 9;
+        });
+
+        match ctx.forwarded.get(0) {
+            Some(crate::optimizeopt::info::Forwarded::IntBound(bound)) => {
+                assert_eq!(bound.lower, 3);
+                assert_eq!(bound.upper, 9);
+            }
+            other => panic!("expected Vec mirror IntBound after BoxRef mutation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7024,7 +7433,7 @@ mod ensure_ptr_info_arg0_tests {
     use super::*;
     use crate::optimizeopt::info::{ArrayPtrInfo, EnsuredPtrInfo, PtrInfo};
     use crate::optimizeopt::intutils::IntBound;
-    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, SizeDescr, Value};
+    use majit_ir::{Descr, DescrRef, GcRef, Op, OpCode, OpRef, SizeDescr, Type, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -7125,7 +7534,7 @@ mod ensure_ptr_info_arg0_tests {
     /// Constant `Value::Ref` arg0 → `EnsuredPtrInfo::Constant(gcref)`.
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_ref() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xdead_beef)));
         let op = field_op_with_parent(struct_parent_descr());
         let info = ctx.ensure_ptr_info_arg0(&op);
@@ -7142,7 +7551,7 @@ mod ensure_ptr_info_arg0_tests {
     /// protection (info.py:719-720).
     #[test]
     fn ensure_ptr_info_arg0_returns_constant_for_value_int() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.seed_constant(OpRef::from_raw(0), Value::Int(1));
         let op = field_op_with_parent(struct_parent_descr());
         let info = ctx.ensure_ptr_info_arg0(&op);
@@ -7156,7 +7565,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_constant_string_returns_exact_length_via_resolver() {
         use std::sync::Arc;
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xC0FE)));
         // Resolver pretends every constant has byte-string length 5 in
         // mode_string and unicode length 7 in mode_unicode.
@@ -7195,7 +7604,7 @@ mod ensure_ptr_info_arg0_tests {
     #[test]
     fn ensure_ptr_info_arg0_constant_string_falls_back_to_nonnegative_without_resolver() {
         use std::sync::Arc;
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0x1234)));
         let op = {
             let descr: DescrRef = Arc::new(TestSizeDescr {
@@ -7219,7 +7628,7 @@ mod ensure_ptr_info_arg0_tests {
     /// freshly-installed `PtrInfo::Struct` via `Forwarded(&mut PtrInfo)`.
     #[test]
     fn ensure_ptr_info_arg0_constructs_struct_for_non_object_field() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         // Keep a strong reference to the parent alive for the duration
         // of the test: `SimpleFieldDescr::parent_descr` is a
         // `Weak<DescrRef>` (breaks the cycle between SizeDescr.all_fielddescrs
@@ -7229,19 +7638,19 @@ mod ensure_ptr_info_arg0_tests {
         let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let pi = info.as_mut().expect("Forwarded variant expected");
-        assert!(matches!(pi, PtrInfo::Struct(_)));
+        assert!(matches!(&*pi, PtrInfo::Struct(_)));
     }
 
     /// optimizer.py:480-484 GETFIELD branch with `parent_descr.is_object() == true`
     /// → `info.InstancePtrInfo(parent_descr)`.
     #[test]
     fn ensure_ptr_info_arg0_constructs_instance_for_object_field() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         let _parent = instance_parent_descr();
         let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let pi = info.as_mut().expect("Forwarded variant expected");
-        assert!(matches!(pi, PtrInfo::Instance(_)));
+        assert!(matches!(&*pi, PtrInfo::Instance(_)));
     }
 
     /// optimizer.py:485-487 ARRAYLEN_GC branch → `info.ArrayPtrInfo(descr)`.
@@ -7251,7 +7660,7 @@ mod ensure_ptr_info_arg0_tests {
     /// pre-installed `nonnegative` lenbound on the freshly-built ArrayPtrInfo.
     #[test]
     fn ensure_ptr_info_arg0_arraylen_returns_array_with_nonnegative_lenbound() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         let op = array_op();
         let mut info = ctx.ensure_ptr_info_arg0(&op);
         let bound = info
@@ -7270,7 +7679,7 @@ mod ensure_ptr_info_arg0_tests {
     /// non-negative bound.
     #[test]
     fn ensure_ptr_info_arg0_constant_arraylen_returns_nonnegative() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.seed_constant(OpRef::from_raw(0), Value::Ref(GcRef(0xfeed)));
         let op = array_op();
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -7288,13 +7697,14 @@ mod ensure_ptr_info_arg0_tests {
     /// the Rust port checks via state preserved across calls.
     #[test]
     fn ensure_ptr_info_arg0_returns_existing_array_unchanged() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         let op = array_op();
         // First call constructs the ArrayPtrInfo and tightens the lenbound
         // through the helper.
         {
             let mut info = ctx.ensure_ptr_info_arg0(&op);
-            if let Some(PtrInfo::Array(arr)) = info.as_mut() {
+            let mut handle = info.as_mut().expect("expected fresh ArrayPtrInfo");
+            if let PtrInfo::Array(arr) = &mut *handle {
                 let _ = arr.lenbound.make_gt_const(7);
             } else {
                 panic!("expected fresh ArrayPtrInfo");
@@ -7302,8 +7712,9 @@ mod ensure_ptr_info_arg0_tests {
         }
         // Second call returns the same ArrayPtrInfo (lenbound preserved).
         let mut info = ctx.ensure_ptr_info_arg0(&op);
-        match info.as_mut() {
-            Some(PtrInfo::Array(ArrayPtrInfo { lenbound, .. })) => {
+        let mut handle = info.as_mut().expect("second call must still return Array");
+        match &mut *handle {
+            PtrInfo::Array(ArrayPtrInfo { lenbound, .. }) => {
                 assert!(
                     lenbound.lower >= 8,
                     "second call must return the previously-mutated ArrayPtrInfo (lower={})",
@@ -7320,14 +7731,15 @@ mod ensure_ptr_info_arg0_tests {
     /// is preserved on the freshly-installed PtrInfo.
     #[test]
     fn ensure_ptr_info_arg0_upgrades_nonnull_to_struct() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         // Pre-install a NonNullPtrInfo with a specific last_guard_pos.
         ctx.set_ptr_info(OpRef::from_raw(0), PtrInfo::NonNull { last_guard_pos: 7 });
         let _parent = struct_parent_descr();
         let op = field_op_with_parent(_parent.clone());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
-        match info.as_mut() {
-            Some(pi @ PtrInfo::Struct(_)) => {
+        let mut handle = info.as_mut().expect("expected upgraded Struct, got None");
+        match &mut *handle {
+            pi @ PtrInfo::Struct(_) => {
                 assert_eq!(pi.last_guard_pos(), Some(7));
             }
             other => panic!("expected upgraded Struct, got {other:?}"),
@@ -7341,15 +7753,18 @@ mod ensure_ptr_info_arg0_tests {
     /// hits, and the existing Instance is returned without overwrite.
     #[test]
     fn ensure_ptr_info_arg0_does_not_overwrite_existing_instance() {
-        let mut ctx = OptContext::with_num_inputs(4, 1);
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
         ctx.set_ptr_info(
             OpRef::from_raw(0),
             PtrInfo::instance(Some(instance_parent_descr()), Some(GcRef(0xc0de))),
         );
         let op = field_op_with_parent(struct_parent_descr());
         let mut info = ctx.ensure_ptr_info_arg0(&op);
-        match info.as_mut() {
-            Some(PtrInfo::Instance(_)) => {} // unchanged
+        let mut handle = info
+            .as_mut()
+            .expect("expected Instance preserved, got None");
+        match &mut *handle {
+            PtrInfo::Instance(_) => {} // unchanged
             other => panic!("expected Instance preserved, got {other:?}"),
         }
     }
@@ -7493,7 +7908,9 @@ mod imported_short_preamble_fallback_tests {
 
     #[test]
     fn force_op_from_preamble_replays_pop_without_builder_lookup() {
-        let mut ctx = OptContext::with_num_inputs(16, 2);
+        // 2 Ref inputargs for the body label — typical loop-body shape.
+        let mut ctx =
+            OptContext::with_inputarg_types(16, &[majit_ir::Type::Ref, majit_ir::Type::Ref]);
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::from_raw(0), OpRef::from_raw(1)],
             &[OpRef::from_raw(7), OpRef::from_raw(8)],

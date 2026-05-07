@@ -206,7 +206,7 @@ pub struct Optimizer {
     /// Empty for callers that never set the pool (tests, retrace
     /// helpers without recorder); mirror writes installed in H-3.1
     /// fall back to legacy `forwarded` Vec only.
-    pending_box_pool: Vec<crate::r#box::BoxRef>,
+    pending_box_pool: crate::r#box::BoxPool,
 }
 
 fn value_from_backend_constant_bits_typed(
@@ -1137,7 +1137,7 @@ impl Optimizer {
             opt_ops_emitted: 0,
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
-            pending_box_pool: Vec::new(),
+            pending_box_pool: crate::r#box::BoxPool::new(),
         }
     }
 
@@ -1146,8 +1146,8 @@ impl Optimizer {
     /// `OptContext.box_pool`. Production callers invoke this after
     /// extracting `treeloop.box_pool`. Calling it more than once before
     /// optimization replaces the staged pool.
-    pub fn set_pending_box_pool(&mut self, box_pool: Vec<crate::r#box::BoxRef>) {
-        self.pending_box_pool = box_pool;
+    pub fn set_pending_box_pool(&mut self, box_pool: impl Into<crate::r#box::BoxPool>) {
+        self.pending_box_pool = box_pool.into();
     }
 
     /// Record a CALL_PURE result for cross-iteration constant folding.
@@ -3023,8 +3023,19 @@ impl Optimizer {
         if !inline_short_preamble || front_target_tokens.len() <= 1 {
             if let Some(preamble_token) = front_target_tokens.first() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
+                    // opencoder.py:259 inputarg_from_tp parity — seed inputarg
+                    // BoxRefs with the producer-side types when available; the
+                    // Ref fallback covers the rare case the recorder hasn't
+                    // populated `trace_inputarg_types` (e.g. test-only entry
+                    // paths) and matches the historical Type::Void behaviour
+                    // for ptr-handle slots.
                     let ni = self.final_num_inputs();
-                    OptContext::with_num_inputs(32, ni)
+                    let types: Vec<majit_ir::Type> = self
+                        .trace_inputarg_types
+                        .get(..ni)
+                        .map(|s| s.to_vec())
+                        .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
+                    OptContext::with_inputarg_types(32, &types)
                 });
                 // unroll.py:240-242: jump_to_preamble → send_extra_operation
                 let mut jump_op = terminal_jump.clone();
@@ -3040,8 +3051,15 @@ impl Optimizer {
 
         // unroll.py:203: self.flush()
         let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
+            // opencoder.py:259 inputarg_from_tp parity — same fallback shape
+            // as the inline_short_preamble path above.
             let ni = self.final_num_inputs();
-            OptContext::with_num_inputs(32, ni)
+            let types: Vec<majit_ir::Type> = self
+                .trace_inputarg_types
+                .get(..ni)
+                .map(|s| s.to_vec())
+                .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
+            OptContext::with_inputarg_types(32, &types)
         });
 
         // RPython parity: export virtual state BEFORE flush() and
@@ -5253,7 +5271,7 @@ mod tests {
     fn test_inputarg_type_phase1_no_fallback() {
         // In Phase 1 (`inputarg_base == 0`) the low-range fallback must
         // NOT trigger — only the canonical own-range path applies.
-        let mut ctx = OptContext::with_num_inputs(8, 3);
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref, Type::Ref]);
         ctx.inputarg_types = vec![Type::Int, Type::Ref, Type::Float];
         // OpRefs in [0..3) resolve through the own range (inputarg_base=0).
         assert_eq!(ctx.inputarg_type(OpRef::from_raw(0)), Some(Type::Int));
@@ -5358,7 +5376,10 @@ mod tests {
         use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
 
         let descr = make_size_descr(16);
-        let mut ctx = OptContext::with_num_inputs(32, 1024);
+        // Generous Ref-typed inputarg pool — slot 10/11 are opaque opref handles
+        // for the test, every slot uses Ref to match the producer-side shape
+        // (`inputarg_from_tp` per opencoder.py:259 with all Ref args).
+        let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
         ctx.set_ptr_info(
             OpRef::from_raw(10),
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -5409,7 +5430,7 @@ mod tests {
 
         let descr = make_size_descr(16);
         let field_descr: DescrRef = std::sync::Arc::new(TestDescr(0));
-        let mut ctx = OptContext::with_num_inputs(16, 1);
+        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
         ctx.set_ptr_info(
             OpRef::from_raw(10),
             PtrInfo::VirtualStruct(VirtualStructInfo {
@@ -5448,7 +5469,7 @@ mod tests {
     #[test]
     fn test_emit_operation_forces_imported_short_guard_args() {
         let mut opt = Optimizer::new();
-        let mut ctx = OptContext::with_num_inputs(16, 1);
+        let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
 
         let mut preamble_op = Op::new(
             OpCode::IntGe,

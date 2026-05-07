@@ -371,6 +371,12 @@ struct PreparedBridgeTrace {
     snapshot_vref_boxes: SnapshotBoxes,
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
+    /// Per-iter `BoxRef` pool from the bridge `TraceIterator`, mirroring
+    /// `opencoder.py:259-262`'s fresh `inputarg_from_tp` / `cls()` allocation
+    /// for the bridge's disjoint Box identity set. The optimizer consumes it
+    /// via `set_pending_box_pool` so BoxRef-routing readers see the bridge's
+    /// own boxes, not the parent loop's.
+    box_pool: crate::r#box::BoxPool,
 }
 
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
@@ -444,6 +450,7 @@ fn prepare_bridge_trace_for_optimizer(
         None,
         &bridge_inputarg_types,
         bridge_inputarg_base,
+        None, // p1_full_prefix — bridge has no prior unroll phase
     );
     let mut ops = Vec::with_capacity(bridge_ops.len());
     while let Some(op) = iter.next() {
@@ -455,6 +462,7 @@ fn prepare_bridge_trace_for_optimizer(
         .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.raw()))
         .collect();
     let cache = iter._cache;
+    let box_pool = iter.box_pool;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
     let snapshot_vref_boxes = translate_trace_iter_box_map(snapshot_vref_boxes, &cache);
@@ -475,6 +483,7 @@ fn prepare_bridge_trace_for_optimizer(
         snapshot_vref_boxes,
         snapshot_frame_pcs,
         pending_bridge_rd,
+        box_pool,
     }
 }
 
@@ -8029,6 +8038,12 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        // Per-iter bridge `BoxRef` pool from `prepare_bridge_trace_for_optimizer`'s
+        // `TraceIterator::new` (`opencoder.py:259-262` parity). The bridge
+        // optimizer reads through `BoxRef::_forwarded` for `getptrinfo` /
+        // `getintbound` callsites; without this plumb, those readers fall back
+        // to the legacy Vec via `box_pool.is_empty()` sentinel.
+        optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         for arg in bridge_inputargs {
@@ -8479,6 +8494,10 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
+        // Per-iter bridge `BoxRef` pool — see the sibling compile_bridge entry
+        // earlier for the rationale. Both bridge entries (descriptor=None and
+        // descriptor=Some) need the plumb so BoxRef readers stay primary.
+        optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
         // RPython Box.type parity: inputargs carry their types implicitly

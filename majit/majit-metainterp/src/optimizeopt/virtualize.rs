@@ -2133,7 +2133,8 @@ mod tests {
     fn test_standard_virtualizable_force_is_noop_in_optimizer() {
         // Verify that Optimizer::force_box skips Virtualizable PtrInfo
         // without destroying the tracked field state.
-        let mut ctx = OptContext::with_num_inputs(8, 1);
+        // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
         ctx.set_ptr_info(
             OpRef::input_arg_ref(0),
             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -2171,7 +2172,8 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_raw_first_read_is_not_cached() {
-        let mut ctx = OptContext::with_num_inputs(8, 1);
+        // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
@@ -2243,7 +2245,9 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_call_does_not_force_frame_to_raw_storeback() {
-        let mut ctx = OptContext::with_num_inputs(8, 3);
+        // opencoder.py:259 inputarg_from_tp — vable Ref + an opaque Int call
+        // arg at slot 1 (slot 100 stays an outside-of-inputargs free opref).
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8, 16],
             static_field_types: vec![Type::Int, Type::Int],
@@ -2261,7 +2265,7 @@ mod tests {
             &[
                 OpRef::input_arg_ref(0),
                 OpRef::from_raw(100),
-                OpRef::from_raw(1),
+                OpRef::input_arg_int(1),
             ],
         );
         call.descr = Some(majit_ir::descr::make_call_descr(
@@ -2288,7 +2292,10 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_raw_getfield_is_not_absorbed_by_optimizer() {
-        let mut ctx = OptContext::with_num_inputs(8, 2);
+        // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg
+        // here; slot 10 (the GetfieldRawI result) lives above the inputarg
+        // range and is not seeded.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
@@ -2311,7 +2318,8 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_raw_setfield_is_not_absorbed_by_optimizer() {
-        let mut ctx = OptContext::with_num_inputs(8, 2);
+        // opencoder.py:259 inputarg_from_tp — vable Ref + Int value inputarg.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
@@ -2326,7 +2334,7 @@ mod tests {
 
         let mut set = Op::new(
             OpCode::SetfieldRaw,
-            &[OpRef::input_arg_ref(0), OpRef::from_raw(1)],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
         );
         set.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
 
@@ -2343,7 +2351,10 @@ mod tests {
         let config = info.to_optimizer_config();
         let real_descr = info.static_field_descr(0);
 
-        let mut ctx = OptContext::with_num_inputs(8, 2);
+        // opencoder.py:259 inputarg_from_tp — vable Ref + the `pc` static Int
+        // field's flat-input slot 1 (init_virtualizable consumes
+        // `config.static_field_offsets.len()` slots after the vable).
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(config);
         pass.setup();
         if let Some(ref mut vt) = pass.vable {
@@ -2402,7 +2413,8 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_raw_getarrayitem_is_not_absorbed_by_optimizer() {
-        let mut ctx = OptContext::with_num_inputs(8, 2);
+        // opencoder.py:259 inputarg_from_tp — vable Ref + Int array index.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
@@ -2426,7 +2438,7 @@ mod tests {
 
         let mut get_item = Op::new(
             OpCode::GetarrayitemRawI,
-            &[OpRef::from_raw(10), OpRef::from_raw(1)],
+            &[OpRef::from_raw(10), OpRef::input_arg_int(1)],
         );
         get_item.descr = Some(array_descr(24));
         let result = pass.propagate_forward(&get_item, &mut ctx);
@@ -2435,7 +2447,8 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_raw_setarrayitem_is_not_absorbed_by_optimizer() {
-        let mut ctx = OptContext::with_num_inputs(8, 2);
+        // opencoder.py:259 inputarg_from_tp — vable Ref + Int array index.
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
@@ -2459,7 +2472,11 @@ mod tests {
 
         let mut set_item = Op::new(
             OpCode::SetarrayitemRaw,
-            &[OpRef::from_raw(10), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[
+                OpRef::from_raw(10),
+                OpRef::input_arg_int(1),
+                OpRef::from_raw(2),
+            ],
         );
         set_item.descr = Some(array_descr(24));
         let result = pass.propagate_forward(&set_item, &mut ctx);
@@ -2468,7 +2485,9 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_raw_setarrayitem_updates_vable_state_without_side_table() {
-        let mut ctx = OptContext::with_num_inputs(3, 2);
+        // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg;
+        // slot 50 (constant), 10 / 2 (free oprefs) sit above the inputarg range.
+        let mut ctx = OptContext::with_inputarg_types(3, &[Type::Ref]);
         ctx.seed_constant(OpRef::from_raw(50), Value::Int(0));
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
