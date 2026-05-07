@@ -301,69 +301,6 @@ impl OptVirtualize {
         }
     }
 
-    // ── Force virtual ──
-
-    /// Force a virtual to become concrete: emit the allocation + setfield ops.
-    /// Returns the OpRef of the emitted allocation.
-    ///
-    /// info.py:137-160 force_box() — master dispatcher delegates to
-    /// PtrInfo::force_box for all standard virtual variants.
-    /// Virtualizable is Rust-specific and stays here.
-    fn force_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref);
-        let info = match ctx.peek_ptr_info_via_box(resolved) {
-            Some(info) if info.is_virtual() => info,
-            _ => return resolved, // not virtual, nothing to do
-        };
-
-        // Virtualizable is not a standard PtrInfo virtual — it represents
-        // an existing heap object with tracked fields, not a deferred alloc.
-        if matches!(info, PtrInfo::Virtualizable(_)) {
-            let vinfo = match ctx.take_ptr_info(resolved) {
-                Some(PtrInfo::Virtualizable(v)) => v,
-                _ => unreachable!(),
-            };
-            return if self.is_standard_virtualizable_ref(resolved, ctx) {
-                resolved
-            } else {
-                self.force_virtualizable(resolved, vinfo, ctx)
-            };
-        }
-
-        // All other virtual variants: delegate to PtrInfo::force_box
-        // (info.py:137-160 AbstractVirtualPtrInfo.force_box + per-subclass
-        // _force_elements).
-        let mut info = ctx.take_ptr_info(resolved).unwrap();
-        let result = info.force_box(resolved, ctx);
-        ctx.get_box_replacement(result)
-    }
-
-    /// Force a virtualizable: emit SETFIELD_RAW ops to write tracked
-    /// field values back to the heap object. Unlike virtual objects,
-    /// no allocation is emitted — the object already exists.
-    fn force_virtualizable(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualizableFieldState,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        // Mark as no longer virtual (prevents infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
-
-        // Emit SETFIELD_RAW for each tracked field, using the original DescrRef
-        for (field_idx, value_ref) in &vinfo.fields {
-            let value_ref = self.force_virtual(*value_ref, ctx);
-            let value_ref = ctx.get_box_replacement(value_ref);
-            let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
-                .unwrap_or_else(|| make_field_index_descr(*field_idx));
-            let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
-            set_op.descr = Some(descr);
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
-        }
-
-        opref
-    }
-
     /// virtualize.py:60-65 make_virtual_raw_slice
     ///
     /// ```text
@@ -1225,34 +1162,6 @@ impl OptVirtualize {
         true
     }
 
-    /// Handle operations that may cause virtuals to escape.
-    fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let mut forced = op.clone();
-        let frame_ref = ctx.get_box_replacement(OpRef::input_arg_ref(0));
-        for arg in &mut forced.args {
-            let resolved = ctx.get_box_replacement(*arg);
-            if self.vable_config.is_some()
-                && resolved == frame_ref
-                && ctx.is_virtualizable_via_box(resolved)
-            {
-                *arg = resolved;
-                continue;
-            }
-            if Self::is_virtual(resolved, ctx) {
-                let forced_arg = self.force_virtual(resolved, ctx);
-                *arg = ctx.get_box_replacement(forced_arg);
-            } else {
-                *arg = resolved;
-            }
-        }
-        self.clear_forced_field_caches();
-        OptimizationResult::Replace(forced)
-    }
-
-    fn clear_forced_field_caches(&mut self) {
-        // No-op: forced field caches are handled by heap.rs cache,
-        // not by separate PtrInfo variants.
-    }
 }
 
 impl Default for OptVirtualize {
@@ -1387,7 +1296,7 @@ impl Optimization for OptVirtualize {
                         }
                     }
                 }
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // virtualize.py:80-90 optimize_FINISH / postprocess_FINISH
@@ -1443,7 +1352,7 @@ impl Optimization for OptVirtualize {
                         }
                     }
                 }
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // virtualize.py:226-240 optimize_CALL_N (aliased to CALL_R / CALL_I)
@@ -1492,7 +1401,7 @@ impl Optimization for OptVirtualize {
                                     return OptimizationResult::Remove;
                                 }
                             }
-                            return self.optimize_escaping_op(op, ctx);
+                            return OptimizationResult::PassOn;
                         }
                         // virtualize.py:230 do_RAW_FREE
                         if ei.oopspecindex == OopSpecIndex::RawFree {
@@ -1507,7 +1416,7 @@ impl Optimization for OptVirtualize {
                                     return OptimizationResult::Remove;
                                 }
                             }
-                            return self.optimize_escaping_op(op, ctx);
+                            return OptimizationResult::PassOn;
                         }
                         // virtualize.py:232-236 OS_JIT_FORCE_VIRTUALIZABLE
                         //   info = getptrinfo(op.getarg(1))
@@ -1520,7 +1429,7 @@ impl Optimization for OptVirtualize {
                     }
                 }
                 // virtualize.py:237-238 else: return self.emit(op)
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // RecordKnownResult + CallPure must pass through to OptPure
@@ -1528,11 +1437,11 @@ impl Optimization for OptVirtualize {
             // since they are in the CALL opcode range.
             OpCode::RecordKnownResult => OptimizationResult::PassOn,
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // Calls / escaping operations — force all virtual args
-            _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
+            _ if op.opcode.is_call() => OptimizationResult::PassOn,
 
             // RPython virtualize.py has no optimize_JUMP. JUMP is held
             // out of the pass pipeline (flush=False at optimizer.py:536-539)
@@ -2246,18 +2155,9 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_force_is_noop_in_optimizer() {
+        // Verify that Optimizer::force_box skips Virtualizable PtrInfo
+        // without destroying the tracked field state.
         let mut ctx = OptContext::with_num_inputs(8, 1);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
-            static_field_offsets: vec![],
-            static_field_types: vec![],
-            static_field_descrs: vec![],
-            array_field_offsets: vec![8],
-            array_item_types: vec![Type::Ref],
-            array_field_descrs: vec![],
-            array_lengths: vec![1],
-            vable_input_offset: 0,
-        });
-        pass.setup();
         ctx.set_ptr_info(
             OpRef::input_arg_ref(0),
             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -2268,11 +2168,28 @@ mod tests {
             }),
         );
 
-        let forced = pass.force_virtual(OpRef::input_arg_ref(0), &mut ctx);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptVirtualize::with_virtualizable(
+            VirtualizableConfig {
+                static_field_offsets: vec![],
+                static_field_types: vec![],
+                static_field_descrs: vec![],
+                array_field_offsets: vec![8],
+                array_item_types: vec![Type::Ref],
+                array_field_descrs: vec![],
+                array_lengths: vec![1],
+                vable_input_offset: 0,
+            },
+        )));
+        let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
         assert_eq!(forced, OpRef::input_arg_ref(0));
         assert!(
             ctx.new_operations.is_empty(),
             "standard virtualizable should not be forced to raw heap ops by optimizer"
+        );
+        assert!(
+            ctx.is_virtualizable_via_box(OpRef::input_arg_ref(0)),
+            "Virtualizable PtrInfo must survive force_box"
         );
     }
 
@@ -2377,11 +2294,14 @@ mod tests {
             majit_ir::EffectInfo::default(),
         ));
 
-        let replaced = match pass.propagate_forward(&call, &mut ctx) {
-            OptimizationResult::Replace(op) => op,
-            other => panic!("expected call replacement, got {other:?}"),
-        };
-        assert_eq!(replaced.arg(0), OpRef::input_arg_ref(0));
+        // RPython parity: virtualize.py's default for calls is emit(op)
+        // which forwards to the next pass without forcing. Forcing happens
+        // in _emit_operation (Optimizer level). OptVirtualize returns PassOn.
+        let result = pass.propagate_forward(&call, &mut ctx);
+        assert!(
+            matches!(result, OptimizationResult::PassOn),
+            "call should PassOn (forcing happens at Optimizer::emit_operation level)"
+        );
         assert!(
             ctx.new_operations
                 .iter()

@@ -1419,6 +1419,15 @@ impl Optimizer {
             }
         }
         if ctx.is_virtual_via_box(resolved) {
+            // Virtualizable represents an existing heap object with tracked
+            // fields — not a deferred allocation. force_box must not take
+            // its PtrInfo. RPython parity: Virtualizable is never a "true"
+            // virtual (no allocation to emit); it just tracks field state
+            // for the standard frame. Calling force_box on it would destroy
+            // the tracked state via take_ptr_info.
+            if ctx.is_virtualizable_via_box(resolved) {
+                return resolved;
+            }
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.
