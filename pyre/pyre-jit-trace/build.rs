@@ -13,6 +13,19 @@ use walkdir::WalkDir;
 /// - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 /// - pyre-interpreter (object space, bytecode dispatch, eval loop)
 fn main() {
+    // Run on a worker thread with a large stack: on Windows the main
+    // thread's default stack is 1 MiB, which `syn`'s recursive parsing
+    // of the ~90 collected source files overflows
+    // (STATUS_STACK_OVERFLOW 0xc00000fd).
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("spawn build-script worker")
+        .join()
+        .expect("build-script worker panicked");
+}
+
+fn real_main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let pyre_base = format!("{manifest_dir}/..");
     let repo_root = format!("{manifest_dir}/../..");
