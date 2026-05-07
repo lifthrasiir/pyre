@@ -112,6 +112,25 @@ impl PartialEq for EffectInfo {
 
 impl Eq for EffectInfo {}
 
+/// Manual Hash matching the PartialEq subset (skips
+/// `single_write_descr_array` and `extradescrs` for the same reason
+/// `effectinfo.py:155-164` excludes them from the cache key).
+impl std::hash::Hash for EffectInfo {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.extraeffect.hash(state);
+        self.oopspecindex.hash(state);
+        self.readonly_descrs_fields.hash(state);
+        self.write_descrs_fields.hash(state);
+        self.readonly_descrs_arrays.hash(state);
+        self.write_descrs_arrays.hash(state);
+        self.readonly_descrs_interiorfields.hash(state);
+        self.write_descrs_interiorfields.hash(state);
+        self.can_invalidate.hash(state);
+        self.can_collect.hash(state);
+        self.call_release_gil_target.hash(state);
+    }
+}
+
 impl Default for EffectInfo {
     fn default() -> Self {
         EffectInfo {

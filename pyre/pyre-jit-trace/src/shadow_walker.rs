@@ -1,4 +1,4 @@
-//! Walker fix A — shadow execution scaffolding.
+//! Shadow execution scaffolding.
 //!
 //! Master plan tingly-splashing-balloon.md Phase D-2: production tracing
 //! runs the trait-driven `MIFrame::execute_opcode_step` (today's only

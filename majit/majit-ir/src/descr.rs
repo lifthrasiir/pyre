@@ -659,6 +659,16 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
 
     // ── Downcasting helpers ──
 
+    /// Generic `Any` downcast escape hatch.  Default `None`; descriptor
+    /// types that need consumer-side concrete-type identification (e.g.
+    /// pyre's `CallDescrStub` lowering through `flatten_descr_by_ptr`)
+    /// override to return `Some(self)`.  Avoids forcing every `Descr`
+    /// impl to add `Any` as a supertrait when only a small subset
+    /// participates in downstream downcast paths.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         None
     }

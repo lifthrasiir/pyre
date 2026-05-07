@@ -3170,6 +3170,84 @@ impl TraceCtx {
         );
     }
 
+    /// Pure-call analog of [`call_typed_with_effect`] that mirrors
+    /// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes,
+    /// descr, exc=False, pure=True)` for `EF_ELIDABLE_CANNOT_RAISE`
+    /// callees: records the initial `Call{I,R,F,N}` op, then patches
+    /// it via [`record_result_of_call_pure`] so the trace ends up with
+    /// `CallPure*` (or a `Const` when all args fold) AND the
+    /// `call_pure_results` cache is populated for cross-trace
+    /// constant folding by the optimizer's pure pass
+    /// (`pyjitpl.py:2397 + compile.py:221 take_call_pure_results`).
+    ///
+    /// `concrete_arg_values` must be parallel to `args` and start with
+    /// the funcbox's concrete value (i.e., one entry for the funcbox
+    /// followed by one per real arg) — same shape as
+    /// `_build_allboxes(funcbox, argboxes, descr)` in
+    /// `pyjitpl.py:1960-1993`. `concrete_result` is the value returned
+    /// by executing the helper with the concrete operand values; the
+    /// caller is responsible for invoking the helper (the runtime
+    /// tracer already has the concrete operands available before the
+    /// recorded trace runs).
+    ///
+    /// Caller must guarantee the EI is `EF_ELIDABLE_CANNOT_RAISE`
+    /// (`check_can_raise()` false, `check_is_elidable()` true) — this
+    /// helper does NOT emit `GuardNoException`.  For elidable-can-raise
+    /// callees the caller must thread the call through the
+    /// (yet-unwritten) variant that handles `handle_possible_exception`.
+    pub fn call_typed_with_effect_pure(
+        &mut self,
+        opcode: OpCode,
+        func_ptr: *const (),
+        args: &[OpRef],
+        arg_types: &[Type],
+        ret_type: Type,
+        effect_info: majit_ir::EffectInfo,
+        concrete_arg_values: &[Value],
+        concrete_result: Value,
+    ) -> OpRef {
+        debug_assert!(
+            effect_info.check_is_elidable() && !effect_info.check_can_raise(false),
+            "call_typed_with_effect_pure requires EF_ELIDABLE_CANNOT_RAISE"
+        );
+        let func_ref = self.constants.get_or_insert(func_ptr as usize as i64);
+        let descr =
+            crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(func_ref);
+        call_args.extend_from_slice(args);
+        debug_assert_eq!(
+            call_args.len(),
+            concrete_arg_values.len(),
+            "concrete_arg_values must include the funcbox concrete value as the first entry"
+        );
+        // pyjitpl.py:1943: patch_pos = self.metainterp.history.get_trace_position()
+        let patch_pos = self.get_trace_position();
+        // pyjitpl.py:1944-1945: op = execute_and_record_varargs(opnum, ...)
+        let op = self
+            .recorder
+            .record_op_with_descr(opcode, &call_args, descr.clone());
+        // pyjitpl.py:2659 _record_helper_varargs heap invalidation parity.
+        if let Some(call_descr) = descr.as_call_descr() {
+            self.heap_cache.invalidate_caches_varargs(
+                opcode,
+                Some(call_descr.get_extra_info()),
+                &call_args,
+            );
+        }
+        // pyjitpl.py:1947-1948: record_result_of_call_pure patches CALL → CALL_PURE
+        // and populates call_pure_results.
+        self.record_result_of_call_pure(
+            op,
+            &call_args,
+            concrete_arg_values,
+            descr,
+            patch_pos,
+            opcode,
+            concrete_result,
+        )
+    }
+
     /// pyjitpl.py:3553-3579: record_result_of_call_pure.
     ///
     /// Patch a CALL into a CALL_PURE. Called after a pure call executes

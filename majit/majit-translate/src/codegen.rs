@@ -862,13 +862,29 @@ pub fn generated_binary_int_value(
     }
 
     // intobject.py range validation for FloorDiv/Mod/Shift.
-    // RPython generates these as branches in jitcode; pyre validates
-    // concretely and falls back to residual for out-of-range cases.
+    // For FloorDiv/Mod the RPython-orthodox preconditions are
+    // `rhs != 0` AND `not (lhs == i64::MIN && rhs == -1)` — PyPy
+    // `intobject.py:316 _floordiv` / `:341 _mod` wrap
+    // `ovfcheck(x // y)` / `ovfcheck(x % y)` in `try / except
+    // ZeroDivisionError`, letting `OverflowError` propagate up to
+    // `_make_descr_binop:820-823` where it routes to `ovf2long`
+    // (long fallback). RPython's `_handle_int_special`
+    // (jtransform.py:2042) emits the `int.py_div` / `int.py_mod`
+    // oopspec call as `EF_ELIDABLE_CANNOT_RAISE`; the inlined
+    // `_ovf_zer` wrapper (`rint.py:429 ll_int_py_div_ovf_zer` /
+    // `:520 ll_int_py_mod_ovf_zer`) contributes the explicit
+    // `int_eq(rhs, 0) -> guard_false` plus the
+    // `(lhs == INT_MIN) & (rhs == -1) -> guard_false` overflow
+    // check ahead of the call. Pyre keeps a trace-time short-circuit
+    // on both cases AND emits the matching runtime guards so a
+    // re-used trace bails out before invoking the helper with bad
+    // operands (the helper uses `wrapping_div` / `wrapping_rem` and
+    // would silently return `INT_MIN` / a wrap value otherwise).
     if needs_concrete_check {
         match op_code {
             OpCode::IntFloorDiv | OpCode::IntMod => {
                 let (lhs, rhs) = concrete?;
-                if lhs < 0 || rhs <= 0 {
+                if rhs == 0 || (lhs == i64::MIN && rhs == -1) {
                     return None;
                 }
             }
@@ -913,8 +929,101 @@ pub fn generated_binary_int_value(
         crate::state::trace_unbox_int_with_resume(frame, ctx, b, int_type_addr)
     };
 
-    // RPython jitcode: int_OP_ovf(a_raw, b_raw) → guard_no_overflow
-    let raw_result = ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
+    // The inlined `_ovf_zer` wrapper (`rint.py:429 ll_int_py_div_
+    // ovf_zer` / `:520 ll_int_py_mod_ovf_zer`) contributes two
+    // explicit guards to the trace ahead of the `int.py_div` /
+    // `int.py_mod` residual call:
+    //   1. `int_eq(rhs, 0) -> guard_false` — from the `_zer` body.
+    //   2. `int_and(int_eq(lhs, INT_MIN), int_eq(rhs, -1)) ->
+    //      guard_false` — from the `_ovf` body
+    //      (`if (x == -sys.maxint - 1) & (y == -1): raise
+    //      OverflowError`).
+    // With `EF_ELIDABLE_CANNOT_RAISE` the trace has no
+    // `GUARD_NO_EXCEPTION` for this call, so these guards are the
+    // only barrier between a re-used trace and an unsafe
+    // `bhimpl_int_floordiv` / `bhimpl_int_mod` invocation: the
+    // zero divisor would silently return `0` (Rust safety default),
+    // and `INT_MIN / -1` would wrap to `INT_MIN` via `wrapping_div`
+    // (helper) instead of routing to PyPy's `ovf2long` long-fallback
+    // (`intobject.py:491`). Negative operands generally are valid —
+    // PyPy `intobject.py:316/341` accepts them and the helper's
+    // no-branch correction handles every sign combination — so no
+    // sign-only guard is emitted here beyond the overflow corner.
+    if matches!(op_code, OpCode::IntFloorDiv | OpCode::IntMod) {
+        let zero_const = ctx.const_int(0);
+        let rhs_zero = ctx.record_op(OpCode::IntEq, &[rhs_raw, zero_const]);
+        frame.generate_guard(ctx, OpCode::GuardFalse, &[rhs_zero]);
+        let int_min_const = ctx.const_int(i64::MIN);
+        let neg_one_const = ctx.const_int(-1);
+        let lhs_is_min = ctx.record_op(OpCode::IntEq, &[lhs_raw, int_min_const]);
+        let rhs_is_neg_one = ctx.record_op(OpCode::IntEq, &[rhs_raw, neg_one_const]);
+        let ovf_both =
+            ctx.record_op(OpCode::IntAnd, &[lhs_is_min, rhs_is_neg_one]);
+        frame.generate_guard(ctx, OpCode::GuardFalse, &[ovf_both]);
+    }
+
+    // RPython jtransform.py:576-577 `rewrite_op_int_floordiv = _do_builtin_call`
+    // / `rewrite_op_int_mod = _do_builtin_call`: replace the bare primitive
+    // with an `OS_INT_PY_DIV` / `OS_INT_PY_MOD`-tagged residual call so the
+    // optimizer's `optimize_call_int_py_div` / `optimize_call_int_py_mod`
+    // (rewrite.rs:1848 / 1788) specialize power-of-2 divisors → IntRshift,
+    // const 1 → identity, const -1 → IntNeg, etc. The call is routed
+    // through `call_typed_with_effect_pure` so the trace records
+    // `CallI` first then patches via `record_result_of_call_pure`
+    // (pyjitpl.py:1947 / 3553-3579) — populates `call_pure_results`
+    // for cross-trace constant folding and reduces all-const
+    // (lhs, rhs) to a `Const` directly. Other binops keep the
+    // bare-primitive emission since RPython has matching `bhimpl_int_*`
+    // primitives at blackhole.py.
+    let raw_result = match op_code {
+        OpCode::IntFloorDiv => {
+            let (lhs_val, rhs_val) =
+                concrete.expect("IntFloorDiv concrete check passed above");
+            let func_ptr =
+                majit_metainterp::blackhole::bhimpl_int_floordiv as *const ();
+            // The runtime guards above ensure `rhs != 0` and
+            // `not (lhs == INT_MIN && rhs == -1)` for the recorded
+            // trace; safe to invoke the helper concretely here.
+            let concrete_result =
+                majit_metainterp::blackhole::bhimpl_int_floordiv(lhs_val, rhs_val);
+            ctx.call_typed_with_effect_pure(
+                OpCode::CallI,
+                func_ptr,
+                &[lhs_raw, rhs_raw],
+                &[majit_ir::Type::Int, majit_ir::Type::Int],
+                majit_ir::Type::Int,
+                majit_metainterp::INT_PY_DIV_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(func_ptr as usize as i64),
+                    majit_ir::Value::Int(lhs_val),
+                    majit_ir::Value::Int(rhs_val),
+                ],
+                majit_ir::Value::Int(concrete_result),
+            )
+        }
+        OpCode::IntMod => {
+            let (lhs_val, rhs_val) =
+                concrete.expect("IntMod concrete check passed above");
+            let func_ptr = majit_metainterp::blackhole::bhimpl_int_mod as *const ();
+            let concrete_result =
+                majit_metainterp::blackhole::bhimpl_int_mod(lhs_val, rhs_val);
+            ctx.call_typed_with_effect_pure(
+                OpCode::CallI,
+                func_ptr,
+                &[lhs_raw, rhs_raw],
+                &[majit_ir::Type::Int, majit_ir::Type::Int],
+                majit_ir::Type::Int,
+                majit_metainterp::INT_PY_MOD_EFFECT_INFO,
+                &[
+                    majit_ir::Value::Int(func_ptr as usize as i64),
+                    majit_ir::Value::Int(lhs_val),
+                    majit_ir::Value::Int(rhs_val),
+                ],
+                majit_ir::Value::Int(concrete_result),
+            )
+        }
+        _ => ctx.record_op(op_code, &[lhs_raw, rhs_raw]),
+    };
     if has_overflow {
         frame.generate_guard(ctx, OpCode::GuardNoOverflow, &[]);
     }

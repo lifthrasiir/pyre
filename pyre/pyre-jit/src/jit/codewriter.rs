@@ -16,6 +16,7 @@
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use pyre_jit_trace::{PyJitCode, PyJitCodeMetadata};
 
@@ -25,8 +26,8 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState}
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallFlavor, DescrOperand, GraphFlattener, Insn, Kind, ListOfKind, Operand, Register, ResKind,
-    SSARepr, TLabel, slot_for_call_flavor,
+    CallDescrStub, CallFlavor, DescrOperand, GraphFlattener, Insn, Kind, ListOfKind, Operand,
+    Register, ResKind, SSARepr, TLabel, slot_for_call_flavor,
 };
 
 // ---------------------------------------------------------------------------
@@ -1318,6 +1319,105 @@ fn vable_setfield_int_graph_args(
     ]
 }
 
+/// Build the 2-arg `getfield_vable_r` arg vector matching
+/// `rpython/jit/codewriter/jtransform.py:846-847` getfield (vable
+/// branch): `[v_inst, descr]`.  `v_inst` is the portal frame Variable
+/// from `portal_graph_inputvars(code).0` per jtransform.py:840 (the
+/// JIT driver's red `frame` arg threaded into every vable op). The
+/// trailing `vable_static_field_descr(idx)` singleton mirrors
+/// `virtualizable.py:71 static_field_descrs[idx]`.
+fn vable_getfield_ref_graph_args(
+    v_inst: super::flow::SpaceOperationArg,
+    field_idx: u16,
+) -> Vec<super::flow::SpaceOperationArg> {
+    vec![
+        v_inst,
+        majit_ir::descr::vable_static_field_descr(field_idx).into(),
+    ]
+}
+
+/// Emit a graph-side `residual_call_{kinds}_{reskind}` SpaceOperation
+/// mirroring the SSA shape produced by [`emit_residual_call_shape`].
+///
+/// Args follow the same kinds-string selection logic as the SSA emit
+/// (`codewriter.rs:2545-2587`):
+///   - opname suffix `kinds` ∈ `{"r", "ir", "irf"}` chosen by which arg
+///     kinds are present + whether `reskind == ResKind::Float`;
+///   - argv `[Const(fn_idx), ListI?, ListR?, ListF?, Descr(stub)]`,
+///     each `ListX` present iff that letter appears in `kinds`;
+///   - the trailing descr is an interned `Arc<CallDescrStub>` from
+///     [`super::flatten::intern_call_descr_stub`] (Task #41 plumbing).
+///
+/// Returns the fresh result `Variable` if `reskind != Void`; callers
+/// at sites where the symbolic value is already provided by an
+/// `emit_frontend_*` HLOp discard it via `let _ = ...` (matching the
+/// `emit_vable_getfield_ref!` graph dual-write pattern).
+///
+/// Mirrors `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call`
+/// SpaceOperation construction.
+fn record_residual_call_graph_op(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    fn_idx: u16,
+    flavor: CallFlavor,
+    args_i: Vec<super::flow::FlowValue>,
+    args_r: Vec<super::flow::FlowValue>,
+    args_f: Vec<super::flow::FlowValue>,
+    arg_kinds: Vec<Kind>,
+    reskind: ResKind,
+    offset: i64,
+) -> Option<super::flow::Variable> {
+    use super::flow::{FlowListOfKind, SpaceOperationArg};
+    let kinds: &str = if !args_f.is_empty() || reskind == ResKind::Float {
+        "irf"
+    } else if !args_i.is_empty() {
+        "ir"
+    } else {
+        "r"
+    };
+    let opname = format!("residual_call_{kinds}_{}", reskind.as_char());
+    let mut op_args: Vec<SpaceOperationArg> = Vec::with_capacity(5);
+    op_args.push(super::flow::Constant::signed(fn_idx as i64).into());
+    if kinds.contains('i') {
+        op_args.push(SpaceOperationArg::ListOfKind(FlowListOfKind::new(
+            Kind::Int,
+            args_i,
+        )));
+    }
+    if kinds.contains('r') {
+        op_args.push(SpaceOperationArg::ListOfKind(FlowListOfKind::new(
+            Kind::Ref,
+            args_r,
+        )));
+    }
+    if kinds.contains('f') {
+        op_args.push(SpaceOperationArg::ListOfKind(FlowListOfKind::new(
+            Kind::Float,
+            args_f,
+        )));
+    }
+    op_args.push(
+        super::flatten::intern_call_descr_stub(
+            super::flatten::effect_info_for_call_flavor(flavor),
+            arg_kinds,
+            reskind.to_kind(),
+        )
+        .into(),
+    );
+
+    match reskind.to_kind() {
+        Some(result_kind) => {
+            let result = graph.fresh_variable(result_kind);
+            record_graph_op(block, opname, op_args, Some(result.into()), offset);
+            Some(result)
+        }
+        None => {
+            record_graph_op(block, opname, op_args, None, offset);
+            None
+        }
+    }
+}
+
 /// Emit a void-result `SpaceOperation` into `block` and return it.
 /// Matches the call-marker / control-flow emission path in
 /// `rpython/jit/codewriter/jtransform.py:1690-1723` where markers like
@@ -2488,230 +2588,6 @@ fn decode_exception_catch_sites(
 // exceeds 256 — the same condition that crashes the RPython
 // translator.
 
-/// Codewriter-IR-level argument to a residual_call. Mirrors RPython's
-/// `Variable | Constant` admitted by `make_three_lists`
-/// (`rpython/jit/codewriter/jtransform.py:437-445`): each entry can be
-/// a runtime register or a literal constant, and `Assembler::assemble`
-/// resolves the `Const*` cases to `num_regs_kind + add_const_*(value)`
-/// pseudo-register indices at write time
-/// (`rpython/jit/codewriter/assembler.py:80-138` `emit_const`,
-/// `:181-196` `ListOfKind` Constant arm; pyre's
-/// `expect_list_regs_or_pool`
-/// (`pyre/pyre-jit/src/jit/assembler.rs:1736-1784`) is the same routing
-/// at bytecode-write time).
-///
-/// At runtime the BH register file is sized to `num_regs + len(constants)`
-/// and constants are pre-loaded into the high half by
-/// `init_register_files_from_runtime_jitcode`
-/// (`majit/majit-metainterp/src/blackhole.rs:1056-1075`,
-/// `rpython/jit/metainterp/blackhole.py:320-336` `copy_constants`),
-/// so the consumer reads `registers_*[byte]` uniformly without
-/// distinguishing register vs constant.
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // ConstFloat variant wired in by a future float-arg migration slice
-pub(crate) enum CallArgInput {
-    Reg(majit_metainterp::jitcode::JitArgKind, u16),
-    ConstInt(i64),
-    ConstRef(i64),
-    ConstFloat(i64),
-}
-
-impl CallArgInput {
-    pub(crate) fn kind(&self) -> Kind {
-        use majit_metainterp::jitcode::JitArgKind;
-        match self {
-            Self::Reg(JitArgKind::Int, _) | Self::ConstInt(_) => Kind::Int,
-            Self::Reg(JitArgKind::Ref, _) | Self::ConstRef(_) => Kind::Ref,
-            Self::Reg(JitArgKind::Float, _) | Self::ConstFloat(_) => Kind::Float,
-        }
-    }
-
-    fn into_operand(self) -> Operand {
-        match self {
-            Self::Reg(jak, reg) => {
-                use majit_metainterp::jitcode::JitArgKind;
-                let kind = match jak {
-                    JitArgKind::Int => Kind::Int,
-                    JitArgKind::Ref => Kind::Ref,
-                    JitArgKind::Float => Kind::Float,
-                };
-                Operand::reg(kind, reg)
-            }
-            Self::ConstInt(v) => Operand::ConstInt(v),
-            Self::ConstRef(v) => Operand::ConstRef(v),
-            Self::ConstFloat(v) => Operand::ConstFloat(v),
-        }
-    }
-}
-
-/// Operand-level entry — accepts `CallArgInput` so callers can pass
-/// `ConstInt`/`ConstRef`/`ConstFloat` directly without a per-call
-/// `emit_load_const_*!` materialise + fresh-var dance. Mirrors RPython
-/// `make_three_lists` which admits `Variable | Constant` in any slot
-/// (`jtransform.py:437-445`).
-fn emit_residual_call(
-    ssarepr: &mut SSARepr,
-    flavor: CallFlavor,
-    fn_idx: u16,
-    call_args: &[CallArgInput],
-    reskind: ResKind,
-    dst: Option<u16>,
-) {
-    emit_residual_call_shape(ssarepr, flavor, fn_idx, call_args, reskind, dst);
-}
-
-/// Upstream-shape Insn builder for the walker-local `ssarepr`.
-///
-/// `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` emits
-///
-/// ```text
-/// SpaceOperation('%s_%s_%s' % (namebase, kinds, reskind),
-///                [fn, ListOfKind('int',   args_i),
-///                     ListOfKind('ref',   args_r),   # only if 'r' in kinds
-///                     ListOfKind('float', args_f),   # only if 'f' in kinds
-///                     calldescr],
-///                result)
-/// ```
-///
-/// where `kinds` is the smallest cover of actually-present arg kinds
-/// (`'r'` if only ref args, `'ir'` if int+ref, `'irf'` if floats are
-/// present or the result itself is float) and `reskind` ∈ {`i`, `r`,
-/// `f`, `v`}. `namebase = 'residual_call'` for the direct-call helper
-/// (`jtransform.py:460-471 handle_residual_call`).
-///
-/// Phase 3c (commit `bc0d6a06c4`) collapsed the earlier dual emitter,
-/// so this helper now pushes directly into the single walker-local
-/// `SSARepr` that `Assembler::assemble` consumes — there is no longer
-/// a paired `assembler.call_*_typed(...)` direct emission.
-///
-/// PRE-EXISTING-ADAPTATION: upstream stores `calldescr` (an
-/// `AbstractDescr` carrying `EffectInfo`) in the trailing slot; pyre
-/// threads `DescrOperand::CallDescrStub{effect_info, arg_kinds}`
-/// there so the assembler can recover the (dispatch kind, reskind,
-/// per-param kind) tuple statically today.
-///
-/// Convergence path (calldescr interning):
-///   1. ✓ Port `rpython/jit/codewriter/effectinfo.py::EffectInfo` and
-///      `CallInfoCollection` — landed at `majit-ir/src/effectinfo.rs`
-///      (521 lines, full upstream parity for `EffectInfo` /
-///      `ExtraEffect` / `OopSpecIndex` / `CallInfoCollection`).
-///   2. ✓ (Slice 1): `CallDescrStub` carries `effect_info: EffectInfo`
-///      derived from `flavor` at emit time via
-///      `flatten::effect_info_for_call_flavor`; the SSARepr trailing
-///      slot exposes upstream-shape data downstream consumers can read
-///      off `stub.effect_info.extraeffect`.
-///   3. ✓ (Slice 2): `pyre-jit-trace/jitcode_dispatch.rs` routes
-///      forces-virtual / EF_LOOPINVARIANT / elidable / default through
-///      the canonical `CallMayForce*+GuardNotForced` /
-///      `CallLoopinvariant*` / `CallPure*` / `Call*` opcode emission.
-///   4. ✓ (Slice 3): `assembler::dispatch_residual_call` derives its
-///      builder-method choice from
-///      `flatten::dispatch_kind_for_effect_info(&stub.effect_info)`
-///      instead of matching on `stub.flavor`. The canonical dispatch
-///      source is `effect_info`. The `CallFlavor::Assembler` variant
-///      was dropped — pyre's portal-call lowering uses
-///      `CallAssembler{I,R,F,N}`
-///      (`majit-ir/src/resoperation.rs:1120-1123`) per RPython's
-///      `OpHelpers.call_assembler_for_descr` split.
-///   4b. ✓ (Slice 3b): `CallDescrStub.flavor` field dropped; codewriter
-///      sites still take a `CallFlavor` parameter as construction-site
-///      shorthand and `effect_info_for_call_flavor` expands it to the
-///      stored `EffectInfo` at emit time.
-///   5. (Slices 4-6, future) — collapse the per-flavor `BC_CALL_*`
-///      bytecode opcodes (`BC_CALL_MAY_FORCE_*`, `BC_CALL_PURE_*`,
-///      `BC_CALL_LOOPINVARIANT_*`, `BC_CALL_RELEASE_GIL_*`) into a
-///      single `BC_CALL_<reskind>` per result kind (the BH already
-///      treats them identically — see `majit-metainterp/src/blackhole.rs:2264-2287`),
-///      then drop `CallFlavor` itself, then store
-///      `Arc<SimpleCallDescr>` in the SSARepr trailing slot in place
-///      of the stub.
-/// Slices 1-3b landed; Slices 4-6 touch the call hot path bytecode and
-/// warrant a benchmark sweep per slice.
-fn emit_residual_call_shape(
-    ssarepr: &mut SSARepr,
-    flavor: CallFlavor,
-    fn_idx: u16,
-    // Arguments in the C function's parameter order, allowing both
-    // pre-coloured registers and raw constants per RPython's
-    // `make_three_lists` (`jtransform.py:437-445`). The SSARepr side
-    // projects them into kind-separated `ListOfKind` sublists; raw
-    // constants survive into the assembler's `expect_list_regs_or_pool`
-    // routing (`pyre/pyre-jit/src/jit/assembler.rs:1736-1784`) which
-    // interns into `JitCode.constants_*` and emits the
-    // `num_regs_kind + pool_idx` pseudo-register byte (`assembler.py:80-138`
-    // `emit_const`).
-    call_args: &[CallArgInput],
-    reskind: ResKind,
-    dst: Option<u16>,
-) {
-    let mut args_i: Vec<Operand> = Vec::new();
-    let mut args_r: Vec<Operand> = Vec::new();
-    let mut args_f: Vec<Operand> = Vec::new();
-    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(call_args.len());
-    for arg in call_args {
-        let kind = arg.kind();
-        arg_kinds.push(kind);
-        let bucket = match kind {
-            Kind::Int => &mut args_i,
-            Kind::Ref => &mut args_r,
-            Kind::Float => &mut args_f,
-        };
-        bucket.push(arg.into_operand());
-    }
-
-    // `rewrite_call` kinds selection (jtransform.py:423-426).
-    //
-    // PRE-EXISTING-ADAPTATION: `jtransform.py:425, 427` admits a
-    // `force_ir=True` flag that pins `kinds = 'ir'` even when `lst_i`
-    // is empty (and asserts no float result). No pyre caller exercises
-    // it today — the only upstream use sites pass `force_ir=True`
-    // through `rewrite_call` from helpers we have not ported yet.
-    // Plumb a `force_ir: bool` parameter through this function the
-    // moment the first such caller lands; the missing branch would
-    // be `else if !args_i.is_empty() || force_ir { "ir" }` plus the
-    // matching `assert!(!matches!(reskind, ResKind::Float))` guard.
-    let kinds: &str = if !args_f.is_empty() || reskind == ResKind::Float {
-        "irf"
-    } else if !args_i.is_empty() {
-        "ir"
-    } else {
-        "r"
-    };
-    let reskind_ch = reskind.as_char();
-    let opname = format!("residual_call_{kinds}_{reskind_ch}");
-
-    // SSARepr arg list: [Const(fn), ListI?, ListR, ListF?, Descr(stub)].
-    let mut args: Vec<Operand> = Vec::with_capacity(5);
-    args.push(Operand::ConstInt(fn_idx as i64));
-    let mut push_list = |kind: Kind, items: Vec<Operand>| {
-        args.push(Operand::ListOfKind(ListOfKind::new(kind, items)));
-    };
-    if kinds.contains('i') {
-        push_list(Kind::Int, args_i);
-    }
-    if kinds.contains('r') {
-        push_list(Kind::Ref, args_r);
-    }
-    if kinds.contains('f') {
-        push_list(Kind::Float, args_f);
-    }
-    let effect_info = super::flatten::effect_info_for_call_flavor(flavor);
-    args.push(Operand::descr(DescrOperand::CallDescrStub(
-        super::flatten::CallDescrStub {
-            effect_info,
-            arg_kinds,
-        },
-    )));
-
-    let insn = match (reskind.to_kind(), dst) {
-        (Some(kind), Some(d)) => Insn::op_with_result(opname, args, Register::new(kind, d)),
-        (None, None) => Insn::op(opname, args),
-        (Some(_), None) => panic!("residual_call with non-void reskind requires dst"),
-        (None, Some(_)) => panic!("residual_call with void reskind must not have dst"),
-    };
-    ssarepr.insns.push(insn.clone());
-}
-
 // ---------------------------------------------------------------------------
 // RPython: codewriter/codewriter.py — class CodeWriter
 // ---------------------------------------------------------------------------
@@ -2743,6 +2619,18 @@ pub struct CodeWriter {
     /// mint `&mut CallControl` through [`Self::callcontrol`] — matches
     /// the legacy `JITCODE_CACHE` interior-mutability contract.
     callcontrol: UnsafeCell<super::call::CallControl>,
+    /// RPython: `gc_ll_descr.gc_cache._cache_call`
+    /// (`backend/llsupport/descr.py:14 GcCache.__init__` +
+    /// `:665-673 get_call_descr`).  RPython's call descr cache is a
+    /// per-`GcCache` instance dict keyed by `(arg_classes, result_type,
+    /// result_signed, RESULT_ERASED, extrainfo)` and reached via
+    /// `cpu.gc_ll_descr.gc_cache`.  pyre owns the cache here so each
+    /// `CodeWriter` instance carries its own cache, mirroring the
+    /// per-instance ownership upstream.  See
+    /// [`super::flatten::intern_call_descr_stub`] for the `Option<Kind>`
+    /// → `result_type` mapping.
+    call_descr_stub_cache:
+        Mutex<HashMap<(majit_ir::EffectInfo, Vec<Kind>, Option<Kind>), Arc<CallDescrStub>>>,
 }
 
 impl CodeWriter {
@@ -2761,7 +2649,34 @@ impl CodeWriter {
         Self {
             assembler: RefCell::new(Assembler::new()),
             callcontrol: UnsafeCell::new(super::call::CallControl::new(cpu, Vec::new())),
+            call_descr_stub_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Intern a [`CallDescrStub`] by `(effect_info, arg_kinds,
+    /// result_kind)` into this CodeWriter's instance cache and return
+    /// the shared `Arc` upcast to `majit_ir::DescrRef`.  Mirrors
+    /// `gc_ll_descr.gc_cache.get_call_descr(arg_classes, result_type,
+    /// result_signed, RESULT_ERASED, extrainfo)` upstream.  See
+    /// [`super::flatten::intern_call_descr_stub`] (free-function
+    /// forwarder used by graph-side recorders) and
+    /// `call_descr_stub_cache` field docstring for the parity mapping.
+    pub fn intern_call_descr_stub(
+        &self,
+        effect_info: majit_ir::EffectInfo,
+        arg_kinds: Vec<Kind>,
+        result_kind: Option<Kind>,
+    ) -> majit_ir::DescrRef {
+        let key = (effect_info, arg_kinds, result_kind);
+        let mut cache = self.call_descr_stub_cache.lock().unwrap();
+        let arc = cache.entry(key.clone()).or_insert_with(|| {
+            Arc::new(CallDescrStub {
+                effect_info: key.0.clone(),
+                arg_kinds: key.1.clone(),
+                result_kind: key.2,
+            })
+        });
+        arc.clone() as Arc<dyn majit_ir::Descr>
     }
 
     /// `codewriter.py:21` `self.cpu = cpu`.
@@ -3665,11 +3580,28 @@ impl CodeWriter {
                         py_pc
                     ))));
                 // Step 6.1 Phase 2d: if the previous block still needs
-                // a fallthrough edge, attach one before switching
-                // `current_block`. `new_block != current_block` skips
-                // the self-link on the very first PC (where both refs
-                // are `joinpoints[0].first()`).
-                let new_block = if needs_fallthrough {
+                // a fallthrough edge AND we're not already standing in
+                // the block for `py_pc`, attach one before switching
+                // `current_block`.
+                //
+                // The `current_state.next_offset != py_pc` guard skips
+                // the self-loop edge that would otherwise land at the
+                // very first PC of every walker-pop iteration: each
+                // pop sets `current_block = pending_block` whose
+                // `current_state.next_offset == start_pc`, and the
+                // first iteration of the inner `for py_pc in
+                // start_pc..` would call `mergeblock(currentblock=
+                // pending_block, py_pc=start_pc)` — a no-op transition
+                // whose only side-effect is to `append_exit_with_state`
+                // a `pending_block → pending_block` self-loop, leaving
+                // every empty pending block with two outgoing edges
+                // (the self-loop + the next PC's fallthrough) and no
+                // exitswitch.  RPython's `flowcontext.py:407-475` walks
+                // per-block, never invoking the joinpoint-merge path
+                // when "entering" a block — pyre's PC-sequential walker
+                // is the adaptation, but the join check belongs only on
+                // PC transitions, not on PC entry.
+                let new_block = if needs_fallthrough && current_state.next_offset != py_pc {
                     mergeblock(
                         code,
                         &mut graph,
@@ -3886,6 +3818,25 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Returns `Option<super::flow::Variable>` so callsites that
+                // need the graph-side identity for downstream dual-writes
+                // (e.g. `load_const_fn(pycode, idx)` whose `pycode` is the
+                // result of this `getfield_vable_r`) can thread the same
+                // Variable.  Non-portal callees skip the graph emit and
+                // return `None`; existing callers that don't capture
+                // discard via the trailing `;` (no-op for unused Option).
+                if is_portal {
+                    Some(emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "getfield_vable_r",
+                        vable_getfield_ref_graph_args(frame_var.into(), field_idx),
+                        Kind::Ref,
+                        -1,
+                    ))
+                } else {
+                    None
+                }
             }};
         }
         macro_rules! emit_vable_setfield_int {
@@ -4040,6 +3991,11 @@ impl CodeWriter {
         // `assembler.py:220` turns it into the bytecode key
         // `ref_copy/r>r`. The SSARepr arg list follows the upstream
         // `(src, '->', dst)` shape via `op_with_result`.
+        //
+        // RPython generates `ref_copy` ONLY at flatten.py:320 during
+        // link renaming (`GraphFlattener::insert_renamings`), never as
+        // a flow graph SpaceOperation.  Walker MUST NOT record a
+        // graph-side `ref_copy` op.
         macro_rules! emit_ref_copy {
             ($ssarepr:expr, $dst:expr, $src:expr) => {{
                 let dst = $dst;
@@ -4055,7 +4011,8 @@ impl CodeWriter {
 
         // `flatten.py:333-334` parity for `ref_copy` with a ConstRef source.
         // Used when opcode semantics push a real `None`, not the internal
-        // CALL `NULL` sentinel.
+        // CALL `NULL` sentinel.  Same graph-side prohibition as
+        // `emit_ref_copy!`.
         macro_rules! emit_ref_const_copy {
             ($ssarepr:expr, $dst:expr, $value:expr) => {{
                 let dst = $dst;
@@ -4715,14 +4672,46 @@ impl CodeWriter {
                         // `Variable | Constant` directly, so the constant
                         // reaches `expect_list_regs_or_pool`
                         // (assembler.rs:1736-1784) without a scratch register.
-                        emit_residual_call(
-                            &mut ssarepr,
-                            box_int_fn_flavor,
-                            box_int_fn_idx,
-                            &[CallArgInput::ConstInt(val)],
-                            ResKind::Ref,
-                            Some(stack_base + current_depth),
+                        // Task #48 micro-slice 10: box_int_fn factor
+                        // refactor.  The prior `emit_residual_call(
+                        // box_int_fn_idx, ...)` is replaced by a single
+                        // direct push of
+                        // `build_box_int_fn_residual_call_ir_r_insn`,
+                        // which produces the same `residual_call_ir_r(
+                        // ConstInt(fn_idx), ListI([ConstInt(val)]),
+                        // ListR([]), Descr) → Reg(dst)` Insn shape
+                        // `emit_residual_call_shape` would have
+                        // produced (empty `ListR` per RPython
+                        // jtransform.py:425 `kinds = 'ir'` whenever
+                        // `lst_i` is non-empty).  Helper hardcodes
+                        // `CallFlavor::Plain` matching the production
+                        // source at codewriter.rs:2202.  Graph
+                        // dual-write below is NOT retired in this
+                        // slice — incremental factor refactor only.
+                        ssarepr.insns.push(
+                            super::flatten::build_box_int_fn_residual_call_ir_r_insn(
+                                box_int_fn_idx,
+                                val,
+                                stack_base + current_depth,
+                            ),
                         );
+                        // Task #46 micro-slice 7: graph-side residual_call
+                        // dual-write — box_int_fn(val:Int) → Ref produces
+                        // shape residual_call_ir_r.
+                        if is_portal {
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                box_int_fn_idx,
+                                CallFlavor::Plain,
+                                vec![super::flow::Constant::signed(val).into()],
+                                vec![],
+                                vec![],
+                                vec![Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                        }
                         // Push a Ref-typed Variable onto the symbolic
                         // stack — Python value-stack slots all hold
                         // boxed `PyObjectRef` at runtime, mirroring
@@ -4758,26 +4747,59 @@ impl CodeWriter {
                         // Portal vable sync at this slot relies on the next
                         // opcode's pushvalue (LoadConst's existing A-slice 2
                         // elision documented at LoadGlobal's caveat).
-                        emit_vable_getfield_ref!(
+                        let pycode_graph_var = emit_vable_getfield_ref!(
                             ssarepr,
                             portal_frame_reg,
                             dst_slot,
                             VABLE_CODE_FIELD_IDX
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            load_const_fn_flavor,
-                            load_const_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    dst_slot,
-                                ),
-                                CallArgInput::ConstInt(idx as i64),
-                            ],
-                            ResKind::Ref,
-                            Some(dst_slot),
+                        // Task #48 micro-slice 7: LoadConst factor
+                        // refactor.  The prior `emit_residual_call(
+                        // load_const_fn_idx, ...)` call is replaced by
+                        // a single direct push of
+                        // `build_load_const_fn_residual_call_ir_r_insn`,
+                        // which produces the same `residual_call_ir_r(
+                        // ConstInt(fn_idx), ListI([ConstInt(idx)]),
+                        // ListR([Reg(pycode)]), Descr) → Reg(dst)` Insn
+                        // shape `emit_residual_call_shape` would have
+                        // produced.  LoadConst has no frontend HLOp
+                        // (no `lower_load_const_hlop_to_insn` arm), so
+                        // the matching graph dual-write below is NOT
+                        // retired in this slice — this is incremental
+                        // factor refactor only, prepping the future
+                        // `flatten_graph(graph, regallocs)` migration.
+                        // The helper hardcodes `CallFlavor::Plain`
+                        // matching the production source at
+                        // codewriter.rs:2215, so `load_const_fn_flavor`
+                        // is no longer threaded into the SSARepr emit.
+                        ssarepr.insns.push(
+                            super::flatten::build_load_const_fn_residual_call_ir_r_insn(
+                                load_const_fn_idx,
+                                idx as i64,
+                                dst_slot,
+                                dst_slot,
+                            ),
                         );
+                        // Task #46 micro-slice 6: graph-side residual_call
+                        // dual-write for load_const_fn(pycode:Ref, idx:Int)
+                        // → Ref.  Threads the pycode Variable produced by
+                        // emit_vable_getfield_ref!'s graph dual-write so
+                        // the def-use chain on the graph side stays
+                        // consistent.  Shape: residual_call_ir_r.
+                        if let Some(pycode_var) = pycode_graph_var {
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                load_const_fn_idx,
+                                CallFlavor::Plain,
+                                vec![super::flow::Constant::signed(idx as i64).into()],
+                                vec![pycode_var.into()],
+                                vec![],
+                                vec![Kind::Ref, Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                        }
                         // Symbolic stack must hold a Ref-typed value
                         // (Python value-stack slots are all boxed
                         // `PyObjectRef`).  `frontend_constant_flow_value`
@@ -4832,24 +4854,22 @@ impl CodeWriter {
                         let pair = var_nums.get(op_arg);
                         let reg_a = u32::from(pair.idx_1()) as u16;
                         let reg_b = u32::from(pair.idx_2()) as u16;
+                        let value_a = current_state
+                            .locals_w
+                            .get(reg_a as usize)
+                            .and_then(|value| value.clone())
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         emit_ref_copy!(ssarepr, stack_base + current_depth, reg_a);
-                        current_state.stack.push(
-                            current_state
-                                .locals_w
-                                .get(reg_a as usize)
-                                .and_then(|value| value.clone())
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph)),
-                        );
+                        current_state.stack.push(value_a);
                         current_depth += 1;
                         emit_vsd!(current_depth);
+                        let value_b = current_state
+                            .locals_w
+                            .get(reg_b as usize)
+                            .and_then(|value| value.clone())
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         emit_ref_copy!(ssarepr, stack_base + current_depth, reg_b);
-                        current_state.stack.push(
-                            current_state
-                                .locals_w
-                                .get(reg_b as usize)
-                                .and_then(|value| value.clone())
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph)),
-                        );
+                        current_state.stack.push(value_b);
                         current_depth += 1;
                         emit_vsd!(current_depth);
                     }
@@ -5052,26 +5072,26 @@ impl CodeWriter {
                             stored_value,
                             py_pc as i64,
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            store_subscr_fn_flavor,
-                            store_subscr_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    obj_reg,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    key_reg,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    value_reg,
-                                ),
-                            ],
-                            ResKind::Void,
-                            None,
+                        // Task #48 micro-slice 6: SETITEM family
+                        // retirement.  Mirror of slices 3-5: inline
+                        // `emit_residual_call(store_subscr_fn_idx, ...)`
+                        // plus its `is_portal`-gated graph dual-write
+                        // collapse to a single direct push via the
+                        // `(Ref, Ref, Ref) → Void` shape constructor.
+                        // `[phase4-flatten-lowering]` probe `SETITEM
+                        // sequence_match=true` guarantees byte-
+                        // equivalence with the prior
+                        // `emit_residual_call_shape` output.  Graph
+                        // carries only the void `setitem(obj, key,
+                        // value)` HLOp from `emit_frontend_setitem`
+                        // above.
+                        ssarepr.insns.push(
+                            super::flatten::build_store_subscr_fn_residual_call_r_v_insn(
+                                store_subscr_fn_idx,
+                                obj_reg,
+                                key_reg,
+                                value_reg,
+                            ),
                         );
                     }
 
@@ -5104,7 +5124,7 @@ impl CodeWriter {
                         let op_kind = op.get(op_arg);
                         let op_val = binary_op_tag(op_kind)
                             .expect("unsupported binary op tag in jitcode lowering")
-                            as u32;
+                            as i64;
                         // Pop rhs (blackhole will see vsd reflect this pop).
                         let rhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let rhs_value = current_state
@@ -5125,23 +5145,35 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            binary_op_fn_flavor,
-                            binary_op_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    lhs_reg,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    rhs_reg,
-                                ),
-                                CallArgInput::ConstInt(op_val as i64),
-                            ],
-                            ResKind::Ref,
-                            Some(stack_base + current_depth),
+                        // Task #48 micro-slice 3: BINARY_OP family
+                        // retirement.  The prior `emit_residual_call(
+                        // binary_op_fn_idx, ...)` plus its `is_portal`-gated
+                        // graph dual-write at this site (Task #46
+                        // micro-slice 1) are replaced by a single direct
+                        // `build_binary_op_residual_call_ir_r_insn` push.
+                        // The `[phase4-flatten-lowering]` probe (micro-
+                        // slice 2) verified `sequence_match=true` on
+                        // int_loop + fannkuch fixtures for every
+                        // BINARY_OP HLOp `add(lhs, rhs)` lowered through
+                        // the helper, guaranteeing byte-equivalence with
+                        // the prior `emit_residual_call_shape` output.
+                        // Graph carries only the `add(lhs, rhs)` HLOp
+                        // (recorded by `emit_frontend_binary` above);
+                        // the helper consumes the same `(fn_idx, op_val,
+                        // lhs_reg, rhs_reg, dst)` tuple the dual-write
+                        // would have folded back into a `residual_call_ir_r`
+                        // SpaceOperation, but skips the SpaceOperation
+                        // round-trip — flatten-time reconstruction stays
+                        // available for the probe and any future
+                        // `flatten_graph(graph, regallocs)` driver.
+                        ssarepr.insns.push(
+                            super::flatten::build_binary_op_residual_call_ir_r_insn(
+                                binary_op_fn_idx,
+                                op_val,
+                                lhs_reg,
+                                rhs_reg,
+                                stack_base + current_depth,
+                            ),
                         );
                         current_state.stack.push(result_value.into());
                         current_depth += 1;
@@ -5152,7 +5184,7 @@ impl CodeWriter {
                     Instruction::CompareOp { opname } => {
                         // Same stack-direct pattern as BinaryOp — see its comment.
                         let op_kind = opname.get(op_arg);
-                        let op_val = compare_op_tag(op_kind) as u32;
+                        let op_val = compare_op_tag(op_kind);
                         let rhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let rhs_value = current_state
                             .stack
@@ -5171,23 +5203,27 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            compare_fn_flavor,
-                            compare_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    lhs_reg,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    rhs_reg,
-                                ),
-                                CallArgInput::ConstInt(op_val as i64),
-                            ],
-                            ResKind::Ref,
-                            Some(stack_base + current_depth),
+                        // Task #48 micro-slice 4: COMPARE_OP family
+                        // retirement.  Mirrors micro-slice 3 BinaryOp
+                        // closure.  `[phase4-flatten-lowering]` probe
+                        // verified `sequence_match=true` on int_loop +
+                        // fannkuch portal fixtures across every
+                        // COMPARE_OP HLOp lowering, guaranteeing
+                        // byte-equivalence with the prior
+                        // `emit_residual_call_shape` output.  Graph
+                        // carries only the `lt(lhs, rhs)` (or sibling)
+                        // HLOp from `emit_frontend_compare`; the
+                        // SSARepr Insn is built by the helper that
+                        // shares its shape with the probe-side
+                        // `lower_compare_op_hlop_to_insn`.
+                        ssarepr.insns.push(
+                            super::flatten::build_compare_op_residual_call_ir_r_insn(
+                                compare_fn_idx,
+                                op_val,
+                                lhs_reg,
+                                rhs_reg,
+                                stack_base + current_depth,
+                            ),
                         );
                         current_state.stack.push(result_value.into());
                         current_depth += 1;
@@ -5227,17 +5263,25 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_residual_call(
-                            &mut ssarepr,
-                            truth_fn_flavor,
-                            truth_fn_idx,
-                            &[CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
+                        // Task #48 micro-slice 5: BOOL family
+                        // retirement.  Mirror of slices 3-4: inline
+                        // `emit_residual_call(truth_fn_idx, ...)` plus
+                        // its `is_portal`-gated graph dual-write
+                        // collapse to a single direct push via the
+                        // `(Ref) → Int` shape constructor.
+                        // `[phase4-flatten-lowering]` probe `BOOL
+                        // sequence_match=true` guarantees byte-
+                        // equivalence with the prior
+                        // `emit_residual_call_shape` output.  Graph
+                        // carries only the `bool(cond_value)` HLOp
+                        // from `emit_frontend_bool` above.
+                        ssarepr
+                            .insns
+                            .push(super::flatten::build_truth_fn_residual_call_r_i_insn(
+                                truth_fn_idx,
                                 cond_reg,
-                            )],
-                            ResKind::Int,
-                            Some(scratch_truth),
-                        );
+                                scratch_truth,
+                            ));
                         if target_py_pc < num_instrs {
                             emit_goto_if_not!(ssarepr, scratch_truth, target_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
@@ -5275,17 +5319,17 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_residual_call(
-                            &mut ssarepr,
-                            truth_fn_flavor,
-                            truth_fn_idx,
-                            &[CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
+                        // Task #48 micro-slice 5: BOOL family
+                        // retirement (sibling of the PopJumpIfFalse
+                        // closure above) — same `(Ref) → Int` shape
+                        // helper, same probe coverage.
+                        ssarepr
+                            .insns
+                            .push(super::flatten::build_truth_fn_residual_call_r_i_insn(
+                                truth_fn_idx,
                                 cond_reg,
-                            )],
-                            ResKind::Int,
-                            Some(scratch_truth),
-                        );
+                                scratch_truth,
+                            ));
                         // `flatten.py:244-267` for a Bool exitswitch always
                         // emits generic `goto_if_not cond, TLabel(linkfalse)`
                         // + inline `make_link(linktrue)`.
@@ -5357,36 +5401,72 @@ impl CodeWriter {
                         let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         // jtransform.py: getfield_vable_r for w_globals (field 3)
                         // and pycode (field 1) — namespace for lookup, code for names.
-                        emit_vable_getfield_ref!(
+                        let ns_graph_var = emit_vable_getfield_ref!(
                             ssarepr,
                             portal_frame_reg,
                             scratch_ns,
                             VABLE_NAMESPACE_FIELD_IDX
                         );
-                        emit_vable_getfield_ref!(
+                        let code_graph_var = emit_vable_getfield_ref!(
                             ssarepr,
                             portal_frame_reg,
                             scratch_code,
                             VABLE_CODE_FIELD_IDX
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            load_global_fn_flavor,
-                            load_global_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    scratch_ns,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    scratch_code,
-                                ),
-                                CallArgInput::ConstInt(raw_namei),
-                            ],
-                            ResKind::Ref,
-                            Some(scratch_ns),
+                        // Task #48 micro-slice 8: LoadGlobal factor
+                        // refactor.  The prior `emit_residual_call(
+                        // load_global_fn_idx, ...)` call is replaced by
+                        // a single direct push of
+                        // `build_load_global_fn_residual_call_ir_r_insn`,
+                        // which produces the same `residual_call_ir_r(
+                        // ConstInt(fn_idx), ListI([ConstInt(namei)]),
+                        // ListR([Reg(ns), Reg(code)]), Descr) →
+                        // Reg(scratch_ns)` Insn shape
+                        // `emit_residual_call_shape` would have
+                        // produced.  LoadGlobal has no frontend HLOp
+                        // (no `lower_load_global_hlop_to_insn` arm);
+                        // the matching graph dual-write below is NOT
+                        // retired in this slice — incremental factor
+                        // refactor only, prepping the future
+                        // `flatten_graph(graph, regallocs)` migration.
+                        // Helper hardcodes `CallFlavor::Plain` matching
+                        // the production source at codewriter.rs:2184.
+                        ssarepr.insns.push(
+                            super::flatten::build_load_global_fn_residual_call_ir_r_insn(
+                                load_global_fn_idx,
+                                raw_namei,
+                                scratch_ns,
+                                scratch_code,
+                                scratch_ns,
+                            ),
                         );
+                        // Task #46 micro-slice 6: graph-side residual_call
+                        // dual-write for load_global_fn(ns:Ref, code:Ref,
+                        // namei:Int) → Ref.  Both ns and code Variables
+                        // come from the preceding emit_vable_getfield_ref!
+                        // graph dual-writes — thread them so def-use stays
+                        // intact.  Shape: residual_call_ir_r.
+                        if let (Some(ns_var), Some(code_var)) = (ns_graph_var, code_graph_var) {
+                            // Match helper bind-site flavor at
+                            // codewriter.rs:2186 (`load_global_fn`
+                            // is `EF_CAN_RAISE`, not virtual-forcing)
+                            // — graph dual-write must agree with the
+                            // SSA helper so any future
+                            // `flatten_graph(graph, regallocs)`
+                            // migration sees a single classification.
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                load_global_fn_idx,
+                                CallFlavor::Plain,
+                                vec![super::flow::Constant::signed(raw_namei).into()],
+                                vec![ns_var.into(), code_var.into()],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref, Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                        }
                         // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
                         // const-source pushvalue writes the constant directly to
                         // the stack TOS register and (in portal case) to the
@@ -5425,13 +5505,12 @@ impl CodeWriter {
                         let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                         for i in (0..nargs).rev() {
                             let arg_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let arg_value = current_state
+                                .stack
+                                .pop()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             emit_ref_copy!(ssarepr, arg_regs[i], arg_reg);
-                            graph_arg_values_rev.push(
-                                current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph)),
-                            );
+                            graph_arg_values_rev.push(arg_value);
                         }
                         let callable_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let callable_value = current_state
@@ -5447,16 +5526,8 @@ impl CodeWriter {
                         // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                         // call_fn(callable, arg0, ...) → result
                         // Parent frame accessed via BH_VABLE_PTR thread-local.
-                        let mut call_args = vec![CallArgInput::Reg(
-                            majit_metainterp::jitcode::JitArgKind::Ref,
-                            callable_reg,
-                        )];
-                        for i in 0..nargs {
-                            call_args.push(CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
-                                arg_regs[i],
-                            ));
-                        }
+                        // The flatten.rs helper consumes `callable_reg` and
+                        // `&arg_regs` directly; no intermediate Vec needed.
                         // Select the correct arity-specific call helper.
                         // RPython blackhole.py: call_int_function transmutes
                         // to the correct arity. Each nargs needs a matching
@@ -5466,11 +5537,11 @@ impl CodeWriter {
                             fresh_ref_value(&mut graph)
                         } else {
                             let graph_call_args: Vec<_> =
-                                graph_arg_values_rev.into_iter().rev().collect();
+                                graph_arg_values_rev.iter().rev().cloned().collect();
                             emit_frontend_simple_call(
                                 &mut graph,
                                 &current_block.block(),
-                                callable_value,
+                                callable_value.clone(),
                                 graph_call_args,
                                 py_pc as i64,
                             )
@@ -5479,25 +5550,73 @@ impl CodeWriter {
                         if nargs > 8 {
                             emit_abort_permanent!(ssarepr);
                         } else {
-                            let (fn_idx, fn_flavor) = match nargs {
-                                0 => (call_fn_0_idx, call_fn_0_flavor),
-                                1 => (call_fn_idx, call_fn_flavor),
-                                2 => (call_fn_2_idx, call_fn_2_flavor),
-                                3 => (call_fn_3_idx, call_fn_3_flavor),
-                                4 => (call_fn_4_idx, call_fn_4_flavor),
-                                5 => (call_fn_5_idx, call_fn_5_flavor),
-                                6 => (call_fn_6_idx, call_fn_6_flavor),
-                                7 => (call_fn_7_idx, call_fn_7_flavor),
-                                _ => (call_fn_8_idx, call_fn_8_flavor),
+                            let fn_idx = match nargs {
+                                0 => call_fn_0_idx,
+                                1 => call_fn_idx,
+                                2 => call_fn_2_idx,
+                                3 => call_fn_3_idx,
+                                4 => call_fn_4_idx,
+                                5 => call_fn_5_idx,
+                                6 => call_fn_6_idx,
+                                7 => call_fn_7_idx,
+                                _ => call_fn_8_idx,
                             };
-                            emit_residual_call(
-                                &mut ssarepr,
-                                fn_flavor,
-                                fn_idx,
-                                &call_args,
-                                ResKind::Ref,
-                                Some(stack_base + current_depth),
+                            // Task #48 micro-slice 9: CALL family
+                            // factor refactor.  The prior
+                            // `emit_residual_call(call_fn_N_idx, ...)`
+                            // call is replaced by a single direct push
+                            // of `build_call_fn_residual_call_r_r_insn`,
+                            // which produces the same `residual_call_r_r(
+                            // ConstInt(fn_idx), ListR([Reg(callable),
+                            // Reg(arg0), ..., Reg(arg_{N-1})]), Descr) →
+                            // Reg(dst)` Insn shape
+                            // `emit_residual_call_shape` would have
+                            // produced (no leading `ListI` because
+                            // `args_i` is empty for all-Ref call_args).
+                            // CALL has no frontend HLOp with the same
+                            // shape (the graph carries `simple_call`
+                            // pre-rtype HLOp recorded by
+                            // `emit_frontend_simple_call`); the matching
+                            // graph dual-write below is NOT retired in
+                            // this slice — incremental factor refactor
+                            // only, prepping the future
+                            // `flatten_graph(graph, regallocs)`
+                            // migration.  Helper hardcodes
+                            // `CallFlavor::MayForce` matching the
+                            // production source at codewriter.rs:2175
+                            // and 2238-2245 (every `call_fn_N` is
+                            // bound MayForce).
+                            ssarepr.insns.push(
+                                super::flatten::build_call_fn_residual_call_r_r_insn(
+                                    fn_idx,
+                                    callable_reg,
+                                    &arg_regs,
+                                    stack_base + current_depth,
+                                ),
                             );
+                            // Task #46 micro-slice 5: graph-side residual_call
+                            // dual-write — call_fn_N signature
+                            // `(ref, ref, ..., ref) -> ref` (nargs+1 refs,
+                            // callable + nargs).  All-ref args make the
+                            // shape `residual_call_r_r`.
+                            if is_portal {
+                                let mut graph_args_r: Vec<super::flow::FlowValue> =
+                                    Vec::with_capacity(nargs + 1);
+                                graph_args_r.push(callable_value);
+                                graph_args_r.extend(graph_arg_values_rev.into_iter().rev());
+                                let _ = record_residual_call_graph_op(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    fn_idx,
+                                    CallFlavor::MayForce,
+                                    vec![],
+                                    graph_args_r,
+                                    vec![],
+                                    vec![Kind::Ref; nargs + 1],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                            }
                         }
                         current_state.stack.push(call_result_value);
                         current_depth += 1;
@@ -5516,6 +5635,7 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        let operand_value_for_dual = operand_value.clone();
                         let negated = emit_frontend_neg(
                             &mut graph,
                             &current_block.block(),
@@ -5526,32 +5646,84 @@ impl CodeWriter {
                             binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
                                 .expect("subtract must have a jit binary-op tag");
                         let scratch_zero = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                        emit_residual_call(
-                            &mut ssarepr,
-                            box_int_fn_flavor,
-                            box_int_fn_idx,
-                            &[CallArgInput::ConstInt(0)],
-                            ResKind::Ref,
-                            Some(scratch_zero),
+                        // Task #48 micro-slice 10: box_int_fn factor
+                        // refactor (UnaryNegative site).  See
+                        // LoadSmallInt site for the shared rationale.
+                        ssarepr.insns.push(
+                            super::flatten::build_box_int_fn_residual_call_ir_r_insn(
+                                box_int_fn_idx,
+                                0,
+                                scratch_zero,
+                            ),
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            binary_op_fn_flavor,
-                            binary_op_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    scratch_zero,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    operand_reg,
-                                ),
-                                CallArgInput::ConstInt(subtract_tag),
-                            ],
-                            ResKind::Ref,
-                            Some(stack_base + current_depth),
+                        // Task #48 micro-slice 11: UnaryNegative
+                        // binary_op_fn factor refactor.  The prior
+                        // `emit_residual_call(binary_op_fn_idx, ...)`
+                        // is replaced by a single direct push of the
+                        // existing `build_binary_op_residual_call_ir_r_insn`
+                        // helper introduced in micro-slice 3 — no new
+                        // flatten.rs code is needed because the shape
+                        // matches BINARY_OP exactly: `(zero:Ref,
+                        // operand:Ref, sub_tag:Int) → Ref` MayForce.
+                        // Graph dual-write below is unchanged.
+                        ssarepr.insns.push(
+                            super::flatten::build_binary_op_residual_call_ir_r_insn(
+                                binary_op_fn_idx,
+                                subtract_tag,
+                                scratch_zero,
+                                operand_reg,
+                                stack_base + current_depth,
+                            ),
                         );
+                        // Task #46 micro-slice 7: graph-side residual_call
+                        // dual-writes for both UnaryNegative emits.  The
+                        // first (box_int_fn(0:Int)→Ref) result is threaded
+                        // into the second (binary_op_fn(zero, operand,
+                        // sub_tag)→Ref) so def-use stays intact.  The
+                        // graph dual-write must mirror the SSA emit's
+                        // operand identity exactly — SSA's binary_op_fn
+                        // takes `operand_reg` (the pre-neg value), so the
+                        // graph dual-write threads the matching pre-neg
+                        // FlowValue (`operand_value_for_dual`, cloned
+                        // before `emit_frontend_neg` consumed
+                        // `operand_value`).  Threading `negated` here
+                        // would record `binary_op_fn(0, neg(operand),
+                        // sub) = +operand` graph-side while SSA computes
+                        // `0 - operand = -operand`, breaking probe parity.
+                        if is_portal {
+                            // Match helper bind-site flavor at
+                            // codewriter.rs:2202 (`box_int_fn` is
+                            // `EF_CAN_RAISE` allocation-only, not
+                            // virtual-forcing).  `binary_op_fn` is
+                            // bound `MayForce` at codewriter.rs:2192
+                            // and stays unchanged.
+                            let zero_graph_var = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                box_int_fn_idx,
+                                CallFlavor::Plain,
+                                vec![super::flow::Constant::signed(0).into()],
+                                vec![],
+                                vec![],
+                                vec![Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            if let Some(zero_var) = zero_graph_var {
+                                let _ = record_residual_call_graph_op(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    binary_op_fn_idx,
+                                    CallFlavor::MayForce,
+                                    vec![super::flow::Constant::signed(subtract_tag as i64).into()],
+                                    vec![zero_var.into(), operand_value_for_dual.into()],
+                                    vec![],
+                                    vec![Kind::Ref, Kind::Ref, Kind::Int],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                            }
+                        }
                         current_state.stack.push(negated.into());
                         current_depth += 1;
                         emit_vsd!(current_depth);
@@ -5599,13 +5771,12 @@ impl CodeWriter {
                         let mut item_values_rev = Vec::with_capacity(argc);
                         for i in (0..argc).rev() {
                             let item_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let item_value = current_state
+                                .stack
+                                .pop()
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             emit_ref_copy!(ssarepr, arg_regs[i], item_reg);
-                            item_values_rev.push(
-                                current_state
-                                    .stack
-                                    .pop()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph)),
-                            );
+                            item_values_rev.push(item_value);
                         }
                         // build_list_fn(argc, item0, item1) → list. The C ABI is
                         // `extern "C" fn(i64, i64, i64)`; the helper dispatches
@@ -5621,29 +5792,29 @@ impl CodeWriter {
                             item_values_rev.into_iter().rev().collect(),
                             py_pc as i64,
                         );
-                        let item0 = if argc >= 1 {
-                            CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
-                                arg_regs[0],
-                            )
-                        } else {
-                            CallArgInput::ConstInt(0) // dummy
-                        };
-                        let item1 = if argc >= 2 {
-                            CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
-                                arg_regs[1],
-                            )
-                        } else {
-                            CallArgInput::ConstInt(0) // dummy
-                        };
-                        emit_residual_call(
-                            &mut ssarepr,
-                            build_list_fn_flavor,
-                            build_list_fn_idx,
-                            &[CallArgInput::ConstInt(argc as i64), item0, item1],
-                            ResKind::Ref,
-                            Some(stack_base + current_depth),
+                        // Task #48 micro-slice 13: BuildList factor
+                        // refactor.  The prior `emit_residual_call(
+                        // build_list_fn_idx, ...)` is replaced by a
+                        // single direct push of
+                        // `build_build_list_fn_residual_call_ir_r_insn`.
+                        // The helper internally pads unused item slots
+                        // with `ConstInt(0)` matching the prior inline
+                        // dummy logic, and produces the same `residual_
+                        // call_ir_r(ConstInt(fn_idx), ListI([argc, ...
+                        // dummies]), ListR([... regs]), Descr)` shape
+                        // `emit_residual_call_shape` would have
+                        // produced.  No graph dual-write exists for
+                        // build_list_fn (only the `newlist` frontend
+                        // HLOp recorded above).  Helper hardcodes
+                        // `CallFlavor::Plain` matching the production
+                        // source at codewriter.rs:2226.
+                        ssarepr.insns.push(
+                            super::flatten::build_build_list_fn_residual_call_ir_r_insn(
+                                build_list_fn_idx,
+                                argc,
+                                &arg_regs,
+                                stack_base + current_depth,
+                            ),
                         );
                         current_state.stack.push(result_value.into());
                         current_depth += 1;
@@ -5669,10 +5840,10 @@ impl CodeWriter {
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 let cause_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                super::flatten::Operand::Register(super::flatten::Register::new(
+                                    super::flatten::Kind::Ref,
                                     cause_reg,
-                                )
+                                ))
                             } else {
                                 // Tier 4 Epic A: PY_NULL flows directly through
                                 // the residual_call's ListOfKind(Ref) as a
@@ -5683,7 +5854,7 @@ impl CodeWriter {
                                 // through the ref constants pool
                                 // (assembler.rs:1709-1724
                                 // expect_ref_reg_or_pool).
-                                CallArgInput::ConstRef(pyre_object::PY_NULL as i64)
+                                super::flatten::Operand::ConstRef(pyre_object::PY_NULL as i64)
                             };
                             // Drop the pre-normalization exception operand from
                             // the shadow stack. The residual call below may
@@ -5704,19 +5875,28 @@ impl CodeWriter {
                             // `emit_raise!` reads the same register as its
                             // source. Pattern matches Sessions 1-3 retirements
                             // (Call/UnaryNegative/CheckExcMatch input-side).
-                            emit_residual_call(
-                                &mut ssarepr,
-                                normalize_raise_varargs_fn_flavor,
-                                normalize_raise_varargs_fn_idx,
-                                &[
-                                    CallArgInput::Reg(
-                                        majit_metainterp::jitcode::JitArgKind::Ref,
-                                        exc_reg,
-                                    ),
+                            // Task #48 micro-slice 14: RaiseVarargs
+                            // normalize_raise_varargs_fn factor
+                            // refactor.  The prior `emit_residual_call(
+                            // normalize_raise_varargs_fn_idx, ...)` is
+                            // replaced by a single direct push of
+                            // `build_normalize_raise_varargs_fn_residual_call_r_r_insn`,
+                            // which produces the same `residual_call_r_r(
+                            // ConstInt(fn_idx), ListR([Reg(exc),
+                            // cause]), Descr) → Reg(exc)` Insn shape.
+                            // Helper hardcodes `CallFlavor::MayForce`
+                            // matching the production source at
+                            // codewriter.rs:2235.  The polymorphic
+                            // `cause` Operand (Reg or ConstRef) is
+                            // built inline above.  No graph dual-write
+                            // exists for normalize_raise_varargs_fn.
+                            ssarepr.insns.push(
+                                super::flatten::build_normalize_raise_varargs_fn_residual_call_r_r_insn(
+                                    normalize_raise_varargs_fn_idx,
+                                    exc_reg,
                                     cause,
-                                ],
-                                ResKind::Ref,
-                                Some(exc_reg),
+                                    exc_reg,
+                                ),
                             );
                             let normalized_exc_fv = fresh_ref_value(&mut graph);
                             emit_raise!(ssarepr, exc_reg, normalized_exc_fv, py_pc as i64);
@@ -5755,25 +5935,62 @@ impl CodeWriter {
                         // get_current_exception / set_current_exception are TLS read/write —
                         // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
                         // getcalldescr's analyzer outcome for non-raising helpers).
-                        emit_residual_call(
-                            &mut ssarepr,
-                            get_current_exception_fn_flavor,
-                            get_current_exception_fn_idx,
-                            &[],
-                            ResKind::Ref,
-                            Some(scratch_prev),
+                        // Task #48 micro-slice 15: PushExcInfo
+                        // get/set_current_exception factor refactor.
+                        // Both helpers are PlainCannotRaise (TLS
+                        // read/write only).  `get_current_exception`
+                        // is 0-arg `() → Ref`; `set_current_exception`
+                        // is 1-arg `(exc:Ref) → Void`.  Graph
+                        // dual-writes below remain unchanged.
+                        ssarepr.insns.push(
+                            super::flatten::build_get_current_exception_fn_residual_call_r_r_insn(
+                                get_current_exception_fn_idx,
+                                scratch_prev,
+                            ),
                         );
-                        emit_residual_call(
-                            &mut ssarepr,
-                            set_current_exception_fn_flavor,
-                            set_current_exception_fn_idx,
-                            &[CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
+                        ssarepr.insns.push(
+                            super::flatten::build_set_current_exception_fn_residual_call_r_v_insn(
+                                set_current_exception_fn_idx,
                                 exc_reg,
-                            )],
-                            ResKind::Void,
-                            None,
+                            ),
                         );
+                        // Task #46 micro-slice 7: graph dual-writes for
+                        // both PushExcInfo emits.  get_current_exception
+                        // takes no args (shape residual_call_r_r with empty
+                        // ListR); set_current_exception is `(exc:Ref)→Void`
+                        // (shape residual_call_r_v).
+                        if is_portal {
+                            // Match helper bind-site flavors at
+                            // codewriter.rs:2253 / :2259 — both
+                            // current-exception helpers are TLS
+                            // read/write only and bound
+                            // `PlainCannotRaise` (`EF_CANNOT_RAISE`,
+                            // call.py:303 `else` branch).
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                get_current_exception_fn_idx,
+                                CallFlavor::PlainCannotRaise,
+                                vec![],
+                                vec![],
+                                vec![],
+                                vec![],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                set_current_exception_fn_idx,
+                                CallFlavor::PlainCannotRaise,
+                                vec![],
+                                vec![exc_value.clone()],
+                                vec![],
+                                vec![Kind::Ref],
+                                ResKind::Void,
+                                py_pc as i64,
+                            );
+                        }
                         let prev_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(prev_value.clone());
                         emit_pushvalue_ref!(ssarepr, current_depth, scratch_prev, prev_value);
@@ -5793,27 +6010,60 @@ impl CodeWriter {
                         // runtime exception type; the residual helper owns
                         // the check.
                         let match_type_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                        let _ = current_state.stack.pop();
+                        let match_type_value = current_state
+                            .stack
+                            .pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let exc_reg = stack_base + current_depth - 1;
+                        // Peek (don't pop) the exception value for the graph
+                        // dual-write — net stack effect is zero (pop match
+                        // type, peek exception, push bool result).
+                        let exc_value = current_state
+                            .stack
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
                         let scratch_match = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                        emit_residual_call(
-                            &mut ssarepr,
-                            compare_fn_flavor,
-                            compare_fn_idx,
-                            &[
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    exc_reg,
-                                ),
-                                CallArgInput::Reg(
-                                    majit_metainterp::jitcode::JitArgKind::Ref,
-                                    match_type_reg,
-                                ),
-                                CallArgInput::ConstInt(10),
-                            ],
-                            ResKind::Ref,
-                            Some(scratch_match),
+                        // Task #48 micro-slice 12: CheckExcMatch
+                        // compare_fn factor refactor.  `compare_fn` is
+                        // the same helper used by COMPARE_OP — the
+                        // call shape `(exc:Ref, match_type:Ref, op_val:
+                        // Int) → Ref` MayForce is identical to slice 4's
+                        // BINARY_OP/COMPARE_OP `_ir_r` family.  CheckExcMatch
+                        // passes `op_val = 10` (ISINSTANCE_OP from
+                        // `runtime_ops::compare_op_tag`'s table) directly
+                        // rather than mapping through `compare_op_tag`.
+                        // Reusing `build_compare_op_residual_call_ir_r_insn`
+                        // matches the semantic shape — the helper
+                        // accepts any `op_val: i64` and the dual-write
+                        // already records the same `compare_fn(...,
+                        // ISINSTANCE_OP:Int) → Ref` `residual_call_ir_r`
+                        // shape (codewriter.rs:6219-6232).
+                        ssarepr.insns.push(
+                            super::flatten::build_compare_op_residual_call_ir_r_insn(
+                                compare_fn_idx,
+                                10,
+                                exc_reg,
+                                match_type_reg,
+                                scratch_match,
+                            ),
                         );
+                        // Task #46 micro-slice 7: compare_fn(exc, match_type,
+                        // ISINSTANCE_OP:Int) → Ref shape residual_call_ir_r.
+                        if is_portal {
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                compare_fn_idx,
+                                CallFlavor::MayForce,
+                                vec![super::flow::Constant::signed(10).into()],
+                                vec![exc_value, match_type_value],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref, Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
+                        }
                         let result_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(result_value.clone());
                         emit_pushvalue_ref!(ssarepr, current_depth, scratch_match, result_value);
@@ -5830,19 +6080,40 @@ impl CodeWriter {
                         // reinstated as the "current" one so a bare `raise`
                         // re-propagates it.
                         let prev_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                        let _ = current_state.stack.pop();
+                        let prev_value = current_state
+                            .stack
+                            .pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         // set_current_exception is a TLS write — EF_CANNOT_RAISE.
-                        emit_residual_call(
-                            &mut ssarepr,
-                            set_current_exception_fn_flavor,
-                            set_current_exception_fn_idx,
-                            &[CallArgInput::Reg(
-                                majit_metainterp::jitcode::JitArgKind::Ref,
+                        // Task #48 micro-slice 15: PopExcept
+                        // set_current_exception factor refactor.
+                        // PlainCannotRaise TLS write `(prev:Ref) → Void`.
+                        // Graph dual-write below unchanged.
+                        ssarepr.insns.push(
+                            super::flatten::build_set_current_exception_fn_residual_call_r_v_insn(
+                                set_current_exception_fn_idx,
                                 prev_reg,
-                            )],
-                            ResKind::Void,
-                            None,
+                            ),
                         );
+                        // Task #46 micro-slice 7: set_current_exception
+                        // `(prev:Ref)→Void` shape residual_call_r_v.
+                        // Match helper bind-site flavor at
+                        // codewriter.rs:2259 — TLS write,
+                        // `PlainCannotRaise`.
+                        if is_portal {
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                set_current_exception_fn_idx,
+                                CallFlavor::PlainCannotRaise,
+                                vec![],
+                                vec![prev_value],
+                                vec![],
+                                vec![Kind::Ref],
+                                ResKind::Void,
+                                py_pc as i64,
+                            );
+                        }
                         current_state.last_exception = None;
                     }
 
@@ -6212,15 +6483,32 @@ impl CodeWriter {
             if site.push_lasti {
                 // A-slice 6: box_int writes the lasti result directly to
                 // the exception slot, retiring obj_tmp0 → exc_slot copy.
-                emit_residual_call(
-                    &mut ssarepr,
-                    box_int_fn_flavor,
-                    box_int_fn_idx,
-                    &[CallArgInput::ConstInt(site.lasti_py_pc as i64)],
-                    ResKind::Ref,
-                    Some(exc_slot),
-                );
+                // Task #48 micro-slice 10: box_int_fn factor refactor
+                // (exception lasti site).  See LoadSmallInt site for
+                // the shared rationale.
+                ssarepr
+                    .insns
+                    .push(super::flatten::build_box_int_fn_residual_call_ir_r_insn(
+                        box_int_fn_idx,
+                        site.lasti_py_pc as i64,
+                        exc_slot,
+                    ));
+                // Task #46 micro-slice 7: graph dual-write of the lasti
+                // box.  Shape residual_call_ir_r (kinds=ir, reskind=r);
+                // pure const arg ConstInt(lasti_py_pc).
                 if is_portal {
+                    let _ = record_residual_call_graph_op(
+                        &mut graph,
+                        &current_block.block(),
+                        box_int_fn_idx,
+                        CallFlavor::Plain,
+                        vec![super::flow::Constant::signed(site.lasti_py_pc as i64).into()],
+                        vec![],
+                        vec![],
+                        vec![Kind::Int],
+                        ResKind::Ref,
+                        -1,
+                    );
                     let scratch_lasti_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                     emit_load_const_i!(
                         ssarepr,
@@ -6592,8 +6880,25 @@ impl CodeWriter {
                     }
                 }
 
-                let mut graph_shape_counts: HashMap<String, usize> = HashMap::new();
+                // Symmetric split for graph-side `parallel_all`: pre-rtype
+                // HLOperation shapes (`add/lt/bool/setitem/...` from
+                // `emit_frontend_*`) live at the flowspace level and have
+                // no inline counterpart by design — inline lowers them
+                // through helper-call `residual_call_*`.  See
+                // `is_graph_only_artifact` docstring for the dual-stage
+                // architecture rationale.
+                let mut graph_walker: Vec<&super::flatten::Insn> = Vec::new();
+                let mut graph_artifact_count: usize = 0;
                 for insn in &parallel_all {
+                    if super::flatten::is_graph_only_artifact(insn) {
+                        graph_artifact_count += 1;
+                    } else {
+                        graph_walker.push(insn);
+                    }
+                }
+
+                let mut graph_shape_counts: HashMap<String, usize> = HashMap::new();
+                for insn in &graph_walker {
                     *graph_shape_counts
                         .entry(shape_descriptor(insn))
                         .or_insert(0) += 1;
@@ -6610,10 +6915,12 @@ impl CodeWriter {
                     multiset_match += g_count.min(i_count);
                 }
                 eprintln!(
-                    "[phase4-graph-shape] {} parallel={} inline_walker={} \
-                     inline_artifact={} multiset_match={}",
+                    "[phase4-graph-shape] {} parallel={} graph_walker={} graph_artifact={} \
+                     inline_walker={} inline_artifact={} multiset_match={}",
                     code.obj_name,
                     parallel_all.len(),
+                    graph_walker.len(),
+                    graph_artifact_count,
                     inline_walker.len(),
                     inline_artifact_count,
                     multiset_match,
@@ -6706,6 +7013,7 @@ impl CodeWriter {
                     "setarrayitem_vable_r",
                     "getarrayitem_vable_r",
                     "setfield_vable_i",
+                    "getfield_vable_r",
                 ];
                 for &family in FAMILIES {
                     let parallel = super::flatten::flatten_family_ops(
@@ -6901,7 +7209,28 @@ impl CodeWriter {
                 // `getarrayitem_vable_r` (Session 19 slice 2) graduates
                 // because both LOAD_FAST + StoreFastLoadFast LOAD halves
                 // already record graph counterparts.
-                const FULL_EQ_FAMILIES: &[&str] = &["setfield_vable_i", "getarrayitem_vable_r"];
+                // `getfield_vable_r` (Liveness epic prep
+                // 2026-05-05): the graph emit is paired 1:1 with the
+                // inline emit inside `emit_vable_getfield_ref!`, so
+                // multiset equality holds by construction — but the
+                // graph half of every such macro is `is_portal`-gated,
+                // so the equality only holds for portal CodeObjects.
+                // The FULL_EQ assertion below skips the check when
+                // `!is_portal` to keep the probe sound on helper
+                // jitcodes (where inline emits fire but the graph
+                // dual-write intentionally does not).
+                //
+                // `ref_copy` retired from FULL_EQ_FAMILIES alongside
+                // its graph dual-write retirement (2026-05-06): RPython
+                // generates `ref_copy` only at flatten.py:320 link
+                // renaming, never as a flow graph SpaceOperation, so
+                // walker no longer records a graph-side counterpart;
+                // there is nothing for the equality probe to check.
+                const FULL_EQ_FAMILIES: &[&str] = &[
+                    "setfield_vable_i",
+                    "getarrayitem_vable_r",
+                    "getfield_vable_r",
+                ];
                 for &family in SUB_MULTISET_FAMILIES.iter().chain(FULL_EQ_FAMILIES.iter()) {
                     let parallel = super::flatten::flatten_family_ops(
                         &graph,
@@ -6951,8 +7280,16 @@ impl CodeWriter {
                     // FULL_EQ additionally requires `parallel.len() ==
                     // inline.len()`. Combined with the sub-multiset
                     // shape-counts loop above, this proves the two
-                    // multisets are equal.
-                    if FULL_EQ_FAMILIES.contains(&family) {
+                    // multisets are equal.  The check is portal-only:
+                    // each FULL_EQ family's graph dual-write is
+                    // `is_portal`-gated inside its emit macro, so
+                    // helper-jitcode CodeObjects with inline emits but
+                    // no graph dual-writes would falsely trip this
+                    // assertion.  The sub-multiset shape-counts pass
+                    // above remains active in both branches because
+                    // an empty parallel set is a valid sub-multiset
+                    // of any inline set.
+                    if FULL_EQ_FAMILIES.contains(&family) && is_portal {
                         assert_eq!(
                             parallel.len(),
                             inline.len(),
@@ -6966,6 +7303,414 @@ impl CodeWriter {
                 }
             }
         }
+
+        // Task #48 micro-slice 2: `[phase4-flatten-lowering]` probe.
+        // Verifies that the BINARY_OP HLOp lowering helper
+        // (`flatten::lower_binary_op_hlop_to_insn`) produces the
+        // same Insn SHAPE sequence — in the same order — as the
+        // inline emit's `residual_call_ir_r` ops filtered by
+        // `args[0] == ConstInt(binary_op_fn_idx)`.
+        //
+        // Per-CodeObject report:
+        //   `[phase4-flatten-lowering] {obj_name} BINARY_OP \
+        //    lowered=N inline=M sequence_match=true|false`
+        //
+        // Comparison precision = `shape_descriptor` (opname +
+        // arg-type tags + ->reg).  Register colors and ConstInt
+        // literal values are not compared — graph regalloc differs
+        // from pre-rename SSA regalloc by design, so shape
+        // comparison is the right precision per the
+        // `[phase4-flatten-family]` probe convention.
+        //
+        // Probe runs only on portal CodeObjects: helper jitcodes
+        // never emit BINARY_OP HLOps (their bytecodes don't go
+        // through the `BinaryOp` walker arm).
+        //
+        // Gated only on `log_enabled` (PYRE_PHASE1_REGALLOC_LOG=1)
+        // so it fires in release builds as well — the
+        // `[phase4-flatten-family]` strict assertions live behind
+        // `cfg!(debug_assertions) && log_enabled`, but this probe
+        // is measurement-only (no assert) and the production
+        // verification value comes from running it on the same
+        // release-built fixtures the `[phase4-flatten-family]`
+        // probe (in its `eprintln` form, also outside the strict
+        // block) reports against.
+        //
+        // Slice 3 of the epic retires the inline
+        // `emit_residual_call(binary_op_fn_idx, ...)` callsite and
+        // the matching graph dual-write once this probe reports
+        // `sequence_match=true` across all production fixtures.
+        if log_enabled && is_portal {
+            let mut graph_regallocs =
+                super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+            super::regalloc::enforce_input_args_simulation(&graph, &mut graph_regallocs);
+            let lowering_ctx = super::flatten::LoweringContext {
+                binary_op_fn_idx,
+                compare_op_fn_idx: compare_fn_idx,
+                truth_fn_idx,
+                store_subscr_fn_idx,
+            };
+            let mut get_register = |variable: super::flow::Variable| {
+                let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                let color = graph_regallocs
+                    .get(&kind)
+                    .and_then(|r| r.coloring.get(&variable.id).copied())
+                    .unwrap_or(u16::MAX);
+                super::flatten::Register::new(kind, color)
+            };
+            let mut lower_constant =
+                |c: &super::flow::Constant| super::flatten::flatten_constant_operand_for_probe(c);
+            let mut lowered_binary: Vec<super::flatten::Insn> = Vec::new();
+            let mut lowered_compare: Vec<super::flatten::Insn> = Vec::new();
+            let mut lowered_bool: Vec<super::flatten::Insn> = Vec::new();
+            let mut lowered_setitem: Vec<super::flatten::Insn> = Vec::new();
+            for block in graph.iterblocks() {
+                let block = block.borrow();
+                for op in &block.operations {
+                    if let Some(insn) = super::flatten::lower_binary_op_hlop_to_insn(
+                        op,
+                        &lowering_ctx,
+                        &mut get_register,
+                        &mut lower_constant,
+                    ) {
+                        lowered_binary.push(insn);
+                    }
+                    if let Some(insn) = super::flatten::lower_compare_op_hlop_to_insn(
+                        op,
+                        &lowering_ctx,
+                        &mut get_register,
+                        &mut lower_constant,
+                    ) {
+                        lowered_compare.push(insn);
+                    }
+                    if let Some(insn) = super::flatten::lower_bool_hlop_to_insn(
+                        op,
+                        &lowering_ctx,
+                        &mut get_register,
+                        &mut lower_constant,
+                    ) {
+                        lowered_bool.push(insn);
+                    }
+                    if let Some(insn) = super::flatten::lower_setitem_hlop_to_insn(
+                        op,
+                        &lowering_ctx,
+                        &mut get_register,
+                        &mut lower_constant,
+                    ) {
+                        lowered_setitem.push(insn);
+                    }
+                }
+            }
+            // Per-family inline filter + sequence_match report.
+            // Each family identifies its inline residual_call by
+            // matching `(opname, fn_idx)` — `opname` is the
+            // family-specific shape (`residual_call_ir_r` for the
+            // `(Ref, Ref, Int) → Ref` families, `residual_call_r_i`
+            // for the `(Ref) → Int` BOOL family) and `fn_idx` is
+            // the leading `ConstInt` arg.
+            let report_family = |family: &str,
+                                 expected_opname: &str,
+                                 fn_idx: u16,
+                                 lowered: &[super::flatten::Insn]| {
+                let inline: Vec<&super::flatten::Insn> = ssarepr
+                        .insns
+                        .iter()
+                        .filter(|insn| {
+                            matches!(
+                                insn,
+                                super::flatten::Insn::Op { opname, args, .. }
+                                    if opname == expected_opname
+                                        && matches!(
+                                            args.first(),
+                                            Some(super::flatten::Operand::ConstInt(v)) if *v == fn_idx as i64
+                                        )
+                            )
+                        })
+                        .collect();
+                let sequence_match = lowered.len() == inline.len()
+                    && lowered
+                        .iter()
+                        .zip(inline.iter())
+                        .all(|(l, r)| shape_descriptor(l) == shape_descriptor(*r));
+                eprintln!(
+                    "[phase4-flatten-lowering] {} {family} lowered={} inline={} sequence_match={}",
+                    code.obj_name,
+                    lowered.len(),
+                    inline.len(),
+                    sequence_match,
+                );
+                if !sequence_match && lowered.len() == inline.len() {
+                    for (i, (l, r)) in lowered.iter().zip(inline.iter()).enumerate() {
+                        let ls = shape_descriptor(l);
+                        let rs = shape_descriptor(*r);
+                        if ls != rs {
+                            eprintln!(
+                                "[phase4-flatten-lowering]   {} {family} pos={i} lowered_shape={ls} inline_shape={rs}",
+                                code.obj_name,
+                            );
+                            break;
+                        }
+                    }
+                }
+            };
+            report_family(
+                "BINARY_OP",
+                "residual_call_ir_r",
+                binary_op_fn_idx,
+                &lowered_binary,
+            );
+            report_family(
+                "COMPARE_OP",
+                "residual_call_ir_r",
+                compare_fn_idx,
+                &lowered_compare,
+            );
+            report_family("BOOL", "residual_call_r_i", truth_fn_idx, &lowered_bool);
+            report_family(
+                "SETITEM",
+                "residual_call_r_v",
+                store_subscr_fn_idx,
+                &lowered_setitem,
+            );
+
+            // Slice #48.17 (Option C pipeline-flip prep):
+            // `[phase4-flatten-driver]` probe.  Walks
+            // `graph.iterblocks()` once through the unified
+            // `flatten::flatten_op_to_insn_with_lowering`
+            // dispatcher and reruns the same per-family
+            // `(opname, fn_idx)` filter + sequence_match
+            // comparison the `[phase4-flatten-lowering]` probe
+            // just produced.  Difference: the lowering probe
+            // iterates per-family separately, the driver probe
+            // iterates once through the dispatcher and threads
+            // every retired-family HLOp through it.  Both probes
+            // reporting `sequence_match=true` confirms the
+            // dispatcher routes each HLOp opname to the matching
+            // `lower_*` helper without misdispatch and preserves
+            // graph block walk order.  Probe-positive answer is
+            // the precondition for switching production from
+            // inline emit to a post-walker `flatten_graph(graph,
+            // ssarepr, ctx)` driver that uses the dispatcher as
+            // its per-op core.
+            //
+            // Same `log_enabled && is_portal` gate as
+            // `[phase4-flatten-lowering]`; same shape_descriptor
+            // precision (no register or ConstInt literal value
+            // comparison).
+            let mut driver_lowered: Vec<super::flatten::Insn> = Vec::new();
+            for block in graph.iterblocks() {
+                let block = block.borrow();
+                for op in &block.operations {
+                    if let Some(insn) = super::flatten::flatten_op_to_insn_with_lowering(
+                        op,
+                        &lowering_ctx,
+                        &mut get_register,
+                        &mut lower_constant,
+                    ) {
+                        driver_lowered.push(insn);
+                    }
+                }
+            }
+            let report_driver_family = |family: &str, expected_opname: &str, fn_idx: u16| {
+                let driver: Vec<&super::flatten::Insn> = driver_lowered
+                        .iter()
+                        .filter(|insn| {
+                            matches!(
+                                insn,
+                                super::flatten::Insn::Op { opname, args, .. }
+                                    if opname == expected_opname
+                                        && matches!(
+                                            args.first(),
+                                            Some(super::flatten::Operand::ConstInt(v)) if *v == fn_idx as i64
+                                        )
+                            )
+                        })
+                        .collect();
+                let inline: Vec<&super::flatten::Insn> = ssarepr
+                        .insns
+                        .iter()
+                        .filter(|insn| {
+                            matches!(
+                                insn,
+                                super::flatten::Insn::Op { opname, args, .. }
+                                    if opname == expected_opname
+                                        && matches!(
+                                            args.first(),
+                                            Some(super::flatten::Operand::ConstInt(v)) if *v == fn_idx as i64
+                                        )
+                            )
+                        })
+                        .collect();
+                let sequence_match = driver.len() == inline.len()
+                    && driver
+                        .iter()
+                        .zip(inline.iter())
+                        .all(|(l, r)| shape_descriptor(l) == shape_descriptor(*r));
+                eprintln!(
+                    "[phase4-flatten-driver] {} {family} driver={} inline={} sequence_match={}",
+                    code.obj_name,
+                    driver.len(),
+                    inline.len(),
+                    sequence_match,
+                );
+                if !sequence_match && driver.len() == inline.len() {
+                    for (i, (l, r)) in driver.iter().zip(inline.iter()).enumerate() {
+                        let ls = shape_descriptor(l);
+                        let rs = shape_descriptor(*r);
+                        if ls != rs {
+                            eprintln!(
+                                "[phase4-flatten-driver]   {} {family} pos={i} driver_shape={ls} inline_shape={rs}",
+                                code.obj_name,
+                            );
+                            break;
+                        }
+                    }
+                }
+            };
+            report_driver_family("BINARY_OP", "residual_call_ir_r", binary_op_fn_idx);
+            report_driver_family("COMPARE_OP", "residual_call_ir_r", compare_fn_idx);
+            report_driver_family("BOOL", "residual_call_r_i", truth_fn_idx);
+            report_driver_family("SETITEM", "residual_call_r_v", store_subscr_fn_idx);
+
+            // Slice #48.19 (Option C pipeline-flip prep):
+            // `[phase4-flatten-graph]` probe.  Runs the FULL
+            // `flatten::flatten_graph_with_lowering(graph, ssarepr,
+            // ctx, get_register, lower_constant)` driver end-to-end
+            // on the same graph and compares its output Insn stream
+            // against the inline `ssarepr` per retired family.
+            //
+            // Difference from `[phase4-flatten-driver]`: that probe
+            // walks `graph.iterblocks()` through the per-op
+            // `flatten_op_to_insn_with_lowering` dispatcher in a
+            // flat loop.  This probe exercises the full
+            // `GraphFlattener` (Label emission, `make_link` /
+            // `insert_exits` block boundary handling, terminator
+            // emission), so a `sequence_match=true` here confirms
+            // the GraphFlattener wraps the dispatcher correctly
+            // — the precondition for switching production at the 4
+            // retired-family walker arms from inline emit to a
+            // post-walk `flatten_graph_with_lowering` invocation
+            // (Slice #48.20+).
+            //
+            // The driver runs against a fresh `SSARepr`; the
+            // existing inline `ssarepr` is read-only here.
+            //
+            // `flatten_graph` is still a Phase 1 SCAFFOLD: many
+            // walker emits (rtype-direct int/ref ops, framestate
+            // ops, guard ops) lack graph counterparts so
+            // `driver_ssarepr.insns.len()` will be much smaller
+            // than `ssarepr.insns.len()`.  Only the per-retired-
+            // family `(opname, fn_idx)` filtered subsequences need
+            // to byte-match — those are the ones a production flip
+            // would swap inline emits for.
+            //
+            // The driver call is wrapped in `catch_unwind` because
+            // the SCAFFOLD panics on graph shapes it doesn't yet
+            // model (overflow exception edges, unsupported exits).
+            // Probe-only must not crash production for fixtures
+            // that exercise such shapes; on panic we report
+            // `panic=true` and skip the per-family comparison.
+            let mut driver_get_register = |variable: super::flow::Variable| {
+                let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                let color = graph_regallocs
+                    .get(&kind)
+                    .and_then(|r| r.coloring.get(&variable.id).copied())
+                    .unwrap_or(u16::MAX);
+                super::flatten::Register::new(kind, color)
+            };
+            let mut driver_lower_constant =
+                |c: &super::flow::Constant| super::flatten::flatten_constant_operand_for_probe(c);
+            let driver_name = format!("{}-driver", code.obj_name);
+            let mut driver_ssarepr = super::flatten::SSARepr::new(driver_name);
+            let driver_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::flatten::flatten_graph_with_lowering(
+                    &graph,
+                    &mut driver_ssarepr,
+                    lowering_ctx,
+                    &mut driver_get_register,
+                    &mut driver_lower_constant,
+                );
+            }));
+            match driver_result {
+                Err(_) => {
+                    eprintln!(
+                        "[phase4-flatten-graph] {} panic=true driver_total=N/A inline_total={}",
+                        code.obj_name,
+                        ssarepr.insns.len(),
+                    );
+                }
+                Ok(()) => {
+                    eprintln!(
+                        "[phase4-flatten-graph] {} panic=false driver_total={} inline_total={}",
+                        code.obj_name,
+                        driver_ssarepr.insns.len(),
+                        ssarepr.insns.len(),
+                    );
+                    let report_graph_family = |family: &str, expected_opname: &str, fn_idx: u16| {
+                        let driver: Vec<&super::flatten::Insn> = driver_ssarepr
+                                .insns
+                                .iter()
+                                .filter(|insn| {
+                                    matches!(
+                                        insn,
+                                        super::flatten::Insn::Op { opname, args, .. }
+                                            if opname == expected_opname
+                                                && matches!(
+                                                    args.first(),
+                                                    Some(super::flatten::Operand::ConstInt(v)) if *v == fn_idx as i64
+                                                )
+                                    )
+                                })
+                                .collect();
+                        let inline: Vec<&super::flatten::Insn> = ssarepr
+                                .insns
+                                .iter()
+                                .filter(|insn| {
+                                    matches!(
+                                        insn,
+                                        super::flatten::Insn::Op { opname, args, .. }
+                                            if opname == expected_opname
+                                                && matches!(
+                                                    args.first(),
+                                                    Some(super::flatten::Operand::ConstInt(v)) if *v == fn_idx as i64
+                                                )
+                                    )
+                                })
+                                .collect();
+                        let sequence_match = driver.len() == inline.len()
+                            && driver
+                                .iter()
+                                .zip(inline.iter())
+                                .all(|(l, r)| shape_descriptor(l) == shape_descriptor(*r));
+                        eprintln!(
+                            "[phase4-flatten-graph] {} {family} driver={} inline={} sequence_match={}",
+                            code.obj_name,
+                            driver.len(),
+                            inline.len(),
+                            sequence_match,
+                        );
+                        if !sequence_match && driver.len() == inline.len() {
+                            for (i, (l, r)) in driver.iter().zip(inline.iter()).enumerate() {
+                                let ls = shape_descriptor(l);
+                                let rs = shape_descriptor(*r);
+                                if ls != rs {
+                                    eprintln!(
+                                        "[phase4-flatten-graph]   {} {family} pos={i} driver_shape={ls} inline_shape={rs}",
+                                        code.obj_name,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    report_graph_family("BINARY_OP", "residual_call_ir_r", binary_op_fn_idx);
+                    report_graph_family("COMPARE_OP", "residual_call_ir_r", compare_fn_idx);
+                    report_graph_family("BOOL", "residual_call_r_i", truth_fn_idx);
+                    report_graph_family("SETITEM", "residual_call_r_v", store_subscr_fn_idx);
+                }
+            }
+        }
+
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
         // `flatten.py:88-100` `enforce_input_args` may rotate the

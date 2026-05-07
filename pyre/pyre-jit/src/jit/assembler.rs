@@ -1367,6 +1367,26 @@ fn dispatch_residual_call(
         other => panic!("residual_call: unknown reskind {other:?}"),
     };
 
+    // Parity check: `CallDescrStub::result_kind` is part of the stub's
+    // cache key (rewrite.rs codegen-side cache, mirroring RPython
+    // `rpython/jit/backend/llsupport/descr.py:665` where `result_type`
+    // belongs to `getCallDescr`'s key).  The opname suffix's `reskind`
+    // must agree with `stub.result_kind`; a mismatch means a producer
+    // wrote a bogus stub or a wrong opname, which would otherwise route
+    // through this function silently and corrupt the JitCallArg flat
+    // layout.  Fail loud rather than swallow the divergence.
+    let stub_reskind = match stub.result_kind {
+        Some(Kind::Int) => ResKind::Int,
+        Some(Kind::Ref) => ResKind::Ref,
+        Some(Kind::Float) => ResKind::Float,
+        None => ResKind::Void,
+    };
+    assert_eq!(
+        reskind, stub_reskind,
+        "residual_call({opname}): opname-derived reskind {reskind:?} disagrees with \
+         CallDescrStub::result_kind {stub_reskind:?}; producer must keep them aligned"
+    );
+
     // Slice 3 of the EffectInfo wire-up epic: derive the dispatch branch
     // from `stub.effect_info`. Mirrors `pyjitpl.py:1995-2126
     // do_residual_call`'s precedence — the optimizer upstream picks
@@ -2345,6 +2365,7 @@ mod tests {
                         CallFlavor::PureCanRaise,
                     ),
                     arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Float],
+                    result_kind: Some(Kind::Float),
                 })),
             ],
             Register::new(Kind::Float, 1),
@@ -2386,6 +2407,7 @@ mod tests {
                         CallFlavor::ReleaseGil,
                     ),
                     arg_kinds: vec![Kind::Int, Kind::Ref],
+                    result_kind: None,
                 })),
             ],
         ));

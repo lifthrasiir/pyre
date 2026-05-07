@@ -267,6 +267,55 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
     call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
 };
 
+/// `EF_ELIDABLE_CANNOT_RAISE` with `OS_INT_PY_DIV` oopspec — Python `//`
+/// (floor division). RPython parity: jtransform.py:2046-2047
+/// `_handle_int_special` classifies `int.py_div` as
+/// `EF_ELIDABLE_CANNOT_RAISE`. Source-level zero/overflow wrappers
+/// (`rint.py:417 ll_int_py_div_zer`, `:429 ll_int_py_div_ovf_zer`)
+/// are inlined into the calling graph before the JIT sees this
+/// oopspec call; their checks become runtime guards in the trace,
+/// not properties of this call descriptor. The optimizer's
+/// `optimize_call_int_py_div` (rewrite.py:713-766) reads the
+/// `OS_INT_PY_DIV` oopspec to specialize power-of-2 divisors to
+/// `int_rshift`, constant 1 to identity, constant -1 to `int_neg`, etc.
+/// Callee is pure: no heap touched, no GC trigger, no raise.
+pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::ElidableCannotRaise,
+    oopspecindex: OopSpecIndex::IntPyDiv,
+    readonly_descrs_fields: 0,
+    write_descrs_fields: 0,
+    readonly_descrs_arrays: 0,
+    write_descrs_arrays: 0,
+    readonly_descrs_interiorfields: 0,
+    write_descrs_interiorfields: 0,
+    can_invalidate: false,
+    can_collect: false,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
+/// Counterpart of [`INT_PY_DIV_EFFECT_INFO`] for Python `%`. RPython
+/// parity: jtransform.py:2046-2047 classifies `int.py_mod` as
+/// `EF_ELIDABLE_CANNOT_RAISE`; zero/overflow checks from the source
+/// wrappers (`rint.py:509 ll_int_py_mod_zer`, `:520
+/// ll_int_py_mod_ovf_zer`) are inlined upstream of the JIT trace.
+pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
+    extraeffect: ExtraEffect::ElidableCannotRaise,
+    oopspecindex: OopSpecIndex::IntPyMod,
+    readonly_descrs_fields: 0,
+    write_descrs_fields: 0,
+    readonly_descrs_arrays: 0,
+    write_descrs_arrays: 0,
+    readonly_descrs_interiorfields: 0,
+    write_descrs_interiorfields: 0,
+    can_invalidate: false,
+    can_collect: false,
+    single_write_descr_array: None,
+    extradescrs: None,
+    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+};
+
 /// `EF_ELIDABLE_CANNOT_RAISE` (effectinfo.py:17). Selected by
 /// `call.py:299 getcalldescr` when `_canraise(op) == False` for an
 /// elidable callee — `pyjitpl.py:2126 do_residual_call` records
