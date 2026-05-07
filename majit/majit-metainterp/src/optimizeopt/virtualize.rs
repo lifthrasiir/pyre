@@ -90,7 +90,6 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 /// pyre's tracing layer (`pyjitpl.rs`), then remove this tracker entirely.
 pub(crate) struct VirtualizableTracker {
     config: VirtualizableConfig,
-    initialized: bool,
     needs_setup: bool,
 }
 
@@ -98,13 +97,11 @@ impl VirtualizableTracker {
     fn new(config: VirtualizableConfig) -> Self {
         VirtualizableTracker {
             config,
-            initialized: false,
             needs_setup: false,
         }
     }
 
     fn setup(&mut self) {
-        self.initialized = false;
         self.needs_setup = true;
     }
 
@@ -131,7 +128,6 @@ impl VirtualizableTracker {
 
     /// Seed virtualizable state from existing trace inputs.
     fn init(&mut self, ctx: &mut OptContext) {
-        self.initialized = true;
         if ctx.num_inputs() <= 1 {
             return;
         }
@@ -701,16 +697,18 @@ impl OptVirtualize {
         if let Some(info) = ctx.peek_ptr_info_via_box(array_ref) {
             if let PtrInfo::VirtualArray(vinfo) = info {
                 if let Some(index) = ctx.get_constant_int(index_ref) {
-                    let idx = index as usize;
-                    if idx < vinfo.items.len() {
-                        let item_ref = vinfo.items[idx];
-                        // virtualize.py:282-284: reading uninitialized items → InvalidLoop
-                        if item_ref.is_none() {
-                            return OptimizationResult::InvalidLoop;
-                        }
-                        ctx.replace_op(op.pos, item_ref);
-                        return OptimizationResult::Remove;
+                    // info.py:580-582: getitem returns None for
+                    // negative, out-of-range, or uninitialized slots.
+                    // virtualize.py:282-284: None → InvalidLoop.
+                    if index < 0 || (index as usize) >= vinfo.items.len() {
+                        return OptimizationResult::InvalidLoop;
                     }
+                    let item_ref = vinfo.items[index as usize];
+                    if item_ref.is_none() {
+                        return OptimizationResult::InvalidLoop;
+                    }
+                    ctx.replace_op(op.pos, item_ref);
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -749,16 +747,18 @@ impl OptVirtualize {
 
         if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
             if let Some(index) = ctx.get_constant_int(index_ref) {
-                let elem_idx = index as usize;
-                if elem_idx < vinfo.element_fields.len() {
-                    let fld = get_field(&vinfo.element_fields[elem_idx], field_idx);
-                    // virtualize.py:394-396: reading uninitialized → InvalidLoop
-                    if fld.is_none() {
-                        return OptimizationResult::InvalidLoop;
-                    }
-                    ctx.replace_op(op.pos, fld.unwrap());
-                    return OptimizationResult::Remove;
+                // info.py:651-656 _compute_index: negative or out-of-range → -1
+                // info.py:663-668 getinteriorfield_virtual: -1 → None
+                // virtualize.py:394-396: None → InvalidLoop
+                if index < 0 || (index as usize) >= vinfo.element_fields.len() {
+                    return OptimizationResult::InvalidLoop;
                 }
+                let fld = get_field(&vinfo.element_fields[index as usize], field_idx);
+                if fld.is_none() {
+                    return OptimizationResult::InvalidLoop;
+                }
+                ctx.replace_op(op.pos, fld.unwrap());
+                return OptimizationResult::Remove;
             }
         }
         // virtualize.py:399: self.make_nonnull(op.getarg(0))
