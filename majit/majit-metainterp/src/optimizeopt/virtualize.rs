@@ -65,267 +65,52 @@ pub struct VirtualizableConfig {
 
 /// JitVirtualRef field slot indices.
 ///
-/// PyPy stores struct fields densely by `fielddescr.get_index()`. Keep the
-/// virtual JitVirtualRef fields in the same slot order and let the descriptor
-/// object carry offset/type metadata.
-const VREF_TYPE_TAG_FIELD_INDEX: u32 = 0;
-const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 1;
-const VREF_FORCED_FIELD_INDEX: u32 = 2;
+/// RPython virtualref.py: JitVirtualRef has two fields (virtual_token, forced).
+/// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE, not stored as
+/// a tracked field. Indices are dense (0-based), matching RPython's
+/// `heaptracker.all_fielddescrs()` which excludes typeptr.
+const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0;
+const VREF_FORCED_FIELD_INDEX: u32 = 1;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
-/// The virtualize optimization pass.
-pub struct OptVirtualize {
-    /// Phase 2 (loop body): don't virtualize New() because guard failure
-    /// recovery_layout is not yet populated (RPython rd_virtuals equivalent).
-    pub is_phase2: bool,
-    /// If set, frame OpRef::input_arg_ref(0) is treated as a virtualizable object
-    /// whose field accesses are absorbed by the optimizer.
-    vable_config: Option<VirtualizableConfig>,
-    /// Whether virtualizable state has been initialized from existing trace inputs.
-    vable_initialized: bool,
-    /// Whether setup needs to initialize virtualizable PtrInfo on ctx.
-    /// Set in setup(), applied in first propagate_forward().
-    needs_vable_setup: bool,
-    /// optimizer.py:27 REMOVED + virtualize.py:67-75,180,247:
-    /// `last_emitted_operation is REMOVED` flag tracked by OptVirtualize.
-    /// Set true when _optimize_JIT_FORCE_VIRTUAL or do_RAW_MALLOC_VARSIZE_CHAR
-    /// folds away their CALL; checked by optimize_GUARD_NO_EXCEPTION and
-    /// optimize_GUARD_NOT_FORCED to skip the now-orphaned guard.
-    last_emitted_was_removed: bool,
-    /// virtualize.py:48 OptVirtualize.__init__: self._last_guard_not_forced_2 = None
-    /// virtualize.py:77-78 optimize_GUARD_NOT_FORCED_2 stashes the op here.
-    last_guard_not_forced_2: Option<Op>,
-    /// virtualize.py:81 / 84: self._finish_guard_op.
-    /// Set by optimize_FINISH and consumed by postprocess_FINISH after the
-    /// FINISH result has already been forced and emitted.
-    finish_guard_op: Option<Op>,
+/// PRE-EXISTING-ADAPTATION: Virtualizable field tracking in the optimizer.
+///
+/// RPython does NOT track virtualizable field values in the optimizer.
+/// Field tracking happens during tracing (`pyjitpl.py:virtualizable_boxes`),
+/// not in the optimization pipeline. The optimizer only removes
+/// `COND_CALL(OS_JIT_FORCE_VIRTUALIZABLE)` when the target is virtual.
+///
+/// Pyre's tracing model carries virtualizable fields as trace input args
+/// (`OpRef::input_arg_ref`), and the optimizer maps them via
+/// `VirtualizableFieldState`. This exists because pyre doesn't yet have
+/// RPython's `virtualizable_boxes` model in the metainterp.
+///
+/// **Convergence path:** Port RPython's `virtualizable_boxes` model to
+/// pyre's tracing layer (`pyjitpl.rs`), then remove this tracker entirely.
+pub(crate) struct VirtualizableTracker {
+    config: VirtualizableConfig,
+    needs_setup: bool,
 }
 
-impl OptVirtualize {
-    pub fn new() -> Self {
-        OptVirtualize {
-            is_phase2: false,
-            vable_config: None,
-            vable_initialized: false,
-            needs_vable_setup: false,
-            last_emitted_was_removed: false,
-            last_guard_not_forced_2: None,
-            finish_guard_op: None,
+impl VirtualizableTracker {
+    fn new(config: VirtualizableConfig) -> Self {
+        VirtualizableTracker {
+            config,
+            needs_setup: false,
         }
     }
 
-    /// Create with virtualizable config for frame field tracking.
-    pub fn with_virtualizable(config: VirtualizableConfig) -> Self {
-        OptVirtualize {
-            is_phase2: false,
-            vable_config: Some(config),
-            vable_initialized: false,
-            needs_vable_setup: false,
-            last_emitted_was_removed: false,
-            last_guard_not_forced_2: None,
-            finish_guard_op: None,
-        }
-    }
-
-    fn record_known_class(
-        &mut self,
-        obj_ref: OpRef,
-        class_ptr: majit_ir::GcRef,
-        ctx: &mut OptContext,
-    ) {
-        let updated = match ctx.peek_ptr_info_via_box(obj_ref) {
-            Some(PtrInfo::Virtual(mut vinfo)) => {
-                if vinfo.known_class.is_none() {
-                    vinfo.known_class = Some(class_ptr);
-                }
-                PtrInfo::Virtual(vinfo)
-            }
-            Some(PtrInfo::VirtualStruct(vinfo)) => PtrInfo::VirtualStruct(vinfo),
-            Some(PtrInfo::VirtualArray(vinfo)) => PtrInfo::VirtualArray(vinfo),
-            Some(PtrInfo::VirtualArrayStruct(vinfo)) => PtrInfo::VirtualArrayStruct(vinfo),
-            Some(PtrInfo::VirtualRawBuffer(vinfo)) => PtrInfo::VirtualRawBuffer(vinfo),
-            Some(PtrInfo::VirtualRawSlice(vinfo)) => PtrInfo::VirtualRawSlice(vinfo),
-            Some(PtrInfo::Virtualizable(vinfo)) => PtrInfo::Virtualizable(vinfo),
-            Some(PtrInfo::Instance(mut iinfo)) => {
-                if iinfo.known_class.is_none() {
-                    iinfo.known_class = Some(class_ptr);
-                }
-                PtrInfo::Instance(iinfo)
-            }
-            Some(PtrInfo::NonNull { .. })
-            | Some(PtrInfo::Constant(_))
-            | Some(PtrInfo::Struct(_))
-            | Some(PtrInfo::Array(_))
-            | Some(PtrInfo::Str(_))
-            | None => PtrInfo::known_class(class_ptr, true),
-        };
-        ctx.set_ptr_info(obj_ref, updated);
-    }
-
-    /// Seed virtualizable state from existing trace inputs.
-    ///
-    /// RPython standard virtualizables do not synthesize optimizer-owned
-    /// loop inputs. The interpreter/JitCode contract already carries static
-    /// field values and array elements as ordinary trace inputs, and the
-    /// optimizer only maps those existing boxes into PtrInfo state.
-    fn init_virtualizable(&mut self, ctx: &mut OptContext) {
-        let Some(config) = &self.vable_config else {
-            return;
-        };
-        self.vable_initialized = true;
-        if ctx.num_inputs() <= 1 {
-            return;
-        }
-
-        let mut state = VirtualizableFieldState {
-            fields: vec![],
-            field_descrs: vec![],
-            arrays: vec![],
-            last_guard_pos: -1,
-        };
-        // virtualizable.py:90 read_boxes: vable scalars start AFTER frame
-        // and any non-vable extra reds (e.g. interp_jit.py:67 `ec`).
-        let mut flat_input_idx = 1usize + config.vable_input_offset;
-
-        for (field_idx_in_vinfo, &offset) in config.static_field_offsets.iter().enumerate() {
-            if flat_input_idx >= ctx.num_inputs() {
-                break;
-            }
-            let field_idx = virtualizable_field_index(offset);
-            // virtualizable.py:90 read_boxes mints `BoxInt`/`BoxRef` per
-            // static-field declared type. Producer side
-            // (`TraceCtx::new`/state.rs:2960-2965) already minted typed
-            // `OpRef::input_arg_typed(slot, field_type)`; mirror that
-            // here so PtrInfo storage and `get_box_replacement`
-            // lookups (variant-aware Eq) match against the same
-            // `InputArg{Int,Ref,Float}` class
-            // (resoperation.py:719/727/739).
-            let slot_tp = ctx
-                .inputarg_type_at(flat_input_idx)
-                .unwrap_or(majit_ir::Type::Ref);
-            let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
-            set_field(&mut state.fields, field_idx, input_ref);
-            set_field_descr(
-                &mut state.field_descrs,
-                field_idx,
-                config
-                    .static_field_descrs
-                    .get(field_idx_in_vinfo)
-                    .cloned()
-                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
-            );
-            flat_input_idx += 1;
-        }
-
-        for (array_idx, (&offset, &length)) in config
-            .array_field_offsets
-            .iter()
-            .zip(config.array_lengths.iter())
-            .enumerate()
-        {
-            let field_idx = virtualizable_field_index(offset);
-            set_field_descr(
-                &mut state.field_descrs,
-                field_idx,
-                config
-                    .array_field_descrs
-                    .get(array_idx)
-                    .cloned()
-                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
-            );
-
-            let mut elements = Vec::with_capacity(length);
-            for _ in 0..length {
-                if flat_input_idx >= ctx.num_inputs() {
-                    break;
-                }
-                // Array elements are W_Root payloads
-                // (interp_jit.py:25-31 locals_cells_stack_w[*]),
-                // produced as `OpRef::input_arg_ref(slot)` upstream.
-                // Honor `inputarg_type_at` if a non-Ref type was
-                // declared for the slot — the type field on the
-                // virtualizable info is the source of truth.
-                let slot_tp = ctx
-                    .inputarg_type_at(flat_input_idx)
-                    .unwrap_or(majit_ir::Type::Ref);
-                elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
-                flat_input_idx += 1;
-            }
-            if !elements.is_empty() {
-                state.arrays.push((array_idx as u32, elements));
-            }
-        }
-
-        // virtualizable.py:139-154: the virtualizable identity is
-        // `inputargs[0]` — `box.type='r'` per `BoxRef` (history.py:307).
-        ctx.set_ptr_info(OpRef::input_arg_ref(0), PtrInfo::Virtualizable(state));
-    }
-
-    /// Given a virtualizable array field descr's byte offset, return the
-    /// array's index into `VirtualizableFieldState::arrays`
-    /// (= position in `VirtualizableConfig::array_field_offsets`).
-    fn virtualizable_array_idx_for_offset(&self, offset: usize) -> Option<u32> {
-        self.vable_config
-            .as_ref()?
-            .array_field_offsets
-            .iter()
-            .position(|&off| off == offset)
-            .map(|idx| idx as u32)
-    }
-
-    /// Recover the standard virtualizable array slot that produced `array_ref`.
-    ///
-    /// RPython/PyPy do not keep a separate array-pointer side table here;
-    /// the virtualizable state itself is the source of truth. In Rust we
-    /// recover the alias on demand from the emitted producer op instead of
-    /// persisting an extra `HashMap<OpRef, ...>` beside PtrInfo.
-    fn resolve_virtualizable_array_source(
-        &self,
-        array_ref: OpRef,
-        ctx: &OptContext,
-    ) -> Option<(OpRef, u32)> {
-        let producer = ctx.get_producing_op(array_ref)?;
-        if !matches!(
-            producer.opcode,
-            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
-        ) {
-            return None;
-        }
-        let frame_ref = ctx.get_box_replacement(producer.arg(0));
-        if !self.is_standard_virtualizable_ref(frame_ref, ctx) {
-            return None;
-        }
-        let field_idx = descr_index(&producer.descr);
-        let offset = extract_field_offset(field_idx)?;
-        let array_idx = self.virtualizable_array_idx_for_offset(offset)?;
-        Some((frame_ref, array_idx))
-    }
-
-    // ── PtrInfo accessors (delegated to ctx) ──
-
-    fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
-        let resolved = ctx.get_box_replacement(opref);
-        ctx.is_virtual_via_box(resolved)
-    }
-
-    fn is_standard_virtualizable_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        // virtualizable.py:139-154: `inputargs[0]` is the BoxRef
-        // virtualizable identity (history.py:307 ConstPtr / InputArgRef).
-        self.vable_config.is_some()
-            && opref == ctx.get_box_replacement(OpRef::input_arg_ref(0))
-            && ctx.is_virtualizable_via_box(opref)
+    fn setup(&mut self) {
+        self.needs_setup = true;
     }
 
     /// Apply deferred virtualizable setup if needed.
-    /// Skips if `OpRef::input_arg_ref(0)` already has PtrInfo (e.g. tests
-    /// pre-populate). The frame identity is `inputargs[0]` per
-    /// virtualizable.py:139-154 with `box.type='r'`.
-    fn ensure_vable_setup(&mut self, ctx: &mut OptContext) {
-        if self.needs_vable_setup {
-            self.needs_vable_setup = false;
+    fn ensure_setup(&mut self, ctx: &mut OptContext) {
+        if self.needs_setup {
+            self.needs_setup = false;
             if !ctx.has_ptr_info_via_box(OpRef::input_arg_ref(0)) {
-                self.init_virtualizable(ctx);
+                self.init(ctx);
                 if !ctx.has_ptr_info_via_box(OpRef::input_arg_ref(0)) {
                     ctx.set_ptr_info(
                         OpRef::input_arg_ref(0),
@@ -341,67 +126,179 @@ impl OptVirtualize {
         }
     }
 
-    // ── Force virtual ──
-
-    /// Force a virtual to become concrete: emit the allocation + setfield ops.
-    /// Returns the OpRef of the emitted allocation.
-    ///
-    /// info.py:137-160 force_box() — master dispatcher delegates to
-    /// PtrInfo::force_box for all standard virtual variants.
-    /// Virtualizable is Rust-specific and stays here.
-    fn force_virtual(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let resolved = ctx.get_box_replacement(opref);
-        let info = match ctx.peek_ptr_info_via_box(resolved) {
-            Some(info) if info.is_virtual() => info,
-            _ => return resolved, // not virtual, nothing to do
-        };
-
-        // Virtualizable is not a standard PtrInfo virtual — it represents
-        // an existing heap object with tracked fields, not a deferred alloc.
-        if matches!(info, PtrInfo::Virtualizable(_)) {
-            let vinfo = match ctx.take_ptr_info(resolved) {
-                Some(PtrInfo::Virtualizable(v)) => v,
-                _ => unreachable!(),
-            };
-            return if self.is_standard_virtualizable_ref(resolved, ctx) {
-                resolved
-            } else {
-                self.force_virtualizable(resolved, vinfo, ctx)
-            };
+    /// Seed virtualizable state from existing trace inputs.
+    fn init(&mut self, ctx: &mut OptContext) {
+        if ctx.num_inputs() <= 1 {
+            return;
         }
 
-        // All other virtual variants: delegate to PtrInfo::force_box
-        // (info.py:137-160 AbstractVirtualPtrInfo.force_box + per-subclass
-        // _force_elements).
-        let mut info = ctx.take_ptr_info(resolved).unwrap();
-        let result = info.force_box(resolved, ctx);
-        ctx.get_box_replacement(result)
+        let mut state = VirtualizableFieldState {
+            fields: vec![],
+            field_descrs: vec![],
+            arrays: vec![],
+            last_guard_pos: -1,
+        };
+        let mut flat_input_idx = 1usize + self.config.vable_input_offset;
+
+        for (field_idx_in_vinfo, &offset) in self.config.static_field_offsets.iter().enumerate() {
+            if flat_input_idx >= ctx.num_inputs() {
+                break;
+            }
+            let field_idx = virtualizable_field_index(offset);
+            let slot_tp = ctx
+                .inputarg_type_at(flat_input_idx)
+                .unwrap_or(majit_ir::Type::Ref);
+            let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
+            set_field(&mut state.fields, field_idx, input_ref);
+            set_field_descr(
+                &mut state.field_descrs,
+                field_idx,
+                self.config
+                    .static_field_descrs
+                    .get(field_idx_in_vinfo)
+                    .cloned()
+                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
+            );
+            flat_input_idx += 1;
+        }
+
+        for (array_idx, (&offset, &length)) in self
+            .config
+            .array_field_offsets
+            .iter()
+            .zip(self.config.array_lengths.iter())
+            .enumerate()
+        {
+            let field_idx = virtualizable_field_index(offset);
+            set_field_descr(
+                &mut state.field_descrs,
+                field_idx,
+                self.config
+                    .array_field_descrs
+                    .get(array_idx)
+                    .cloned()
+                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
+            );
+
+            let mut elements = Vec::with_capacity(length);
+            for _ in 0..length {
+                if flat_input_idx >= ctx.num_inputs() {
+                    break;
+                }
+                let slot_tp = ctx
+                    .inputarg_type_at(flat_input_idx)
+                    .unwrap_or(majit_ir::Type::Ref);
+                elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
+                flat_input_idx += 1;
+            }
+            if !elements.is_empty() {
+                state.arrays.push((array_idx as u32, elements));
+            }
+        }
+
+        ctx.set_ptr_info(OpRef::input_arg_ref(0), PtrInfo::Virtualizable(state));
     }
 
-    /// Force a virtualizable: emit SETFIELD_RAW ops to write tracked
-    /// field values back to the heap object. Unlike virtual objects,
-    /// no allocation is emitted — the object already exists.
-    fn force_virtualizable(
-        &mut self,
-        opref: OpRef,
-        vinfo: VirtualizableFieldState,
-        ctx: &mut OptContext,
-    ) -> OpRef {
-        // Mark as no longer virtual (prevents infinite recursion)
-        ctx.set_ptr_info(opref, PtrInfo::nonnull());
+    fn is_standard_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        opref == ctx.get_box_replacement(OpRef::input_arg_ref(0))
+            && ctx.is_virtualizable_via_box(opref)
+    }
 
-        // Emit SETFIELD_RAW for each tracked field, using the original DescrRef
-        for (field_idx, value_ref) in &vinfo.fields {
-            let value_ref = self.force_virtual(*value_ref, ctx);
-            let value_ref = ctx.get_box_replacement(value_ref);
-            let descr = get_field_descr(&vinfo.field_descrs, *field_idx)
-                .unwrap_or_else(|| make_field_index_descr(*field_idx));
-            let mut set_op = Op::new(OpCode::SetfieldRaw, &[opref, value_ref]);
-            set_op.descr = Some(descr);
-            ctx.emit_extra(ctx.current_pass_idx, set_op);
+    fn array_idx_for_offset(&self, offset: usize) -> Option<u32> {
+        self.config
+            .array_field_offsets
+            .iter()
+            .position(|&off| off == offset)
+            .map(|idx| idx as u32)
+    }
+
+    fn resolve_array_source(&self, array_ref: OpRef, ctx: &OptContext) -> Option<(OpRef, u32)> {
+        let producer = ctx.get_producing_op(array_ref)?;
+        if !matches!(
+            producer.opcode,
+            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
+        ) {
+            return None;
         }
+        let frame_ref = ctx.get_box_replacement(producer.arg(0));
+        if !self.is_standard_ref(frame_ref, ctx) {
+            return None;
+        }
+        let field_idx = descr_index(&producer.descr);
+        let offset = extract_field_offset(field_idx)?;
+        let array_idx = self.array_idx_for_offset(offset)?;
+        Some((frame_ref, array_idx))
+    }
 
-        opref
+    /// Returns true if `struct_ref` is the standard virtualizable frame
+    /// and the op is a raw field access that should pass through.
+    fn should_passthrough_raw(&self, struct_ref: OpRef, is_raw_op: bool, ctx: &OptContext) -> bool {
+        is_raw_op && self.is_standard_ref(struct_ref, ctx)
+    }
+
+    /// Mirror a setarrayitem write to the virtualizable array state.
+    fn mirror_setarrayitem(
+        &self,
+        array_ref: OpRef,
+        index: i64,
+        value_ref: OpRef,
+        ctx: &mut OptContext,
+    ) {
+        if let Some((frame_ref, array_idx)) = self.resolve_array_source(array_ref, ctx) {
+            let elem_idx = index as usize;
+            ctx.with_ptr_info_mut(frame_ref, |info| {
+                if let PtrInfo::Virtualizable(vstate) = info {
+                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
+                }
+            });
+        }
+    }
+}
+
+/// The virtualize optimization pass.
+pub struct OptVirtualize {
+    /// PRE-EXISTING-ADAPTATION: pyre-specific virtualizable field tracker.
+    /// See `VirtualizableTracker` doc comment for convergence path.
+    vable: Option<VirtualizableTracker>,
+    /// optimizer.py:27 REMOVED + virtualize.py:67-75,180,247:
+    last_emitted_was_removed: bool,
+    /// virtualize.py:48
+    last_guard_not_forced_2: Option<Op>,
+    /// virtualize.py:81 / 84
+    finish_guard_op: Option<Op>,
+}
+
+impl OptVirtualize {
+    pub fn new() -> Self {
+        OptVirtualize {
+            vable: None,
+            last_emitted_was_removed: false,
+            last_guard_not_forced_2: None,
+            finish_guard_op: None,
+        }
+    }
+
+    /// Create with virtualizable config for frame field tracking.
+    pub fn with_virtualizable(config: VirtualizableConfig) -> Self {
+        OptVirtualize {
+            vable: Some(VirtualizableTracker::new(config)),
+            last_emitted_was_removed: false,
+            last_guard_not_forced_2: None,
+            finish_guard_op: None,
+        }
+    }
+
+    // ── PtrInfo accessors (delegated to ctx) ──
+
+    fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
+        let resolved = ctx.get_box_replacement(opref);
+        ctx.is_virtual_via_box(resolved)
+    }
+
+    fn is_standard_virtualizable_ref(&self, opref: OpRef, ctx: &OptContext) -> bool {
+        self.vable
+            .as_ref()
+            .is_some_and(|vt| vt.is_standard_ref(opref, ctx))
     }
 
     /// virtualize.py:60-65 make_virtual_raw_slice
@@ -562,6 +459,8 @@ impl OptVirtualize {
                 return OptimizationResult::Remove;
             }
         }
+        // virtualize.py:220: self.pure_from_args(rop.ARRAYLEN_GC, [op], arg, descr=op.getdescr())
+        ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos, size_ref);
         OptimizationResult::PassOn
     }
 
@@ -685,24 +584,6 @@ impl OptVirtualize {
         );
         let is_standard_vable_ref = self.is_standard_virtualizable_ref(struct_ref, ctx);
 
-        // RPython import_state: if this is a GetfieldGcR(pool) that loads a head
-        // which was virtual in the preamble, forward to the imported virtual head.
-        //
-        // The import-state pool is not pyre's standard virtualizable frame.
-        // PyFrame is also inputarg 0, so applying this shortcut to v0 would
-        // corrupt virtualizable field loads such as locals_cells_stack_w.
-        if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
-            let pool_ref = ctx.get_box_replacement(OpRef::input_arg_ref(0)); // pool is always inputarg 0 (W_Root)
-            if struct_ref == pool_ref && !is_standard_vable_ref {
-                for &(descr_idx, virtual_head) in &ctx.imported_virtual_heads {
-                    if field_idx == descr_idx as u32 {
-                        ctx.replace_op(op.pos, virtual_head);
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-        }
-
         if is_raw_op && is_standard_vable_ref {
             return OptimizationResult::PassOn;
         }
@@ -780,12 +661,6 @@ impl OptVirtualize {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
-        // Phase 0 probe (Tasks #158/#159/#122 epic): when
-        // MAJIT_PROBE_LIVENESS env is set, log every setarrayitem_gc
-        // resolution path (Virtual elide / Vable mirror / passthrough).
-        // Goal P0-Q2: identify which array-write path is the source of
-        // vable mirror staleness for fannkuch's LoadFastLoadFast read.
-        let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             let idx = index as usize;
@@ -801,121 +676,50 @@ impl OptVirtualize {
                 })
                 .unwrap_or(false);
             if did_virtual_write {
-                if probe {
-                    eprintln!(
-                        "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → VirtualArray.items[{}] = value (REMOVE)",
-                        op.pos.raw(),
-                        array_ref,
-                        idx,
-                        value_ref,
-                        idx,
-                    );
-                }
                 return OptimizationResult::Remove;
             }
-            // virtualizable.py:134-137 write-back parity: mirror writes to
-            // the virtualizable heap arrays into `PtrInfo::Virtualizable`
-            // so end-of-preamble export sees the updated STORE_FAST values.
-            if let Some((frame_ref, array_idx)) =
-                self.resolve_virtualizable_array_source(array_ref, ctx)
-            {
-                let elem_idx = index as usize;
-                if probe {
-                    eprintln!(
-                        "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → Vable[{}].arrays[{}].elem[{}] = value (mirror, PASS)",
-                        op.pos.raw(),
-                        array_ref,
-                        elem_idx,
-                        value_ref,
-                        frame_ref.raw(),
-                        array_idx,
-                        elem_idx,
-                    );
-                }
-                ctx.with_ptr_info_mut(frame_ref, |info| {
-                    if let PtrInfo::Virtualizable(vstate) = info {
-                        set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
-                    }
-                });
-            } else if probe {
-                eprintln!(
-                    "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → no vable mirror (passthrough)",
-                    op.pos.raw(),
-                    array_ref,
-                    index as usize,
-                    value_ref,
-                );
+            if let Some(ref vt) = self.vable {
+                vt.mirror_setarrayitem(array_ref, index, value_ref, ctx);
             }
-        } else if probe {
-            eprintln!(
-                "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} value_ref={:?} (passthrough)",
-                op.pos.raw(),
-                array_ref,
-                index_ref,
-                value_ref,
-            );
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
-        // Virtual value-arg is NOT forced here; _emit_operation
-        // (optimizer.py:623-625) forces it at final emission time so the
-        // SetfieldGc init ops precede this SetarrayitemGc in _newoperations.
         if !ctx.has_ptr_info_via_box(array_ref) {
             ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:276-296 optimize_GETARRAYITEM_GC_I (aliased to R/F and PURE variants)
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        // Phase 0 probe (Tasks #158/#159/#122 epic): symmetric to the
-        // setarrayitem_gc probe — log every read resolution. P0-Q2 needs
-        // BOTH sides to confirm whether the read sees the fresh value
-        // written by a recent setarrayitem or a stale slot from before.
-        let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(info) = ctx.peek_ptr_info_via_box(array_ref) {
-                if let PtrInfo::VirtualArray(vinfo) = info {
-                    let idx = index as usize;
-                    if idx < vinfo.items.len() {
-                        let item_ref = vinfo.items[idx];
-                        if !item_ref.is_none() {
-                            if probe {
-                                eprintln!(
-                                    "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → VirtualArray.items[{}] = {:?} (REMOVE → fold)",
-                                    op.pos.raw(),
-                                    array_ref,
-                                    idx,
-                                    idx,
-                                    item_ref,
-                                );
-                            }
-                            ctx.replace_op(op.pos, item_ref);
-                            return OptimizationResult::Remove;
-                        }
+        if let Some(info) = ctx.peek_ptr_info_via_box(array_ref) {
+            if let PtrInfo::VirtualArray(vinfo) = info {
+                if let Some(index) = ctx.get_constant_int(index_ref) {
+                    // info.py:580-582: getitem returns None for
+                    // negative, out-of-range, or uninitialized slots.
+                    // virtualize.py:282-284: None → InvalidLoop.
+                    if index < 0 || (index as usize) >= vinfo.items.len() {
+                        return OptimizationResult::InvalidLoop;
                     }
+                    let item_ref = vinfo.items[index as usize];
+                    if item_ref.is_none() {
+                        return OptimizationResult::InvalidLoop;
+                    }
+                    ctx.replace_op(op.pos, item_ref);
+                    return OptimizationResult::Remove;
                 }
             }
-            if probe {
-                eprintln!(
-                    "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → no fold (PASS, runtime read)",
-                    op.pos.raw(),
-                    array_ref,
-                    index as usize,
-                );
-            }
-        } else if probe {
-            eprintln!(
-                "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} (PASS)",
-                op.pos.raw(),
-                array_ref,
-                index_ref,
-            );
+        }
+        // virtualize.py:287: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:268-274 optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
 
@@ -924,20 +728,14 @@ impl OptVirtualize {
             ctx.make_constant(op.pos, Value::Int(len));
             return OptimizationResult::Remove;
         }
-        OptimizationResult::PassOn
-    }
-
-    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_box_replacement(op.arg(0));
-
-        if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.peek_ptr_info_via_box(str_ref) {
-            let len = vinfo.items.len() as i64;
-            ctx.make_constant(op.pos, Value::Int(len));
-            return OptimizationResult::Remove;
+        // virtualize.py:273: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:387-401 optimize_GETINTERIORFIELD_GC_I (aliased to R/F)
     fn optimize_getinteriorfield_gc(
         &mut self,
         op: &Op,
@@ -947,20 +745,30 @@ impl OptVirtualize {
         let index_ref = op.arg(1);
         let field_idx = descr_index(&op.descr);
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
-                let elem_idx = index as usize;
-                if elem_idx < vinfo.element_fields.len() {
-                    if let Some(val) = get_field(&vinfo.element_fields[elem_idx], field_idx) {
-                        ctx.replace_op(op.pos, val);
-                        return OptimizationResult::Remove;
-                    }
+        if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
+            if let Some(index) = ctx.get_constant_int(index_ref) {
+                // info.py:651-656 _compute_index: negative or out-of-range → -1
+                // info.py:663-668 getinteriorfield_virtual: -1 → None
+                // virtualize.py:394-396: None → InvalidLoop
+                if index < 0 || (index as usize) >= vinfo.element_fields.len() {
+                    return OptimizationResult::InvalidLoop;
                 }
+                let fld = get_field(&vinfo.element_fields[index as usize], field_idx);
+                if fld.is_none() {
+                    return OptimizationResult::InvalidLoop;
+                }
+                ctx.replace_op(op.pos, fld.unwrap());
+                return OptimizationResult::Remove;
             }
+        }
+        // virtualize.py:399: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:404-414 optimize_SETINTERIORFIELD_GC
     fn optimize_setinteriorfield_gc(
         &mut self,
         op: &Op,
@@ -976,9 +784,6 @@ impl OptVirtualize {
             let did_write = ctx
                 .with_ptr_info_mut(array_ref, |info| {
                     if let PtrInfo::VirtualArrayStruct(vinfo) = info {
-                        // info.py:658-661: setinteriorfield_virtual
-                        // index = self._compute_index(index, fielddescr)
-                        // if index >= 0: self._items[index] = fld
                         if elem_idx < vinfo.element_fields.len() {
                             set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
                             return true;
@@ -990,6 +795,10 @@ impl OptVirtualize {
             if did_write {
                 return OptimizationResult::Remove;
             }
+        }
+        // virtualize.py:413: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1119,51 +928,47 @@ impl OptVirtualize {
 
     /// Handle VirtualRefR / VirtualRefI.
     ///
-    /// Replace the VIRTUAL_REF operation with a virtual struct of type
-    /// JitVirtualRef. The struct has two fields:
-    /// - virtual_token (field index VREF_VIRTUAL_TOKEN): set to a ForceToken op
-    /// - forced (field index VREF_FORCED): set to NULL (constant 0)
+    /// virtualize.py:112-130 optimize_VIRTUAL_REF
     ///
-    /// This way the vref itself becomes virtual. If it never escapes, the
-    /// allocation is eliminated entirely. If it does escape, the forcing
-    /// mechanism emits the struct allocation + field writes.
+    /// Replace the VIRTUAL_REF operation with a virtual object of type
+    /// JitVirtualRef (via make_virtual → InstancePtrInfo / PtrInfo::Virtual).
+    /// Two tracked fields:
+    /// - virtual_token: set to a ForceToken op
+    /// - forced: set to CONST_NULL
+    /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
+    /// the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_descr: DescrRef = Arc::new(VRefSizeDescr);
 
-        // Emit a FORCE_TOKEN to capture the JIT frame address.
+        // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = Op::new(OpCode::ForceToken, &[]);
         let token_ref = ctx.emit_extra(ctx.current_pass_idx, token_op);
-
-        // The emitted ForceToken may reuse an OpRef index that previously
-        // had PtrInfo::Virtual attached (from an earlier NEW_WITH_VTABLE
-        // that was virtualized). Clear that to prevent accidental forcing
-        // of unrelated virtuals when the vref struct is forced.
         ctx.set_ptr_info(token_ref, PtrInfo::nonnull());
 
+        // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
 
-        // RPython typeptr parity: type_tag is stored at offset 0, equivalent
-        // to the GC object header's typeptr that RPython sets automatically.
-        let type_tag_ref = ctx.emit_constant_int(crate::virtualref::VREF_TYPE_TAG as i64);
-
+        // virtualize.py:123-125: make_virtual(c_cls, newop, vref_descr)
+        // → InstancePtrInfo(descr, known_class, is_virtual=True)
+        let known_class = Some(majit_ir::GcRef(crate::virtualref::VREF_TYPE_TAG as usize));
         let fields = vec![
-            (VREF_TYPE_TAG_FIELD_INDEX, type_tag_ref),
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),
         ];
         let field_descrs = vec![
-            make_vref_field_descr(VREF_TYPE_TAG_FIELD_INDEX),
             make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
             make_vref_field_descr(VREF_FORCED_FIELD_INDEX),
         ];
-        let vinfo = VirtualStructInfo {
+        let vinfo = VirtualInfo {
             descr: vref_descr,
+            known_class,
+            ob_type_descr: None,
             fields,
             field_descrs,
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
+        ctx.set_ptr_info(op.pos, PtrInfo::Virtual(vinfo));
 
         OptimizationResult::Remove
     }
@@ -1217,7 +1022,7 @@ impl OptVirtualize {
                 if !info.is_virtual() {
                     return false;
                 }
-                if let PtrInfo::VirtualStruct(vinfo) = info {
+                if let PtrInfo::Virtual(vinfo) = info {
                     if !obj_is_null {
                         set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
                     }
@@ -1232,7 +1037,7 @@ impl OptVirtualize {
             // with_ptr_info_mut calls.
             let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
             ctx.with_ptr_info_mut(vref_ref, |info| {
-                if let PtrInfo::VirtualStruct(vinfo) = info {
+                if let PtrInfo::Virtual(vinfo) = info {
                     set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
                 }
             });
@@ -1292,7 +1097,7 @@ impl OptVirtualize {
         let vref = ctx.get_box_replacement(op.arg(1));
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
         let (token_ref, forced_ref) = match ctx.peek_ptr_info_via_box(vref) {
-            Some(PtrInfo::VirtualStruct(vinfo)) => {
+            Some(PtrInfo::Virtual(vinfo)) => {
                 // tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
                 // if tokenop is None: return False
                 let tok = match get_field(&vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX) {
@@ -1333,34 +1138,6 @@ impl OptVirtualize {
         true
     }
 
-    /// Handle operations that may cause virtuals to escape.
-    fn optimize_escaping_op(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let mut forced = op.clone();
-        let frame_ref = ctx.get_box_replacement(OpRef::input_arg_ref(0));
-        for arg in &mut forced.args {
-            let resolved = ctx.get_box_replacement(*arg);
-            if self.vable_config.is_some()
-                && resolved == frame_ref
-                && ctx.is_virtualizable_via_box(resolved)
-            {
-                *arg = resolved;
-                continue;
-            }
-            if Self::is_virtual(resolved, ctx) {
-                let forced_arg = self.force_virtual(resolved, ctx);
-                *arg = ctx.get_box_replacement(forced_arg);
-            } else {
-                *arg = resolved;
-            }
-        }
-        self.clear_forced_field_caches();
-        OptimizationResult::Replace(forced)
-    }
-
-    fn clear_forced_field_caches(&mut self) {
-        // No-op: forced field caches are handled by heap.rs cache,
-        // not by separate PtrInfo variants.
-    }
 }
 
 impl Default for OptVirtualize {
@@ -1371,7 +1148,9 @@ impl Default for OptVirtualize {
 
 impl Optimization for OptVirtualize {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        self.ensure_vable_setup(ctx);
+        if let Some(ref mut vt) = self.vable {
+            vt.ensure_setup(ctx);
+        }
         // optimizer.py:84-92 base emit/emit_result reset last_emitted_operation
         // to the current op on every emit. RPython's `last_emitted is REMOVED`
         // check therefore reads the prior op's outcome — model that by
@@ -1408,13 +1187,16 @@ impl Optimization for OptVirtualize {
             OpCode::GetarrayitemGcI
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF
+            // virtualize.py:294-296: GETARRAYITEM_GC_PURE aliases
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF
             | OpCode::GetarrayitemRawI
             | OpCode::GetarrayitemRawR
             | OpCode::GetarrayitemRawF => self.optimize_getarrayitem_gc(op, ctx),
 
             // Array length
             OpCode::ArraylenGc => self.optimize_arraylen_gc(op, ctx),
-            OpCode::Strlen => self.optimize_strlen(op, ctx),
 
             // Interior field access on potentially-virtual array-of-structs
             OpCode::GetinteriorfieldGcI
@@ -1492,7 +1274,7 @@ impl Optimization for OptVirtualize {
                         }
                     }
                 }
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // virtualize.py:80-90 optimize_FINISH / postprocess_FINISH
@@ -1548,7 +1330,7 @@ impl Optimization for OptVirtualize {
                         }
                     }
                 }
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // virtualize.py:226-240 optimize_CALL_N (aliased to CALL_R / CALL_I)
@@ -1597,7 +1379,7 @@ impl Optimization for OptVirtualize {
                                     return OptimizationResult::Remove;
                                 }
                             }
-                            return self.optimize_escaping_op(op, ctx);
+                            return OptimizationResult::PassOn;
                         }
                         // virtualize.py:230 do_RAW_FREE
                         if ei.oopspecindex == OopSpecIndex::RawFree {
@@ -1612,7 +1394,7 @@ impl Optimization for OptVirtualize {
                                     return OptimizationResult::Remove;
                                 }
                             }
-                            return self.optimize_escaping_op(op, ctx);
+                            return OptimizationResult::PassOn;
                         }
                         // virtualize.py:232-236 OS_JIT_FORCE_VIRTUALIZABLE
                         //   info = getptrinfo(op.getarg(1))
@@ -1625,7 +1407,7 @@ impl Optimization for OptVirtualize {
                     }
                 }
                 // virtualize.py:237-238 else: return self.emit(op)
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // RecordKnownResult + CallPure must pass through to OptPure
@@ -1633,11 +1415,11 @@ impl Optimization for OptVirtualize {
             // since they are in the CALL opcode range.
             OpCode::RecordKnownResult => OptimizationResult::PassOn,
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // Calls / escaping operations — force all virtual args
-            _ if op.opcode.is_call() => self.optimize_escaping_op(op, ctx),
+            _ if op.opcode.is_call() => OptimizationResult::PassOn,
 
             // RPython virtualize.py has no optimize_JUMP. JUMP is held
             // out of the pass pipeline (flush=False at optimizer.py:536-539)
@@ -1645,35 +1427,11 @@ impl Optimization for OptVirtualize {
             // dispatches to the standard emit path — no virtualize-specific
             // handler. Falling through to the default PassOn matches RPython.
 
-            // ── Record hint opcodes ──
-            // These record information about values that downstream passes can use.
-            // The hints themselves are removed (no code emitted).
-
-            // RECORD_EXACT_CLASS(ref, class_const): record that ref has class class_const.
-            // Enables subsequent GUARD_CLASS elimination.
-            OpCode::RecordExactClass => {
-                let ref_opref = ctx.get_box_replacement(op.arg(0));
-                if let Some(Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
-                    self.record_known_class(ref_opref, class_ref, ctx);
-                }
-                OptimizationResult::Remove
-            }
-
-            // RECORD_EXACT_VALUE_I(ref, int_const): record that ref has exact int value.
-            OpCode::RecordExactValueI => {
-                let ref_opref = ctx.get_box_replacement(op.arg(0));
-                if let Some(val) = ctx.get_constant_int(op.arg(1)) {
-                    ctx.make_constant(ref_opref, Value::Int(val));
-                }
-                OptimizationResult::Remove
-            }
-
-            // RECORD_EXACT_VALUE_R(ref, ref_const): record that ref equals ref_const.
-            OpCode::RecordExactValueR => {
-                let ref_opref = ctx.get_box_replacement(op.arg(0));
-                ctx.replace_op(ref_opref, ctx.get_box_replacement(op.arg(1)));
-                OptimizationResult::Remove
-            }
+            // RECORD_EXACT_CLASS / RECORD_EXACT_VALUE_I / RECORD_EXACT_VALUE_R:
+            // Handled by OptRewrite (rewrite.py:376-395), not virtualize.py.
+            // PassOn forwards them to rewrite which runs before virtualize
+            // in the default pipeline — these should already be consumed
+            // before reaching this pass. Keep as PassOn for robustness.
 
             // virtualize.py:417-418 dispatch_opt = make_dispatcher_method(
             //     OptVirtualize, 'optimize_', default=OptVirtualize.emit)
@@ -1690,10 +1448,9 @@ impl Optimization for OptVirtualize {
     fn setup(&mut self) {
         self.last_emitted_was_removed = false;
         self.last_guard_not_forced_2 = None;
-        self.vable_initialized = false;
-        // Defer virtualizable PtrInfo init to first propagate_forward
-        // (setup() doesn't have access to OptContext).
-        self.needs_vable_setup = self.vable_config.is_some();
+        if let Some(ref mut vt) = self.vable {
+            vt.setup();
+        }
         self.finish_guard_op = None;
     }
 
@@ -1716,10 +1473,6 @@ impl Optimization for OptVirtualize {
 
     fn name(&self) -> &'static str {
         "virtualize"
-    }
-
-    fn set_phase2(&mut self, phase2: bool) {
-        self.is_phase2 = phase2;
     }
 }
 
@@ -1892,7 +1645,6 @@ impl FieldDescr for VRefFieldDescr {
 
 fn make_vref_field_descr(index: u32) -> DescrRef {
     let (offset, field_type) = match index {
-        VREF_TYPE_TAG_FIELD_INDEX => (0, Type::Int),
         VREF_VIRTUAL_TOKEN_FIELD_INDEX => (8, Type::Int),
         VREF_FORCED_FIELD_INDEX => (16, Type::Ref),
         _ => panic!("invalid JitVirtualRef field slot {index}"),
@@ -1922,12 +1674,17 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
         std::mem::size_of::<crate::virtualref::JitVirtualRef>()
     }
     fn type_id(&self) -> u32 {
-        // virtualref.py — JIT_VIRTUAL_REF is a real GC type in RPython.
-        // pyre registers it via gc.register_type() at startup; the assigned
-        // id is stored in the global and returned here so the backend's
-        // alloc_nursery_typed() uses the correct GC type with proper
-        // gc_ptr_offsets for tracing the `forced` Ref field.
         crate::virtualref::vref_gc_type_id()
+    }
+    fn is_object(&self) -> bool {
+        true
+    }
+    fn vtable(&self) -> usize {
+        // virtualref.py:94-98: jit_virtual_ref_const_class — the vtable
+        // identity used by is_virtual_ref(). Pyre stores this as the
+        // VREF_TYPE_TAG magic value at offset 0. NEW_WITH_VTABLE writes
+        // it at allocation time, matching RPython's gc.new_with_vtable().
+        crate::virtualref::VREF_TYPE_TAG as usize
     }
     fn is_immutable(&self) -> bool {
         false
@@ -2375,18 +2132,9 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_force_is_noop_in_optimizer() {
+        // Verify that Optimizer::force_box skips Virtualizable PtrInfo
+        // without destroying the tracked field state.
         let mut ctx = OptContext::with_num_inputs(8, 1);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
-            static_field_offsets: vec![],
-            static_field_types: vec![],
-            static_field_descrs: vec![],
-            array_field_offsets: vec![8],
-            array_item_types: vec![Type::Ref],
-            array_field_descrs: vec![],
-            array_lengths: vec![1],
-            vable_input_offset: 0,
-        });
-        pass.setup();
         ctx.set_ptr_info(
             OpRef::input_arg_ref(0),
             PtrInfo::Virtualizable(VirtualizableFieldState {
@@ -2397,11 +2145,28 @@ mod tests {
             }),
         );
 
-        let forced = pass.force_virtual(OpRef::input_arg_ref(0), &mut ctx);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptVirtualize::with_virtualizable(
+            VirtualizableConfig {
+                static_field_offsets: vec![],
+                static_field_types: vec![],
+                static_field_descrs: vec![],
+                array_field_offsets: vec![8],
+                array_item_types: vec![Type::Ref],
+                array_field_descrs: vec![],
+                array_lengths: vec![1],
+                vable_input_offset: 0,
+            },
+        )));
+        let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
         assert_eq!(forced, OpRef::input_arg_ref(0));
         assert!(
             ctx.new_operations.is_empty(),
             "standard virtualizable should not be forced to raw heap ops by optimizer"
+        );
+        assert!(
+            ctx.is_virtualizable_via_box(OpRef::input_arg_ref(0)),
+            "Virtualizable PtrInfo must survive force_box"
         );
     }
 
@@ -2506,11 +2271,14 @@ mod tests {
             majit_ir::EffectInfo::default(),
         ));
 
-        let replaced = match pass.propagate_forward(&call, &mut ctx) {
-            OptimizationResult::Replace(op) => op,
-            other => panic!("expected call replacement, got {other:?}"),
-        };
-        assert_eq!(replaced.arg(0), OpRef::input_arg_ref(0));
+        // RPython parity: virtualize.py's default for calls is emit(op)
+        // which forwards to the next pass without forcing. Forcing happens
+        // in _emit_operation (Optimizer level). OptVirtualize returns PassOn.
+        let result = pass.propagate_forward(&call, &mut ctx);
+        assert!(
+            matches!(result, OptimizationResult::PassOn),
+            "call should PassOn (forcing happens at Optimizer::emit_operation level)"
+        );
         assert!(
             ctx.new_operations
                 .iter()
@@ -2579,7 +2347,9 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(8, 2);
         let mut pass = OptVirtualize::with_virtualizable(config);
         pass.setup();
-        pass.ensure_vable_setup(&mut ctx);
+        if let Some(ref mut vt) = pass.vable {
+            vt.ensure_setup(&mut ctx);
+        }
 
         let Some(PtrInfo::Virtualizable(vstate)) =
             ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
@@ -3534,11 +3304,11 @@ mod tests {
     #[test]
     fn test_virtual_ref_does_not_force_underlying_obj() {
         // p0 = new_with_vtable(descr=size1)   <- virtual
-        // vref = virtual_ref_r(p0, token)     <- virtual struct
+        // vref = virtual_ref_r(p0, token)     <- virtual (RPython: InstancePtrInfo)
         // call_n(vref)                         <- forces vref, NOT p0
         //
         // The key property: forcing the vref should NOT force the wrapped
-        // object p0. The vref struct's `forced` field is set to NULL (0)
+        // object p0. The vref's `forced` field is set to CONST_NULL
         // by optimize_virtual_ref, so p0 is not referenced in the vref fields.
         // p0 only appears in the original VirtualRefR args, which are discarded.
         let sd = size_descr(1);
@@ -3555,26 +3325,26 @@ mod tests {
 
         let result = run_pass(&ops);
 
-        // The vref struct is a VirtualStruct forced as New.
-        // p0 (NewWithVtable) should NOT appear because the vref's forced field
-        // is NULL, not p0.
+        // RPython parity: vref is a Virtual (InstancePtrInfo) forced as
+        // NewWithVtable. The only NewWithVtable should be the vref itself;
+        // p0 (the wrapped object) must NOT be forced.
         let new_vtable_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::NewWithVtable)
             .count();
         assert_eq!(
             new_vtable_count,
-            0,
-            "the wrapped object p0 should NOT be forced; got ops: {:?}",
+            1,
+            "only the vref should be forced as NewWithVtable, not p0; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
 
-        // The vref struct itself is forced as New
+        // No New ops — the vref is no longer a VirtualStruct
         let new_count = result.iter().filter(|o| o.opcode == OpCode::New).count();
         assert_eq!(
             new_count,
-            1,
-            "only the vref struct should be allocated; got ops: {:?}",
+            0,
+            "no New should be emitted; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
     }

@@ -814,10 +814,11 @@ impl Optimizer {
                     );
                 }
             }
-            if let Some(descr_idx) = entry.head_load_descr_index {
-                ctx.imported_virtual_heads
-                    .push((descr_idx as usize, entry.head));
-            }
+            // RPython parity: imported virtual heads are NOT looked up via
+            // a side table. inline_short_preamble replays the getfield ops
+            // through send_extra_operation, which populates OptHeap's cache.
+            // The body's getfield then folds naturally.
+            let _ = entry.head_load_descr_index; // consumed by shortpreamble replay
         }
     }
 
@@ -1419,6 +1420,15 @@ impl Optimizer {
             }
         }
         if ctx.is_virtual_via_box(resolved) {
+            // Virtualizable represents an existing heap object with tracked
+            // fields — not a deferred allocation. force_box must not take
+            // its PtrInfo. RPython parity: Virtualizable is never a "true"
+            // virtual (no allocation to emit); it just tracks field state
+            // for the standard frame. Calling force_box on it would destroy
+            // the tracked state via take_ptr_info.
+            if ctx.is_virtualizable_via_box(resolved) {
+                return resolved;
+            }
             // RPython: info.force_box() sets _is_virtual=False in-place.
             // Take ownership so the Virtual PtrInfo is removed. force_box_impl
             // installs a non-virtual (Instance/Struct) at the alloc_ref.

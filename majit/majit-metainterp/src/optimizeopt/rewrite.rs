@@ -2916,6 +2916,19 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
+            // rewrite.py:388-395: optimize_record_exact_value
+            //   box = op.getarg(0)
+            //   expectedconstbox = op.getarg(1)
+            //   assert isinstance(expectedconstbox, Const)
+            //   self.make_constant(box, expectedconstbox)
+            OpCode::RecordExactValueI | OpCode::RecordExactValueR => {
+                let box_ref = ctx.get_box_replacement(op.arg(0));
+                if let Some(val) = ctx.get_constant(op.arg(1)) {
+                    ctx.make_constant(box_ref, val);
+                }
+                OptimizationResult::Remove
+            }
+
             // rewrite.py:574-584: optimize_CALL_N — dispatch on oopspecindex
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
                 if let Some(ref descr) = op.descr {
