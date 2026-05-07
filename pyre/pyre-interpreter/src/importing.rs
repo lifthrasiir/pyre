@@ -3691,6 +3691,15 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
 
     let ns_ptr = Box::into_raw(namespace);
     let module = w_module_new(name, ns_ptr as *mut u8);
+    // Pre-populate the W_DictObject's entries Vec from the storage and
+    // bind the back-mirror so post-init `dict_storage_store` writes
+    // (init_fn-style late additions, dict subclass alias mutation)
+    // surface in `module.__dict__.keys()`/`items()` and the
+    // `del module.__dict__[name]` exact-match path.  Mirrors PyPy's
+    // single `module.py:77 self.w_dict` view.
+    unsafe {
+        crate::bind_module_back_mirror(ns_ptr, module);
+    }
     Some(module)
 }
 
@@ -3926,15 +3935,86 @@ fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, Strin
 }
 
 // ── exec_code_module ─────────────────────────────────────────────────
-// PyPy equivalent: importing.py `exec_code_module(space, w_mod, code_w, ...)`
+// PyPy equivalent: importing.py `exec_code_module(space, w_mod, code_w,
+//                                  pathname, cpathname, write_paths=True)`
 //
-// Execute a code object in the module's namespace dict.
+// Mirrors `pypy/module/imp/importing.py:269-300` line-by-line:
+//   w_dict = space.getattr(w_mod, '__dict__')                       # ns
+//   space.call_method(w_dict, 'setdefault',
+//                     '__builtins__', space.builtin)
+//   if write_paths:
+//       space.setitem(w_dict, '__file__', w_pathname)
+//       space.setitem(w_dict, '__cached__', w_cpathname)
+//       _fix_up_module(d, name, pathname, cpathname)               # appexec
+//   code_w.exec_code(space, w_dict, w_dict)
+//
+// `pathname` is `None` for callers that do not have a filesystem path
+// (REPL `__main__`, builtin module bootstrap), matching PyPy's
+// `write_paths=False` shape.  `cpathname` is `None` when no `.pyc` cache
+// is available (pyre has no .pyc cache today, so all reachable callers
+// pass `None` here — kept as a parameter so the signature mirrors PyPy
+// instead of erasing the field).
 
 fn exec_code_module(
     code: CodeObject,
     namespace: *mut DictStorage,
     execution_context: *const PyExecutionContext,
+    pathname: Option<&str>,
+    cpathname: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // importing.py:272-274 — setdefault('__builtins__', space.builtin).
+    // `fresh_dict_storage` already seeds `__builtins__` for module-shape
+    // namespaces; the explicit setdefault here mirrors PyPy's defensive
+    // call so callers that hand in a pre-built storage (future
+    // `_imp.exec_dynamic`-style entry) still inherit the builtins
+    // pointer with no surprises.
+    {
+        let ns = unsafe { &mut *namespace };
+        if crate::dict_storage_get(ns, "__builtins__").is_none() {
+            let ctx = unsafe { &*execution_context };
+            let w_builtin = ctx.get_builtin();
+            if !w_builtin.is_null() {
+                crate::dict_storage_store(ns, "__builtins__", w_builtin);
+            }
+        }
+    }
+    // importing.py:275-298 write_paths block.  Pyre callers always pass
+    // `Some(pathname)` for source-file imports and `None` for the
+    // `write_paths=False` shape (REPL, builtin bootstrap).
+    if let Some(p) = pathname {
+        let ns = unsafe { &mut *namespace };
+        // importing.py:284 setitem('__file__', w_pathname).
+        let w_pathname = pyre_object::w_str_new(p);
+        crate::dict_storage_store(ns, "__file__", w_pathname);
+        // importing.py:285 setitem('__cached__', w_cpathname).  PyPy
+        // surfaces `space.w_None` when `cpathname is None`, i.e. the
+        // import was not satisfied from a `.pyc`.  Pyre has no .pyc
+        // path today so reachable callers still hit the None arm.
+        let w_cpathname = match cpathname {
+            Some(c) => pyre_object::w_str_new(c),
+            None => pyre_object::w_none(),
+        };
+        crate::dict_storage_store(ns, "__cached__", w_cpathname);
+        // importing.py:286-298 — `_fix_up_module(d, name, pathname,
+        // cpathname)`.  PyPy's `_fix_up_module`
+        // (`lib-python/3/importlib/_bootstrap_external.py:1728`) sets
+        // `__spec__`/`__loader__`/`__file__`/`__cached__` from the
+        // app-level `SourceFileLoader` + `spec_from_file_location`
+        // helpers.  Pyre lacks the importlib bootstrap machinery
+        // (`SourceFileLoader`, `ModuleSpec`, `spec_from_file_location`
+        // are not yet ported), so as a PRE-EXISTING-ADAPTATION we seed
+        // `__loader__`/`__spec__` with `None` only when missing —
+        // matching PyPy's `if not loader / if not spec` guards
+        // (_bootstrap_external.py:1732, 1739).  When the importlib
+        // app-level layer lands, the `None` arms will collapse onto the
+        // mechanical PyPy port.
+        if crate::dict_storage_get(ns, "__loader__").is_none() {
+            crate::dict_storage_store(ns, "__loader__", pyre_object::w_none());
+        }
+        if crate::dict_storage_get(ns, "__spec__").is_none() {
+            crate::dict_storage_store(ns, "__spec__", pyre_object::w_none());
+        }
+    }
     let code_ptr = Box::into_raw(Box::new(code));
     let w_code = crate::w_code_new(code_ptr as *const ());
     // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py:31-33
@@ -3981,23 +4061,20 @@ fn load_source_module(
     let mut namespace = Box::new(ctx.fresh_dict_storage());
     namespace.fix_ptr();
 
-    // Set __name__ in the module namespace (PyPy: Module.__init__ sets __name__)
-    let name_obj = pyre_object::w_str_new(modulename);
-    crate::dict_storage_store(&mut namespace, "__name__", name_obj);
-
-    // Set __file__ (PyPy: _prepare_module sets __file__)
-    let file_obj = pyre_object::w_str_new(&pathname_str);
-    crate::dict_storage_store(&mut namespace, "__file__", file_obj);
-
-    // importing.py:285 sets __cached__ on the module dict before
-    // exec_code_module runs.  Pyre has no .pyc cache today, so the
-    // bytecode-compiled file path is unknown — set to None so that
-    // app-level code that probes `mod.__cached__` sees a defined
-    // attribute matching CPython's "no cache available" sentinel.
-    crate::dict_storage_store(&mut namespace, "__cached__", pyre_object::w_none());
-
-    // Set __package__ — PyPy: _prepare_module sets __package__
-    // For "a.b.c" → __package__ = "a.b"; for "a" → __package__ = "a"
+    // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
+    // the module's w_dict.  `w_module_new(modulename, ns_ptr)` below
+    // does that via `w_dict_setitem_str("__name__", ...)` which the
+    // storage proxy mirrors back into `namespace`, so an explicit
+    // dict_storage_store here would be redundant.
+    //
+    // `__file__`/`__cached__` setting moved into `exec_code_module`
+    // (`importing.py:284-285`) so the per-module attribute seeding
+    // mirrors the PyPy call order.
+    //
+    // `__package__` is set by PyPy `interp_import._prepare_module`
+    // (`pypy/module/imp/interp_import.py`); pyre has no `_prepare_module`
+    // yet, so we still seed it here as a PRE-EXISTING-ADAPTATION until
+    // the prepare-module path is ported.
     let pkg = if let Some(dot) = modulename.rfind('.') {
         &modulename[..dot]
     } else {
@@ -4011,9 +4088,20 @@ fn load_source_module(
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
     let module = w_module_new(modulename, ns_ptr as *mut u8);
+    // Bind the storage→W_DictObject back-mirror so STORE_NAME writes
+    // during exec_code_module surface in `module.__dict__.keys()`,
+    // `items()`, and `del module.__dict__[k]` (PyPy
+    // `module.py:77 Module.getdict()` returns the live dict).
+    unsafe {
+        crate::bind_module_back_mirror(ns_ptr, module);
+    }
     set_sys_module(modulename, module);
 
-    exec_code_module(code, ns_ptr, execution_context)?;
+    // PyPy `importing.py:300` passes `pathname`/`cpathname` to
+    // `exec_code_module`; pyre has no .pyc cache today so cpathname is
+    // always None, matching the PyPy `cpathname is None` arm at line
+    // 282-283.
+    exec_code_module(code, ns_ptr, execution_context, Some(&pathname_str), None)?;
 
     // Module-level code may have rewritten `sys.modules[name]` (the
     // `decimal` → `_pydecimal` pattern, or PyPy's `_cffi_backend` style

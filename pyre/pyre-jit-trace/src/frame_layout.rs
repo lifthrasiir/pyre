@@ -46,6 +46,10 @@ pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 /// Byte offset of `f_backref` in `PyFrame`.
 pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
 
+/// Byte offset of `builtin` in `PyFrame` (the picked storage_ptr — the
+/// `*mut DictStorage` consulted by the LOAD_GLOBAL builtins fast path).
+pub const PYFRAME_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, builtin);
+
 /// Byte offset of `w_builtin` in `PyFrame`.
 ///
 /// `frame.w_builtin` carries the picked builtin Module (`pick_builtin_w`
@@ -82,6 +86,7 @@ const _: () = {
         PYFRAME_W_YIELDING_FROM_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET
     );
     assert!(PYFRAME_F_BACKREF_OFFSET == pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET);
+    assert!(PYFRAME_BUILTIN_OFFSET == pyre_interpreter::pyframe::PYFRAME_BUILTIN_OFFSET);
     assert!(PYFRAME_W_BUILTIN_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_BUILTIN_OFFSET);
 };
 

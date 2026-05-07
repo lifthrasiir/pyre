@@ -997,6 +997,27 @@ pub fn register_build_class() {
         let ns = &mut *(ns_ptr as *mut crate::DictStorage);
         ns.remove(name);
     });
+    // Read-through hook so a dict with `dict_storage_proxy` set
+    // (Module.w_dict, globals view) surfaces storage entries on read
+    // miss — `module.py:Module.getdictvalue` parity for the case where
+    // the authoritative state lives in the storage rather than the
+    // dict's own entries Vec.
+    pyre_object::dictobject::register_dict_storage_lookup_hook(|ns_ptr, name| unsafe {
+        let ns = &*(ns_ptr as *const crate::DictStorage);
+        crate::dict_storage_get(ns, name)
+    });
+    // Items-enumeration hook: `len(module.__dict__)`,
+    // `module.__dict__.items()`, `keys()`, `values()`, and
+    // `del module.__dict__[name]` need to see every binding the storage
+    // owns, not just the W_DictObject's entries Vec.  PyPy
+    // `Module.getdict()` returns the live W_DictMultiObject whose state
+    // IS the module dict; pyre's split entries-vs-storage layout would
+    // otherwise miss every binding stored directly on the namespace
+    // (install_default_builtins, frame.fresh_dict_storage callers).
+    pyre_object::dictobject::register_dict_storage_items_hook(|ns_ptr| unsafe {
+        let ns = &*(ns_ptr as *const crate::DictStorage);
+        ns.entries().map(|(k, v)| (k.to_string(), *v)).collect()
+    });
 }
 
 /// `ObjSpace.call_function(callable, *args)` — direct implementation.

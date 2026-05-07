@@ -2006,24 +2006,176 @@ fn exec_or_eval(
         }
     }
 
-    fn build_storage_from_dict(d: pyre_object::PyObjectRef) -> Box<crate::DictStorage> {
-        let mut ns = Box::new(crate::DictStorage::new());
-        unsafe {
-            let backing = crate::type_methods::resolve_dict_backing(d);
-            if !backing.is_null() {
-                for (key, value) in pyre_object::w_dict_items(backing) {
-                    if !value.is_null() && pyre_object::is_str(key) {
-                        crate::dict_storage_store(
-                            &mut ns,
-                            pyre_object::w_str_get_value(key),
-                            value,
-                        );
-                    }
-                }
+    /// Build a `DictStorage` mirror for the user dict and bind the
+    /// user dict's `W_DictObject` as the storage's `mirror_target`,
+    /// so every storage-side write (STORE_GLOBAL) and delete
+    /// (DELETE_GLOBAL) propagates straight back into the user dict's
+    /// entries Vec while exec runs.  PyPy `pyopcode.py:771-776`
+    /// achieves the same shape by running the frame on the user dict
+    /// directly; pyre's frame layout still uses `*mut DictStorage`
+    /// for the bytecode-handler fastpath, so we get parity by paring
+    /// a forward storage proxy (W_DictObject → storage, already
+    /// wired) with this back-mirror (storage → W_DictObject) — the
+    /// two halves stand in for PyPy's single `W_DictMultiObject`.
+    ///
+    /// The initial population copy is mandatory because the bytecode
+    /// handlers read from `*mut DictStorage`; LOAD_GLOBAL would
+    /// otherwise miss every binding the user dict already held.  The
+    /// mirror runs from this point on so no post-exec drain is
+    /// needed: the user dict is always in sync.
+    ///
+    /// RAII binding for the frame's globals storage.
+    ///
+    /// Lifecycle (PyPy `pyopcode.py:771-776` parity — the user dict
+    /// and the frame's `w_globals` are one and the same throughout
+    /// the run):
+    ///
+    /// * **User dict has an existing `dict_storage_proxy`** (typical
+    ///   for `module.__dict__` whose proxy is the module's own
+    ///   storage with a back-mirror to the entries Vec): the binding
+    ///   reuses that proxy directly as the frame's globals.  No temp
+    ///   allocation, no proxy swap, no post-exec replay — STORE_GLOBAL
+    ///   / DELETE_GLOBAL inside `exec("del x", module.__dict__)` land
+    ///   on the very dict the module sees afterwards.
+    ///
+    /// * **User dict has no existing proxy** (typical fresh
+    ///   `exec(src, {})`): the binding owns a temp `DictStorage`
+    ///   pre-populated from the user dict's str-keyed entries with
+    ///   `mirror_target = backing`; `attach_forward_proxy` is called
+    ///   exactly once after all fallible setup so a `?` early-return
+    ///   never leaves a dangling proxy hand-off.
+    ///
+    /// `Drop` (and `detach`) clears both halves idempotently: forward
+    /// proxy restored to its pre-exec value, and `mirror_target`
+    /// reset on the temp storage so the box can drop without an
+    /// observer holding a freed pointer.  This is the cleanup hole
+    /// guard for `createframe` and `setdictscope_object` early
+    /// returns.
+    struct GlobalsBinding {
+        /// Owned temp storage when allocated; `None` when reusing an
+        /// existing proxy storage.
+        owned: Option<Box<crate::DictStorage>>,
+        /// The storage the frame uses for `w_globals`.  Either the
+        /// owned temp storage's interior pointer, or the user dict's
+        /// existing proxy.
+        storage_ptr: *mut crate::DictStorage,
+        /// User dict's W_DictObject backing (`PY_NULL` when no user
+        /// dict, e.g. `exec(src)` with no globals arg).
+        backing: pyre_object::PyObjectRef,
+        /// `true` once `attach_forward_proxy` swapped the user dict's
+        /// proxy to point at our temp storage; cleared by `detach`.
+        proxy_attached: bool,
+        /// User dict's pre-attach proxy, restored by `detach` when
+        /// `proxy_attached` is true.  Always null otherwise.
+        saved_proxy: *mut u8,
+    }
+
+    impl GlobalsBinding {
+        fn empty() -> Self {
+            Self {
+                owned: None,
+                storage_ptr: std::ptr::null_mut(),
+                backing: std::ptr::null_mut(),
+                proxy_attached: false,
+                saved_proxy: std::ptr::null_mut(),
             }
         }
-        ns.fix_ptr();
-        ns
+
+        fn from_user_dict(d: pyre_object::PyObjectRef) -> Self {
+            let backing = unsafe { crate::type_methods::resolve_dict_backing(d) };
+            if backing.is_null() {
+                return Self::empty();
+            }
+            let existing_proxy = unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) };
+            if !existing_proxy.is_null() {
+                // Reuse the existing proxy storage directly.  PyPy
+                // `pyopcode.py:771` — the frame runs on the very
+                // same dict the caller passed in, so `exec("del x",
+                // module.__dict__)` removes from the module's
+                // storage rather than a temp copy that gets thrown
+                // away.  No proxy swap, no replay, no extra
+                // bookkeeping.
+                return Self {
+                    owned: None,
+                    storage_ptr: existing_proxy as *mut crate::DictStorage,
+                    backing,
+                    proxy_attached: false,
+                    saved_proxy: std::ptr::null_mut(),
+                };
+            }
+            // Fresh user dict — allocate a temp storage, pre-populate
+            // from the user dict's str-keyed entries, and bind the
+            // back-mirror so storage-side writes propagate to the
+            // user dict's entries Vec while exec runs.  Forward proxy
+            // attach is deferred to `attach_forward_proxy` so any
+            // fallible setup between here and `frame.run()`
+            // (createframe, setdictscope_object) cannot leave the
+            // user dict pointing at a Box we're about to drop.
+            let mut ns = Box::new(crate::DictStorage::new());
+            unsafe {
+                for (key, value) in pyre_object::w_dict_items(backing) {
+                    if !value.is_null() && pyre_object::is_str(key) {
+                        let name = pyre_object::w_str_get_value(key).to_string();
+                        crate::dict_storage_store(&mut ns, &name, value);
+                    }
+                }
+                ns.set_mirror_target(backing);
+            }
+            ns.fix_ptr();
+            let storage_ptr: *mut crate::DictStorage = ns.as_mut() as *mut _;
+            Self {
+                owned: Some(ns),
+                storage_ptr,
+                backing,
+                proxy_attached: false,
+                saved_proxy: std::ptr::null_mut(),
+            }
+        }
+
+        /// Attach the temp storage as the user dict's
+        /// `dict_storage_proxy` so alias mutations
+        /// (`exec("g['x']=1; y=x", g)`) propagate from the user
+        /// dict's W_DictObject into the frame's storage.  No-op when
+        /// reusing an existing proxy.  Call exactly once, AFTER all
+        /// fallible setup, so a `?` early-return cannot leave the
+        /// user dict pointing at a Box we're about to drop.
+        unsafe fn attach_forward_proxy(&mut self) {
+            if self.proxy_attached
+                || self.owned.is_none()
+                || self.backing.is_null()
+                || self.storage_ptr.is_null()
+            {
+                return;
+            }
+            self.saved_proxy = pyre_object::w_dict_get_dict_storage_proxy(self.backing);
+            pyre_object::w_dict_set_dict_storage_proxy(self.backing, self.storage_ptr as *mut u8);
+            self.proxy_attached = true;
+        }
+
+        /// Restore the user dict's pre-exec proxy and clear the temp
+        /// storage's `mirror_target`.  Idempotent.  Called via `Drop`
+        /// on every exit path including `?` early-returns and
+        /// panic-unwinds.
+        unsafe fn detach(&mut self) {
+            if self.proxy_attached {
+                pyre_object::w_dict_set_dict_storage_proxy(self.backing, self.saved_proxy);
+                self.proxy_attached = false;
+                self.saved_proxy = std::ptr::null_mut();
+            }
+            if let Some(storage) = self.owned.as_deref_mut() {
+                storage.set_mirror_target(pyre_object::PY_NULL);
+            }
+        }
+
+        fn storage_ptr(&self) -> *mut crate::DictStorage {
+            self.storage_ptr
+        }
+    }
+
+    impl Drop for GlobalsBinding {
+        fn drop(&mut self) {
+            unsafe { self.detach() }
+        }
     }
 
     fn ensure_builtins(
@@ -2054,23 +2206,6 @@ fn exec_or_eval(
         }
     }
 
-    fn sync_storage_to_dict(target: PyObjectRef, source: *mut crate::DictStorage) {
-        if source.is_null() {
-            return;
-        }
-        unsafe {
-            let backing = crate::type_methods::resolve_dict_backing(target);
-            if backing.is_null() {
-                return;
-            }
-            for (k, &v) in (*source).entries() {
-                if !v.is_null() {
-                    pyre_object::w_dict_store(backing, pyre_object::w_str_new(k), v);
-                }
-            }
-        }
-    }
-
     // pypy/interpreter/pyopcode.py:2003-2013 ensure_ns —
     //   globals: not None ⇒ isinstance_w(w_dict) else TypeError
     //   locals : not None ⇒ space.lookup(__getitem__) is not None
@@ -2098,15 +2233,18 @@ fn exec_or_eval(
         unsafe { (*caller_frame).execution_context }
     };
 
-    let mut owned_globals: Option<Box<crate::DictStorage>> = None;
-    let sync_back_globals = if !is_none_or_null(globals_arg) {
-        owned_globals = Some(build_storage_from_dict(globals_arg));
-        Some(globals_arg)
+    let mut globals_binding = if !is_none_or_null(globals_arg) {
+        GlobalsBinding::from_user_dict(globals_arg)
     } else {
-        None
+        GlobalsBinding::empty()
     };
-    let mut globals_ptr = if let Some(storage) = owned_globals.as_deref_mut() {
-        storage as *mut crate::DictStorage
+    // Anonymous fallback storage for the no-globals + no-caller-frame
+    // path (`exec(src)` outside any frame).  Owned outside the
+    // GlobalsBinding because it has no W_DictObject backing — there
+    // is nothing to mirror to and no proxy to swap.
+    let mut anon_globals: Option<Box<crate::DictStorage>> = None;
+    let mut globals_ptr = if !globals_binding.storage_ptr().is_null() {
+        globals_binding.storage_ptr()
     } else if !caller_frame.is_null() {
         unsafe { (*caller_frame).get_w_globals() }
     } else {
@@ -2115,45 +2253,62 @@ fn exec_or_eval(
     if globals_ptr.is_null() {
         let mut storage = Box::new(crate::DictStorage::new());
         storage.fix_ptr();
-        owned_globals = Some(storage);
-        globals_ptr = owned_globals
-            .as_deref_mut()
-            .map(|storage| storage as *mut crate::DictStorage)
-            .unwrap_or(std::ptr::null_mut());
+        let raw: *mut crate::DictStorage = storage.as_mut() as *mut _;
+        anon_globals = Some(storage);
+        globals_ptr = raw;
     }
     if !globals_ptr.is_null() {
         ensure_builtins(unsafe { &mut *globals_ptr }, caller_frame, exec_ctx);
     }
 
-    let mut owned_locals: Option<Box<crate::DictStorage>> = None;
-    let mut locals_ptr = std::ptr::null_mut::<crate::DictStorage>();
-    let mut sync_back_locals = None;
-    // pypy/interpreter/pyopcode.py:2003-2013 ensure_ns: any object with
-    // `__getitem__` is legal locals.  Dict locals take the
-    // `*mut DictStorage` fast path with a setup-time copy + run-time
-    // sync-back; non-dict mappings are passed straight through to
-    // `frame.setdictscope_object(w_locals_object)` so STORE / LOAD /
-    // DELETE_NAME route through `space.setitem / getitem / delitem`
-    // directly — matching PyPy's in-place mutation visibility on the
-    // original mapping object during exec.
+    // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,
+    // w_globals, w_locals, outer_func)` runs the frame on the
+    // user-supplied dict directly.  Pyre routes locals through
+    // `frame.setdictscope_object(w_locals)` so STORE_NAME / LOAD_NAME /
+    // DELETE_NAME dispatch via `space.setitem` / `space.getitem` /
+    // `space.delitem` on the live mapping (dict subclass `__getitem__`
+    // overrides win, alias mutations are visible immediately, and
+    // there is no entry/exit storage copy + drain pair).  Both exact
+    // dicts and arbitrary `__getitem__`-bearing mappings now share
+    // this path.
+    //
+    // pypy/interpreter/pyopcode.py:2015 ensure_ns — when the caller
+    // omits both globals and locals, exec falls back to caller globals
+    // (already wired above) AND caller `getdictscope()`.  When the
+    // caller omits ONLY locals, locals collapse to globals (PyPy
+    // `pyopcode.py:2010-2013`), which the existing same-storage shape
+    // below covers via the `is_none_or_null(locals_arg)` skip.
+    //
+    // Resolve the implicit caller-locals only when globals_arg is also
+    // None: that's the `exec(src)` shape where PyPy hands the caller's
+    // live local mapping in via `frame.getdictscope()`.  When
+    // globals_arg is supplied but locals_arg is None, PyPy collapses
+    // locals=globals and pyre's existing same-dict path handles it.
+    let mut implicit_caller_locals: pyre_object::PyObjectRef = std::ptr::null_mut();
+    if is_none_or_null(globals_arg) && is_none_or_null(locals_arg) && !caller_frame.is_null() {
+        // pyframe.py:540 getdictscope returns the caller's
+        // w_locals (PyObjectRef) — same dict-or-mapping the
+        // interpreter sees inside the calling function body.
+        implicit_caller_locals = unsafe { (*caller_frame).getdictscope_w()? };
+    }
     let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
     if !is_none_or_null(locals_arg) {
         let same_as_globals =
             !is_none_or_null(globals_arg) && std::ptr::eq(locals_arg, globals_arg);
         if !same_as_globals {
-            if is_dict_w(locals_arg) {
-                owned_locals = Some(build_storage_from_dict(locals_arg));
-                sync_back_locals = Some(locals_arg);
-                locals_ptr = owned_locals
-                    .as_deref_mut()
-                    .map(|storage| storage as *mut crate::DictStorage)
-                    .unwrap_or(std::ptr::null_mut());
-            } else {
-                locals_object_arg = locals_arg;
-            }
+            // Dict and non-dict mapping arms share the
+            // setdictscope_object path — for exact dict locals this
+            // matches PyPy's `code.exec_code(space, w_globals,
+            // w_locals)` chain (pyopcode.py:776) which feeds
+            // `space.setitem(w_locals, name, value)` to STORE_NAME.
+            // Pyre's earlier `is_dict_w` arm built a storage copy and
+            // drained it back through a `Vec<String>` snapshot to
+            // mirror DELETE_GLOBAL while preserving alias mutations;
+            // routing through `setdictscope_object` retires the copy +
+            // snapshot entirely.
+            locals_object_arg = locals_arg;
         }
     }
-    let _keep_owned_locals_alive = &owned_locals;
     // eval.py:31-33 Code.exec_code → space.createframe(...) + frame.run().
     // For eval() with a code object that carries freevars, createframe
     // surfaces pyframe.py:242-246's TypeError "directly executed code
@@ -2172,28 +2327,49 @@ fn exec_or_eval(
     // were separately supplied.  Without this call, initialize_frame_scopes'
     // module-code arm has already bound w_locals = w_globals, matching
     // PyPy's `exec(src, g)` (and `exec(src, g, l)` where `l is g`).
-    if !locals_ptr.is_null() {
-        frame.setdictscope(locals_ptr)?;
-    } else if !locals_object_arg.is_null() {
+    if !locals_object_arg.is_null() {
         frame.setdictscope_object(locals_object_arg)?;
+    } else if !implicit_caller_locals.is_null() {
+        // pyopcode.py:2015 — `exec(src)` with no globals/locals uses
+        // the caller's `getdictscope()` as locals.  Skip when the
+        // resolved object is the caller's globals (module-level exec
+        // collapses to locals=globals — same-dict shape kept by the
+        // module-frame's initialize_frame_scopes binding).
+        let caller_globals = unsafe { (*caller_frame).get_w_globals() };
+        let same_as_globals =
+            !caller_globals.is_null() && std::ptr::eq(globals_ptr, caller_globals);
+        if !same_as_globals {
+            frame.setdictscope_object(implicit_caller_locals)?;
+        }
     }
+    // Attach the forward proxy after every fallible setup step has
+    // succeeded so a `?` early-return from createframe /
+    // setdictscope_object cannot leave the user dict pointing at a
+    // Box we're about to drop.  The companion detach lives in
+    // `GlobalsBinding::Drop`, which runs even on panic-unwind paths
+    // through `frame.run()`.
+    unsafe {
+        globals_binding.attach_forward_proxy();
+    }
+
     // run() rather than execute_frame so that
     // `eval(compile("(x for x in [])", ..., 'eval'))` of generator-flagged
     // code returns the wrapped generator object instead of executing the
     // body inline.
     let result = frame.run();
 
-    // Sync each storage back to the dict the caller passed in.  STORE_GLOBAL
-    // mutated globals_ptr, STORE_NAME mutated locals_ptr (or globals_ptr
-    // when locals were not separated) — matching PyPy's per-namespace
-    // routing rather than the merge-then-drain pattern that conflated the
-    // two.
-    if let Some(target) = sync_back_globals {
-        sync_storage_to_dict(target, globals_ptr);
+    // Explicit detach so the proxy/mirror state is cleared BEFORE
+    // `globals_binding` drops; `Drop` then becomes idempotent and
+    // covers the rare panic-unwind path.  STORE_GLOBAL /
+    // DELETE_GLOBAL writes during exec already landed on the user
+    // dict via the back-mirror, and alias mutations propagated
+    // through the forward proxy, so no post-exec drain is needed
+    // (PyPy `pyopcode.py:771-776` parity — the user dict and the
+    // frame's globals are one and the same throughout the run).
+    unsafe {
+        globals_binding.detach();
     }
-    if let Some(target) = sync_back_locals {
-        sync_storage_to_dict(target, locals_ptr);
-    }
+    let _ = anon_globals; // keep anon storage alive across exec
 
     let _ = raw_code; // keep raw_code alive until after exec for safety.
     match result {

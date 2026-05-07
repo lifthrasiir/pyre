@@ -233,10 +233,12 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 visitor(&mut *(gen_slot as *mut majit_ir::GcRef));
                 let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
                 visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
-                // pyframe.py:91-92 `self.builtin = ...` — the picked
+                // pyframe.py:115-116 `self.builtin = ...` — the picked
                 // builtin Module is a GC root.  Pyre stashes its identity
                 // on `frame.w_builtin` so `frame.get_builtin()` returns
-                // the same object PyPy would.
+                // the same object PyPy would.  (The companion
+                // `frame.builtin` is a `*mut DictStorage` — not a
+                // GCREF — used only by the LOAD_GLOBAL fast path.)
                 let w_builtin_slot = &mut (*(frame)).w_builtin as *mut PyObjectRef;
                 visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
                 // pyframe.py:147 `debugdata.w_locals` (and the pyre-only
@@ -849,13 +851,17 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// chosen at frame-creation time by `pick_builtin(w_globals)`
     /// (`pyframe.py:115-116` + `pypy/module/__builtin__/moduledef.py:89`),
     /// so `exec("x = len", {"__builtins__": {}})` raises `NameError`
-    /// because the empty dict is the picked builtin.  Pyre caches the
-    /// picked storage in `frame.builtin`.
+    /// because the empty dict is the picked builtin.
     fn load_global_value(&mut self, name: &str) -> Result<Self::Value, PyError> {
         let ns = unsafe { &*self.get_w_globals() };
         if let Some(value) = crate::dict_storage_get(ns, name) {
             return Ok(value);
         }
+        // pyopcode.py:921 `w_value = self.get_builtin().getdictvalue
+        // (self.space, varname)`.  pyre caches the picked builtin's
+        // backing storage in `frame.builtin` (a `*mut DictStorage`) so
+        // the fallback is one `dict_storage_get` — equivalent to PyPy's
+        // `module.getdictvalue` walking `module.w_dict` for the str key.
         if !self.builtin.is_null() {
             if let Some(value) = crate::dict_storage_get(unsafe { &*self.builtin }, name) {
                 return Ok(value);
@@ -1963,11 +1969,16 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── delete_global ──
-    // pypy/interpreter/pyopcode.py:901 DELETE_GLOBAL — delitem only; no NameError conversion.
+    // pypy/interpreter/pyopcode.py:901-903 DELETE_GLOBAL —
+    //   `self.space.delitem(self.get_w_globals(), w_varname)`.
+    // `space.delitem` on a dict raises `KeyError(w_varname)` when the
+    // key is missing; pyre's storage-direct path mirrors that without
+    // translating the failure into a NameError.
     fn delete_global(&mut self, name: &str) -> Result<(), Self::Error> {
         let ns = self.get_w_globals();
-        unsafe {
-            crate::dict_storage_delete(&mut *ns, name);
+        let found = unsafe { crate::dict_storage_delete(&mut *ns, name) };
+        if !found {
+            return Err(PyError::key_error(format!("'{name}'")));
         }
         Ok(())
     }

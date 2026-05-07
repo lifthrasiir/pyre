@@ -388,66 +388,54 @@ impl EffectInfo {
         call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
     };
 
-    // ── Bitstring check methods (effectinfo.py parity) ──
+    // ── Bitstring check methods (effectinfo.py:211-230 parity) ──
     //
-    // effectinfo.py:149-156 — `EF_RANDOM_EFFECTS` keeps every readonly /
-    // write descr set as `None`, the wildcard for "anything could happen".
-    // PyPy's optimizer guards `check_*` with `has_random_effects()` (heap.py:460)
-    // so the None-set is never actually queried; pyre's caller is
-    // similarly guarded (`call_has_random_effects` in heap.rs:2602).  The
-    // `RandomEffects` short-circuit below preserves the semantic for any
-    // unguarded reader: when the bitsets stand in for None, any descr
-    // index is reported as touched.
-
-    fn random_effects(&self) -> bool {
-        matches!(self.extraeffect, ExtraEffect::RandomEffects)
-    }
+    // PyPy `effectinfo.py:211-230` does NOT short-circuit on
+    // `EF_RANDOM_EFFECTS`: each `check_*` is a one-liner
+    // `bitstring.bitcheck(self.bitstring_*, ei_index)`.  The
+    // `EF_RANDOM_EFFECTS` case is handled at construction time —
+    // `effectinfo.py:149-156` keeps the `_readonly_*`/`_write_*` sets as
+    // `None` and `compute_bitstrings` (`effectinfo.py:484-489`) sets the
+    // bitstring fields to `None` too.  The contract is that callers must
+    // gate via `has_random_effects()` first (heap.py:460) so the
+    // `None`-bitstring case is never queried.
+    //
+    // Pyre `MOST_GENERAL` (line 356) populates every bitset with
+    // `u64::MAX` so the bitcheck reports every descr_idx < 64 as
+    // touched, matching the wildcard contract for the bounded index
+    // range pyre supports today.  The optimizer caller
+    // (`heap.rs:2589 call_has_random_effects`) gates the same way as
+    // PyPy, so `descr_idx >= 64` is unreachable in practice — the bare
+    // bitcheck is sufficient parity, no `random_effects()`
+    // short-circuit needed.
 
     /// effectinfo.py:211-213: check_readonly_descr_field(fielddescr)
     pub fn check_readonly_descr_field(&self, descr_idx: u32) -> bool {
-        if self.random_effects() {
-            return true;
-        }
         descr_idx < 64 && (self.readonly_descrs_fields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:214-216: check_write_descr_field(fielddescr)
     pub fn check_write_descr_field(&self, descr_idx: u32) -> bool {
-        if self.random_effects() {
-            return true;
-        }
         descr_idx < 64 && (self.write_descrs_fields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:217-219: check_readonly_descr_array(arraydescr)
     pub fn check_readonly_descr_array(&self, descr_idx: u32) -> bool {
-        if self.random_effects() {
-            return true;
-        }
         descr_idx < 64 && (self.readonly_descrs_arrays & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:220-222: check_write_descr_array(arraydescr)
     pub fn check_write_descr_array(&self, descr_idx: u32) -> bool {
-        if self.random_effects() {
-            return true;
-        }
         descr_idx < 64 && (self.write_descrs_arrays & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:223-226: check_readonly_descr_interiorfield (NOTE: not used so far)
     pub fn check_readonly_descr_interiorfield(&self, descr_idx: u32) -> bool {
-        if self.random_effects() {
-            return true;
-        }
         descr_idx < 64 && (self.readonly_descrs_interiorfields & (1u64 << descr_idx)) != 0
     }
 
     /// effectinfo.py:227-230: check_write_descr_interiorfield (NOTE: not used so far)
     pub fn check_write_descr_interiorfield(&self, descr_idx: u32) -> bool {
-        if self.random_effects() {
-            return true;
-        }
         descr_idx < 64 && (self.write_descrs_interiorfields & (1u64 << descr_idx)) != 0
     }
 

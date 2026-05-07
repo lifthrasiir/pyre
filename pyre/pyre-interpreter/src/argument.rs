@@ -1188,12 +1188,20 @@ impl Arguments {
                     }
                     continue;
                 }
-                if let Some(w_def) = crate::baseobjspace::finditem_str(w_kw_defs, name) {
-                    scope_w[i] = w_def;
-                } else if let Some(list) = missing_kwonly.as_mut() {
-                    list.push(name.to_string());
-                } else {
-                    missing_kwonly = Some(vec![name.to_string()]);
+                // PyPy `baseobjspace.py:870 finditem` re-raises any
+                // `OperationError` other than KeyError, so a kwonly-defaults
+                // dict with a subclass `__getitem__` raising e.g.
+                // `RuntimeError` surfaces here instead of being
+                // mis-classified as "default missing".
+                match crate::baseobjspace::finditem_str(w_kw_defs, name)? {
+                    Some(w_def) => scope_w[i] = w_def,
+                    None => {
+                        if let Some(list) = missing_kwonly.as_mut() {
+                            list.push(name.to_string());
+                        } else {
+                            missing_kwonly = Some(vec![name.to_string()]);
+                        }
+                    }
                 }
             }
             // argument.py:335-338 — surface ArgErrMissing.

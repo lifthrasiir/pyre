@@ -868,6 +868,15 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 /// PyPy: dictobject.py descr_keys — returns dict_keys view.
+///
+/// Routes through `w_dict_items` so the storage-proxy union view
+/// (`Module.__dict__.keys()` reaching every binding the storage
+/// owns, not just the entries Vec) matches PyPy's single
+/// W_DictMultiObject.  The back-mirror wired in
+/// `bind_module_back_mirror` keeps entries Vec in sync with
+/// storage on writes/deletes; the union here is the safety net for
+/// dicts whose proxy was set without a back-mirror (rare but
+/// possible for transient `globals()` views).
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let dict = resolve_dict_backing(args[0]);
@@ -875,9 +884,10 @@ pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         return Ok(w_list_new(vec![]));
     }
     unsafe {
-        let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
-        let entries = &*d.entries;
-        let keys: Vec<PyObjectRef> = entries.iter().map(|&(k, _)| k).collect();
+        let keys: Vec<PyObjectRef> = pyre_object::w_dict_items(dict)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         Ok(w_list_new(keys))
     }
 }
@@ -890,9 +900,10 @@ pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         return Ok(w_list_new(vec![]));
     }
     unsafe {
-        let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
-        let entries = &*d.entries;
-        let values: Vec<PyObjectRef> = entries.iter().map(|&(_, v)| v).collect();
+        let values: Vec<PyObjectRef> = pyre_object::w_dict_items(dict)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
         Ok(w_list_new(values))
     }
 }
@@ -905,11 +916,9 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         return Ok(w_list_new(vec![]));
     }
     unsafe {
-        let d = &*(dict as *const pyre_object::dictobject::W_DictObject);
-        let entries = &*d.entries;
-        let items: Vec<PyObjectRef> = entries
-            .iter()
-            .map(|&(k, v)| w_tuple_new(vec![k, v]))
+        let items: Vec<PyObjectRef> = pyre_object::w_dict_items(dict)
+            .into_iter()
+            .map(|(k, v)| w_tuple_new(vec![k, v]))
             .collect();
         Ok(w_list_new(items))
     }
@@ -925,9 +934,10 @@ pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     if !other_raw.is_null() {
         unsafe {
-            let src = &*(other_raw as *const pyre_object::dictobject::W_DictObject);
-            let entries = &*src.entries;
-            for &(k, v) in entries {
+            // Walk the union view so updates from a storage-proxied
+            // source dict (e.g. `module.__dict__`) include entries
+            // that live only in the proxy storage.
+            for (k, v) in pyre_object::w_dict_items(other_raw) {
                 w_dict_store(dict, k, v);
             }
         }

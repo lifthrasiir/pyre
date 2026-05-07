@@ -202,6 +202,12 @@ fn run_source(source: &str, mode: Mode) {
     // enum.global_enum and similar introspection works.
     let main_module =
         pyre_object::moduleobject::w_module_new("__main__", frame.w_globals as *mut u8);
+    // Bind storage→W_DictObject back-mirror so STORE_NAME / STORE_GLOBAL
+    // writes during the script run surface in `__main__.__dict__`'s
+    // keys/items/lookups (PyPy `module.py:77 Module.getdict()` parity).
+    unsafe {
+        pyre_interpreter::bind_module_back_mirror(frame.w_globals, main_module);
+    }
     importing::set_sys_module("__main__", main_module);
 
     match eval_with_jit(&mut frame) {

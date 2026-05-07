@@ -141,10 +141,33 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
 
 /// Get a value by PyObjectRef key.
 ///
+/// When `dict_storage_proxy` is attached, the storage is treated as
+/// authoritative for str keys: lookup checks the storage FIRST, so a
+/// transient proxy dict whose `entries` Vec carries a stale snapshot
+/// (`dict_storage_to_dict` materialisation, `w_module_new`
+/// pre-population that was later mutated by a STORE_GLOBAL on the
+/// shared storage) returns the live value rather than the cached
+/// stale one.  Non-str keys live only in the entries Vec because
+/// `DictStorage` is str-keyed by construction.
+///
+/// PyPy parity: `pypy/interpreter/module.py:77 Module.getdict()`
+/// returns the live `W_DictMultiObject` whose state IS the module's
+/// dict — there is no stale snapshot to worry about because there is
+/// only one map.  Pyre's split (entries Vec + DictStorage) mirrors
+/// the same single-source-of-truth shape only when the storage side
+/// wins for the key types it represents.
+///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
+    if !dict.dict_storage_proxy.is_null() && crate::is_str(key) {
+        if let Some(v) =
+            maybe_lookup_dict_storage(dict.dict_storage_proxy, crate::w_str_get_value(key))
+        {
+            return Some(v);
+        }
+    }
     let entries = &*dict.entries;
     for &(ref k, v) in entries {
         if dict_keys_equal(*k, key) {
@@ -210,8 +233,29 @@ unsafe fn maybe_sync_dict_storage_delete(ns_ptr: *mut u8, key_str: &str) {
     }
 }
 
+/// Storage-proxy read-through.  PyPy keeps every dict-backed lookup
+/// inside the same `W_DictMultiObject`, so reads see entries
+/// regardless of which interpreter side wrote them.  Pyre splits the
+/// dict's `entries` Vec from the `DictStorage` proxy, so a dict whose
+/// authoritative state lives in the storage (`Module.w_dict` over
+/// `space.builtin`'s storage, `globals()` view) must surface storage
+/// entries on read.  Returns `None` when no proxy is attached or the
+/// hook is unregistered.
+unsafe fn maybe_lookup_dict_storage(ns_ptr: *mut u8, key_str: &str) -> Option<PyObjectRef> {
+    if ns_ptr.is_null() {
+        return None;
+    }
+    let ptr = DICT_STORAGE_LOOKUP_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    (*ptr)(ns_ptr, key_str)
+}
+
 type NamespaceStoreHook = unsafe fn(*mut u8, &str, PyObjectRef);
 type NamespaceDeleteHook = unsafe fn(*mut u8, &str);
+type NamespaceLookupHook = unsafe fn(*mut u8, &str) -> Option<PyObjectRef>;
+type NamespaceItemsHook = unsafe fn(*mut u8) -> Vec<(String, PyObjectRef)>;
 
 struct AtomicHookPtr(std::sync::atomic::AtomicPtr<NamespaceStoreHook>);
 
@@ -251,8 +295,44 @@ impl AtomicDeleteHookPtr {
     }
 }
 
+struct AtomicLookupHookPtr(std::sync::atomic::AtomicPtr<NamespaceLookupHook>);
+
+impl AtomicLookupHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceLookupHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceLookupHook {
+        self.0.load(order) as *const NamespaceLookupHook
+    }
+}
+
+struct AtomicItemsHookPtr(std::sync::atomic::AtomicPtr<NamespaceItemsHook>);
+
+impl AtomicItemsHookPtr {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn store(&self, hook: NamespaceItemsHook) {
+        let raw = crate::lltype::malloc_raw(hook);
+        self.0.store(raw, std::sync::atomic::Ordering::Release);
+    }
+
+    fn load(&self, order: std::sync::atomic::Ordering) -> *const NamespaceItemsHook {
+        self.0.load(order) as *const NamespaceItemsHook
+    }
+}
+
 static DICT_STORAGE_STORE_HOOK: AtomicHookPtr = AtomicHookPtr::new();
 static DICT_STORAGE_DELETE_HOOK: AtomicDeleteHookPtr = AtomicDeleteHookPtr::new();
+static DICT_STORAGE_LOOKUP_HOOK: AtomicLookupHookPtr = AtomicLookupHookPtr::new();
+static DICT_STORAGE_ITEMS_HOOK: AtomicItemsHookPtr = AtomicItemsHookPtr::new();
 
 /// Register the interpreter-level hook that writes (name, value) into a
 /// DictStorage. Called once during interpreter startup.
@@ -264,6 +344,39 @@ pub fn register_dict_storage_store_hook(hook: NamespaceStoreHook) {
 /// DictStorage. Called once during interpreter startup.
 pub fn register_dict_storage_delete_hook(hook: NamespaceDeleteHook) {
     DICT_STORAGE_DELETE_HOOK.store(hook);
+}
+
+/// Register the interpreter-level hook that looks up `name` in a
+/// DictStorage and returns its value (or `None`).  Called once during
+/// interpreter startup so dicts with a `dict_storage_proxy` surface
+/// storage entries on read miss.
+pub fn register_dict_storage_lookup_hook(hook: NamespaceLookupHook) {
+    DICT_STORAGE_LOOKUP_HOOK.store(hook);
+}
+
+/// Register the interpreter-level hook that enumerates all str-keyed
+/// `(name, value)` pairs from a DictStorage.  Used by `w_dict_len`,
+/// `w_dict_items`, `w_dict_str_entries` and `w_dict_delitem_str` to keep
+/// the full dict protocol (`len(module.__dict__)`, `module.__dict__.items()`,
+/// `del module.__dict__[name]`) consistent with PyPy's
+/// `Module.getdict()` returning the live W_DictMultiObject — pyre splits
+/// the proxy off the entries Vec and would otherwise miss every storage
+/// entry not yet mirrored into the W_DictObject.
+pub fn register_dict_storage_items_hook(hook: NamespaceItemsHook) {
+    DICT_STORAGE_ITEMS_HOOK.store(hook);
+}
+
+/// Read-side counterpart of `maybe_sync_dict_storage_store`: enumerate
+/// the str-keyed entries currently in the backing storage.
+unsafe fn maybe_items_dict_storage(ns_ptr: *mut u8) -> Vec<(String, PyObjectRef)> {
+    if ns_ptr.is_null() {
+        return Vec::new();
+    }
+    let ptr = DICT_STORAGE_ITEMS_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return Vec::new();
+    }
+    (*ptr)(ns_ptr)
 }
 
 /// Get the dict_storage_proxy pointer from a dict (used by interpreter for
@@ -300,9 +413,17 @@ pub unsafe fn w_dict_setitem(obj: PyObjectRef, key: i64, value: PyObjectRef) {
     w_dict_store(obj, crate::w_int_new(key), value)
 }
 
-/// Get a value by str key (convenience wrapper).
+/// Get a value by str key (convenience wrapper).  Mirrors
+/// `w_dict_lookup`'s storage-first contract for proxied dicts so
+/// stale `entries` snapshots (e.g. `dict_storage_to_dict`
+/// materialisation) don't shadow live storage updates.
 pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(v) = maybe_lookup_dict_storage(dict.dict_storage_proxy, key) {
+            return Some(v);
+        }
+    }
     let entries = &*dict.entries;
     for &(ref k, v) in entries {
         if crate::is_str(*k) && crate::w_str_get_value(*k) == key {
@@ -317,8 +438,41 @@ pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef
     w_dict_store(obj, crate::w_str_new(key), value)
 }
 
-/// Remove an entry by str key. Returns true if the key was found.
-pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
+/// Set a value by str key WITHOUT firing the dict_storage_proxy
+/// store hook.  Used by the storage→W_DictObject back-mirror so a
+/// `dict_storage_store` on a storage that has a registered mirror
+/// target updates the W_DictObject's entries Vec without
+/// re-entering `maybe_sync_dict_storage_store` (which would feed
+/// the same write right back into the storage and create an
+/// observable double-invalidation of slot watchers).
+///
+/// PyPy keeps everything in one `W_DictMultiObject`, so the
+/// asymmetric "entries Vec write must skip storage notification"
+/// shape is pyre-only; the no-proxy variant is the structural
+/// adapter for the bidirectional sync that PyPy gets for free.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: PyObjectRef) {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.entries;
+    for entry in entries.iter_mut() {
+        if crate::is_str(entry.0) && crate::w_str_get_value(entry.0) == key {
+            entry.1 = value;
+            return;
+        }
+    }
+    entries.push((crate::w_str_new(key), value));
+    dict.len += 1;
+}
+
+/// Remove an entry by str key WITHOUT firing the dict_storage_proxy
+/// delete hook.  Counterpart of `w_dict_setitem_str_no_proxy`; see
+/// that doc-comment for the back-mirror rationale.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject`.
+pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *dict.entries;
     if let Some(idx) = entries
@@ -327,32 +481,111 @@ pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
     {
         entries.remove(idx);
         dict.len -= 1;
-        // Storage proxy sync: keep `pick_builtin`'s lazy mirror /
-        // `globals()` view in step with explicit `del dict[name]`.
-        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key);
         true
     } else {
         false
     }
 }
 
+/// Remove an entry by str key. Returns true if the key was found.
+pub unsafe fn w_dict_delitem_str(obj: PyObjectRef, key: &str) -> bool {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.entries;
+    let mut hit = false;
+    if let Some(idx) = entries
+        .iter()
+        .position(|(k, _)| crate::is_str(*k) && crate::w_str_get_value(*k) == key)
+    {
+        entries.remove(idx);
+        dict.len -= 1;
+        hit = true;
+    }
+    // Storage proxy sync: keep `pick_builtin`'s lazy mirror / `globals()`
+    // view in step with explicit `del dict[name]`.  PyPy's
+    // `W_DictMultiObject` keeps a single map so a `del module.__dict__[k]`
+    // removes the entry whether it lives in entries Vec or storage; pyre
+    // mirrors that by always issuing the delete-through hook even when
+    // the entries Vec missed (proxy storage may still own the binding).
+    if !dict.dict_storage_proxy.is_null() {
+        if !hit {
+            // Probe storage so we report whether anything was actually
+            // removed; PyPy raises KeyError when neither side knows the
+            // key.
+            if maybe_lookup_dict_storage(dict.dict_storage_proxy, key).is_some() {
+                hit = true;
+            }
+        }
+        maybe_sync_dict_storage_delete(dict.dict_storage_proxy, key);
+    }
+    hit
+}
+
 /// Get the number of entries.
+///
+/// Storage-authoritative for str keys when proxy is attached:
+/// returns the storage's str-key count plus any non-str-keyed
+/// `entries` Vec slots (storage is str-keyed by construction).  This
+/// avoids the stale-cache double-count `dict_storage_to_dict` would
+/// otherwise produce when a STORE_GLOBAL through the shared storage
+/// replaces a pre-existing entry — the entries Vec might still hold
+/// the old version, but storage owns the live count.
+///
+/// PyPy parity: `pypy/interpreter/module.py:77 Module.getdict()`
+/// returns the live `W_DictMultiObject`; pyre's split arrangement
+/// reproduces that view by treating storage as the source of truth
+/// for the keys it represents.
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
-    (*(obj as *const W_DictObject)).len
+    let dict = &*(obj as *const W_DictObject);
+    if dict.dict_storage_proxy.is_null() {
+        return dict.len;
+    }
+    let storage_items = maybe_items_dict_storage(dict.dict_storage_proxy);
+    let entries = &*dict.entries;
+    let non_str = entries.iter().filter(|(k, _)| !crate::is_str(*k)).count();
+    storage_items.len() + non_str
 }
 
 /// Iterate over all (key, value) pairs without type assumptions.
+///
+/// Storage-authoritative for str keys when proxy is attached: emits
+/// the storage's str-keyed entries first, then any non-str-keyed
+/// `entries` Vec slots.  Stale str entries cached in the entries Vec
+/// (e.g. `dict_storage_to_dict` snapshot taken before a STORE_GLOBAL
+/// on the shared storage) are dropped in favour of the storage's
+/// live values.
 pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     let dict = &*(obj as *const W_DictObject);
-    (*dict.entries).clone()
+    let entries = &*dict.entries;
+    if dict.dict_storage_proxy.is_null() {
+        return entries.clone();
+    }
+    let mut out: Vec<(PyObjectRef, PyObjectRef)> =
+        maybe_items_dict_storage(dict.dict_storage_proxy)
+            .into_iter()
+            .map(|(name, value)| (crate::w_str_new(&name), value))
+            .collect();
+    for &(k, v) in entries.iter() {
+        if !crate::is_str(k) {
+            out.push((k, v));
+        }
+    }
+    out
 }
 
 /// Iterate over (key_str, value) pairs. Keys must be str objects.
+///
+/// Storage-authoritative for str keys when proxy is attached;
+/// non-str entries Vec slots are filtered out per the str-keyed
+/// signature.
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
     let dict = &*(obj as *const W_DictObject);
+    if !dict.dict_storage_proxy.is_null() {
+        return maybe_items_dict_storage(dict.dict_storage_proxy);
+    }
     let entries = &*dict.entries;
     entries
         .iter()
+        .filter(|(k, _)| crate::is_str(*k))
         .map(|&(k, v)| (crate::w_str_get_value(k).to_string(), v))
         .collect()
 }

@@ -1183,10 +1183,14 @@ impl Optimization for OptVirtualize {
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
                 self.optimize_setarrayitem_gc(op, ctx)
             }
+            // virtualize.py:289-296 — GETARRAYITEM_GC_R/F + the PURE
+            // variants alias `optimize_GETARRAYITEM_GC_I` (the upstream
+            // comment notes the operations are not completely
+            // equivalent — `GETARRAYITEM_GC_PURE` is `is_always_pure()`
+            // — but the OptVirtualize dispatch is the same).
             OpCode::GetarrayitemGcI
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF
-            // virtualize.py:294-296: GETARRAYITEM_GC_PURE aliases
             | OpCode::GetarrayitemGcPureI
             | OpCode::GetarrayitemGcPureR
             | OpCode::GetarrayitemGcPureF

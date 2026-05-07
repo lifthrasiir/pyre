@@ -2749,17 +2749,16 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
-/// PyPy-compatible lookup that returns `None` instead of raising `KeyError`.
-pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Option<PyObjectRef> {
+/// `pypy/interpreter/baseobjspace.py:870 finditem` — return the value
+/// for `key` in `obj`, or `None` if absent.  PyPy catches only the
+/// `KeyError` arm and re-raises any other `OperationError`; in Rust
+/// the re-raise surfaces as `Result::Err`, the absent case as
+/// `Ok(None)`, and a hit as `Ok(Some(value))`.
+pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     match getitem(obj, index) {
-        Ok(value) => Some(value),
-        Err(err) => {
-            if err.kind == crate::PyErrorKind::KeyError {
-                None
-            } else {
-                panic!("space.finditem: unexpected {err:?}");
-            }
-        }
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind == crate::PyErrorKind::KeyError => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -2861,8 +2860,8 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
     }
 }
 
-/// PyPy-compatible string-keyed item lookup that returns `None` on miss.
-pub fn finditem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+/// String-keyed `finditem` shorthand: `space.finditem_str(w_obj, key)`.
+pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, PyError> {
     finditem(obj, w_str_new(key))
 }
 
@@ -2957,13 +2956,17 @@ pub fn len(obj: PyObjectRef) -> PyResult {
                 pyre_object::bytesobject::bytes_like_len(obj) as i64
             ))
         } else if is_instance(obj) {
-            // Instance __len__ — descroperation.py len → space.lookup(obj, '__len__')
+            // descroperation.py:294-298 `_len` — `space.lookup(w_obj,
+            // '__len__')` then `space.get_and_call_function(w_descr,
+            // w_obj)`.  PyPy `get_and_call_function` raises on user
+            // exception; pyre's `call_function` stashes errors as PY_NULL.
+            // Use `call_and_check` so user-raised exceptions propagate.
             if let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__len__") {
-                return Ok(crate::call_function(method, &[obj]));
+                return crate::builtins::call_and_check(method, &[obj]);
             }
             // Per-instance __len__ via the unified getattr path (live dict + ATTR_TABLE).
             if let Ok(method) = getattr(obj, "__len__") {
-                return Ok(crate::call_function(method, &[obj]));
+                return crate::builtins::call_and_check(method, &[obj]);
             }
             Err(PyError::type_error(format!(
                 "object of type '{}' has no len()",
@@ -3305,17 +3308,35 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
         }
     }
 
-    // Module objects: look up in module namespace
-    // PyPy: space.getattr(w_module, w_name) → Module.getdictvalue(space, name)
+    // Module objects: look up in module namespace.
+    // PyPy `space.getattr(w_module, w_name) → Module.getdictvalue(space,
+    // name)` (`pypy/interpreter/module.py:Module.getdictvalue`
+    // inherited from `baseobjspace.py:45-48 W_Root.getdictvalue`):
+    //
+    //     w_dict = self.getdict(space)        # module.py:77 → self.w_dict
+    //     if w_dict is not None:
+    //         return space.finditem_str(w_dict, attr)
+    //     return None
+    //
+    // Routing through `space.finditem_str` (rather than reading the
+    // backing storage directly) gives dict subclass `__getitem__`
+    // overrides their PyPy chance to fire on the user-supplied
+    // `__builtins__` aliasing case (`moduledef.py:102-103
+    // Module(space, None, w_builtin)`), and routes through the
+    // storage-authoritative read path so transient W_DictObject
+    // snapshots can't shadow the live storage state.  The Result-
+    // bearing variant propagates non-KeyError errors from subclass
+    // overrides (`baseobjspace.py:870 finditem` re-raise).
     unsafe {
         if is_module(obj) {
             if name == "__dict__" {
-                let ns_ptr = w_module_get_dict_ptr(obj) as *const crate::DictStorage;
-                return Ok(dict_storage_to_dict(ns_ptr));
+                // module.py:20 — `Module.getdict(space)` returns
+                // `self.w_dict`.  Always non-null after construction.
+                return Ok(pyre_object::w_module_get_w_dict(obj));
             }
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !ns_ptr.is_null() {
-                if let Some(&value) = (*ns_ptr).get(name) {
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                if let Some(value) = finditem_str(w_dict, name)? {
                     if !value.is_null() {
                         return Ok(value);
                     }
@@ -4556,13 +4577,26 @@ pub fn setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     // Mirrors the `__setattr__` entry that `register_proxy_typedef_dict`
     // installs on the proxy types: force the receiver, then delegate.
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
-    // Module objects: store directly in the module namespace so `sys.ps1 = ...`
-    // and similar interactive mutations are visible through module getattr/import.
+    // Module objects: PyPy `module.py:Module` does not override
+    // `descr__setattr__`, so the call falls through to W_Root's
+    // `setdictvalue` (`baseobjspace.py:51-56`):
+    //
+    //     w_dict = self.getdict(space)
+    //     if w_dict is not None:
+    //         space.setitem_str(w_dict, attr, w_value)
+    //
+    // `space.setitem_str` is the generic dispatch: for an exact
+    // `W_DictMultiObject` it goes direct, but for a dict subclass
+    // (`moduledef.py:102-103` user-supplied `__builtins__`) it
+    // dispatches through the subclass's `__setitem__`.  pyre's
+    // `setitem` mirrors that — `is_dict(obj)` writes
+    // entries+storage in lock-step, `is_instance(obj)` looks up
+    // `__setitem__` in the MRO and calls it.
     unsafe {
         if is_module(obj) {
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !ns_ptr.is_null() {
-                crate::dict_storage_store(&mut *ns_ptr, name, value);
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                setitem(w_dict, w_str_new(name), value)?;
                 return Ok(w_none());
             }
         }
@@ -4690,12 +4724,45 @@ pub fn delattr(obj: PyObjectRef, name: &str) -> PyResult {
     // (matches the `__delattr__` entry installed by
     // `register_proxy_typedef_dict`).
     let obj = crate::module::_weakref::interp_weakref::force(obj)?;
+    // Module objects: PyPy `module.py:Module` does not override
+    // `descr__delattr__`, so the call falls through to W_Root's
+    // `deldictvalue` (`baseobjspace.py:58-67`):
+    //
+    //     w_dict = self.getdict(space)
+    //     if w_dict is not None:
+    //         try: space.delitem(w_dict, space.newtext(attr))
+    //         except KeyError: ...
+    //
+    // `space.delitem` is the generic dispatch: exact W_DictObject
+    // goes direct, dict subclass (moduledef.py:102-103
+    // user-supplied `__builtins__`) routes through the subclass's
+    // `__delitem__`.  KeyError is swallowed (returning False from
+    // `deldictvalue`); pyre falls through to `raiseattrerror` at
+    // the end of the function for the same observable behaviour.
+    //
+    //     def deldictvalue(self, space, attr):
+    //         w_dict = self.getdict(space)
+    //         if w_dict is not None:
+    //             try:
+    //                 space.delitem(w_dict, space.newtext(attr))
+    //                 return True
+    //             except OperationError as ex:
+    //                 if not ex.match(space, space.w_KeyError):
+    //                     raise
+    //         return False
     unsafe {
         if is_module(obj) {
-            let ns_ptr = w_module_get_dict_ptr(obj) as *mut crate::DictStorage;
-            if !ns_ptr.is_null() {
-                crate::dict_storage_store(&mut *ns_ptr, name, PY_NULL);
-                return Ok(w_none());
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                match delitem(w_dict, w_str_new(name)) {
+                    Ok(()) => return Ok(w_none()),
+                    Err(err) if err.kind == crate::PyErrorKind::KeyError => {
+                        // descroperation.py descr__delattr__: deldictvalue
+                        // returning False raises AttributeError immediately.
+                        return Err(raiseattrerror(obj, name));
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
     }
@@ -5053,10 +5120,174 @@ pub fn unpackiterable(
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let w_iterator = iter(w_iterable)?;
     if expected_length == -1 {
+        // baseobjspace.py:989-993 — generator fast path.  PyPy comments
+        // (`generator.py:322 "This is a hack for performance"`) flag this
+        // as an optimization, but the structural difference from the
+        // generic next-loop is observable: `unpack_into` runs each yield
+        // through the same suspended frame without the per-iteration
+        // PyTypeObject/__next__ slot lookup, and uses a private
+        // `_invoke_execute_frame(space.w_None)` instead of `space.next`.
+        // Port both branches.
+        if unsafe { pyre_object::generatorobject::is_generator(w_iterator) } {
+            let mut lst_w: Vec<PyObjectRef> = Vec::new();
+            generator_unpack_into(w_iterator, &mut lst_w)?;
+            return Ok(lst_w);
+        }
         _unpackiterable_unknown_length(w_iterator, w_iterable)
     } else {
         // baseobjspace.py:996-998 — known-length path with shape validation.
         _unpackiterable_known_length_jitlook(w_iterator, expected_length as usize)
+    }
+}
+
+/// pypy/interpreter/baseobjspace.py:368-372 `iterator_greenkey`.
+///
+/// ```python
+/// def iterator_greenkey(self, space):
+///     """ Return something that can be used as a green key in jit
+///     drivers that iterate over self. by default, it's just the type
+///     of self, but custom iterators should override it. """
+///     return space.type(self)
+/// ```
+///
+/// Default implementation returning `space.type(w_iterable)`.  Pyre's
+/// W_Root subclasses don't carry per-type overrides yet, so every
+/// caller hits this default — matching PyPy's
+/// `baseobjspace.py:2099-2103 ObjSpace.iterator_greenkey` after the
+/// trivial `w_iterable.iterator_greenkey(self)` indirection.
+pub fn iterator_greenkey(w_iterable: PyObjectRef) -> PyObjectRef {
+    if w_iterable.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    crate::typedef::r#type(w_iterable).unwrap_or(pyre_object::PY_NULL)
+}
+
+/// pypy/interpreter/baseobjspace.py:1010 `unpackiterable_driver`
+/// JitDriver merge-point hint.
+///
+/// PyPy declares `unpackiterable_driver = JitDriver(greens=['greenkey'],
+/// reds='auto', name='unpackiterable')` and calls
+/// `unpackiterable_driver.jit_merge_point(greenkey=greenkey)` once per
+/// loop turn so the JIT specialises the loop trace per
+/// `iterator_greenkey(w_iterator)` value.
+///
+/// Pyre's metainterp drives compilation from bytecode-level
+/// `BC_JIT_MERGE_POINT` opcodes; an in-Rust `_unpackiterable_unknown_length`
+/// is residual-call'd from the JIT'd interpreter loop, so the merge-point
+/// inside this body is not visible to the live tracer.  The structural
+/// port keeps the greenkey computation + the call so the per-greenkey
+/// dispatch contract is documented at the call site; the runtime hook
+/// is a no-op until the metainterp grows a Rust-callee merge-point
+/// observer.
+#[inline]
+fn unpackiterable_driver_jit_merge_point(_greenkey: PyObjectRef) {
+    // No-op: see doc comment above.
+}
+
+/// pypy/interpreter/generator.py:317-343 `_create_unpack_into` body.
+///
+/// ```python
+/// def unpack_into(self, results):
+///     """This is a hack for performance: runs the generator and
+///     collects all produced items in a list."""
+///     frame = self.frame
+///     if frame is None:    # already finished
+///         return
+///     pycode = self.pycode
+///     while True:
+///         jitdriver.jit_merge_point(pycode=pycode)
+///         space = self.space
+///         try:
+///             w_result = self._invoke_execute_frame(space.w_None)
+///         except OperationError as e:
+///             if not e.match(space, space.w_StopIteration):
+///                 raise
+///             break
+///         if frame.frame_finished_execution:
+///             self.frame_is_finished()
+///             break
+///         results.append(w_result)     # YIELDed
+/// ```
+///
+/// Pyre stores the suspended PyFrame on the W_GeneratorObject as
+/// `frame_ptr`; an exhausted generator has either `exhausted=true` or a
+/// null frame_ptr.  `_invoke_execute_frame(space.w_None)` corresponds to
+/// the frame's own `execute_frame(None, None)` resume — same routing as
+/// `generator_send_ex` for the `already_started=true, w_arg=None` path.
+fn generator_unpack_into(
+    gen_obj: PyObjectRef,
+    results: &mut Vec<PyObjectRef>,
+) -> Result<(), crate::PyError> {
+    use pyre_object::generatorobject::*;
+    unsafe {
+        // generator.py:325-327 — `frame is None: return`.
+        if w_generator_is_running(gen_obj) {
+            return Err(PyError::value_error("generator already executing"));
+        }
+        if w_generator_is_exhausted(gen_obj) {
+            return Ok(());
+        }
+        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+        if frame_ptr.is_null() {
+            w_generator_set_exhausted(gen_obj);
+            return Ok(());
+        }
+        let frame = &mut *frame_ptr;
+        // generator.py:328 `pycode = self.pycode` — pyre stashes pycode on
+        // the suspended frame; expose it as the JitDriver greenkey.
+        let pycode = frame.pycode as PyObjectRef;
+        loop {
+            // generator.py:330 `jitdriver.jit_merge_point(pycode=pycode)`.
+            unpackiterable_driver_jit_merge_point(pycode);
+            // generator.py:331 `space = self.space`.
+            // generator.py:332-336 `try: w_result =
+            //   self._invoke_execute_frame(space.w_None)`.
+            //
+            // `_invoke_execute_frame(w_arg_or_err)` calls
+            // `frame.execute_frame(w_arg_or_err)` (generator.py:131),
+            // which feeds `w_arg_or_err` to `resume_execute_frame` —
+            // pushing it onto the YIELD result slot.  unpack_into
+            // always passes `space.w_None`, both for the never-started
+            // case (frame.last_instr == -1: PyPy
+            // `resume_execute_frame` skips the push and returns
+            // `r_uint(0)`) and for every subsequent resume.  Pyre's
+            // earlier `frame.execute_frame(None, None)` skipped the
+            // push entirely, so `yield`-expressions that bind the
+            // resume value (e.g. `x = yield`) would observe stale
+            // stack on the second iteration.
+            w_generator_set_started(gen_obj);
+            w_generator_set_running(gen_obj, true);
+            let result = frame.execute_frame(Some(pyre_object::w_none()), None);
+            w_generator_set_running(gen_obj, false);
+            match result {
+                // generator.py:132-138 `_invoke_execute_frame`'s
+                // `finally: self.frame_is_finished()` runs before the
+                // OperationError reaches the unpack_into try/except,
+                // so by the time PyPy's `if e.match(StopIteration):
+                // break` fires the generator is already marked
+                // finished.  Pyre's inline `frame.execute_frame` path
+                // skips that finally block, so mirror it explicitly.
+                Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                    w_generator_set_exhausted(gen_obj);
+                    break;
+                }
+                Err(e) => {
+                    w_generator_set_exhausted(gen_obj);
+                    return Err(e);
+                }
+                Ok(w_result) => {
+                    // generator.py:339-341 — frame finished ⇒ RETURNed,
+                    // mark exhausted and stop without appending.
+                    if frame.frame_finished_execution {
+                        w_generator_set_exhausted(gen_obj);
+                        break;
+                    }
+                    // generator.py:342 `results.append(w_result)`.
+                    results.push(w_result);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -5081,17 +5312,6 @@ pub fn unpackiterable(
 ///         items.append(w_item)
 ///     return items
 /// ```
-///
-/// PRE-EXISTING-ADAPTATION (residual): the `unpackiterable_driver`
-/// JitDriver merge-point and `iterator_greenkey` are Pyre-side
-/// JIT-tracing scaffolding that pyre handles through its own dispatch
-/// loop — no observable semantics change; performance contribution
-/// folds into the regular trace.  The PyPy `is_generator(w_iterator) →
-/// GeneratorIterator.unpack_into` fast path at baseobjspace.py:988-994
-/// is also a perf hack (generator.py:322-343 says "This is a hack for
-/// performance"); the body is functionally identical to the next()
-/// loop here, so a port would buy nothing for a non-translated
-/// runtime.
 fn _unpackiterable_unknown_length(
     w_iterator: PyObjectRef,
     w_iterable: PyObjectRef,
@@ -5105,7 +5325,12 @@ fn _unpackiterable_unknown_length(
     if hint > 0 {
         let _ = items.try_reserve_exact(hint as usize);
     }
+    // baseobjspace.py:1010 `greenkey = self.iterator_greenkey(w_iterator)`.
+    let greenkey = iterator_greenkey(w_iterator);
     loop {
+        // baseobjspace.py:1012
+        // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
+        unpackiterable_driver_jit_merge_point(greenkey);
         match next(w_iterator) {
             Ok(w_item) => items.push(w_item),
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
@@ -5268,14 +5493,11 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 ///   4. absent / not Module-or-dict ⇒ build a default empty Module
 ///      with only `None=w_None` defined — matches `moduledef.py:106-108`
 ///      `builtin = module.Module(space, None); space.setitem(builtin
-///      .w_dict, 'None', w_None); return builtin`.  Pyre previously
-///      fell back to the EC's full builtins, exposing strictly more
-///      names than PyPy in `exec("...", {"__builtins__": 42})`-style
-///      cases.
+///      .w_dict, 'None', w_None); return builtin`.
 ///
-/// Returns the `*mut DictStorage` that pyre's interpreter consults for
-/// `LOAD_GLOBAL`'s builtins fallback.  The companion `pick_builtin_w`
-/// returns the picked `PyObjectRef` (Module wrapping the dict, or the
+/// Returns the `*mut DictStorage` consulted by the `LOAD_GLOBAL` builtins
+/// fast path.  `pick_builtin_w` is the companion that returns the
+/// `PyObjectRef` (Module wrapping the dict, the picked Module, or the
 /// default Module) for callers that need the Module form
 /// (`frame.get_builtin()`, `exec`'s `__builtins__` setdefault).
 pub fn pick_builtin(
@@ -5285,29 +5507,12 @@ pub fn pick_builtin(
     pick_builtin_pair(w_globals, exec_ctx).0
 }
 
-/// Companion to `pick_builtin` returning the picked `PyObjectRef` — the
-/// `Module` (PyPy `space.builtin`, the wrapping `Module(space, None,
-/// w_builtin)`, or the empty default Module).  Used by
-/// `frame.get_builtin()` and by `exec()` when seeding the
-/// `__builtins__` global.
+/// Companion to `pick_builtin` returning the `PyObjectRef` Module identity.
 pub fn pick_builtin_w(
     w_globals: *mut crate::DictStorage,
     exec_ctx: *const crate::PyExecutionContext,
 ) -> PyObjectRef {
     pick_builtin_pair(w_globals, exec_ctx).1
-}
-
-/// Allocate the `moduledef.py:106-108` default Module — empty backing
-/// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
-/// `Module.__init__`; pyre's `w_module_new` requires a `&str` so use
-/// the empty string as the anonymous-name sentinel).
-fn build_default_pick_builtin_module() -> (*mut crate::DictStorage, PyObjectRef) {
-    let mut ns = Box::new(crate::DictStorage::new());
-    crate::dict_storage_store(&mut ns, "None", unsafe { pyre_object::w_none() });
-    ns.fix_ptr();
-    let storage: *mut crate::DictStorage = Box::into_raw(ns);
-    let w_builtin = pyre_object::w_module_new("", storage as *mut u8);
-    (storage, w_builtin)
 }
 
 fn pick_builtin_pair(
@@ -5329,9 +5534,7 @@ fn pick_builtin_pair(
                 // moduledef.py:104 `isinstance(w_builtin, module.Module)`.
                 if unsafe { pyre_object::is_module(w_builtin) } {
                     let storage = unsafe { pyre_object::w_module_get_dict_ptr(w_builtin) };
-                    if !storage.is_null() {
-                        return (storage as *mut crate::DictStorage, w_builtin);
-                    }
+                    return (storage as *mut crate::DictStorage, w_builtin);
                 }
                 // moduledef.py:102-103 `space.isinstance_w(w_builtin, w_dict)`.
                 let backing = crate::type_methods::resolve_dict_backing(w_builtin);
@@ -5362,10 +5565,16 @@ fn pick_builtin_pair(
                         storage = leaked as *mut u8;
                     }
                     // moduledef.py:103 `return module.Module(space, None,
-                    // w_builtin)` — wrap a fresh Module per call so
-                    // `frame.get_builtin()` returns a Module identity (PyPy
-                    // contract) instead of the raw dict.
-                    let w_module = pyre_object::w_module_new("", storage);
+                    // w_builtin)` — PyPy stores the caller's object
+                    // (whether `W_DictMultiObject` or a dict subclass
+                    // instance) directly as `module.w_dict`, so
+                    // `space.finditem_str(module.w_dict, name)`
+                    // dispatches through subclass `__getitem__`
+                    // overrides and `f_builtins`/`module.__dict__`
+                    // surface the original identity.  `module.dict`
+                    // keeps the storage proxy on the backing for the
+                    // storage-keyed `LOAD_GLOBAL` fast path.
+                    let w_module = pyre_object::w_module_new_aliasing_dict("", storage, w_builtin);
                     return (storage as *mut crate::DictStorage, w_module);
                 }
                 // Fall through — `__builtins__` is not Module/dict (e.g.
@@ -5379,6 +5588,19 @@ fn pick_builtin_pair(
     // (b) `__builtins__` is absent from globals, or (c) `__builtins__`
     // is not Module/dict.
     build_default_pick_builtin_module()
+}
+
+/// Allocate the `moduledef.py:106-108` default Module — empty backing
+/// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
+/// `Module.__init__`; pyre's `w_module_new` requires a `&str` so use
+/// the empty string as the anonymous-name sentinel).
+fn build_default_pick_builtin_module() -> (*mut crate::DictStorage, PyObjectRef) {
+    let mut ns = Box::new(crate::DictStorage::new());
+    crate::dict_storage_store(&mut ns, "None", unsafe { pyre_object::w_none() });
+    ns.fix_ptr();
+    let storage: *mut crate::DictStorage = Box::into_raw(ns);
+    let w_builtin = pyre_object::w_module_new("", storage as *mut u8);
+    (storage, w_builtin)
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053
@@ -7013,6 +7235,19 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
                 }
                 return Ok(());
             }
+        }
+        // entries Vec missed.  When the dict has a storage proxy
+        // (Module.__dict__ over its backing DictStorage), the binding
+        // may live only in the proxy storage; PyPy's
+        // W_DictMultiObject `dictobject.py:descr_delitem` would
+        // remove either way.  Mirrors `w_dict_delitem_str`'s
+        // storage-fallback shape for str-keyed deletes.
+        if is_str(key) {
+            return if dictobject::w_dict_delitem_str(obj, w_str_get_value(key)) {
+                Ok(())
+            } else {
+                Err(PyError::key_error("KeyError"))
+            };
         }
     }
     Err(PyError::key_error("KeyError"))

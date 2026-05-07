@@ -96,23 +96,23 @@ pub struct PyFrame {
     pub w_yielding_from: PyObjectRef,
     /// PyPy: `f_backref = jit.vref_None`.
     pub f_backref: *mut PyFrame,
-    /// pyframe.py:90 / pyframe.py:115-116 — `self.builtin = space.builtin
+    /// pyframe.py:115-116 — `self.builtin = space.builtin
     /// .pick_builtin(w_globals)` (gated under `honor__builtins__` upstream;
     /// pyre runs as if the option were always on, matching CPython's
     /// unconditional `__builtins__` honoring).  Cached at frame creation
     /// from `globals['__builtins__']` and consulted by LOAD_GLOBAL's
     /// builtins fallback (`pyopcode.py:918-927`).  PyPy stores this as a
-    /// `Module` reference; pyre keeps a `*mut DictStorage` because (a)
-    /// `EC.builtins` is already storage-shaped, not a `Module`, and (b)
-    /// `frame.w_globals` follows the same `*mut DictStorage` convention,
-    /// so the LOAD_GLOBAL fallback path is one `dict_storage_get` call.
+    /// `Module` reference; pyre keeps a `*mut DictStorage` for the fast
+    /// storage-keyed `dict_storage_get` LOAD_GLOBAL fallback.  The
+    /// companion `w_builtin` carries the Module identity.
     pub builtin: *mut DictStorage,
-    /// Companion to `builtin`: the picked `PyObjectRef` (Module or user
-    /// dict) returned by `pick_builtin_w(w_globals)`.  This mirrors PyPy
-    /// `frame.builtin`'s identity — `frame.get_builtin()` returns this
-    /// directly so callers (e.g. `exec` 's `setdefault('__builtins__',
-    /// self.get_builtin())` at `pyopcode.py:773-774`) see the picked
-    /// object, not the EC's default builtin module.
+    /// Companion to `builtin`: the picked `PyObjectRef` (Module wrapping
+    /// the dict, or the default Module) returned by
+    /// `pick_builtin_w(w_globals)`.  Mirrors PyPy `frame.builtin`'s
+    /// identity — `frame.get_builtin()` returns this directly so callers
+    /// (`exec`'s `setdefault('__builtins__', self.get_builtin())` at
+    /// `pyopcode.py:773-774`) see the picked Module, not the EC's
+    /// default builtin.
     pub w_builtin: PyObjectRef,
 }
 
@@ -480,6 +480,10 @@ pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 /// chained recursive callees may have a nursery-allocated parent frame
 /// reachable through this pointer.
 pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
+
+/// Byte offset of `builtin` in `PyFrame` (the picked storage_ptr — the
+/// `*mut DictStorage` consulted by the LOAD_GLOBAL builtins fast path).
+pub const PYFRAME_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, builtin);
 
 /// Byte offset of `w_builtin` in `PyFrame` (the picked builtin Module).
 /// Read by the descr GC walker so a collection survives across the
@@ -909,24 +913,16 @@ impl PyFrame {
         code: CodeObject,
         execution_context: Rc<PyExecutionContext>,
     ) -> Result<Box<Self>, crate::PyError> {
+        // `fresh_dict_storage` already seeds `__builtins__ = space
+        // .builtin` (PyPy `main.py:45 / Module.__init__` parity).  Just
+        // set `__name__` on top.
         let mut w_globals = Box::new(execution_context.fresh_dict_storage());
         w_globals.fix_ptr();
-        // Set __name__ — PyPy: Module.__init__ sets __name__ in w_dict
         crate::dict_storage_store(
             &mut w_globals,
             "__name__",
             pyre_object::w_str_new("__main__"),
         );
-        // pypy/interpreter/main.py:45 — `space.setitem(w_globals,
-        // '__builtins__', space.builtin)` for top-level frame globals so
-        // `pick_builtin` sees the canonical builtins Module.  Without
-        // this, `pick_builtin` falls back to the empty default
-        // (`moduledef.py:106-108`) and module-entry code can't see
-        // `len`, `print`, …
-        let w_builtin = execution_context.get_builtin();
-        if !w_builtin.is_null() {
-            crate::dict_storage_store(&mut w_globals, "__builtins__", w_builtin);
-        }
         let w_globals = Box::into_raw(w_globals);
         let code_ptr = Box::into_raw(Box::new(code));
         let w_code = crate::w_code_new(code_ptr as *const ());
@@ -1419,11 +1415,10 @@ impl PyFrame {
     }
 
     /// pyframe.py:216-220 `get_builtin` — returns `self.builtin` (the
-    /// per-frame picked builtin Module / dict, set at frame creation by
-    /// `pick_builtin(w_globals)`).  Pyre stashes the picked PyObjectRef
-    /// on `w_builtin`; falls back to the EC's default builtin when the
-    /// frame was constructed without globals (e.g. `PyFrame::new_minimal`
-    /// stub frames).
+    /// per-frame picked builtin Module, set at frame creation by
+    /// `pick_builtin(w_globals)`).  Falls back to the EC's default
+    /// builtin when the frame was constructed without globals (e.g.
+    /// `PyFrame::new_minimal` stub frames).
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
         if !self.w_builtin.is_null() {
@@ -1441,10 +1436,20 @@ impl PyFrame {
         self.f_backref
     }
 
-    /// PyPy-compatible `fget_f_builtins`.
+    /// pyframe.py:768-771 `fget_f_builtins` — `self.get_builtin()
+    /// .getdict(space)`, which `module.py:20` defines as `self.w_dict`.
+    /// Pyre's `w_module_new` constructs `w_dict` at allocation time so
+    /// every Module surfaces a stable, non-null identity here.
     #[inline]
     pub fn fget_f_builtins(&self) -> PyObjectRef {
-        self.get_builtin()
+        let w_builtin = self.get_builtin();
+        if w_builtin.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        if unsafe { pyre_object::is_module(w_builtin) } {
+            return unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        }
+        w_builtin
     }
 
     /// PyPy-compatible `fget_f_back`.

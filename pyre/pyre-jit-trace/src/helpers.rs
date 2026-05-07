@@ -693,8 +693,15 @@ mod tests {
 
     #[test]
     fn test_callable_call_helper_dispatches_builtin_without_trace_side_branching() {
-        let namespace = PyExecutionContext::default().fresh_dict_storage();
-        let abs = *namespace.get("abs").expect("abs builtin must exist");
+        // `fresh_dict_storage` seeds only `__builtins__`; individual
+        // names like `abs` resolve via
+        // `frame.get_builtin().getdictvalue(name)` (`pyopcode.py:921`).
+        // Pull `abs` directly out of the EC's builtins storage to
+        // mirror the same resolution path the interpreter follows.
+        let ctx = PyExecutionContext::default();
+        let storage_ptr = ctx.builtins_storage_ptr();
+        let abs = unsafe { pyre_interpreter::dict_storage_get(&*storage_ptr, "abs") }
+            .expect("abs builtin must exist");
         let result = jit_call_callable_1(0, abs as i64, w_int_new(-11) as i64);
         unsafe {
             assert_eq!(w_int_get_value(result as PyObjectRef), 11);

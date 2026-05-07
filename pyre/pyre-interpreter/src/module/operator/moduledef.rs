@@ -291,11 +291,36 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "length_hint",
+        // pypy/module/operator/interp_operator.py:213-219
+        //   @unwrap_spec(default='index')
+        //   def length_hint(space, w_iterable, default=0):
+        //       return space.newint(space.length_hint(w_iterable, default))
+        // — `default` defaults to 0, must be unwrapped via `__index__`.
+        // Pyre routes through `crate::baseobjspace::length_hint` (the
+        // `space.length_hint` port), so `__length_hint__` priority +
+        // negative-result ValueError + default fallback all match PyPy.
         make_builtin_function("length_hint", |args| {
-            if args.is_empty() {
-                return Ok(w_int_new(0));
+            // PyPy gateway signature `length_hint(space, w_iterable,
+            // default=0)` (interp_operator.py:213) accepts exactly 1 or
+            // 2 application-level arguments.  Pyre's varargs entrypoint
+            // must reject overflow itself — the gateway layer that
+            // would normally enforce this has not been ported yet.
+            if args.is_empty() || args.len() > 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "length_hint expected 1 or 2 arguments, got {}",
+                    args.len()
+                )));
             }
-            crate::baseobjspace::len(args[0]).or(Ok(w_int_new(0)))
+            let w_iterable = args[0];
+            let default = if let Some(&w_default) = args.get(1) {
+                // unwrap_spec='index' — apply __index__ chain via space_index.
+                let w_index = crate::baseobjspace::space_index(w_default)?;
+                crate::baseobjspace::int_w(w_index)?
+            } else {
+                0
+            };
+            let n = crate::baseobjspace::length_hint(w_iterable, default)?;
+            Ok(w_int_new(n))
         }),
     );
 }

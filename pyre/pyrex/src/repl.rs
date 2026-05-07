@@ -61,6 +61,12 @@ pub fn run_repl(quiet: bool) {
     let namespace = Box::into_raw(namespace);
 
     let main_module = pyre_object::moduleobject::w_module_new("__main__", namespace as *mut u8);
+    // Bind storage→W_DictObject back-mirror so REPL STORE_NAME writes
+    // surface in `__main__.__dict__`'s keys/items/lookups (PyPy
+    // `module.py:77 Module.getdict()` parity).
+    unsafe {
+        pyre_interpreter::bind_module_back_mirror(namespace, main_module);
+    }
     importing::set_sys_module("__main__", main_module);
 
     let sys_module = match importing::importhook(
@@ -354,8 +360,15 @@ mod tests {
         let mut namespace = Box::new(pyre_interpreter::DictStorage::default());
         namespace.fix_ptr();
         pyre_interpreter::dict_storage_store(&mut namespace, "ps1", pyre_object::w_str_new("py> "));
-        let sys_module =
-            pyre_object::moduleobject::w_module_new("sys", Box::into_raw(namespace) as *mut u8);
+        let ns_ptr = Box::into_raw(namespace);
+        let sys_module = pyre_object::moduleobject::w_module_new("sys", ns_ptr as *mut u8);
+        // bind_module_back_mirror pre-populates the W_DictObject entries
+        // Vec from the storage so getattr → finditem_str(w_dict, ...)
+        // sees the pre-existing `ps1` binding without depending on the
+        // storage-proxy lookup hook (not registered in this test).
+        unsafe {
+            pyre_interpreter::bind_module_back_mirror(ns_ptr, sys_module);
+        }
 
         assert_eq!(read_prompt(sys_module, "ps1").as_deref(), Some("py> "));
     }
