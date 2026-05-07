@@ -65,12 +65,12 @@ pub struct VirtualizableConfig {
 
 /// JitVirtualRef field slot indices.
 ///
-/// PyPy stores struct fields densely by `fielddescr.get_index()`. Keep the
-/// virtual JitVirtualRef fields in the same slot order and let the descriptor
-/// object carry offset/type metadata.
-const VREF_TYPE_TAG_FIELD_INDEX: u32 = 0;
-const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 1;
-const VREF_FORCED_FIELD_INDEX: u32 = 2;
+/// RPython virtualref.py: JitVirtualRef has two fields (virtual_token, forced).
+/// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE, not stored as
+/// a tracked field. Indices are dense (0-based), matching RPython's
+/// `heaptracker.all_fielddescrs()` which excludes typeptr.
+const VREF_VIRTUAL_TOKEN_FIELD_INDEX: u32 = 0;
+const VREF_FORCED_FIELD_INDEX: u32 = 1;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
@@ -1015,51 +1015,47 @@ impl OptVirtualize {
 
     /// Handle VirtualRefR / VirtualRefI.
     ///
-    /// Replace the VIRTUAL_REF operation with a virtual struct of type
-    /// JitVirtualRef. The struct has two fields:
-    /// - virtual_token (field index VREF_VIRTUAL_TOKEN): set to a ForceToken op
-    /// - forced (field index VREF_FORCED): set to NULL (constant 0)
+    /// virtualize.py:112-130 optimize_VIRTUAL_REF
     ///
-    /// This way the vref itself becomes virtual. If it never escapes, the
-    /// allocation is eliminated entirely. If it does escape, the forcing
-    /// mechanism emits the struct allocation + field writes.
+    /// Replace the VIRTUAL_REF operation with a virtual object of type
+    /// JitVirtualRef (via make_virtual → InstancePtrInfo / PtrInfo::Virtual).
+    /// Two tracked fields:
+    /// - virtual_token: set to a ForceToken op
+    /// - forced: set to CONST_NULL
+    /// The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
+    /// the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_descr: DescrRef = Arc::new(VRefSizeDescr);
 
-        // Emit a FORCE_TOKEN to capture the JIT frame address.
+        // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = Op::new(OpCode::ForceToken, &[]);
         let token_ref = ctx.emit_extra(ctx.current_pass_idx, token_op);
-
-        // The emitted ForceToken may reuse an OpRef index that previously
-        // had PtrInfo::Virtual attached (from an earlier NEW_WITH_VTABLE
-        // that was virtualized). Clear that to prevent accidental forcing
-        // of unrelated virtuals when the vref struct is forced.
         ctx.set_ptr_info(token_ref, PtrInfo::nonnull());
 
+        // virtualize.py:129: vrefvalue.setfield(descr_forced, newop, CONST_NULL)
         let null_ref = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
 
-        // RPython typeptr parity: type_tag is stored at offset 0, equivalent
-        // to the GC object header's typeptr that RPython sets automatically.
-        let type_tag_ref = ctx.emit_constant_int(crate::virtualref::VREF_TYPE_TAG as i64);
-
+        // virtualize.py:123-125: make_virtual(c_cls, newop, vref_descr)
+        // → InstancePtrInfo(descr, known_class, is_virtual=True)
+        let known_class = Some(majit_ir::GcRef(crate::virtualref::VREF_TYPE_TAG as usize));
         let fields = vec![
-            (VREF_TYPE_TAG_FIELD_INDEX, type_tag_ref),
             (VREF_VIRTUAL_TOKEN_FIELD_INDEX, token_ref),
             (VREF_FORCED_FIELD_INDEX, null_ref),
         ];
         let field_descrs = vec![
-            make_vref_field_descr(VREF_TYPE_TAG_FIELD_INDEX),
             make_vref_field_descr(VREF_VIRTUAL_TOKEN_FIELD_INDEX),
             make_vref_field_descr(VREF_FORCED_FIELD_INDEX),
         ];
-        let vinfo = VirtualStructInfo {
+        let vinfo = VirtualInfo {
             descr: vref_descr,
+            known_class,
+            ob_type_descr: None,
             fields,
             field_descrs,
             last_guard_pos: -1,
             cached_vinfo: std::cell::RefCell::new(None),
         };
-        ctx.set_ptr_info(op.pos, PtrInfo::VirtualStruct(vinfo));
+        ctx.set_ptr_info(op.pos, PtrInfo::Virtual(vinfo));
 
         OptimizationResult::Remove
     }
@@ -1113,7 +1109,7 @@ impl OptVirtualize {
                 if !info.is_virtual() {
                     return false;
                 }
-                if let PtrInfo::VirtualStruct(vinfo) = info {
+                if let PtrInfo::Virtual(vinfo) = info {
                     if !obj_is_null {
                         set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_ref);
                     }
@@ -1128,7 +1124,7 @@ impl OptVirtualize {
             // with_ptr_info_mut calls.
             let null_ref = ctx.emit_constant_ref(majit_ir::GcRef(0));
             ctx.with_ptr_info_mut(vref_ref, |info| {
-                if let PtrInfo::VirtualStruct(vinfo) = info {
+                if let PtrInfo::Virtual(vinfo) = info {
                     set_field(&mut vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX, null_ref);
                 }
             });
@@ -1188,7 +1184,7 @@ impl OptVirtualize {
         let vref = ctx.get_box_replacement(op.arg(1));
         // vref = getptrinfo(op.getarg(1)); if vref and vref.is_virtual():
         let (token_ref, forced_ref) = match ctx.peek_ptr_info_via_box(vref) {
-            Some(PtrInfo::VirtualStruct(vinfo)) => {
+            Some(PtrInfo::Virtual(vinfo)) => {
                 // tokenop = vref.getfield(vrefinfo.descr_virtual_token, None)
                 // if tokenop is None: return False
                 let tok = match get_field(&vinfo.fields, VREF_VIRTUAL_TOKEN_FIELD_INDEX) {
@@ -1763,7 +1759,6 @@ impl FieldDescr for VRefFieldDescr {
 
 fn make_vref_field_descr(index: u32) -> DescrRef {
     let (offset, field_type) = match index {
-        VREF_TYPE_TAG_FIELD_INDEX => (0, Type::Int),
         VREF_VIRTUAL_TOKEN_FIELD_INDEX => (8, Type::Int),
         VREF_FORCED_FIELD_INDEX => (16, Type::Ref),
         _ => panic!("invalid JitVirtualRef field slot {index}"),
@@ -1793,12 +1788,17 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
         std::mem::size_of::<crate::virtualref::JitVirtualRef>()
     }
     fn type_id(&self) -> u32 {
-        // virtualref.py — JIT_VIRTUAL_REF is a real GC type in RPython.
-        // pyre registers it via gc.register_type() at startup; the assigned
-        // id is stored in the global and returned here so the backend's
-        // alloc_nursery_typed() uses the correct GC type with proper
-        // gc_ptr_offsets for tracing the `forced` Ref field.
         crate::virtualref::vref_gc_type_id()
+    }
+    fn is_object(&self) -> bool {
+        true
+    }
+    fn vtable(&self) -> usize {
+        // virtualref.py:94-98: jit_virtual_ref_const_class — the vtable
+        // identity used by is_virtual_ref(). Pyre stores this as the
+        // VREF_TYPE_TAG magic value at offset 0. NEW_WITH_VTABLE writes
+        // it at allocation time, matching RPython's gc.new_with_vtable().
+        crate::virtualref::VREF_TYPE_TAG as usize
     }
     fn is_immutable(&self) -> bool {
         false
@@ -3405,11 +3405,11 @@ mod tests {
     #[test]
     fn test_virtual_ref_does_not_force_underlying_obj() {
         // p0 = new_with_vtable(descr=size1)   <- virtual
-        // vref = virtual_ref_r(p0, token)     <- virtual struct
+        // vref = virtual_ref_r(p0, token)     <- virtual (RPython: InstancePtrInfo)
         // call_n(vref)                         <- forces vref, NOT p0
         //
         // The key property: forcing the vref should NOT force the wrapped
-        // object p0. The vref struct's `forced` field is set to NULL (0)
+        // object p0. The vref's `forced` field is set to CONST_NULL
         // by optimize_virtual_ref, so p0 is not referenced in the vref fields.
         // p0 only appears in the original VirtualRefR args, which are discarded.
         let sd = size_descr(1);
@@ -3426,26 +3426,26 @@ mod tests {
 
         let result = run_pass(&ops);
 
-        // The vref struct is a VirtualStruct forced as New.
-        // p0 (NewWithVtable) should NOT appear because the vref's forced field
-        // is NULL, not p0.
+        // RPython parity: vref is a Virtual (InstancePtrInfo) forced as
+        // NewWithVtable. The only NewWithVtable should be the vref itself;
+        // p0 (the wrapped object) must NOT be forced.
         let new_vtable_count = result
             .iter()
             .filter(|o| o.opcode == OpCode::NewWithVtable)
             .count();
         assert_eq!(
             new_vtable_count,
-            0,
-            "the wrapped object p0 should NOT be forced; got ops: {:?}",
+            1,
+            "only the vref should be forced as NewWithVtable, not p0; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
 
-        // The vref struct itself is forced as New
+        // No New ops — the vref is no longer a VirtualStruct
         let new_count = result.iter().filter(|o| o.opcode == OpCode::New).count();
         assert_eq!(
             new_count,
-            1,
-            "only the vref struct should be allocated; got ops: {:?}",
+            0,
+            "no New should be emitted; got ops: {:?}",
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
     }
