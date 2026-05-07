@@ -394,6 +394,45 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     (builder, unwired)
 }
 
+/// Production-side blackhole builder for pyre's guard-failure resume
+/// path.  Wires the minimal pyre-compatible dispatch subset:
+/// `inline_call_pyre_nested/P`, byte-identical canonical control ops
+/// (`live/`, `loop_header/i`, `goto/L`, `catch_exception/L`,
+/// `jit_merge_point/cIRFIRF`), and pyre-u16 misc-family adapters.  Other
+/// bytes continue to fall through `BlackholeInterpreter::
+/// dispatch_step_with_fallback` to the legacy `dispatch_one` arms.
+///
+/// Why minimal install: pyre's runtime `JitCodeBuilder` emits
+/// vable / call / move / etc. opcodes whose payload format diverges
+/// from the canonical RPython `r`/`d` argcode contract decoded by the
+/// canonical handlers.  Two divergence axes block bulk routing:
+///   1. **Register width** — Sub-slice C.1 misc family widens to
+///      pyre-u16 variants; vable/residual_call families are still
+///      audited per family (Task #45 Stage 2 Slice 2.3 Sub-slice C).
+///   2. **Storage layout** — pyre's `vable_write_array_item`
+///      EmbeddedArray storage uses 2-level pointer indirection
+///      (`virtualizable.rs:2504`) that canonical
+///      `cpu.bh_setarrayitem_gc_r` single-indirection cannot bridge
+///      (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`).
+/// Sub-slice C.2.0 (`6a863779cdf`) wired `bh.cpu` via thread-local
+/// leaked `BackendImpl`, so the cpu-trait dispatch path is now
+/// available — the remaining blocker for vable canonical-routing is
+/// the storage layout mismatch.  Wiring the full canonical
+/// dispatch_table (`build_default_bh_builder()`) would still route
+/// every opcode through canonical handlers and produce wrong values
+/// (or panic) on the first vable encountered during resume.  The
+/// format unification is tracked as the `pipeline.insns` ↔
+/// `wellknown_bh_insns` table-unification epic (see
+/// `pyre-jit-trace/src/jitcode_dispatch.rs:5988-5996`).
+///
+/// The subset setup_insns table leaves all non-registered opcodes as
+/// placeholders or out-of-range entries.  Those paths converge on
+/// `dispatch_one`; registered bytes route through their wired handlers
+/// without re-entering `dispatch_one`.
+pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
+    majit_metainterp::blackhole::build_inline_call_only_bh_builder()
+}
+
 /// Strict-coverage variant of [`build_default_bh_builder_with_unwired_report`]
 /// — panics when any `insns` opname lacks a `bhimpl_*` handler.
 ///
@@ -498,6 +537,19 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
                     return None;
                 }
                 cursor += 1;
+            }
+            // PRE-EXISTING-ADAPTATION pseudo-argcode for the pyre-only
+            // `inline_call_pyre_nested` opname.  Payload (little-endian):
+            //   sub_idx u16 + num_args u16
+            //   + num_args × (kind u8, caller_src u16, callee_dst u16)
+            //   + return_i u16 + return_r u16 + return_f u16
+            // Total length: 4 + num_args*5 + 6 bytes.
+            'P' => {
+                cursor += 2;
+                let lo = *code.get(cursor)? as usize;
+                let hi = *code.get(cursor + 1)? as usize;
+                let num_args = lo | (hi << 8);
+                cursor += 2 + num_args * 5 + 6;
             }
             _ => return None,
         }
@@ -724,6 +776,20 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
                     'f' => ResolvedResult::Float { reg },
                     _ => return None,
                 });
+            }
+            // PRE-EXISTING-ADAPTATION: pyre `inline_call_pyre_nested/P`
+            // payload is opaque to the canonical operand-resolver — no
+            // matching `ResolvedOperand` variant exists.  Advance the
+            // cursor by the computed length so the trailing
+            // `cursor == decoded.next_pc` invariant holds; consumers can
+            // route on `decoded.opname == "inline_call_pyre_nested"` for
+            // payload-aware handling.
+            'P' => {
+                cursor += 2;
+                let lo = *code.get(cursor)? as usize;
+                let hi = *code.get(cursor + 1)? as usize;
+                let num_args = lo | (hi << 8);
+                cursor += 2 + num_args * 5 + 6;
             }
             _ => return None,
         }

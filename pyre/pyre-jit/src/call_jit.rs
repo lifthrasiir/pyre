@@ -691,8 +691,16 @@ pub fn resume_in_blackhole(
     }
 
     thread_local! {
+        // RPython `blackhole.py:55-65` constructs a fully-initialized
+        // `BlackholeInterpBuilder` (setup_insns + setup_descrs +
+        // wire_bhimpl_handlers) at metainterp startup; pyre's strict
+        // analogue is `build_default_bh_builder()`.  Earlier this slot
+        // held a bare `BlackholeInterpBuilder::new()` whose
+        // `dispatch_table` was empty, so every acquired interpreter
+        // routed every byte through `dispatch_step_with_fallback` to
+        // the legacy `dispatch_one`.
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
+            std::cell::UnsafeCell::new(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
     }
     let sync_bh_builder_control_opcodes =
         |builder: &mut majit_metainterp::blackhole::BlackholeInterpBuilder| {
@@ -1798,8 +1806,9 @@ pub fn blackhole_resume_via_rd_numb(
     // is scoped to a single call so that bh.run() (which may re-enter
     // blackhole_resume_via_rd_numb) cannot create overlapping &mut refs.
     thread_local! {
+        // See the parallel comment on `BH_BUILDER3` in `resume_in_blackhole`.
         static BH_BUILDER_RD: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
+            std::cell::UnsafeCell::new(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
     }
     let sync_bh_builder_control_opcodes =
         |builder: &mut majit_metainterp::blackhole::BlackholeInterpBuilder| {

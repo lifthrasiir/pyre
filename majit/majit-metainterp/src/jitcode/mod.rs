@@ -673,6 +673,8 @@ mod tests {
             ("store_state_array/dii", BC_STORE_STATE_ARRAY),
             ("load_state_varray/dii", BC_LOAD_STATE_VARRAY),
             ("store_state_varray/dii", BC_STORE_STATE_VARRAY),
+            // pyre nested-bytecode inline_call (pyre-only `P` argcode).
+            ("inline_call_pyre_nested/P", BC_INLINE_CALL),
         ];
 
         for (key, expected_byte) in pairs {
@@ -709,7 +711,7 @@ mod tests {
         // len(constants_i)` slots per register file and copies each constant
         // into the tail portion of the file. We verify both — the array
         // sizes and the copied-in constants.
-        use crate::blackhole::BlackholeInterpreter;
+        use crate::blackhole::BlackholeInterpBuilder;
 
         let body = BuildJitCodeBody {
             code: vec![BC_LIVE, 0x00, 0x00], // live/ with 2-byte offset
@@ -727,7 +729,8 @@ mod tests {
         let bt = BuildJitCode::new("slice2/test");
         bt.set_body(body);
 
-        let mut bh = BlackholeInterpreter::new();
+        let mut builder = BlackholeInterpBuilder::new();
+        let mut bh = builder.acquire_interp();
         bh.prepare_registers_for_canonical_jitcode(&bt, 0);
 
         // num_regs_and_consts_i = 4 + 3 = 7; constants occupy [4..7].

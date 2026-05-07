@@ -874,9 +874,8 @@ pub struct BhJitDriverSd {
 
 impl Default for BhReturnType {
     fn default() -> Self {
-        // Matches BlackholeInterpreter::new() default and avoids a
-        // separate impl Default block; entry-creation defaults to Void
-        // so empty drivers stay inert until populated.
+        // Entry-creation defaults to Void so empty drivers stay inert
+        // until populated.
         BhReturnType::Void
     }
 }
@@ -1000,10 +999,9 @@ pub struct BlackholeInterpreter {
     /// handler lookup is one indirect call (`self.dispatch_table[opcode]`)
     /// without going back to the builder.
     ///
-    /// Empty default for direct `BlackholeInterpreter::new()` callers;
-    /// `dispatch_step_with_fallback` falls back to `dispatch_one` when
-    /// the table is empty or the opcode is out of range, preserving
-    /// behavior for legacy fixtures that bypass `acquire_interp`.
+    /// `Default::default()` and `for_inline_callee` start with an empty
+    /// table; `dispatch_step_with_fallback` falls back to `dispatch_one`
+    /// when the table is empty or the opcode is out of range.
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
 }
 
@@ -1029,8 +1027,43 @@ thread_local! {
 use crate::rvmprof::cintf::jit_rvmprof_code;
 
 impl Default for BlackholeInterpreter {
+    /// Sentinel-value interpreter used by
+    /// `BlackholeInterpBuilder::acquire_interp`'s `unwrap_or_default()`
+    /// and by `for_inline_callee` as the receiver for
+    /// `clone_context_from`.  The 6 builder-shared fields stay at
+    /// `u8::MAX` / empty until either `acquire_interp` populates them
+    /// (RPython `blackhole.py:284-289` parity) or
+    /// `clone_context_from(parent)` copies them from a parent
+    /// interpreter.
     fn default() -> Self {
-        Self::new()
+        Self {
+            cpu: None,
+            descrs: Vec::new(),
+            // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
+            // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
+            op_catch_exception: u8::MAX,
+            op_rvmprof_code: u8::MAX,
+            op_live: u8::MAX,
+            registers_i: Vec::new(),
+            registers_r: Vec::new(),
+            registers_f: Vec::new(),
+            tmpreg_i: 0,
+            tmpreg_r: 0,
+            tmpreg_f: 0,
+            jitcode: std::sync::Arc::new(JitCode::default()),
+            position: 0,
+            nextblackholeinterp: None,
+            return_type: BhReturnType::Void,
+            aborted: false,
+            got_exception: false,
+            last_opcode_position: 0,
+            exception_last_value: 0,
+            virtualizable_ptr: 0,
+            virtualizable_info: std::ptr::null(),
+            jitdrivers_sd: Vec::new(),
+            virtualizable_stack_base: 0,
+            dispatch_table: std::sync::Arc::new(Vec::new()),
+        }
     }
 }
 
@@ -1117,35 +1150,63 @@ impl BlackholeInterpreter {
         self.reset_position_state(position);
     }
 
-    pub fn new() -> Self {
-        Self {
-            cpu: None,
-            descrs: Vec::new(),
-            // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
-            // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
-            op_catch_exception: u8::MAX,
-            op_rvmprof_code: u8::MAX,
-            op_live: u8::MAX,
-            registers_i: Vec::new(),
-            registers_r: Vec::new(),
-            registers_f: Vec::new(),
-            tmpreg_i: 0,
-            tmpreg_r: 0,
-            tmpreg_f: 0,
-            jitcode: std::sync::Arc::new(JitCode::default()),
-            position: 0,
-            nextblackholeinterp: None,
-            return_type: BhReturnType::Void,
-            aborted: false,
-            got_exception: false,
-            last_opcode_position: 0,
-            exception_last_value: 0,
-            virtualizable_ptr: 0,
-            virtualizable_info: std::ptr::null(),
-            jitdrivers_sd: Vec::new(),
-            virtualizable_stack_base: 0,
-            dispatch_table: std::sync::Arc::new(Vec::new()),
-        }
+    /// Spawn a fresh interpreter that shares `parent`'s builder-context
+    /// fields (cpu, descrs, op_*, dispatch_table).  Used by
+    /// `handler_inline_call_pyre_nested` for the callee frame of an
+    /// inline-call: a recursive `BlackholeInterpreter` rather than
+    /// `BlackholeInterpBuilder::acquire_interp` to avoid re-entering the
+    /// thread-local builder pool already lent to the caller.
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython `blackhole.py:1279-1320`
+    /// `bhimpl_inline_call_*` does not allocate a callee interpreter at
+    /// all — it calls `cpu.bh_call_*(jitcode.fnaddr, ..., jitcode.calldescr)`
+    /// directly because RPython's inline_call jitcode carries a native
+    /// entry point.  pyre's sub-jitcodes are byte-interpreted, so a
+    /// nested interpreter is the closest equivalent.  Within that
+    /// adaptation, `for_inline_callee` mirrors the builder→interp 6-field
+    /// copy that `acquire_interp` performs.
+    pub fn for_inline_callee(parent: &Self) -> Self {
+        let mut callee = Self::default();
+        callee.clone_context_from(parent);
+        callee
+    }
+
+    /// Copy the builder-shared context fields from `parent` onto `self`.
+    /// Mirrors `BlackholeInterpBuilder::acquire_interp` (blackhole.rs:3902)
+    /// — the same 6 fields that builder→interp normally propagates.
+    /// Used by `handler_inline_call_pyre_nested` to give the callee
+    /// `BlackholeInterpreter` the same `dispatch_table` (so a nested
+    /// `BC_INLINE_CALL` byte routes through the same handler) plus the
+    /// CPU/descrs/op_* slots the wired handlers would consult.  pyre-only:
+    /// RPython `bhimpl_inline_call_*` (blackhole.py:1279-1320) does not
+    /// allocate a callee interpreter; it calls `cpu.bh_call_*(jitcode.fnaddr,
+    /// ...)` directly because RPython's inline_call jitcode carries a
+    /// native entry point.  pyre's sub-jitcodes are byte-interpreted, so
+    /// the callee path needs an interpreter that shares the parent's
+    /// dispatch table to keep recursive inline_call working.
+    pub fn clone_context_from(&mut self, parent: &Self) {
+        // Six builder-shared fields per `BlackholeInterpBuilder::acquire_interp`
+        // (`blackhole.rs:3825-3842`).
+        self.cpu = parent.cpu;
+        self.descrs = parent.descrs.clone();
+        self.op_catch_exception = parent.op_catch_exception;
+        self.op_rvmprof_code = parent.op_rvmprof_code;
+        self.op_live = parent.op_live;
+        self.dispatch_table = std::sync::Arc::clone(&parent.dispatch_table);
+        // Virtualizable / jitdriver state: RPython `bhimpl_inline_call_*`
+        // (`blackhole.py:1278-1320`) reaches the callee via
+        // `cpu.bh_call_*(jitcode.fnaddr, ...)` so the callee never sees a
+        // BlackholeInterpreter context at all — vable / recursive_call
+        // bytecodes are unreachable through that path upstream.  pyre's
+        // nested interpreter executes the sub-jitcode byte-by-byte, so a
+        // sub-jitcode that contains a vable / recursive_call opcode would
+        // otherwise read the callee's zero-defaults.  Mirror the parent's
+        // state defensively — the closest equivalent to RPython's "callee
+        // never has its own context" shape.
+        self.virtualizable_ptr = parent.virtualizable_ptr;
+        self.virtualizable_info = parent.virtualizable_info;
+        self.jitdrivers_sd = parent.jitdrivers_sd.clone();
+        self.virtualizable_stack_base = parent.virtualizable_stack_base;
     }
 
     /// blackhole.py:312 setposition
@@ -1909,6 +1970,19 @@ impl BlackholeInterpreter {
             .copied()
             .filter(|h| (*h as *const () as usize) != placeholder_addr);
         let Some(handler) = table_handler else {
+            // Stage 2 Slice 2.1 probe — env-gated logging of fallback
+            // arrivals so Slice 2.2/2.3 can decide whether the legacy
+            // `dispatch_one` path is reachable in production.  Removed in
+            // Slice 2.3 once the fallback turns into a panic.
+            if std::env::var_os("MAJIT_DISPATCH_ONE_PROBE").is_some() {
+                eprintln!(
+                    "[bh-probe] dispatch_one fallback byte={opcode:#x} \
+                     pos={} table_len={} jitcode={:?}",
+                    self.last_opcode_position,
+                    self.dispatch_table.len(),
+                    self.jitcode.name,
+                );
+            }
             return self.dispatch_one(opcode);
         };
         // Clone the Arc to detach the `code` borrow from `self`, so the
@@ -2300,100 +2374,11 @@ impl BlackholeInterpreter {
                 self.aborted = true;
                 return Err(DispatchError::LeaveFrame);
             }
-            jitcode::BC_INLINE_CALL => {
-                let sub_idx = self.next_u16() as usize;
-                let num_args = self.next_u16() as usize;
-                let mut arg_triples = Vec::with_capacity(num_args);
-                for _ in 0..num_args {
-                    let kind = JitArgKind::decode(self.next_u8());
-                    let caller_src = self.next_u16() as usize;
-                    let callee_dst = self.next_u16() as usize;
-                    arg_triples.push((kind, caller_src, callee_dst));
-                }
-                // Return slots: caller dst for i/r/f; the callee src comes
-                // from its trailing typed return opcode.
-                let return_i = self.decode_return_slot();
-                let return_r = self.decode_return_slot();
-                let return_f = self.decode_return_slot();
-
-                // RPython `blackhole.py:150-157` — `j` argcode resolves
-                // via `self.descrs[idx]` asserted to be a `JitCode`.
-                let sub_jitcode = self
-                    .jitcode
-                    .exec
-                    .descrs
-                    .get(sub_idx)
-                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry \
-                             (runtime pool has {} items)",
-                            self.jitcode.exec.descrs.len()
-                        )
-                    })
-                    .clone();
-
-                // Create callee blackhole interpreter
-                let mut callee = BlackholeInterpreter::new();
-                callee.setposition(sub_jitcode, 0);
-
-                // Copy arguments from caller to callee
-                for (kind, caller_src, callee_dst) in arg_triples {
-                    match kind {
-                        JitArgKind::Int => {
-                            callee.registers_i[callee_dst] = self.registers_i[caller_src];
-                        }
-                        JitArgKind::Ref => {
-                            callee.registers_r[callee_dst] = self.registers_r[caller_src];
-                        }
-                        JitArgKind::Float => {
-                            callee.registers_f[callee_dst] = self.registers_f[caller_src];
-                        }
-                    }
-                }
-
-                // Copy runtime stacks to callee
-                // Execute callee
-                let _ = callee.run();
-
-                // RPython blackhole.py: propagate callee exceptions/aborts.
-                // If callee aborted or got an exception, propagate to caller.
-                if callee.aborted {
-                    self.aborted = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                if callee.got_exception {
-                    let exc_val = callee.exception_last_value;
-                    // Try to handle in this (caller) frame first.
-                    if exc_val != 0 && self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-
-                // Copy return values
-                if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
-                    match return_kind {
-                        JitArgKind::Int => {
-                            let caller_dst =
-                                return_i.expect("inline int return missing caller destination");
-                            self.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
-                        }
-                        JitArgKind::Ref => {
-                            let caller_dst =
-                                return_r.expect("inline ref return missing caller destination");
-                            self.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
-                        }
-                        JitArgKind::Float => {
-                            let caller_dst =
-                                return_f.expect("inline float return missing caller destination");
-                            self.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
-                        }
-                    }
-                }
-            }
+            // BC_INLINE_CALL is wired to `handler_inline_call_pyre_nested`
+            // (`blackhole.rs::handler_inline_call_pyre_nested`).  Slice 3.2.1
+            // gave the callee `clone_context_from(parent)` so a nested
+            // `BC_INLINE_CALL` byte fires the same handler instead of
+            // falling through here, retiring the legacy arm.
             // -- Int-typed calls --
             // Parity #14 Slice C.5 retired BC_CALL_PURE_INT (Pure now flows
             // through canonical BC_RESIDUAL_CALL_*_I); only
@@ -3159,16 +3144,6 @@ impl BlackholeInterpreter {
             );
         }
         args
-    }
-
-    /// Decode a caller destination slot from bytecode.
-    fn decode_return_slot(&mut self) -> Option<usize> {
-        let dst = self.next_u16() as usize;
-        if dst == u16::MAX as usize {
-            None
-        } else {
-            Some(dst)
-        }
     }
 }
 
@@ -4997,7 +4972,8 @@ mod tests {
             b.record_binop_i(2, OpCode::IntAdd, 0, 1);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5016,7 +4992,8 @@ mod tests {
             b.load_const_i_value(2, 99);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5035,7 +5012,8 @@ mod tests {
             b.load_const_i_value(2, 99);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5053,7 +5031,8 @@ mod tests {
             b.load_const_i_value(1, 99);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5068,7 +5047,8 @@ mod tests {
             b.move_i(1, 0);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5082,7 +5062,8 @@ mod tests {
             b.record_unary_i(1, OpCode::IntNeg, 0);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5096,7 +5077,8 @@ mod tests {
             b.ptr_nonzero(1, 0);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5114,7 +5096,8 @@ mod tests {
             b.load_const_i_value(2, 99);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
@@ -5129,7 +5112,8 @@ mod tests {
             b.record_binop_i(2, OpCode::IntMul, 0, 1);
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             bh.setarg_i(0, 7);
             bh.setarg_i(1, 6);
@@ -5183,11 +5167,363 @@ mod tests {
             b.inline_call_ir_i(sub_idx, &[(0, 0)], &[], Some(1));
             let jitcode = b.finish();
 
-            let mut bh = BlackholeInterpreter::new();
+            // Slice 3.1d: route through `handler_inline_call_pyre_nested`
+            // (the production builder shape) instead of the legacy
+            // `dispatch_one::BC_INLINE_CALL` fallback so this test
+            // exercises the same path as the production blackhole resume.
+            let mut builder = super::build_inline_call_only_bh_builder();
+            assert!(
+                builder.unwired_opnames().is_empty(),
+                "build_inline_call_only_bh_builder left opnames unwired: {:?}",
+                builder.unwired_opnames(),
+            );
+            let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
 
             assert_eq!(bh.registers_i[1], 42);
+        }
+
+        /// Slice 3.1e Tier 2.1: ref-typed return propagation through
+        /// `handler_inline_call_pyre_nested`.  Sub-jitcode is the ref
+        /// identity (passes its ref arg through and `ref_return`s it);
+        /// caller passes a non-trivial constant ref and verifies the
+        /// caller-side ref dst slot received the same word.
+        #[test]
+        fn test_bh_interp_inline_call_ref_return() {
+            let mut sub = JitCodeBuilder::default();
+            sub.ref_return(0);
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            b.load_const_r_value(0, 0xDEAD_BEEF);
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_r(sub_idx, &[], &[(0, 0)], Some(1));
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert_eq!(bh.registers_r[1], 0xDEAD_BEEF);
+        }
+
+        /// Slice 3.1e Tier 2.1: float-typed return propagation.
+        /// Sub-jitcode is the float identity; caller passes a constant
+        /// float bit-pattern and verifies the caller-side float dst.
+        #[test]
+        fn test_bh_interp_inline_call_float_return() {
+            let mut sub = JitCodeBuilder::default();
+            sub.float_return(0);
+            let sub_jitcode = sub.finish();
+
+            let bits = f64::to_bits(3.14_f64) as i64;
+            let mut b = JitCodeBuilder::default();
+            b.load_const_f_value(0, bits);
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_irf_f(sub_idx, &[], &[], &[(0, 0)], Some(1));
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert_eq!(bh.registers_f[1], bits);
+        }
+
+        /// Slice 3.1e Tier 2.1: void-return path skips the
+        /// `trailing_return_info()` block in the handler (returns None
+        /// for `BC_VOID_RETURN`-terminated jitcodes per
+        /// `JitCodeRuntimeExt::trailing_return_info`).  No caller dst
+        /// slot is consumed; the caller proceeds without aborted /
+        /// got_exception flags being set.  Sub-jitcode keeps register
+        /// files empty by skipping all `touch_reg` paths — `void_return`
+        /// alone does not touch any register, so a no-arg call is the
+        /// minimal void scenario.
+        #[test]
+        fn test_bh_interp_inline_call_void_return() {
+            let mut sub = JitCodeBuilder::default();
+            sub.void_return();
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            b.load_const_i_value(0, 99);
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert!(!bh.aborted, "void inline_call should not abort");
+            assert!(
+                !bh.got_exception,
+                "void inline_call should not set got_exception"
+            );
+        }
+
+        /// Slice 3.1f Tier 2.2: exception raised inside the callee is
+        /// caught by the caller's `catch_exception/L` immediately
+        /// following the inline_call.  The handler should sync
+        /// `bh.position` to operand-end before invoking
+        /// `handle_exception_in_frame`, then return `Ok(bh.position)`
+        /// (= catch-handler PC) so subsequent dispatch resumes there.
+        #[test]
+        fn test_bh_interp_inline_call_raises_caught_by_caller() {
+            const EXC_VAL: i64 = 0xCAFE_F00D;
+            const FALLTHROUGH_SENTINEL: i64 = 999;
+            const CAUGHT_SENTINEL: i64 = 42;
+
+            let mut sub = JitCodeBuilder::default();
+            sub.load_const_r_value(0, EXC_VAL);
+            sub.emit_raise(0);
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            // Fallthrough path — must not run if catch dispatch is wired.
+            b.load_const_i_value(2, FALLTHROUGH_SENTINEL);
+            b.int_return(2);
+            // Catch handler — only reached if `handle_exception_in_frame`
+            // honoured the immediately-following `catch_exception/L`.
+            b.mark_label(handler_lbl);
+            b.load_const_i_value(2, CAUGHT_SENTINEL);
+            b.int_return(2);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert!(
+                !bh.got_exception,
+                "caller-side catch_exception should clear got_exception"
+            );
+            assert_eq!(
+                bh.tmpreg_i, CAUGHT_SENTINEL,
+                "caught path must run; fallthrough sentinel is {FALLTHROUGH_SENTINEL}"
+            );
+            assert_eq!(bh.return_type, BhReturnType::Int);
+        }
+
+        /// Slice 3.1f Tier 2.2: exception raised inside the callee
+        /// without a caller-side `catch_exception/L` propagates as
+        /// `LeaveFrame` with `bh.got_exception` and
+        /// `bh.exception_last_value` set.  The handler's
+        /// `handle_exception_in_frame` returns false because no
+        /// matching catch byte follows the inline_call operands.
+        #[test]
+        fn test_bh_interp_inline_call_raises_uncaught_propagates() {
+            const EXC_VAL: i64 = 0x1234_5678;
+
+            let mut sub = JitCodeBuilder::default();
+            sub.load_const_r_value(0, EXC_VAL);
+            sub.emit_raise(0);
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            // No `catch_exception` — the next opcode is unreachable but
+            // still needs to be a valid encoding so `JitCodeBuilder::finish`
+            // produces a well-formed jitcode tail.
+            b.load_const_i_value(0, 0);
+            b.int_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert!(
+                bh.got_exception,
+                "uncaught exception should set got_exception"
+            );
+            assert_eq!(
+                bh.exception_last_value, EXC_VAL,
+                "exception_last_value must propagate the callee's raised ref"
+            );
+        }
+
+        /// Slice 3.1g Tier 2.3: callee `abort_permanent/` propagates
+        /// `aborted = true` to the caller via the handler's
+        /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm.
+        /// `bhimpl_abort_permanent` (blackhole.rs:1714) sets aborted
+        /// + returns LeaveFrame when no `BH_LAST_EXC_VALUE` is pending,
+        /// which is the case for a clean callee spawned via
+        /// `BlackholeInterpreter::for_inline_callee(parent)` (TLS reset
+        /// between tests via thread isolation).
+        #[test]
+        fn test_bh_interp_inline_call_abort_permanent_in_sub_propagates() {
+            let mut sub = JitCodeBuilder::default();
+            sub.abort_permanent();
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            // Trailing return — must not run on the abort path.
+            b.load_const_i_value(0, 0);
+            b.int_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert!(
+                bh.aborted,
+                "callee `abort_permanent/` must propagate aborted=true to caller"
+            );
+            assert!(
+                !bh.got_exception,
+                "abort_permanent without pending TLS exception must not set got_exception"
+            );
+        }
+
+        /// Slice 3.1g Tier 2.3: callee `abort/` propagates aborted=true.
+        /// Slice 3.2.1: callee shares the parent's dispatch_table, so
+        /// byte `BC_ABORT` either fires the wired handler
+        /// (`handler_abort_marker_pyre`, blackhole.rs:5837) or falls
+        /// back to `dispatch_one`'s legacy arm
+        /// (blackhole.rs:2284-2287); both set `aborted = true` +
+        /// LeaveFrame after Slice 3.2.0 unified the two paths.  The
+        /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm
+        /// inside `handler_inline_call_pyre_nested` then propagates to
+        /// the caller.
+        #[test]
+        fn test_bh_interp_inline_call_abort_in_sub_propagates() {
+            let mut sub = JitCodeBuilder::default();
+            sub.abort();
+            let sub_jitcode = sub.finish();
+
+            let mut b = JitCodeBuilder::default();
+            let sub_idx = b.add_sub_jitcode(sub_jitcode);
+            b.inline_call_ir_v(sub_idx, &[], &[], None);
+            b.load_const_i_value(0, 0);
+            b.int_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), 0);
+            let _ = bh.run();
+
+            assert!(
+                bh.aborted,
+                "callee `abort/` must propagate aborted=true to caller"
+            );
+        }
+
+        /// Slice 3.2.2: 2-level nested inline_call.  `outer_sub` itself
+        /// emits `BC_INLINE_CALL` to invoke `inner_sub`.  Acceptance
+        /// criterion for Slice 3.2.1's callee runtime context clone:
+        /// the inner-most callee inherits the parent's dispatch_table
+        /// via `clone_context_from`, so byte 17 routes to
+        /// `handler_inline_call_pyre_nested` recursively instead of
+        /// only working through `dispatch_one`'s legacy arm.  The
+        /// caller-side ground truth is that the int value threaded
+        /// through three frames lands in the outermost caller's
+        /// destination register.
+        #[test]
+        fn test_bh_interp_inline_call_two_level_nested_int_propagates() {
+            // inner_sub: receives r0, returns it.
+            let mut inner = JitCodeBuilder::default();
+            inner.int_return(0);
+            let inner_jitcode = inner.finish();
+
+            // outer_sub: receives r0, calls inner_sub(r0) → r1, returns r1.
+            let mut outer = JitCodeBuilder::default();
+            let inner_idx_in_outer = outer.add_sub_jitcode(inner_jitcode);
+            outer.inline_call_ir_i(inner_idx_in_outer, &[(0, 0)], &[], Some(1));
+            outer.int_return(1);
+            let outer_jitcode = outer.finish();
+
+            // main: r0 = 17, inline_call(outer_sub, arg=(0, 0)) → r1, return r1.
+            let mut main = JitCodeBuilder::default();
+            main.load_const_i_value(0, 17);
+            let outer_idx_in_main = main.add_sub_jitcode(outer_jitcode);
+            main.inline_call_ir_i(outer_idx_in_main, &[(0, 0)], &[], Some(1));
+            main.int_return(1);
+            let main_jitcode = main.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(main_jitcode), 0);
+            let _ = bh.run();
+
+            assert_eq!(
+                bh.registers_i[1], 17,
+                "2-level nested inline_call must thread int value through both frames"
+            );
+        }
+
+        /// `clone_context_from` mirrors
+        /// `BlackholeInterpBuilder::acquire_interp`'s 6 builder-shared
+        /// fields plus parent's virtualizable / jitdriver state (Fix 7
+        /// extension).  Direct unit check that the callee receives the
+        /// parent's `dispatch_table` Arc, the cached control opcode
+        /// bytes, and the virtualizable / jitdriver_sd / stack-base
+        /// state a sub-jitcode might consult if it contains a vable /
+        /// recursive_call opcode.
+        #[test]
+        fn test_clone_context_from_mirrors_acquire_interp_fields() {
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut parent = builder.acquire_interp();
+            // Make the parent's vable / jitdriver state non-default so
+            // the assertion below distinguishes "copied" from
+            // "callee-default".
+            parent.virtualizable_ptr = 0xDEAD_BEEF;
+            parent.virtualizable_stack_base = 7;
+
+            let mut callee = BlackholeInterpreter::default();
+            callee.clone_context_from(&parent);
+
+            assert!(
+                std::sync::Arc::ptr_eq(&callee.dispatch_table, &parent.dispatch_table),
+                "callee must share the parent's dispatch_table Arc"
+            );
+            assert_eq!(callee.op_catch_exception, parent.op_catch_exception);
+            assert_eq!(callee.op_rvmprof_code, parent.op_rvmprof_code);
+            assert_eq!(callee.op_live, parent.op_live);
+            assert_eq!(callee.descrs.len(), parent.descrs.len());
+            assert_eq!(callee.virtualizable_ptr, parent.virtualizable_ptr);
+            assert_eq!(
+                callee.virtualizable_stack_base,
+                parent.virtualizable_stack_base
+            );
+            assert_eq!(callee.jitdrivers_sd.len(), parent.jitdrivers_sd.len());
+        }
+
+        /// Slice 3.2.0: `handler_abort_marker_pyre` mirrors
+        /// `dispatch_one::BC_ABORT` arm semantics
+        /// (blackhole.rs:2284-2287).  Reaching `OpKind::Abort` at
+        /// runtime sets `aborted = true` and exits the frame —
+        /// continuing dispatch past it would misread the next bytes
+        /// as opcodes.
+        #[test]
+        fn test_handler_abort_marker_pyre_sets_aborted_and_leaves_frame() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            assert!(!bh.aborted);
+            let result = super::handler_abort_marker_pyre(&mut bh, &[], 0);
+            match result {
+                Err(super::DispatchError::LeaveFrame) => {}
+                other => {
+                    panic!("handler_abort_marker_pyre must return Err(LeaveFrame), got {other:?}")
+                }
+            }
+            assert!(bh.aborted);
         }
 
         /// Integration test: build bytecode manually with known opcode
@@ -5221,8 +5557,10 @@ mod tests {
                 2, 2, // opcode 2 = int_return, src=r2
             ];
 
-            // Create BlackholeInterpreter with 3 int regs
-            let mut bh = BlackholeInterpreter::new();
+            // Acquire BlackholeInterpreter from the same builder so the
+            // 6 builder-shared fields (op_live etc.) flow through, then
+            // size the int register file for r0..=r2.
+            let mut bh = builder.acquire_interp();
             bh.registers_i = vec![0i64; 3];
             bh.registers_i[0] = 10; // r0 = 10
             bh.registers_i[1] = 32; // r1 = 32
@@ -5560,17 +5898,19 @@ bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
 // syntax node has no dedicated OpKind variant (assembler.rs
 // `OpKind::Abort { .. } => "abort".into()`). Carries zero operand
 // bytes (empty argcodes). Reaching here at runtime means a graph that
-// made it through rtyper still has an untranslatable op — advance past
-// it rather than panic so blackhole resume can keep walking. RPython
-// has no direct analog: its codewriter raises before lowering, so a
-// jitcode never carries an unrecognized op. Removing this placeholder
-// requires per-case canonical routing or front-end Err.
+// made it through rtyper still has an untranslatable op — abort the
+// frame rather than continue dispatching past it: subsequent bytes
+// would be misread as opcodes. Mirror of dispatch_one::BC_ABORT arm
+// (blackhole.rs:2284): `aborted = true` + `LeaveFrame`. RPython has no
+// direct analog: its codewriter raises before lowering, so a jitcode
+// never carries an unrecognized op.
 fn handler_abort_marker_pyre(
-    _bh: &mut BlackholeInterpreter,
+    bh: &mut BlackholeInterpreter,
     _code: &[u8],
-    position: usize,
+    _position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position)
+    bh.aborted = true;
+    Err(DispatchError::LeaveFrame)
 }
 
 /// Handler for pyre-only `abort/>i` — a no-op result marker emitted by
@@ -7134,6 +7474,265 @@ fn handler_residual_call_r_v(
     Ok(p)
 }
 
+// ── pyre-u16 register-width adapters (Sub-slice C.1) ────────────────
+//
+// PRE-EXISTING-ADAPTATION (pyre register-width axis):
+// pyre's `JitCodeBuilder::push_u16` (`assembler.rs:3300`) writes 2
+// bytes per register operand because pyre lifts RPython's 256-register
+// cap.  RPython's argcode contract (`blackhole.py:107`) reads 1 byte
+// per register (`code[position] as usize`).  These `*_pyre_u16`
+// handlers decode pyre's 2-byte register layout for the inline-call-
+// only production builder's `setup_insns` entries.  Each variant is
+// otherwise byte-for-byte identical to its canonical sister handler.
+// Convergence path: revisit only if pyre's register allocator caps
+// under 256 (Task #45 Sub-slice C-A, currently rejected as
+// register-rich pyre jitcodes panic at 256+).
+
+fn handler_int_copy_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let dst = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    bh.registers_i[dst] = bh.registers_i[src];
+    Ok(position + 4)
+}
+
+fn handler_ref_copy_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let dst = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    bh.registers_r[dst] = bh.registers_r[src];
+    Ok(position + 4)
+}
+
+fn handler_ref_return_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.tmpreg_r = bh.registers_r[src];
+    bh.return_type = BhReturnType::Ref;
+    bh.position = position + 2;
+    Err(DispatchError::LeaveFrame)
+}
+
+fn handler_raise_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[p], code[p + 1]]) as usize;
+    let exc = bh.registers_r[src];
+    bh.position = p + 2;
+    // `blackhole.py:1000` `bhimpl_raise(excvalue)` — `assert e` requires
+    // a non-null exception object.  The legacy `dispatch_one`
+    // `BC_RAISE` arm (`blackhole.rs:2362-2366`) gates `exc != 0` and
+    // routes a null `exc` through `aborted = true` + `LeaveFrame`;
+    // mirror that here so the pyre-u16 production builder path keeps
+    // the same fallback semantics.
+    if exc != 0 {
+        Err(DispatchError::RaiseException(exc))
+    } else {
+        bh.aborted = true;
+        Err(DispatchError::LeaveFrame)
+    }
+}
+
+fn handler_last_exc_value_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let dst = u16::from_le_bytes([code[p], code[p + 1]]) as usize;
+    bh.registers_r[dst] = bh.exception_last_value;
+    Ok(p + 2)
+}
+
+fn handler_goto_if_not_int_is_true_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let a = bh.registers_i[reg];
+    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    let pc = position + 4;
+    if a != 0 { Ok(pc) } else { Ok(target) }
+}
+
+/// Process-global Backend instance for blackhole's `bh_getfield_gc_*` /
+/// `bh_setfield_gc_*` / `bh_getarrayitem_gc_*` / `bh_arraylen_gc` reads.
+///
+/// PRE-EXISTING-ADAPTATION: RPython `blackhole.py:55-56,286` reads
+/// `self.cpu = builder.cpu`, where `builder.cpu` is the metainterp-shared
+/// AbstractCPU subclass (`LLOpHelpers` in tests, real native cpu in
+/// production).  The cpu's `bh_getfield_gc_*` etc. methods are stateless
+/// thin wrappers around `lltype.cast_*` / pointer arithmetic in RPython.
+///
+/// pyre's `MetaInterp::backend` is per-instance (not `'static`) and
+/// owns trace-compilation state (descr registries, etc.) that would be
+/// inappropriate to share with the blackhole `bh.cpu` field which only
+/// needs the stateless GC memory-access methods.  We leak ONE
+/// `BackendImpl` instance for the process — its `bh_getfield_gc_*` and
+/// related methods do direct unsafe pointer arithmetic (`runner.rs:2244-2271`
+/// for dynasm), which is identical to the `dispatch_one` direct-vinfo
+/// access path that the canonical-routing migration replaces.
+///
+/// Convergence path (Task #45 Stage 2 Slice 2.3 Sub-slice C.5): once
+/// `dispatch_step_with_fallback`'s placeholder bridge retires, the
+/// metainterp-owned backend should be plumbed through to blackhole's
+/// `cpu` field — RPython parity ties them together.  Until then, this
+/// leaked instance suffices because vable handlers only invoke
+/// stateless reads.
+#[cfg(any(feature = "dynasm", feature = "cranelift"))]
+pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
+    // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
+    // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs:702`)
+    // which is itself a `thread_local!` — production blackhole resume
+    // already runs on the same thread that owns the trace's metainterp.
+    thread_local! {
+        static CPU: std::cell::Cell<Option<&'static dyn majit_backend::Backend>> =
+            const { std::cell::Cell::new(None) };
+    }
+    CPU.with(|cell| {
+        if let Some(cpu) = cell.get() {
+            return cpu;
+        }
+        let backend: Box<dyn majit_backend::Backend> = Box::new(crate::pyjitpl::BackendImpl::new());
+        let leaked: &'static dyn majit_backend::Backend = Box::leak(backend);
+        cell.set(Some(leaked));
+        leaked
+    })
+}
+
+/// Build a `BlackholeInterpBuilder` for pyre's blackhole resume path,
+/// wiring only the canonical bytes whose `JitCodeBuilder` emit-side
+/// payload matches the bhimpl handler byte-for-byte.
+///
+/// PRE-EXISTING-ADAPTATION: pyre's `JitCodeBuilder` emits other
+/// runtime opcodes (vable, residual_call, etc.) in a 2-byte-register
+/// payload that does not match the canonical RPython argcode contract
+/// that `wire_bhimpl_handlers` would route those bytes through.  This
+/// builder's `setup_insns` registers only the byte-identical canonical
+/// keys plus the misc-family pyre-u16 variants; every other byte falls
+/// through `dispatch_step_with_fallback` to `dispatch_one`'s legacy
+/// arms.  Currently registered:
+///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` (Slice 3.1)
+///   - Sub-slice B byte-identical canonical: `live/`, `loop_header/i`,
+///     `goto/L`, `catch_exception/L`, `jit_merge_point/cIRFIRF`
+///   - Sub-slice C.1 misc-family pyre-u16: `int_copy_pyre_u16/i>i`,
+///     `ref_copy_pyre_u16/r>r`, `ref_return_pyre_u16/r`,
+///     `raise_pyre_u16/r`, `last_exc_value_pyre_u16/>r`,
+///     `goto_if_not_int_is_true_pyre_u16/iL`
+/// The pyre-jit production thread-locals (`BH_BUILDER3`,
+/// `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
+/// shape.
+///
+/// See `pyre-jit-trace/src/jitcode_dispatch.rs:5988-5996` for the
+/// `pipeline.insns` ↔ `wellknown_bh_insns` table-unification epic
+/// that this minimal install side-steps.
+pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
+    use std::collections::HashMap;
+    let mut builder = BlackholeInterpBuilder::new();
+    // Sub-slice C.2.0 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
+    // wire the blackhole cpu BEFORE C.2.1 vable canonical routing.
+    // RPython `blackhole.py:286 self.cpu = builder.cpu` parity — the
+    // production builder must carry a non-None cpu so canonical handlers
+    // like `handler_getfield_vable_r` don't trip
+    // `bh.cpu.expect("cpu not set")` once their setup_insns entries land
+    // in C.2.1.  The leaked instance services only stateless GC reads;
+    // residual_call (`bh_call_*`, C.3-C.4) prereq audit pending.
+    #[cfg(any(feature = "dynasm", feature = "cranelift"))]
+    {
+        builder.cpu = Some(pyre_production_cpu());
+    }
+    let mut insns = HashMap::new();
+    insns.insert(
+        "inline_call_pyre_nested/P".to_string(),
+        majit_translate::insns::BC_INLINE_CALL,
+    );
+    // Sub-slice B (`pyre-bh-setup-insns-byte-identical-subset.md`):
+    // five canonical keys whose `JitCodeBuilder` emit-side payload
+    // matches the wired `bhimpl_*` handler byte-for-byte.  All other
+    // canonical bytes still fall through `dispatch_step_with_fallback`
+    // to `dispatch_one` because pyre's u16 register operands diverge
+    // from RPython's u8 register operands in `code[position]` reads.
+    //   * `live/` — operand-less; both paths skip 2-byte liveness offset.
+    //   * `loop_header/i` — `i` is a 1-byte const-pool slot, RPython-aligned.
+    //   * `goto/L` — operand-less for registers; 2-byte label.
+    //   * `catch_exception/L` — same shape as `goto/L`.
+    //   * `jit_merge_point/cIRFIRF` — both paths delegate to
+    //     `bhimpl_jit_merge_point`, which decodes the post-opcode
+    //     payload via `self.position`-mutating helpers; the IRFIRF
+    //     register-list bytes are u8 in BOTH the emit-side and the
+    //     decoder.
+    insns.insert("live/".to_string(), majit_translate::insns::BC_LIVE);
+    insns.insert(
+        "loop_header/i".to_string(),
+        majit_translate::insns::BC_LOOP_HEADER,
+    );
+    insns.insert("goto/L".to_string(), majit_translate::insns::BC_JUMP);
+    insns.insert(
+        "catch_exception/L".to_string(),
+        majit_translate::insns::BC_CATCH_EXCEPTION,
+    );
+    insns.insert(
+        "jit_merge_point/cIRFIRF".to_string(),
+        majit_translate::insns::BC_JIT_MERGE_POINT_C,
+    );
+    // Sub-slice C.1 (`subslice_c_register_width_axis_plan_2026_05_07.md`):
+    // misc family — six BC_* whose `JitCodeBuilder` emit-side payload
+    // uses pyre's u16 register-width layout that diverges from the
+    // canonical 1-byte argcode contract.  Each `*_pyre_u16` handler
+    // decodes 2-byte register operands; labels remain u16 in both
+    // pyre and RPython, so only register operands needed widening.
+    insns.insert(
+        "int_copy_pyre_u16/i>i".to_string(),
+        majit_translate::insns::BC_MOVE_I,
+    );
+    insns.insert(
+        "ref_copy_pyre_u16/r>r".to_string(),
+        majit_translate::insns::BC_MOVE_R,
+    );
+    insns.insert(
+        "ref_return_pyre_u16/r".to_string(),
+        majit_translate::insns::BC_REF_RETURN,
+    );
+    insns.insert(
+        "raise_pyre_u16/r".to_string(),
+        majit_translate::insns::BC_RAISE,
+    );
+    insns.insert(
+        "last_exc_value_pyre_u16/>r".to_string(),
+        majit_translate::insns::BC_LAST_EXC_VALUE,
+    );
+    insns.insert(
+        "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
+        majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
+    );
+    builder.setup_insns(&insns);
+    // `setup_insns` already derives `op_live` and `op_catch_exception`
+    // from the registered canonical subset above.  `rvmprof_code/ii` is
+    // not registered in this minimal builder yet, but blackhole exception
+    // and live handling expects these cached values to stay in the same
+    // fixed-byte space as pyre's runtime opcodes.  Reapply the canonical
+    // `BC_*` constants explicitly so this builder stays synchronized as
+    // the registered subset changes.
+    builder.setup_cached_control_opcodes(
+        majit_translate::insns::BC_LIVE as i32,
+        majit_translate::insns::BC_CATCH_EXCEPTION as i32,
+        majit_translate::insns::BC_RVMPROF_CODE as i32,
+    );
+    wire_bhimpl_handlers(&mut builder);
+    builder
+}
+
 /// Wire all currently-ported bhimpl methods into a `BlackholeInterpBuilder`'s
 /// dispatch table. Called once after `setup_insns`.
 ///
@@ -7592,6 +8191,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("inline_call_r_r/dR>r", handler_inline_call_r_r);
     builder.wire_handler("inline_call_r_v/dR", handler_inline_call_r_v);
 
+    // PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.  See
+    // the comment on `handler_inline_call_pyre_nested` for rationale.
+    // The canonical keys above remain wired but stay inert in production
+    // because pyre never registers them in `wellknown_bh_insns()` (no
+    // matching entry in `setup_insns`-built `_insns`).  Byte 17 is
+    // exposed via the pyre-only `inline_call_pyre_nested/P` key in
+    // `pyre_extension_insns()`.
+    builder.wire_handler("inline_call_pyre_nested/P", handler_inline_call_pyre_nested);
+
     // Recursive call (stub — needs portal runner)
     // RPython `rpython/jit/metainterp/blackhole.py:1101-1132`:
     //   @arguments("self", "i", "I", "R", "F", "I", "R", "F", returns="X")
@@ -7608,6 +8216,26 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("ref_return/r", handler_ref_return);
     builder.wire_handler("float_return/f", handler_float_return);
     builder.wire_handler("void_return/", handler_void_return);
+
+    // PRE-EXISTING-ADAPTATION: pyre-u16 register-width adapters (Sub-slice C.1).
+    // See the block-header comment on `handler_int_copy_pyre_u16` for the
+    // RPython argcode contract divergence rationale.  These wirings are
+    // inert for builders whose `setup_insns` does not register the
+    // matching opname (`build_default_bh_builder` etc.); they only
+    // become live in `build_inline_call_only_bh_builder`'s
+    // pyre-namespaced insns map.
+    builder.wire_handler("int_copy_pyre_u16/i>i", handler_int_copy_pyre_u16);
+    builder.wire_handler("ref_copy_pyre_u16/r>r", handler_ref_copy_pyre_u16);
+    builder.wire_handler("ref_return_pyre_u16/r", handler_ref_return_pyre_u16);
+    builder.wire_handler("raise_pyre_u16/r", handler_raise_pyre_u16);
+    builder.wire_handler(
+        "last_exc_value_pyre_u16/>r",
+        handler_last_exc_value_pyre_u16,
+    );
+    builder.wire_handler(
+        "goto_if_not_int_is_true_pyre_u16/iL",
+        handler_goto_if_not_int_is_true_pyre_u16,
+    );
 }
 
 // ── goto_if_not_float (blackhole.py:751-798) ────────────────────────
@@ -9046,6 +9674,165 @@ fn handler_inline_call_r_v(
     bh.bhimpl_inline_call_r_v(fnaddr, &ar, &calldescr);
     Ok(p)
 }
+
+/// PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.
+///
+/// Pyre does not compile inlined helpers into separate native functions —
+/// trace IR merges them into a single compiled trace.  When a guard
+/// fails and the blackhole interpreter resumes the original jitcode,
+/// the inline call must be re-interpreted as nested bytecode because
+/// no per-helper `fnaddr` exists.  RPython's canonical `inline_call_*`
+/// handlers (`handler_inline_call_irf_i` etc.) instead expect a real
+/// C-ABI fnaddr stored on `BhDescr::JitCode`.
+///
+/// This handler is the line-by-line port of the legacy
+/// `dispatch_one::BC_INLINE_CALL` arm under the
+/// `(bh, code, position) -> Result<usize, _>` signature.  Operand
+/// payload (pyre-only):
+///   `sub_idx: u16`, `num_args: u16`,
+///   `num_args × (kind: u8, caller_src: u16, callee_dst: u16)`,
+///   `return_i: u16`, `return_r: u16`, `return_f: u16`
+/// `u16::MAX` in any return slot encodes "no caller destination".
+///
+/// Registered via the pyre-only opname `inline_call_pyre_nested/P`
+/// in `pyre_extension_insns()`; canonical `inline_call_*` keys remain
+/// quarantined out of `wellknown_bh_insns()`.
+fn handler_inline_call_pyre_nested(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let sub_idx = jitcode::read_u16(code, &mut p) as usize;
+    let num_args = jitcode::read_u16(code, &mut p) as usize;
+    let mut arg_triples = Vec::with_capacity(num_args);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let caller_src = jitcode::read_u16(code, &mut p) as usize;
+        let callee_dst = jitcode::read_u16(code, &mut p) as usize;
+        arg_triples.push((kind, caller_src, callee_dst));
+    }
+    let return_i = decode_return_slot_at(code, &mut p);
+    let return_r = decode_return_slot_at(code, &mut p);
+    let return_f = decode_return_slot_at(code, &mut p);
+
+    // blackhole.py:150-157 `j` argcode resolves via `descrs[idx]`
+    // asserted to be a JitCode entry; pyre's helper-side
+    // `RuntimeBhDescr::JitCode(Arc<JitCode>)` is the analogous slot.
+    let sub_jitcode = bh
+        .jitcode
+        .exec
+        .descrs
+        .get(sub_idx)
+        .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+        .unwrap_or_else(|| {
+            panic!(
+                "BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry \
+                 (runtime pool has {} items)",
+                bh.jitcode.exec.descrs.len()
+            )
+        })
+        .clone();
+
+    let mut callee = BlackholeInterpreter::for_inline_callee(bh);
+    callee.setposition(sub_jitcode, 0);
+
+    for (kind, caller_src, callee_dst) in arg_triples {
+        match kind {
+            JitArgKind::Int => {
+                callee.registers_i[callee_dst] = bh.registers_i[caller_src];
+            }
+            JitArgKind::Ref => {
+                callee.registers_r[callee_dst] = bh.registers_r[caller_src];
+            }
+            JitArgKind::Float => {
+                callee.registers_f[callee_dst] = bh.registers_f[caller_src];
+            }
+        }
+    }
+
+    // RPython `bhimpl_inline_call_*` calls `cpu.bh_call_*(jitcode.fnaddr,
+    // ...)` directly, so any `JitException` (`ContinueRunningNormally`,
+    // `DoneWithThisFrame*`, `ExitFrameWithExceptionRef`) raised by the
+    // callee bubbles up to the portal runner via the C-level call
+    // (`blackhole.py:1623`).  pyre's nested interpreter executes the
+    // sub-jitcode in-process, so we have to re-raise
+    // `ContinueRunningNormally` ourselves; otherwise a callee that hits a
+    // recursive merge point silently completes "normally" and the parent
+    // frame never sees the portal-restart signal.
+    //
+    // RPython's generic `dispatch_loop` wrapper (`blackhole.py:171`)
+    // sets `self.position = position` AFTER decoding operands/result
+    // and BEFORE re-raising, so the parent frame's post-exception
+    // inspectors see the post-op cursor.  Mirror that invariant here:
+    // sync `bh.position` to the operand-decoded post-op `p` before
+    // propagating the JitException.
+    if let Some(args) = callee.run() {
+        bh.position = p;
+        return Err(DispatchError::ContinueRunningNormally(args));
+    }
+
+    // RPython `blackhole.py:171` invariant: after the handler has
+    // decoded operands and consumed the result payload, every
+    // exceptional exit path must update `self.position` to the
+    // post-op cursor before re-raising.  Mirror that here for the
+    // aborted / got_exception paths — `dispatch_step_with_fallback`
+    // (`blackhole.rs:1993`) only writes `self.position = new_pos`
+    // when the handler returns `Ok`, so any `Err(LeaveFrame)` that
+    // skips the assignment leaves the parent's cursor pre-op.
+    if callee.aborted {
+        bh.position = p;
+        bh.aborted = true;
+        return Err(DispatchError::LeaveFrame);
+    }
+    if callee.got_exception {
+        bh.position = p;
+        let exc_val = callee.exception_last_value;
+        // `handle_exception_in_frame` peeks at `bh.position` to look
+        // for an immediately-following `catch_exception/L`; on a
+        // successful handler dispatch it moves `bh.position` to the
+        // catch target — propagate that.
+        if exc_val != 0 && bh.handle_exception_in_frame(exc_val) {
+            return Ok(bh.position);
+        }
+        bh.exception_last_value = exc_val;
+        bh.got_exception = true;
+        return Err(DispatchError::LeaveFrame);
+    }
+
+    if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
+        match return_kind {
+            JitArgKind::Int => {
+                let caller_dst = return_i.expect("inline int return missing caller destination");
+                bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
+            }
+            JitArgKind::Ref => {
+                let caller_dst = return_r.expect("inline ref return missing caller destination");
+                bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
+            }
+            JitArgKind::Float => {
+                let caller_dst = return_f.expect("inline float return missing caller destination");
+                bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
+            }
+        }
+    }
+
+    Ok(p)
+}
+
+/// Mirror of `BlackholeInterpreter::decode_return_slot` for handler
+/// callsites that thread a local cursor instead of mutating
+/// `self.position`.  `u16::MAX` encodes the "no caller destination"
+/// sentinel.
+fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
+    let dst = jitcode::read_u16(code, cursor) as usize;
+    if dst == u16::MAX as usize {
+        None
+    } else {
+        Some(dst)
+    }
+}
+
 // recursive_call — stub (needs portal runner)
 /// RPython `blackhole.py:1095-1099` `get_portal_runner(jdindex)`:
 /// Returns (fnptr, calldescr) from jitdrivers_sd[jdindex].

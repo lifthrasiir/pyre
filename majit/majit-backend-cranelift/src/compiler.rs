@@ -2931,16 +2931,17 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             }
             // Non-loop-reentry: materialize virtuals then dispatch.
             let mut mat_outputs = outputs.clone();
+            let fail_arg_types = fail_descr.fail_arg_types();
             rebuild_state_after_failure(
                 &mut mat_outputs,
-                fail_descr.fail_arg_types(),
+                fail_arg_types,
                 fail_descr.recovery_layout_ref().as_ref(),
                 bridge.num_inputs,
             );
             return CraneliftBackend::execute_bridge(
                 bridge,
                 &mat_outputs,
-                fail_descr.fail_arg_types(),
+                fail_arg_types,
                 &attachments,
             );
         }
@@ -3310,18 +3311,15 @@ fn call_assembler_fast_path_heap(
         // rebuild_state_after_failure decodes recovery_layout to match
         // what the bridge tracer saw via rebuild_from_resumedata.
         let mut bridge_outputs = outputs;
+        let fail_arg_types = fail_descr.fail_arg_types();
         rebuild_state_after_failure(
             &mut bridge_outputs,
-            fail_descr.fail_arg_types(),
+            fail_arg_types,
             fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
-        let mut frame = CraneliftBackend::execute_bridge(
-            bridge,
-            &bridge_outputs,
-            fail_descr.fail_arg_types(),
-            &attachments,
-        );
+        let mut frame =
+            CraneliftBackend::execute_bridge(bridge, &bridge_outputs, fail_arg_types, &attachments);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {

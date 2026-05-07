@@ -298,8 +298,9 @@ fn helper_policy_tokens_for_fn(
     trace_target_name: Option<&Ident>,
     concrete_target_name: Option<&Ident>,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    let unsupported_byte = jit_interp::call_policy_byte::UNSUPPORTED;
     let unsupported = quote! {
-        (0u8, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null())
+        (#unsupported_byte, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null())
     };
     let (Some(trace_target_name), Some(concrete_target_name)) =
         (trace_target_name, concrete_target_name)
@@ -313,62 +314,110 @@ fn helper_policy_tokens_for_fn(
     // other helper attribute that flows through here advertises null and
     // the parent `#[jit_interp]` lowerer's inferred-policy site
     // (`jitcode_lower.rs::CallPolicySpec::Infer`) skips the call.
+    use jit_interp::call_policy_byte::{
+        INT_DONT_LOOK_INSIDE, INT_DONT_LOOK_INSIDE_CANNOT_RAISE, INT_ELIDABLE,
+        INT_ELIDABLE_CANNOT_RAISE, INT_ELIDABLE_OR_MEMERROR, INT_LOOP_INVARIANT, INT_MAY_FORCE,
+        INT_RELEASE_GIL, REF_DONT_LOOK_INSIDE, REF_DONT_LOOK_INSIDE_CANNOT_RAISE, REF_ELIDABLE,
+        REF_ELIDABLE_CANNOT_RAISE, REF_ELIDABLE_OR_MEMERROR, REF_LOOP_INVARIANT, REF_MAY_FORCE,
+        UNSUPPORTED, VOID_DONT_LOOK_INSIDE, VOID_DONT_LOOK_INSIDE_CANNOT_RAISE,
+        VOID_LOOP_INVARIANT, VOID_MAY_FORCE, VOID_RELEASE_GIL,
+    };
     match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => Ok(match attr_name {
             "dont_look_inside" => quote! {
-                (1u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            // `call.py:303 getcalldescr`'s non-elidable `else` branch —
+            // EF_CANNOT_RAISE for void-return helpers.  Same dispatch
+            // surface as `dont_look_inside` (residual call), but the
+            // recording walker uses `CANNOT_RAISE_EFFECT_INFO` so no
+            // trailing `-live-` is required.
+            "dont_look_inside_cannot_raise" => quote! {
+                (#VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_may_force" => quote! {
-                (9u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_release_gil" => quote! {
-                (13u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_loop_invariant" => quote! {
-                (17u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
         HelperCallKind::Int => Ok(match attr_name {
             "elidable" => quote! {
-                (3u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             // call.py:299 elidable && _canraise(op) == False — EF_ELIDABLE_CANNOT_RAISE.
             "elidable_cannot_raise" => quote! {
-                (19u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             // call.py:295 elidable && _canraise(op) == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
             "elidable_or_memerror" => quote! {
-                (20u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "dont_look_inside" => quote! {
-                (2u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            // `call.py:303` non-elidable EF_CANNOT_RAISE for int-return helpers.
+            "dont_look_inside_cannot_raise" => quote! {
+                (#INT_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_may_force" => quote! {
-                (10u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_release_gil" => quote! {
-                (14u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_RELEASE_GIL, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             "jit_loop_invariant" => quote! {
-                (18u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
         HelperCallKind::Ref => Ok(match attr_name {
-            // RPython rewrite_call() bakes the result kind into the opname.
-            // Our infer path cannot recover a static ref-return BindingKind,
-            // so keep the call targets for explicit wrapped policies but do
-            // not advertise a value-call policy code here.
-            "elidable"
-            | "elidable_cannot_raise"
-            | "elidable_or_memerror"
-            | "dont_look_inside"
-            | "jit_may_force"
-            | "jit_release_gil"
-            | "jit_loop_invariant" => quote! {
-                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            // `lower_call_*` cannot recover a static ref-return
+            // `BindingKind` from these bytes and therefore still
+            // dispatches the residual_call builder family from the
+            // explicit-policy match.  However, the cond_call /
+            // record_known_result lowerers know the binding kind
+            // from the leading argument, so for them the policy byte
+            // identifies both the `EffectInfoSlot` and the PyPy
+            // getcalldescr checks that must run before registering the
+            // descr (result-kind match, forces/release-gil rejection,
+            // loop-invariant no-args assertion).
+            "elidable" => quote! {
+                (#REF_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
+            "elidable_cannot_raise" => quote! {
+                (#REF_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            "elidable_or_memerror" => quote! {
+                (#REF_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            "jit_loop_invariant" => quote! {
+                (#REF_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            "dont_look_inside" => quote! {
+                (#REF_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            // `call.py:303` non-elidable EF_CANNOT_RAISE for ref-return helpers.
+            // Closes the audit's Item 4 parity-divergence (ref dont_look_inside
+            // mapping to CanRaise).  Existing `dont_look_inside` (REF_DONT_LOOK_INSIDE)
+            // stays CanRaise (conservative default for residuals whose annotation
+            // is unknown); REF_DONT_LOOK_INSIDE_CANNOT_RAISE is the explicit
+            // cannot-raise opt-in.
+            "dont_look_inside_cannot_raise" => quote! {
+                (#REF_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            "jit_may_force" => quote! {
+                (#REF_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+            },
+            // RPython `resoperation.py:1238-1248` has
+            // CALL_RELEASE_GIL_I/F/N only; ref-return release-gil calls
+            // assert instead of producing CALL_RELEASE_GIL_R.
+            "jit_release_gil" => unsupported,
             _ => unsupported,
         }),
         HelperCallKind::Float => Ok(match attr_name {
@@ -379,10 +428,11 @@ fn helper_policy_tokens_for_fn(
             | "elidable_cannot_raise"
             | "elidable_or_memerror"
             | "dont_look_inside"
+            | "dont_look_inside_cannot_raise"
             | "jit_may_force"
             | "jit_release_gil"
             | "jit_loop_invariant" => quote! {
-                (0u8, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
+                (#UNSUPPORTED, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
             },
             _ => unsupported,
         }),
@@ -743,6 +793,27 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 /// marker constant that the tracer can detect at compile time.
 #[proc_macro_attribute]
 pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_dont_look_inside_attribute(item, "dont_look_inside")
+}
+
+/// `#[dont_look_inside_cannot_raise]` — non-elidable opaque helper that
+/// the user statically guarantees does not raise.  Maps to
+/// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable `else`
+/// branch), so the recording walker skips the trailing `-live-` marker
+/// and the produced calldescr's `EffectInfo` matches PyPy's
+/// `CANNOT_RAISE_EFFECT_INFO`.
+///
+/// Use when `#[dont_look_inside]` is parity-conservative: the function
+/// is opaque to the tracer (RPython annotation analysis would mark it
+/// as `EF_CANNOT_RAISE`) but pyre lacks the analyzer.  This attribute
+/// provides explicit user opt-in for the cannot-raise effect-info
+/// pending the analyzer's port (Task #64).
+#[proc_macro_attribute]
+pub fn dont_look_inside_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise")
+}
+
+fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
     let attrs = &func.attrs;
     let vis = &func.vis;
@@ -761,7 +832,7 @@ pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
         &policy_path,
         match helper_policy_tokens_for_fn(
             &func,
-            "dont_look_inside",
+            attr_name,
             trace_target_name.as_ref(),
             concrete_target_name.as_ref(),
         ) {
@@ -1320,8 +1391,10 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // parity for int-return inline helpers; ref/float inline helpers must go
     // through explicit `inline_ref` / `inline_float` policies.
     let inferred_policy_code: u8 = match helper.return_kind {
-        InlineReturnKind::Int => 4,
-        InlineReturnKind::Ref | InlineReturnKind::Float => 0,
+        InlineReturnKind::Int => jit_interp::call_policy_byte::INT_INLINE,
+        InlineReturnKind::Ref | InlineReturnKind::Float => {
+            jit_interp::call_policy_byte::UNSUPPORTED
+        }
     };
     let inferred_inline_builder = match helper.return_kind {
         InlineReturnKind::Int => quote! { #helper_with_asm_name as *const () },
@@ -1493,6 +1566,7 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "elidable_or_memerror",
     "elidable_promote",
     "dont_look_inside",
+    "dont_look_inside_cannot_raise",
     "unroll_safe",
     "loop_invariant",
     "not_in_trace",

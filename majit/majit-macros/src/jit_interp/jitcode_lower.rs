@@ -3,6 +3,14 @@ use std::collections::{BTreeSet, HashMap};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+use super::call_policy_byte::{
+    INT_DONT_LOOK_INSIDE, INT_DONT_LOOK_INSIDE_CANNOT_RAISE, INT_ELIDABLE,
+    INT_ELIDABLE_CANNOT_RAISE, INT_ELIDABLE_OR_MEMERROR, INT_INLINE, INT_LOOP_INVARIANT,
+    INT_MAY_FORCE, INT_RELEASE_GIL, REF_DONT_LOOK_INSIDE, REF_DONT_LOOK_INSIDE_CANNOT_RAISE,
+    REF_ELIDABLE, REF_ELIDABLE_CANNOT_RAISE, REF_ELIDABLE_OR_MEMERROR, REF_LOOP_INVARIANT,
+    REF_MAY_FORCE, VOID_DONT_LOOK_INSIDE, VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, VOID_LOOP_INVARIANT,
+    VOID_MAY_FORCE, VOID_RELEASE_GIL,
+};
 use super::codegen_trace::is_promote_call_path;
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprCast, ExprIf, ExprLit,
@@ -196,9 +204,12 @@ fn call_policy_effect_slot(kind: crate::jit_interp::CallPolicyKind) -> Option<Co
         | K::ResidualRefWrapped
         | K::ResidualFloatWrapped => Some(CondCallEffectSlot::CanRaise),
 
-        K::ResidualVoidCannotRaise | K::ResidualVoidCannotRaiseWrapped => {
-            Some(CondCallEffectSlot::CannotRaise)
-        }
+        K::ResidualVoidCannotRaise
+        | K::ResidualVoidCannotRaiseWrapped
+        | K::ResidualIntCannotRaise
+        | K::ResidualIntCannotRaiseWrapped
+        | K::ResidualRefCannotRaiseWrapped
+        | K::ResidualFloatCannotRaiseWrapped => Some(CondCallEffectSlot::CannotRaise),
 
         K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
@@ -253,6 +264,8 @@ fn call_policy_result_kind(kind: crate::jit_interp::CallPolicyKind) -> Option<Ca
 
         K::ResidualInt
         | K::ResidualIntWrapped
+        | K::ResidualIntCannotRaise
+        | K::ResidualIntCannotRaiseWrapped
         | K::MayForceInt
         | K::MayForceIntWrapped
         | K::ReleaseGilInt
@@ -268,6 +281,7 @@ fn call_policy_result_kind(kind: crate::jit_interp::CallPolicyKind) -> Option<Ca
         | K::InlineInt => Some(CallResultKind::Int),
 
         K::ResidualRefWrapped
+        | K::ResidualRefCannotRaiseWrapped
         | K::MayForceRefWrapped
         | K::LoopInvariantRefWrapped
         | K::ElidableRefWrapped
@@ -276,6 +290,7 @@ fn call_policy_result_kind(kind: crate::jit_interp::CallPolicyKind) -> Option<Ca
         | K::InlineRef => Some(CallResultKind::Ref),
 
         K::ResidualFloatWrapped
+        | K::ResidualFloatCannotRaiseWrapped
         | K::MayForceFloatWrapped
         | K::ReleaseGilFloatWrapped
         | K::LoopInvariantFloatWrapped
@@ -296,6 +311,7 @@ fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) -> bool {
             | K::ReleaseGilVoidWrapped
             | K::LoopInvariantVoidWrapped
             | K::ResidualIntWrapped
+            | K::ResidualIntCannotRaiseWrapped
             | K::MayForceIntWrapped
             | K::ReleaseGilIntWrapped
             | K::LoopInvariantIntWrapped
@@ -303,12 +319,14 @@ fn call_policy_is_wrapped(kind: crate::jit_interp::CallPolicyKind) -> bool {
             | K::ElidableIntCannotRaiseWrapped
             | K::ElidableIntOrMemerrorWrapped
             | K::ResidualRefWrapped
+            | K::ResidualRefCannotRaiseWrapped
             | K::MayForceRefWrapped
             | K::LoopInvariantRefWrapped
             | K::ElidableRefWrapped
             | K::ElidableRefCannotRaiseWrapped
             | K::ElidableRefOrMemerrorWrapped
             | K::ResidualFloatWrapped
+            | K::ResidualFloatCannotRaiseWrapped
             | K::MayForceFloatWrapped
             | K::ReleaseGilFloatWrapped
             | K::LoopInvariantFloatWrapped
@@ -325,6 +343,203 @@ fn call_result_matches_binding(result_kind: CallResultKind, binding_kind: Bindin
             | (CallResultKind::Ref, BindingKind::Ref)
             | (CallResultKind::Float, BindingKind::Float)
     )
+}
+
+/// Build the runtime guard that wraps `live_placeholder*` for an
+/// inferred-policy callee.  See [`LiveMarkerCondition`] for the
+/// PRE-EXISTING-ADAPTATION rationale and the convergence path
+/// (Tasks #146/#235) that retires this wrapper.
+fn inferred_policy_live_condition(func: &Expr, can_raise_codes: &[u8]) -> TokenStream {
+    let policy_path =
+        helper_policy_path(func).expect("inferred helper policy requires a path expression");
+    let patterns = can_raise_codes
+        .iter()
+        .copied()
+        .map(|code| quote! { #code })
+        .collect::<Vec<_>>();
+    if patterns.is_empty() {
+        return quote! { false };
+    }
+    quote! {{
+        let (__policy, _, _, _, _) = #policy_path();
+        matches!(__policy, #(#patterns)|*)
+    }}
+}
+
+fn inferred_conditional_call_policy_check(func_args_empty: bool) -> TokenStream {
+    let loop_invariant_arm = if func_args_empty {
+        quote! { #VOID_LOOP_INVARIANT => {} }
+    } else {
+        quote! {
+            #VOID_LOOP_INVARIANT => panic!(
+                "conditional_call!: arguments not supported for loop-invariant function",
+            )
+        }
+    };
+    quote! {
+        match __policy {
+            // Void-return, non-forcing calldescrs accepted by
+            // jtransform.py:1677.  `VOID_DONT_LOOK_INSIDE_CANNOT_RAISE`
+            // is the EF_CANNOT_RAISE void surface; jtransform's gate
+            // accepts both EF_CAN_RAISE and EF_CANNOT_RAISE — the
+            // latter just skips the trailing `-live-` per
+            // `jtransform.py:1681 calldescr_canraise`.
+            #VOID_DONT_LOOK_INSIDE | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE => {},
+            #loop_invariant_arm,
+            // Void-return but rejected by jtransform.py:1677's
+            // `check_forces_virtual_or_virtualizable` gate or by the
+            // release-gil structural surface.
+            #VOID_MAY_FORCE | #VOID_RELEASE_GIL => panic!(
+                "conditional_call! cannot dispatch MayForce / ReleaseGil callees",
+            ),
+            // PyPy `call.py:getcalldescr` checks actual return type before
+            // effect flags; `conditional_call!` is the void-result opcode.
+            #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE | #INT_MAY_FORCE | #INT_RELEASE_GIL
+            | #INT_LOOP_INVARIANT | #INT_ELIDABLE_CANNOT_RAISE | #INT_ELIDABLE_OR_MEMERROR
+            | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE
+            | #REF_ELIDABLE | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
+            | #REF_LOOP_INVARIANT | #REF_DONT_LOOK_INSIDE | #REF_MAY_FORCE => panic!(
+                "conditional_call! requires a void-return helper policy",
+            ),
+            _ => panic!(
+                "conditional_call! could not infer a PyPy-compatible helper policy",
+            ),
+        }
+    }
+}
+
+fn inferred_conditional_call_value_policy_check(
+    value_kind: BindingKind,
+    func_args_empty: bool,
+) -> TokenStream {
+    match value_kind {
+        BindingKind::Int => {
+            let loop_invariant_arm = if func_args_empty {
+                quote! { #INT_LOOP_INVARIANT => {} }
+            } else {
+                quote! {
+                    #INT_LOOP_INVARIANT => panic!(
+                        "conditional_call_elidable!: arguments not supported for loop-invariant function",
+                    )
+                }
+            };
+            quote! {
+                match __policy {
+                    // INT_DONT_LOOK_INSIDE_CANNOT_RAISE: int residual
+                    // EF_CANNOT_RAISE accepted on the int value branch
+                    // per `call.py:300`.
+                    #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE | #INT_ELIDABLE_CANNOT_RAISE
+                    | #INT_ELIDABLE_OR_MEMERROR | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE => {},
+                    #loop_invariant_arm,
+                    #INT_MAY_FORCE | #INT_RELEASE_GIL => panic!(
+                        "conditional_call_elidable! cannot dispatch MayForce / ReleaseGil callees",
+                    ),
+                    // VOID_DONT_LOOK_INSIDE_CANNOT_RAISE (28) and
+                    // REF_DONT_LOOK_INSIDE_CANNOT_RAISE (30) are wrong
+                    // result kind for the int value branch.
+                    #VOID_DONT_LOOK_INSIDE | #VOID_MAY_FORCE | #VOID_RELEASE_GIL
+                    | #VOID_LOOP_INVARIANT | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
+                    | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE | #REF_ELIDABLE
+                    | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
+                    | #REF_LOOP_INVARIANT | #REF_DONT_LOOK_INSIDE | #REF_MAY_FORCE => panic!(
+                        "conditional_call_elidable! value/result kind mismatch for inferred helper policy",
+                    ),
+                    _ => panic!(
+                        "conditional_call_elidable! could not infer a PyPy-compatible helper policy",
+                    ),
+                }
+            }
+        }
+        BindingKind::Ref => {
+            let loop_invariant_arm = if func_args_empty {
+                quote! { #REF_LOOP_INVARIANT => {} }
+            } else {
+                quote! {
+                    #REF_LOOP_INVARIANT => panic!(
+                        "conditional_call_elidable!: arguments not supported for loop-invariant function",
+                    )
+                }
+            };
+            quote! {
+                match __policy {
+                    // REF_DONT_LOOK_INSIDE_CANNOT_RAISE: ref residual
+                    // EF_CANNOT_RAISE accepted on the ref value branch.
+                    #REF_ELIDABLE | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
+                    | #REF_DONT_LOOK_INSIDE | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE => {},
+                    #loop_invariant_arm,
+                    #REF_MAY_FORCE => panic!(
+                        "conditional_call_elidable! cannot dispatch MayForce callees",
+                    ),
+                    // VOID_DONT_LOOK_INSIDE_CANNOT_RAISE (28) and
+                    // INT_DONT_LOOK_INSIDE_CANNOT_RAISE (29) are wrong
+                    // result kind for the ref value branch.
+                    #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE
+                    | #VOID_MAY_FORCE | #INT_MAY_FORCE | #VOID_RELEASE_GIL | #INT_RELEASE_GIL
+                    | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
+                    | #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #INT_ELIDABLE_CANNOT_RAISE
+                    | #INT_ELIDABLE_OR_MEMERROR => panic!(
+                        "conditional_call_elidable! value/result kind mismatch for inferred helper policy",
+                    ),
+                    _ => panic!(
+                        "conditional_call_elidable! could not infer a PyPy-compatible helper policy",
+                    ),
+                }
+            }
+        }
+        BindingKind::Float => quote! {
+            panic!("Conditional call does not support floats");
+        },
+    }
+}
+
+fn inferred_record_known_result_policy_check(result_kind: BindingKind) -> TokenStream {
+    match result_kind {
+        BindingKind::Int => quote! {
+            match __policy {
+                #INT_ELIDABLE | #INT_ELIDABLE_CANNOT_RAISE | #INT_ELIDABLE_OR_MEMERROR => {},
+                // INT_DONT_LOOK_INSIDE_CANNOT_RAISE (29): int residual
+                // EF_CANNOT_RAISE — not elidable, rejected here.
+                #INT_DONT_LOOK_INSIDE | #INT_MAY_FORCE | #INT_RELEASE_GIL | #INT_LOOP_INVARIANT
+                | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE => panic!(
+                    "record_known_result! requires an elidable helper policy",
+                ),
+                #VOID_DONT_LOOK_INSIDE | #VOID_MAY_FORCE | #VOID_RELEASE_GIL
+                | #VOID_LOOP_INVARIANT | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
+                | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE | #REF_ELIDABLE
+                | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR
+                | #REF_LOOP_INVARIANT | #REF_DONT_LOOK_INSIDE | #REF_MAY_FORCE => panic!(
+                    "record_known_result! result kind mismatch for inferred helper policy",
+                ),
+                _ => panic!(
+                    "record_known_result! could not infer a PyPy-compatible helper policy",
+                ),
+            }
+        },
+        BindingKind::Ref => quote! {
+            match __policy {
+                #REF_ELIDABLE | #REF_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_OR_MEMERROR => {},
+                // REF_DONT_LOOK_INSIDE_CANNOT_RAISE (30): ref residual
+                // EF_CANNOT_RAISE — not elidable, rejected here.
+                #REF_LOOP_INVARIANT | #REF_DONT_LOOK_INSIDE | #REF_MAY_FORCE
+                | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE => panic!(
+                    "record_known_result! requires an elidable helper policy",
+                ),
+                #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #INT_ELIDABLE
+                | #VOID_MAY_FORCE | #INT_MAY_FORCE | #VOID_RELEASE_GIL | #INT_RELEASE_GIL
+                | #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
+                | #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #INT_ELIDABLE_CANNOT_RAISE
+                | #INT_ELIDABLE_OR_MEMERROR => panic!(
+                    "record_known_result! result kind mismatch for inferred helper policy",
+                ),
+                _ => panic!(
+                    "record_known_result! could not infer a PyPy-compatible helper policy",
+                ),
+            }
+        },
+        BindingKind::Float => quote! {
+            panic!("record_known_result does not support floats");
+        },
+    }
 }
 
 impl LowererConfig {
@@ -641,6 +856,37 @@ enum ControlFlowClass {
     LabelDef,
 }
 
+/// PRE-EXISTING-ADAPTATION (no upstream counterpart).
+///
+/// `rpython/jit/codewriter/liveness.py:82-116`'s `-live-` is always
+/// unconditional; `jtransform.py:311-312` decides whether to emit one at
+/// translation time from `calldescr_canraise(calldescr)`, which is
+/// statically known once the calldescr is built.  pyre's macro expansion
+/// sees only a runtime helper-policy byte (`__majit_call_policy_<name>()`)
+/// for inferred-policy callees because cross-crate proc macros cannot read
+/// another crate's proc-macro-generated function at expand time, so the
+/// emit decision is deferred to a runtime guard wrapped around
+/// `live_placeholder*`.  `remove_repeated_live` merges adjacent markers
+/// only when the run contains at least one unconditional marker (which
+/// guarantees emit at this position, so unioning the conditional
+/// siblings' reads is safe); a run consisting entirely of conditional
+/// markers stays unmerged so that each marker's BC_LIVE captures only
+/// its own alive set when its condition holds — unioning them would
+/// over-capture vs PyPy's per-site `liveness.py:111-115`
+/// `liveset.update(live[1:])` (which only sees `-live-`s that actually
+/// exist).  Convergence path: once the ann/rtyper EffectInfo
+/// infrastructure (Tasks #146/#235) exposes the helper's analyzer
+/// outcome at expand time, this conditional surface retires and
+/// `LiveMarkerCondition` plus `live_marker_if` /
+/// `inferred_policy_live_condition` can be removed.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct LiveMarkerCondition {
+    /// Boolean expression evaluated both in the JitCode builder body and in
+    /// the liveness prebuild body.
+    emit: TokenStream,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct OpMeta {
@@ -657,6 +903,11 @@ struct OpMeta {
     /// `-live-` marker TLabel operands. RPython stores every TLabel in
     /// the instruction tuple; a marker can carry more than one.
     live_target_labels: Vec<Ident>,
+    /// Optional guard for the physical `BC_LIVE` emission.  Unconditional
+    /// markers match normal RPython ssarepr.  Conditional markers are the
+    /// strict-parity bridge for inferred helper policies whose can-raise
+    /// answer is represented by a runtime policy byte.
+    live_condition: Option<LiveMarkerCondition>,
     control: ControlFlowClass,
 }
 
@@ -664,6 +915,15 @@ struct OpMeta {
 impl OpMeta {
     fn live_marker() -> Self {
         Self::live_marker_with(Vec::new(), Vec::new())
+    }
+
+    /// Conditional `-live-` for inferred-policy callees.  See
+    /// [`LiveMarkerCondition`] for the PRE-EXISTING-ADAPTATION rationale
+    /// and convergence path.
+    fn live_marker_if(condition: TokenStream) -> Self {
+        let mut marker = Self::live_marker();
+        marker.live_condition = Some(LiveMarkerCondition { emit: condition });
+        marker
     }
 
     /// `-live-` marker carrying explicit force-alive register args and/or
@@ -682,6 +942,7 @@ impl OpMeta {
             writes: Vec::new(),
             target_label: None,
             live_target_labels,
+            live_condition: None,
             control: ControlFlowClass::LiveMarker,
         }
     }
@@ -696,6 +957,7 @@ impl OpMeta {
             writes,
             target_label: None,
             live_target_labels: Vec::new(),
+            live_condition: None,
             control: ControlFlowClass::Linear,
         }
     }
@@ -708,6 +970,7 @@ impl OpMeta {
             writes: Vec::new(),
             target_label: Some(target),
             live_target_labels: Vec::new(),
+            live_condition: None,
             control: ControlFlowClass::UnconditionalJump,
         }
     }
@@ -721,6 +984,7 @@ impl OpMeta {
             writes: Vec::new(),
             target_label: Some(target),
             live_target_labels: Vec::new(),
+            live_condition: None,
             control: ControlFlowClass::ConditionalGuard,
         }
     }
@@ -734,6 +998,7 @@ impl OpMeta {
             writes: Vec::new(),
             target_label: Some(target),
             live_target_labels: Vec::new(),
+            live_condition: None,
             control: ControlFlowClass::LabelDef,
         }
     }
@@ -747,6 +1012,7 @@ impl OpMeta {
             writes: Vec::new(),
             target_label: None,
             live_target_labels: Vec::new(),
+            live_condition: None,
             control: ControlFlowClass::Linear,
         }
     }
@@ -1002,12 +1268,22 @@ fn liveness_prebuild_tokens(
             return None;
         }
         let (live_i, live_r, live_f) = liveness_triple_from_reads(&m.reads);
-        Some(quote! {
+        let register = quote! {
             let _ = __asm._register_liveness_offset(
                 &[#(#live_i),*],
                 &[#(#live_r),*],
                 &[#(#live_f),*],
             );
+        };
+        Some(if let Some(condition) = m.live_condition.as_ref() {
+            let condition = condition.emit.clone();
+            quote! {
+                if #condition {
+                    #register
+                }
+            }
+        } else {
+            register
         })
     });
     quote! {
@@ -1071,10 +1347,40 @@ fn remove_repeated_live(op_metadata: &mut Vec<OpMeta>, statements: &mut Vec<Toke
             new_stmts.push(statements[first_marker_idx].clone());
             continue;
         }
-        // Multiple markers: union their `reads` registers per RPython
-        // `liveness.py:111-115 liveset.update(live[1:])`. Union typed
-        // Register reads as a single bag (Ord = (kind, index)) and union
-        // `live_target_labels` separately.
+        // PRE-EXISTING-ADAPTATION: `liveness.py:82-116 remove_repeated_live`
+        // unions the `reads` of every marker in the run because every
+        // upstream marker actually fires (RPython has no conditional
+        // emission).  pyre's `live_marker_if` markers exist or not at
+        // runtime depending on the helper-policy byte
+        // (`__majit_call_policy_<name>()`), so unioning their reads here
+        // would over-capture: when only one condition holds at runtime,
+        // the merged BC_LIVE would still pin the union of the
+        // would-have-fired siblings' alive sets.  When the run contains
+        // any unconditional marker the merged BC_LIVE is guaranteed to
+        // fire (PyPy parity), so unioning is safe and the merged marker
+        // becomes unconditional.  When every marker is conditional, fall
+        // back to keeping them unmerged — each emits its own BC_LIVE
+        // only when its own condition holds, matching PyPy's per-site
+        // alive-set capture (at the cost of skipping `liveness.py:82`'s
+        // dedup, which `production` doesn't trigger anyway because the
+        // lowerer emits at most one marker per call/guard site).
+        if markers
+            .iter()
+            .all(|mi| op_metadata[*mi].live_condition.is_some())
+        {
+            for idx in first_marker_idx..i {
+                new_meta.push(op_metadata[idx].clone());
+                new_stmts.push(statements[idx].clone());
+            }
+            continue;
+        }
+        // Multiple markers with at least one unconditional: union their
+        // `reads` registers per RPython `liveness.py:111-115
+        // liveset.update(live[1:])`.  Union typed Register reads as a
+        // single bag (Ord = (kind, index)) and union
+        // `live_target_labels` separately.  Result is unconditional —
+        // the unconditional sibling forces emit, so the conditional
+        // siblings' reads fold in at this fully-fired position.
         let mut merged_reads: Vec<Register> = Vec::new();
         let mut merged_labels: Vec<Ident> = Vec::new();
         for mi in &markers {
@@ -1086,15 +1392,19 @@ fn remove_repeated_live(op_metadata: &mut Vec<OpMeta>, statements: &mut Vec<Toke
         merged_reads.dedup();
         merged_labels.sort_by_key(|label| label.to_string());
         merged_labels.dedup_by_key(|label| label.to_string());
+        let merged_marker = OpMeta::live_marker_with(merged_reads, merged_labels);
         for li in &interleaved_labels {
             new_meta.push(op_metadata[*li].clone());
             new_stmts.push(statements[*li].clone());
         }
-        new_meta.push(OpMeta::live_marker_with(merged_reads, merged_labels));
+        new_meta.push(merged_marker);
         // Reuse the first marker's statement token (a single
         // `live_placeholder()` call); the duplicated runs don't survive
         // the collapse since RPython prints just one `-live-` for the
-        // whole run.
+        // whole run.  `rewrite_live_marker_statements_with_triples`
+        // (later pass) overwrites the body — the merged marker's
+        // `live_condition` is `None` so the rewrite emits an
+        // unconditional `live_placeholder_with_triple(...)`.
         new_stmts.push(statements[first_marker_idx].clone());
     }
     *op_metadata = new_meta;
@@ -1139,12 +1449,22 @@ fn rewrite_live_marker_statements_with_triples(
         }
         let (live_i, live_r, live_f) = liveness_triple(&live_sets[next_marker]);
         next_marker += 1;
-        statements[i] = quote! {
+        let live_stmt = quote! {
             let _ = __builder.live_placeholder_with_triple(
                 &[#(#live_i),*],
                 &[#(#live_r),*],
                 &[#(#live_f),*],
             );
+        };
+        statements[i] = if let Some(condition) = m.live_condition.as_ref() {
+            let condition = condition.emit.clone();
+            quote! {
+                if #condition {
+                    #live_stmt
+                }
+            }
+        } else {
+            live_stmt
         };
     }
     debug_assert_eq!(
@@ -1357,11 +1677,17 @@ impl<'c> Lowerer<'c> {
     /// `helper_policy_path` but no explicit `calls={{ helper => ... }}`
     /// entry — RPython's `getcalldescr` (`call.py:282-303`) derives
     /// `extraeffect` from the call graph regardless of any user
-    /// annotation, so a missing explicit policy must not crash.  The
-    /// `inferred_default` is the macro's analyzer-absent fallback (e.g.
-    /// `ResidualVoidWrapped` for `conditional_call!`); the trailing
-    /// `-live-` emission will still be correct because the default's
-    /// slot is `CanRaise`, which `slot.can_raise()` reports true.
+    /// annotation, so a missing explicit policy must not crash.
+    ///
+    /// Returns `(kind, is_inferred)`.  The `kind` is the
+    /// `CallPolicyKind` to drive expansion-time decisions (result-kind
+    /// dispatch, wrapped-vs-direct registration shape, the
+    /// `record_known_result!` elidable assert).  When `is_inferred` is
+    /// true, the runtime `__policy` byte from the helper's
+    /// `_jit_helper_policy` accessor reflects the actual analyzer
+    /// outcome, and the registration code below picks the matching
+    /// `EffectInfoSlot` at runtime instead of trusting the static
+    /// default.
     ///
     /// Panics only when no helper-policy path exists at all — in that
     /// case the macro literally cannot register the function pointer.
@@ -1370,10 +1696,10 @@ impl<'c> Lowerer<'c> {
         func: &Expr,
         macro_name: &str,
         inferred_default: crate::jit_interp::CallPolicyKind,
-    ) -> crate::jit_interp::CallPolicyKind {
+    ) -> (crate::jit_interp::CallPolicyKind, bool) {
         match self.resolve_call_policy(func) {
-            Some(CallPolicySpec::Explicit(kind)) => kind,
-            Some(CallPolicySpec::Infer) => inferred_default,
+            Some(CallPolicySpec::Explicit(kind)) => (kind, false),
+            Some(CallPolicySpec::Infer) => (inferred_default, true),
             None => {
                 panic!(
                     "{macro_name} cannot resolve a helper policy for the callee — \
@@ -1404,13 +1730,79 @@ impl<'c> Lowerer<'c> {
         func: &Expr,
         kind: crate::jit_interp::CallPolicyKind,
         slot: CondCallEffectSlot,
+        is_inferred: bool,
+        inferred_policy_check: Option<TokenStream>,
     ) -> TokenStream {
-        let slot_token = slot.token();
+        let static_slot_token = slot.token();
+        // For `Infer` mode, the helper's `_jit_helper_policy` byte is
+        // the macro-time stand-in for RPython's `_canraise` /
+        // `_elidable_function_` / `_jit_loop_invariant_` analyzers
+        // (`call.py:282-303 getcalldescr`).  Map it to the matching
+        // `EffectInfoSlot` at runtime so an auto-discovered
+        // `#[elidable_cannot_raise]` helper used without an explicit
+        // `calls = { ... }` entry still registers an
+        // `ElidableCannotRaise` slot — matching what an explicit
+        // policy would have given.
+        //
+        // Bytes are allocated by `helper_policy_tokens_for_fn`
+        // (`majit-macros/src/lib.rs`):
+        //   1u8/2u8 — `dont_look_inside` Void/Int (`Plain`).
+        //   3u8 — `elidable` Int.
+        //   17u8/18u8 — `jit_loop_invariant` Void/Int.
+        //   19u8 — `elidable_cannot_raise` Int.
+        //   20u8 — `elidable_or_memerror` Int.
+        //   21u8/22u8/23u8 — `elidable*` Ref.
+        //   24u8 — `jit_loop_invariant` Ref.
+        //   25u8 — `dont_look_inside` Ref (`Plain`).
+        //   26u8 — Ref `MayForce` (rejected here). Ref `ReleaseGil` has
+        //   no upstream CALL_RELEASE_GIL_R and is emitted as unsupported.
+        //   9u8/10u8/13u8/14u8 — `MayForce` / `ReleaseGil` (rejected
+        //   by `cond_call_slot_for_policy`'s `jtransform.py:1677`
+        //   gate, but reach here at runtime — panic to match).
+        // Unknown bytes (including `0u8` "unsupported") are rejected by
+        // the call-site-specific inferred policy check before this slot is
+        // used.  The fallback is kept only for defensive expansion.
+        let slot_expr = if is_inferred {
+            quote! {
+                match __policy {
+                    #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #REF_DONT_LOOK_INSIDE => {
+                        majit_metainterp::EffectInfoSlot::CanRaise
+                    }
+                    // `call.py:303 getcalldescr` non-elidable EF_CANNOT_RAISE
+                    // (`#[dont_look_inside_cannot_raise]` opt-in for void/int/ref).
+                    #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
+                    | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE => {
+                        majit_metainterp::EffectInfoSlot::CannotRaise
+                    }
+                    #INT_ELIDABLE | #REF_ELIDABLE => majit_metainterp::EffectInfoSlot::ElidableCanRaise,
+                    #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #REF_LOOP_INVARIANT => {
+                        majit_metainterp::EffectInfoSlot::LoopInvariant
+                    }
+                    #INT_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_CANNOT_RAISE => {
+                        majit_metainterp::EffectInfoSlot::ElidableCannotRaise
+                    }
+                    #INT_ELIDABLE_OR_MEMERROR | #REF_ELIDABLE_OR_MEMERROR => {
+                        majit_metainterp::EffectInfoSlot::ElidableOrMemerror
+                    }
+                    #VOID_MAY_FORCE | #INT_MAY_FORCE | #VOID_RELEASE_GIL | #INT_RELEASE_GIL
+                    | #REF_MAY_FORCE => panic!(
+                        "conditional_call! / conditional_call_elidable! / record_known_result! \
+                         cannot dispatch MayForce / ReleaseGil callees \
+                         (jtransform.py:1677 _rewrite_op_cond_call assert)",
+                    ),
+                    _ => #static_slot_token,
+                }
+            }
+        } else {
+            static_slot_token
+        };
         if call_policy_is_wrapped(kind) {
             let policy_path =
                 helper_policy_path(func).expect("wrapped helper policy requires a path expression");
+            let inferred_policy_check = inferred_policy_check.unwrap_or_else(|| quote! {});
             quote! {
                 let (__policy, _inline_builder, __trace_target, __concrete_target, _prebuild) = #policy_path();
+                #inferred_policy_check
                 if __trace_target.is_null() && __concrete_target.is_null() {
                     panic!("wrapped helper policy requires generated call-target wrappers");
                 }
@@ -1427,12 +1819,12 @@ impl<'c> Lowerer<'c> {
                 let __fn_idx = __builder.add_call_target_with_slot(
                     __trace_target,
                     __concrete_target,
-                    #slot_token,
+                    #slot_expr,
                 );
             }
         } else {
             quote! {
-                let __fn_idx = __builder.add_fn_ptr_with_slot(#func as *const (), #slot_token);
+                let __fn_idx = __builder.add_fn_ptr_with_slot(#func as *const (), #slot_expr);
             }
         }
     }
@@ -1827,7 +2219,7 @@ impl<'c> Lowerer<'c> {
         // analyzer-absent CanRaise slot is the lowering's static slot;
         // the runtime helper-policy lookup overrides this for callees
         // whose flavor turns out otherwise.
-        let policy = self.cond_call_policy_or_inferred_default(
+        let (policy, is_inferred) = self.cond_call_policy_or_inferred_default(
             func_path,
             "conditional_call!",
             crate::jit_interp::CallPolicyKind::ResidualVoidWrapped,
@@ -1850,13 +2242,31 @@ impl<'c> Lowerer<'c> {
         // which doesn't share that assert. Mirror the check here so
         // a `conditional_call!(cond, loop_invariant_helper, arg)`
         // panics at expansion time instead of silently registering a
-        // bytecode shape RPython would reject at calldescr build.
-        if matches!(slot, CondCallEffectSlot::LoopInvariant) && !func_args.is_empty() {
+        // bytecode shape RPython would reject at calldescr build.  In
+        // `Infer` mode the slot is decided at runtime from `__policy`,
+        // so the static check only fires when the macro-time default
+        // resolves to LoopInvariant — explicit policy paths preserve
+        // the original eager assert.
+        if !is_inferred
+            && matches!(slot, CondCallEffectSlot::LoopInvariant)
+            && !func_args.is_empty()
+        {
             panic!(
                 "conditional_call!: arguments not supported for loop-invariant function (policy {policy:?})",
             );
         }
-        let register_target = self.call_target_registration_tokens(func_path, policy, slot);
+        let inferred_policy_check = if is_inferred {
+            Some(inferred_conditional_call_policy_check(func_args.is_empty()))
+        } else {
+            None
+        };
+        let register_target = self.call_target_registration_tokens(
+            func_path,
+            policy,
+            slot,
+            is_inferred,
+            inferred_policy_check,
+        );
         self.emit_op(
             OpMeta::linear(OpKind::Call, arg_regs, vec![]),
             quote! {
@@ -1865,8 +2275,17 @@ impl<'c> Lowerer<'c> {
             },
         );
         // `jtransform.py:1681-1683`: append `-live-` exactly when
-        // `calldescr_canraise(calldescr)` for the slot selected above.
-        if slot.can_raise() {
+        // `calldescr_canraise(calldescr)` for the selected calldescr.
+        // In inferred mode the physical BC_LIVE is guarded by the same
+        // helper-policy byte that selects the calldescr slot, preserving
+        // PyPy's cannot-raise / loop-invariant no-marker shape.
+        if is_inferred {
+            let condition = inferred_policy_live_condition(func_path, &[1]);
+            self.emit_op(
+                OpMeta::live_marker_if(condition),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        } else if slot.can_raise() {
             self.emit_op(
                 OpMeta::live_marker(),
                 quote! { let _ = __builder.live_placeholder(); },
@@ -1948,7 +2367,7 @@ impl<'c> Lowerer<'c> {
             BindingKind::Float => crate::jit_interp::CallPolicyKind::ElidableFloatWrapped,
             BindingKind::Int => crate::jit_interp::CallPolicyKind::ElidableIntWrapped,
         };
-        let policy = self.cond_call_policy_or_inferred_default(
+        let (policy, is_inferred) = self.cond_call_policy_or_inferred_default(
             func_path,
             "conditional_call_elidable!",
             inferred_default,
@@ -1969,12 +2388,31 @@ impl<'c> Lowerer<'c> {
         // `conditional_call_elidable!` accepts non-elidable cache-computing
         // helpers per `rlib/jit.py:1334-1336`, so a `LoopInvariant` slot is
         // legal in principle and must enforce the same args-empty rule.
-        if matches!(slot, CondCallEffectSlot::LoopInvariant) && !func_args.is_empty() {
+        // Static check applies only to explicit-policy paths; `Infer`
+        // resolves slot at runtime from the `__policy` byte.
+        if !is_inferred
+            && matches!(slot, CondCallEffectSlot::LoopInvariant)
+            && !func_args.is_empty()
+        {
             panic!(
                 "conditional_call_elidable!: arguments not supported for loop-invariant function (policy {policy:?})",
             );
         }
-        let register_target = self.call_target_registration_tokens(func_path, policy, slot);
+        let inferred_policy_check = if is_inferred {
+            Some(inferred_conditional_call_value_policy_check(
+                value_kind,
+                func_args.is_empty(),
+            ))
+        } else {
+            None
+        };
+        let register_target = self.call_target_registration_tokens(
+            func_path,
+            policy,
+            slot,
+            is_inferred,
+            inferred_policy_check,
+        );
         self.emit_op(
             OpMeta::linear(
                 OpKind::Call,
@@ -1991,7 +2429,20 @@ impl<'c> Lowerer<'c> {
         // still accepts non-elidable cache-computing helpers per
         // `rlib/jit.py:1334-1336`; their explicit policy maps to
         // `EffectInfoSlot::CanRaise` and therefore keeps the marker.
-        if slot.can_raise() {
+        // `Infer` resolves slot at runtime; guard the physical marker with
+        // the same can-raise policy cases instead of emitting a redundant
+        // PyPy-invisible marker.
+        if is_inferred {
+            let can_raise_codes: &[u8] = match value_kind {
+                BindingKind::Int => &[INT_DONT_LOOK_INSIDE, INT_ELIDABLE, INT_ELIDABLE_OR_MEMERROR],
+                BindingKind::Ref => &[REF_ELIDABLE, REF_ELIDABLE_OR_MEMERROR, REF_DONT_LOOK_INSIDE],
+                BindingKind::Float => &[],
+            };
+            self.emit_op(
+                OpMeta::live_marker_if(inferred_policy_live_condition(func_path, can_raise_codes)),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        } else if slot.can_raise() {
             self.emit_op(
                 OpMeta::live_marker(),
                 quote! { let _ = __builder.live_placeholder(); },
@@ -2073,7 +2524,7 @@ impl<'c> Lowerer<'c> {
             BindingKind::Float => crate::jit_interp::CallPolicyKind::ElidableFloatWrapped,
             BindingKind::Int => crate::jit_interp::CallPolicyKind::ElidableIntWrapped,
         };
-        let policy = self.cond_call_policy_or_inferred_default(
+        let (policy, is_inferred) = self.cond_call_policy_or_inferred_default(
             func_path,
             "record_known_result!",
             inferred_default,
@@ -2088,7 +2539,20 @@ impl<'c> Lowerer<'c> {
         if !slot.is_elidable() {
             panic!("record_known_result! requires an elidable helper policy, got {policy:?}");
         }
-        let register_target = self.call_target_registration_tokens(func_path, policy, slot);
+        let inferred_policy_check = if is_inferred {
+            Some(inferred_record_known_result_policy_check(
+                result_binding.kind,
+            ))
+        } else {
+            None
+        };
+        let register_target = self.call_target_registration_tokens(
+            func_path,
+            policy,
+            slot,
+            is_inferred,
+            inferred_policy_check,
+        );
         let result_typed = Register::new(result_binding.kind, result_reg);
         let mut reads = Vec::with_capacity(arg_regs.len() + 1);
         reads.push(result_typed);
@@ -2101,8 +2565,20 @@ impl<'c> Lowerer<'c> {
             },
         );
         // `jtransform.py:311-312`: append `-live-` exactly when the
-        // elidable calldescr can raise.
-        if slot.can_raise() {
+        // elidable calldescr can raise.  In inferred mode, guard the
+        // physical marker on the elidable-can-raise / memoryerror policy
+        // bytes instead of emitting one for elidable_cannot_raise.
+        if is_inferred {
+            let can_raise_codes: &[u8] = match result_binding.kind {
+                BindingKind::Int => &[INT_ELIDABLE, INT_ELIDABLE_OR_MEMERROR],
+                BindingKind::Ref => &[REF_ELIDABLE, REF_ELIDABLE_OR_MEMERROR],
+                BindingKind::Float => &[],
+            };
+            self.emit_op(
+                OpMeta::live_marker_if(inferred_policy_live_condition(func_path, can_raise_codes)),
+                quote! { let _ = __builder.live_placeholder(); },
+            );
+        } else if slot.can_raise() {
             self.emit_op(
                 OpMeta::live_marker(),
                 quote! { let _ = __builder.live_placeholder(); },
@@ -2402,6 +2878,33 @@ impl<'c> Lowerer<'c> {
                         );
                     }
                 }
+                // `call.py:303 getcalldescr` non-elidable EF_CANNOT_RAISE
+                // for int residuals.  Dispatches via the
+                // `_with_effect_info(CANNOT_RAISE_EFFECT_INFO)` builder
+                // method so the recorded calldescr's `EffectInfo`
+                // matches PyPy's `CANNOT_RAISE_EFFECT_INFO`.
+                crate::jit_interp::CallPolicyKind::ResidualIntCannotRaise => {
+                    let throwaway_reg = self.alloc_reg();
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::int(throwaway_reg)],
+                        ),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                __fn_idx,
+                                #typed_args,
+                                #throwaway_reg,
+                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                            );
+                        },
+                    );
+                }
                 crate::jit_interp::CallPolicyKind::ElidableInt
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
@@ -2540,6 +3043,7 @@ impl<'c> Lowerer<'c> {
                 // allocated (per-bank slot picked by JitCodeBuilder when the
                 // typed call dispatches) and never read.
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
@@ -2547,12 +3051,14 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualRefCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualFloatCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
@@ -2565,6 +3071,7 @@ impl<'c> Lowerer<'c> {
                     // Result bank — pick from the wrapped policy variant family.
                     let result_kind = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped
+                        | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                         | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
                         | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                         | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
@@ -2574,6 +3081,7 @@ impl<'c> Lowerer<'c> {
                             BindingKind::Int
                         }
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped
+                        | crate::jit_interp::CallPolicyKind::ResidualRefCannotRaiseWrapped
                         | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
                         | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
                         | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
@@ -2586,6 +3094,17 @@ impl<'c> Lowerer<'c> {
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
                             quote! { __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        // `call.py:303` non-elidable EF_CANNOT_RAISE int — wrapped.
+                        crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped => {
+                            quote! {
+                                __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #throwaway_reg,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
                             quote! { __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
@@ -2608,6 +3127,17 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
                             quote! { __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
+                        // `call.py:303` non-elidable EF_CANNOT_RAISE ref — wrapped.
+                        crate::jit_interp::CallPolicyKind::ResidualRefCannotRaiseWrapped => {
+                            quote! {
+                                __builder.residual_call_ref_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #throwaway_reg,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
+                        }
                         crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
                             quote! { __builder.call_may_force_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
                         }
@@ -2625,6 +3155,17 @@ impl<'c> Lowerer<'c> {
                         }
                         crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
                             quote! { __builder.residual_call_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
+                        }
+                        // `call.py:303` non-elidable EF_CANNOT_RAISE float — wrapped.
+                        crate::jit_interp::CallPolicyKind::ResidualFloatCannotRaiseWrapped => {
+                            quote! {
+                                __builder.residual_call_float_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #throwaway_reg,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
                             quote! { __builder.call_may_force_float_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg); }
@@ -2700,16 +3241,24 @@ impl<'c> Lowerer<'c> {
                         };
                         let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                         match __policy {
-                            1u8 => {
+                            #VOID_DONT_LOOK_INSIDE => {
                                 __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
                             }
-                            9u8 => {
+                            // `call.py:303` non-elidable EF_CANNOT_RAISE for void.
+                            #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE => {
+                                __builder.residual_call_void_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
+                            #VOID_MAY_FORCE => {
                                 __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             }
-                            13u8 => {
+                            #VOID_RELEASE_GIL => {
                                 __builder.call_release_gil_void_canonical_via_target(__fn_idx, #typed_args);
                             }
-                            17u8 => {
+                            #VOID_LOOP_INVARIANT => {
                                 __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             }
                             _ => {
@@ -4049,6 +4598,28 @@ impl<'c> Lowerer<'c> {
                         );
                     }
                 }
+                // `call.py:303` non-elidable EF_CANNOT_RAISE int — explicit policy.
+                crate::jit_interp::CallPolicyKind::ResidualIntCannotRaise => {
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::Call,
+                            __arg_regs,
+                            vec![Register::new(result_kind, reg)],
+                        ),
+                        quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                __fn_idx,
+                                #typed_args,
+                                #reg,
+                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                            );
+                        },
+                    );
+                }
                 crate::jit_interp::CallPolicyKind::ElidableInt
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
@@ -4084,6 +4655,7 @@ impl<'c> Lowerer<'c> {
                     );
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceIntWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilIntWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantIntWrapped
@@ -4091,12 +4663,14 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualRefWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualRefCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceRefWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::ElidableRefOrMemerrorWrapped
                 | crate::jit_interp::CallPolicyKind::ResidualFloatWrapped
+                | crate::jit_interp::CallPolicyKind::ResidualFloatCannotRaiseWrapped
                 | crate::jit_interp::CallPolicyKind::MayForceFloatWrapped
                 | crate::jit_interp::CallPolicyKind::ReleaseGilFloatWrapped
                 | crate::jit_interp::CallPolicyKind::LoopInvariantFloatWrapped
@@ -4108,6 +4682,17 @@ impl<'c> Lowerer<'c> {
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::ResidualIntWrapped => {
                             quote! { __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
+                        }
+                        // `call.py:303` non-elidable EF_CANNOT_RAISE int — wrapped value-form.
+                        crate::jit_interp::CallPolicyKind::ResidualIntCannotRaiseWrapped => {
+                            quote! {
+                                __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #reg,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceIntWrapped => {
                             quote! { __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg); }
@@ -4130,6 +4715,18 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::ResidualRefWrapped => {
                             result_kind = BindingKind::Ref;
                             quote! { __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #reg); }
+                        }
+                        // `call.py:303` non-elidable EF_CANNOT_RAISE ref — wrapped value-form.
+                        crate::jit_interp::CallPolicyKind::ResidualRefCannotRaiseWrapped => {
+                            result_kind = BindingKind::Ref;
+                            quote! {
+                                __builder.residual_call_ref_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #reg,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceRefWrapped => {
                             result_kind = BindingKind::Ref;
@@ -4154,6 +4751,18 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::ResidualFloatWrapped => {
                             result_kind = BindingKind::Float;
                             quote! { __builder.residual_call_float_canonical_via_target(__fn_idx, #typed_args, #reg); }
+                        }
+                        // `call.py:303` non-elidable EF_CANNOT_RAISE float — wrapped value-form.
+                        crate::jit_interp::CallPolicyKind::ResidualFloatCannotRaiseWrapped => {
+                            result_kind = BindingKind::Float;
+                            quote! {
+                                __builder.residual_call_float_canonical_via_target_with_effect_info(
+                                    __fn_idx,
+                                    #typed_args,
+                                    #reg,
+                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                );
+                            }
                         }
                         crate::jit_interp::CallPolicyKind::MayForceFloatWrapped => {
                             result_kind = BindingKind::Float;
@@ -4322,21 +4931,30 @@ impl<'c> Lowerer<'c> {
                             };
                             let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                             match __policy {
-                                2u8 => {
+                                #INT_DONT_LOOK_INSIDE => {
                                     __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                3u8 => {
+                                // `call.py:303` non-elidable EF_CANNOT_RAISE for int.
+                                #INT_DONT_LOOK_INSIDE_CANNOT_RAISE => {
+                                    __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                        __fn_idx,
+                                        #typed_args,
+                                        #reg,
+                                        majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    );
+                                }
+                                #INT_ELIDABLE => {
                                     __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 // call.py:299 _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
-                                19u8 => {
+                                #INT_ELIDABLE_CANNOT_RAISE => {
                                     __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
                                 }
                                 // call.py:295 _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
-                                20u8 => {
+                                #INT_ELIDABLE_OR_MEMERROR => {
                                     __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
-                                4u8 => {
+                                #INT_INLINE => {
                                     let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
                                         unsafe { std::mem::transmute(__inline_builder) };
                                     let __sub_jitcode = __builder_fn(__asm);
@@ -4346,13 +4964,13 @@ impl<'c> Lowerer<'c> {
                                     let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                     #inline_call
                                 }
-                                10u8 => {
+                                #INT_MAY_FORCE => {
                                     __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                14u8 => {
+                                #INT_RELEASE_GIL => {
                                     __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                18u8 => {
+                                #INT_LOOP_INVARIANT => {
                                     __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 _ => {
@@ -4361,17 +4979,30 @@ impl<'c> Lowerer<'c> {
                             }
                         },
                     );
-                    // jtransform.py:480-482 — `inline_call_*` is followed by a
-                    // `-live-` marker; assembler.py:146-158 encodes its
-                    // per-pc liveness offset via `_encode_liveness`.  The
-                    // inferred-policy path resolves the call kind at trace
-                    // time (`__policy == 4u8` → inline; 2/10/14 → residual
-                    // family), so emit the trailing `OpMeta::live_marker()`
-                    // unconditionally — Pure (3u8) / LoopInvariant (18u8)
-                    // get a redundant but harmless 2-byte BC_LIVE slot,
-                    // matching the explicit `Inline*` path
-                    // (`self.emit_op(OpMeta::live_marker, post_live)`).
-                    self.emit_op(OpMeta::live_marker(), post_live.clone());
+                    // jtransform.py:467/480-482 — `inline_call_*` is always
+                    // followed by `-live-`; a residual call (`call_*`)
+                    // appends `-live-` only when `calldescr_canraise(calldescr)`
+                    // (`call.py:295-300`).  In inferred mode the policy
+                    // byte selects the calldescr at runtime, so emit the
+                    // marker conditional on the can-raise codes plus the
+                    // inline byte (4u8) which forces emit per
+                    // jtransform.py:480-482.  LoopInvariantInt (18u8) and
+                    // ElidableCannotRaiseInt (19u8) skip the marker
+                    // because their calldescrs are statically cannot-raise.
+                    self.emit_op(
+                        OpMeta::live_marker_if(inferred_policy_live_condition(
+                            func,
+                            &[
+                                INT_DONT_LOOK_INSIDE,
+                                INT_ELIDABLE,
+                                INT_INLINE,
+                                INT_MAY_FORCE,
+                                INT_RELEASE_GIL,
+                                INT_ELIDABLE_OR_MEMERROR,
+                            ],
+                        )),
+                        post_live.clone(),
+                    );
                 } else {
                     self.emit_op(
                         OpMeta::linear(
@@ -4393,21 +5024,30 @@ impl<'c> Lowerer<'c> {
                             };
                             let __fn_idx = __builder.add_call_target(__trace_target, __concrete_target);
                             match __policy {
-                                2u8 => {
+                                #INT_DONT_LOOK_INSIDE => {
                                     __builder.residual_call_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                3u8 => {
+                                // `call.py:303` non-elidable EF_CANNOT_RAISE for int.
+                                #INT_DONT_LOOK_INSIDE_CANNOT_RAISE => {
+                                    __builder.residual_call_int_canonical_via_target_with_effect_info(
+                                        __fn_idx,
+                                        #typed_args,
+                                        #reg,
+                                        majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    );
+                                }
+                                #INT_ELIDABLE => {
                                     __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
                                 // call.py:299 _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
-                                19u8 => {
+                                #INT_ELIDABLE_CANNOT_RAISE => {
                                     __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
                                 }
                                 // call.py:295 _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
-                                20u8 => {
+                                #INT_ELIDABLE_OR_MEMERROR => {
                                     __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
-                                4u8 => {
+                                #INT_INLINE => {
                                 let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let __sub_jitcode = __builder_fn(__asm);
@@ -4417,13 +5057,13 @@ impl<'c> Lowerer<'c> {
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
                             }
-                            10u8 => {
+                            #INT_MAY_FORCE => {
                                 __builder.call_may_force_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
-                            14u8 => {
+                            #INT_RELEASE_GIL => {
                                 __builder.call_release_gil_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
-                            18u8 => {
+                            #INT_LOOP_INVARIANT => {
                                 __builder.call_loopinvariant_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                             }
                             _ => {
@@ -4431,8 +5071,21 @@ impl<'c> Lowerer<'c> {
                             }
                         }
                     });
-                    // jtransform.py:480-482 — see int_arg_regs branch above.
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    // jtransform.py:467/480-482 — see int_arg_regs branch above.
+                    self.emit_op(
+                        OpMeta::live_marker_if(inferred_policy_live_condition(
+                            func,
+                            &[
+                                INT_DONT_LOOK_INSIDE,
+                                INT_ELIDABLE,
+                                INT_INLINE,
+                                INT_MAY_FORCE,
+                                INT_RELEASE_GIL,
+                                INT_ELIDABLE_OR_MEMERROR,
+                            ],
+                        )),
+                        post_live,
+                    );
                 }
             }
         }
@@ -5496,6 +6149,53 @@ mod tests {
     }
 
     #[test]
+    fn remove_repeated_live_keeps_conditional_only_runs_unmerged() {
+        // A run consisting entirely of conditional markers stays
+        // unmerged: unioning their reads would over-capture vs PyPy's
+        // per-site `liveness.py:111-115` `liveset.update(live[1:])`
+        // (which only ever sees `-live-`s that actually exist).  Each
+        // marker's BC_LIVE fires (or not) on its own condition and
+        // captures only its own alive set.
+        let mut ops = vec![
+            OpMeta::live_marker_if(quote! { policy_a() }),
+            OpMeta::live_marker_if(quote! { policy_b() }),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[3]), vec![]),
+        ];
+        let mut stmts: Vec<TokenStream> = (0..ops.len()).map(|_| quote! { let _ = (); }).collect();
+        remove_repeated_live(&mut ops, &mut stmts);
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0].control, ControlFlowClass::LiveMarker));
+        assert!(matches!(ops[1].control, ControlFlowClass::LiveMarker));
+        assert!(ops[0].live_condition.is_some());
+        assert!(ops[1].live_condition.is_some());
+        assert!(matches!(ops[2].control, ControlFlowClass::Linear));
+    }
+
+    #[test]
+    fn remove_repeated_live_drops_conditions_when_run_includes_unconditional_marker() {
+        // An unconditional marker mixed in with conditional ones forces
+        // the merged result to be unconditional — PyPy emits at this
+        // position regardless, so the conditional siblings must follow
+        // suit (their alive sets fold in).
+        let mut ops = vec![
+            OpMeta::live_marker_if(quote! { policy_a() }),
+            OpMeta::live_marker_with(Register::ints(&[1]), vec![]),
+            OpMeta::live_marker_if(quote! { policy_b() }),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[3]), vec![]),
+        ];
+        let mut stmts: Vec<TokenStream> = (0..ops.len()).map(|_| quote! { let _ = (); }).collect();
+        remove_repeated_live(&mut ops, &mut stmts);
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0].control, ControlFlowClass::LiveMarker));
+        assert!(
+            ops[0].live_condition.is_none(),
+            "merged marker must be unconditional when run contains an unconditional marker"
+        );
+        assert_eq!(ops[0].reads, vec![Register::int(1)]);
+        assert!(matches!(ops[1].control, ControlFlowClass::Linear));
+    }
+
+    #[test]
     fn rewrite_live_marker_replaces_placeholder_with_triple() {
         // [marker, reads=[1], writes=[2]] — backward walk records {1}
         // alive at marker, def[2] discards 2 from alive carry-over.
@@ -5671,6 +6371,15 @@ mod tests {
         )
     }
 
+    fn lowerer_with_inferred_call_policy(path: &str) -> Lowerer<'static> {
+        let path: Path = syn::parse_str(path).expect("failed to parse path");
+        Lowerer::new_with_call_policies(
+            None,
+            vec![(canonical_path_segments(&path), CallPolicySpec::Infer)],
+            InferenceFailureMode::ReturnNone,
+        )
+    }
+
     fn parse_call(code: &str) -> ExprCall {
         syn::parse_str(code).expect("failed to parse call")
     }
@@ -5771,6 +6480,37 @@ mod tests {
     }
 
     #[test]
+    fn record_known_result_inferred_policy_validates_and_conditions_live_marker() {
+        let mut lowerer = lowerer_with_inferred_call_policy("helper");
+        lowerer
+            .bindings
+            .insert("known".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("record_known_result!(known, helper, arg)").expect("parse macro expr");
+
+        lowerer
+            .lower_record_known_result(&expr)
+            .expect("record_known_result should lower");
+
+        assert_eq!(lowerer.op_metadata.len(), 2);
+        assert!(matches!(
+            lowerer.op_metadata[0].kind,
+            OpKind::RecordKnownResult
+        ));
+        assert!(lowerer.op_metadata[1].live_condition.is_some());
+        let tokens = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(tokens.contains("match __policy"));
+        assert!(tokens.contains("requires an elidable helper policy"));
+    }
+
+    #[test]
     #[should_panic(expected = "record_known_result! requires an elidable helper policy")]
     fn record_known_result_rejects_non_elidable_policy() {
         let mut lowerer =
@@ -5837,6 +6577,32 @@ mod tests {
             syn::parse_str("conditional_call!(cond, helper, arg)").expect("parse macro expr");
 
         let _ = lowerer.lower_conditional_call(&expr);
+    }
+
+    #[test]
+    fn conditional_call_inferred_policy_keeps_runtime_loopinvariant_arg_check() {
+        let mut lowerer = lowerer_with_inferred_call_policy("helper");
+        lowerer
+            .bindings
+            .insert("cond".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("arg".to_string(), binding(1, BindingKind::Int));
+        let expr: Expr =
+            syn::parse_str("conditional_call!(cond, helper, arg)").expect("parse macro expr");
+
+        lowerer
+            .lower_conditional_call(&expr)
+            .expect("conditional_call should lower");
+
+        assert!(lowerer.op_metadata.last().unwrap().live_condition.is_some());
+        let tokens = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(tokens.contains("match __policy"));
+        assert!(tokens.contains("arguments not supported for loop-invariant function"));
     }
 
     #[test]

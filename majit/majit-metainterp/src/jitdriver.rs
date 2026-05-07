@@ -843,7 +843,18 @@ impl<S: JitState> JitDriver<S> {
             jitcode
         };
 
-        let mut bh = crate::blackhole::BlackholeInterpreter::new();
+        // RPython `resume.py blackhole_from_resumedata` acquires the
+        // interpreter from `metainterp_sd.blackholeinterpbuilder`
+        // (`blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`).
+        // Use the inline-call-only builder so byte 17 (`BC_INLINE_CALL`)
+        // is wired to `handler_inline_call_pyre_nested` even when a
+        // resume jitcode emits one — Slice 3.3 retired the
+        // `dispatch_one::BC_INLINE_CALL` legacy arm so an empty builder
+        // would now panic on byte 17 instead of falling through.
+        // Mirrors the production `BH_BUILDER3` shape from
+        // `pyre-jit/src/call_jit.rs::resume_in_blackhole`.
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
+        let mut bh = builder.acquire_interp();
         bh.setposition(std::sync::Arc::new(jitcode), 0);
 
         // Set inputarg register values from fail_values
@@ -1966,7 +1977,17 @@ impl<S: JitState> JitDriver<S> {
                     .as_deref()
                     .unwrap_or(&fallback_alloc);
 
-                let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
+                // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
+                // wired to handler_inline_call_pyre_nested when the
+                // multi-frame state-field-JIT chain reconstructs sub-frames
+                // via parent.descrs[idx].as_jitcode() above.  Slice 3.3
+                // retired the dispatch_one BC_INLINE_CALL legacy arm so an
+                // empty builder would now panic on byte 17.  Re-apply
+                // staticdata control opcodes after the constructor's
+                // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
+                // the values match the metainterp's actual byte
+                // assignments.
+                let mut bh_builder = crate::blackhole::build_inline_call_only_bh_builder();
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
@@ -3712,7 +3733,17 @@ impl<S: JitState> JitDriver<S> {
                     .as_deref()
                     .unwrap_or(&fallback_alloc);
 
-                let mut bh_builder = crate::blackhole::BlackholeInterpBuilder::new();
+                // Inline-call-only builder so byte 17 (BC_INLINE_CALL) is
+                // wired to handler_inline_call_pyre_nested when the
+                // multi-frame state-field-JIT chain reconstructs sub-frames
+                // via parent.descrs[idx].as_jitcode() above.  Slice 3.3
+                // retired the dispatch_one BC_INLINE_CALL legacy arm so an
+                // empty builder would now panic on byte 17.  Re-apply
+                // staticdata control opcodes after the constructor's
+                // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
+                // the values match the metainterp's actual byte
+                // assignments.
+                let mut bh_builder = crate::blackhole::build_inline_call_only_bh_builder();
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,

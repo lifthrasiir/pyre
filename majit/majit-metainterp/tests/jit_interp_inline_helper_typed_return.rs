@@ -1,4 +1,4 @@
-use majit_macros::{dont_look_inside, jit_inline};
+use majit_macros::{dont_look_inside, dont_look_inside_cannot_raise, jit_inline};
 use majit_metainterp::jitcode::JitCodeRuntimeExt;
 
 fn assert_single_return_opcode(jitcode: &majit_metainterp::JitCode, key: &str) {
@@ -58,6 +58,27 @@ fn wrapped_float_identity(value: f64) -> f64 {
 
 #[dont_look_inside]
 fn wrapped_int_identity(value: i64) -> i64 {
+    value
+}
+
+// Ports of the same identity helpers under the explicit cannot-raise
+// opt-in.  The function bodies are pure pass-throughs that PyPy
+// `getcalldescr` would mark `EF_CANNOT_RAISE` (`call.py:303`); pyre
+// lacks the annotation analyzer (Task #64) so users opt in via
+// `#[dont_look_inside_cannot_raise]`.
+
+#[dont_look_inside_cannot_raise]
+fn wrapped_ref_identity_cr(ptr: *const i64) -> *const i64 {
+    ptr
+}
+
+#[dont_look_inside_cannot_raise]
+fn wrapped_float_identity_cr(value: f64) -> f64 {
+    value
+}
+
+#[dont_look_inside_cannot_raise]
+fn wrapped_int_identity_cr(value: i64) -> i64 {
     value
 }
 
@@ -169,12 +190,12 @@ fn jit_inline_inferred_policy_only_advertises_int_return_helpers() {
 }
 
 #[test]
-fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_policy() {
+fn wrapped_helpers_advertise_supported_inferred_policy_bytes() {
     let (ref_policy, ref_inline_builder, ref_trace_target, ref_concrete_target, _) =
         __majit_call_policy_wrapped_ref_identity();
     assert_eq!(
-        ref_policy, 0u8,
-        "ref-return wrapped helper should not advertise inferred value-call policy"
+        ref_policy, 25u8,
+        "ref-return wrapped helper should advertise inferred residual-ref policy"
     );
     assert!(
         ref_inline_builder.is_null(),
@@ -189,7 +210,7 @@ fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_poli
         __majit_call_policy_wrapped_float_identity();
     assert_eq!(
         float_policy, 0u8,
-        "float-return wrapped helper should not advertise inferred value-call policy"
+        "float-return wrapped helper should stay unsupported via inferred path"
     );
     assert!(
         float_inline_builder.is_null(),
@@ -213,6 +234,49 @@ fn wrapped_non_int_helpers_keep_targets_but_do_not_advertise_inferred_value_poli
     assert!(
         !int_trace_target.is_null() && !int_concrete_target.is_null(),
         "int-return wrapped helper should still expose call targets"
+    );
+}
+
+#[test]
+fn dont_look_inside_cannot_raise_emits_dedicated_policy_bytes() {
+    // Item 4-5 fix: `#[dont_look_inside_cannot_raise]` opt-in maps to
+    // distinct policy bytes per result kind so the inferred slot lookup
+    // (`jitcode_lower.rs:1711` via `byte 28u8|29u8|30u8 -> CannotRaise`)
+    // can produce `CANNOT_RAISE_EFFECT_INFO` calldescrs and skip the
+    // trailing `-live-` marker that the audit cited as parity-divergent
+    // for `dont_look_inside` ref helpers.
+    let (ref_policy, _, ref_trace_target, ref_concrete_target, _) =
+        __majit_call_policy_wrapped_ref_identity_cr();
+    assert_eq!(
+        ref_policy, 30u8,
+        "ref-return cannot-raise wrapped helper should emit byte 30u8"
+    );
+    assert!(
+        !ref_trace_target.is_null() && !ref_concrete_target.is_null(),
+        "explicit wrapped ref policy still needs trace/concrete targets"
+    );
+
+    let (float_policy, _, float_trace_target, float_concrete_target, _) =
+        __majit_call_policy_wrapped_float_identity_cr();
+    assert_eq!(
+        float_policy, 0u8,
+        "float-return cannot-raise wrapped helper stays unsupported via inferred path \
+         (mirrors `wrapped_float_identity` 0u8 — separate explicit policy required)"
+    );
+    assert!(
+        !float_trace_target.is_null() && !float_concrete_target.is_null(),
+        "explicit wrapped float policy still needs trace/concrete targets"
+    );
+
+    let (int_policy, _, int_trace_target, int_concrete_target, _) =
+        __majit_call_policy_wrapped_int_identity_cr();
+    assert_eq!(
+        int_policy, 29u8,
+        "int-return cannot-raise wrapped helper should emit byte 29u8"
+    );
+    assert!(
+        !int_trace_target.is_null() && !int_concrete_target.is_null(),
+        "int-return cannot-raise wrapped helper should still expose call targets"
     );
 }
 
@@ -290,7 +354,7 @@ fn jit_inline_float_identity_works_through_jitcode_builder() {
 #[test]
 fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     use majit_metainterp::JitCodeBuilder;
-    use majit_metainterp::blackhole::BlackholeInterpreter;
+    use majit_metainterp::blackhole::build_inline_call_only_bh_builder;
 
     let mut asm = majit_metainterp::Assembler::new();
     let sub_jitcode = __majit_inline_jitcode_inline_mixed_int_identity_with_asm(&mut asm);
@@ -307,15 +371,19 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
         "mixed helper int parameter should live in dense int reg 0"
     );
 
-    let mut builder = JitCodeBuilder::new();
-    builder.load_const_r_value(0, 0xDEAD);
-    builder.load_const_i_value(0, 21);
-    builder.load_const_f_value(0, f64::to_bits(3.5) as i64);
-    let sub_idx = builder.add_sub_jitcode(sub_jitcode);
-    builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
-    let jitcode = builder.finish();
+    let mut jc_builder = JitCodeBuilder::new();
+    jc_builder.load_const_r_value(0, 0xDEAD);
+    jc_builder.load_const_i_value(0, 21);
+    jc_builder.load_const_f_value(0, f64::to_bits(3.5) as i64);
+    let sub_idx = jc_builder.add_sub_jitcode(sub_jitcode);
+    jc_builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
+    let jitcode = jc_builder.finish();
 
-    let mut bh = BlackholeInterpreter::new();
+    // Slice 3.1d: route through `handler_inline_call_pyre_nested`
+    // (the production builder shape) instead of the legacy
+    // `dispatch_one::BC_INLINE_CALL` fallback.
+    let mut bh_builder = build_inline_call_only_bh_builder();
+    let mut bh = bh_builder.acquire_interp();
     bh.setposition(std::sync::Arc::new(jitcode), 0);
     let _ = bh.run();
 

@@ -462,7 +462,9 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     // `inline_call_*` keys come from the translator/codewriter pipeline
     // when they are actually emitted; pre-registering them here would make
     // `wellknown_bh_insns()` claim a bytecode contract this runtime does
-    // not truthfully expose.
+    // not truthfully expose.  The pyre-only nested-bytecode shape is
+    // registered separately as `inline_call_pyre_nested/P` in
+    // `pyre_extension_insns()`.
 
     // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
     // Argcodes follow assembler.py:162-196: two registers + label.
@@ -630,5 +632,19 @@ pub fn pyre_extension_insns() -> HashMap<&'static str, u8> {
     m.insert("store_state_array/dii", BC_STORE_STATE_ARRAY);
     m.insert("load_state_varray/dii", BC_LOAD_STATE_VARRAY);
     m.insert("store_state_varray/dii", BC_STORE_STATE_VARRAY);
+    // PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.
+    //
+    // RPython's canonical `inline_call_*` keys (`/dIRF>i`, `/dIR>r`, …)
+    // dispatch through a real C-ABI `fnaddr` stored on `BhDescr::JitCode`.
+    // Pyre does not compile inlined helpers into separate native
+    // functions — guard-failure resume must re-interpret the helper as
+    // nested bytecode.  Byte 17 (`BC_INLINE_CALL`) is reused for this
+    // pyre-only handler (`handler_inline_call_pyre_nested`).  The `P`
+    // pseudo-argcode is opaque from the canonical RPython argcodes
+    // alphabet: payload is `sub_idx u16 + num_args u16 + num_args ×
+    // (kind u8, src u16, dst u16) + 3 × (return slot u16; u16::MAX = None)`.
+    // Generic walkers must consult `decode_op_at` (which knows `P`) for
+    // length, not the canonical argcodes table.
+    m.insert("inline_call_pyre_nested/P", BC_INLINE_CALL);
     m
 }

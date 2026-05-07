@@ -5,6 +5,7 @@
 //! 2. Generating `JitState` types and impl
 //! 3. Replacing `jit_merge_point!()` / `can_enter_jit!()` markers
 
+pub(crate) mod call_policy_byte;
 mod classify;
 mod codegen_state;
 mod codegen_trace;
@@ -236,6 +237,13 @@ pub(crate) enum CallPolicyKind {
     LoopInvariantVoidWrapped,
     ResidualInt,
     ResidualIntWrapped,
+    /// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable
+    /// `else` branch) for int-returning residual helpers.  Mirrors
+    /// the void-side `ResidualVoidCannotRaise` pair.  Producers pick
+    /// this when the callee is statically known to be non-elidable
+    /// AND cannot raise.
+    ResidualIntCannotRaise,
+    ResidualIntCannotRaiseWrapped,
     MayForceInt,
     MayForceIntWrapped,
     ReleaseGilInt,
@@ -256,6 +264,12 @@ pub(crate) enum CallPolicyKind {
     ElidableIntOrMemerror,
     ElidableIntOrMemerrorWrapped,
     ResidualRefWrapped,
+    /// `EF_CANNOT_RAISE` for ref-returning residual helpers.
+    /// Mirrors `ResidualIntCannotRaiseWrapped`; the unwrapped variant
+    /// is absent because the inferred lower path cannot recover a
+    /// static ref-return BindingKind from the policy byte alone
+    /// (mirrors the existing `ResidualRefWrapped`-only shape).
+    ResidualRefCannotRaiseWrapped,
     MayForceRefWrapped,
     // ReleaseGilRefWrapped intentionally absent: resoperation.py:1243-1244
     // (`# no such thing`) excludes CALL_RELEASE_GIL_R from the upstream
@@ -266,6 +280,9 @@ pub(crate) enum CallPolicyKind {
     ElidableRefCannotRaiseWrapped,
     ElidableRefOrMemerrorWrapped,
     ResidualFloatWrapped,
+    /// `EF_CANNOT_RAISE` for float-returning residual helpers.
+    /// Mirrors `ResidualIntCannotRaiseWrapped` / `ResidualRefCannotRaiseWrapped`.
+    ResidualFloatCannotRaiseWrapped,
     MayForceFloatWrapped,
     ReleaseGilFloatWrapped,
     LoopInvariantFloatWrapped,
@@ -291,6 +308,8 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "loopinvariant_void_wrapped" => CallPolicyKind::LoopInvariantVoidWrapped,
         "residual_int" => CallPolicyKind::ResidualInt,
         "residual_int_wrapped" => CallPolicyKind::ResidualIntWrapped,
+        "residual_int_cannot_raise" => CallPolicyKind::ResidualIntCannotRaise,
+        "residual_int_cannot_raise_wrapped" => CallPolicyKind::ResidualIntCannotRaiseWrapped,
         "may_force_int" => CallPolicyKind::MayForceInt,
         "may_force_int_wrapped" => CallPolicyKind::MayForceIntWrapped,
         "release_gil_int" => CallPolicyKind::ReleaseGilInt,
@@ -308,6 +327,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_int_or_memerror" => CallPolicyKind::ElidableIntOrMemerror,
         "elidable_int_or_memerror_wrapped" => CallPolicyKind::ElidableIntOrMemerrorWrapped,
         "residual_ref_wrapped" => CallPolicyKind::ResidualRefWrapped,
+        "residual_ref_cannot_raise_wrapped" => CallPolicyKind::ResidualRefCannotRaiseWrapped,
         "may_force_ref_wrapped" => CallPolicyKind::MayForceRefWrapped,
         // "release_gil_ref_wrapped" intentionally rejected per
         // resoperation.py:1243-1244 — see CallPolicyKind comment.
@@ -316,6 +336,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "elidable_ref_cannot_raise_wrapped" => CallPolicyKind::ElidableRefCannotRaiseWrapped,
         "elidable_ref_or_memerror_wrapped" => CallPolicyKind::ElidableRefOrMemerrorWrapped,
         "residual_float_wrapped" => CallPolicyKind::ResidualFloatWrapped,
+        "residual_float_cannot_raise_wrapped" => CallPolicyKind::ResidualFloatCannotRaiseWrapped,
         "may_force_float_wrapped" => CallPolicyKind::MayForceFloatWrapped,
         "release_gil_float_wrapped" => CallPolicyKind::ReleaseGilFloatWrapped,
         "loopinvariant_float_wrapped" => CallPolicyKind::LoopInvariantFloatWrapped,
@@ -965,17 +986,21 @@ fn rewrite_body(
             | CallPolicyKind::ReleaseGilVoidWrapped
             | CallPolicyKind::LoopInvariantVoidWrapped => Some(ObserverReplayKind::Void),
             CallPolicyKind::ResidualInt
+            | CallPolicyKind::ResidualIntCannotRaise
             | CallPolicyKind::MayForceInt
             | CallPolicyKind::ReleaseGilInt
             | CallPolicyKind::LoopInvariantInt
             | CallPolicyKind::ResidualIntWrapped
+            | CallPolicyKind::ResidualIntCannotRaiseWrapped
             | CallPolicyKind::MayForceIntWrapped
             | CallPolicyKind::ReleaseGilIntWrapped
             | CallPolicyKind::LoopInvariantIntWrapped => Some(ObserverReplayKind::Int),
             CallPolicyKind::ResidualRefWrapped
+            | CallPolicyKind::ResidualRefCannotRaiseWrapped
             | CallPolicyKind::MayForceRefWrapped
             | CallPolicyKind::LoopInvariantRefWrapped => Some(ObserverReplayKind::Ref),
             CallPolicyKind::ResidualFloatWrapped
+            | CallPolicyKind::ResidualFloatCannotRaiseWrapped
             | CallPolicyKind::MayForceFloatWrapped
             | CallPolicyKind::ReleaseGilFloatWrapped
             | CallPolicyKind::LoopInvariantFloatWrapped => Some(ObserverReplayKind::Float),
@@ -999,13 +1024,16 @@ fn rewrite_body(
                 | CallPolicyKind::ReleaseGilVoidWrapped
                 | CallPolicyKind::LoopInvariantVoidWrapped
                 | CallPolicyKind::ResidualIntWrapped
+                | CallPolicyKind::ResidualIntCannotRaiseWrapped
                 | CallPolicyKind::MayForceIntWrapped
                 | CallPolicyKind::ReleaseGilIntWrapped
                 | CallPolicyKind::LoopInvariantIntWrapped
                 | CallPolicyKind::ResidualRefWrapped
+                | CallPolicyKind::ResidualRefCannotRaiseWrapped
                 | CallPolicyKind::MayForceRefWrapped
                 | CallPolicyKind::LoopInvariantRefWrapped
                 | CallPolicyKind::ResidualFloatWrapped
+                | CallPolicyKind::ResidualFloatCannotRaiseWrapped
                 | CallPolicyKind::MayForceFloatWrapped
                 | CallPolicyKind::ReleaseGilFloatWrapped
                 | CallPolicyKind::LoopInvariantFloatWrapped

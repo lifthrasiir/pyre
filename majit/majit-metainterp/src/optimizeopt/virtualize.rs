@@ -1137,7 +1137,6 @@ impl OptVirtualize {
         self.last_emitted_was_removed = true;
         true
     }
-
 }
 
 impl Default for OptVirtualize {
