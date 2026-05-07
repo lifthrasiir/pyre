@@ -5480,42 +5480,27 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     )))
 }
 
-/// pyframe.py:115-116 — `self.builtin = space.builtin.pick_builtin(w_globals)`.
-/// Body ports `pypy/module/__builtin__/moduledef.py:89-109 pick_builtin`:
+/// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
+/// w_globals)`.  Body ports `pypy/module/__builtin__/moduledef.py:89-109
+/// pick_builtin`:
 ///   1. `space.getitem(w_globals, '__builtins__')` (`KeyError` ⇒ default)
 ///   2. recognise `Module` ⇒ return that Module
 ///   3. recognise dict (incl. dict subclass) ⇒ wrap as
-///      `module.Module(space, None, w_builtin)` (a fresh Module per call,
-///      with `module.w_dict = w_builtin`).  Pyre's storage model needs
-///      a `DictStorage` mirror of the dict's contents; lazy-allocate
-///      and attach via `dict_storage_proxy` so subsequent dict mutations
-///      sync into the storage (and `w_dict_delitem_str` removes from it).
+///      `module.Module(space, None, w_builtin)` (a fresh Module per
+///      call, with `module.w_dict = w_builtin`).
 ///   4. absent / not Module-or-dict ⇒ build a default empty Module
 ///      with only `None=w_None` defined — matches `moduledef.py:106-108`
 ///      `builtin = module.Module(space, None); space.setitem(builtin
 ///      .w_dict, 'None', w_None); return builtin`.
 ///
-/// Returns the `*mut DictStorage` consulted by the `LOAD_GLOBAL` builtins
-/// fast path.  `pick_builtin_w` is the companion that returns the
-/// `PyObjectRef` (Module wrapping the dict, the picked Module, or the
-/// default Module) for callers that need the Module form
-/// (`frame.get_builtin()`, `exec`'s `__builtins__` setdefault).
-pub fn pick_builtin(
-    w_globals: *mut crate::DictStorage,
-    exec_ctx: *const crate::PyExecutionContext,
-) -> *mut crate::DictStorage {
-    pick_builtin_pair(w_globals, exec_ctx).0
-}
-
-/// Companion to `pick_builtin` returning the `PyObjectRef` Module identity.
-pub fn pick_builtin_w(
-    w_globals: *mut crate::DictStorage,
-    exec_ctx: *const crate::PyExecutionContext,
-) -> PyObjectRef {
-    pick_builtin_pair(w_globals, exec_ctx).1
-}
-
-fn pick_builtin_pair(
+/// Pyre's split-storage variant returns BOTH the storage_ptr (for the
+/// LOAD_GLOBAL fast path) AND the picked Module identity (for
+/// `frame.get_builtin()` / `exec`'s `__builtins__` seeding) so that
+/// PyFrame::new can fill `frame.builtin` (storage) and `frame.w_builtin`
+/// (Module) with a single allocation — the user-dict subclass arm
+/// builds a wrapping Module, which a paired `pick_builtin` +
+/// `pick_builtin_w` would otherwise allocate twice.
+pub fn pick_builtin_pair(
     w_globals: *mut crate::DictStorage,
     exec_ctx: *const crate::PyExecutionContext,
 ) -> (*mut crate::DictStorage, PyObjectRef) {
@@ -5537,45 +5522,22 @@ fn pick_builtin_pair(
                     return (storage as *mut crate::DictStorage, w_builtin);
                 }
                 // moduledef.py:102-103 `space.isinstance_w(w_builtin, w_dict)`.
+                // PyPy: `return module.Module(space, None, w_builtin)` —
+                // a Module wrapping the caller's dict.  Pyre returns
+                // `frame.builtin = NULL` so the storage-keyed
+                // `LOAD_GLOBAL` fast path is skipped for this rare
+                // case; `load_global_value` falls through to
+                // `space.finditem_str(w_module.w_dict, name)`,
+                // dispatching through any dict subclass `__getitem__`
+                // override.
                 let backing = crate::type_methods::resolve_dict_backing(w_builtin);
                 if !backing.is_null() {
-                    let mut storage =
-                        unsafe { pyre_object::w_dict_get_dict_storage_proxy(backing) };
-                    if storage.is_null() {
-                        // Lazy-allocate the DictStorage mirror and attach
-                        // it to the dict so subsequent stores/deletes
-                        // sync via `maybe_sync_dict_storage_*`.
-                        let mut ns = Box::new(crate::DictStorage::new());
-                        unsafe {
-                            for (k, v) in pyre_object::w_dict_items(backing) {
-                                if !v.is_null() && pyre_object::is_str(k) {
-                                    crate::dict_storage_store(
-                                        &mut ns,
-                                        pyre_object::w_str_get_value(k),
-                                        v,
-                                    );
-                                }
-                            }
-                        }
-                        ns.fix_ptr();
-                        let leaked: *mut crate::DictStorage = Box::into_raw(ns);
-                        unsafe {
-                            pyre_object::w_dict_set_dict_storage_proxy(backing, leaked as *mut u8);
-                        }
-                        storage = leaked as *mut u8;
-                    }
-                    // moduledef.py:103 `return module.Module(space, None,
-                    // w_builtin)` — PyPy stores the caller's object
-                    // (whether `W_DictMultiObject` or a dict subclass
-                    // instance) directly as `module.w_dict`, so
-                    // `space.finditem_str(module.w_dict, name)`
-                    // dispatches through subclass `__getitem__`
-                    // overrides and `f_builtins`/`module.__dict__`
-                    // surface the original identity.  `module.dict`
-                    // keeps the storage proxy on the backing for the
-                    // storage-keyed `LOAD_GLOBAL` fast path.
-                    let w_module = pyre_object::w_module_new_aliasing_dict("", storage, w_builtin);
-                    return (storage as *mut crate::DictStorage, w_module);
+                    let w_module = pyre_object::w_module_new_aliasing_dict(
+                        "",
+                        std::ptr::null_mut(),
+                        w_builtin,
+                    );
+                    return (std::ptr::null_mut(), w_module);
                 }
                 // Fall through — `__builtins__` is not Module/dict (e.g.
                 // `42`, a list, ...).  PyPy moduledef.py:106-108 builds

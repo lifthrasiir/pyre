@@ -866,6 +866,19 @@ impl NamespaceOpcodeHandler for PyFrame {
             if let Some(value) = crate::dict_storage_get(unsafe { &*self.builtin }, name) {
                 return Ok(value);
             }
+        } else if !self.w_builtin.is_null() && unsafe { pyre_object::is_module(self.w_builtin) } {
+            // moduledef.py:102-103 dict-subclass `__builtins__` case:
+            // `pick_builtin` returns a Module wrapping the user dict
+            // with NULL storage — go through the W_DictObject so a
+            // dict subclass `__getitem__` override surfaces and PyPy
+            // `module.getdictvalue` re-raise behaviour
+            // (`baseobjspace.py:870 finditem`) is honoured.
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(self.w_builtin) };
+            if !w_dict.is_null() {
+                if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+                    return Ok(value);
+                }
+            }
         }
         dict_storage_load(ns, name)
     }

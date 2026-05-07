@@ -984,39 +984,38 @@ pub fn call_with_kwargs(
 
 pub fn register_build_class() {
     crate::typedef::init_typeobjects();
-    // Wire the dict→namespace write-through hook so that
-    // `globals()[name] = value` stays visible after the globals() dict
-    // is discarded. PyPy: the module dict IS the namespace in PyPy,
-    // so there is no separate hook; pyre keeps the namespace as a
-    // flat DictStorage and syncs via this callback.
-    pyre_object::dictobject::register_dict_storage_store_hook(|ns_ptr, name, value| unsafe {
-        let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-        crate::dict_storage_store(ns, name, value);
-    });
-    pyre_object::dictobject::register_dict_storage_delete_hook(|ns_ptr, name| unsafe {
-        let ns = &mut *(ns_ptr as *mut crate::DictStorage);
-        ns.remove(name);
-    });
-    // Read-through hook so a dict with `dict_storage_proxy` set
-    // (Module.w_dict, globals view) surfaces storage entries on read
-    // miss — `module.py:Module.getdictvalue` parity for the case where
-    // the authoritative state lives in the storage rather than the
-    // dict's own entries Vec.
-    pyre_object::dictobject::register_dict_storage_lookup_hook(|ns_ptr, name| unsafe {
-        let ns = &*(ns_ptr as *const crate::DictStorage);
-        crate::dict_storage_get(ns, name)
-    });
-    // Items-enumeration hook: `len(module.__dict__)`,
-    // `module.__dict__.items()`, `keys()`, `values()`, and
-    // `del module.__dict__[name]` need to see every binding the storage
-    // owns, not just the W_DictObject's entries Vec.  PyPy
-    // `Module.getdict()` returns the live W_DictMultiObject whose state
-    // IS the module dict; pyre's split entries-vs-storage layout would
-    // otherwise miss every binding stored directly on the namespace
-    // (install_default_builtins, frame.fresh_dict_storage callers).
-    pyre_object::dictobject::register_dict_storage_items_hook(|ns_ptr| unsafe {
-        let ns = &*(ns_ptr as *const crate::DictStorage);
-        ns.entries().map(|(k, v)| (k.to_string(), *v)).collect()
+    install_dict_storage_hooks();
+}
+
+/// Wire the storage ↔ W_DictObject sync hooks.  Idempotent — guarded
+/// by an internal `Once` so repeated invocations
+/// (`register_build_class` at runtime startup, `ExecutionContext::new`
+/// defensive registration before module allocation) collapse to a
+/// single registration without leaking additional function pointers
+/// per call.  PyPy's single `W_DictMultiObject` owns both halves of
+/// the dict view; pyre's split storage / W_DictObject layout would
+/// otherwise let an early `w_dict_setitem_str` (e.g.
+/// `Module.__init__`'s `__name__` write) silently miss the storage if
+/// these hooks are not yet registered.
+pub fn install_dict_storage_hooks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        pyre_object::dictobject::register_dict_storage_store_hook(|ns_ptr, name, value| unsafe {
+            let ns = &mut *(ns_ptr as *mut crate::DictStorage);
+            crate::dict_storage_store(ns, name, value);
+        });
+        pyre_object::dictobject::register_dict_storage_delete_hook(|ns_ptr, name| unsafe {
+            let ns = &mut *(ns_ptr as *mut crate::DictStorage);
+            ns.remove(name);
+        });
+        pyre_object::dictobject::register_dict_storage_lookup_hook(|ns_ptr, name| unsafe {
+            let ns = &*(ns_ptr as *const crate::DictStorage);
+            crate::dict_storage_get(ns, name)
+        });
+        pyre_object::dictobject::register_dict_storage_items_hook(|ns_ptr| unsafe {
+            let ns = &*(ns_ptr as *const crate::DictStorage);
+            ns.entries().map(|(k, v)| (k.to_string(), *v)).collect()
+        });
     });
 }
 

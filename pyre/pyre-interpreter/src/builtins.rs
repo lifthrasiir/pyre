@@ -2180,9 +2180,10 @@ fn exec_or_eval(
 
     fn ensure_builtins(
         ns: &mut crate::DictStorage,
+        w_globals_obj: pyre_object::PyObjectRef,
         caller_frame: *const crate::PyFrame,
         exec_ctx: *const crate::PyExecutionContext,
-    ) {
+    ) -> Result<(), crate::PyError> {
         // pypy/interpreter/pyopcode.py:773-774
         //   space.call_method(w_globals, 'setdefault',
         //                     '__builtins__', self.get_builtin())
@@ -2191,9 +2192,6 @@ fn exec_or_eval(
         // not the EC's default.  When the caller frame's picked builtin
         // is unavailable (e.g. exec called from outside any frame), fall
         // through to the EC default.
-        if crate::dict_storage_get(ns, "__builtins__").is_some() {
-            return;
-        }
         let w_builtin = if !caller_frame.is_null() {
             unsafe { (*caller_frame).get_builtin() }
         } else if !exec_ctx.is_null() {
@@ -2201,9 +2199,28 @@ fn exec_or_eval(
         } else {
             pyre_object::PY_NULL
         };
-        if !w_builtin.is_null() {
+        if w_builtin.is_null() {
+            return Ok(());
+        }
+        // PyPy `pyopcode.py:773 space.call_method(w_globals, 'setdefault',
+        // '__builtins__', self.get_builtin())` — the receiver is the
+        // ORIGINAL `w_globals` argument the caller passed, not the
+        // backing W_DictObject that GlobalsBinding strips off via
+        // `resolve_dict_backing`.  Dispatching on the user object
+        // (e.g. a dict subclass instance) lets a `setdefault`
+        // override fire; dispatching on the backing would bypass it.
+        // Anonymous storage (no user object) has nothing to dispatch
+        // through and goes direct.
+        if !w_globals_obj.is_null() {
+            let key = pyre_object::w_str_new("__builtins__");
+            let setdefault = crate::baseobjspace::getattr(w_globals_obj, "setdefault")?;
+            crate::call_and_check(setdefault, &[key, w_builtin])?;
+            return Ok(());
+        }
+        if crate::dict_storage_get(ns, "__builtins__").is_none() {
             crate::dict_storage_store(ns, "__builtins__", w_builtin);
         }
+        Ok(())
     }
 
     // pypy/interpreter/pyopcode.py:2003-2013 ensure_ns —
@@ -2257,8 +2274,41 @@ fn exec_or_eval(
         anon_globals = Some(storage);
         globals_ptr = raw;
     }
+    // Attach the forward proxy BEFORE seeding `__builtins__` so that
+    // `space.call_method(w_globals, 'setdefault', ...)` (PyPy
+    // pyopcode.py:773) lands in BOTH the user dict's W_DictObject AND
+    // the frame storage that `pick_builtin` / LOAD_GLOBAL will consult.
+    // PyPy's single `W_DictMultiObject` makes this a non-issue; pyre's
+    // split storage requires the proxy bridge live before the
+    // `setdefault` write.  `GlobalsBinding::Drop` detaches even on
+    // `?` early-return from `ensure_builtins` / `createframe`.
+    unsafe {
+        globals_binding.attach_forward_proxy();
+    }
     if !globals_ptr.is_null() {
-        ensure_builtins(unsafe { &mut *globals_ptr }, caller_frame, exec_ctx);
+        // Pass the ORIGINAL `globals_arg` (the user's PyObjectRef —
+        // possibly a dict subclass instance) so `ensure_builtins` can
+        // dispatch `setdefault` on it via PyPy `pyopcode.py:773
+        // space.call_method(w_globals, 'setdefault', ...)`.  When the
+        // caller omits globals, fall back to the caller frame's
+        // w_globals object (or PY_NULL for the no-frame case, which
+        // forces the storage-direct write below).
+        let w_globals_obj = if !is_none_or_null(globals_arg) {
+            globals_arg
+        } else if !caller_frame.is_null() {
+            // Caller-frame globals are kept as `*mut DictStorage`;
+            // there is no PyObjectRef to dispatch through.  Anonymous
+            // path — direct storage write.
+            pyre_object::PY_NULL
+        } else {
+            pyre_object::PY_NULL
+        };
+        ensure_builtins(
+            unsafe { &mut *globals_ptr },
+            w_globals_obj,
+            caller_frame,
+            exec_ctx,
+        )?;
     }
 
     // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,
@@ -2342,16 +2392,6 @@ fn exec_or_eval(
             frame.setdictscope_object(implicit_caller_locals)?;
         }
     }
-    // Attach the forward proxy after every fallible setup step has
-    // succeeded so a `?` early-return from createframe /
-    // setdictscope_object cannot leave the user dict pointing at a
-    // Box we're about to drop.  The companion detach lives in
-    // `GlobalsBinding::Drop`, which runs even on panic-unwind paths
-    // through `frame.run()`.
-    unsafe {
-        globals_binding.attach_forward_proxy();
-    }
-
     // run() rather than execute_frame so that
     // `eval(compile("(x for x in [])", ..., 'eval'))` of generator-flagged
     // code returns the wrapped generator object instead of executing the

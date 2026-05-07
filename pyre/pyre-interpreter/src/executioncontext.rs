@@ -639,6 +639,16 @@ impl Default for ExecutionContext {
 impl ExecutionContext {
     #[inline]
     pub fn new() -> Self {
+        // Register the storage ↔ W_DictObject sync hooks before any
+        // module / dict allocation observes a missed mirror.  PyPy's
+        // single `W_DictMultiObject` owns both views; pyre's split
+        // requires the hooks to be live so that early construction
+        // (`get_builtin()` calling `w_module_new("builtins", ns)` —
+        // which writes `__name__` via `w_dict_setitem_str`) propagates
+        // into the storage instead of silently being dropped on the
+        // floor.  `Once` makes this idempotent across multiple ECs.
+        static HOOKS_INSTALLED: std::sync::Once = std::sync::Once::new();
+        HOOKS_INSTALLED.call_once(crate::call::install_dict_storage_hooks);
         Self {
             space: pyre_object::PY_NULL,
             topframeref: std::ptr::null_mut(),

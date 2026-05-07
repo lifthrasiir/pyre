@@ -847,6 +847,13 @@ impl PyFrame {
         let size = nlocals + ncells + 16; // small stack
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+        // Single `pick_builtin_pair` call — for the dict-subclass
+        // `__builtins__` arm this allocates a wrapping Module, so
+        // `pick_builtin` + `pick_builtin_w` would build it twice and
+        // leak the first.  PyPy stores a single
+        // `self.builtin = pick_builtin(w_globals)`; we widen the
+        // return type to surface both halves of pyre's split.
+        let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -864,8 +871,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            builtin: crate::baseobjspace::pick_builtin(w_globals, execution_context),
-            w_builtin: crate::baseobjspace::pick_builtin_w(w_globals, execution_context),
+            builtin: __pick.0,
+            w_builtin: __pick.1,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -954,6 +961,7 @@ impl PyFrame {
 
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
+        let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -971,8 +979,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            builtin: crate::baseobjspace::pick_builtin(w_globals, execution_context),
-            w_builtin: crate::baseobjspace::pick_builtin_w(w_globals, execution_context),
+            builtin: __pick.0,
+            w_builtin: __pick.1,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -1938,6 +1946,7 @@ impl PyFrame {
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
 
+        let __pick = crate::baseobjspace::pick_builtin_pair(globals, execution_context);
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -1953,8 +1962,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            builtin: crate::baseobjspace::pick_builtin(globals, execution_context),
-            w_builtin: crate::baseobjspace::pick_builtin_w(globals, execution_context),
+            builtin: __pick.0,
+            w_builtin: __pick.1,
         };
         frame.init_cells();
         if stores_global {
@@ -2163,6 +2172,7 @@ pub fn createframe(
         unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
 
     let size = num_locals + ncellvars + nfreevars + max_stack;
+    let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
     let mut frame = Box::new(PyFrame {
         execution_context,
         pycode: code,
@@ -2178,8 +2188,8 @@ pub fn createframe(
         f_generator_nowref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
-        builtin: crate::baseobjspace::pick_builtin(w_globals, execution_context),
-        w_builtin: crate::baseobjspace::pick_builtin_w(w_globals, execution_context),
+        builtin: __pick.0,
+        w_builtin: __pick.1,
     });
     if stores_global {
         frame.getorcreate_debug_data(-1).w_globals = w_globals;

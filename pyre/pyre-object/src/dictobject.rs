@@ -539,10 +539,28 @@ pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     if dict.dict_storage_proxy.is_null() {
         return dict.len;
     }
+    // Union of storage str keys + entries Vec str keys (deduplicated)
+    // + non-str entries Vec slots.  Mirrors PyPy's
+    // `W_DictMultiObject` behaviour where the single storage owns all
+    // entries: a str key written through `w_dict_setitem_str` lands in
+    // the entries Vec immediately, but the proxy `maybe_sync` may
+    // silently no-op if the items hook is not yet registered (early
+    // module init at process startup).  Skipping the entries Vec
+    // entirely would drop those transient str writes.
     let storage_items = maybe_items_dict_storage(dict.dict_storage_proxy);
     let entries = &*dict.entries;
-    let non_str = entries.iter().filter(|(k, _)| !crate::is_str(*k)).count();
-    storage_items.len() + non_str
+    let mut count = storage_items.len();
+    for (k, _) in entries.iter() {
+        if !crate::is_str(*k) {
+            count += 1;
+            continue;
+        }
+        let name = crate::w_str_get_value(*k);
+        if !storage_items.iter().any(|(s, _)| s == name) {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Iterate over all (key, value) pairs without type assumptions.
@@ -559,13 +577,22 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
     if dict.dict_storage_proxy.is_null() {
         return entries.clone();
     }
-    let mut out: Vec<(PyObjectRef, PyObjectRef)> =
-        maybe_items_dict_storage(dict.dict_storage_proxy)
-            .into_iter()
-            .map(|(name, value)| (crate::w_str_new(&name), value))
-            .collect();
+    let storage_items = maybe_items_dict_storage(dict.dict_storage_proxy);
+    let mut out: Vec<(PyObjectRef, PyObjectRef)> = storage_items
+        .iter()
+        .map(|(name, value)| (crate::w_str_new(name), *value))
+        .collect();
+    // Append entries Vec slots that aren't already represented in
+    // storage: non-str keys (storage is str-keyed only) and any str
+    // key that hasn't been mirrored into storage yet (early init
+    // before the items hook is registered, or pending sync).
     for &(k, v) in entries.iter() {
         if !crate::is_str(k) {
+            out.push((k, v));
+            continue;
+        }
+        let name = crate::w_str_get_value(k);
+        if !storage_items.iter().any(|(s, _)| s == name) {
             out.push((k, v));
         }
     }
@@ -579,15 +606,27 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
 /// signature.
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
     let dict = &*(obj as *const W_DictObject);
-    if !dict.dict_storage_proxy.is_null() {
-        return maybe_items_dict_storage(dict.dict_storage_proxy);
-    }
     let entries = &*dict.entries;
-    entries
-        .iter()
-        .filter(|(k, _)| crate::is_str(*k))
-        .map(|&(k, v)| (crate::w_str_get_value(k).to_string(), v))
-        .collect()
+    if dict.dict_storage_proxy.is_null() {
+        return entries
+            .iter()
+            .filter(|(k, _)| crate::is_str(*k))
+            .map(|&(k, v)| (crate::w_str_get_value(k).to_string(), v))
+            .collect();
+    }
+    let mut out = maybe_items_dict_storage(dict.dict_storage_proxy);
+    // Union with entries Vec str keys not yet mirrored into storage —
+    // see `w_dict_items` for the early-init / pending-sync rationale.
+    for &(k, v) in entries.iter() {
+        if !crate::is_str(k) {
+            continue;
+        }
+        let name = crate::w_str_get_value(k);
+        if !out.iter().any(|(s, _)| s == name) {
+            out.push((name.to_string(), v));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
