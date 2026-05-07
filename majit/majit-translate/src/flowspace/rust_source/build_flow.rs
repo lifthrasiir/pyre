@@ -403,18 +403,22 @@ impl Builder {
     ///    `pyopcode.py:502`); the bare identifier `None` resolves to
     ///    `Constant(ConstValue::None)` (Python's NoneType singleton —
     ///    flowspace's `Constant(None)` carrier per `model.py`);
-    ///    `host_env::HOST_RUST_MODULE_FUNCS` (the `func_globals`
+    ///    `host_env::HOST_RUST_MODULE_GLOBALS` (the `func_globals`
     ///    analogue, populated by [`super::register::register_rust_module`])
-    ///    yields a `Constant(HostObject(<UserFunction>))` for any
-    ///    top-level `fn` in a previously-walked `syn::File`; the
+    ///    yields whatever `ConstValue` was registered for the matching
+    ///    `(module_id, name)` — `Item::Enum` and `Item::Struct` lift to
+    ///    `HostObject(<class>)`, literal `Item::Const` lifts to the
+    ///    literal value directly (`Int` / `Bool` / `byte_str`); the
     ///    closed-world `host_env::PYRE_STDLIB` registry (the
     ///    `__builtin__` analogue) yields a
     ///    `Constant(HostObject(<class>))` for `Ok` / `Some` / `Err` /
-    ///    `Result` / `Option`; otherwise `UnboundLocal`. No on-demand
-    ///    minting at single-segment scope — a bare PascalCase
-    ///    identifier could be a local, a unit struct, a const, or a
-    ///    type, and the adapter cannot disambiguate without
-    ///    annotator-level context.
+    ///    `Result` / `Option`; otherwise `UnboundLocal`. `Item::Fn` is
+    ///    NOT in the module-globals registry (Issue 1.2
+    ///    PRE-EXISTING-ADAPTATION — see "uncovered" section below).
+    ///    No on-demand minting at single-segment scope — a bare
+    ///    PascalCase identifier could be a local, a unit struct, a
+    ///    const, or a type, and the adapter cannot disambiguate
+    ///    without annotator-level context.
     /// 2. **Multi-segment paths** (`A::B::C`) — leftmost segment goes
     ///    through single-segment resolution but with mint fallback
     ///    (PRE-EXISTING-ADAPTATION, see "Mint-on-demand stand-in"
@@ -463,17 +467,15 @@ impl Builder {
     ///   `file.items.iter().find_map(...)` in
     ///   `build_host_function_from_rust_file`, bypassing the
     ///   registry.
-    /// - **Production callsites that don't walk the file first.**
-    ///   `Translation::from_rust_item_fn` and the driver tests in
-    ///   `translator/driver.rs` invoke `build_host_function_from_rust`
-    ///   on a single `ItemFn` without first registering the enclosing
-    ///   `syn::File`'s sibling items. Until those callsites switch to
-    ///   the walker-first idiom, the leftmost segment may legitimately
-    ///   miss the registry even though the enum exists in source.
-    /// - **`Item::Static`, compound `Item::Const`, `Item::Use`,
-    ///   `Item::Mod`, `Item::Impl`.** Walker dispatch deferred
-    ///   pending a const-expression evaluator and import-graph
-    ///   resolution.
+    /// - **`Item::Use`, `Item::Mod`, `Item::Impl`.** Walker dispatch
+    ///   deferred pending import-graph resolution (`Item::Use`,
+    ///   `Item::Mod`) and method-on-class redirection
+    ///   (`Item::Impl`). Compound `Item::Const` was closed by Issue
+    ///   2.4 (extended `eval_const_expr` for shifts / bitwise /
+    ///   comparisons / bool ops). Immutable `Item::Static` was
+    ///   closed by Slice O15 (`register.rs::register_rust_module`
+    ///   walks `static FOO: T = <expr>;` parallel to `Item::Const`;
+    ///   `static mut` is a documented PRE-EXISTING-ADAPTATION skip).
     /// - **Third-party crate types** (`rustpython_compiler_core::Instruction`)
     ///   that pyre-interpreter references — the walker has no
     ///   visibility into upstream crate sources.
@@ -494,13 +496,16 @@ impl Builder {
     /// minted class has empty members; constfold would
     /// `FlowingError` on every getattr.
     ///
-    /// **Convergence path**: route every production callsite through
-    /// `register_rust_module(&parsed_file)` before invoking
-    /// `build_host_function_from_rust(item_fn)`. Then drop the
-    /// `mint_unknown` branch and surface `AdapterError::UnboundLocal`
-    /// (the closest local analogue of `FlowingError`) for
-    /// unregistered names. Tracked as Slice O9 (callsite cutover) +
-    /// Slice O10 (`Item::Const` walker dispatch).
+    /// **Convergence path**: Slice O9 (production callsite cutover
+    /// through [`super::register::build_host_function_from_rust_file`])
+    /// and Slice O10 (`Item::Const` walker dispatch) both landed
+    /// 2026-05-04; Slice O12 / O15 added immutable `Item::Static`.
+    /// The remaining `mint_unknown` branch survives only for the
+    /// `Item::Fn` / `Item::Use` / `Item::Mod` / `Item::Impl` gaps
+    /// above, plus third-party crate types whose source the walker
+    /// cannot see. Once those are covered the branch becomes
+    /// `AdapterError::UnboundLocal` (the closest local analogue of
+    /// upstream's `FlowingError("global name '%s' is not defined")`).
     ///
     /// ### Constfold-then-emit cascade (Slice O8 — landed)
     ///

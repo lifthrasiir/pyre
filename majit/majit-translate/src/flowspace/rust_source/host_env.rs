@@ -83,18 +83,25 @@ use crate::flowspace::model::{ConstValue, HostObject};
 ///   bare [`super::register::build_host_function_from_rust`]
 ///   single-`ItemFn` entry that has no enclosing file.
 /// - [`Self::for_path`] — find-or-mint keyed on a stable path
-///   string. The counterpart of `sys.modules[path]`: re-importing
-///   the same module returns the cached module object, so all
-///   `def`/`class` statements in it share one `__dict__`. Right
-///   answer for the file-aware
+///   string. Path-keyed `exec(source, shared_dict)` shape: every
+///   walk of the same path re-executes against the **same**
+///   `(module_id, _)` partition with last-writer-wins semantics
+///   (see [`Self::for_path`]'s docstring). This is **not**
+///   upstream `sys.modules[path]` import-cache behaviour — that
+///   cache short-circuits the second `import` entirely; the
+///   pyre walker has no such short-circuit and re-runs every
+///   walk. The two-walks-converge invariant is the registry id
+///   only, not the registry contents. Right answer for the
+///   file-aware
 ///   [`super::register::build_host_function_from_rust_file`]
 ///   path: two walks of the same source file (e.g. one driver
 ///   test asks for entry-point A, another asks for entry-point B,
-///   both inside the same `pyopcode.rs`) must reach the same
-///   partition so the entry points share their sibling-item view,
-///   matching upstream `entry_point_a.__globals__ is
-///   entry_point_b.__globals__` for two functions defined in the
-///   same Python module.
+///   both inside the same `pyopcode.rs`) reach the same
+///   partition so the entry points share their sibling-item
+///   view as long as both walks succeed end-to-end. Callers
+///   that want `sys.modules`-style "skip the second import"
+///   semantics must gate the call themselves on a prior
+///   [`module_globals_lookup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleId(u64);
 
@@ -108,11 +115,20 @@ impl ModuleId {
     }
 
     /// Find-or-mint a `ModuleId` keyed on `path`. Two calls with the
-    /// same path return the same id; first call mints a fresh id
-    /// (via [`Self::fresh`]) and caches it. Mirrors upstream
-    /// `sys.modules[path]` import-cache semantics: re-importing the
-    /// same module returns the cached module object so `def` /
-    /// `class` statements bind into one shared `__dict__`.
+    /// same path return the same `id` so multiple walks of the same
+    /// source file share one `(module_id, name)` partition in
+    /// [`HOST_RUST_MODULE_GLOBALS`]. Each walk is `exec(source,
+    /// shared_dict)`-shaped — every `Item::Const` / `Item::Enum` /
+    /// `Item::Struct` re-runs and overwrites under the fixed
+    /// `module_id` ([`register_module_global`] is last-writer-wins).
+    /// This is **not** upstream `sys.modules[name]` import-cache
+    /// behaviour: that cache short-circuits the re-execution
+    /// entirely on the second `import`. The pyre walker has no such
+    /// short-circuit, so callers that want import-cache semantics
+    /// must gate the call themselves on a prior
+    /// [`module_globals_lookup`] (or first-class
+    /// `Translation`-level memo). The two-walks-converge invariant
+    /// here is only the registry id, not the registry contents.
     ///
     /// `path` is the caller-supplied identity string. For a
     /// `syn::File` produced by `syn::parse_file(p)`, callers thread

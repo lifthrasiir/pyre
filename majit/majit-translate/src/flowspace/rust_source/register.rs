@@ -61,16 +61,21 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     BinOp, Expr, ExprBinary, ExprForLoop, ExprLit, ExprPath, ExprUnary, File, FnArg, Item,
-    ItemConst, ItemEnum, ItemFn, ItemStruct, Lit, Local, Pat, PatIdent, UnOp,
+    ItemEnum, ItemFn, ItemStruct, Lit, Local, Pat, PatIdent, UnOp,
 };
 
 use super::build_flow::{AdapterError, build_flow_from_rust_in_module};
 use super::host_env::{
-    ModuleId, module_globals_lookup, module_globals_snapshot, register_module_global,
+    ModuleId, module_globals_lookup, module_globals_snapshot, pyre_stdlib_lookup,
+    register_module_global,
 };
 use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::objspace::CO_NEWLOCALS;
+use crate::flowspace::operation::{
+    ArithOps, cmp_fold, coerce_arith, coerce_int_pair, float_py_mod, int_py_floor_div, int_py_mod,
+    is_foldable_numeric, python_eq_const,
+};
 use crate::flowspace::pygraph::PyGraph;
 
 /// Walk `item_fn`, run the Rust-AST adapter, and return the
@@ -349,25 +354,37 @@ pub fn build_host_function_metadata_from_rust(
 /// - **`Item::Struct`** → `class Foo: ...` with empty class dict.
 ///   Struct fields live on instances, not the class object.
 ///   Stored as `ConstValue::HostObject(<class>)`.
-/// - **`Item::Const`** → `MODULE_NAME = <literal>` at module top
-///   level. Bound to `module.__dict__[MODULE_NAME]` as the literal
-///   value itself. Stored as `ConstValue::Int/Bool/UniStr/ByteStr`
+/// - **`Item::Const`** → `MODULE_NAME = <expr>` at module top
+///   level. Bound to `module.__dict__[MODULE_NAME]` as the
+///   evaluated value. Stored as `ConstValue::Int/Bool/UniStr/ByteStr/Float`
 ///   directly (no HostObject wrapper) — mirrors upstream
 ///   `find_global` returning `const(value)` regardless of value
-///   type. Only literal RHS exprs are supported in this slice
-///   (`Lit::Int` / `Lit::Bool` / `Lit::Str` / `Lit::ByteStr` /
-///   unary-`Neg` over `Lit::Int`); compound const expressions
-///   (`const Y: i64 = X + 1;` referring to other consts, calls to
-///   `const fn`, etc.) require a richer evaluator and are skipped
-///   here — each falls through to the
-///   `Builder::resolve_path_constant` mint-or-fail path.
+///   type. RHS evaluation is delegated to [`eval_const_expr`],
+///   which covers literal forms (`Lit::Int` / `Lit::Bool` /
+///   `Lit::Str` / `Lit::ByteStr` / `Lit::Float` / `Lit::Char` /
+///   `Lit::Byte`), unary `Neg` / `Not`, single-segment Path
+///   lookups against prior `bindings` and the registry partition
+///   (forward-ref + re-walk paths), and binary ops (`+` / `-` /
+///   `*` / `/` / `%` / `<<` / `>>` / `&` / `|` / `^` / `==` /
+///   `!=` / `<` / `<=` / `>` / `>=` / `&&` / `||`) over
+///   evaluated operands. Shapes [`eval_const_expr`] does not yet
+///   cover (function calls, struct literals, multi-segment paths)
+///   decline-fold to `Ok(None)` and the walker silently skips —
+///   those bindings then fall through to
+///   `Builder::resolve_path_constant`'s mint-or-fail path at
+///   call sites.
 ///
-/// Other `Item::*` kinds (`Item::Fn`, `Item::Static`, `Item::Use`,
-/// `Item::Mod`, `Item::Impl`, …) are silently skipped. `Item::Fn`
-/// for the parity reason above; the others as upstream-walker
-/// follow-ups (each populates `module.__dict__` at Python import
-/// time too). Each future slice extends the dispatch match without
-/// changing the call sites.
+/// Other `Item::*` kinds (`Item::Fn`, `Item::Use`, `Item::Mod`,
+/// `Item::Impl`, …) are silently skipped. `Item::Fn` for the
+/// parity reason above; the others as upstream-walker follow-ups
+/// (each populates `module.__dict__` at Python import time too).
+/// **Immutable** `Item::Static` is admitted alongside `Item::Const`
+/// (Slice O12) — upstream Python's `module.__dict__` sees both
+/// shapes identically. `static mut FOO` is **NOT** registered
+/// (Slice O15 / codex audit 2026-05-06): runtime mutation makes
+/// the initial-value snapshot unsound for constfold reads, so the
+/// adapter skips until a live-store path lands. Each future slice
+/// extends the dispatch match without changing the call sites.
 ///
 /// ### Per-module scoping (Issue 1.3, 2026-05-05)
 ///
@@ -391,17 +408,28 @@ pub fn register_rust_module(file: &File) -> Result<ModuleId, AdapterError> {
 /// Path-aware sibling of [`register_rust_module`]. When
 /// `source_filename` is `Some(path)`, the registry id is keyed on
 /// `path` so that two walks of files at the same path converge on
-/// the same [`ModuleId`] (mirrors upstream `sys.modules[name]`
-/// import-cache). When `None`, the call mints a fresh
-/// [`ModuleId`] every time — anonymous walks NEVER merge.
+/// the same [`ModuleId`] (scoped sharing of the `(module_id, name)`
+/// partition; **not** upstream `sys.modules` import-cache, which
+/// short-circuits the second `import` entirely — the walker
+/// re-executes every time and overwrites entries last-writer-wins).
+/// When `None`, the call mints a fresh [`ModuleId`] every time —
+/// anonymous walks NEVER merge.
 ///
-/// Mirrors upstream's two ways of obtaining a module dict:
+/// Two walk shapes:
 ///
-/// - **Path-keyed** (`Some(path)`) ↔ `sys.modules[modulename]`:
-///   every `def` / `class` statement in the same source file binds
-///   into the same `__dict__` via the import-cache lookup. Two
+/// - **Path-keyed** (`Some(path)`): every walk re-executes against
+///   the shared `(module_id, name)` partition under
+///   `exec(source, shared_dict)` semantics — entries from the
+///   second walk overwrite those from the first per the
+///   [`register_module_global`] last-writer-wins rule. Mid-walk
+///   failure (an `Item::Const` RHS that surfaces `Err`) leaves
+///   prior bindings of THIS walk in the partition. Callers that
+///   want `sys.modules`-style "skip the second import" semantics
+///   must gate the call themselves on a prior
+///   [`module_globals_lookup`] for a known sentinel name. Two
 ///   `Translation` instances built against entry points from the
-///   same file see identical `func.__globals__` references.
+///   same file see identical registry partitions only when both
+///   re-walks succeed end-to-end.
 /// - **Anonymous** (`None`) ↔ `exec(source, fresh_dict)`: each
 ///   `exec` runs the code against a fresh namespace, even if the
 ///   source string is byte-identical to a prior `exec`. Two
@@ -417,10 +445,9 @@ pub fn register_rust_module(file: &File) -> Result<ModuleId, AdapterError> {
 /// regression: `exec(source, dict_a)` and `exec(source, dict_b)`
 /// in upstream Python produce **distinct** `__dict__`s — content
 /// equality does not imply module identity. Path-keyed sharing
-/// is the only orthodox way to opt into a shared registry slice;
-/// callers who need that contract MUST thread a stable path
-/// (filesystem path, fixture label, anything) through
-/// `Some(...)`.
+/// is the only way to opt into a shared registry slice; callers
+/// who need that contract MUST thread a stable path (filesystem
+/// path, fixture label, anything) through `Some(...)`.
 pub fn register_rust_module_at(
     file: &File,
     source_filename: Option<&str>,
@@ -472,15 +499,67 @@ pub fn register_rust_module_at(
                 // populated by a prior walk (Issue 2.3, 2026-05-05) —
                 // mirrors upstream `module.__dict__` being the live
                 // reference visible across re-imports.
-                // Codex parity audit (2026-05-05): deterministic-
-                // failure cases (overflow, type mismatch, unbound name)
-                // surface as `Err` and abort the walk, matching upstream
-                // Python's import-time exception. Unsupported shapes
-                // (function calls, struct literals, multi-segment paths,
-                // float / char literals) return `Ok(None)` and are
-                // silently skipped — those are walker-coverage gaps
-                // (Issue 2.3 follow-up), not deterministic failures.
+                // Failure modes:
+                //
+                // - **Type mismatch / zero divisor** (`true + 1`,
+                //   `1 / 0`) → `Err`. Walker aborts the file, matching
+                //   upstream Python's import-time exception.
+                // - **`i64` overflow** (`MAX + 1`, `MIN / -1`,
+                //   `1 << 64`) → `Unsupported`. Upstream Python
+                //   would bind a bignum at module top level; pyre
+                //   adapter has no bignum carrier, and this is not an
+                //   upstream `FlowingError`. Surface the unsupported
+                //   carrier loudly instead of pretending Python raised.
+                //   (Function-body constfold takes a different path —
+                //   it declines per `operation.py:140-142` and lets
+                //   runtime emit. Module top level has no analogous
+                //   "let runtime do it" stage.)
+                // - **Unsupported shapes** (function calls, struct
+                //   literals, multi-segment paths) → `Ok(None)`.
+                //   Walker-coverage gaps (Issue 2.3 follow-up).
+                // - **Unresolved single-segment Path** → `Err(NameError)`,
+                //   matching `flowcontext.py:853 find_global` which
+                //   raises `FlowingError("global name '...' is not
+                //   defined")` after both globals and builtins miss.
+                //   Walker aborts the file. Walker-coverage gaps for
+                //   `Item::Fn` / `Item::Use` / `Item::Mod` / `Item::Impl`
+                //   surface as parity-correct hard errors here rather
+                //   than silent dropped bindings.
                 if let Some(value) = eval_const_expr(&item_const.expr, &const_bindings, module_id)?
+                {
+                    register_module_global(module_id, &name, value.clone());
+                    const_bindings.insert(name, value);
+                }
+            }
+            // `static FOO: T = <expr>;` (immutable static, Slice
+            // O12 + O15). Module-globals registry binding parallels
+            // `Item::Const`: the import-time RHS folds through the
+            // same `eval_const_expr` and the same source-order
+            // `const_bindings` accumulator. Mirrors `flowcontext.py:847
+            // w_globals.value[varname]` which sees `def`-bound and
+            // assignment-bound names identically.
+            //
+            // **Mutable static (`static mut FOO: T = <expr>;`) is
+            // NOT registered** (Slice O15, codex parity audit
+            // 2026-05-06). PRE-EXISTING-ADAPTATION: Rust's `mut`
+            // marks the global as runtime-mutated; the registry
+            // entry would be a stale snapshot of the *initial*
+            // value the moment any code writes to it, and folding
+            // reads against the initial value would silently
+            // produce wrong constfold results. Upstream Python does
+            // not have this problem (its flow analysis tracks each
+            // `STORE_GLOBAL` at function-body time); pyre's adapter
+            // has no analogous live-store path at module-globals
+            // prepass. Until that lands, skipping mutable statics
+            // entirely is the parity-safe choice — downstream
+            // lookups fall through to `Builder::resolve_path_constant`'s
+            // mint-or-fail path, which is the right shape for
+            // "opaque runtime-mutated symbol".
+            Item::Static(item_static)
+                if matches!(item_static.mutability, syn::StaticMutability::None) =>
+            {
+                let name = item_static.ident.to_string();
+                if let Some(value) = eval_const_expr(&item_static.expr, &const_bindings, module_id)?
                 {
                     register_module_global(module_id, &name, value.clone());
                     const_bindings.insert(name, value);
@@ -498,15 +577,6 @@ pub fn register_rust_module_at(
                 // - **`Item::Fn`** — see "Why no Item::Fn?" doc on
                 //   this fn for the parity reason; convergence is
                 //   the M2.5g side-table walker epic.
-                // - **`Item::Static`** — module-level mutable
-                //   bindings; upstream `MUTABLE = []` at module
-                //   top level. Walker dispatch needs the same
-                //   literal evaluator as `Item::Const` plus a
-                //   mutability marker on the `ConstValue`.
-                // - **Compound `Item::Const`** (`const Y = X + 1`)
-                //   — needs a const-expression evaluator capable of
-                //   threading prior registry entries through binop
-                //   / call ops.
                 // - **`Item::Use`** — re-export of another item's
                 //   binding. Upstream Python's `from x import y`
                 //   binds `module.__dict__["y"]` to the imported
@@ -570,23 +640,45 @@ fn build_host_class_from_enum(item_enum: &ItemEnum) -> HostObject {
 /// `bindings` as the lookup environment for prior `const` names in
 /// the same module walk.
 ///
-/// Tri-state return mirrors upstream Python's import-time RHS
-/// evaluation contract:
+/// Tri-state return:
 ///
 /// - `Ok(Some(v))` — RHS evaluated successfully; bind `name = v`.
-/// - `Ok(None)` — RHS shape is *unsupported* by this static
-///   evaluator (e.g. function call, struct literal, multi-segment
-///   path, `Lit::Float` / `Lit::Char`). Walker silently skips the
-///   binding because we cannot statically tell whether upstream
-///   Python's runtime evaluator would succeed or raise — this is
-///   the "incomplete walker coverage" case (Issue 2.3 follow-up).
-/// - `Err(e)` — RHS shape is *supported* but evaluation
-///   deterministically fails. Upstream Python raises immediately
-///   at import time (`OverflowError`, `TypeError`, `NameError`,
-///   `ZeroDivisionError`, …); the walker propagates the error to
-///   abort the walk, matching upstream's "import-time RHS failure
-///   is an immediate exception, not an unresolved global" semantic
-///   (Codex parity audit, 2026-05-05).
+/// - `Ok(None)` — decline-fold. Used for **shape unsupported** at
+///   this evaluator: function call, struct literal, multi-segment
+///   path. Walker silently skips (walker-coverage gap, Issue 2.3
+///   follow-up) and the const stays unbound; downstream lookups
+///   fall through to mint-or-fail.
+/// - `Err(e)` — supported shape but the operation cannot produce
+///   a representable binding at module top level:
+///   - **Type mismatch** in unary / binary op (`!"x"`,
+///     `1 < "x"` ordering).
+///   - **Zero-divisor** (`1 / 0`, `1 % False`, `1.0 / 0.0`).
+///   - **Negative shift count** (`1 << -1`, `1 >> -1`) per
+///     `operator.lshift/rshift` raising `ValueError` upstream.
+///   - **`i64` overflow** on `Lit::Int` / unary `Neg` / binop
+///     (`MAX + 1`, `MIN / -1`, `1 << 64`). Upstream Python module
+///     execution would bind a bignum here and continue; pyre
+///     adapter has no bignum carrier so surfaces the divergence as
+///     `AdapterError::Unsupported`, not an upstream-shaped
+///     `FlowingError`. **Note**: this is structurally distinct from
+///     `PureOperation.constfold`'s
+///     `can_overflow and type(result) is long` decline arm at
+///     `operation.py:140-142`. THAT rule lives at function-body
+///     constfold time — it lets the runtime evaluate the op as
+///     bignum after declining. There is no analogous "let the
+///     runtime do it" at module-import-time prepass.
+///   - **Unresolved single-segment Path** — name not in `bindings`
+///     and not in the registry partition. Mirrors
+///     `flowcontext.py:853 find_global` raising
+///     `FlowingError("global name '...' is not defined")` after
+///     both globals and builtins miss. Walker-coverage gaps for
+///     `Item::Fn` / `Item::Use` / `Item::Mod` / `Item::Impl`
+///     surface here — those are fixed by extending walker
+///     coverage, not by silently dropping the binding.
+///   Walker propagates the error to abort the walk, matching
+///   upstream Python's module-execution-aborts-on-exception
+///   semantics (`Y = X + 1; X = 1` fails on `Y` with NameError;
+///   the `X = 1` statement never runs).
 ///
 /// Supported shapes:
 ///
@@ -598,33 +690,60 @@ fn build_host_class_from_enum(item_enum: &ItemEnum) -> HostObject {
 ///   unicode regardless of where it appears.
 /// - `Lit::ByteStr(s)` → `ConstValue::byte_str(s)` (Rust `b"..."`
 ///   bytes literal stays bytes).
-/// - `-<Lit::Int>` (unary negation over an integer literal) →
-///   `ConstValue::Int(-n)`. `syn` parses `const X: i64 = -1` as
-///   `Expr::Unary { op: Neg, expr: Lit(1) }`, not a single
-///   `Lit::Int(-1)`, so unwrap one level for the common signed-int
-///   form.
-/// - **`Expr::Path` (single segment)** → `bindings.get(name)`
-///   lookup, or `module_globals_lookup(module_id, name)` fallback.
-///   Mirrors upstream Python's name resolution against
-///   `module.__dict__` at import time: by the time the RHS of
-///   `Y = X + 1` runs, the prior `X = 1` has already bound
-///   `module.__dict__["X"]`. The fallback through the registry
-///   handles the path-keyed re-walk case (Issue 2.3): when
-///   `module_id` was minted by a prior walk that already
-///   populated `X`, the second walk's fresh `bindings` does not
-///   carry it but the registry partition does — upstream's live
-///   `module.__dict__` is visible across re-imports too.
+/// - `Lit::Float(f)` → `ConstValue::Float(f.to_bits())`. Same shape
+///   as `build_flow.rs::lower_literal::Lit::Float`. Out-of-`f64`-range
+///   raises `AdapterError::Unsupported` at module top level (no carrier).
+/// - `Lit::Char(c)` → `ConstValue::uni_str(c.to_string())`. Single-
+///   char unicode string — upstream RPython has no `char` type,
+///   single-char strings fill the role.
+/// - `Lit::Byte(b)` → `ConstValue::ByteStr(vec![b])`. Mirrors
+///   `build_flow.rs::lower_literal::Lit::Byte`.
+/// - `-<Lit::Int>` / `-<Lit::Float>` (unary negation over a
+///   numeric literal) → `ConstValue::Int(-n)` /
+///   `ConstValue::Float(-f).to_bits()`. `syn` parses `const X:
+///   i64 = -1` as `Expr::Unary { op: Neg, expr: Lit(1) }` (and
+///   likewise for floats), not a signed literal, so unwrap one
+///   level. Mirrors `operation.rs::pyfunc`'s
+///   `(OpKind::Neg, [ConstValue::Int])` and
+///   `(OpKind::Neg, [ConstValue::Float])` arms so a top-level
+///   const and an in-body unary `-` agree on the value.
+/// - **`Expr::Path` (single segment)** → resolution chain mirrors
+///   upstream `flowcontext.py:845-853 find_global`:
+///   1. `bindings.get(name)` — per-walk source-order accumulator,
+///      stand-in for the in-progress module dict.
+///   2. `module_globals_lookup(module_id, name)` — registry
+///      partition; covers re-walks where the second walk's fresh
+///      `bindings` is empty but the partition was populated by the
+///      first walk.
+///   3. `pyre_stdlib_lookup(name)` — closed-world builtins
+///      (`Ok` / `Some` / `Err` / `Result` / `Option`). Mirrors
+///      upstream's `getattr(__builtin__, varname)` second arm.
+///   4. NameError. All three channels miss matches upstream's
+///      `AttributeError → FlowingError` final step.
 ///   Multi-segment paths fall through to `None` (a path like
 ///   `mod::CONST_X` would require cross-file lookup and is out
 ///   of scope for this slice).
 /// - **`Expr::Binary { Add | Sub | Mul | Div | Rem | Shl | Shr |
 ///   BitAnd | BitOr | BitXor, lhs, rhs }`** over `Int` operands →
-///   `Int(a OP b)`. Uses Rust's checked arithmetic; arithmetic
-///   overflow surfaces as `Err(OverflowError: …)` (mirrors upstream
-///   raising at import time — silent decline would invite a
-///   wrong-shape constant into the module dict). `Div` / `Rem`
-///   raise `Err(ZeroDivisionError)` on zero divisor; `Shl` / `Shr`
-///   raise `Err(ValueError)` on negative or `>= 64` shift counts.
+///   `Int(a OP b)`. `Div` / `Rem` use Python floor-div / floor-mod
+///   semantics (negative-divisor sign-flip) line-by-line per
+///   `rpython/rtyper/rint.py:398 ll_int_py_div` /
+///   `:496 ll_int_py_mod`, matching `flowspace::operation`'s
+///   `int_py_floor_div` / `int_py_mod` so a `const Y = 3 / -2` at
+///   module top level and `3 / -2` inside a function body produce
+///   the same value. Zero divisor surfaces as
+///   `Err(ZeroDivisionError)` per upstream `operator.floordiv(_, 0)`
+///   raising at import time. `i64` overflow on `+` / `-` / `*` /
+///   `i64::MIN / -1` / shifts that don't fit in `u32` / `>= 64`
+///   surface as `AdapterError::Unsupported` (pyre adapter has no bignum
+///   carrier; the function-body `PureOperation.constfold` decline
+///   path at `operation.py:140-142` does not apply at import-time
+///   prepass — see fn-level doc).
+/// - **`Expr::Binary { Add | Sub | Mul | Div, lhs, rhs }`** over
+///   `Float` operands → `Float(a OP b)`. Mirrors `operation.rs::pyfunc`
+///   Float arms (`operation.rs:1367-1383`). Rust `BinOp::Div` over
+///   `f64` is true division (matches Python `/`). `Float / 0.0`
+///   raises `Err(ZeroDivisionError)` per Python semantics.
 /// - **`Expr::Binary { Eq | Ne, lhs, rhs }`** over any operand
 ///   pair → `Bool(...)`. Same-type pairs use the matching arm's
 ///   structural equality; mixed-type pairs (e.g. `Int` vs `UniStr`)
@@ -643,18 +762,46 @@ fn build_host_class_from_enum(item_enum: &ItemEnum) -> HostObject {
 /// - **`Expr::Unary { Not, expr }`** over `Bool` → `Bool(!b)` (Rust
 ///   `!bool` is logical negation), or over `Int` → `Int(!n)` (Rust
 ///   `!int` is bitwise complement, mirroring Python `~`).
+/// - **`Expr::Paren(expr)` / `Expr::Group(expr)`** — transparent
+///   delegation to the inner expression. Upstream Python has no
+///   parenthesisation node (parens evaporate at parse time and only
+///   affect operator precedence) so a `const X: bool = (1 == 2)`
+///   resolves identically to `const X: bool = 1 == 2`. Mirrors the
+///   body lowerer's transparency at `build_flow.rs:1317`.
 fn eval_const_expr(
     expr: &Expr,
     bindings: &StdHashMap<String, ConstValue>,
     module_id: ModuleId,
 ) -> Result<Option<ConstValue>, AdapterError> {
     let raise = |reason: String| AdapterError::Flowing { reason };
+    let unsupported = |reason: String| AdapterError::Unsupported { reason };
     match expr {
         Expr::Lit(ExprLit { lit, .. }) => match lit {
+            // Literal that does not fit in `i64`. Upstream Python
+            // module-top-level `X = 9223372036854775808` would bind
+            // `X` to a Python long (bignum) without raising — Python
+            // ints are arbitrary precision. Pyre's adapter has no
+            // bignum carrier, so the binding cannot be created. The
+            // orthodox response is `AdapterError::Unsupported`:
+            // declining to `Ok(None)` would silently produce a
+            // `module.__dict__` missing a name that upstream Python
+            // would have bound, creating worse divergence than
+            // aborting the walk. This is not a `FlowingError` because
+            // upstream Python does not raise.
+            //
+            // Note: this is structurally distinct from
+            // `PureOperation.constfold`'s `can_overflow and type(result)
+            // is long` decline arm at `operation.py:140-142`. THAT
+            // rule lives at function-body constfold time — it lets the
+            // runtime evaluate the op as bignum. There is no analogous
+            // "let the runtime do it" at module-import-time prepass:
+            // upstream Python would have already produced the bignum
+            // by the time this prepass ran.
             Lit::Int(n) => match n.base10_parse::<i64>() {
                 Ok(v) => Ok(Some(ConstValue::Int(v))),
-                Err(_) => Err(raise(format!(
-                    "OverflowError: integer literal {n} does not fit in i64"
+                Err(_) => Err(unsupported(format!(
+                    "integer literal {} exceeds i64 carrier; bignum constants are not supported",
+                    n
                 ))),
             },
             Lit::Bool(b) => Ok(Some(ConstValue::Bool(b.value))),
@@ -666,6 +813,32 @@ fn eval_const_expr(
             // `b"..."` literal — bytes. Mirrors
             // `build_flow.rs::lower_literal::Lit::ByteStr`.
             Lit::ByteStr(s) => Ok(Some(ConstValue::ByteStr(s.value()))),
+            // Float literal — `ConstValue::Float` stores
+            // `f64::to_bits()` so the enum keeps `Eq + Hash`
+            // (`model.rs:1696-1701`). Matches the in-body shape
+            // at `build_flow.rs::lower_literal::Lit::Float`. Out-
+            // of-`f64`-range surfaces `AdapterError::Unsupported` for
+            // the same reason `Lit::Int` overflow does: upstream
+            // Python would still bind a value (even if `inf`), but
+            // the representation we encode through `f64::to_bits()`
+            // cannot carry the source-text the user wrote.
+            Lit::Float(f) => match f.base10_parse::<f64>() {
+                Ok(v) => Ok(Some(ConstValue::Float(v.to_bits()))),
+                Err(e) => Err(unsupported(format!(
+                    "float literal out of f64 range; float carrier cannot represent source literal: {e}"
+                ))),
+            },
+            // Rust `'a'` char literal — single Unicode scalar.
+            // Upstream RPython has no `char` type; single-char
+            // strings fill the role (`model.py:658`,
+            // `operation.py` string ops accept `len == 1` like
+            // any other unicode). Emit as `ConstValue::UniStr`
+            // matching `build_flow.rs::lower_literal::Lit::Char`.
+            Lit::Char(ch) => Ok(Some(ConstValue::uni_str(ch.value().to_string()))),
+            // Rust `b'a'` byte literal — single byte. Mirrors
+            // `build_flow.rs::lower_literal::Lit::Byte` which
+            // emits `ConstValue::ByteStr(vec![b])`.
+            Lit::Byte(b) => Ok(Some(ConstValue::ByteStr(vec![b.value()]))),
             _ => Ok(None),
         },
         // `const X: i64 = -1` — `syn` parses as `Unary { op: Neg,
@@ -680,14 +853,32 @@ fn eval_const_expr(
                 return Ok(None);
             };
             match v {
+                // `-(i64::MIN)` overflows the `i64` carrier. Upstream
+                // Python would bind `2**63` (bignum) without raising;
+                // pyre adapter has no bignum carrier, so surface as
+                // `AdapterError::Unsupported`. See `Lit::Int` doc
+                // above for why decline-fold (Ok(None)) is wrong at
+                // module top level (it lives at function-body constfold
+                // time per `operation.py:140-142`, not import-time
+                // prepass).
                 ConstValue::Int(n) => match n.checked_neg() {
                     Some(neg) => Ok(Some(ConstValue::Int(neg))),
-                    None => Err(raise(format!(
-                        "OverflowError: -({n}) overflows i64 (i64::MIN unary negation)"
+                    None => Err(unsupported(format!(
+                        "-i64::MIN ({}) exceeds i64 carrier; bignum constants are not supported",
+                        n
                     ))),
                 },
+                // `-3.14` / `-2.5` etc. — `syn` parses the leading
+                // minus as `Expr::Unary { Neg, Lit::Float(...) }`,
+                // not a signed float literal. Mirrors
+                // `operation.rs::pyfunc`'s
+                // `(OpKind::Neg, [ConstValue::Float(bits)]) =>
+                //   Some(ConstValue::float(-f64::from_bits(*bits)))`
+                // so a module-top `const X: f64 = -3.14` and an
+                // in-body `-3.14` agree on the bit pattern.
+                ConstValue::Float(bits) => Ok(Some(ConstValue::float(-f64::from_bits(bits)))),
                 other => Err(raise(format!(
-                    "TypeError: unary `-` operand must be Int, got {other:?}"
+                    "TypeError: unary `-` operand must be Int or Float, got {other:?}"
                 ))),
             }
         }
@@ -717,8 +908,21 @@ fn eval_const_expr(
         // (Issue 2.3 — covers re-walk: a path-keyed `module_id`
         // already populated by a prior walk has the entry in
         // the registry but not in this walk's fresh `bindings`).
-        // Multi-segment paths are out of scope for the const
-        // evaluator (silent skip).
+        // Multi-segment paths fall through to `Ok(None)` (cross-
+        // file lookup is a separate slice).
+        //
+        // Unresolved single-segment names raise
+        // `FlowingError("global name '...' is not defined")`,
+        // matching upstream `flowcontext.py:853 find_global` which
+        // raises after both globals and builtins miss. Aborts the
+        // walker — same as Python module execution where
+        // `Y = X + 1; X = 1` fails with NameError on Y and the
+        // remaining statements never execute. Walker gaps for
+        // `Item::Use` / `Item::Mod` / `Item::Impl` (and `Item::Fn`)
+        // surface here as parity-correct hard errors rather than
+        // silent dropped bindings — pyre adapter cannot pretend a
+        // name resolves when upstream Python's same execution would
+        // have aborted.
         Expr::Path(ExprPath {
             qself: None, path, ..
         }) if path.segments.len() == 1 => {
@@ -727,23 +931,46 @@ fn eval_const_expr(
                 return Ok(None);
             }
             let name = seg.ident.to_string();
+            // Resolution order mirrors `flowcontext.py:845-853 find_global`:
+            //
+            //     try:
+            //         value = w_globals.value[varname]   # 1. globals
+            //     except KeyError:
+            //         try:
+            //             value = getattr(__builtin__, varname)  # 2. builtins
+            //         except AttributeError:
+            //             raise FlowingError("global name '%s' is not defined")
+            //
+            // pyre's adapter has two channels in place of one Python
+            // dict: per-walk source-order `bindings` (the in-progress
+            // module dict) and `module_globals_lookup` (re-walks /
+            // pre-walk registry partition). Both stand in for the
+            // `w_globals.value[varname]` lookup. The closed-world
+            // `pyre_stdlib_lookup` is the `__builtin__` analogue
+            // (`Ok` / `Some` / `Err` / `Result` / `Option` HostObject
+            // singletons; documented at `host_env.rs:170-191` as the
+            // adapter's auxiliary builtins). NameError fires only when
+            // all three channels miss, matching upstream's final
+            // `AttributeError → FlowingError` step.
             match bindings
                 .get(&name)
                 .cloned()
                 .or_else(|| module_globals_lookup(module_id, &name))
+                .or_else(|| pyre_stdlib_lookup(&name).map(ConstValue::HostObject))
             {
                 Some(v) => Ok(Some(v)),
-                None => Err(raise(format!(
-                    "NameError: name '{name}' is not defined at import time"
-                ))),
+                None => Err(raise(format!("global name '{name}' is not defined"))),
             }
         }
         // `const Y = X + 1` etc — operator dispatch over evaluated
-        // operands. Type-mismatch / overflow / division-by-zero
-        // surface as `Err` so the walker bails immediately, matching
-        // upstream Python's import-time exception. Truly unsupported
-        // operator/operand combinations return `Ok(None)` (silent
-        // skip).
+        // operands. Type-mismatch and zero-divisor surface as
+        // `Err`, matching upstream Python's import-time
+        // exception. `i64` overflow at module top level is a local
+        // carrier limitation: upstream Python would bind a bignum, so
+        // the adapter returns `Unsupported` rather than silently
+        // dropping the binding or pretending Python raised. Truly
+        // unsupported operator/operand combinations return `Ok(None)`
+        // (silent skip).
         //
         // **Short-circuit `&&` / `||`** (codex parity audit,
         // 2026-05-05): both Rust source and upstream Python's
@@ -773,6 +1000,18 @@ fn eval_const_expr(
             };
             eval_binop(op, &lhs, &rhs)
         }
+        // `Expr::Paren` / `Expr::Group` are transparent. Upstream
+        // Python has no parenthesisation node — parens evaporate at
+        // parse time and only affect operator precedence — so a
+        // `const X: bool = (1 == 2)` resolves identically to
+        // `const X: bool = 1 == 2`. Mirrors the body lowerer's
+        // transparency at `build_flow.rs:1317
+        // Expr::Paren(ExprParen { expr, .. }) => lower_expr(b, expr)`.
+        // `Expr::Group` is the proc-macro-emitted invisible grouping
+        // wrapper; same semantic.
+        Expr::Paren(syn::ExprParen { expr, .. }) | Expr::Group(syn::ExprGroup { expr, .. }) => {
+            eval_const_expr(expr, bindings, module_id)
+        }
         _ => Ok(None),
     }
 }
@@ -782,36 +1021,95 @@ fn eval_const_expr(
 /// Tri-state return mirrors [`eval_const_expr`]:
 ///
 /// - `Ok(Some(v))` — success.
-/// - `Ok(None)` — shape unsupported by this evaluator (e.g. an
-///   operator that's never reachable from typed Rust source for
-///   the given operand pair). Walker silently skips.
-/// - `Err(e)` — supported shape but operation deterministically
-///   raises (overflow, type mismatch, division-by-zero, shift
-///   count out of range). Walker propagates as `AdapterError`,
-///   matching upstream Python's import-time exception.
+/// - `Ok(None)` — decline-fold for **shape unsupported** by this
+///   evaluator (operator/operand pair never reachable from typed
+///   Rust source, e.g. `BinOp::Add` over `(UniStr, Int)`). Walker
+///   silently skips so the const stays unbound and downstream
+///   lookups fall through to mint-or-fail. **Note**: `i64` overflow
+///   on `+` / `-` / `*` / `/` / `%` / `<<` does NOT decline-fold at
+///   module top level — it returns `AdapterError::Unsupported`
+///   instead. The
+///   `PureOperation.constfold` decline arm at `operation.py:140-142`
+///   lives at *function-body* constfold time, where the runtime
+///   evaluates the op as bignum after the fold is declined; there
+///   is no analogous "let the runtime do it" at module-import-time
+///   prepass — upstream Python would have already produced the
+///   bignum and bound it. Pyre adapter surfaces the divergence
+///   (no bignum carrier) loudly.
+///   `>>` count `>= 64` is the one exception: `operation.py:484`
+///   registers `rshift` without `ovf=True`, and Python's arithmetic
+///   right shift saturates rather than producing a long, so the
+///   constfold *can* still produce a representable result.
+/// - `Err(e)` — supported shape but operation cannot produce a
+///   representable binding:
+///   - **Type mismatch** in unary / binary op
+///     (`!"x"`, `1 < "x"` ordering).
+///   - **Zero-divisor** (`1 / 0`, `1 // False`, `1 % 0`,
+///     `1.0 / 0.0`).
+///   - **Negative shift count** (`1 << -1`, `1 >> -1`).
+///     Upstream `operator.lshift` / `operator.rshift` raise
+///     `ValueError: negative shift count` directly; the
+///     constfold's `try/except Exception` (`operation.py:120-127`)
+///     captures and re-raises as `FlowingError`.
+///   - **`i64` overflow** on `Add` / `Sub` / `Mul` / `Div` (`MIN /
+///     -1`) / `Shl` (`count >= 64`). Upstream Python would bind
+///     a bignum; pyre adapter has no bignum carrier so surfaces
+///     the divergence as `AdapterError::Unsupported`.
+///   Walker propagates the error to abort the walk, matching
+///   upstream Python's module-execution-aborts-on-exception
+///   semantics.
 fn eval_binop(
     op: &BinOp,
     lhs: &ConstValue,
     rhs: &ConstValue,
 ) -> Result<Option<ConstValue>, AdapterError> {
     let raise = |reason: String| AdapterError::Flowing { reason };
-    let int_overflow = |op_name: &str, a: i64, b: i64| {
-        Err(raise(format!(
-            "OverflowError: {a} {op_name} {b} overflows i64"
-        )))
-    };
+    let unsupported = |reason: String| AdapterError::Unsupported { reason };
     let int_zerodiv = |op_name: &str| {
         Err(raise(format!(
             "ZeroDivisionError: integer {op_name} by zero"
         )))
     };
-    let int_shift_oor = |op_name: &str, b: i64| {
-        Err(raise(format!(
-            "ValueError: {op_name} count {b} out of range (must fit in u32 and < 64)"
+    let int_overflow = |op_name: &str, a: i64, b: i64| {
+        Err(unsupported(format!(
+            "i64 {op_name} ({a} {op_name} {b}) exceeds i64 carrier; bignum constants are not supported"
         )))
+    };
+    // Python floor-div for `i64`. Line-by-line port of
+    // `rpython/rtyper/rint.py:398 ll_int_py_div`. Returns `None` on
+    // `i64` overflow (`x == i64::MIN, y == -1`), which the caller
+    // surfaces as `AdapterError::Unsupported` at module top level.
+    let int_py_floor_div = |x: i64, y: i64| -> Option<i64> {
+        let r = x.checked_div(y)?;
+        let p = r.checked_mul(y)?;
+        let u = if y < 0 {
+            p.checked_sub(x)?
+        } else {
+            x.checked_sub(p)?
+        };
+        r.checked_add(u >> (i64::BITS - 1))
+    };
+    // Python `%` for `i64`. Line-by-line port of
+    // `rpython/rtyper/rint.py:496 ll_int_py_mod`. `y == -1` is
+    // short-circuited (matches `flowspace::operation::int_py_mod`)
+    // because `i64::MIN.checked_rem(-1)` returns `None` even though
+    // the well-defined remainder is `0`.
+    let int_py_mod = |x: i64, y: i64| -> Option<i64> {
+        if y == -1 {
+            return Some(0);
+        }
+        let r = x.checked_rem(y)?;
+        let u = if y < 0 { r.checked_neg()? } else { r };
+        r.checked_add(y & (u >> (i64::BITS - 1)))
     };
     match (lhs, rhs) {
         (ConstValue::Int(a), ConstValue::Int(b)) => match op {
+            // `+` / `-` / `*` overflow → `Unsupported`. At
+            // module top level upstream Python would bind a bignum;
+            // pyre adapter has no bignum carrier so the divergence
+            // surfaces loudly. (Function-body constfold is a
+            // *different* path — it declines per
+            // `operation.py:140-142`.)
             BinOp::Add(_) => match a.checked_add(*b) {
                 Some(v) => Ok(Some(ConstValue::Int(v))),
                 None => int_overflow("+", *a, *b),
@@ -824,11 +1122,20 @@ fn eval_binop(
                 Some(v) => Ok(Some(ConstValue::Int(v))),
                 None => int_overflow("*", *a, *b),
             },
+            // `Div` and `Rem` use Python floor-div / floor-mod
+            // semantics (negative-divisor sign-flip) — same helpers
+            // as `flowspace::operation::int_py_floor_div` /
+            // `int_py_mod` so a `const Y: i64 = 3 / -2` and the
+            // function-body `3 / -2` produce the same value. Zero
+            // divisor → `Err(ZeroDivisionError)` per upstream
+            // `operator.floordiv(_, 0)` raising. `i64::MIN / -1`
+            // overflow → `Unsupported` at module top level
+            // (upstream binds bignum `2**63`).
             BinOp::Div(_) => {
                 if *b == 0 {
                     return int_zerodiv("division");
                 }
-                match a.checked_div(*b) {
+                match int_py_floor_div(*a, *b) {
                     Some(v) => Ok(Some(ConstValue::Int(v))),
                     None => int_overflow("/", *a, *b),
                 }
@@ -837,22 +1144,60 @@ fn eval_binop(
                 if *b == 0 {
                     return int_zerodiv("modulo");
                 }
-                match a.checked_rem(*b) {
+                // `x % -1 == 0` for any `x` upstream — fold
+                // unconditionally. `int_py_mod` would otherwise
+                // route through `i64::MIN.checked_rem(-1)` which
+                // returns `None` (the *quotient* `2^63` overflows,
+                // even though the remainder `0` itself fits),
+                // declining a fold that has a well-defined value.
+                if *b == -1 {
+                    return Ok(Some(ConstValue::Int(0)));
+                }
+                // `int_py_mod` only returns `None` on
+                // `i64::MIN.checked_rem(-1)` (handled above) —
+                // every other `(x, y)` with `y != 0` produces a
+                // well-defined result. Unwrap defensively, but if
+                // a future helper change introduces another
+                // overflow path, surface it as Err.
+                match int_py_mod(*a, *b) {
                     Some(v) => Ok(Some(ConstValue::Int(v))),
                     None => int_overflow("%", *a, *b),
                 }
             }
-            // `<<` / `>>` — `checked_shl` / `checked_shr` take a
-            // `u32` count and reject `count >= 64`. Negative `b`
-            // is also rejected (cannot fit in `u32`).
-            BinOp::Shl(_) => match u32::try_from(*b).ok().and_then(|n| a.checked_shl(n)) {
-                Some(v) => Ok(Some(ConstValue::Int(v))),
-                None => int_shift_oor("<<", *b),
-            },
-            BinOp::Shr(_) => match u32::try_from(*b).ok().and_then(|n| a.checked_shr(n)) {
-                Some(v) => Ok(Some(ConstValue::Int(v))),
-                None => int_shift_oor(">>", *b),
-            },
+            // `<<` — Negative `count` raises `ValueError: negative
+            // shift count` upstream (`operator.lshift(_, -1)`).
+            // `count >= 64` overflows the i64 carrier; upstream
+            // Python would bind a bignum, pyre adapter cannot, so
+            // surface as `Unsupported`.
+            BinOp::Shl(_) => {
+                if *b < 0 {
+                    return Err(raise(format!("ValueError: negative shift count {b}")));
+                }
+                match u32::try_from(*b).ok().and_then(|n| a.checked_shl(n)) {
+                    Some(v) => Ok(Some(ConstValue::Int(v))),
+                    None => int_overflow("<<", *a, *b),
+                }
+            }
+            // `>>` — Python's arithmetic right shift saturates
+            // on counts `>= 64`: any non-negative `a` shifts to
+            // `0`, any negative `a` sign-extends to `-1`. Rust's
+            // `i64 >> 64` panics in debug, so we explicit-saturate.
+            // `rshift` is NOT registered with `ovf=True` upstream
+            // (`operation.py:484 add_operator('rshift', 2,
+            // dispatch=2, pure=True)`), so the long-decline arm
+            // doesn't apply — we MUST fold the saturation result.
+            // Negative count surfaces as `ValueError` like `Shl`.
+            BinOp::Shr(_) => {
+                if *b < 0 {
+                    return Err(raise(format!("ValueError: negative shift count {b}")));
+                }
+                let saturated = if *a < 0 { -1 } else { 0 };
+                let folded = u32::try_from(*b)
+                    .ok()
+                    .and_then(|n| a.checked_shr(n))
+                    .unwrap_or(saturated);
+                Ok(Some(ConstValue::Int(folded)))
+            }
             BinOp::BitAnd(_) => Ok(Some(ConstValue::Int(a & b))),
             BinOp::BitOr(_) => Ok(Some(ConstValue::Int(a | b))),
             BinOp::BitXor(_) => Ok(Some(ConstValue::Int(a ^ b))),
@@ -864,6 +1209,52 @@ fn eval_binop(
             BinOp::Ge(_) => Ok(Some(ConstValue::Bool(a >= b))),
             _ => Ok(None),
         },
+        // Float-Float arithmetic mirrors `operation.rs::pyfunc`'s
+        // `(OpKind::{Add,Sub,Mul,TrueDiv,Mod}, [ConstValue::Float,
+        // ConstValue::Float])` arms (`operation.rs:1336-1393`). Rust
+        // `BinOp::Div` over `f64` IS Python's `/` (true division),
+        // not floor-division — Rust has no integer-floor `/` for
+        // floats. `BinOp::Rem` is Rust's `%`, which we route through
+        // `float_py_mod` so the const-evaluator and the function-body
+        // constfold produce bit-identical results (signed-zero
+        // copysign + sign-of-denominator correction per upstream
+        // `pypy/objspace/std/floatobject.py:543-563 descr_mod`).
+        // Comparison ops use `partial_cmp` semantics on the underlying
+        // `f64` (NaN compares as false everywhere, matching Python
+        // `float('nan') < 1.0 == False`).
+        (ConstValue::Float(a_bits), ConstValue::Float(b_bits)) => {
+            let a = f64::from_bits(*a_bits);
+            let b = f64::from_bits(*b_bits);
+            match op {
+                BinOp::Add(_) => Ok(Some(ConstValue::float(a + b))),
+                BinOp::Sub(_) => Ok(Some(ConstValue::float(a - b))),
+                BinOp::Mul(_) => Ok(Some(ConstValue::float(a * b))),
+                BinOp::Div(_) => {
+                    if b == 0.0 {
+                        return Err(raise(
+                            "ZeroDivisionError: float division by zero".to_string(),
+                        ));
+                    }
+                    Ok(Some(ConstValue::float(a / b)))
+                }
+                BinOp::Rem(_) => {
+                    if b == 0.0 {
+                        return Err(raise("ZeroDivisionError: float modulo".to_string()));
+                    }
+                    Ok(Some(ConstValue::float(float_py_mod(a, b))))
+                }
+                // `==` / `!=` use IEEE 754 semantics on `f64`
+                // (`NaN != NaN`), matching Python 3's
+                // `float('nan') == float('nan') is False`.
+                BinOp::Eq(_) => Ok(Some(ConstValue::Bool(a == b))),
+                BinOp::Ne(_) => Ok(Some(ConstValue::Bool(a != b))),
+                BinOp::Lt(_) => Ok(Some(ConstValue::Bool(a < b))),
+                BinOp::Le(_) => Ok(Some(ConstValue::Bool(a <= b))),
+                BinOp::Gt(_) => Ok(Some(ConstValue::Bool(a > b))),
+                BinOp::Ge(_) => Ok(Some(ConstValue::Bool(a >= b))),
+                _ => Ok(None),
+            }
+        }
         (ConstValue::Bool(a), ConstValue::Bool(b)) => match op {
             // Rust `&&` / `||` are short-circuit at the source
             // level — the lowerer in `eval_const_expr` handles the
@@ -900,30 +1291,187 @@ fn eval_binop(
             BinOp::Ge(_) => Ok(Some(ConstValue::Bool(a >= b))),
             _ => Ok(None),
         },
-        // Mixed-type operand pair. Python 3's behaviour splits on the
-        // operator family:
+        // Mixed-numeric arm: cross-type pairs over `Int` / `Bool` /
+        // `Float` follow Python's numeric tower (`bool ⊂ int ⊂ float`)
+        // via the same `coerce_arith` / `coerce_int_pair` helpers
+        // `flowspace::operation::pyfunc` uses, so the const-evaluator
+        // and the function-body constfold agree on values for
+        // `Int + Float`, `Bool + Int`, `Int % Float`, `True / 0.0`,
+        // etc. Mirrors upstream `PureOperation.constfold`
+        // (`operation.py:120-127`) which calls `operator.<op>(*args)`
+        // directly — Python's runtime coerces at the operator level.
         //
-        // - **`==` / `!=`**: never raise across distinct primitive
-        //   types — `1 == "1"` returns `False`, `1 != "1"` returns
-        //   `True`. Rust typed source rules out numeric-coerced
-        //   pairs like `true == 1` at parse time (Rust's `==` is
-        //   typed `T: PartialEq`, no implicit `bool ↔ i64` coerce),
-        //   so this arm only ever fires on genuinely distinct
-        //   primitive carriers (`Int` vs `UniStr`, etc.); the
-        //   answer is always `Bool(false)` / `Bool(true)`. The
-        //   structural difference vs upstream Python (where
-        //   `True == 1` IS True) is documented as a Rust-language
-        //   adaptation, not a parity gap.
-        // - **Ordering (`<`, `<=`, `>`, `>=`)**: Python 3 raises
-        //   `TypeError("'<' not supported between instances of …")`
-        //   at import time. Surface as walker error so the binding
-        //   does not silently bind a wrong-shape `Bool`.
-        // - **All other ops** (`+`, `-`, `*`, `/`, etc.) over
-        //   distinct types: `TypeError` per upstream `operator.add`
-        //   etc.
+        // Reached only for cross-type pairs (same-type pairs match
+        // typed arms above). Bool/Bool arithmetic is intentionally
+        // NOT routed here; the typed `(Bool, Bool)` arm declines to
+        // `Ok(None)` for arithmetic ops, matching the prior behavior
+        // where the walker silent-skips that combination.
+        (_, _) if is_foldable_numeric(lhs) && is_foldable_numeric(rhs) => match op {
+            BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) => {
+                let pair = coerce_arith(lhs, rhs).expect("both operands numeric");
+                match (op, pair) {
+                    (BinOp::Add(_), ArithOps::Int(x, y)) => match x.checked_add(y) {
+                        Some(v) => Ok(Some(ConstValue::Int(v))),
+                        None => int_overflow("+", x, y),
+                    },
+                    (BinOp::Add(_), ArithOps::Float(x, y)) => Ok(Some(ConstValue::float(x + y))),
+                    (BinOp::Sub(_), ArithOps::Int(x, y)) => match x.checked_sub(y) {
+                        Some(v) => Ok(Some(ConstValue::Int(v))),
+                        None => int_overflow("-", x, y),
+                    },
+                    (BinOp::Sub(_), ArithOps::Float(x, y)) => Ok(Some(ConstValue::float(x - y))),
+                    (BinOp::Mul(_), ArithOps::Int(x, y)) => match x.checked_mul(y) {
+                        Some(v) => Ok(Some(ConstValue::Int(v))),
+                        None => int_overflow("*", x, y),
+                    },
+                    (BinOp::Mul(_), ArithOps::Float(x, y)) => Ok(Some(ConstValue::float(x * y))),
+                    _ => unreachable!(),
+                }
+            }
+            BinOp::Div(_) => {
+                let pair = coerce_arith(lhs, rhs).expect("both operands numeric");
+                match pair {
+                    ArithOps::Int(x, y) => {
+                        if y == 0 {
+                            return int_zerodiv("division");
+                        }
+                        match int_py_floor_div(x, y) {
+                            Some(v) => Ok(Some(ConstValue::Int(v))),
+                            None => int_overflow("/", x, y),
+                        }
+                    }
+                    ArithOps::Float(x, y) => {
+                        if y == 0.0 {
+                            return Err(raise(
+                                "ZeroDivisionError: float division by zero".to_string(),
+                            ));
+                        }
+                        Ok(Some(ConstValue::float(x / y)))
+                    }
+                }
+            }
+            BinOp::Rem(_) => {
+                let pair = coerce_arith(lhs, rhs).expect("both operands numeric");
+                match pair {
+                    ArithOps::Int(x, y) => {
+                        if y == 0 {
+                            return int_zerodiv("modulo");
+                        }
+                        if y == -1 {
+                            return Ok(Some(ConstValue::Int(0)));
+                        }
+                        match int_py_mod(x, y) {
+                            Some(v) => Ok(Some(ConstValue::Int(v))),
+                            None => int_overflow("%", x, y),
+                        }
+                    }
+                    ArithOps::Float(x, y) => {
+                        if y == 0.0 {
+                            return Err(raise("ZeroDivisionError: float modulo".to_string()));
+                        }
+                        Ok(Some(ConstValue::float(float_py_mod(x, y))))
+                    }
+                }
+            }
+            // Shifts and bitwise: int-only coercion; Float operand
+            // surfaces `TypeError` per Python `1 << 1.0`. `coerce_int_pair`
+            // returns `None` when either side is a Float.
+            BinOp::Shl(_)
+            | BinOp::Shr(_)
+            | BinOp::BitAnd(_)
+            | BinOp::BitOr(_)
+            | BinOp::BitXor(_) => {
+                let Some((x, y)) = coerce_int_pair(lhs, rhs) else {
+                    return Err(raise(format!(
+                        "TypeError: unsupported operand types for binop: {lhs:?} OP {rhs:?}"
+                    )));
+                };
+                match op {
+                    BinOp::Shl(_) => {
+                        if y < 0 {
+                            return Err(raise(format!("ValueError: negative shift count {y}")));
+                        }
+                        match u32::try_from(y).ok().and_then(|n| x.checked_shl(n)) {
+                            Some(v) => Ok(Some(ConstValue::Int(v))),
+                            None => int_overflow("<<", x, y),
+                        }
+                    }
+                    BinOp::Shr(_) => {
+                        if y < 0 {
+                            return Err(raise(format!("ValueError: negative shift count {y}")));
+                        }
+                        Ok(Some(ConstValue::Int(if y >= 64 {
+                            if x < 0 { -1 } else { 0 }
+                        } else {
+                            x >> (y as u32)
+                        })))
+                    }
+                    BinOp::BitAnd(_) => Ok(Some(ConstValue::Int(x & y))),
+                    BinOp::BitOr(_) => Ok(Some(ConstValue::Int(x | y))),
+                    BinOp::BitXor(_) => Ok(Some(ConstValue::Int(x ^ y))),
+                    _ => unreachable!(),
+                }
+            }
+            // Eq / Ne / Lt / Le / Gt / Ge over numeric pairs go through
+            // the precision-correct helpers (handle ints beyond the
+            // f64 53-bit mantissa boundary per upstream
+            // `floatobject.py:135-148`).
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(python_eq_const(lhs, rhs)))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(!python_eq_const(lhs, rhs)))),
+            BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_) => match cmp_fold(lhs, rhs) {
+                Some(o) => {
+                    let v = match op {
+                        BinOp::Lt(_) => o.is_lt(),
+                        BinOp::Le(_) => o.is_le(),
+                        BinOp::Gt(_) => o.is_gt(),
+                        BinOp::Ge(_) => o.is_ge(),
+                        _ => unreachable!(),
+                    };
+                    Ok(Some(ConstValue::Bool(v)))
+                }
+                None => Ok(None),
+            },
+            _ => Ok(None),
+        },
+        // Catch-all for non-numeric cross-type pairs.
+        //
+        // **Eq / Ne / Lt / Le / Gt / Ge** delegate to the same helpers
+        // that `pyfunc` uses for function-body constfold so the
+        // const-evaluator and the in-flow constfold agree on Python
+        // semantics. Concretely:
+        //
+        //   `Int(1) == "1"`         → False  (`python_eq_const` falls
+        //                                     through to derived PartialEq)
+        //
+        // Upstream `PureOperation.constfold` calls
+        // `operator.eq(*args)` / `operator.lt(*args)` directly, so
+        // Python's runtime drives the result.
+        //
+        // **Cross-type ordering** — `cmp_fold` returns `None` for
+        // genuinely-incomparable pairs (`Int <-> UniStr` etc.).
+        // Python 3 raises `TypeError("'<' not supported between
+        // instances of …")` for those; surface as walker error.
+        //
+        // **All other ops** (`+`, `-`, `*`, `/`, etc.) over distinct
+        // types: `TypeError` per upstream `operator.add` etc.
         _ => match op {
-            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(false))),
-            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(true))),
+            BinOp::Eq(_) => Ok(Some(ConstValue::Bool(python_eq_const(lhs, rhs)))),
+            BinOp::Ne(_) => Ok(Some(ConstValue::Bool(!python_eq_const(lhs, rhs)))),
+            BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_) => match cmp_fold(lhs, rhs) {
+                Some(o) => {
+                    let v = match op {
+                        BinOp::Lt(_) => o.is_lt(),
+                        BinOp::Le(_) => o.is_le(),
+                        BinOp::Gt(_) => o.is_gt(),
+                        BinOp::Ge(_) => o.is_ge(),
+                        _ => unreachable!(),
+                    };
+                    Ok(Some(ConstValue::Bool(v)))
+                }
+                None => Err(raise(format!(
+                    "TypeError: ordering comparison not supported between {lhs:?} and {rhs:?}"
+                ))),
+            },
             _ => Err(raise(format!(
                 "TypeError: unsupported operand types for binop: {lhs:?} OP {rhs:?}"
             ))),
@@ -1481,17 +2029,102 @@ mod tests {
 
     #[test]
     fn register_rust_module_skips_non_walked_item_kinds() {
-        // Walker dispatches `Item::Fn`, `Item::Enum`, `Item::Struct`,
-        // and `Item::Const` (Slice O10). Other kinds (`Item::Static`,
-        // `Item::Use`, …) are follow-up slices — they must NOT
-        // pollute the module-globals registry until their dispatch
-        // is added.
+        // Walker dispatches `Item::Enum`, `Item::Struct`, `Item::Const`
+        // (Slice O10), and `Item::Static` (Slice O12). Remaining kinds
+        // (`Item::Use`, `Item::Mod`, `Item::Impl`, `Item::Fn`) are
+        // follow-up slices — they must NOT pollute the module-globals
+        // registry until their dispatch is added.
         use super::super::host_env::module_globals_lookup;
 
-        let src = "static PARITY_PROBE_WALKER_STATIC_ONLY: i64 = 1;";
+        // `use` re-export — upstream `from x import y` would bind
+        // `y` in `module.__dict__`; pyre walker doesn't yet resolve
+        // cross-module references, so the binding is silently
+        // skipped.
+        let src = "use std::collections::HashMap as PARITY_PROBE_WALKER_USE_ONLY;";
         let file = syn::parse_file(src).expect("file fixture parses");
         let module_id = register_rust_module(&file).expect("walker must succeed");
-        assert!(module_globals_lookup(module_id, "PARITY_PROBE_WALKER_STATIC_ONLY").is_none());
+        assert!(module_globals_lookup(module_id, "PARITY_PROBE_WALKER_USE_ONLY").is_none());
+    }
+
+    #[test]
+    fn register_rust_module_walks_item_static_like_item_const() {
+        // Slice O12: immutable `static FOO: T = <expr>;` populates
+        // `module.__dict__` identically to `const FOO`.
+        use super::super::host_env::module_globals_lookup;
+
+        let src = "static ParityProbe_O12_Static: i64 = 5;
+                   static ParityProbe_O12_StaticStr: &str = \"hello\";
+                   static ParityProbe_O12_StaticBool: bool = true;";
+        let file = syn::parse_file(src).expect("static fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O12_Static"),
+            Some(ConstValue::Int(5)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O12_StaticStr"),
+            Some(ConstValue::uni_str("hello".to_string())),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O12_StaticBool"),
+            Some(ConstValue::Bool(true)),
+        );
+    }
+
+    #[test]
+    fn register_rust_module_skips_mutable_static() {
+        // Slice O15 / codex parity audit (2026-05-06): `static mut`
+        // is NOT registered. Runtime mutation makes the initial-
+        // value snapshot unsound for constfold reads. PRE-EXISTING-
+        // ADAPTATION until a live-store path lands. Downstream
+        // lookups for the name fall through to the mint-or-fail
+        // resolver — the registry intentionally has no entry.
+        use super::super::host_env::module_globals_lookup;
+
+        let src = "static mut ParityProbe_O15_StaticMut: i64 = 7;
+                   static ParityProbe_O15_StaticImmut: i64 = 9;";
+        let file = syn::parse_file(src).expect("static-mut fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert!(
+            module_globals_lookup(module_id, "ParityProbe_O15_StaticMut").is_none(),
+            "`static mut` must NOT be registered (runtime mutation makes snapshot unsound)",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O15_StaticImmut"),
+            Some(ConstValue::Int(9)),
+            "immutable `static` next to a `static mut` still walks normally",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_static_resolves_compound_rhs_against_prior_bindings() {
+        // Static RHS goes through the same `eval_const_expr` as
+        // `Item::Const`, so forward-ref to a sibling `const` (or
+        // sibling `static`) works the same way: source-order
+        // `bindings` accumulator is populated before the next item
+        // is evaluated. Mirrors upstream Python's import-time linear
+        // execution: `X = 1; Y = X + 1` binds both, in order.
+        use super::super::host_env::module_globals_lookup;
+
+        let src = "const ParityProbe_O12_X: i64 = 10;
+                   static ParityProbe_O12_Y: i64 = ParityProbe_O12_X + 5;
+                   static ParityProbe_O12_Z: i64 = ParityProbe_O12_Y * 2;";
+        let file = syn::parse_file(src).expect("compound static fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O12_X"),
+            Some(ConstValue::Int(10)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O12_Y"),
+            Some(ConstValue::Int(15)),
+            "`Y` resolves prior `const X` through the source-order accumulator",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O12_Z"),
+            Some(ConstValue::Int(30)),
+            "`Z` resolves prior `static Y` (Slice O12 admits Item::Static into the accumulator)",
+        );
     }
 
     #[test]
@@ -1978,6 +2611,164 @@ mod tests {
     }
 
     #[test]
+    fn register_rust_module_const_evaluator_shift_parity() {
+        // `<<` / `>>` over int operands must match upstream
+        // `operator.lshift` / `operator.rshift` semantics so a
+        // module-top `const X = 1 >> 64` and a body `1 >> 64`
+        // produce the same value.
+        //
+        // - **Negative shift count** raises `ValueError: negative
+        //   shift count` upstream — propagate as `Err` (walker
+        //   aborts the file).
+        // - **`<<` count >= 64** declines per the
+        //   `can_overflow and type(result) is long` arm
+        //   (`operation.py:140-142`): the bignum result doesn't
+        //   fit in `i64`, walker leaves the const unbound.
+        // - **`>>` count >= 64** saturates: `1 >> 64 == 0`,
+        //   `-1 >> 64 == -1`. RShift is not in the `can_overflow`
+        //   set so the long-decline arm doesn't apply.
+        let neg_shl = "pub const X: i64 = 1 << -1;";
+        let file = syn::parse_file(neg_shl).expect("negative shl fixture parses");
+        let err =
+            register_rust_module(&file).expect_err("negative shift count must abort the walker");
+        match err {
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("ValueError") && reason.contains("negative shift count"),
+                "expected ValueError on negative shift, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+        let neg_shr = "pub const Y: i64 = 1 >> -1;";
+        let file = syn::parse_file(neg_shr).expect("negative shr fixture parses");
+        register_rust_module(&file).expect_err("negative shr count must abort the walker");
+        // Large positive shr — saturating fold.
+        let big_shr = "pub const ParityProbe_BigShr_pos: i64 = 1 >> 64;
+                       pub const ParityProbe_BigShr_neg: i64 = -1 >> 64;
+                       pub const ParityProbe_BigShr_100: i64 = 100 >> 128;";
+        let file = syn::parse_file(big_shr).expect("big shr fixture parses");
+        let module_id = register_rust_module(&file).expect("big positive shr saturates, no abort");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_BigShr_pos"),
+            Some(ConstValue::Int(0)),
+            "1 >> 64 == 0 (saturating non-negative)",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_BigShr_neg"),
+            Some(ConstValue::Int(-1)),
+            "-1 >> 64 == -1 (sign-extending)",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_BigShr_100"),
+            Some(ConstValue::Int(0)),
+        );
+        // Large positive shl — unsupported bignum carrier at module top level.
+        // Upstream Python `1 << 64` binds bignum `2**64`; pyre
+        // adapter has no bignum carrier so surfaces as
+        // `AdapterError::Unsupported`. The function-body constfold path
+        // (`operation.py:140-142`) declines with Ok(None) instead,
+        // but THAT path is at function evaluation time where the
+        // runtime can produce the bignum — there is no analogous
+        // path at module-import-time prepass.
+        let big_shl = "pub const ParityProbe_BigShl: i64 = 1 << 64;";
+        let file = syn::parse_file(big_shl).expect("big shl fixture parses");
+        let err = register_rust_module(&file)
+            .expect_err("1 << 64 requires unsupported bignum carrier at module top level");
+        match err {
+            AdapterError::Unsupported { reason } => assert!(
+                reason.contains("bignum") && reason.contains("i64"),
+                "expected bignum unsupported error on 1 << 64, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_mod_minus_one() {
+        // `x % -1 == 0` for every `x` upstream. The `int_py_mod`
+        // closure short-circuits `y == -1` so that
+        // `i64::MIN.checked_rem(-1)` (which Rust returns `None`
+        // for, because the *quotient* `2^63` overflows even though
+        // the remainder `0` itself fits) does not silently decline
+        // a well-defined fold. Source `-9223372036854775808` lies
+        // outside what `syn` can parse as a single `Neg(Lit)`
+        // (the inner literal `9223372036854775808` is `i64::MAX +
+        // 1`), so the operation.rs `int_py_mod`-level test pins
+        // the `MIN` boundary directly. Here we pin the
+        // representable-source cases.
+        let src = "pub const ParityProbe_ModMinusOne_pos: i64 = 7 % -1;
+                   pub const ParityProbe_ModMinusOne_neg: i64 = -7 % -1;
+                   pub const ParityProbe_ModMinusOne_max: i64 = 9223372036854775807 % -1;";
+        let file = syn::parse_file(src).expect("x % -1 fixture parses");
+        let module_id = register_rust_module(&file).expect("x % -1 folds, no abort");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ModMinusOne_pos"),
+            Some(ConstValue::Int(0)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ModMinusOne_neg"),
+            Some(ConstValue::Int(0)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_ModMinusOne_max"),
+            Some(ConstValue::Int(0)),
+            "i64::MAX % -1 == 0 (no overflow path)",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_uses_python_floor_div_and_mod() {
+        // The const evaluator's `Div` / `Rem` arms must agree with
+        // `flowspace::operation`'s `int_py_floor_div` / `int_py_mod`
+        // over negative-divisor pairs so a `const Y: i64 = 3 / -2`
+        // at module top level produces the same value the function-
+        // body `3 / -2` would after constfold. C-style truncation
+        // (`a.checked_div(b)`) gives `-1` for `3 / -2` and `1` for
+        // `3 % -2`, which would diverge from the body result.
+        // Python floor-div toward `-inf` gives `-2` and `-1`
+        // respectively (line-by-line port of
+        // `rpython/rtyper/rint.py:398 ll_int_py_div`,
+        // `:496 ll_int_py_mod`).
+        let src = "pub const ParityProbe_FloorDiv_pos_div_neg: i64 = 3 / -2;
+                   pub const ParityProbe_FloorMod_pos_mod_neg: i64 = 3 % -2;
+                   pub const ParityProbe_FloorDiv_neg_div_pos: i64 = -3 / 2;
+                   pub const ParityProbe_FloorMod_neg_mod_pos: i64 = -3 % 2;
+                   pub const ParityProbe_FloorDiv_neg_div_neg: i64 = -3 / -2;
+                   pub const ParityProbe_FloorMod_neg_mod_neg: i64 = -3 % -2;";
+        let file = syn::parse_file(src).expect("floor-div fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_FloorDiv_pos_div_neg"),
+            Some(ConstValue::Int(-2)),
+            "3 // -2 == -2 (Python floor toward -inf, not C trunc -1)",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_FloorMod_pos_mod_neg"),
+            Some(ConstValue::Int(-1)),
+            "3 % -2 == -1 (sign matches divisor)",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_FloorDiv_neg_div_pos"),
+            Some(ConstValue::Int(-2)),
+            "-3 // 2 == -2",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_FloorMod_neg_mod_pos"),
+            Some(ConstValue::Int(1)),
+            "-3 % 2 == 1",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_FloorDiv_neg_div_neg"),
+            Some(ConstValue::Int(1)),
+            "-3 // -2 == 1",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_FloorMod_neg_mod_neg"),
+            Some(ConstValue::Int(-1)),
+            "-3 % -2 == -1",
+        );
+    }
+
+    #[test]
     fn register_rust_module_walks_compound_const_with_comparison_and_bool() {
         // Issue 2.4 (2026-05-05): comparison ops over Int / Bool /
         // strings produce Bool; `&&`/`||` over Bool stay Bool.
@@ -2063,46 +2854,44 @@ mod tests {
 
     #[test]
     fn register_rust_module_aborts_when_short_circuit_does_not_apply() {
-        // RHS deterministic-failure surfaces when LHS does not
-        // short-circuit: `true && BAD` MUST evaluate BAD and propagate
-        // its NameError, distinguishing this from the short-circuit
-        // path above.
+        // Without LHS short-circuit, the RHS is evaluated; an
+        // unresolved single-segment Path raises NameError per
+        // upstream `flowcontext.py:853 find_global`'s
+        // `FlowingError("global name '...' is not defined")`.
+        // Walker aborts the file matching upstream Python's
+        // module-execution-aborts-on-exception semantic.
         let src = "pub const ParityProbe_ShortCircuit_NoShort_AND: bool = true && ParityProbe_UnboundRhs;";
         let file = syn::parse_file(src).expect("non-short-circuit-failure fixture parses");
-        let err = register_rust_module(&file).expect_err(
-            "true && <unbound> must surface RHS NameError because LHS \
-             does not short-circuit",
-        );
+        let err = register_rust_module(&file)
+            .expect_err("unbound RHS at module top must abort the walker");
         match err {
-            AdapterError::Flowing { reason } => {
-                assert!(
-                    reason.contains("NameError") && reason.contains("ParityProbe_UnboundRhs"),
-                    "expected NameError on RHS, got: {reason}",
-                );
-            }
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("global name 'ParityProbe_UnboundRhs' is not defined"),
+                "expected NameError-shaped Flowing error, got: {reason}",
+            ),
             other => panic!("expected AdapterError::Flowing, got {other:?}"),
         }
     }
 
     #[test]
-    fn register_rust_module_overflow_const_aborts_walker() {
-        // `i64::MAX + 1` overflows — codex parity audit (2026-05-05)
-        // requires that import-time deterministic-failure cases
-        // surface as walker errors, not silent skips. Mirrors upstream
-        // Python's import-time `OverflowError` (caught by
-        // `PureOperation.constfold` and re-raised as `FlowingError`,
-        // operation.py:120-127).
+    fn register_rust_module_aborts_on_overflow_const() {
+        // `i64::MAX + 1` at module top level. Upstream Python would
+        // bind a bignum `2**63` without raising; pyre adapter has no
+        // bignum carrier so surfaces as `AdapterError::Unsupported`.
+        // Walker aborts the file. (NOT the function-body
+        // `PureOperation.constfold` decline path at
+        // `operation.py:140-142` — that path lives at function
+        // evaluation time where the runtime can produce the bignum.)
         let src = "pub const ParityProbe_Issue24_OVERFLOW: i64 = 9223372036854775807 + 1;";
         let file = syn::parse_file(src).expect("overflow fixture parses");
-        let err = register_rust_module(&file).expect_err("overflow must abort the walker");
+        let err = register_rust_module(&file)
+            .expect_err("i64 overflow at module top requires unsupported bignum carrier");
         match err {
-            AdapterError::Flowing { reason } => {
-                assert!(
-                    reason.contains("OverflowError"),
-                    "expected upstream-style OverflowError surface, got: {reason}",
-                );
-            }
-            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+            AdapterError::Unsupported { reason } => assert!(
+                reason.contains("bignum") && reason.contains("i64"),
+                "expected bignum unsupported error, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Unsupported, got {other:?}"),
         }
     }
 
@@ -2202,11 +2991,9 @@ mod tests {
         // `TypeError` via the catch-all, mis-aborting valid module
         // top-level constants like `pub const X: bool = 1 == "1";`.
         //
-        // The fixture deliberately omits parens around the binop —
-        // `Expr::Paren` transparency is a separate pre-existing
-        // walker-coverage gap (eval_const_expr's catch-all silently
-        // declines wrapped expressions) and would mask the parity
-        // we want to test here.
+        // Bare-binop and paren-wrapped fixtures must agree per
+        // `Expr::Paren` transparency — `(1 == "a")` and `1 == "a"`
+        // produce the same binding (matches `build_flow.rs:1317`).
         let src = "pub const ParityProbe_Issue3_eq_int_str: bool = 1 == \"a\";
                    pub const ParityProbe_Issue3_ne_int_str: bool = 1 != \"a\";";
         let file = syn::parse_file(src).expect("eq-mixed fixture parses");
@@ -2245,28 +3032,442 @@ mod tests {
     }
 
     #[test]
-    fn register_rust_module_unbound_name_aborts_walker() {
-        // Forward-reference to a name not yet bound — codex parity
-        // audit (2026-05-05) requires that import-time `NameError`
-        // surface as a walker error, not silent skip. Mirrors upstream
-        // Python: `Y = X + 1` evaluated before `X` is bound raises
-        // `NameError` at import time, which `PureOperation.constfold`
-        // routes through `FlowingError`.
+    fn register_rust_module_const_evaluator_paren_is_transparent() {
+        // Upstream Python parens evaporate at parse time, so
+        // `(1 + 2)` and `1 + 2` produce identical bindings. `syn`
+        // surfaces `Expr::Paren` and `Expr::Group` as wrapper
+        // nodes; `eval_const_expr` must delegate transparently
+        // to mirror `build_flow.rs:1317
+        // Expr::Paren(ExprParen { expr, .. }) => lower_expr(b, expr)`.
+        let src = "pub const ParityProbe_Paren_BareSum: i64 = 1 + 2;
+                   pub const ParityProbe_Paren_WrappedSum: i64 = (1 + 2);
+                   pub const ParityProbe_Paren_NestedWrap: i64 = (((1 + 2)));
+                   pub const ParityProbe_Paren_WrappedEq: bool = (1 == 1);";
+        let file = syn::parse_file(src).expect("paren-transparency fixture parses");
+        let module_id = register_rust_module(&file).expect("walker must succeed");
+        let lookup = |name: &str| super::super::host_env::module_globals_lookup(module_id, name);
+        assert_eq!(
+            lookup("ParityProbe_Paren_BareSum"),
+            Some(ConstValue::Int(3))
+        );
+        assert_eq!(
+            lookup("ParityProbe_Paren_WrappedSum"),
+            Some(ConstValue::Int(3)),
+            "`(1 + 2)` must fold identically to `1 + 2`",
+        );
+        assert_eq!(
+            lookup("ParityProbe_Paren_NestedWrap"),
+            Some(ConstValue::Int(3)),
+            "nested parens are transparent at every level",
+        );
+        assert_eq!(
+            lookup("ParityProbe_Paren_WrappedEq"),
+            Some(ConstValue::Bool(true)),
+            "paren around comparison stays transparent",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_path_falls_back_to_builtins() {
+        // Upstream `flowcontext.py:845-853 find_global`: globals miss
+        // → `getattr(__builtin__, varname)` → NameError on builtins
+        // miss. pyre's adapter has `pyre_stdlib_lookup` as the
+        // closed-world `__builtin__` analogue (`Ok` / `Some` / `Err` /
+        // `Result` / `Option`). The const evaluator must consult it
+        // before raising NameError, so a top-level
+        // `pub const X: Result = Ok;` (where `Ok` is not in walker
+        // bindings or registry) resolves through builtins.
+        let src = "pub const ParityProbe_Builtins_Ok: i64 = 0;
+                   pub const ParityProbe_Builtins_Forward: bool = Ok == Ok;";
+        let file = syn::parse_file(src).expect("builtins-fallback fixture parses");
+        let module_id = register_rust_module(&file).expect(
+            "walker must succeed — `Ok` resolves through pyre_stdlib_lookup, not NameError",
+        );
+        // The eq comparison succeeds because both sides resolve to
+        // the same `HostObject(Ok)` singleton (PYRE_STDLIB returns
+        // identical `HostObject` clones across lookups; structural
+        // equality holds).
+        let v = super::super::host_env::module_globals_lookup(
+            module_id,
+            "ParityProbe_Builtins_Forward",
+        );
+        assert_eq!(
+            v,
+            Some(ConstValue::Bool(true)),
+            "`Ok == Ok` must fold to True via builtins fallback (Ok singleton)",
+        );
+
+        // Negative control: a bare identifier that is neither in
+        // bindings nor in the registry nor in PYRE_STDLIB still
+        // raises NameError per upstream's final
+        // AttributeError → FlowingError step.
+        let bad_src = "pub const ParityProbe_Builtins_NotABuiltin: i64 =
+            ParityProbe_Builtins_Unbound + 1;";
+        let bad_file = syn::parse_file(bad_src).expect("bad fixture parses");
+        let err = register_rust_module(&bad_file)
+            .expect_err("name absent from all three channels must raise NameError");
+        match err {
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("global name 'ParityProbe_Builtins_Unbound' is not defined"),
+                "expected NameError-shaped Flowing error, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_aborts_on_unbound_name() {
+        // Forward-reference to a name not yet bound surfaces as
+        // `FlowingError("global name '...' is not defined")` per
+        // `flowcontext.py:853 find_global`. Mirrors upstream
+        // Python's module-execution-aborts-on-exception semantic:
+        // `Y = X + 1; X = 1` fails on Y with NameError and the
+        // `X = 1` statement never executes. Walker therefore aborts
+        // before reaching the LATER binding.
         let src =
             "pub const ParityProbe_Issue4_const_FORWARD: i64 = ParityProbe_Issue4_const_LATER + 1;
                    pub const ParityProbe_Issue4_const_LATER: i64 = 1;";
         let file = syn::parse_file(src).expect("forward-ref fixture parses");
         let err = register_rust_module(&file)
-            .expect_err("unbound forward reference must abort the walker");
+            .expect_err("forward-ref to unbound name aborts module execution");
         match err {
-            AdapterError::Flowing { reason } => {
-                assert!(
-                    reason.contains("NameError")
-                        && reason.contains("ParityProbe_Issue4_const_LATER"),
-                    "expected NameError on unbound forward reference, got: {reason}",
-                );
-            }
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("global name 'ParityProbe_Issue4_const_LATER' is not defined"),
+                "expected NameError-shaped Flowing error, got: {reason}",
+            ),
             other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_float_char_byte_literals() {
+        // Slice O11: `Lit::Float` / `Lit::Char` / `Lit::Byte` at the
+        // module top level resolve to the same `ConstValue` shape
+        // as their in-body counterparts at
+        // `build_flow.rs::lower_literal`. A `const PI: f64 = 3.14`
+        // and a body `3.14` must therefore agree on the bit pattern.
+        let src = r#"
+pub const ParityProbe_O11_Float: f64 = 3.14;
+pub const ParityProbe_O11_FloatNeg: f64 = -2.5;
+pub const ParityProbe_O11_FloatZero: f64 = 0.0;
+pub const ParityProbe_O11_Char: char = 'a';
+pub const ParityProbe_O11_CharUnicode: char = '한';
+pub const ParityProbe_O11_Byte: u8 = b'a';
+"#;
+        let file = syn::parse_file(src).expect("float/char/byte fixture parses");
+        let module_id = register_rust_module(&file).expect("float/char/byte literals walk");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O11_Float"),
+            Some(ConstValue::Float(3.14_f64.to_bits())),
+            "Lit::Float folds to ConstValue::Float(to_bits())",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O11_FloatNeg"),
+            Some(ConstValue::Float((-2.5_f64).to_bits())),
+            "syn parses `-2.5` as `Expr::Unary(Neg, Lit::Float(2.5))`, \
+             so the Neg arm folds via operation.rs::pyfunc's \
+             (OpKind::Neg, [ConstValue::Float]) parity",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O11_FloatZero"),
+            Some(ConstValue::Float(0.0_f64.to_bits())),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O11_Char"),
+            Some(ConstValue::uni_str("a".to_string())),
+            "Lit::Char folds to single-codepoint UniStr",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O11_CharUnicode"),
+            Some(ConstValue::uni_str("한".to_string())),
+            "non-ASCII char literal preserves the codepoint",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O11_Byte"),
+            Some(ConstValue::ByteStr(vec![b'a'])),
+            "Lit::Byte folds to single-byte ByteStr",
+        );
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_float_arithmetic() {
+        // Slice O14: `eval_binop` admits `(Float, Float)` operand
+        // pairs for arithmetic + comparison, mirroring
+        // `operation.rs::pyfunc`'s Float arms (`operation.rs:1367-1383`).
+        // Compound `const Z: f64 = X + Y` therefore folds at module
+        // top level the same way the function-body `X + Y` would.
+        // Rust `BinOp::Div` over `f64` is true division (matches
+        // Python `/`). `Float / 0.0` raises `ZeroDivisionError`.
+        let src = r#"
+pub const ParityProbe_O14_FAdd: f64 = 1.0 + 2.5;
+pub const ParityProbe_O14_FSub: f64 = 5.0 - 1.5;
+pub const ParityProbe_O14_FMul: f64 = 2.0 * 3.5;
+pub const ParityProbe_O14_FDiv: f64 = 7.0 / 2.0;
+pub const ParityProbe_O14_FEq: bool = 1.5 == 1.5;
+pub const ParityProbe_O14_FNe: bool = 1.5 != 2.0;
+pub const ParityProbe_O14_FLt: bool = 1.5 < 2.0;
+pub const ParityProbe_O14_FLe: bool = 1.5 <= 1.5;
+pub const ParityProbe_O14_FGt: bool = 2.5 > 1.5;
+pub const ParityProbe_O14_FGe: bool = 1.5 >= 1.5;
+"#;
+        let file = syn::parse_file(src).expect("float-arith fixture parses");
+        let module_id = register_rust_module(&file).expect("Float arithmetic walks");
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FAdd"),
+            Some(ConstValue::Float(3.5_f64.to_bits())),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FSub"),
+            Some(ConstValue::Float(3.5_f64.to_bits())),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FMul"),
+            Some(ConstValue::Float(7.0_f64.to_bits())),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FDiv"),
+            Some(ConstValue::Float(3.5_f64.to_bits())),
+            "Rust `/` over f64 is true division (matches Python `/`)",
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FEq"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FNe"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FLt"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FLe"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FGt"),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            module_globals_lookup(module_id, "ParityProbe_O14_FGe"),
+            Some(ConstValue::Bool(true)),
+        );
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_float_div_by_zero_raises() {
+        // Float `/ 0.0` raises `ZeroDivisionError` per upstream
+        // `operator.truediv(_, 0.0)`. Walker aborts the file.
+        let src = "pub const ParityProbe_O14_FDivZero: f64 = 1.0 / 0.0;";
+        let file = syn::parse_file(src).expect("float-zerodiv fixture parses");
+        let err =
+            register_rust_module(&file).expect_err("float division by zero must abort the walker");
+        match err {
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("ZeroDivisionError"),
+                "expected ZeroDivisionError, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_float_mod_binds_and_zero_raises() {
+        // Rust `%` is `BinOp::Rem`. The const-evaluator routes
+        // `Float % Float` through `flowspace::operation::float_py_mod`
+        // so the bound value matches the function-body constfold,
+        // including the signed-zero copysign and sign-of-denominator
+        // correction from `pypy/objspace/std/floatobject.py:543-563
+        // descr_mod`. Mirror of
+        // `register_rust_module_const_evaluator_float_arithmetic` for
+        // the `%` operator.
+        let src = "\
+            pub const ParityProbe_FModOK: f64 = 7.0 % 2.0;
+            pub const ParityProbe_FModSign: f64 = -7.0 % 2.0;
+            pub const ParityProbe_FModNegDiv: f64 = 7.0 % -2.0;
+        ";
+        let file = syn::parse_file(src).expect("float-mod fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+
+        match module_globals_for_test(module_id, "ParityProbe_FModOK") {
+            Some(ConstValue::Float(bits)) => assert_eq!(f64::from_bits(bits), 1.0),
+            other => panic!("expected Float(1.0), got {other:?}"),
+        }
+        // `(-7.0) % 2.0`: divisor is positive, remainder follows
+        // divisor sign → +1.0.
+        match module_globals_for_test(module_id, "ParityProbe_FModSign") {
+            Some(ConstValue::Float(bits)) => assert_eq!(f64::from_bits(bits), 1.0),
+            other => panic!("expected Float(1.0), got {other:?}"),
+        }
+        // `7.0 % (-2.0)`: divisor is negative, remainder follows
+        // divisor sign → -1.0.
+        match module_globals_for_test(module_id, "ParityProbe_FModNegDiv") {
+            Some(ConstValue::Float(bits)) => assert_eq!(f64::from_bits(bits), -1.0),
+            other => panic!("expected Float(-1.0), got {other:?}"),
+        }
+
+        // Zero-divisor surfaces as FlowingError matching upstream
+        // `operator.mod(_, 0.0)` ZeroDivisionError. Aborts walker.
+        let src = "pub const ParityProbe_FModZero: f64 = 1.0 % 0.0;";
+        let file = syn::parse_file(src).expect("float-mod-zero fixture parses");
+        let err =
+            register_rust_module(&file).expect_err("float modulo by zero must abort the walker");
+        match err {
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("ZeroDivisionError") && reason.contains("float modulo"),
+                "expected ZeroDivisionError float modulo, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_mixed_numeric_arithmetic_uses_python_coercion() {
+        // Mirrors `flowspace::operation::pyfunc`'s mixed-numeric
+        // arithmetic so the const-evaluator and the function-body
+        // constfold agree on Python `bool ⊂ int ⊂ float`. Cross-type
+        // pairs (Int+Float, Bool+Int, Int%Float, etc.) MUST bind a
+        // value, not abort with TypeError.
+        //
+        // Upstream `PureOperation.constfold` (operation.py:120-127)
+        // calls `operator.<op>(*args)` directly; Python's runtime
+        // coerces `1 + 1.0 == 2.0`, `True * 3 == 3`, `7 % 2.5 == 2.0`,
+        // etc. The mixed-numeric arm in `eval_binop` ports that
+        // behavior.
+        let src = "\
+            pub const INT_ONE: i64 = 1;
+            pub const FLOAT_HALF: f64 = 0.5;
+            pub const BOOL_TRUE: bool = true;
+            pub const ParityProbe_IntPlusFloat: f64 = INT_ONE + FLOAT_HALF;
+            pub const ParityProbe_FloatTimesInt: f64 = FLOAT_HALF * INT_ONE;
+            pub const ParityProbe_BoolPlusInt: i64 = BOOL_TRUE + INT_ONE;
+            pub const ParityProbe_IntDivFloat: f64 = INT_ONE / FLOAT_HALF;
+            pub const ParityProbe_IntModFloat: f64 = INT_ONE % FLOAT_HALF;
+            pub const ParityProbe_BoolMulFloat: f64 = BOOL_TRUE * FLOAT_HALF;
+        ";
+        let file = syn::parse_file(src).expect("mixed-numeric fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+
+        let f = |name: &str, expected: f64| match module_globals_for_test(module_id, name) {
+            Some(ConstValue::Float(bits)) => assert_eq!(
+                f64::from_bits(bits),
+                expected,
+                "{name}: expected Float({expected})",
+            ),
+            other => panic!("{name}: expected Float({expected}), got {other:?}"),
+        };
+        f("ParityProbe_IntPlusFloat", 1.5);
+        f("ParityProbe_FloatTimesInt", 0.5);
+        f("ParityProbe_IntDivFloat", 2.0);
+        // 1 % 0.5 == 0.0 (1.0 - 0.5 * floor(1.0/0.5) == 0.0).
+        f("ParityProbe_IntModFloat", 0.0);
+        f("ParityProbe_BoolMulFloat", 0.5);
+
+        match module_globals_for_test(module_id, "ParityProbe_BoolPlusInt") {
+            Some(ConstValue::Int(2)) => {}
+            other => panic!("expected Int(2), got {other:?}"),
+        }
+
+        // Float zero divisor through mixed-numeric Div is float-specific
+        // ZeroDivisionError per upstream Python.
+        let src = "\
+            pub const FLOAT_ZERO: f64 = 0.0;
+            pub const ParityProbe_IntDivFloatZero: f64 = 1 / FLOAT_ZERO;
+        ";
+        let file = syn::parse_file(src).expect("int/float-zero fixture parses");
+        let err = register_rust_module(&file).expect_err("Int / Float(0.0) must raise float ZDE");
+        match err {
+            AdapterError::Flowing { reason } => assert!(
+                reason.contains("ZeroDivisionError") && reason.contains("float division by zero"),
+                "expected float ZDE, got: {reason}",
+            ),
+            other => panic!("expected AdapterError::Flowing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_int_float_compare_handles_mantissa_boundary() {
+        // Port test for `pypy/objspace/std/floatobject.py:135-148`'s
+        // bigint-aware Int↔Float comparison. f64 mantissa is 53 bits;
+        // ints with `|i| > 2^53` are not exactly representable as f64.
+        // Upstream's `_compare` routes through `do_compare_bigint` for
+        // these values, comparing against `floor(f)` exactly. Naive
+        // `*x as f64` would round `Int(2^53 + 1)` to `2^53`,
+        // misclassifying it as equal to `Float(2^53)`.
+        //
+        // 2^53 = 9007199254740992 (exactly representable as f64)
+        // 2^53 + 1 = 9007199254740993 (NOT representable; f64 rounds
+        //   to 2^53)
+        let src = "\
+            pub const I_2_TO_53_PLUS_1: i64 = 9007199254740993;
+            pub const F_2_TO_53: f64 = 9007199254740992.0;
+            pub const ParityProbe_BigIntEqFloat: bool = I_2_TO_53_PLUS_1 == F_2_TO_53;
+            pub const ParityProbe_BigIntGtFloat: bool = I_2_TO_53_PLUS_1 > F_2_TO_53;
+            pub const ParityProbe_FloatLtBigInt: bool = F_2_TO_53 < I_2_TO_53_PLUS_1;
+        ";
+        let file = syn::parse_file(src).expect("mantissa-boundary fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+
+        // Eq: i = 2^53 + 1, f = 2^53. They are NOT equal; naive cast
+        // would say True (because (2^53 + 1) as f64 == 2^53).
+        match module_globals_for_test(module_id, "ParityProbe_BigIntEqFloat") {
+            Some(ConstValue::Bool(false)) => {}
+            other => {
+                panic!("Int(2^53+1) == Float(2^53) must be False (bigint compare), got {other:?}",)
+            }
+        }
+        // Gt: i > f, since i = 2^53 + 1 > f = 2^53.
+        match module_globals_for_test(module_id, "ParityProbe_BigIntGtFloat") {
+            Some(ConstValue::Bool(true)) => {}
+            other => panic!("Int(2^53+1) > Float(2^53) must be True, got {other:?}"),
+        }
+        match module_globals_for_test(module_id, "ParityProbe_FloatLtBigInt") {
+            Some(ConstValue::Bool(true)) => {}
+            other => panic!("Float(2^53) < Int(2^53+1) must be True, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_rust_module_const_evaluator_mixed_numeric_eq_uses_python_coercion() {
+        // Cross-numeric `==` / `!=` / `<` / `<=` / `>` / `>=` follow
+        // Python's `bool ⊂ int ⊂ float` coercion, matching upstream
+        // `PureOperation.constfold` calling `operator.eq(*args)`
+        // directly. Without this, `Int(1) == Float(1.0)` would fold
+        // to `False` via structural ConstValue equality, diverging
+        // from Python.
+        //
+        // Cross-numeric pairs reach the const-evaluator via the
+        // bindings/registry/builtins resolver chain (e.g. an `Int`
+        // const compared to a `Float` const). Rust's typed source
+        // can't write `1 == 1.0` directly, but it can write
+        // `INT_ONE == FLOAT_ONE` after binding both names — that's
+        // the path this test exercises.
+        let src = "\
+            pub const INT_ONE: i64 = 1;
+            pub const FLOAT_ONE: f64 = 1.0;
+            pub const BOOL_TRUE: bool = true;
+            pub const ParityProbe_IntEqFloat: bool = INT_ONE == FLOAT_ONE;
+            pub const ParityProbe_BoolEqInt: bool = BOOL_TRUE == INT_ONE;
+            pub const ParityProbe_BoolEqFloat: bool = BOOL_TRUE == FLOAT_ONE;
+            pub const ParityProbe_FloatLtInt: bool = FLOAT_ONE < INT_ONE;
+        ";
+        let file = syn::parse_file(src).expect("mixed-numeric fixture parses");
+        let module_id = register_rust_module(&file).expect("walk succeeds");
+
+        for (name, expected) in [
+            ("ParityProbe_IntEqFloat", true),
+            ("ParityProbe_BoolEqInt", true),
+            ("ParityProbe_BoolEqFloat", true),
+            ("ParityProbe_FloatLtInt", false), // 1.0 < 1 == False
+        ] {
+            match module_globals_for_test(module_id, name) {
+                Some(ConstValue::Bool(v)) => assert_eq!(
+                    v, expected,
+                    "{name}: expected Bool({expected}), got Bool({v})",
+                ),
+                other => panic!("{name}: expected Bool, got {other:?}"),
+            }
         }
     }
 }
