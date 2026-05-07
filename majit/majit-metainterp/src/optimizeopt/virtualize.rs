@@ -76,9 +76,6 @@ const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
-    /// Phase 2 (loop body): don't virtualize New() because guard failure
-    /// recovery_layout is not yet populated (RPython rd_virtuals equivalent).
-    pub is_phase2: bool,
     /// If set, frame OpRef::input_arg_ref(0) is treated as a virtualizable object
     /// whose field accesses are absorbed by the optimizer.
     vable_config: Option<VirtualizableConfig>,
@@ -105,7 +102,6 @@ pub struct OptVirtualize {
 impl OptVirtualize {
     pub fn new() -> Self {
         OptVirtualize {
-            is_phase2: false,
             vable_config: None,
             vable_initialized: false,
             needs_vable_setup: false,
@@ -118,7 +114,6 @@ impl OptVirtualize {
     /// Create with virtualizable config for frame field tracking.
     pub fn with_virtualizable(config: VirtualizableConfig) -> Self {
         OptVirtualize {
-            is_phase2: false,
             vable_config: Some(config),
             vable_initialized: false,
             needs_vable_setup: false,
@@ -126,41 +121,6 @@ impl OptVirtualize {
             last_guard_not_forced_2: None,
             finish_guard_op: None,
         }
-    }
-
-    fn record_known_class(
-        &mut self,
-        obj_ref: OpRef,
-        class_ptr: majit_ir::GcRef,
-        ctx: &mut OptContext,
-    ) {
-        let updated = match ctx.peek_ptr_info_via_box(obj_ref) {
-            Some(PtrInfo::Virtual(mut vinfo)) => {
-                if vinfo.known_class.is_none() {
-                    vinfo.known_class = Some(class_ptr);
-                }
-                PtrInfo::Virtual(vinfo)
-            }
-            Some(PtrInfo::VirtualStruct(vinfo)) => PtrInfo::VirtualStruct(vinfo),
-            Some(PtrInfo::VirtualArray(vinfo)) => PtrInfo::VirtualArray(vinfo),
-            Some(PtrInfo::VirtualArrayStruct(vinfo)) => PtrInfo::VirtualArrayStruct(vinfo),
-            Some(PtrInfo::VirtualRawBuffer(vinfo)) => PtrInfo::VirtualRawBuffer(vinfo),
-            Some(PtrInfo::VirtualRawSlice(vinfo)) => PtrInfo::VirtualRawSlice(vinfo),
-            Some(PtrInfo::Virtualizable(vinfo)) => PtrInfo::Virtualizable(vinfo),
-            Some(PtrInfo::Instance(mut iinfo)) => {
-                if iinfo.known_class.is_none() {
-                    iinfo.known_class = Some(class_ptr);
-                }
-                PtrInfo::Instance(iinfo)
-            }
-            Some(PtrInfo::NonNull { .. })
-            | Some(PtrInfo::Constant(_))
-            | Some(PtrInfo::Struct(_))
-            | Some(PtrInfo::Array(_))
-            | Some(PtrInfo::Str(_))
-            | None => PtrInfo::known_class(class_ptr, true),
-        };
-        ctx.set_ptr_info(obj_ref, updated);
     }
 
     /// Seed virtualizable state from existing trace inputs.
@@ -562,6 +522,8 @@ impl OptVirtualize {
                 return OptimizationResult::Remove;
             }
         }
+        // virtualize.py:220: self.pure_from_args(rop.ARRAYLEN_GC, [op], arg, descr=op.getdescr())
+        ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos, size_ref);
         OptimizationResult::PassOn
     }
 
@@ -780,12 +742,6 @@ impl OptVirtualize {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
-        // Phase 0 probe (Tasks #158/#159/#122 epic): when
-        // MAJIT_PROBE_LIVENESS env is set, log every setarrayitem_gc
-        // resolution path (Virtual elide / Vable mirror / passthrough).
-        // Goal P0-Q2: identify which array-write path is the source of
-        // vable mirror staleness for fannkuch's LoadFastLoadFast read.
-        let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             let idx = index as usize;
@@ -801,16 +757,6 @@ impl OptVirtualize {
                 })
                 .unwrap_or(false);
             if did_virtual_write {
-                if probe {
-                    eprintln!(
-                        "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → VirtualArray.items[{}] = value (REMOVE)",
-                        op.pos.raw(),
-                        array_ref,
-                        idx,
-                        value_ref,
-                        idx,
-                    );
-                }
                 return OptimizationResult::Remove;
             }
             // virtualizable.py:134-137 write-back parity: mirror writes to
@@ -820,102 +766,49 @@ impl OptVirtualize {
                 self.resolve_virtualizable_array_source(array_ref, ctx)
             {
                 let elem_idx = index as usize;
-                if probe {
-                    eprintln!(
-                        "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → Vable[{}].arrays[{}].elem[{}] = value (mirror, PASS)",
-                        op.pos.raw(),
-                        array_ref,
-                        elem_idx,
-                        value_ref,
-                        frame_ref.raw(),
-                        array_idx,
-                        elem_idx,
-                    );
-                }
                 ctx.with_ptr_info_mut(frame_ref, |info| {
                     if let PtrInfo::Virtualizable(vstate) = info {
                         set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
                     }
                 });
-            } else if probe {
-                eprintln!(
-                    "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → no vable mirror (passthrough)",
-                    op.pos.raw(),
-                    array_ref,
-                    index as usize,
-                    value_ref,
-                );
             }
-        } else if probe {
-            eprintln!(
-                "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} value_ref={:?} (passthrough)",
-                op.pos.raw(),
-                array_ref,
-                index_ref,
-                value_ref,
-            );
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
-        // Virtual value-arg is NOT forced here; _emit_operation
-        // (optimizer.py:623-625) forces it at final emission time so the
-        // SetfieldGc init ops precede this SetarrayitemGc in _newoperations.
         if !ctx.has_ptr_info_via_box(array_ref) {
             ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:276-296 optimize_GETARRAYITEM_GC_I (aliased to R/F and PURE variants)
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        // Phase 0 probe (Tasks #158/#159/#122 epic): symmetric to the
-        // setarrayitem_gc probe — log every read resolution. P0-Q2 needs
-        // BOTH sides to confirm whether the read sees the fresh value
-        // written by a recent setarrayitem or a stale slot from before.
-        let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(info) = ctx.peek_ptr_info_via_box(array_ref) {
-                if let PtrInfo::VirtualArray(vinfo) = info {
+        if let Some(info) = ctx.peek_ptr_info_via_box(array_ref) {
+            if let PtrInfo::VirtualArray(vinfo) = info {
+                if let Some(index) = ctx.get_constant_int(index_ref) {
                     let idx = index as usize;
                     if idx < vinfo.items.len() {
                         let item_ref = vinfo.items[idx];
-                        if !item_ref.is_none() {
-                            if probe {
-                                eprintln!(
-                                    "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → VirtualArray.items[{}] = {:?} (REMOVE → fold)",
-                                    op.pos.raw(),
-                                    array_ref,
-                                    idx,
-                                    idx,
-                                    item_ref,
-                                );
-                            }
-                            ctx.replace_op(op.pos, item_ref);
-                            return OptimizationResult::Remove;
+                        // virtualize.py:282-284: reading uninitialized items → InvalidLoop
+                        if item_ref.is_none() {
+                            return OptimizationResult::InvalidLoop;
                         }
+                        ctx.replace_op(op.pos, item_ref);
+                        return OptimizationResult::Remove;
                     }
                 }
             }
-            if probe {
-                eprintln!(
-                    "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → no fold (PASS, runtime read)",
-                    op.pos.raw(),
-                    array_ref,
-                    index as usize,
-                );
-            }
-        } else if probe {
-            eprintln!(
-                "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} (PASS)",
-                op.pos.raw(),
-                array_ref,
-                index_ref,
-            );
+        }
+        // virtualize.py:287: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:268-274 optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
 
@@ -924,20 +817,14 @@ impl OptVirtualize {
             ctx.make_constant(op.pos, Value::Int(len));
             return OptimizationResult::Remove;
         }
-        OptimizationResult::PassOn
-    }
-
-    fn optimize_strlen(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let str_ref = ctx.get_box_replacement(op.arg(0));
-
-        if let Some(PtrInfo::VirtualArray(vinfo)) = ctx.peek_ptr_info_via_box(str_ref) {
-            let len = vinfo.items.len() as i64;
-            ctx.make_constant(op.pos, Value::Int(len));
-            return OptimizationResult::Remove;
+        // virtualize.py:273: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:387-401 optimize_GETINTERIORFIELD_GC_I (aliased to R/F)
     fn optimize_getinteriorfield_gc(
         &mut self,
         op: &Op,
@@ -947,20 +834,28 @@ impl OptVirtualize {
         let index_ref = op.arg(1);
         let field_idx = descr_index(&op.descr);
 
-        if let Some(index) = ctx.get_constant_int(index_ref) {
-            if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
+        if let Some(PtrInfo::VirtualArrayStruct(vinfo)) = ctx.peek_ptr_info_via_box(array_ref) {
+            if let Some(index) = ctx.get_constant_int(index_ref) {
                 let elem_idx = index as usize;
                 if elem_idx < vinfo.element_fields.len() {
-                    if let Some(val) = get_field(&vinfo.element_fields[elem_idx], field_idx) {
-                        ctx.replace_op(op.pos, val);
-                        return OptimizationResult::Remove;
+                    let fld = get_field(&vinfo.element_fields[elem_idx], field_idx);
+                    // virtualize.py:394-396: reading uninitialized → InvalidLoop
+                    if fld.is_none() {
+                        return OptimizationResult::InvalidLoop;
                     }
+                    ctx.replace_op(op.pos, fld.unwrap());
+                    return OptimizationResult::Remove;
                 }
             }
+        }
+        // virtualize.py:399: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
 
+    /// virtualize.py:404-414 optimize_SETINTERIORFIELD_GC
     fn optimize_setinteriorfield_gc(
         &mut self,
         op: &Op,
@@ -976,9 +871,6 @@ impl OptVirtualize {
             let did_write = ctx
                 .with_ptr_info_mut(array_ref, |info| {
                     if let PtrInfo::VirtualArrayStruct(vinfo) = info {
-                        // info.py:658-661: setinteriorfield_virtual
-                        // index = self._compute_index(index, fielddescr)
-                        // if index >= 0: self._items[index] = fld
                         if elem_idx < vinfo.element_fields.len() {
                             set_field(&mut vinfo.element_fields[elem_idx], field_idx, value_ref);
                             return true;
@@ -990,6 +882,10 @@ impl OptVirtualize {
             if did_write {
                 return OptimizationResult::Remove;
             }
+        }
+        // virtualize.py:413: self.make_nonnull(op.getarg(0))
+        if !ctx.has_ptr_info_via_box(array_ref) {
+            ctx.set_ptr_info(array_ref, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1408,13 +1304,16 @@ impl Optimization for OptVirtualize {
             OpCode::GetarrayitemGcI
             | OpCode::GetarrayitemGcR
             | OpCode::GetarrayitemGcF
+            // virtualize.py:294-296: GETARRAYITEM_GC_PURE aliases
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF
             | OpCode::GetarrayitemRawI
             | OpCode::GetarrayitemRawR
             | OpCode::GetarrayitemRawF => self.optimize_getarrayitem_gc(op, ctx),
 
             // Array length
             OpCode::ArraylenGc => self.optimize_arraylen_gc(op, ctx),
-            OpCode::Strlen => self.optimize_strlen(op, ctx),
 
             // Interior field access on potentially-virtual array-of-structs
             OpCode::GetinteriorfieldGcI
@@ -1645,35 +1544,11 @@ impl Optimization for OptVirtualize {
             // dispatches to the standard emit path — no virtualize-specific
             // handler. Falling through to the default PassOn matches RPython.
 
-            // ── Record hint opcodes ──
-            // These record information about values that downstream passes can use.
-            // The hints themselves are removed (no code emitted).
-
-            // RECORD_EXACT_CLASS(ref, class_const): record that ref has class class_const.
-            // Enables subsequent GUARD_CLASS elimination.
-            OpCode::RecordExactClass => {
-                let ref_opref = ctx.get_box_replacement(op.arg(0));
-                if let Some(Value::Ref(class_ref)) = ctx.get_constant(op.arg(1)) {
-                    self.record_known_class(ref_opref, class_ref, ctx);
-                }
-                OptimizationResult::Remove
-            }
-
-            // RECORD_EXACT_VALUE_I(ref, int_const): record that ref has exact int value.
-            OpCode::RecordExactValueI => {
-                let ref_opref = ctx.get_box_replacement(op.arg(0));
-                if let Some(val) = ctx.get_constant_int(op.arg(1)) {
-                    ctx.make_constant(ref_opref, Value::Int(val));
-                }
-                OptimizationResult::Remove
-            }
-
-            // RECORD_EXACT_VALUE_R(ref, ref_const): record that ref equals ref_const.
-            OpCode::RecordExactValueR => {
-                let ref_opref = ctx.get_box_replacement(op.arg(0));
-                ctx.replace_op(ref_opref, ctx.get_box_replacement(op.arg(1)));
-                OptimizationResult::Remove
-            }
+            // RECORD_EXACT_CLASS / RECORD_EXACT_VALUE_I / RECORD_EXACT_VALUE_R:
+            // Handled by OptRewrite (rewrite.py:376-395), not virtualize.py.
+            // PassOn forwards them to rewrite which runs before virtualize
+            // in the default pipeline — these should already be consumed
+            // before reaching this pass. Keep as PassOn for robustness.
 
             // virtualize.py:417-418 dispatch_opt = make_dispatcher_method(
             //     OptVirtualize, 'optimize_', default=OptVirtualize.emit)
@@ -1716,10 +1591,6 @@ impl Optimization for OptVirtualize {
 
     fn name(&self) -> &'static str {
         "virtualize"
-    }
-
-    fn set_phase2(&mut self, phase2: bool) {
-        self.is_phase2 = phase2;
     }
 }
 
