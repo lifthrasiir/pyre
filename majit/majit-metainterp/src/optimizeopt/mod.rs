@@ -2980,44 +2980,60 @@ impl OptContext {
     }
 
     pub fn replace_op(&mut self, old: OpRef, new: OpRef) {
-        if old == new || old.is_constant() {
+        if old.is_constant() {
             return;
         }
-        // RPython Box.type invariant: `make_equal_to(box, other)` only
-        // fires between boxes of matching type (IntFrontendOp only ever
-        // forwards to something with `.type == 'i'`). A cross-type
-        // forward would change `opref_type(old)`'s answer from its
-        // original kind to `new`'s kind — the exact retyping the
-        // `register_value_type` guard is designed to forbid. Assert here
-        // so the wrong-kind forward surfaces at the replace site rather
-        // than silently at the next downstream lookup.
-        if !new.is_none() {
-            if let (Some(old_tp), Some(new_tp)) = (self.opref_type(old), self.opref_type(new)) {
-                debug_assert_eq!(
-                    old_tp, new_tp,
-                    "replace_op: cross-type forward {:?}:{:?} -> {:?}:{:?} \
-                     (RPython Box.type invariant violation; emit explicit \
-                     wrapint/wrapfloat/unbox before forwarding instead of \
-                     retyping through replace_op)",
-                    old, old_tp, new, new_tp,
-                );
-            }
-        }
         use crate::optimizeopt::info::Forwarded;
+        if new.is_none() {
+            let idx = old.raw() as usize;
+            if idx < self.forwarded.len() {
+                self.forwarded[idx] = Forwarded::None;
+            }
+            self.mirror_forwarded_to_box(idx);
+            return;
+        }
+        // optimizer.py:388: op = get_box_replacement(op)
+        let old = self.get_box_replacement(old);
+        // optimizer.py:389: if op is newop: return
+        if old == new {
+            return;
+        }
+        if let (Some(old_tp), Some(new_tp)) = (self.opref_type(old), self.opref_type(new)) {
+            debug_assert_eq!(
+                old_tp, new_tp,
+                "replace_op: cross-type forward {:?}:{:?} -> {:?}:{:?}",
+                old, old_tp, new, new_tp,
+            );
+        }
         let idx = old.raw() as usize;
         if idx >= self.forwarded.len() {
             self.forwarded.resize(idx + 1, Forwarded::None);
         }
-        if new.is_none() {
-            self.forwarded[idx] = Forwarded::None;
-        } else {
-            self.forwarded[idx] = Forwarded::Op(new);
-        }
-        // H-3.1 mirror: `optimizer.py:387 make_equal_to → set_forwarded(newop)`.
-        // For const targets the mirror builds a fresh `BoxRef::new_const(value)`
-        // from `const_pool` per call site, matching `history.py:220`
-        // ConstInt construction (no dedup).
+        // optimizer.py:391-396: transfer existing info from old to new.
+        // RPython's `get_forwarded()` returns `AbstractInfo` (IntBound,
+        // PtrInfo). `Forwarded::Const` represents `set_forwarded(constbox)`
+        // which RPython's chain walker traverses into — `get_forwarded()`
+        // on the Const returns None, so Const is NOT eligible for transfer.
+        let old_info = match &self.forwarded[idx] {
+            Forwarded::Info(_) | Forwarded::IntBound(_) => {
+                Some(std::mem::replace(&mut self.forwarded[idx], Forwarded::None))
+            }
+            _ => None,
+        };
+        self.forwarded[idx] = Forwarded::Op(new);
         self.mirror_forwarded_to_box(idx);
+        // optimizer.py:395-396: newop.set_forwarded(opinfo)
+        // Const targets never receive info (resoperation.py:50-55).
+        if let Some(info) = old_info {
+            if !new.is_constant() {
+                let new_idx = new.raw() as usize;
+                if new_idx >= self.forwarded.len() {
+                    self.forwarded.resize(new_idx + 1, Forwarded::None);
+                }
+                self.forwarded[new_idx] = info;
+                self.mirror_forwarded_to_box(new_idx);
+            }
+        }
     }
 
     /// RPython unroll.py: source.set_forwarded(target)
