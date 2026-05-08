@@ -6233,4 +6233,148 @@ mod tests {
             "arrays with different constant at index 1 cannot alias"
         );
     }
+
+    fn dict_lookup_descr(idx: u32, extra0: DescrRef, extra1: DescrRef) -> DescrRef {
+        Arc::new(TestCallDescr {
+            idx,
+            effect: EffectInfo {
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: OopSpecIndex::DictLookup,
+                extradescrs: Some(vec![extra0, extra1]),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// heap.py:480-528 parity: FLAG_LOOKUP deduplicates consecutive dict lookups.
+    #[test]
+    fn test_dict_lookup_cache_flag_lookup() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        // Build args: [func_addr, dict, key, hash, flag=FLAG_LOOKUP(0)]
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag = ctx.make_constant_int(0); // FLAG_LOOKUP
+
+        // First lookup — not cached yet, should return false (emit).
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+
+        // Second lookup with same dict+key — should be cached.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+        assert!(heap.last_emitted_removed);
+    }
+
+    /// heap.py:495-499 parity: FLAG_STORE reuses only if cached value >= 0.
+    #[test]
+    fn test_dict_lookup_cache_flag_store_nonneg() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag_lookup = ctx.make_constant_int(0); // FLAG_LOOKUP
+        let flag_store = ctx.make_constant_int(1); // FLAG_STORE
+
+        // Seed cache with FLAG_LOOKUP, then try FLAG_STORE.
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_lookup]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        // Pretend the result is known >= 0.
+        ctx.setintbound(
+            pos1,
+            &crate::optimizeopt::intutils::IntBound::from_constant(5),
+        );
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+
+        // FLAG_STORE with known non-negative cached value → reuse.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_store]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+    }
+
+    /// heap.py:390 parity: clean_caches clears cached_dict_reads.
+    #[test]
+    fn test_dict_lookup_cache_cleared_by_clean_caches() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag = ctx.make_constant_int(0);
+
+        // Seed cache.
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        heap._optimize_call_dict_lookup(&op1, &mut ctx);
+        assert!(!heap.cached_dict_reads.is_empty());
+
+        // clean_caches should clear it.
+        heap.clean_caches(&mut ctx);
+        assert!(heap.cached_dict_reads.is_empty());
+
+        // Second lookup after clean — should NOT be cached.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(!heap._optimize_call_dict_lookup(&op2, &mut ctx));
+    }
+
+    /// FLAG_DELETE (2+) should never cache or reuse.
+    #[test]
+    fn test_dict_lookup_cache_flag_delete_no_cache() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag_delete = ctx.make_constant_int(2); // FLAG_DELETE
+
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_delete]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+        assert!(heap.cached_dict_reads.is_empty());
+    }
 }

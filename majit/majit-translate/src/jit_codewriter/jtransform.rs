@@ -3309,6 +3309,8 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // All jit.* oopspecs are intercepted by _handle_jit_call() before
         // reaching this function. Remaining oopspecs map to OS_* indices.
         "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
+        _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
     }
 }
@@ -5411,5 +5413,26 @@ mod tests {
             &[arg],
             &ValueType::Ref,
         ));
+    }
+
+    #[test]
+    fn map_user_oopspec_dict_lookup() {
+        use majit_ir::descr::OopSpecIndex;
+        assert_eq!(
+            super::map_user_oopspec_to_index("ordereddict.lookup(d, key, hash, flag)"),
+            OopSpecIndex::DictLookup
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("ordereddict.lookup"),
+            OopSpecIndex::DictLookup
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("dict.lookup"),
+            OopSpecIndex::DictLookup
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("dict.setitem"),
+            OopSpecIndex::None
+        );
     }
 }
