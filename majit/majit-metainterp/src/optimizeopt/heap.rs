@@ -3020,6 +3020,9 @@ impl Optimization for OptHeap {
         self.seen_allocation.clear();
         self.unescaped.clear();
         self.known_nonnull.clear();
+        self.last_emitted_removed = false;
+        self.cached_dict_reads.clear();
+        self.corresponding_array_descrs.clear();
         self.quasi_immut_cache.clear();
     }
 

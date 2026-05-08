@@ -5698,4 +5698,78 @@ mod tests {
             segs(&bare_family),
         );
     }
+
+    #[test]
+    fn test_getcalldescr_extradescrs_propagated() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct StubDescr(u32);
+        impl majit_ir::Descr for StubDescr {
+            fn index(&self) -> u32 {
+                self.0
+            }
+        }
+
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pure_add"]);
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("pure_add"));
+        cc.find_all_graphs_for_tests();
+
+        let extra0: DescrRef = Arc::new(StubDescr(80));
+        let extra1: DescrRef = Arc::new(StubDescr(81));
+        let extras = Some(vec![extra0.clone(), extra1.clone()]);
+
+        let target = CallTarget::function_path(["pure_add"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::DictLookup,
+            None,
+            &mut cache,
+            extras,
+        );
+        let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].index(), 80);
+        assert_eq!(got[1].index(), 81);
+    }
+
+    #[test]
+    fn test_getcalldescr_extradescrs_survives_random_effects() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct StubDescr(u32);
+        impl majit_ir::Descr for StubDescr {
+            fn index(&self) -> u32 {
+                self.0
+            }
+        }
+
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["chaotic"]);
+        cc.register_function_graph(path.clone(), raising_graph("chaotic"));
+        cc.find_all_graphs_for_tests();
+
+        let extra0: DescrRef = Arc::new(StubDescr(90));
+        let extras = Some(vec![extra0.clone()]);
+
+        let target = CallTarget::function_path(["chaotic"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::DictLookup,
+            Some(ExtraEffect::RandomEffects),
+            &mut cache,
+            extras,
+        );
+        let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].index(), 90);
+    }
 }

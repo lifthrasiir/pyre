@@ -125,7 +125,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Note: GUARD_SUBCLASS/IS_OBJECT/NONNULL/CLASS, COND_CALL, INT_PY_DIV는 propagate_forward match arm으로 구현됨
 
 **heap.rs** (90%)
-- Implemented: variable-index array caching (`cached_arrayitems_var` HashMap)
+- Implemented: variable-index array caching (`ArrayCacheSubMap::cached_varindex_triples`)
 - Implemented: aliasing analysis (`cannot_alias_via_content`, `_cannot_alias_via_classes_or_lengths` inline)
 - Implemented: `export_cached_fields()` / `import_cached_fields()` (bridge 지식 직렬화)
 - Implemented: `force_lazy_sets_for_guard()` (가드 전용 선택적 lazy set forcing → pendingfields → rd_pendingfields)
