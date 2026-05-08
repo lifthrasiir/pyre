@@ -1081,67 +1081,6 @@ fn mergeblock(
     newblock
 }
 
-fn ensure_pc_block(
-    code: &CodeObject,
-    graph: &mut super::flow::FunctionGraph,
-    joinpoints: &mut HashMap<usize, Vec<SpamBlockRef>>,
-    current_block: &SpamBlockRef,
-    current_state: &FrameState,
-    py_pc: usize,
-) -> SpamBlockRef {
-    // PRE-EXISTING-ADAPTATION — pyre-only helper with no upstream
-    // counterpart.  `flowcontext.py:399-475` never asks "which block
-    // is at PC N"; the current block is whichever one the walker
-    // popped from `pendingblocks`, and per-PC lookup happens only via
-    // `mergeblock`'s `candidates = joinpoints.setdefault(next_offset,
-    // [])` (flowcontext.py:426) inside a targeted merge check.  This
-    // helper exists because pyre's walker is PC-sequential (see
-    // codewriter.rs:3514 `for py_pc in start_pc..num_instrs`) and
-    // needs a "block at this PC" probe at fallthrough / exception /
-    // split-merge boundaries.  Retires together with the walker
-    // restructure at Task #227 Phase 4.
-    //
-    // Phase P2c: `joinpoints[py_pc].first()` is the single source of
-    // truth for the "current block at this PC" after pc_blocks was
-    // retired.  Every `mergeblock` / `make_next_block` / fresh-path
-    // below uses `candidates.insert(0, ...)` to keep the most recent
-    // live candidate at the head.  `dead()` filtering guards against
-    // P3's unconditional supersede leaving a dead block in the list
-    // transiently before `candidates.remove(...)` runs.
-    if let Some(block) = joinpoints
-        .get(&py_pc)
-        .and_then(|blocks| blocks.iter().find(|b| !b.dead()))
-        .cloned()
-    {
-        return block;
-    }
-
-    // RPython parity: `flowcontext.py` keeps the current block across
-    // sequential opcodes — a SpamBlock spans every PC between two
-    // joinpoint candidates.  Without this, every sequential
-    // `emit_mark_label_pc!` after the first opcode would synthesise an
-    // orphan block (no predecessor link from `current_block`), which
-    // disconnects the graph CFG from `startblock` and starves
-    // `flatten_graph_with_lowering` of operations.  Register the
-    // existing `current_block` at `py_pc` so the walker keeps emitting
-    // into the same block instead of forking on every byte boundary.
-    if !current_block.dead() {
-        joinpoints
-            .entry(py_pc)
-            .or_default()
-            .insert(0, current_block.clone());
-        return current_block.clone();
-    }
-
-    let block = SpamBlockRef::new(graph.new_block(Vec::new()), None);
-    initialize_spam_block(code, graph, &block, current_state, py_pc);
-    joinpoints
-        .entry(py_pc)
-        .or_default()
-        .insert(0, block.clone());
-    block
-}
-
 /// PRE-EXISTING-ADAPTATION: Rust `FlowValue` is statically kinded
 /// (Int/Ref/Float) and requires `Kind::Ref` at construction. RPython
 /// `Variable()` (`flowspace/model.py`) is unkinded — flowgraph
@@ -3638,15 +3577,56 @@ impl CodeWriter {
                         &mut link_exit_states,
                         &mut pendingblocks,
                     )
+                } else if let Some(target) = joinpoints
+                    .get(&py_pc)
+                    .and_then(|blocks| blocks.iter().find(|b| !b.dead()))
+                    .cloned()
+                {
+                    // Branch arrival / catch landing / earlier sequential
+                    // walker step at this PC already registered a live
+                    // block.  RPython equivalent: the `set_branch` /
+                    // `mergeblock` that targeted `py_pc` populated the
+                    // joinpoint candidate list (`flowcontext.py:426
+                    // candidates = self.joinpoints.setdefault(...)`).
+                    target
+                } else if !current_block.dead() {
+                    // Natural fall-through: previous opcode set
+                    // `next_offset = py_pc` and `current_block` is still
+                    // live, so the walker stays in it and registers it
+                    // at the joinpoint so a future cross-PC `mergeblock`
+                    // / `set_branch` that targets `py_pc` finds the
+                    // correct block (the one carrying the ops already
+                    // emitted at this PC).  RPython does not need this
+                    // step because its per-block walker
+                    // (`flowcontext.py:407-475`) processes a SpamBlock's
+                    // ops contiguously without re-entering joinpoint
+                    // logic on every byte; pyre's PC-sequential walker
+                    // is the adaptation, retired together with the
+                    // walker restructure (Task #227 Phase 4).
+                    joinpoints
+                        .entry(py_pc)
+                        .or_default()
+                        .insert(0, current_block.clone());
+                    current_block.clone()
                 } else {
-                    ensure_pc_block(
-                        code,
-                        &mut graph,
-                        &mut joinpoints,
-                        &current_block,
-                        &current_state,
-                        py_pc,
-                    )
+                    // `current_block` already closed and no joinpoint
+                    // candidate exists — synthesize a fresh SpamBlock
+                    // for `py_pc`.  Suspected dead code in current
+                    // benchmarks (the earlier `else` branch never fires
+                    // it), kept fail-loud-by-construction so a future
+                    // slice can confirm and delete after a wider
+                    // suite.  RPython parity: a fresh `SpamBlock` here
+                    // would mirror `flowcontext.py:472 newblock = self.
+                    // make_next_block(...)` minus the predecessor edge,
+                    // which is exactly the orphan-block hazard W-1
+                    // fixed.
+                    let block = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+                    initialize_spam_block(code, &mut graph, &block, &current_state, py_pc);
+                    joinpoints
+                        .entry(py_pc)
+                        .or_default()
+                        .insert(0, block.clone());
+                    block
                 };
                 if let Some(fallthrough_case) = pending_bool_fallthrough_case.take() {
                     set_last_bool_exitcase(&current_block.block(), fallthrough_case);
