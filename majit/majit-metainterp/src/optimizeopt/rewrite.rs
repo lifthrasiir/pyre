@@ -1991,9 +1991,13 @@ impl OptRewrite {
         let arraydescr = match &ei.single_write_descr_array {
             Some(d) => d.clone(),
             None => {
-                // Fallback: check bitset — must have exactly one array write.
-                let w = ei.write_descrs_arrays;
-                if w == 0 || !w.is_power_of_two() {
+                // Fallback: check bitstring — must have exactly one array write.
+                let count: u32 = ei
+                    .write_descrs_arrays
+                    .as_ref()
+                    .map(|w| w.iter().map(|b| b.count_ones()).sum())
+                    .unwrap_or(0);
+                if count != 1 {
                     return false;
                 }
                 // No actual DescrRef available — cannot emit typed ops.

@@ -5772,20 +5772,17 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 /// (`(a ^ b) < 0 && d * b != a -> d - 1`) yields Python-floor
 /// semantics for every legal sign combination of `(a, b)`.
 ///
-/// Rust-safety adaptation: `wrapping_div(0)` panics in both debug
-/// and release builds (Rust integer division by zero is always a
-/// panic — it is not UB), and `INT_MIN.wrapping_div(-1)` returns
-/// `INT_MIN` (wrong but well-defined).  The explicit `b == 0 ->
-/// return 0` short-circuit keeps the helper safe when called
-/// outside the JIT trace context (e.g., from non-traced Rust). The
-/// helper does NOT short-circuit the overflow corner — that case
-/// is impossible from the trace path thanks to the runtime guard,
-/// and a non-traced caller hitting it gets `wrapping_div`'s
-/// well-defined (if mathematically wrong) result.
+/// `wrapping_div(0)` panics (Rust integer division by zero is always
+/// a panic, in both debug and release builds), and
+/// `INT_MIN.wrapping_div(-1)` returns `INT_MIN` (wrong but
+/// well-defined).  Both corners are unreachable from the JIT trace
+/// path: the `_ovf_zer` wrapper's `int_eq(rhs, 0) -> guard_false` and
+/// `(lhs == INT_MIN) & (rhs == -1) -> guard_false` runtime guards
+/// (emitted at `codegen.rs::generated_binary_int_value`) bail out the
+/// trace before this helper is invoked, matching RPython's
+/// `rint.py:429 ll_int_py_div_ovf_zer` shape.  Direct (non-traced)
+/// callers must respect the same precondition.
 pub fn bhimpl_int_floordiv(a: i64, b: i64) -> i64 {
-    if b == 0 {
-        return 0;
-    }
     let d = a.wrapping_div(b);
     if (a ^ b) < 0 && d.wrapping_mul(b) != a {
         d.wrapping_sub(1)
@@ -5796,17 +5793,13 @@ pub fn bhimpl_int_floordiv(a: i64, b: i64) -> i64 {
 
 /// RPython `rint.py:496-500 ll_int_py_mod` (oopspec `int.py_mod`).
 /// See [`bhimpl_int_floordiv`] for the JIT-side runtime guard
-/// rationale (`int_eq(rhs, 0)` + `(lhs == INT_MIN) & (rhs == -1)`)
-/// and the Rust-safety adaptation note. Uses `wrapping_rem` for the
-/// C-style remainder step, then applies RPython `ll_int_py_mod`'s
-/// sign correction only when the remainder and divisor have opposite
-/// signs.  This keeps ordinary same-sign cases unchanged (unlike a
-/// blind `(r + b) % b`) while avoiding Rust's debug-mode overflow
-/// check for non-traced calls with `INT_MIN % -1`.
+/// rationale (`int_eq(rhs, 0)` + `(lhs == INT_MIN) & (rhs == -1)`).
+/// Uses `wrapping_rem` for the C-style remainder step, then applies
+/// RPython `ll_int_py_mod`'s sign correction only when the remainder
+/// and divisor have opposite signs.  As with `bhimpl_int_floordiv`,
+/// `wrapping_rem(0)` and `INT_MIN % -1` are unreachable from the
+/// trace path; non-traced callers must respect the same precondition.
 pub fn bhimpl_int_mod(a: i64, b: i64) -> i64 {
-    if b == 0 {
-        return 0;
-    }
     let r = a.wrapping_rem(b);
     if r != 0 && (r ^ b) < 0 {
         r.wrapping_add(b)

@@ -17192,9 +17192,20 @@ mod tests {
                 as *mut majit_backend_dynasm::guard::DynasmFailDescr)
         };
         if descr.meta_descr.is_none() {
-            descr.meta_descr = Some(crate::compile::make_resume_guard_descr_typed(
-                descr.fail_arg_types.clone(),
-            ));
+            let meta = crate::compile::make_resume_guard_descr_typed(descr.fail_arg_types.clone());
+            // `DynasmFailDescr::trace_id()` (`guard.rs:380-392`) forwards
+            // through `meta_resume_fd().trace_id()` whenever a meta_descr
+            // is attached and falls back to the backend-local
+            // `self.trace_id` field only when meta_descr is absent.
+            // `make_resume_guard_descr_typed` initialises trace_id to 0
+            // (`compile.rs:3425`); without copying the backend-local
+            // trace_id over, the freshly-stamped meta_descr would mask
+            // the descr's real trace_id and break `(trace_id, fail_index)`
+            // lookups in `try_find_descr`.
+            if let Some(meta_fd) = meta.as_fail_descr() {
+                meta_fd.set_trace_id(descr.trace_id);
+            }
+            descr.meta_descr = Some(meta);
         }
         let meta_fd = descr
             .meta_descr

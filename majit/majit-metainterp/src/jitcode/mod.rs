@@ -117,7 +117,7 @@ pub use majit_translate::jitcode::enumerate_vars;
 /// [`crate::call_descr::EffectInfoSlot`]).  Callers that have a
 /// resolved `JitCallTarget` thread the slot through
 /// `make_call_descr_from_target_slot` so the recorded descr carries
-/// the right `EffectInfo` instead of the `DEFAULT_EFFECT_INFO`
+/// the right `EffectInfo` instead of the `default_effect_info()`
 /// fallback.  The default ([`EffectInfoSlot::CanRaise`]) preserves the
 /// pre-G-2 behaviour for every existing construction site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2701,7 +2701,7 @@ impl<'c> Lowerer<'c> {
                             __builder.residual_call_void_canonical_via_target_with_effect_info(
                                 __fn_idx,
                                 __typed_args,
-                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                majit_metainterp::cannot_raise_effect_info(),
                             );
                         }
                     } else {
@@ -2880,9 +2880,9 @@ impl<'c> Lowerer<'c> {
                 }
                 // `call.py:303 getcalldescr` non-elidable EF_CANNOT_RAISE
                 // for int residuals.  Dispatches via the
-                // `_with_effect_info(CANNOT_RAISE_EFFECT_INFO)` builder
+                // `_with_effect_info(cannot_raise_effect_info())` builder
                 // method so the recorded calldescr's `EffectInfo`
-                // matches PyPy's `CANNOT_RAISE_EFFECT_INFO`.
+                // matches PyPy's `cannot_raise_effect_info()`.
                 crate::jit_interp::CallPolicyKind::ResidualIntCannotRaise => {
                     let throwaway_reg = self.alloc_reg();
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
@@ -2900,7 +2900,7 @@ impl<'c> Lowerer<'c> {
                                 __fn_idx,
                                 #typed_args,
                                 #throwaway_reg,
-                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                majit_metainterp::cannot_raise_effect_info(),
                             );
                         },
                     );
@@ -2964,7 +2964,7 @@ impl<'c> Lowerer<'c> {
                             __builder.residual_call_void_canonical_via_target_with_effect_info(
                                 __fn_idx,
                                 #typed_args,
-                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                majit_metainterp::cannot_raise_effect_info(),
                             );
                         }
                     } else {
@@ -3102,7 +3102,7 @@ impl<'c> Lowerer<'c> {
                                     __fn_idx,
                                     #typed_args,
                                     #throwaway_reg,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                         }
@@ -3134,7 +3134,7 @@ impl<'c> Lowerer<'c> {
                                     __fn_idx,
                                     #typed_args,
                                     #throwaway_reg,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                         }
@@ -3163,7 +3163,7 @@ impl<'c> Lowerer<'c> {
                                     __fn_idx,
                                     #typed_args,
                                     #throwaway_reg,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                         }
@@ -3249,7 +3249,7 @@ impl<'c> Lowerer<'c> {
                                 __builder.residual_call_void_canonical_via_target_with_effect_info(
                                     __fn_idx,
                                     #typed_args,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                             #VOID_MAY_FORCE => {
@@ -4615,7 +4615,7 @@ impl<'c> Lowerer<'c> {
                                 __fn_idx,
                                 #typed_args,
                                 #reg,
-                                majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                majit_metainterp::cannot_raise_effect_info(),
                             );
                         },
                     );
@@ -4690,7 +4690,7 @@ impl<'c> Lowerer<'c> {
                                     __fn_idx,
                                     #typed_args,
                                     #reg,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                         }
@@ -4724,7 +4724,7 @@ impl<'c> Lowerer<'c> {
                                     __fn_idx,
                                     #typed_args,
                                     #reg,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                         }
@@ -4760,7 +4760,7 @@ impl<'c> Lowerer<'c> {
                                     __fn_idx,
                                     #typed_args,
                                     #reg,
-                                    majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                    majit_metainterp::cannot_raise_effect_info(),
                                 );
                             }
                         }
@@ -4940,7 +4940,7 @@ impl<'c> Lowerer<'c> {
                                         __fn_idx,
                                         #typed_args,
                                         #reg,
-                                        majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                        majit_metainterp::cannot_raise_effect_info(),
                                     );
                                 }
                                 #INT_ELIDABLE => {
@@ -5033,7 +5033,7 @@ impl<'c> Lowerer<'c> {
                                         __fn_idx,
                                         #typed_args,
                                         #reg,
-                                        majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+                                        majit_metainterp::cannot_raise_effect_info(),
                                     );
                                 }
                                 #INT_ELIDABLE => {

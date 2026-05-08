@@ -1199,7 +1199,22 @@ impl DynasmBackend {
         trace_id: u64,
         fail_index: u32,
     ) -> Option<Arc<DynasmFailDescr>> {
-        let compiled = Self::get_compiled(token);
+        // Query-style miss tolerance: when `token.compiled` is absent
+        // (e.g. a freshly issued JitCellToken whose backend code has
+        // not been attached, or one rotated into `previous_tokens`),
+        // probing callers like `compiled_bridge_descr_arc` /
+        // `compiled_bridge_fail_descr_layouts` must observe `None`
+        // instead of a panic. Cranelift's counterpart at
+        // `compiler.rs:13955-13958` (`token.compiled.as_ref().and_then
+        // (|c| c.downcast_ref::<CompiledLoop>())?`) follows the same
+        // contract; pyre's `bridge_source_descr`
+        // (`pyjitpl/mod.rs:7743-7757`) walks `compiled.token` then
+        // each `previous_tokens[*]`, depending on `None` to advance.
+        let compiled = token
+            .compiled
+            .as_ref()?
+            .downcast_ref::<CompiledCode>()
+            .expect("compiled data is not CompiledCode");
         // RPython looks up the faildescr by object identity (the resume
         // descr stored on the guard op IS what `cpu.get_latest_descr()`
         // returns).  Pyre's lookup is `(trace_id, fail_index)`-keyed; the

@@ -1,3 +1,4 @@
+pub mod bitstring;
 pub mod descr;
 pub mod effectinfo;
 pub mod op_type_index;

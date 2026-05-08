@@ -4515,7 +4515,7 @@ mod tests {
     fn residual_effect(extraeffect: majit_ir::descr::ExtraEffect) -> majit_ir::descr::EffectInfo {
         majit_ir::descr::EffectInfo {
             extraeffect,
-            ..crate::call_descr::DEFAULT_EFFECT_INFO
+            ..crate::call_descr::default_effect_info()
         }
     }
 

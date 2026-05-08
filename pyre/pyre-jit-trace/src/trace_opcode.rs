@@ -7,7 +7,7 @@ use crate::state::*;
 
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{
-    CANNOT_RAISE_NO_HEAP_EFFECT_INFO, DEFAULT_EFFECT_INFO, TraceAction, TraceCtx,
+    CANNOT_RAISE_NO_HEAP_EFFECT_INFO, TraceAction, TraceCtx, default_effect_info,
 };
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
@@ -277,7 +277,7 @@ fn emit_call_assembler_callee_frame(
             helper,
             &helper_args,
             &helper_arg_types,
-            DEFAULT_EFFECT_INFO,
+            default_effect_info(),
         );
         return Ok((frame, true));
     }
@@ -294,7 +294,7 @@ fn emit_call_assembler_callee_frame(
             frame_helper,
             &helper_args,
             &helper_arg_types,
-            DEFAULT_EFFECT_INFO,
+            default_effect_info(),
         );
         return Ok((frame, true));
     }
@@ -5383,14 +5383,14 @@ impl MIFrame {
                             helper,
                             &[this.frame(), args[0]],
                             &helper_arg_types,
-                            DEFAULT_EFFECT_INFO,
+                            default_effect_info(),
                         )
                     } else {
                         ctx.call_ref_typed_with_effect(
                             helper,
                             &[this.frame(), callable, args[0]],
                             &helper_arg_types,
-                            DEFAULT_EFFECT_INFO,
+                            default_effect_info(),
                         )
                     }
                 } else if let Some(frame_helper) =
@@ -5403,7 +5403,7 @@ impl MIFrame {
                         frame_helper,
                         &helper_args,
                         &helper_arg_types,
-                        DEFAULT_EFFECT_INFO,
+                        default_effect_info(),
                     )
                 } else {
                     panic!("no frame helper for {} args", args.len());
@@ -5686,7 +5686,7 @@ impl MIFrame {
                     frame_helper,
                     &helper_args,
                     &helper_arg_types,
-                    DEFAULT_EFFECT_INFO,
+                    default_effect_info(),
                 );
                 let force_fn = crate::callbacks::get().jit_force_callee_frame;
                 // pyjitpl.py:2017: do_residual_call step 1
@@ -7138,7 +7138,7 @@ impl OpcodeStepExecutor for MIFrame {
                     normalize_raise_varargs_jit as *const (),
                     &[this.frame(), exc_val.opref, cause_opref],
                     &[Type::Ref, Type::Ref, Type::Ref],
-                    DEFAULT_EFFECT_INFO,
+                    default_effect_info(),
                 )
             })
         };

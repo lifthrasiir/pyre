@@ -1085,6 +1085,7 @@ fn ensure_pc_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
     joinpoints: &mut HashMap<usize, Vec<SpamBlockRef>>,
+    current_block: &SpamBlockRef,
     current_state: &FrameState,
     py_pc: usize,
 ) -> SpamBlockRef {
@@ -1113,6 +1114,23 @@ fn ensure_pc_block(
         .cloned()
     {
         return block;
+    }
+
+    // RPython parity: `flowcontext.py` keeps the current block across
+    // sequential opcodes — a SpamBlock spans every PC between two
+    // joinpoint candidates.  Without this, every sequential
+    // `emit_mark_label_pc!` after the first opcode would synthesise an
+    // orphan block (no predecessor link from `current_block`), which
+    // disconnects the graph CFG from `startblock` and starves
+    // `flatten_graph_with_lowering` of operations.  Register the
+    // existing `current_block` at `py_pc` so the walker keeps emitting
+    // into the same block instead of forking on every byte boundary.
+    if !current_block.dead() {
+        joinpoints
+            .entry(py_pc)
+            .or_default()
+            .insert(0, current_block.clone());
+        return current_block.clone();
     }
 
     let block = SpamBlockRef::new(graph.new_block(Vec::new()), None);
@@ -2667,6 +2685,14 @@ impl CodeWriter {
         arg_kinds: Vec<Kind>,
         result_kind: Option<Kind>,
     ) -> majit_ir::DescrRef {
+        // `descr.py:665` keys `get_call_descr` on
+        // `(arg_classes, result_type, result_signed, RESULT_ERASED, extrainfo)`
+        // and `descr.py:670-674` writes `result_type` onto the constructed
+        // CallDescr. Pyre mirrors the redundancy: the cache key carries
+        // `result_kind` AND the stored stub carries it too, so the
+        // assembler can cross-validate the descr's `result_kind` against
+        // the opname-tail-derived `ResKind` at dispatch time
+        // (`assembler.rs:1370`).
         let key = (effect_info, arg_kinds, result_kind);
         let mut cache = self.call_descr_stub_cache.lock().unwrap();
         let arc = cache.entry(key.clone()).or_insert_with(|| {
@@ -3613,7 +3639,14 @@ impl CodeWriter {
                         &mut pendingblocks,
                     )
                 } else {
-                    ensure_pc_block(code, &mut graph, &mut joinpoints, &current_state, py_pc)
+                    ensure_pc_block(
+                        code,
+                        &mut graph,
+                        &mut joinpoints,
+                        &current_block,
+                        &current_state,
+                        py_pc,
+                    )
                 };
                 if let Some(fallthrough_case) = pending_bool_fallthrough_case.take() {
                     set_last_bool_exitcase(&current_block.block(), fallthrough_case);
@@ -4695,11 +4728,19 @@ impl CodeWriter {
                                 stack_base + current_depth,
                             ),
                         );
-                        // Task #46 micro-slice 7: graph-side residual_call
-                        // dual-write — box_int_fn(val:Int) → Ref produces
-                        // shape residual_call_ir_r.
-                        if is_portal {
-                            let _ = record_residual_call_graph_op(
+                        // Graph-side `residual_call_ir_r` for
+                        // `box_int_fn(val:Int) → Ref`.  RPython parity:
+                        // `flowcontext.py:135-139 self.recorder.append`
+                        // produces a fresh result Variable for every
+                        // residual_call, and the consumer (here, the
+                        // value-stack push) reads that Variable directly
+                        // — no separate fresh Ref placeholder.  Thread
+                        // the call result Variable into the symbolic
+                        // stack so the def-use chain matches the
+                        // upstream "call result is the downstream value"
+                        // shape.
+                        let boxed = if is_portal {
+                            record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 box_int_fn_idx,
@@ -4710,26 +4751,14 @@ impl CodeWriter {
                                 vec![Kind::Int],
                                 ResKind::Ref,
                                 py_pc as i64,
-                            );
-                        }
-                        // Push a Ref-typed Variable onto the symbolic
-                        // stack — Python value-stack slots all hold
-                        // boxed `PyObjectRef` at runtime, mirroring
-                        // RPython's post-rtyper invariant where `box_int`
-                        // (`rtyper/lltypesystem/rtagged.py:32`,
-                        // `rtyper/rmodel.py:181`) wraps the int constant
-                        // into a Ref-typed Variable.  PRE-EXISTING-
-                        // ADAPTATION: pyre lacks the rtyper layer so the
-                        // fresh Variable has no defining op in the graph
-                        // (the boxing is realised by the inline
-                        // `box_int_fn_idx` residual_call above, not a
-                        // graph op).  The dangling Variable is treated
-                        // as live-on-entry by `make_dependencies`
-                        // (`regalloc.rs:78-86`); runtime register holds
-                        // the boxed Ref written by the residual_call.
-                        // Convergence: rtyper-equivalent `box_int_const`
-                        // graph op (Task #229 TmpVarEnv epic).
-                        current_state.stack.push(fresh_ref_value(&mut graph));
+                            )
+                        } else {
+                            None
+                        };
+                        let stack_value = boxed
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        current_state.stack.push(stack_value);
                         current_depth += 1;
                         emit_vsd!(current_depth);
                     }
@@ -4780,14 +4809,41 @@ impl CodeWriter {
                                 dst_slot,
                             ),
                         );
-                        // Task #46 micro-slice 6: graph-side residual_call
-                        // dual-write for load_const_fn(pycode:Ref, idx:Int)
-                        // → Ref.  Threads the pycode Variable produced by
-                        // emit_vable_getfield_ref!'s graph dual-write so
-                        // the def-use chain on the graph side stays
-                        // consistent.  Shape: residual_call_ir_r.
-                        if let Some(pycode_var) = pycode_graph_var {
-                            let _ = record_residual_call_graph_op(
+                        // Graph-side `residual_call_ir_r` for
+                        // `load_const_fn(pycode:Ref, idx:Int) → Ref`.
+                        // RPython `flowcontext.py:135-139` keeps the
+                        // residual_call result as the consumer's input
+                        // (no separate fresh placeholder); the call is
+                        // recorded only when the symbolic stack is
+                        // about to consume its result Variable.
+                        // `frontend_constant_flow_value` recognises a
+                        // small set of constants (e.g. `None`) directly
+                        // as Ref-kind FlowValues — for those, the
+                        // upstream optimizer does not record a
+                        // residual_call at all (jtransform.py inlines
+                        // the constant), so skip the graph dual-write
+                        // to avoid an orphan call result.
+                        let raw_value = code
+                            .constants
+                            .get(idx)
+                            .and_then(frontend_constant_flow_value);
+                        let recognised_ref = match &raw_value {
+                            Some(super::flow::FlowValue::Constant(c))
+                                if c.kind == Some(Kind::Ref) =>
+                            {
+                                Some(super::flow::FlowValue::Constant(c.clone()))
+                            }
+                            Some(super::flow::FlowValue::Variable(v))
+                                if v.kind == Some(Kind::Ref) =>
+                            {
+                                Some(super::flow::FlowValue::Variable(v.clone()))
+                            }
+                            _ => None,
+                        };
+                        let value = if let Some(constant_value) = recognised_ref {
+                            constant_value
+                        } else if let Some(pycode_var) = pycode_graph_var {
+                            record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 load_const_fn_idx,
@@ -4798,38 +4854,12 @@ impl CodeWriter {
                                 vec![Kind::Ref, Kind::Int],
                                 ResKind::Ref,
                                 py_pc as i64,
-                            );
-                        }
-                        // Symbolic stack must hold a Ref-typed value
-                        // (Python value-stack slots are all boxed
-                        // `PyObjectRef`).  `frontend_constant_flow_value`
-                        // returns the un-boxed semantic constant — Ref
-                        // for `None` (`Constant::none()`), Int for
-                        // `Integer`/`Boolean`, no-kind for `Str`.  Only
-                        // the `None` case matches the post-rtyper
-                        // invariant; for the rest push a fresh Ref
-                        // Variable representing the boxed form (the
-                        // boxing is realised by the inline
-                        // `load_const_fn_idx` residual_call above, not
-                        // a graph op).  Same PRE-EXISTING-ADAPTATION as
-                        // `LoadSmallInt`'s push above — see that arm
-                        // for the rtyper-equivalent convergence note.
-                        let raw_value = code
-                            .constants
-                            .get(idx)
-                            .and_then(frontend_constant_flow_value);
-                        let value = match raw_value {
-                            Some(super::flow::FlowValue::Constant(c))
-                                if c.kind == Some(Kind::Ref) =>
-                            {
-                                super::flow::FlowValue::Constant(c)
-                            }
-                            Some(super::flow::FlowValue::Variable(v))
-                                if v.kind == Some(Kind::Ref) =>
-                            {
-                                super::flow::FlowValue::Variable(v)
-                            }
-                            _ => fresh_ref_value(&mut graph),
+                            )
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph))
+                        } else {
+                            // is_portal=false: no graph dual-write at all.
+                            fresh_ref_value(&mut graph)
                         };
                         current_state.stack.push(value);
                         current_depth += 1;
@@ -5393,10 +5423,8 @@ impl CodeWriter {
                         // `pushvalue(w_value)` — there is NO
                         // `SpaceOperation('load_global', ...)` at the graph
                         // level. Pyre cannot fold runtime globals at compile
-                        // time, so the shadow stack just receives an unknown
-                        // Ref FlowValue; the runtime load happens via the
-                        // residual helper emitted below.
-                        let result_value = fresh_ref_value(&mut graph);
+                        // time, so the shadow stack receives the runtime
+                        // residual_call's result Variable (bound below).
                         let scratch_ns = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         // jtransform.py: getfield_vable_r for w_globals (field 3)
@@ -5446,15 +5474,20 @@ impl CodeWriter {
                         // come from the preceding emit_vable_getfield_ref!
                         // graph dual-writes — thread them so def-use stays
                         // intact.  Shape: residual_call_ir_r.
-                        if let (Some(ns_var), Some(code_var)) = (ns_graph_var, code_graph_var) {
-                            // Match helper bind-site flavor at
-                            // codewriter.rs:2186 (`load_global_fn`
-                            // is `EF_CAN_RAISE`, not virtual-forcing)
-                            // — graph dual-write must agree with the
-                            // SSA helper so any future
-                            // `flatten_graph(graph, regallocs)`
-                            // migration sees a single classification.
-                            let _ = record_residual_call_graph_op(
+                        // Match helper bind-site flavor at
+                        // codewriter.rs:2186 (`load_global_fn`
+                        // is `EF_CAN_RAISE`, not virtual-forcing)
+                        // — graph dual-write must agree with the
+                        // SSA helper so any future
+                        // `flatten_graph(graph, regallocs)`
+                        // migration sees a single classification.
+                        // RPython `flowcontext.py:135-139` keeps the
+                        // residual_call result as the consumer's input
+                        // (no separate fresh placeholder).
+                        let loaded = if let (Some(ns_var), Some(code_var)) =
+                            (ns_graph_var, code_graph_var)
+                        {
+                            record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 load_global_fn_idx,
@@ -5465,8 +5498,13 @@ impl CodeWriter {
                                 vec![Kind::Ref, Kind::Ref, Kind::Int],
                                 ResKind::Ref,
                                 py_pc as i64,
-                            );
-                        }
+                            )
+                        } else {
+                            None
+                        };
+                        let result_value = loaded
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
                         // const-source pushvalue writes the constant directly to
                         // the stack TOS register and (in portal case) to the
@@ -6493,11 +6531,17 @@ impl CodeWriter {
                         site.lasti_py_pc as i64,
                         exc_slot,
                     ));
-                // Task #46 micro-slice 7: graph dual-write of the lasti
-                // box.  Shape residual_call_ir_r (kinds=ir, reskind=r);
-                // pure const arg ConstInt(lasti_py_pc).
+                // Graph-side `residual_call_ir_r` for
+                // `box_int_fn(lasti:Int) → Ref` followed by the
+                // matching `setarrayitem_vable_r(frame, lasti_depth,
+                // boxed_lasti)` — the call result Variable feeds the
+                // vable-array write so the def-use chain matches the
+                // upstream "call result is the consumer's input" shape
+                // (`flowcontext.py:135-139` recorder pattern,
+                // `jtransform.py:1898 do_fixed_list_setitem` for the
+                // array write).
                 if is_portal {
-                    let _ = record_residual_call_graph_op(
+                    let boxed_lasti = record_residual_call_graph_op(
                         &mut graph,
                         &current_block.block(),
                         box_int_fn_idx,
@@ -6509,6 +6553,28 @@ impl CodeWriter {
                         ResKind::Ref,
                         -1,
                     );
+                    if let Some(boxed_var) = boxed_lasti {
+                        let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
+                        let v_lasti_idx = emit_graph_op_with_result(
+                            &mut graph,
+                            &current_block.block(),
+                            "int_copy",
+                            vec![super::flow::Constant::signed(lasti_depth_value).into()],
+                            Kind::Int,
+                            -1,
+                        );
+                        record_graph_op(
+                            &current_block.block(),
+                            "setarrayitem_vable_r",
+                            vable_setarrayitem_ref_graph_args(
+                                frame_var.into(),
+                                v_lasti_idx.into(),
+                                boxed_var.into(),
+                            ),
+                            None,
+                            -1,
+                        );
+                    }
                     let scratch_lasti_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                     emit_load_const_i!(
                         ssarepr,
@@ -7571,6 +7637,15 @@ impl CodeWriter {
             report_driver_family("COMPARE_OP", "residual_call_ir_r", compare_fn_idx);
             report_driver_family("BOOL", "residual_call_r_i", truth_fn_idx);
             report_driver_family("SETITEM", "residual_call_r_v", store_subscr_fn_idx);
+            // Slice #48.20 dual-stream extension: LoadGlobal / LoadConst /
+            // LoadSmallInt + exception-lasti record their `residual_call_ir_r`
+            // SpaceOperations directly (no pre-rtype HLOp). They flow through
+            // the dispatcher's passthrough fallback, so a `sequence_match=true`
+            // here proves the `flatten_op_to_insn` lowering reproduces the
+            // inline emit byte-for-byte for these families too.
+            report_driver_family("LOAD_GLOBAL", "residual_call_ir_r", load_global_fn_idx);
+            report_driver_family("LOAD_CONST", "residual_call_ir_r", load_const_fn_idx);
+            report_driver_family("BOX_INT", "residual_call_ir_r", box_int_fn_idx);
 
             // Slice #48.19 (Option C pipeline-flip prep):
             // `[phase4-flatten-graph]` probe.  Runs the FULL
@@ -7707,6 +7782,12 @@ impl CodeWriter {
                     report_graph_family("COMPARE_OP", "residual_call_ir_r", compare_fn_idx);
                     report_graph_family("BOOL", "residual_call_r_i", truth_fn_idx);
                     report_graph_family("SETITEM", "residual_call_r_v", store_subscr_fn_idx);
+                    // Slice #48.20 dual-stream extension: see matching block
+                    // above the `flatten_graph_with_lowering` invocation for
+                    // the rationale.
+                    report_graph_family("LOAD_GLOBAL", "residual_call_ir_r", load_global_fn_idx);
+                    report_graph_family("LOAD_CONST", "residual_call_ir_r", load_const_fn_idx);
+                    report_graph_family("BOX_INT", "residual_call_ir_r", box_int_fn_idx);
                 }
             }
         }

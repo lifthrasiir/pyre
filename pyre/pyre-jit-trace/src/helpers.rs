@@ -5,7 +5,7 @@
 //! correct calling convention and integer-based parameter passing.
 
 use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, OpCode, OpRef, Type, Value};
-use majit_metainterp::{DEFAULT_EFFECT_INFO, TraceCtx};
+use majit_metainterp::{TraceCtx, default_effect_info};
 
 use pyre_interpreter::{
     PyBigInt, PyError, binary_op_tag, compare_op_tag, jit_range_iter_next_or_null,
@@ -56,17 +56,17 @@ pub fn emit_trace_call_int_typed(
     // plumbing — pyre-jit-trace helpers live outside the codewriter
     // pipeline so the analyzer's per-callee EI never reaches this
     // emit site. Until per-helper EI registration lands (Task #64),
-    // fall back to the conservative `DEFAULT_EFFECT_INFO`
+    // fall back to the conservative `default_effect_info()`
     // (≡ `effectinfo.MOST_GENERAL` for unanalyzed callees: CanRaise +
     // all-writes-set bitmasks).
-    ctx.call_int_typed_with_effect(helper, args, arg_types, DEFAULT_EFFECT_INFO)
+    ctx.call_int_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
 /// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr,
 /// exc=False, pure=True)` parity for direct trace emit paths.
 ///
 /// `emit_trace_call_int_typed` calls into the tracer with
-/// `DEFAULT_EFFECT_INFO` (`effectinfo.MOST_GENERAL`, CanRaise +
+/// `default_effect_info()` (`effectinfo.MOST_GENERAL`, CanRaise +
 /// all-writes-set), so even an `#[elidable_cannot_raise]` callee is
 /// recorded as a plain `CallI`.  This wrapper threads an explicit
 /// `ElidableCannotRaise` `EffectInfo` through
@@ -110,7 +110,7 @@ pub fn emit_trace_call_ref_typed(
     arg_types: &[Type],
 ) -> OpRef {
     // See emit_trace_call_int_typed for the plumbing-gap rationale.
-    ctx.call_ref_typed_with_effect(helper, args, arg_types, DEFAULT_EFFECT_INFO)
+    ctx.call_ref_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
 pub fn emit_trace_call_void(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) {
@@ -155,7 +155,7 @@ pub fn emit_trace_build_flat(
         )));
     };
     let arg_types = vec![Type::Ref; items.len()];
-    Ok(ctx.call_ref_typed_with_effect(helper, items, &arg_types, DEFAULT_EFFECT_INFO))
+    Ok(ctx.call_ref_typed_with_effect(helper, items, &arg_types, default_effect_info()))
 }
 
 pub fn emit_trace_call_callable(
@@ -184,7 +184,7 @@ pub fn emit_trace_call_known_builtin(
     call_args.extend_from_slice(args);
     let mut arg_types = vec![Type::Ref];
     arg_types.extend(std::iter::repeat_n(Type::Ref, args.len()));
-    Ok(ctx.call_ref_typed_with_effect(helper, &call_args, &arg_types, DEFAULT_EFFECT_INFO))
+    Ok(ctx.call_ref_typed_with_effect(helper, &call_args, &arg_types, default_effect_info()))
 }
 
 pub fn emit_trace_call_known_function(
@@ -738,7 +738,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
 // invokes the helper through `TraceCtx::call_typed_with_effect_pure`
 // with an explicit `ElidableCannotRaise` `EffectInfo`.  Production
 // `emit_trace_call_int_typed` callsites still pass
-// `DEFAULT_EFFECT_INFO` until per-helper EI registration (Task #64)
+// `default_effect_info()` until per-helper EI registration (Task #64)
 // lands; this canary closes the macro-side gap so the EI side can
 // proceed in a separate slice.
 #[majit_macros::elidable_cannot_raise]

@@ -1367,24 +1367,23 @@ fn dispatch_residual_call(
         other => panic!("residual_call: unknown reskind {other:?}"),
     };
 
-    // Parity check: `CallDescrStub::result_kind` is part of the stub's
-    // cache key (rewrite.rs codegen-side cache, mirroring RPython
-    // `rpython/jit/backend/llsupport/descr.py:665` where `result_type`
-    // belongs to `getCallDescr`'s key).  The opname suffix's `reskind`
-    // must agree with `stub.result_kind`; a mismatch means a producer
-    // wrote a bogus stub or a wrong opname, which would otherwise route
-    // through this function silently and corrupt the JitCallArg flat
-    // layout.  Fail loud rather than swallow the divergence.
-    let stub_reskind = match stub.result_kind {
-        Some(Kind::Int) => ResKind::Int,
-        Some(Kind::Ref) => ResKind::Ref,
-        Some(Kind::Float) => ResKind::Float,
-        None => ResKind::Void,
-    };
+    // `descr.py:665 getCallDescr` keys on `result_type` AND `descr.py:670-674`
+    // stores it on the constructed `CallDescr`; the dispatcher reads
+    // `descr.result_type` and the opname suffix as a redundant pair
+    // that MUST agree per `descr.create_call_stub` round-trip. Pyre
+    // mirrors that invariant: the opname tail decodes to `reskind`,
+    // `CallDescrStub.result_kind` carries the descr-side answer, and
+    // they cross-validate here. Use `assert_eq!` (not
+    // `debug_assert_eq!`) so the invariant survives release builds —
+    // RPython's invariants are runtime-enforced, and a silent release
+    // bypass would let a producer's bad opname/result_kind pair reach
+    // the dispatch branch undetected.
     assert_eq!(
-        reskind, stub_reskind,
-        "residual_call({opname}): opname-derived reskind {reskind:?} disagrees with \
-         CallDescrStub::result_kind {stub_reskind:?}; producer must keep them aligned"
+        stub.result_kind,
+        reskind.to_kind(),
+        "residual_call: descr result_kind {:?} disagrees with opname-tail reskind {:?}",
+        stub.result_kind,
+        reskind,
     );
 
     // Slice 3 of the EffectInfo wire-up epic: derive the dispatch branch

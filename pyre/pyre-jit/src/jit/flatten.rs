@@ -409,15 +409,13 @@ pub struct CallDescrStub {
     /// equals the sum of the int/ref/float `ListOfKind` sublists for the
     /// same residual_call Insn.
     pub arg_kinds: Vec<Kind>,
-    /// Result kind for the residual_call.  `Some(Kind::Int / Ref / Float)`
-    /// for the typed-result `residual_call_*_{i,r,f}` opnames; `None`
-    /// for the void-result `residual_call_*_v` form.  RPython parity
-    /// with `backend/llsupport/descr.py:14 GcCache._cache_call` key
-    /// `(arg_classes, result_type, result_signed, RESULT_ERASED,
-    /// extrainfo)`'s `result_type` slot.  pyre's `Kind::Ref` = gcref
-    /// equivalent so `RESULT_ERASED` collapses to "is Ref"; pyre's
-    /// `Kind::Int` carries no signed/unsigned distinction so
-    /// `result_signed` is implicitly `true` for Int results.
+    /// `descr.py:665` carries `result_type` on both the cache key and
+    /// the constructed `CallDescr`. Pyre mirrors that redundancy so
+    /// `dispatch_residual_call` (`assembler.rs:1370`) can cross-check
+    /// the descr-side answer against the opname-tail-derived `ResKind`
+    /// it would have computed independently — RPython's invariant is
+    /// that the two MUST agree per `descr.create_call_stub` /
+    /// `descr.result_type` round-trip in `descr.py:670-674`.
     pub result_kind: Option<Kind>,
 }
 
@@ -436,7 +434,7 @@ impl Descr for CallDescrStub {
     fn repr(&self) -> String {
         format!(
             "CallDescrStub(ei={:?}, kinds={:?}, result={:?})",
-            self.effect_info.extraeffect, self.arg_kinds, self.result_kind
+            self.effect_info.extraeffect, self.arg_kinds, self.result_kind,
         )
     }
 }
@@ -627,7 +625,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
         // EF_CAN_RAISE — default normal call (`effectinfo.py:22`).
-        // Mirror `majit-metainterp/src/call_descr.rs::DEFAULT_EFFECT_INFO`
+        // Mirror `majit-metainterp/src/call_descr.rs::default_effect_info()`
         // (the conservative "all read/write descrs touched" fallback used
         // when the producer has no analyzer output).  `EffectInfo::default()`
         // alone leaves the descr bitsets at zero, which makes
@@ -637,12 +635,12 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // the upstream constructor; the analyzer port is a separate epic.
         CallFlavor::Plain => EffectInfo {
             extraeffect: ExtraEffect::CanRaise,
-            readonly_descrs_fields: u64::MAX,
-            write_descrs_fields: u64::MAX,
-            readonly_descrs_arrays: u64::MAX,
-            write_descrs_arrays: u64::MAX,
-            readonly_descrs_interiorfields: u64::MAX,
-            write_descrs_interiorfields: u64::MAX,
+            readonly_descrs_fields: Some(vec![0xff; 8]),
+            write_descrs_fields: Some(vec![0xff; 8]),
+            readonly_descrs_arrays: Some(vec![0xff; 8]),
+            write_descrs_arrays: Some(vec![0xff; 8]),
+            readonly_descrs_interiorfields: Some(vec![0xff; 8]),
+            write_descrs_interiorfields: Some(vec![0xff; 8]),
             ..EffectInfo::default()
         },
         // EF_CANNOT_RAISE — `call.py:303 getcalldescr`'s `else` branch
@@ -655,14 +653,14 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // as `Plain` — pyre's analyzer port (Task #64) is the upstream
         // replacement; producers select this flavor today only when the
         // callee is statically known not to raise.
-        CallFlavor::PlainCannotRaise => majit_metainterp::CANNOT_RAISE_EFFECT_INFO,
+        CallFlavor::PlainCannotRaise => majit_metainterp::cannot_raise_effect_info(),
         // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `effectinfo.py:23`.
         // `optimize_CALL_MAY_FORCE_*` branch.
         //
         // PRE-EXISTING-ADAPTATION (Slice γ): saturate the
         // `read/write_descrs_*` bitsets to `u64::MAX`, matching the
-        // `Plain` / `CANNOT_RAISE_EFFECT_INFO` analyzer-absent
-        // fallback (`call_descr.rs:175-207 DEFAULT_EFFECT_INFO`).
+        // `Plain` / `cannot_raise_effect_info()` analyzer-absent
+        // fallback (`call_descr.rs:175-207 default_effect_info()`).
         // RPython's `effectinfo.py:172-177` only clears
         // `_write_descrs_*` for elidable / loopinvariant extraeffects;
         // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` keeps the analyzer's
@@ -674,12 +672,12 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // a NEW-DEVIATION the reviewer flagged as #4.
         CallFlavor::MayForce => EffectInfo {
             extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
-            readonly_descrs_fields: u64::MAX,
-            write_descrs_fields: u64::MAX,
-            readonly_descrs_arrays: u64::MAX,
-            write_descrs_arrays: u64::MAX,
-            readonly_descrs_interiorfields: u64::MAX,
-            write_descrs_interiorfields: u64::MAX,
+            readonly_descrs_fields: Some(vec![0xff; 8]),
+            write_descrs_fields: Some(vec![0xff; 8]),
+            readonly_descrs_arrays: Some(vec![0xff; 8]),
+            write_descrs_arrays: Some(vec![0xff; 8]),
+            readonly_descrs_interiorfields: Some(vec![0xff; 8]),
+            write_descrs_interiorfields: Some(vec![0xff; 8]),
             ..EffectInfo::default()
         },
         // EF_LOOPINVARIANT — `effectinfo.py:18`.
@@ -757,21 +755,19 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
             // arraycopy / arraymove fast-paths for traces whose
             // release-gil descr came from this producer.
             can_invalidate: true,
-            // PRE-EXISTING-ADAPTATION (Slice γ): RPython
-            // `effectinfo.py:149-155` keeps `readonly_descrs_*` and
-            // `write_descrs_*` as `None` for `EF_RANDOM_EFFECTS`
-            // (the optimizer reads `None` as "any descr touched").
-            // Pyre's `EffectInfo` uses bare `u64`, so the
-            // semantically-equivalent representation is `u64::MAX` —
-            // `force_from_effectinfo` (`heap.rs:712`) iterates per
-            // descr index and flushes every bit-set entry, matching
-            // upstream's "anything is touched" guarantee.
-            readonly_descrs_fields: u64::MAX,
-            write_descrs_fields: u64::MAX,
-            readonly_descrs_arrays: u64::MAX,
-            write_descrs_arrays: u64::MAX,
-            readonly_descrs_interiorfields: u64::MAX,
-            write_descrs_interiorfields: u64::MAX,
+            // RPython `effectinfo.py:149-155` + `compute_bitstrings`
+            // line 488-489 keep the bitstrings as `None` for
+            // `EF_RANDOM_EFFECTS`; the optimizer's `has_random_effects()`
+            // gate (heap.py:460 / heap.rs:2602) routes RandomEffects
+            // calls through `clean_caches` instead of
+            // `force_from_effectinfo`, so `check_*_descr_*` is never
+            // queried on the wildcard.
+            readonly_descrs_fields: None,
+            write_descrs_fields: None,
+            readonly_descrs_arrays: None,
+            write_descrs_arrays: None,
+            readonly_descrs_interiorfields: None,
+            write_descrs_interiorfields: None,
             call_release_gil_target: (1, 0),
             ..EffectInfo::default()
         },
@@ -2868,11 +2864,9 @@ pub fn build_compare_op_residual_call_ir_r_insn(
 /// `(Ref, Ref, Int) → Ref` arity as BINARY_OP/COMPARE_OP — only the
 /// CallFlavor on the EffectInfo descr differs.
 ///
-/// Note: the prior graph dual-write at codewriter.rs:5622-5635
-/// hardcodes `CallFlavor::MayForce` (a pre-existing parity
-/// discrepancy with the bind site `Plain` at codewriter.rs:2184).
-/// This slice does not touch the dual-write and the asymmetry
-/// persists; aligning the dual-write flavor is a separate concern.
+/// The matching graph dual-write at codewriter.rs (LoadGlobal arm)
+/// records `CallFlavor::Plain` so the SSA helper, the inline
+/// SSARepr emit, and the graph residual_call agree end-to-end.
 pub fn build_load_global_fn_residual_call_ir_r_insn(
     load_global_fn_idx: u16,
     namei: i64,
@@ -3684,7 +3678,6 @@ mod tests {
                 DescrOperand::CallDescrStub(stub) => {
                     assert_eq!(stub.effect_info, ei);
                     assert_eq!(stub.arg_kinds, kinds);
-                    assert_eq!(stub.result_kind, Some(Kind::Float));
                 }
                 other => panic!("expected DescrOperand::CallDescrStub, got {other:?}"),
             },

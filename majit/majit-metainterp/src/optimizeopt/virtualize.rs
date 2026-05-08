@@ -3055,7 +3055,7 @@ mod tests {
         // production `MetaCallDescr` defaulted to `EF_CANNOT_RAISE`
         // with empty bitsets, so `force_from_effectinfo` saw "no
         // tracked field read or written" and skipped the flush. With
-        // `DEFAULT_EFFECT_INFO` flipped to `EF_CAN_RAISE` + all-ones
+        // `default_effect_info()` flipped to `EF_CAN_RAISE` + all-ones
         // bitsets the per-cached-field flush runs and `setfield_gc`
         // survives in front of the call.
         let sd = size_descr(2);

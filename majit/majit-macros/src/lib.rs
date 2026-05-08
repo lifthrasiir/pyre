@@ -336,7 +336,7 @@ fn helper_policy_tokens_for_fn(
             // `call.py:303 getcalldescr`'s non-elidable `else` branch —
             // EF_CANNOT_RAISE for void-return helpers.  Same dispatch
             // surface as `dont_look_inside` (residual call), but the
-            // recording walker uses `CANNOT_RAISE_EFFECT_INFO` so no
+            // recording walker uses `cannot_raise_effect_info()` so no
             // trailing `-live-` is required.
             "dont_look_inside_cannot_raise" => quote! {
                 (#VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null())
@@ -813,7 +813,7 @@ pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable `else`
 /// branch), so the recording walker skips the trailing `-live-` marker
 /// and the produced calldescr's `EffectInfo` matches PyPy's
-/// `CANNOT_RAISE_EFFECT_INFO`.
+/// `cannot_raise_effect_info()`.
 ///
 /// Use when `#[dont_look_inside]` is parity-conservative: the function
 /// is opaque to the tracer (RPython annotation analysis would mark it

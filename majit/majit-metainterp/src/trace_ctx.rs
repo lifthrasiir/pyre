@@ -3977,12 +3977,14 @@ impl TraceCtx {
         // so `realfuncaddr` IS `func_ptr` and `saveerr=0`.  Populating
         // the field at the call site keeps the descr's IR carrying the
         // real `(realfuncaddr, saveerr)` pair just like upstream's
-        // `effectinfo.call_release_gil_target`.
+        // `effectinfo.call_release_gil_target`. effectinfo.py:149-155
+        // requires every readonly/write descr set be `None` for
+        // `EF_RANDOM_EFFECTS`; spread MOST_GENERAL instead of
+        // `EffectInfo::default()` whose `Some(Vec::new())` bitstrings
+        // would silently misrepresent the wildcard.
         let effect_info = majit_ir::EffectInfo {
-            extraeffect: majit_ir::ExtraEffect::RandomEffects,
-            can_invalidate: true,
             call_release_gil_target: (func_ptr as usize as u64, 0),
-            ..majit_ir::EffectInfo::default()
+            ..majit_ir::EffectInfo::MOST_GENERAL
         };
         self.record_release_gil_typed_with_effect(
             OpCode::call_release_gil_for_type(Type::Int),
@@ -4000,11 +4002,13 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
+        // effectinfo.py:149-155: `EF_RANDOM_EFFECTS` keeps every
+        // readonly/write descr set as `None`; spread MOST_GENERAL for
+        // the wildcard rather than `EffectInfo::default()`'s
+        // `Some(Vec::new())` bitstrings.
         let effect_info = majit_ir::EffectInfo {
-            extraeffect: majit_ir::ExtraEffect::RandomEffects,
-            can_invalidate: true,
             call_release_gil_target: (func_ptr as usize as u64, 0),
-            ..majit_ir::EffectInfo::default()
+            ..majit_ir::EffectInfo::MOST_GENERAL
         };
         self.record_release_gil_typed_with_effect(
             OpCode::call_release_gil_for_type(Type::Float),

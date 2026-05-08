@@ -61,20 +61,20 @@ pub fn consider_array(_array_name: &str) -> bool {
 pub struct EffectInfo {
     pub extraeffect: ExtraEffect,
     pub oopspecindex: OopSpecIndex,
-    /// effectinfo.py: bitstring_readonly_descrs_fields
-    pub readonly_descrs_fields: u64,
-    /// effectinfo.py: bitstring_write_descrs_fields
-    pub write_descrs_fields: u64,
-    /// effectinfo.py: bitstring_readonly_descrs_arrays
-    pub readonly_descrs_arrays: u64,
-    /// effectinfo.py: bitstring_write_descrs_arrays
-    pub write_descrs_arrays: u64,
-    /// effectinfo.py: bitstring_readonly_descrs_interiorfields
-    /// Bitset of interior field descriptor indices that may be read.
+    /// effectinfo.py:185 bitstring_readonly_descrs_fields. `None` = wildcard
+    /// (effectinfo.py:488-489 sets the bitstring to `None` for `EF_RANDOM_EFFECTS`).
+    pub readonly_descrs_fields: Option<Vec<u8>>,
+    /// effectinfo.py:188 bitstring_write_descrs_fields.
+    pub write_descrs_fields: Option<Vec<u8>>,
+    /// effectinfo.py:186 bitstring_readonly_descrs_arrays.
+    pub readonly_descrs_arrays: Option<Vec<u8>>,
+    /// effectinfo.py:189 bitstring_write_descrs_arrays.
+    pub write_descrs_arrays: Option<Vec<u8>>,
+    /// effectinfo.py:187 bitstring_readonly_descrs_interiorfields.
     /// effectinfo.py:327-340: interiorfield reads also set array read bits.
-    pub readonly_descrs_interiorfields: u64,
-    /// effectinfo.py: bitstring_write_descrs_interiorfields
-    pub write_descrs_interiorfields: u64,
+    pub readonly_descrs_interiorfields: Option<Vec<u8>>,
+    /// effectinfo.py:190 bitstring_write_descrs_interiorfields.
+    pub write_descrs_interiorfields: Option<Vec<u8>>,
     /// effectinfo.py: can_invalidate
     pub can_invalidate: bool,
     /// effectinfo.py:194: can_collect — whether this call can trigger GC collection.
@@ -136,12 +136,15 @@ impl Default for EffectInfo {
         EffectInfo {
             extraeffect: ExtraEffect::CanRaise,
             oopspecindex: OopSpecIndex::None,
-            readonly_descrs_fields: 0,
-            write_descrs_fields: 0,
-            readonly_descrs_arrays: 0,
-            write_descrs_arrays: 0,
-            readonly_descrs_interiorfields: 0,
-            write_descrs_interiorfields: 0,
+            // effectinfo.py:175-181: empty frozenset for elidable, but `__new__`
+            // requires a non-None value for non-RandomEffects EIs. Empty Vec
+            // is the bitstring equivalent (no descrs touched).
+            readonly_descrs_fields: Some(Vec::new()),
+            write_descrs_fields: Some(Vec::new()),
+            readonly_descrs_arrays: Some(Vec::new()),
+            write_descrs_arrays: Some(Vec::new()),
+            readonly_descrs_interiorfields: Some(Vec::new()),
+            write_descrs_interiorfields: Some(Vec::new()),
             single_write_descr_array: None,
             extradescrs: None,
             // RPython effectinfo.py:125: can_collect=True default
@@ -314,16 +317,20 @@ impl EffectInfo {
     }
 
     /// Const-compatible constructor for static initialization.
+    ///
+    /// Empty bitstrings (`Some(Vec::new())`) match `effectinfo.py:175-181`
+    /// for elidable EIs whose `_write_descrs_*` collapse to `frozenset()`,
+    /// later compiled to a zero-length bitstring by `compute_bitstrings`.
     pub const fn const_new(extraeffect: ExtraEffect, oopspecindex: OopSpecIndex) -> Self {
         EffectInfo {
             extraeffect,
             oopspecindex,
-            readonly_descrs_fields: 0,
-            write_descrs_fields: 0,
-            readonly_descrs_arrays: 0,
-            write_descrs_arrays: 0,
-            readonly_descrs_interiorfields: 0,
-            write_descrs_interiorfields: 0,
+            readonly_descrs_fields: Some(Vec::new()),
+            write_descrs_fields: Some(Vec::new()),
+            readonly_descrs_arrays: Some(Vec::new()),
+            write_descrs_arrays: Some(Vec::new()),
+            readonly_descrs_interiorfields: Some(Vec::new()),
+            write_descrs_interiorfields: Some(Vec::new()),
             single_write_descr_array: None,
             extradescrs: None,
             can_invalidate: false,
@@ -366,21 +373,19 @@ impl EffectInfo {
     /// effectinfo.py:271-273: MOST_GENERAL
     /// `EffectInfo(None, None, None, None, None, None, EF_RANDOM_EFFECTS, can_invalidate=True)`.
     ///
-    /// RPython encodes the `descrs=None` arguments as "any descr can
-    /// be touched" — `effectinfo.py:149-155` keeps the bitsets as
-    /// `None` for `EF_RANDOM_EFFECTS` and the consumer reads `None`
-    /// as a wildcard.  Pyre's bare-`u64` bitset has no `None` slot,
-    /// so the parity-equivalent representation is `u64::MAX`
-    /// (`force_from_effectinfo` flushes every bit-set descr index).
+    /// `effectinfo.py:149-155` + `compute_bitstrings` line 488-489 keep
+    /// the bitstrings as `None` for `EF_RANDOM_EFFECTS`; the optimizer's
+    /// `has_random_effects()` guard (heap.py:460 / heap.rs:2602) prevents
+    /// `check_*_descr_*` from being called on the wildcard.
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
         oopspecindex: OopSpecIndex::None,
-        readonly_descrs_fields: u64::MAX,
-        write_descrs_fields: u64::MAX,
-        readonly_descrs_arrays: u64::MAX,
-        write_descrs_arrays: u64::MAX,
-        readonly_descrs_interiorfields: u64::MAX,
-        write_descrs_interiorfields: u64::MAX,
+        readonly_descrs_fields: None,
+        write_descrs_fields: None,
+        readonly_descrs_arrays: None,
+        write_descrs_arrays: None,
+        readonly_descrs_interiorfields: None,
+        write_descrs_interiorfields: None,
         single_write_descr_array: None,
         extradescrs: None,
         can_invalidate: true,
@@ -400,43 +405,73 @@ impl EffectInfo {
     // gate via `has_random_effects()` first (heap.py:460) so the
     // `None`-bitstring case is never queried.
     //
-    // Pyre `MOST_GENERAL` (line 356) populates every bitset with
-    // `u64::MAX` so the bitcheck reports every descr_idx < 64 as
-    // touched, matching the wildcard contract for the bounded index
-    // range pyre supports today.  The optimizer caller
-    // (`heap.rs:2589 call_has_random_effects`) gates the same way as
-    // PyPy, so `descr_idx >= 64` is unreachable in practice — the bare
-    // bitcheck is sufficient parity, no `random_effects()`
-    // short-circuit needed.
+    // Pyre `MOST_GENERAL` (line 380) populates every bitset with `None`,
+    // matching `effectinfo.py:271-273 MOST_GENERAL`.  The optimizer
+    // caller (`heap.rs:2589 call_has_random_effects`) gates the same
+    // way as PyPy, so the `None`-bitstring case must never be queried;
+    // the helpers below `expect()` the bitstring rather than silently
+    // returning `false`, mirroring `bitstring.bitcheck(None, ...)`'s
+    // RPython fail-fast (`TypeError: object of type 'NoneType' has no
+    // len()`).
 
     /// effectinfo.py:211-213: check_readonly_descr_field(fielddescr)
     pub fn check_readonly_descr_field(&self, descr_idx: u32) -> bool {
-        descr_idx < 64 && (self.readonly_descrs_fields & (1u64 << descr_idx)) != 0
+        crate::bitstring::bitcheck(
+            self.readonly_descrs_fields
+                .as_deref()
+                .expect("check_readonly_descr_field on EF_RANDOM_EFFECTS — caller must gate via has_random_effects()"),
+            descr_idx,
+        )
     }
 
     /// effectinfo.py:214-216: check_write_descr_field(fielddescr)
     pub fn check_write_descr_field(&self, descr_idx: u32) -> bool {
-        descr_idx < 64 && (self.write_descrs_fields & (1u64 << descr_idx)) != 0
+        crate::bitstring::bitcheck(
+            self.write_descrs_fields
+                .as_deref()
+                .expect("check_write_descr_field on EF_RANDOM_EFFECTS — caller must gate via has_random_effects()"),
+            descr_idx,
+        )
     }
 
     /// effectinfo.py:217-219: check_readonly_descr_array(arraydescr)
     pub fn check_readonly_descr_array(&self, descr_idx: u32) -> bool {
-        descr_idx < 64 && (self.readonly_descrs_arrays & (1u64 << descr_idx)) != 0
+        crate::bitstring::bitcheck(
+            self.readonly_descrs_arrays
+                .as_deref()
+                .expect("check_readonly_descr_array on EF_RANDOM_EFFECTS — caller must gate via has_random_effects()"),
+            descr_idx,
+        )
     }
 
     /// effectinfo.py:220-222: check_write_descr_array(arraydescr)
     pub fn check_write_descr_array(&self, descr_idx: u32) -> bool {
-        descr_idx < 64 && (self.write_descrs_arrays & (1u64 << descr_idx)) != 0
+        crate::bitstring::bitcheck(
+            self.write_descrs_arrays
+                .as_deref()
+                .expect("check_write_descr_array on EF_RANDOM_EFFECTS — caller must gate via has_random_effects()"),
+            descr_idx,
+        )
     }
 
     /// effectinfo.py:223-226: check_readonly_descr_interiorfield (NOTE: not used so far)
     pub fn check_readonly_descr_interiorfield(&self, descr_idx: u32) -> bool {
-        descr_idx < 64 && (self.readonly_descrs_interiorfields & (1u64 << descr_idx)) != 0
+        crate::bitstring::bitcheck(
+            self.readonly_descrs_interiorfields
+                .as_deref()
+                .expect("check_readonly_descr_interiorfield on EF_RANDOM_EFFECTS — caller must gate via has_random_effects()"),
+            descr_idx,
+        )
     }
 
     /// effectinfo.py:227-230: check_write_descr_interiorfield (NOTE: not used so far)
     pub fn check_write_descr_interiorfield(&self, descr_idx: u32) -> bool {
-        descr_idx < 64 && (self.write_descrs_interiorfields & (1u64 << descr_idx)) != 0
+        crate::bitstring::bitcheck(
+            self.write_descrs_interiorfields
+                .as_deref()
+                .expect("check_write_descr_interiorfield on EF_RANDOM_EFFECTS — caller must gate via has_random_effects()"),
+            descr_idx,
+        )
     }
 
     /// effectinfo.py:201-206: set single_write_descr_array.
@@ -450,9 +485,15 @@ impl EffectInfo {
     }
 
     /// effectinfo.py:201-206: auto-set single_write_descr_array.
+    ///
+    /// RPython sets this when `_write_descrs_arrays` has exactly one
+    /// element. Pyre's bitstring counterpart counts the set bits.
     pub fn set_single_write_descr_array(&mut self, descr: DescrRef) {
-        let w = self.write_descrs_arrays;
-        if w != 0 && w.is_power_of_two() {
+        let count: u32 = match &self.write_descrs_arrays {
+            Some(bs) => bs.iter().map(|b| b.count_ones()).sum(),
+            None => 0,
+        };
+        if count == 1 {
             self.single_write_descr_array = Some(descr);
         }
     }

@@ -242,7 +242,7 @@ fn dont_look_inside_cannot_raise_emits_dedicated_policy_bytes() {
     // Item 4-5 fix: `#[dont_look_inside_cannot_raise]` opt-in maps to
     // distinct policy bytes per result kind so the inferred slot lookup
     // (`jitcode_lower.rs:1711` via `byte 28u8|29u8|30u8 -> CannotRaise`)
-    // can produce `CANNOT_RAISE_EFFECT_INFO` calldescrs and skip the
+    // can produce `cannot_raise_effect_info()` calldescrs and skip the
     // trailing `-live-` marker that the audit cited as parity-divergent
     // for `dont_look_inside` ref helpers.
     let (ref_policy, _, ref_trace_target, ref_concrete_target, _) =

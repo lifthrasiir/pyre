@@ -3240,15 +3240,16 @@ fn effectinfo_from_writeanalyze(
 ) -> EffectInfo {
     // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
+        // effectinfo.py:286-292: every readonly/write descr is `None` (wildcard).
         return EffectInfo {
             extraeffect: ExtraEffect::RandomEffects,
             oopspecindex,
-            readonly_descrs_fields: !0, // all bits set = top_set (None in RPython)
-            write_descrs_fields: !0,
-            readonly_descrs_arrays: !0,
-            write_descrs_arrays: !0,
-            readonly_descrs_interiorfields: !0,
-            write_descrs_interiorfields: !0,
+            readonly_descrs_fields: None,
+            write_descrs_fields: None,
+            readonly_descrs_arrays: None,
+            write_descrs_arrays: None,
+            readonly_descrs_interiorfields: None,
+            write_descrs_interiorfields: None,
             single_write_descr_array: None,
             extradescrs: None,
             can_invalidate,
@@ -3300,18 +3301,30 @@ fn effectinfo_from_writeanalyze(
     EffectInfo {
         extraeffect,
         oopspecindex,
-        readonly_descrs_fields,
-        write_descrs_fields,
-        readonly_descrs_arrays,
-        write_descrs_arrays,
-        readonly_descrs_interiorfields,
-        write_descrs_interiorfields,
+        readonly_descrs_fields: Some(u64_to_bitstring(readonly_descrs_fields)),
+        write_descrs_fields: Some(u64_to_bitstring(write_descrs_fields)),
+        readonly_descrs_arrays: Some(u64_to_bitstring(readonly_descrs_arrays)),
+        write_descrs_arrays: Some(u64_to_bitstring(write_descrs_arrays)),
+        readonly_descrs_interiorfields: Some(u64_to_bitstring(readonly_descrs_interiorfields)),
+        write_descrs_interiorfields: Some(u64_to_bitstring(write_descrs_interiorfields)),
         single_write_descr_array,
         extradescrs: None,
         can_invalidate,
         can_collect,
         call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
     }
+}
+
+/// Translate a `WriteAnalysis` u64 accumulator (bit `n` set ↔ descr index
+/// `n` touched) into the `bitstring.py:3-13` byte representation that
+/// `EffectInfo.bitstring_*` consumers expect.
+fn u64_to_bitstring(mask: u64) -> Vec<u8> {
+    let bytes = mask.to_le_bytes();
+    let mut len = bytes.len();
+    while len > 0 && bytes[len - 1] == 0 {
+        len -= 1;
+    }
+    bytes[..len].to_vec()
 }
 
 /// RPython: `op.args[0].concretetype` — resolve full ARRAY identity.

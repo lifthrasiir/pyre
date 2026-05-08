@@ -1436,17 +1436,17 @@ impl OptHeap {
     /// do NOT escape arguments.
     fn mark_escaped_varargs(&mut self, op: &Op, ctx: &mut OptContext) {
         let oopspec = Self::get_oopspecindex(op);
-        // heapcache.py:275: single_write_descr_array is not None.
-        // RPython: exactly one array write descriptor is known.
-        // Bitstring: is_power_of_two means exactly one bit set.
+        // heapcache.py:272: `descr.get_extra_info().single_write_descr_array
+        // is not None`. The check predicates on the dedicated
+        // `single_write_descr_array` field, NOT on the `bitstring_write*`
+        // bit-count — `effectinfo.py:201-206 set_single_write_descr_array`
+        // populates the field in addition to flipping the array bit, and
+        // heapcache reads back the field directly.
         let has_single_write_descr = op
             .descr
             .as_ref()
             .and_then(|d| d.as_call_descr())
-            .map(|cd| {
-                let w = cd.get_extra_info().write_descrs_arrays;
-                w != 0 && w.is_power_of_two()
-            })
+            .map(|cd| cd.get_extra_info().single_write_descr_array.is_some())
             .unwrap_or(false);
         if oopspec == OopSpecIndex::Arraycopy
             && has_single_write_descr
@@ -3294,7 +3294,7 @@ mod tests {
 
     use majit_ir::{
         CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, FieldDescr, OopSpecIndex, Op, OpCode,
-        OpRef, SizeDescr, Type,
+        OpRef, SizeDescr, Type, bitstring,
     };
 
     use crate::optimizeopt::info::PtrInfo;
@@ -3567,9 +3567,13 @@ mod tests {
             false,
             0,
             EffectInfo {
-                // Write all fields/arrays so invalidation is triggered
-                write_descrs_fields: u64::MAX,
-                write_descrs_arrays: u64::MAX,
+                // Write all fields/arrays so invalidation is triggered.
+                // `effectinfo.py:185-190` represents the read/write sets
+                // as bytestring bitstrings (`bitstring.py:make_bitstring`),
+                // so an "all bits set" sentinel for an unknown universe
+                // is a fully-saturated 8-byte run.
+                write_descrs_fields: Some(vec![0xff; 8]),
+                write_descrs_arrays: Some(vec![0xff; 8]),
                 ..EffectInfo::default()
             },
         ))
@@ -5109,7 +5113,7 @@ mod tests {
             70,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
-                write_descrs_fields: 1u64 << 1,
+                write_descrs_fields: Some(bitstring::make_bitstring(&[1])),
                 ..Default::default()
             },
         );
@@ -5139,7 +5143,7 @@ mod tests {
             71,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
-                write_descrs_fields: 1u64 << 0,
+                write_descrs_fields: Some(bitstring::make_bitstring(&[0])),
                 ..Default::default()
             },
         );
@@ -5199,7 +5203,7 @@ mod tests {
             73,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
-                write_descrs_arrays: 1u64 << 1,
+                write_descrs_arrays: Some(bitstring::make_bitstring(&[1])),
                 ..Default::default()
             },
         );
@@ -5262,7 +5266,7 @@ mod tests {
             74,
             EffectInfo {
                 extraeffect: ExtraEffect::CanRaise,
-                write_descrs_arrays: 1u64 << 0,
+                write_descrs_arrays: Some(bitstring::make_bitstring(&[0])),
                 ..Default::default()
             },
         );

@@ -942,13 +942,15 @@ pub fn generated_binary_int_value(
     // `GUARD_NO_EXCEPTION` for this call, so these guards are the
     // only barrier between a re-used trace and an unsafe
     // `bhimpl_int_floordiv` / `bhimpl_int_mod` invocation: the
-    // zero divisor would silently return `0` (Rust safety default),
-    // and `INT_MIN / -1` would wrap to `INT_MIN` via `wrapping_div`
-    // (helper) instead of routing to PyPy's `ovf2long` long-fallback
-    // (`intobject.py:491`). Negative operands generally are valid —
-    // PyPy `intobject.py:316/341` accepts them and the helper's
-    // no-branch correction handles every sign combination — so no
-    // sign-only guard is emitted here beyond the overflow corner.
+    // helpers are now `wrapping_div` / `wrapping_rem` precondition
+    // wrappers (`blackhole.rs:5785/5802`), so a zero divisor is
+    // undefined behaviour in release and panics in debug, and
+    // `INT_MIN / -1` wraps to `INT_MIN` instead of routing to PyPy's
+    // `ovf2long` long-fallback (`intobject.py:491`). Negative
+    // operands generally are valid — PyPy `intobject.py:316/341`
+    // accepts them and the helper's no-branch correction handles
+    // every sign combination — so no sign-only guard is emitted
+    // here beyond the overflow corner.
     if matches!(op_code, OpCode::IntFloorDiv | OpCode::IntMod) {
         let zero_const = ctx.const_int(0);
         let rhs_zero = ctx.record_op(OpCode::IntEq, &[rhs_raw, zero_const]);
@@ -1143,7 +1145,7 @@ pub fn generated_binary_float_value(
             crate::trace_opcode::float_pow_jit as *const (),
             &[lhs_raw, rhs_raw],
             &[majit_ir::Type::Float, majit_ir::Type::Float],
-            majit_metainterp::DEFAULT_EFFECT_INFO,
+            majit_metainterp::default_effect_info(),
         );
         // pyjitpl.py:3395 GUARD_NO_EXCEPTION from handle_possible_exception.
         frame.generate_guard(ctx, OpCode::GuardNoException, &[]);

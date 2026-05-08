@@ -21,12 +21,12 @@ struct MetaCallDescr {
 struct EffectInfoKey {
     extraeffect: ExtraEffect,
     oopspecindex: OopSpecIndex,
-    readonly_descrs_fields: u64,
-    write_descrs_fields: u64,
-    readonly_descrs_arrays: u64,
-    write_descrs_arrays: u64,
-    readonly_descrs_interiorfields: u64,
-    write_descrs_interiorfields: u64,
+    readonly_descrs_fields: Option<Vec<u8>>,
+    write_descrs_fields: Option<Vec<u8>>,
+    readonly_descrs_arrays: Option<Vec<u8>>,
+    write_descrs_arrays: Option<Vec<u8>>,
+    readonly_descrs_interiorfields: Option<Vec<u8>>,
+    write_descrs_interiorfields: Option<Vec<u8>>,
     can_invalidate: bool,
     can_collect: bool,
     call_release_gil_target: (u64, i32),
@@ -37,12 +37,12 @@ impl EffectInfoKey {
         Self {
             extraeffect: effect_info.extraeffect,
             oopspecindex: effect_info.oopspecindex,
-            readonly_descrs_fields: effect_info.readonly_descrs_fields,
-            write_descrs_fields: effect_info.write_descrs_fields,
-            readonly_descrs_arrays: effect_info.readonly_descrs_arrays,
-            write_descrs_arrays: effect_info.write_descrs_arrays,
-            readonly_descrs_interiorfields: effect_info.readonly_descrs_interiorfields,
-            write_descrs_interiorfields: effect_info.write_descrs_interiorfields,
+            readonly_descrs_fields: effect_info.readonly_descrs_fields.clone(),
+            write_descrs_fields: effect_info.write_descrs_fields.clone(),
+            readonly_descrs_arrays: effect_info.readonly_descrs_arrays.clone(),
+            write_descrs_arrays: effect_info.write_descrs_arrays.clone(),
+            readonly_descrs_interiorfields: effect_info.readonly_descrs_interiorfields.clone(),
+            write_descrs_interiorfields: effect_info.write_descrs_interiorfields.clone(),
             can_invalidate: effect_info.can_invalidate,
             can_collect: effect_info.can_collect,
             call_release_gil_target: effect_info.call_release_gil_target,
@@ -179,32 +179,33 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 ///    correctness no-op for helpers that never raise but still bloats
 ///    the trace.
 ///
-/// `EF_CAN_RAISE` with all-ones field/array bitsets (`u64::MAX`)
-/// is the parity-equivalent middle ground: `force_from_effectinfo`
-/// (heap.py:540-560) iterates per cached descr index and sees both
-/// readonly and write bits set, so every cached lazy_set / field
-/// gets flushed exactly the same way as the conservative branch —
-/// without resetting `seen_guard_not_invalidated` or routing through
-/// `clean_caches`. The bitsets cap at u64 (descr_idx < 64 in
-/// `effectinfo.rs`); descr indices ≥ 64 still slip through, the same
-/// blind spot upstream papered over with frozenset bitstrings before
-/// the bitstring rewrite. PRE-EXISTING-ADAPTATION: the bitset width
-/// upgrade is a separate slice from the EffectInfo port.
-pub const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
-    extraeffect: ExtraEffect::CanRaise,
-    oopspecindex: OopSpecIndex::None,
-    readonly_descrs_fields: u64::MAX,
-    write_descrs_fields: u64::MAX,
-    readonly_descrs_arrays: u64::MAX,
-    write_descrs_arrays: u64::MAX,
-    readonly_descrs_interiorfields: u64::MAX,
-    write_descrs_interiorfields: u64::MAX,
-    can_invalidate: false,
-    can_collect: true,
-    single_write_descr_array: None,
-    extradescrs: None,
-    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
-};
+/// `EF_CAN_RAISE` with all-ones field/array bitsets is the parity-
+/// equivalent middle ground: `force_from_effectinfo` (heap.py:540-560)
+/// iterates per cached descr index and sees both readonly and write
+/// bits set, so every cached lazy_set / field gets flushed exactly the
+/// same way as the conservative branch — without resetting
+/// `seen_guard_not_invalidated` or routing through `clean_caches`.
+/// The bitsets are 8 bytes wide; descr indices ≥ 64 still slip through,
+/// the same blind spot upstream papered over with frozenset bitstrings
+/// before the bitstring rewrite. PRE-EXISTING-ADAPTATION: the analyzer
+/// port replaces this fallback with per-callee `EffectInfo`.
+pub fn default_effect_info() -> EffectInfo {
+    EffectInfo {
+        extraeffect: ExtraEffect::CanRaise,
+        oopspecindex: OopSpecIndex::None,
+        readonly_descrs_fields: Some(vec![0xff; 8]),
+        write_descrs_fields: Some(vec![0xff; 8]),
+        readonly_descrs_arrays: Some(vec![0xff; 8]),
+        write_descrs_arrays: Some(vec![0xff; 8]),
+        readonly_descrs_interiorfields: Some(vec![0xff; 8]),
+        write_descrs_interiorfields: Some(vec![0xff; 8]),
+        can_invalidate: false,
+        can_collect: true,
+        single_write_descr_array: None,
+        extradescrs: None,
+        call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+    }
+}
 
 /// `EF_CANNOT_RAISE` (effectinfo.py:19). Selected by `call.py:303
 /// getcalldescr`'s `else` branch (non-elidable callee whose
@@ -214,32 +215,34 @@ pub const DEFAULT_EFFECT_INFO: EffectInfo = EffectInfo {
 /// trailing `GUARD_NO_EXCEPTION`.
 ///
 /// PRE-EXISTING-ADAPTATION: same `read/write_descrs_*` and `can_collect`
-/// saturation as [`DEFAULT_EFFECT_INFO`].  `call.py:320-324
+/// saturation as [`default_effect_info()`].  `call.py:320-324
 /// effectinfo_from_writeanalyze` builds those bitsets from the
 /// `readwrite_analyzer` and `collect_analyzer` results; pyre has no
 /// analyzers ported yet (Task #64), so a conservative full-bitset is
 /// the line-by-line equivalent of "no analyzer ran" — it preserves
 /// `force_from_effectinfo`'s per-cached-descr flush behaviour for
 /// callees that mutate heap state but never raise, matching the same
-/// fallback semantics `DEFAULT_EFFECT_INFO` uses for raising callees.
+/// fallback semantics `default_effect_info()` uses for raising callees.
 /// When the analyzers land, this constant becomes the no-callee-info
 /// default and producers thread per-callee `EffectInfo` values through
 /// `make_call_descr_with_effect`.
-pub const CANNOT_RAISE_EFFECT_INFO: EffectInfo = EffectInfo {
-    extraeffect: ExtraEffect::CannotRaise,
-    oopspecindex: OopSpecIndex::None,
-    readonly_descrs_fields: u64::MAX,
-    write_descrs_fields: u64::MAX,
-    readonly_descrs_arrays: u64::MAX,
-    write_descrs_arrays: u64::MAX,
-    readonly_descrs_interiorfields: u64::MAX,
-    write_descrs_interiorfields: u64::MAX,
-    can_invalidate: false,
-    can_collect: true,
-    single_write_descr_array: None,
-    extradescrs: None,
-    call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
-};
+pub fn cannot_raise_effect_info() -> EffectInfo {
+    EffectInfo {
+        extraeffect: ExtraEffect::CannotRaise,
+        oopspecindex: OopSpecIndex::None,
+        readonly_descrs_fields: Some(vec![0xff; 8]),
+        write_descrs_fields: Some(vec![0xff; 8]),
+        readonly_descrs_arrays: Some(vec![0xff; 8]),
+        write_descrs_arrays: Some(vec![0xff; 8]),
+        readonly_descrs_interiorfields: Some(vec![0xff; 8]),
+        write_descrs_interiorfields: Some(vec![0xff; 8]),
+        can_invalidate: false,
+        can_collect: true,
+        single_write_descr_array: None,
+        extradescrs: None,
+        call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+    }
+}
 
 /// `EF_CANNOT_RAISE` for a callee that the producer statically knows
 /// touches no heap state and cannot trigger GC — typically a flat TLS
@@ -247,19 +250,19 @@ pub const CANNOT_RAISE_EFFECT_INFO: EffectInfo = EffectInfo {
 /// effectinfo_from_writeanalyze` would compute empty
 /// `readonly_descrs_*` / `write_descrs_*` bitsets and `can_collect =
 /// False` from `read_analyzer` / `write_analyzer` / `collect_analyzer`
-/// for such helpers.  Using [`CANNOT_RAISE_EFFECT_INFO`] for them is
+/// for such helpers.  Using [`cannot_raise_effect_info()`] for them is
 /// the analyzer-absent conservative fallback, which over-reports the
 /// callee as a heap mutator and inflates GC map / liveness work; this
 /// constant is the matching analyzer-output for known-flat helpers.
 pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::CannotRaise,
     oopspecindex: OopSpecIndex::None,
-    readonly_descrs_fields: 0,
-    write_descrs_fields: 0,
-    readonly_descrs_arrays: 0,
-    write_descrs_arrays: 0,
-    readonly_descrs_interiorfields: 0,
-    write_descrs_interiorfields: 0,
+    readonly_descrs_fields: Some(Vec::new()),
+    write_descrs_fields: Some(Vec::new()),
+    readonly_descrs_arrays: Some(Vec::new()),
+    write_descrs_arrays: Some(Vec::new()),
+    readonly_descrs_interiorfields: Some(Vec::new()),
+    write_descrs_interiorfields: Some(Vec::new()),
     can_invalidate: false,
     can_collect: false,
     single_write_descr_array: None,
@@ -282,12 +285,12 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::IntPyDiv,
-    readonly_descrs_fields: 0,
-    write_descrs_fields: 0,
-    readonly_descrs_arrays: 0,
-    write_descrs_arrays: 0,
-    readonly_descrs_interiorfields: 0,
-    write_descrs_interiorfields: 0,
+    readonly_descrs_fields: Some(Vec::new()),
+    write_descrs_fields: Some(Vec::new()),
+    readonly_descrs_arrays: Some(Vec::new()),
+    write_descrs_arrays: Some(Vec::new()),
+    readonly_descrs_interiorfields: Some(Vec::new()),
+    write_descrs_interiorfields: Some(Vec::new()),
     can_invalidate: false,
     can_collect: false,
     single_write_descr_array: None,
@@ -303,12 +306,12 @@ pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
 pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
     oopspecindex: OopSpecIndex::IntPyMod,
-    readonly_descrs_fields: 0,
-    write_descrs_fields: 0,
-    readonly_descrs_arrays: 0,
-    write_descrs_arrays: 0,
-    readonly_descrs_interiorfields: 0,
-    write_descrs_interiorfields: 0,
+    readonly_descrs_fields: Some(Vec::new()),
+    write_descrs_fields: Some(Vec::new()),
+    readonly_descrs_arrays: Some(Vec::new()),
+    write_descrs_arrays: Some(Vec::new()),
+    readonly_descrs_interiorfields: Some(Vec::new()),
+    write_descrs_interiorfields: Some(Vec::new()),
     can_invalidate: false,
     can_collect: false,
     single_write_descr_array: None,
@@ -370,7 +373,7 @@ pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EffectInfoSlot {
     /// `EF_CAN_RAISE` — `call.py:301` `elif self._canraise(op)`.
-    /// Conservative analyzer-absent default; matches `DEFAULT_EFFECT_INFO`.
+    /// Conservative analyzer-absent default; matches `default_effect_info()`.
     #[default]
     CanRaise,
     /// `EF_CANNOT_RAISE` — `call.py:303` `else` branch.
@@ -393,8 +396,8 @@ pub enum EffectInfoSlot {
 /// const captures the analyzer-absent fallback for that `extraeffect`.
 pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
     match slot {
-        EffectInfoSlot::CanRaise => DEFAULT_EFFECT_INFO,
-        EffectInfoSlot::CannotRaise => CANNOT_RAISE_EFFECT_INFO,
+        EffectInfoSlot::CanRaise => default_effect_info(),
+        EffectInfoSlot::CannotRaise => cannot_raise_effect_info(),
         EffectInfoSlot::ElidableCanRaise => ELIDABLE_EFFECT_INFO,
         EffectInfoSlot::ElidableCannotRaise => ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
         EffectInfoSlot::ElidableOrMemerror => ELIDABLE_OR_MEMERROR_EFFECT_INFO,
@@ -416,12 +419,12 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
     } else if opcode.is_call_loopinvariant() {
         LOOPINVARIANT_EFFECT_INFO
     } else {
-        DEFAULT_EFFECT_INFO
+        default_effect_info()
     }
 }
 
 /// Create a CallDescr with the conservative
-/// [`DEFAULT_EFFECT_INFO`] (`EF_CAN_RAISE` + all-ones field/array
+/// [`default_effect_info()`] (`EF_CAN_RAISE` + all-ones field/array
 /// bitsets).  This is the analyzer-absent fallback that mirrors RPython's
 /// behaviour when `call.py:296-326 getcalldescr` runs against a callee
 /// graph that the readwrite/raise analyzers haven't visited yet.
@@ -443,7 +446,7 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
 /// where the conservative descr is the test's intent — matching the
 /// "no analyzer ran" path the production fallbacks above subsume.
 pub fn make_call_descr(arg_types: &[Type], result_type: Type) -> DescrRef {
-    make_call_descr_with_effect(arg_types, result_type, DEFAULT_EFFECT_INFO)
+    make_call_descr_with_effect(arg_types, result_type, default_effect_info())
 }
 
 /// Create a CallDescr whose effect info matches the call opcode family.

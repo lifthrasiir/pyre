@@ -1606,14 +1606,14 @@ impl JitCodeBuilder {
         // call analyzer result the conservative default writes/reads
         // every descr — RPython upgrades to bitstring sets but pyre's
         // u64 bitset defaults to `u64::MAX` per
-        // `crate::call_descr::DEFAULT_EFFECT_INFO`. Using
+        // `crate::call_descr::default_effect_info()`. Using
         // `EffectInfo::default()` here would carry empty bitsets through
         // the trace IR and let stale heapcache entries survive a side-
         // effecting helper call.
         self.residual_call_void_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
-            crate::call_descr::DEFAULT_EFFECT_INFO,
+            crate::call_descr::default_effect_info(),
         );
     }
 
@@ -1789,7 +1789,7 @@ impl JitCodeBuilder {
                 // "all writes" by `force_from_effectinfo`). Pyre's
                 // bitset model encodes that as `u64::MAX`.
                 extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..crate::call_descr::default_effect_info()
             },
             "call_may_force_void_canonical_via_target",
         );
@@ -1817,8 +1817,11 @@ impl JitCodeBuilder {
                 // `can_invalidate=true` so the heapcache `clear_caches`
                 // path fires (heapcache.py:343-353) instead of only
                 // the escape-based fallback.
-                extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
-                can_invalidate: true,
+                // effectinfo.py:149-155 keeps every readonly/write
+                // descr set None for `EF_RANDOM_EFFECTS`; spreading
+                // `..MOST_GENERAL` matches the wildcard contract
+                // instead of inheriting `default_effect_info()`'s
+                // `Some(vec![0xff; 8])` saturation.
                 // effectinfo.py:255-257 is_call_release_gil() needs a
                 // non-zero `tgt_func`. The actual C address is filled
                 // in by `resolve_call_release_gil_target` from the
@@ -1828,7 +1831,7 @@ impl JitCodeBuilder {
                 // via `bh_call_v_dispatch` with no errno save (Task
                 // #64 will wire real saveerr through the macro DSL).
                 call_release_gil_target: (1, 0),
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
             "call_release_gil_void_canonical_via_target",
         );
@@ -2021,7 +2024,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            crate::call_descr::DEFAULT_EFFECT_INFO,
+            crate::call_descr::default_effect_info(),
         );
     }
 
@@ -2062,7 +2065,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            crate::call_descr::DEFAULT_EFFECT_INFO,
+            crate::call_descr::default_effect_info(),
         );
     }
 
@@ -2173,7 +2176,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            crate::call_descr::DEFAULT_EFFECT_INFO,
+            crate::call_descr::default_effect_info(),
         );
     }
 
@@ -2237,7 +2240,7 @@ impl JitCodeBuilder {
             dst,
             majit_ir::descr::EffectInfo {
                 extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..crate::call_descr::default_effect_info()
             },
         );
     }
@@ -2259,10 +2262,12 @@ impl JitCodeBuilder {
             arg_regs,
             dst,
             majit_ir::descr::EffectInfo {
-                extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
-                can_invalidate: true,
+                // effectinfo.py:149-155: `EF_RANDOM_EFFECTS` keeps every
+                // readonly/write descr set as `None`; spread MOST_GENERAL
+                // for the wildcard rather than `default_effect_info()`'s
+                // saturated `Some(vec![0xff; 8])` bitstrings.
                 call_release_gil_target: (1, 0),
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
         );
     }
@@ -2306,7 +2311,7 @@ impl JitCodeBuilder {
             dst,
             majit_ir::descr::EffectInfo {
                 extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..crate::call_descr::default_effect_info()
             },
         );
     }
@@ -2348,7 +2353,7 @@ impl JitCodeBuilder {
             dst,
             majit_ir::descr::EffectInfo {
                 extraeffect: majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable,
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..crate::call_descr::default_effect_info()
             },
         );
     }
@@ -2366,10 +2371,12 @@ impl JitCodeBuilder {
             arg_regs,
             dst,
             majit_ir::descr::EffectInfo {
-                extraeffect: majit_ir::descr::ExtraEffect::RandomEffects,
-                can_invalidate: true,
+                // effectinfo.py:149-155: `EF_RANDOM_EFFECTS` keeps every
+                // readonly/write descr set as `None`; spread MOST_GENERAL
+                // for the wildcard rather than `default_effect_info()`'s
+                // saturated `Some(vec![0xff; 8])` bitstrings.
                 call_release_gil_target: (1, 0),
-                ..crate::call_descr::DEFAULT_EFFECT_INFO
+                ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
         );
     }
