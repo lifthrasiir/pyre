@@ -299,12 +299,13 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if idx < live_positions.len() && live_positions[idx] {
             continue;
         }
+        let key = OptContext::op_ref_for_value(idx as u32, value).raw();
         constants
-            .entry(idx as u32)
+            .entry(key)
             .or_insert_with(|| value_to_backend_constant_bits(value));
     }
     for (&const_idx, value) in &ctx.const_pool {
-        let key = OpRef::from_const(const_idx).raw();
+        let key = OptContext::const_ref_for_value(const_idx, value).raw();
         constants.insert(key, value_to_backend_constant_bits(value));
     }
 }
@@ -5097,7 +5098,7 @@ mod tests {
         ops[1].pos = OpRef::from_raw(67);
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::from_const(0).raw(), 472);
+        constants.insert(OpRef::const_int(0).raw(), 472);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: std::collections::HashSet<_> = result
@@ -5121,7 +5122,7 @@ mod tests {
             "SetfieldGc targets must remain emitted New refs; got {:?}",
             result
         );
-        assert_eq!(constants.get(&OpRef::from_const(0).raw()), Some(&472));
+        assert_eq!(constants.get(&OpRef::const_int(0).raw()), Some(&472));
         assert!(
             !constants.contains_key(&68),
             "live New position must not collide with constant map {:?}",
@@ -5475,7 +5476,7 @@ mod tests {
             OpCode::IntGe,
             &[OpRef::from_raw(3), OpRef::from_raw(10_000)],
         );
-        preamble_op.pos = OpRef::from_raw(14);
+        preamble_op.pos = OpRef::int_op(14);
         ctx.make_constant(OpRef::from_raw(10_000), majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::from_raw(0)],
@@ -5489,21 +5490,20 @@ mod tests {
             }],
         );
         ctx.potential_extra_ops.insert(
-            OpRef::from_raw(14),
+            OpRef::int_op(14),
             crate::optimizeopt::info::PreambleOp {
-                op: OpRef::from_raw(14),
+                op: OpRef::int_op(14),
                 invented_name: false,
                 preamble_op: {
-                    let mut op =
-                        majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::from_raw(14)]);
-                    op.pos = OpRef::from_raw(14);
+                    let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::int_op(14)]);
+                    op.pos = OpRef::int_op(14);
                     op
                 },
             },
         );
 
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(14)]);
-        guard.pos = OpRef::from_raw(15);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
+        guard.pos = OpRef::void_op(15);
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
@@ -5512,8 +5512,8 @@ mod tests {
         let sp = ctx
             .build_imported_short_preamble()
             .expect("forcing imported short guard arg should build short preamble");
-        assert_eq!(sp.used_boxes, vec![OpRef::from_raw(14)]);
-        assert_eq!(sp.jump_args, vec![OpRef::from_raw(14)]);
+        assert_eq!(sp.used_boxes, vec![OpRef::int_op(14)]);
+        assert_eq!(sp.jump_args, vec![OpRef::int_op(14)]);
     }
 
     #[test]

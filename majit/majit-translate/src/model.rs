@@ -1141,9 +1141,7 @@ impl FrameState {
 ///
 ///   1. Walk every reachable block.  For each operation, evaluate
 ///      `canremove(op, block)` per `simplify.py:435-436`:
-///
-///          op.opname in CanRemove and op is not block.raising_op
-///
+///      `op.opname in CanRemove and op is not block.raising_op`,
 ///      where `block.raising_op` is `block.operations[-1]` whenever
 ///      `block.canraise` (`flowspace/model.py:218-221`).  Pyre's
 ///      `Block::canraise()` mirrors the upstream

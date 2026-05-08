@@ -2337,7 +2337,7 @@ mod tests {
 
         let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
-        get.pos = OpRef::from_raw(10);
+        get.pos = OpRef::int_op(10);
 
         let result = pass.propagate_forward(&get, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2456,7 +2456,7 @@ mod tests {
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef::from_raw(10);
+        get_field.pos = OpRef::int_op(10);
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
@@ -2465,7 +2465,7 @@ mod tests {
 
         let mut get_item = Op::new(
             OpCode::GetarrayitemRawI,
-            &[OpRef::from_raw(10), OpRef::input_arg_int(1)],
+            &[OpRef::int_op(10), OpRef::input_arg_int(1)],
         );
         get_item.descr = Some(array_descr(24));
         let result = pass.propagate_forward(&get_item, &mut ctx);
@@ -2490,7 +2490,7 @@ mod tests {
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef::from_raw(10);
+        get_field.pos = OpRef::int_op(10);
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
@@ -2500,7 +2500,7 @@ mod tests {
         let mut set_item = Op::new(
             OpCode::SetarrayitemRaw,
             &[
-                OpRef::from_raw(10),
+                OpRef::int_op(10),
                 OpRef::input_arg_int(1),
                 OpRef::from_raw(2),
             ],
@@ -2530,7 +2530,7 @@ mod tests {
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef::from_raw(10);
+        get_field.pos = OpRef::int_op(10);
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
@@ -2539,7 +2539,7 @@ mod tests {
 
         let mut set_item = Op::new(
             OpCode::SetarrayitemRaw,
-            &[OpRef::from_raw(10), OpRef::from_raw(50), OpRef::from_raw(2)],
+            &[OpRef::int_op(10), OpRef::from_raw(50), OpRef::from_raw(2)],
         );
         set_item.descr = Some(array_descr(24));
         assert!(matches!(

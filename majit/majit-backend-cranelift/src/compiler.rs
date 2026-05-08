@@ -4068,14 +4068,14 @@ fn validate_oprefs_for_compile(
             if !bound {
                 if std::env::var_os("MAJIT_LOG").is_some() {
                     eprintln!(
-                        "[validate-oprefs] op[{}] {:?} dereferences undefined OpRef::from_raw({}) — InvalidLoop",
+                        "[validate-oprefs] op[{}] {:?} dereferences undefined OpRef::int_op({}) — InvalidLoop",
                         op_idx,
                         op.opcode,
                         arg.raw()
                     );
                 }
                 return Err(BackendError::CompilationFailed(format!(
-                    "InvalidLoop: op[{}] {:?} dereferences undefined OpRef::from_raw({})",
+                    "InvalidLoop: op[{}] {:?} dereferences undefined OpRef::int_op({})",
                     op_idx,
                     op.opcode,
                     arg.raw()
@@ -4402,11 +4402,13 @@ fn build_type_overrides(
     for (op_idx, op) in ops.iter().enumerate() {
         let result_type = op.result_type();
         if result_type != Type::Void {
-            // history.py:220 Box.type parity: an op's `.pos` is the typed
-            // OpRef the recorder assigned to its result. Use it directly
-            // — `inputarg_type` looks up by raw position so the variant
-            // tag is variant-blind, and an op without `.pos` (synthetic)
-            // can never collide with an inputarg slot anyway.
+            // history.py:220 Box.type parity. An op's `.pos` is the typed
+            // OpRef the recorder assigned (e.g. `IntOp(n)`); this loop
+            // detects the pyre-only flat-OpRef collision where an op's
+            // raw position matches a live inputarg slot. `inputarg_type`
+            // resolves by raw u32 (variant-blind) so a typed `IntOp(n)`
+            // still finds the inputarg at slot n. Synthetic ops without
+            // `.pos` cannot collide with an inputarg slot anyway.
             if op.pos.is_none() {
                 continue;
             }
@@ -14447,7 +14449,7 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut o = Op::new(opcode, args);
-        o.pos = OpRef::from_raw(pos);
+        o.pos = OpRef::op_typed(pos, opcode.result_type());
         o
     }
 
@@ -14474,7 +14476,7 @@ mod tests {
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {
         let mut o = Op::with_descr(opcode, args, descr);
-        o.pos = OpRef::from_raw(pos);
+        o.pos = OpRef::op_typed(pos, opcode.result_type());
         o
     }
 
@@ -14887,19 +14889,15 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(
-                OpCode::IntLt,
-                &[OpRef::from_raw(1), OpRef::from_raw(101)],
-                2,
-            ),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -14923,11 +14921,15 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1);
@@ -14945,12 +14947,12 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_ref(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_ref(1)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -14971,11 +14973,15 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(2);
@@ -14993,11 +14999,15 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntMul,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(3);
@@ -15015,15 +15025,15 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntFloorDiv,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(3);
@@ -15041,15 +15051,27 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntAnd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::IntOr, &[OpRef::from_raw(0), OpRef::from_raw(1)], 3),
-            mk_op(OpCode::IntXor, &[OpRef::from_raw(0), OpRef::from_raw(1)], 4),
+            mk_op(
+                OpCode::IntAnd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(
+                OpCode::IntOr,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                3,
+            ),
+            mk_op(
+                OpCode::IntXor,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                4,
+            ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(2), OpRef::from_raw(3), OpRef::from_raw(4)],
+                &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -15071,27 +15093,27 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntLshift,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(
                 OpCode::IntRshift,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 3,
             ),
             mk_op(
                 OpCode::UintRshift,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 4,
             ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(2), OpRef::from_raw(3), OpRef::from_raw(4)],
+                &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -15114,24 +15136,48 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntLt, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::IntLe, &[OpRef::from_raw(0), OpRef::from_raw(1)], 3),
-            mk_op(OpCode::IntEq, &[OpRef::from_raw(0), OpRef::from_raw(1)], 4),
-            mk_op(OpCode::IntNe, &[OpRef::from_raw(0), OpRef::from_raw(1)], 5),
-            mk_op(OpCode::IntGt, &[OpRef::from_raw(0), OpRef::from_raw(1)], 6),
-            mk_op(OpCode::IntGe, &[OpRef::from_raw(0), OpRef::from_raw(1)], 7),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(
+                OpCode::IntLe,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                3,
+            ),
+            mk_op(
+                OpCode::IntEq,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                4,
+            ),
+            mk_op(
+                OpCode::IntNe,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                5,
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                6,
+            ),
+            mk_op(
+                OpCode::IntGe,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                7,
+            ),
             mk_op(
                 OpCode::Finish,
                 &[
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(4),
-                    OpRef::from_raw(5),
-                    OpRef::from_raw(6),
-                    OpRef::from_raw(7),
+                    OpRef::int_op(2),
+                    OpRef::int_op(3),
+                    OpRef::int_op(4),
+                    OpRef::int_op(5),
+                    OpRef::int_op(6),
+                    OpRef::int_op(7),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -15155,19 +15201,19 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntEq,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(OpCode::GuardFalse, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardFalse, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 2,
             ),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -15197,10 +15243,18 @@ mod tests {
             InputArg::new_int(4),
         ];
         let ops = vec![
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 5),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                5,
+            ),
             mk_op(
                 OpCode::Jump,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -15215,8 +15269,12 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(8);
@@ -15233,19 +15291,27 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_int(0),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
                 OpRef::NONE.raw(),
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(76);
@@ -15292,12 +15358,12 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::Jump,
-                &[OpRef::from_raw(1), OpRef::from_raw(0)],
+                &[OpRef::input_arg_ref(1), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -15348,12 +15414,12 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_ref(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(1), OpRef::from_raw(0)],
+                &[OpRef::input_arg_ref(1), OpRef::input_arg_float(0)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -15402,8 +15468,8 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
         ];
 
         backend.set_next_trace_id(78);
@@ -15440,12 +15506,20 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let root_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(90);
@@ -15457,8 +15531,12 @@ mod tests {
 
         let bridge_inputargs = vec![InputArg::new_int(0)];
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         let fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
             0,
@@ -15522,12 +15600,20 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let root_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(190);
@@ -15590,12 +15676,20 @@ mod tests {
             Vec::new(),
             None,
         );
-        let mut bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut bridge_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(191);
@@ -15660,12 +15754,20 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut root_guard = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        root_guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut root_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        root_guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let root_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             root_guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(290);
@@ -15725,12 +15827,20 @@ mod tests {
             Vec::new(),
             None,
         );
-        let mut bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(0)], OpRef::NONE.raw());
-        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut bridge_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        bridge_guard.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             bridge_guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(291);
@@ -15900,24 +16010,24 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::from_raw(0)], 2),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+                2,
+            ),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 3,
             ),
-            mk_op(
-                OpCode::IntGt,
-                &[OpRef::from_raw(3), OpRef::from_raw(101)],
-                4,
-            ),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(101)], 4),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::Jump,
-                &[OpRef::from_raw(3), OpRef::from_raw(2)],
+                &[OpRef::int_op(3), OpRef::int_op(2)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -15943,18 +16053,26 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)], 3),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(
+                OpCode::IntMul,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                3,
+            ),
             mk_op(
                 OpCode::Finish,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(3),
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::int_op(2),
+                    OpRef::int_op(3),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -15985,16 +16103,20 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::from_raw(100), OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                ],
                 2,
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16021,16 +16143,20 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CallPureI,
-                &[OpRef::from_raw(100), OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                ],
                 2,
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16063,14 +16189,18 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -16098,16 +16228,20 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CallF,
-                &[OpRef::from_raw(100), OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::input_arg_float(0),
+                    OpRef::input_arg_float(1),
+                ],
                 2,
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16133,20 +16267,16 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 1,
                 descr,
             ),
-            mk_op(
-                OpCode::IntLt,
-                &[OpRef::from_raw(1), OpRef::from_raw(101)],
-                2,
-            ),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16194,31 +16324,27 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                &[OpRef::int_op(100), OpRef::int_op(101)],
                 OpRef::NONE.raw(),
                 call_void.clone(),
             ),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(102), OpRef::from_raw(0)],
+                &[OpRef::int_op(102), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 call_void,
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(103)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
                 1,
             ),
-            mk_op(
-                OpCode::IntLt,
-                &[OpRef::from_raw(1), OpRef::from_raw(104)],
-                2,
-            ),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(104)], 2),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16250,18 +16376,18 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardException, &[OpRef::from_raw(101)], 1);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16297,18 +16423,18 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardException, &[OpRef::from_raw(101)], 1);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16338,17 +16464,21 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -16384,17 +16514,21 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -16432,13 +16566,13 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardException, &[OpRef::from_raw(101)], 3);
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr.clone(),
             ),
@@ -16446,17 +16580,17 @@ mod tests {
             mk_op(OpCode::SaveException, &[], 2),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(103)],
+                &[OpRef::int_op(100), OpRef::int_op(103)],
                 OpRef::NONE.raw(),
                 descr,
             ),
             mk_op(
                 OpCode::RestoreException,
-                &[OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[OpRef::int_op(1), OpRef::ref_op(2)],
                 OpRef::NONE.raw(),
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16504,17 +16638,21 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::from_raw(100), OpRef::from_raw(0)],
+                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -16544,9 +16682,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::SameAsR, &[OpRef::from_raw(0)], 1),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 1),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(31);
@@ -16562,9 +16700,13 @@ mod tests {
 
         let inputargs = vec![InputArg::new_float(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::SameAsF, &[OpRef::from_raw(0)], 1),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_float(0)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::SameAsF, &[OpRef::input_arg_float(0)], 1),
+            mk_op(OpCode::Finish, &[OpRef::float_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(32);
@@ -16600,16 +16742,24 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CondCallN,
-                &[OpRef::from_raw(0), OpRef::from_raw(100), OpRef::from_raw(1)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::int_op(100),
+                    OpRef::input_arg_int(1),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -16645,16 +16795,24 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CondCallN,
-                &[OpRef::from_raw(0), OpRef::from_raw(100), OpRef::from_raw(1)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::int_op(100),
+                    OpRef::input_arg_int(1),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -16682,16 +16840,20 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CondCallValueI,
-                &[OpRef::from_raw(0), OpRef::from_raw(100), OpRef::from_raw(1)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::int_op(100),
+                    OpRef::input_arg_int(1),
+                ],
                 2,
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16718,16 +16880,20 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::CondCallValueI,
-                &[OpRef::from_raw(0), OpRef::from_raw(100), OpRef::from_raw(1)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::int_op(100),
+                    OpRef::input_arg_int(1),
+                ],
                 2,
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16749,18 +16915,14 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(
-                OpCode::GuardNonnull,
-                &[OpRef::from_raw(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardNonnull, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -16782,13 +16944,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardIsnull,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(45);
@@ -16804,13 +16970,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardIsnull,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(46);
@@ -16826,13 +16996,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardValue,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         // Test: value matches -> guard passes, reaches Finish
@@ -17082,48 +17256,48 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::FloatLt,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 2,
             ),
             mk_op(
                 OpCode::FloatLe,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 3,
             ),
             mk_op(
                 OpCode::FloatEq,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 4,
             ),
             mk_op(
                 OpCode::FloatNe,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 5,
             ),
             mk_op(
                 OpCode::FloatGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 6,
             ),
             mk_op(
                 OpCode::FloatGe,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 7,
             ),
             mk_op(
                 OpCode::Finish,
                 &[
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(4),
-                    OpRef::from_raw(5),
-                    OpRef::from_raw(6),
-                    OpRef::from_raw(7),
+                    OpRef::int_op(2),
+                    OpRef::int_op(3),
+                    OpRef::int_op(4),
+                    OpRef::int_op(5),
+                    OpRef::int_op(6),
+                    OpRef::int_op(7),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -17150,36 +17324,36 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::FloatEq,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 2,
             ),
             mk_op(
                 OpCode::FloatNe,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 3,
             ),
             mk_op(
                 OpCode::FloatLe,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 4,
             ),
             mk_op(
                 OpCode::FloatGe,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
                 5,
             ),
             mk_op(
                 OpCode::Finish,
                 &[
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(4),
-                    OpRef::from_raw(5),
+                    OpRef::int_op(2),
+                    OpRef::int_op(3),
+                    OpRef::int_op(4),
+                    OpRef::int_op(5),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -17207,9 +17381,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], 1, fd),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], 1, fd),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(70);
@@ -17233,16 +17407,20 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
                 fd,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(71);
@@ -17264,9 +17442,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], 1, fd),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], 1, fd),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(72);
@@ -17295,16 +17473,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::GetarrayitemGcI,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 2,
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(73);
@@ -17334,16 +17512,28 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(2)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(74);
@@ -17369,9 +17559,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(OpCode::ArraylenGc, &[OpRef::from_raw(0)], 1, ad),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], 1, ad),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(75);
@@ -17394,20 +17584,20 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(50)],
+                &[OpRef::int_op(50)],
                 OpRef::NONE.raw(),
                 loop_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(50)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(50)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(76_001);
@@ -17427,18 +17617,26 @@ mod tests {
         let ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
                 start_descr,
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(2)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 loop_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(76_102);
@@ -17455,13 +17653,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardNonnullClass,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -17496,16 +17698,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntAddOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardNoOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(80);
@@ -17526,16 +17728,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntAddOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardNoOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(81);
@@ -17555,16 +17757,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntSubOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardNoOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(82);
@@ -17584,16 +17786,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntSubOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardNoOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(83);
@@ -17613,16 +17815,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntMulOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardNoOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(84);
@@ -17642,16 +17844,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntMulOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardNoOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(85);
@@ -17671,16 +17873,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::IntAddOvf,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
             mk_op(OpCode::GuardOverflow, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(86);
@@ -17710,9 +17912,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(OpCode::GetfieldGcF, &[OpRef::from_raw(0)], 1, fd),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::GetfieldGcF, &[OpRef::input_arg_ref(0)], 1, fd),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(90);
@@ -17739,9 +17941,9 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op_with_descr(OpCode::GetfieldGcPureR, &[OpRef::from_raw(0)], 1, fd),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::GetfieldGcPureR, &[OpRef::input_arg_ref(0)], 1, fd),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(91);
@@ -17766,17 +17968,17 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
                 fd.clone(),
             ),
-            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], 2, fd),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], 2, fd),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(92);
@@ -17805,22 +18007,30 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::SetarrayitemGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
                 ad.clone(),
             ),
             mk_op_with_descr(
                 OpCode::GetarrayitemGcI,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 3,
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(93);
@@ -17842,17 +18052,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GcLoadI,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
                 ],
                 1,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -17880,21 +18090,21 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcLoadIndexedR,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(102),
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
                 ],
                 2,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -17921,20 +18131,24 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(101),
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::input_arg_ref(1),
+                    OpRef::int_op(101),
                 ],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -17965,33 +18179,37 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcStoreIndexed,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(102),
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcLoadIndexedI,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(102),
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
                 ],
                 3,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18024,14 +18242,14 @@ mod tests {
         let ad = make_array_descr_with_signedness(0, 1, Type::Int, false, None);
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
                 1,
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18057,22 +18275,26 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_float(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::RawStore,
-                &[OpRef::from_raw(0), OpRef::from_raw(100), OpRef::from_raw(1)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::input_arg_float(1),
+                ],
                 OpRef::NONE.raw(),
                 ad.clone(),
             ),
             mk_op_with_descr(
                 OpCode::RawLoadF,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
                 2,
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18101,21 +18323,25 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcLoadIndexedI,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
                 ],
                 3,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18144,16 +18370,16 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::GetinteriorfieldGcI,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 2,
                 id,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(101);
@@ -18182,22 +18408,30 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::SetinteriorfieldGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
                 id.clone(),
             ),
             mk_op_with_descr(
                 OpCode::GetinteriorfieldGcI,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 3,
                 id,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(102);
@@ -18232,19 +18466,19 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntMul,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 2,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18264,13 +18498,13 @@ mod tests {
         // Now compile a bridge for guard 0: bridge takes x, returns x + 100
         let bridge_inputargs = vec![InputArg::new_int(0)];
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut bridge_constants = HashMap::new();
@@ -18321,9 +18555,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::GuardTrue,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(201);
@@ -18362,22 +18604,30 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard_op = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         // Explicit fail_args: save both i0 and i1 plus the computed sum (i0+i1)
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
         ]));
 
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             guard_op,
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(203);
@@ -18395,16 +18645,16 @@ mod tests {
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(2), OpRef::from_raw(100)],
-                3,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(100)], 3),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut bridge_constants = HashMap::new();
@@ -18449,19 +18699,31 @@ mod tests {
             InputArg::new_float(1),
             InputArg::new_ref(2),
         ];
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard_op = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
+            OpRef::input_arg_float(1),
+            OpRef::input_arg_ref(2),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_float(1),
+                    OpRef::input_arg_ref(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(1001);
@@ -18487,26 +18749,34 @@ mod tests {
             InputArg::new_float(2),
             InputArg::new_ref(3),
         ];
-        let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard_op = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
-            OpRef::from_raw(3),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_float(2),
+            OpRef::input_arg_ref(3),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(3),
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_ref(1),
+                    OpRef::input_arg_float(2),
+                    OpRef::input_arg_ref(3),
                 ],
                 OpRef::NONE.raw(),
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(1005);
@@ -18532,20 +18802,24 @@ mod tests {
         let ad = make_array_descr(16, 4, Type::Int, None);
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::ZeroArray,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(103),
+                    OpRef::input_arg_ref(0),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
+                    OpRef::int_op(102),
+                    OpRef::int_op(103),
                 ],
                 OpRef::NONE.raw(),
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -18583,22 +18857,30 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(
                 OpCode::ZeroArray,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                    OpRef::int_op(100),
+                    OpRef::int_op(101),
                 ],
                 OpRef::NONE.raw(),
                 ad,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -18634,9 +18916,13 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(OpCode::CallMayForceN, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(1004);
@@ -18664,24 +18950,32 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(0),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(OpCode::ForceToken, &[], 2),
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef::from_raw(100), OpRef::from_raw(2), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::ref_op(2),
+                    OpRef::input_arg_int(1),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -18732,24 +19026,32 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(0),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(OpCode::ForceToken, &[], 2),
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef::from_raw(100), OpRef::from_raw(2), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::ref_op(2),
+                    OpRef::input_arg_int(1),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -18798,26 +19100,30 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(3),
-            OpRef::from_raw(0),
+            OpRef::input_arg_int(1),
+            OpRef::int_op(3),
+            OpRef::input_arg_int(0),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(OpCode::ForceToken, &[], 2),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::from_raw(100), OpRef::from_raw(2), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::ref_op(2),
+                    OpRef::input_arg_int(1),
+                ],
                 3,
                 descr,
             ),
-            mk_op(OpCode::SameAsI, &[OpRef::from_raw(3)], 4),
+            mk_op(OpCode::SameAsI, &[OpRef::int_op(3)], 4),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18853,25 +19159,29 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(3),
-            OpRef::from_raw(0),
+            OpRef::input_arg_int(1),
+            OpRef::int_op(3),
+            OpRef::input_arg_int(0),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(OpCode::ForceToken, &[], 2),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::from_raw(100), OpRef::from_raw(2), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::ref_op(2),
+                    OpRef::input_arg_int(1),
+                ],
                 3,
                 descr,
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18920,25 +19230,29 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(1),
-            OpRef::from_raw(3),
-            OpRef::from_raw(0),
+            OpRef::input_arg_int(1),
+            OpRef::int_op(3),
+            OpRef::input_arg_int(0),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             mk_op(OpCode::ForceToken, &[], 2),
             mk_op_with_descr(
                 OpCode::CallMayForceF,
-                &[OpRef::from_raw(100), OpRef::from_raw(2), OpRef::from_raw(1)],
+                &[
+                    OpRef::int_op(100),
+                    OpRef::ref_op(2),
+                    OpRef::input_arg_int(1),
+                ],
                 3,
                 descr,
             ),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -18981,13 +19295,13 @@ mod tests {
 
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut callee_constants = HashMap::new();
         callee_constants.insert(100, 2);
@@ -19000,14 +19314,14 @@ mod tests {
 
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerI,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 1,
                 make_call_assembler_descr(&callee_token, vec![Type::Int], Type::Int),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         backend.set_constants(HashMap::new());
 
@@ -19066,14 +19380,14 @@ mod tests {
         backend.set_next_trace_id(1500_241);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerI,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 1,
                 make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Int),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut caller = JitCellToken::new(1500_241);
         backend
@@ -19083,13 +19397,13 @@ mod tests {
         backend.set_next_trace_id(1500_240);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut constants = HashMap::new();
         constants.insert(100, 7);
@@ -19111,14 +19425,14 @@ mod tests {
         let mut deferred_target = JitCellToken::new(1500_245);
         let caller_inputargs = vec![InputArg::new_ref(0)];
         let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerR,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_ref(0)],
                 1,
                 make_call_assembler_descr(&deferred_target, vec![Type::Ref], Type::Ref),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut caller = JitCellToken::new(1500_246);
         backend
@@ -19128,8 +19442,12 @@ mod tests {
         backend.set_next_trace_id(1500_245);
         let callee_inputargs = vec![InputArg::new_ref(0)];
         let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         backend.set_constants(HashMap::new());
         backend
@@ -19152,14 +19470,14 @@ mod tests {
         let mut deferred_target = JitCellToken::new(1500_247);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerR,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 1,
                 make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Ref),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut caller = JitCellToken::new(1500_248);
         backend
@@ -19169,17 +19487,17 @@ mod tests {
         backend.set_next_trace_id(1500_247);
         let callee_inputargs = vec![InputArg::new_int(0)];
         let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(1)]));
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
         let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
             mk_op(OpCode::ForceToken, &[], 2),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
         let mut constants = HashMap::new();
         constants.insert(100, 10);
@@ -19201,8 +19519,12 @@ mod tests {
 
         let ref_inputargs = vec![InputArg::new_ref(0)];
         let plain_ref_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         let mut plain_ref_target = JitCellToken::new(1500_349);
         backend
@@ -19210,12 +19532,12 @@ mod tests {
             .unwrap();
 
         let mut guard_op = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(1)]));
+        guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::ref_op(1)]));
         let force_token_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(OpCode::ForceToken, &[], 1),
             guard_op,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
         let mut force_token_target = JitCellToken::new(1500_350);
         backend
@@ -19223,14 +19545,14 @@ mod tests {
             .unwrap();
 
         let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerR,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_ref(0)],
                 1,
                 make_call_assembler_descr(&plain_ref_target, vec![Type::Ref], Type::Ref),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
         let mut caller = JitCellToken::new(1500_351);
         backend
@@ -19260,30 +19582,26 @@ mod tests {
 
         let mut token = JitCellToken::new(1500_250);
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 1,
             ),
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 2,
             ),
             mk_op_with_descr(
                 OpCode::CallAssemblerI,
-                &[OpRef::from_raw(2)],
+                &[OpRef::int_op(2)],
                 3,
                 make_call_assembler_descr(&token, vec![Type::Int], Type::Int),
             ),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(3), OpRef::from_raw(100)],
-                4,
-            ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
@@ -19303,8 +19621,12 @@ mod tests {
 
         backend.set_constants(HashMap::new());
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
         backend
             .compile_bridge(failed_descr, &inputargs, &bridge_ops, &token, &[])
@@ -19341,30 +19663,26 @@ mod tests {
 
             let mut token = JitCellToken::new(token_number);
             let ops = vec![
-                mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+                mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
                 mk_op(
                     OpCode::IntGt,
-                    &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                    &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                     1,
                 ),
-                mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+                mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw()),
                 mk_op(
                     OpCode::IntSub,
-                    &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                    &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                     2,
                 ),
                 mk_op_with_descr(
                     OpCode::CallAssemblerI,
-                    &[OpRef::from_raw(2)],
+                    &[OpRef::int_op(2)],
                     3,
                     make_call_assembler_descr(&token, vec![Type::Int], Type::Int),
                 ),
-                mk_op(
-                    OpCode::IntAdd,
-                    &[OpRef::from_raw(3), OpRef::from_raw(100)],
-                    4,
-                ),
-                mk_op(OpCode::Finish, &[OpRef::from_raw(4)], OpRef::NONE.raw()),
+                mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
+                mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             ];
             backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
@@ -19373,8 +19691,12 @@ mod tests {
                 .expect("base-case guard should produce a valid descr");
             backend.set_constants(HashMap::new());
             let bridge_ops = vec![
-                mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-                mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+                mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+                mk_op(
+                    OpCode::Finish,
+                    &[OpRef::input_arg_int(0)],
+                    OpRef::NONE.raw(),
+                ),
             ];
             backend
                 .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
@@ -19388,14 +19710,14 @@ mod tests {
         let mut deferred_target = JitCellToken::new(token_number);
         let caller_inputargs = vec![InputArg::new_int(0)];
         let caller_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerI,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 1,
                 make_call_assembler_descr(&deferred_target, vec![Type::Int], Type::Int),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut caller = JitCellToken::new(1500_253);
         backend
@@ -19404,13 +19726,13 @@ mod tests {
 
         let callee_inputargs = vec![InputArg::new_int(0)];
         let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let mut constants = HashMap::new();
         constants.insert(100, 7);
@@ -19430,14 +19752,14 @@ mod tests {
         let mut callee_token = JitCellToken::new(1500_352);
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallAssemblerI,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 1,
                 make_call_assembler_descr(&callee_token, vec![Type::Int], Type::Int),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let err = backend
@@ -19455,22 +19777,26 @@ mod tests {
         let loop_descr = make_label_descr(1500_260);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut root_constants = HashMap::new();
@@ -19490,15 +19816,15 @@ mod tests {
         bridge_constants.insert(101, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 1,
             ),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(1)],
+                &[OpRef::int_op(1)],
                 OpRef::NONE.raw(),
                 loop_descr,
             ),
@@ -19525,22 +19851,26 @@ mod tests {
         let loop_descr = make_label_descr(1500_259);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut root_constants = HashMap::new();
@@ -19563,18 +19893,14 @@ mod tests {
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 2,
             ),
-            mk_op(OpCode::Label, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(2), OpRef::from_raw(102)],
-                3,
-            ),
+            mk_op(OpCode::Label, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(102)], 3),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(3)],
+                &[OpRef::int_op(3)],
                 OpRef::NONE.raw(),
                 loop_descr,
             ),
@@ -19602,32 +19928,32 @@ mod tests {
             InputArg::new_int(1),
             InputArg::new_ref(2),
         ];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(4)], OpRef::NONE.raw());
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
         guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
         ]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_ref(2),
+                ],
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
             mk_op_with_descr(
                 OpCode::GetfieldGcPureI,
-                &[OpRef::from_raw(2)],
+                &[OpRef::input_arg_ref(2)],
                 3,
                 int_field.clone(),
             ),
-            mk_op(
-                OpCode::IntGt,
-                &[OpRef::from_raw(3), OpRef::from_raw(100)],
-                4,
-            ),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(100)], 4),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut root_constants = HashMap::new();
@@ -19656,19 +19982,27 @@ mod tests {
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_ref(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op_with_descr(OpCode::NewWithVtable, &[], 3, int_size.clone()),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(3), OpRef::from_raw(101)],
+                &[OpRef::int_op(3), OpRef::int_op(101)],
                 OpRef::NONE.raw(),
                 int_field.clone(),
             ),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(3)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::int_op(3),
+                ],
                 OpRef::NONE.raw(),
                 loop_descr,
             ),
@@ -19695,39 +20029,39 @@ mod tests {
         let body_descr = make_label_descr(1500_266);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 start_descr,
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 2,
             ),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(2)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 body_descr.clone(),
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(3)],
+                &[OpRef::int_op(3)],
                 OpRef::NONE.raw(),
                 body_descr.clone(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let mut root_constants = HashMap::new();
@@ -19748,15 +20082,15 @@ mod tests {
         bridge_constants.insert(102, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(102)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(102)],
                 1,
             ),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(1)],
+                &[OpRef::int_op(1)],
                 OpRef::NONE.raw(),
                 body_descr,
             ),
@@ -19781,56 +20115,52 @@ mod tests {
         let final_descr = make_label_descr(1500_270);
 
         let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(1)], OpRef::NONE.raw());
-        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
+        guard.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_int(0)],
                 OpRef::NONE.raw(),
                 start_descr,
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
                 2,
             ),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(2)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(3)],
+                &[OpRef::int_op(3)],
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(3), OpRef::from_raw(102)],
-                4,
-            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(102)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(4)],
+                &[OpRef::int_op(4)],
                 OpRef::NONE.raw(),
                 final_descr.clone(),
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(5)],
+                &[OpRef::int_op(5)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(5)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
         ];
 
         let mut root_constants = HashMap::new();
@@ -19852,15 +20182,15 @@ mod tests {
         bridge_constants.insert(103, 5);
         backend.set_constants(bridge_constants);
         let bridge_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(103)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
                 1,
             ),
             mk_op_with_descr(
                 OpCode::Jump,
-                &[OpRef::from_raw(1)],
+                &[OpRef::int_op(1)],
                 OpRef::NONE.raw(),
                 middle_descr,
             ),
@@ -19890,22 +20220,26 @@ mod tests {
         let ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 OpRef::NONE.raw(),
                 start_descr.clone(),
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 3,
             ),
             mk_op_with_descr(
                 OpCode::Label,
                 &[
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(0),
+                    OpRef::int_op(3),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                    OpRef::input_arg_int(0),
                 ],
                 OpRef::NONE.raw(),
                 body_descr,
@@ -19913,10 +20247,10 @@ mod tests {
             mk_op_with_descr(
                 OpCode::Jump,
                 &[
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(0),
+                    OpRef::int_op(3),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                    OpRef::input_arg_int(0),
                 ],
                 OpRef::NONE.raw(),
                 start_descr,
@@ -19938,7 +20272,7 @@ mod tests {
             (
                 OpCode::CallMallocNursery,
                 vec![InputArg::new_int(0)],
-                vec![OpRef::from_raw(0)],
+                vec![OpRef::input_arg_ref(0)],
                 1,
                 "configured GC runtime",
             ),
@@ -19949,39 +20283,47 @@ mod tests {
                     InputArg::new_int(1),
                     InputArg::new_int(2),
                 ],
-                vec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                vec![
+                    OpRef::input_arg_ref(0),
+                    OpRef::input_arg_int(1),
+                    OpRef::input_arg_int(2),
+                ],
                 3,
                 "configured GC runtime",
             ),
             (
                 OpCode::CallMallocNurseryVarsizeFrame,
                 vec![InputArg::new_int(0)],
-                vec![OpRef::from_raw(0)],
+                vec![OpRef::input_arg_ref(0)],
                 1,
                 "configured GC runtime",
             ),
             (
                 OpCode::CondCallGcWb,
                 vec![InputArg::new_ref(0)],
-                vec![OpRef::from_raw(0)],
+                vec![OpRef::input_arg_ref(0)],
                 OpRef::NONE.raw(),
                 "configured GC runtime",
             ),
             (
                 OpCode::CondCallGcWbArray,
                 vec![InputArg::new_ref(0), InputArg::new_int(1)],
-                vec![OpRef::from_raw(0), OpRef::from_raw(1)],
+                vec![OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
                 "configured GC runtime",
             ),
         ];
 
         for (idx, (opcode, inputargs, op_args, pos, detail)) in cases.into_iter().enumerate() {
-            let label_args: Vec<OpRef> = (0..inputargs.len() as u32).map(OpRef::from_raw).collect();
+            let label_args: Vec<OpRef> = (0..inputargs.len() as u32).map(OpRef::int_op).collect();
             let ops = vec![
                 mk_op(OpCode::Label, &label_args, OpRef::NONE.raw()),
                 mk_op(opcode, &op_args, pos),
-                mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+                mk_op(
+                    OpCode::Finish,
+                    &[OpRef::input_arg_ref(0)],
+                    OpRef::NONE.raw(),
+                ),
             ];
             assert_compile_unsupported(inputargs, ops, 1400 + idx as u64, opcode, detail);
         }
@@ -20003,28 +20345,28 @@ mod tests {
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(10001),
-                    OpRef::from_raw(10002),
-                    OpRef::from_raw(10003),
+                    OpRef::ref_op(0),
+                    OpRef::int_op(10001),
+                    OpRef::int_op(10002),
+                    OpRef::int_op(10003),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(10004),
-                    OpRef::from_raw(10005),
-                    OpRef::from_raw(10003),
+                    OpRef::ref_op(0),
+                    OpRef::int_op(10004),
+                    OpRef::int_op(10005),
+                    OpRef::int_op(10003),
                 ],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1500);
@@ -20053,35 +20395,35 @@ mod tests {
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(10001),
-                    OpRef::from_raw(10002),
-                    OpRef::from_raw(10003),
+                    OpRef::ref_op(0),
+                    OpRef::int_op(10001),
+                    OpRef::int_op(10002),
+                    OpRef::int_op(10003),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::NurseryPtrIncrement,
-                &[OpRef::from_raw(0), OpRef::from_raw(10004)],
+                &[OpRef::ref_op(0), OpRef::int_op(10004)],
                 1,
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(10001),
-                    OpRef::from_raw(10005),
-                    OpRef::from_raw(10003),
+                    OpRef::int_op(1),
+                    OpRef::int_op(10001),
+                    OpRef::int_op(10005),
+                    OpRef::int_op(10003),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::ref_op(0), OpRef::int_op(1)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -20114,14 +20456,14 @@ mod tests {
         let ad = make_array_descr(16, 8, Type::Int, Some(0));
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
             mk_op_with_descr(
                 OpCode::CallMallocNurseryVarsize,
                 &[
-                    OpRef::from_raw(10002),
-                    OpRef::from_raw(10003),
-                    OpRef::from_raw(0),
+                    OpRef::int_op(10002),
+                    OpRef::int_op(10003),
+                    OpRef::input_arg_int(0),
                 ],
                 1,
                 ad.clone(),
@@ -20129,14 +20471,14 @@ mod tests {
             mk_op(
                 OpCode::GcStore,
                 &[
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(10000),
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(10001),
+                    OpRef::int_op(1),
+                    OpRef::int_op(10000),
+                    OpRef::input_arg_int(0),
+                    OpRef::int_op(10001),
                 ],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1502);
@@ -20159,24 +20501,24 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallR,
                 &[
-                    OpRef::from_raw(10000),
-                    OpRef::from_raw(10001),
-                    OpRef::from_raw(10002),
-                    OpRef::from_raw(0),
+                    OpRef::int_op(10000),
+                    OpRef::int_op(10001),
+                    OpRef::int_op(10002),
+                    OpRef::input_arg_int(0),
                 ],
                 1,
                 majit_ir::make_malloc_array_calldescr(),
             ),
             mk_op(
                 OpCode::CheckMemoryError,
-                &[OpRef::from_raw(1)],
+                &[OpRef::int_op(1)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1503);
@@ -20195,13 +20537,17 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::CondCallGcWb,
-                &[OpRef::from_raw(0)],
+                &[OpRef::input_arg_ref(0)],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(1503);
@@ -20265,17 +20611,13 @@ mod tests {
         let mut consts = HashMap::new();
         consts.insert(10000, alloc_size as i64);
         backend.set_constants(consts);
-        let size_arg = OpRef::from_raw(10000);
+        let size_arg = OpRef::int_op(10000);
         let inputargs = vec![];
-        let mut guard = mk_op(
-            OpCode::GuardNonnull,
-            &[OpRef::from_raw(2)],
-            OpRef::NONE.raw(),
-        );
+        let mut guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
         guard.fail_args = Some(smallvec::smallvec![
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2)
+            OpRef::ref_op(0),
+            OpRef::ref_op(1),
+            OpRef::ref_op(2)
         ]);
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
@@ -20283,7 +20625,7 @@ mod tests {
             mk_op(OpCode::CallMallocNursery, &[size_arg], 1),
             mk_op(OpCode::CallMallocNursery, &[size_arg], 2), // overflows
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(1505);
@@ -20328,24 +20670,24 @@ mod tests {
         let inputargs = vec![];
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(16)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 0),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::ref_op(0), OpRef::int_op(100)],
                 OpRef::NONE.raw(),
                 fd.clone(),
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(32)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(32)], 1),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(1), OpRef::from_raw(101)],
+                &[OpRef::ref_op(1), OpRef::int_op(101)],
                 OpRef::NONE.raw(),
                 fd,
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(24)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(24)], 2),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[OpRef::ref_op(0), OpRef::ref_op(1), OpRef::ref_op(2)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -20398,22 +20740,26 @@ mod tests {
         let int_fd = make_field_descr(0, 8, Type::Int, true);
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(16)], 1),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 1),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(1), OpRef::from_raw(100)],
+                &[OpRef::ref_op(1), OpRef::int_op(100)],
                 OpRef::NONE.raw(),
                 int_fd,
             ),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::ref_op(1)],
                 OpRef::NONE.raw(),
                 ref_fd,
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::from_raw(24)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(24)], 2),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -20442,37 +20788,22 @@ mod tests {
         ))));
 
         let ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                ],
+                &[OpRef::int_op(0), OpRef::int_op(101), OpRef::int_op(200)],
             ),
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(201),
-                ],
+                &[OpRef::int_op(0), OpRef::int_op(102), OpRef::int_op(201)],
             ),
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(103),
-                    OpRef::from_raw(202),
-                ],
+                &[OpRef::int_op(0), OpRef::int_op(103), OpRef::int_op(202)],
             ),
-            Op::new(
-                OpCode::Strgetitem,
-                &[OpRef::from_raw(0), OpRef::from_raw(102)],
-            ),
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(4), OpRef::from_raw(5)]),
+            Op::new(OpCode::Strgetitem, &[OpRef::int_op(0), OpRef::int_op(102)]),
+            Op::new(OpCode::Strlen, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
 
         let mut constants = HashMap::new();
@@ -20500,39 +20831,28 @@ mod tests {
         ))));
 
         let ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                ],
+                &[OpRef::int_op(0), OpRef::int_op(101), OpRef::int_op(200)],
             ),
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(201),
-                ],
+                &[OpRef::int_op(0), OpRef::int_op(102), OpRef::int_op(201)],
             ),
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Copystrcontent,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(100),
+                    OpRef::int_op(0),
+                    OpRef::int_op(3),
+                    OpRef::int_op(101),
+                    OpRef::int_op(101),
+                    OpRef::int_op(100),
                 ],
             ),
-            Op::new(
-                OpCode::Strgetitem,
-                &[OpRef::from_raw(3), OpRef::from_raw(102)],
-            ),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(5)]),
+            Op::new(OpCode::Strgetitem, &[OpRef::int_op(3), OpRef::int_op(102)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
 
         let mut constants = HashMap::new();
@@ -20557,21 +20877,17 @@ mod tests {
         ))));
 
         let ops = vec![
-            Op::new(OpCode::Newunicode, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Unicodesetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                ],
+                &[OpRef::int_op(0), OpRef::int_op(101), OpRef::int_op(200)],
             ),
             Op::new(
                 OpCode::Unicodegetitem,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
+                &[OpRef::int_op(0), OpRef::int_op(101)],
             ),
-            Op::new(OpCode::Unicodelen, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(2), OpRef::from_raw(3)]),
+            Op::new(OpCode::Unicodelen, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
 
         let mut constants = HashMap::new();
@@ -20594,16 +20910,16 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            Op::new(OpCode::Label, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Strhash, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::Strhash, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
             Op::new(
                 OpCode::Strgetitem,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             ),
             Op::new(
                 OpCode::Finish,
-                &[OpRef::from_raw(2), OpRef::from_raw(3), OpRef::from_raw(4)],
+                &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
 
@@ -20636,16 +20952,16 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            Op::new(OpCode::Label, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Unicodehash, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Unicodelen, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Label, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::Unicodehash, &[OpRef::input_arg_ref(0)]),
+            Op::new(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
             Op::new(
                 OpCode::Unicodegetitem,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             ),
             Op::new(
                 OpCode::Finish,
-                &[OpRef::from_raw(2), OpRef::from_raw(3), OpRef::from_raw(4)],
+                &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
 
@@ -20690,16 +21006,16 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                &[OpRef::int_op(100), OpRef::int_op(101)],
                 1,
                 descr,
             ),
             mk_op(
                 OpCode::Finish,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_ref(0), OpRef::int_op(1)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -20747,18 +21063,18 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CondCallN,
-                &[
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(101),
-                ],
+                &[OpRef::int_op(102), OpRef::int_op(100), OpRef::int_op(101)],
                 OpRef::NONE.raw(),
                 descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut constants = HashMap::new();
@@ -20801,8 +21117,12 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(1508);
@@ -20831,8 +21151,12 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(1509);
@@ -20853,13 +21177,17 @@ mod tests {
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             // GUARD_NOT_INVALIDATED takes no data args
             mk_op(OpCode::GuardNotInvalidated, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(100);
@@ -20880,21 +21208,25 @@ mod tests {
 
         // Build a guard with explicit fail_args so we can inspect them.
         let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_op.pos = OpRef::from_raw(OpRef::NONE.raw());
+        guard_op.pos = OpRef::int_op(OpRef::NONE.raw());
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
         ]));
 
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             guard_op,
-            mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2),
-            mk_op(OpCode::Finish, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(101);
@@ -20910,7 +21242,7 @@ mod tests {
 
         // After invalidation: guard fails, side-exits with the guard's fail args.
         let frame = backend.execute_token(&token, &[Value::Int(10), Value::Int(32)]);
-        // The guard's fail_args are [OpRef::from_raw(0), OpRef::from_raw(1)] = the input values.
+        // The guard's fail_args are [OpRef::input_arg_int(0), OpRef::input_arg_int(1)] = the input values.
         let descr = backend.get_latest_descr(&frame);
         // fail_index 0 is the GuardNotInvalidated guard (first guard in the trace).
         assert_eq!(descr.fail_index(), 0);
@@ -20928,24 +21260,20 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos = OpRef::from_raw(OpRef::NONE.raw());
-        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(1)]));
+        guard_inv.pos = OpRef::int_op(OpRef::NONE.raw());
+        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
 
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ), // i = i + 1
             guard_inv, // guard_not_invalidated
-            mk_op(
-                OpCode::IntLt,
-                &[OpRef::from_raw(1), OpRef::from_raw(101)],
-                2,
-            ), // i < 1000000
-            mk_op(OpCode::GuardTrue, &[OpRef::from_raw(2)], OpRef::NONE.raw()),
-            mk_op(OpCode::Jump, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2), // i < 1000000
+            mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+            mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut constants = HashMap::new();
@@ -20983,13 +21311,17 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos = OpRef::from_raw(OpRef::NONE.raw());
-        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(0)]));
+        guard_inv.pos = OpRef::int_op(OpRef::NONE.raw());
+        guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
 
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             guard_inv,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         let mut token = JitCellToken::new(103);
@@ -21026,24 +21358,36 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard1 = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard1 = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
         ]));
-        let int_add = mk_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)], 2);
-        let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(2)], OpRef::NONE.raw());
-        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(2)]));
+        let int_add = mk_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            2,
+        );
+        let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(2)]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             guard1,
             int_add,
             guard2,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(500);
@@ -21079,20 +21423,32 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_float(2),
         ];
-        let mut guard = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         guard.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_float(2),
         ]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::input_arg_ref(1),
+                    OpRef::input_arg_float(2),
+                ],
                 OpRef::NONE.raw(),
             ),
             guard,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(501);
@@ -21134,22 +21490,34 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard1 = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(0)], OpRef::NONE.raw());
+        let mut guard1 = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
         guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
         ]));
-        let mut guard2 = mk_op(OpCode::GuardFalse, &[OpRef::from_raw(1)], OpRef::NONE.raw());
-        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::from_raw(1)]));
+        let mut guard2 = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::input_arg_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(1)]));
         let ops = vec![
             mk_op(
                 OpCode::Label,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
             ),
             guard1,
             guard2,
-            mk_op(OpCode::Finish, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
         ];
 
         backend.set_next_trace_id(502);
@@ -21195,23 +21563,19 @@ mod tests {
 
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::from_raw(0)], OpRef::NONE.raw()),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(0), OpRef::from_raw(100)],
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
                 1,
             ),
-            mk_op(
-                OpCode::IntGt,
-                &[OpRef::from_raw(1), OpRef::from_raw(101)],
-                2,
-            ),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
             {
-                let mut g = mk_op(OpCode::GuardTrue, &[OpRef::from_raw(2)], OpRef::NONE.raw());
-                g.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+                let mut g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+                g.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
                 g
             },
-            mk_op(OpCode::Finish, &[OpRef::from_raw(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
 
         let mut token = JitCellToken::new(99_999);

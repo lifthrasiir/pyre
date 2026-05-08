@@ -228,9 +228,13 @@ pub struct AssemblerARM64<'a> {
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [Op],
     /// OpRef.0 → index into `inputargs`. Pre-computed at construction.
-    inputarg_index: HashMap<u32, usize>,
+    inputarg_index: HashMap<OpRef, usize>,
     /// OpRef.0 → index into `operations`. Pre-computed at construction.
-    op_index: HashMap<u32, usize>,
+    op_index: HashMap<OpRef, usize>,
+    /// Variant-blind raw fallback maps for legacy `OpRef::from_raw()`
+    /// `Untyped(_)` readers; mirror `OpTypeIndex::raw_*_index`.
+    raw_inputarg_index: HashMap<u32, usize>,
+    raw_op_index: HashMap<u32, usize>,
     /// Constants: OpRef index (>= 10000) → i64 value.
     constants: HashMap<u32, i64>,
     /// Constant type annotations for float immediates and fail args.
@@ -355,10 +359,17 @@ impl<'a> AssemblerARM64<'a> {
         if opref.is_none() {
             return None;
         }
+        // history.py:182 / resoperation.py:29: typed `OpRef` variants
+        // (`Const{Int,Float,Ptr}` / `InputArg{Int,Float,Ref}` /
+        // `{Int,Float,Ref,Void}Op`) carry their `box.type` intrinsically.
+        // Trust the variant first; the side tables only serve `Untyped`.
+        if let Some(tp) = opref.ty() {
+            return (tp != Type::Void).then_some(tp);
+        }
         if opref.is_constant() {
             return self.constant_types.get(&opref.raw()).copied();
         }
-        if let Some(&idx) = self.op_index.get(&opref.raw()) {
+        if let Some(&idx) = self.op_index.get(&opref) {
             let tp = self.operations[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -367,10 +378,31 @@ impl<'a> AssemblerARM64<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
+        if let Some(&idx) = self.inputarg_index.get(&opref) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.raw()) {
+        if let Some(&idx) = self.op_index.get(&opref) {
+            let tp = self.operations[idx].type_;
+            if tp != Type::Void {
+                return Some(tp);
+            }
+        }
+        // Variant-blind raw fallback for legacy `OpRef::from_raw(n)`
+        // `Untyped(n)` readers — mirrors `OpTypeIndex::opref_type_at_or_after`.
+        let raw_for_fallback = opref.raw();
+        if let Some(&idx) = self.raw_op_index.get(&raw_for_fallback) {
+            let tp = self.operations[idx].type_;
+            if tp == Type::Void {
+                return None;
+            }
+            if at_op_index.map_or(true, |at| idx <= at) {
+                return Some(tp);
+            }
+        }
+        if let Some(&idx) = self.raw_inputarg_index.get(&raw_for_fallback) {
+            return Some(self.inputargs[idx].tp);
+        }
+        if let Some(&idx) = self.raw_op_index.get(&raw_for_fallback) {
             let tp = self.operations[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -395,6 +427,8 @@ impl<'a> AssemblerARM64<'a> {
     ) -> Self {
         let inputarg_index = OpTypeIndex::build_inputarg_index(inputargs);
         let op_index = OpTypeIndex::build_op_index(operations);
+        let raw_inputarg_index = OpTypeIndex::build_raw_inputarg_index(inputargs);
+        let raw_op_index = OpTypeIndex::build_raw_op_index(operations);
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
@@ -410,6 +444,8 @@ impl<'a> AssemblerARM64<'a> {
             operations,
             inputarg_index,
             op_index,
+            raw_inputarg_index,
+            raw_op_index,
             constants,
             constant_types: HashMap::new(),
             next_slot: 0,

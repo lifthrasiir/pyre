@@ -2090,7 +2090,7 @@ mod tests {
     fn test_replace_box_marks_old_as_const() {
         let mut cache = HeapCache::new();
         let old = OpRef::ref_op(5);
-        let new = OpRef::from_const(0);
+        let new = OpRef::const_ptr(0);
 
         cache.arraylen_now_known(old, old);
         cache.replace_box(old, new);

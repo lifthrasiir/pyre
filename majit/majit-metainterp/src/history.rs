@@ -562,8 +562,11 @@ mod tests {
     fn test_trace_with_jump() {
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            ),
+            Op::new(OpCode::Jump, &[OpRef::int_op(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.is_loop());
@@ -576,8 +579,11 @@ mod tests {
     fn test_trace_with_finish() {
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            ),
+            Op::new(OpCode::Finish, &[OpRef::int_op(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.is_loop());
@@ -607,9 +613,12 @@ mod tests {
         // TreeLoop has inputargs and operations as primary fields.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(2), OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(3), OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(2), OpRef::input_arg_int(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(3), OpRef::input_arg_int(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -622,13 +631,19 @@ mod tests {
     fn test_trace_guards_can_have_fail_args() {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
-        guard.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]);
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
+        guard.fail_args = Some(smallvec::smallvec![
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1)
+        ]);
 
         let ops = vec![
             guard,
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(2), OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(OpCode::Jump, &[OpRef::int_op(2), OpRef::input_arg_int(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -636,8 +651,8 @@ mod tests {
         assert_eq!(guards.len(), 1);
         let fa = guards[0].fail_args.as_ref().unwrap();
         assert_eq!(fa.len(), 2);
-        assert_eq!(fa[0], OpRef::from_raw(0));
-        assert_eq!(fa[1], OpRef::from_raw(1));
+        assert_eq!(fa[0], OpRef::input_arg_int(0));
+        assert_eq!(fa[1], OpRef::input_arg_int(1));
     }
 
     #[test]
@@ -645,11 +660,14 @@ mod tests {
         // iter_guards returns only guard ops.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(2), OpRef::from_raw(0)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(3)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(3), OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(2), OpRef::input_arg_int(0)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::int_op(3)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(3), OpRef::input_arg_int(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -665,7 +683,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::from_raw(0), OpRef::from_raw(0)],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
         )];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.is_loop());
@@ -680,8 +698,11 @@ mod tests {
         let loop_trace = TreeLoop::new(
             inputargs.clone(),
             vec![
-                Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-                Op::new(OpCode::Jump, &[OpRef::from_raw(1)]),
+                Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+                ),
+                Op::new(OpCode::Jump, &[OpRef::int_op(1)]),
             ],
         );
         assert!(loop_trace.is_loop());
@@ -690,8 +711,11 @@ mod tests {
         let finish_trace = TreeLoop::new(
             inputargs,
             vec![
-                Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-                Op::new(OpCode::Finish, &[OpRef::from_raw(1)]),
+                Op::new(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+                ),
+                Op::new(OpCode::Finish, &[OpRef::int_op(1)]),
             ],
         );
         assert!(!finish_trace.is_loop());
@@ -708,7 +732,11 @@ mod tests {
         ];
         let ops = vec![Op::new(
             OpCode::Jump,
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                OpRef::input_arg_float(2),
+            ],
         )];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -724,17 +752,23 @@ mod tests {
         // Multiple guards can have different fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
-        g0.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
+        g0.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
 
-        let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::from_raw(1)]);
-        g1.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0), OpRef::from_raw(1)]);
+        let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
+        g1.fail_args = Some(smallvec::smallvec![
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1)
+        ]);
 
         let ops = vec![
             g0,
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
             g1,
-            Op::new(OpCode::Jump, &[OpRef::from_raw(2), OpRef::from_raw(1)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(2), OpRef::input_arg_int(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -750,8 +784,8 @@ mod tests {
         // Guards without explicitly set fail_args have None.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]),
+            Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -765,10 +799,13 @@ mod tests {
         // iter_ops preserves op order and opcodes.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(2), OpRef::from_raw(0)]),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(3), OpRef::from_raw(1)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(4), OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(2), OpRef::input_arg_int(0)]),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(3), OpRef::input_arg_int(1)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(4), OpRef::input_arg_int(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -800,9 +837,12 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let descr: DescrRef = Arc::new(TestDescr(42));
         let ops = vec![
-            Op::with_descr(OpCode::CallI, &[OpRef::from_raw(0)], descr.clone()),
-            Op::with_descr(OpCode::GuardTrue, &[OpRef::from_raw(0)], descr.clone()),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::with_descr(OpCode::CallI, &[OpRef::input_arg_int(0)], descr.clone()),
+            Op::with_descr(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], descr.clone()),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -829,12 +869,15 @@ mod tests {
             OpCode::Jump,
         ];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(1), OpRef::from_raw(0)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(2), OpRef::from_raw(0)]),
-            Op::new(OpCode::IntNeg, &[OpRef::from_raw(3)]),
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(4), OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(4)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            ),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(1), OpRef::input_arg_int(0)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(2), OpRef::input_arg_int(0)]),
+            Op::new(OpCode::IntNeg, &[OpRef::int_op(3)]),
+            Op::new(OpCode::IntLt, &[OpRef::int_op(4), OpRef::input_arg_int(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(4)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -848,8 +891,11 @@ mod tests {
         // Verify that cloning a trace produces an independent copy.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            ),
+            Op::new(OpCode::Jump, &[OpRef::int_op(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         let trace2 = trace.clone();
@@ -864,12 +910,12 @@ mod tests {
         // Stress test: a trace with 100+ operations.
         let inputargs = vec![InputArg::new_int(0)];
         let mut ops = Vec::new();
-        let mut prev = OpRef::from_raw(0);
+        let mut prev = OpRef::input_arg_int(0);
         for i in 0..100 {
-            let mut op = Op::new(OpCode::IntAdd, &[prev, OpRef::from_raw(0)]);
-            op.pos = OpRef::from_raw(i + 1);
+            let mut op = Op::new(OpCode::IntAdd, &[prev, OpRef::input_arg_int(0)]);
+            op.pos = OpRef::int_op(i + 1);
             ops.push(op);
-            prev = OpRef::from_raw(i + 1);
+            prev = OpRef::int_op(i + 1);
         }
         ops.push(Op::new(OpCode::Jump, &[prev]));
         let trace = TreeLoop::new(inputargs, ops);
@@ -893,19 +939,22 @@ mod tests {
         // fail_args must reference valid input or op refs.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let add_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
+        let add_op = Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        );
+        let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
         guard_op.fail_args = Some(smallvec::smallvec![
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2)
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
+            OpRef::int_op(2)
         ]);
 
         let ops = vec![
             add_op,
             guard_op,
-            Op::new(OpCode::Jump, &[OpRef::from_raw(2), OpRef::from_raw(1)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(2), OpRef::input_arg_int(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -921,19 +970,22 @@ mod tests {
         // Multiple guards with varying fail_args sizes.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
-        let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
+        let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
         g0.fail_args = Some(smallvec::smallvec![]);
 
-        let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::from_raw(1)]);
-        g1.fail_args = Some(smallvec::smallvec![OpRef::from_raw(0)]);
+        let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
+        g1.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
 
-        let add = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+        let add = Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        );
 
-        let mut g2 = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]);
+        let mut g2 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
         g2.fail_args = Some(smallvec::smallvec![
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2)
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
+            OpRef::int_op(2)
         ]);
 
         let ops = vec![
@@ -941,7 +993,10 @@ mod tests {
             g1,
             add,
             g2,
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -957,15 +1012,18 @@ mod tests {
         // Modifications to a cloned trace do not affect the original.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(1)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            ),
+            Op::new(OpCode::Jump, &[OpRef::int_op(1)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
         let mut trace2 = trace.clone();
 
         trace2.ops.push(Op::new(
             OpCode::IntSub,
-            &[OpRef::from_raw(0), OpRef::from_raw(0)],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
         ));
         assert_eq!(trace.num_ops(), 2);
         assert_eq!(trace2.num_ops(), 3);
@@ -976,15 +1034,21 @@ mod tests {
         // iter_guards must skip all non-guard ops, even in a complex trace.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(2), OpRef::from_raw(3)]),
-            Op::new(OpCode::IntNeg, &[OpRef::from_raw(4)]),
-            Op::new(OpCode::GuardFalse, &[OpRef::from_raw(5)]),
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(4), OpRef::from_raw(5)]),
+            Op::new(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(2), OpRef::int_op(3)]),
+            Op::new(OpCode::IntNeg, &[OpRef::int_op(4)]),
+            Op::new(OpCode::GuardFalse, &[OpRef::int_op(5)]),
+            Op::new(OpCode::IntLt, &[OpRef::int_op(4), OpRef::int_op(5)]),
             Op::new(OpCode::GuardNoException, &[]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(4), OpRef::from_raw(5)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
 
@@ -1002,8 +1066,8 @@ mod tests {
     #[test]
     fn test_check_consistency_valid() {
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::input_arg_int(0), OpRef::int_op(1)]),
+            Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
         ];
         let trace = TreeLoop::new(vec![InputArg::new_int(0)], ops);
         assert!(trace.check_consistency());
@@ -1013,7 +1077,7 @@ mod tests {
     fn test_check_consistency_no_final() {
         let ops = vec![Op::new(
             OpCode::IntAdd,
-            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
         let trace = TreeLoop::new(vec![], ops);
         assert!(!trace.check_consistency());
@@ -1022,29 +1086,26 @@ mod tests {
     #[test]
     fn test_free_vars() {
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
         ];
-        ops[0].pos = OpRef::from_raw(0);
-        ops[1].pos = OpRef::from_raw(1);
+        ops[0].pos = OpRef::int_op(0);
+        ops[1].pos = OpRef::int_op(1);
         let trace = TreeLoop::new(vec![], ops);
         let free = trace.free_vars();
-        // OpRef::from_raw(100) and OpRef::from_raw(101) are free (not defined)
-        assert!(free.contains(&OpRef::from_raw(100)));
-        assert!(free.contains(&OpRef::from_raw(101)));
-        assert!(!free.contains(&OpRef::from_raw(0))); // defined by op[0]
+        // OpRef::int_op(100) and OpRef::int_op(101) are free (not defined)
+        assert!(free.contains(&OpRef::int_op(100)));
+        assert!(free.contains(&OpRef::int_op(101)));
+        assert!(!free.contains(&OpRef::int_op(0))); // defined by op[0]
     }
 
     #[test]
     fn test_count_by_category() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::CallI, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::CallI, &[OpRef::int_op(0)]),
             Op::new(OpCode::Finish, &[]),
         ];
         let trace = TreeLoop::new(vec![], ops);
@@ -1058,10 +1119,10 @@ mod tests {
     #[test]
     fn test_split_at_label() {
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::Label, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::Label, &[OpRef::int_op(0)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         let trace = TreeLoop::new(vec![], ops);
         let (preamble, body) = trace.split_at_label();
@@ -1072,13 +1133,10 @@ mod tests {
     #[test]
     fn test_num_guards() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
-            Op::new(
-                OpCode::GuardClass,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
-            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(0)]),
+            Op::new(OpCode::GuardClass, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Finish, &[]),
         ];
         let trace = TreeLoop::new(vec![], ops);
@@ -1088,8 +1146,8 @@ mod tests {
     #[test]
     fn test_get_final_op() {
         let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
         ];
         let trace = TreeLoop::new(vec![], ops);
         let final_op = trace.get_final_op().unwrap();
@@ -1201,7 +1259,7 @@ mod tests {
         let original_box_types = vec![Type::Int];
 
         let cut = trace.cut_trace_from(start, &original_boxes, &original_box_types);
-        // v1 = OpRef::from_raw(1) is an original trace inputarg NOT in original_boxes.
+        // v1 = OpRef::input_arg_int(1) is an original trace inputarg NOT in original_boxes.
         // It's referenced by the escaped int_add op → added as extra inputarg.
         // Result: inputargs = [v0, v1], prefix = [int_add], post-cut = [int_mul, jump]
         assert_eq!(cut.inputargs.len(), 2); // v0 + escaped v1

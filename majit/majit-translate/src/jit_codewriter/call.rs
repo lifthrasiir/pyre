@@ -4962,9 +4962,21 @@ mod tests {
             None,
             &mut cache,
         );
-        // Should have non-zero bitsets for field reads and writes.
-        assert_ne!(descriptor.extra_info.readonly_descrs_fields, 0);
-        assert_ne!(descriptor.extra_info.write_descrs_fields, 0);
+        // Should have non-empty bitsets for field reads and writes.
+        assert!(
+            descriptor
+                .extra_info
+                .readonly_descrs_fields
+                .as_ref()
+                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+        );
+        assert!(
+            descriptor
+                .extra_info
+                .write_descrs_fields
+                .as_ref()
+                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+        );
     }
 
     #[test]
@@ -5030,7 +5042,13 @@ mod tests {
             ExtraEffect::ElidableCannotRaise
         );
         // Writes should be zeroed out for elidable functions.
-        assert_eq!(descriptor.extra_info.write_descrs_fields, 0);
+        assert!(
+            descriptor
+                .extra_info
+                .write_descrs_fields
+                .as_ref()
+                .is_some_and(|bs| bs.iter().all(|&b| b == 0)),
+        );
     }
 
     #[test]
@@ -5123,11 +5141,22 @@ mod tests {
         );
         // Write is set, but readonly should NOT have the same bit set.
         // RPython: readonly = reads & ~writes
-        assert_ne!(descriptor.extra_info.write_descrs_fields, 0);
-        let overlap = descriptor.extra_info.readonly_descrs_fields
-            & descriptor.extra_info.write_descrs_fields;
-        assert_eq!(
-            overlap, 0,
+        assert!(
+            descriptor
+                .extra_info
+                .write_descrs_fields
+                .as_ref()
+                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+        );
+        let overlap = match (
+            descriptor.extra_info.readonly_descrs_fields.as_ref(),
+            descriptor.extra_info.write_descrs_fields.as_ref(),
+        ) {
+            (Some(ro), Some(wr)) => ro.iter().zip(wr.iter()).any(|(a, b)| (a & b) != 0),
+            _ => false,
+        };
+        assert!(
+            !overlap,
             "readonly and write should not overlap for same field"
         );
     }

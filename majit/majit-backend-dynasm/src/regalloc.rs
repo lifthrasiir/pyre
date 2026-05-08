@@ -1586,10 +1586,17 @@ pub struct RegAlloc<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [Op],
-    /// OpRef.0 → index into `inputargs`. Pre-computed at construction.
-    inputarg_index: HashMap<u32, usize>,
-    /// OpRef.0 → index into `operations`. Pre-computed at construction.
-    op_index: HashMap<u32, usize>,
+    /// OpRef → index into `inputargs`. Pre-computed at construction.
+    inputarg_index: HashMap<OpRef, usize>,
+    /// OpRef → index into `operations`. Pre-computed at construction.
+    op_index: HashMap<OpRef, usize>,
+    /// Raw u32 → index into `inputargs`. Variant-blind fallback for
+    /// legacy `OpRef::from_raw()` `Untyped(_)` readers; mirrors
+    /// `OpTypeIndex::raw_inputarg_index`.
+    raw_inputarg_index: HashMap<u32, usize>,
+    /// Raw u32 → index into `operations`. Variant-blind fallback;
+    /// mirrors `OpTypeIndex::raw_op_index`.
+    raw_op_index: HashMap<u32, usize>,
     /// x86/regalloc.py:1305 self.jump_target_descr — TargetToken descriptor
     /// of the closing JUMP. PyPy keys it by Python object identity; we use
     /// the underlying `Arc<dyn Descr>` allocation address.
@@ -1627,6 +1634,8 @@ impl<'a> RegAlloc<'a> {
         let fm = FrameManager::new(0);
         let inputarg_index = OpTypeIndex::build_inputarg_index(inputargs);
         let op_index = OpTypeIndex::build_op_index(operations);
+        let raw_inputarg_index = OpTypeIndex::build_raw_inputarg_index(inputargs);
+        let raw_op_index = OpTypeIndex::build_raw_op_index(operations);
         RegAlloc {
             longevity,
             rm,
@@ -1639,6 +1648,8 @@ impl<'a> RegAlloc<'a> {
             operations,
             inputarg_index,
             op_index,
+            raw_inputarg_index,
+            raw_op_index,
             jump_target_descr: None,
             final_jump_args: None,
             final_jump_op_position: -1,
@@ -1663,10 +1674,17 @@ impl<'a> RegAlloc<'a> {
         if opref.is_none() {
             return None;
         }
+        // history.py:182 / resoperation.py:29: typed `OpRef` variants
+        // (`Const{Int,Float,Ptr}` / `InputArg{Int,Float,Ref}` /
+        // `{Int,Float,Ref,Void}Op`) carry their `box.type` intrinsically.
+        // Trust the variant first; the side tables only serve `Untyped`.
+        if let Some(tp) = opref.ty() {
+            return (tp != Type::Void).then_some(tp);
+        }
         if opref.is_constant() {
             return self.constant_types.get(&opref.raw()).copied();
         }
-        if let Some(&idx) = self.op_index.get(&opref.raw()) {
+        if let Some(&idx) = self.op_index.get(&opref) {
             let tp = self.operations[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -1675,10 +1693,31 @@ impl<'a> RegAlloc<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
+        if let Some(&idx) = self.inputarg_index.get(&opref) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.raw()) {
+        if let Some(&idx) = self.op_index.get(&opref) {
+            let tp = self.operations[idx].type_;
+            if tp != Type::Void {
+                return Some(tp);
+            }
+        }
+        // Variant-blind raw fallback for legacy `OpRef::from_raw(n)`
+        // `Untyped(n)` readers — mirrors `OpTypeIndex::opref_type_at_or_after`.
+        let raw = opref.raw();
+        if let Some(&idx) = self.raw_op_index.get(&raw) {
+            let tp = self.operations[idx].type_;
+            if tp == Type::Void {
+                return None;
+            }
+            if at_op_index.map_or(true, |at| idx <= at) {
+                return Some(tp);
+            }
+        }
+        if let Some(&idx) = self.raw_inputarg_index.get(&raw) {
+            return Some(self.inputargs[idx].tp);
+        }
+        if let Some(&idx) = self.raw_op_index.get(&raw) {
             let tp = self.operations[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -6004,7 +6043,7 @@ mod tests {
         let i0 = OpRef::input_arg_int(0);
         let i1 = OpRef::int_op(1);
         let i2 = OpRef::int_op(2);
-        let c1 = OpRef::from_const(0);
+        let c1 = OpRef::const_int(0);
 
         let inputargs = vec![InputArg {
             index: i0.raw(),
@@ -6058,7 +6097,7 @@ mod tests {
         // i0 is the typed Ref inputarg slot 0; the regalloc keys boxes
         // by typed `OpRef::input_arg_ref` (variant-aware Eq).
         let i0 = OpRef::input_arg_ref(0);
-        let c0 = OpRef::from_const(0);
+        let c0 = OpRef::const_int(0);
         let inputargs = vec![InputArg {
             index: i0.raw(),
             tp: Type::Ref,
@@ -6194,8 +6233,8 @@ mod tests {
         let i0 = OpRef::int_op(0);
         let i1 = OpRef::int_op(1);
         let i2 = OpRef::int_op(2);
-        let c0 = OpRef::from_const(0);
-        let c8 = OpRef::from_const(8);
+        let c0 = OpRef::const_int(0);
+        let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
             InputArg {
@@ -6247,8 +6286,8 @@ mod tests {
         let i0 = OpRef::input_arg_ref(0);
         let i1 = OpRef::input_arg_ref(1);
         let i2 = OpRef::input_arg_int(2);
-        let c0 = OpRef::from_const(0);
-        let c8 = OpRef::from_const(8);
+        let c0 = OpRef::const_int(0);
+        let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
             InputArg {

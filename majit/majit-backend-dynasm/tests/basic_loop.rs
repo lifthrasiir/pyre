@@ -29,7 +29,7 @@ fn test_just_finish() {
     let inputargs = vec![];
 
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::from_raw(0);
+    finish_op.pos = OpRef::void_op(0);
     finish_op.fail_arg_types = Some(vec![]);
     finish_op.fail_args = Some(vec![].into());
 
@@ -65,12 +65,12 @@ fn test_simple_int_add() {
     let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
-    add_op.pos = OpRef::from_raw(1); // result is OpRef::from_raw(1)
+    add_op.pos = OpRef::int_op(1); // result is OpRef::int_op(1)
 
-    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::from_raw(1)]);
-    finish_op.pos = OpRef::from_raw(2);
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
+    finish_op.pos = OpRef::void_op(2);
     finish_op.fail_arg_types = Some(vec![Type::Int]);
-    finish_op.fail_args = Some(vec![OpRef::from_raw(1)].into());
+    finish_op.fail_args = Some(vec![OpRef::int_op(1)].into());
 
     let ops = vec![add_op, finish_op];
 
@@ -109,12 +109,12 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
-    add_op.pos = OpRef::from_raw(1);
+    add_op.pos = OpRef::int_op(1);
 
-    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::from_raw(1)]);
-    finish_op.pos = OpRef::from_raw(2);
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
+    finish_op.pos = OpRef::void_op(2);
     finish_op.fail_arg_types = Some(vec![]);
-    finish_op.fail_args = Some(vec![OpRef::from_raw(1)].into());
+    finish_op.fail_args = Some(vec![OpRef::int_op(1)].into());
 
     let ops = vec![add_op, finish_op];
 
@@ -134,7 +134,7 @@ fn test_float_add() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
-    let i0 = OpRef::from_raw(0); // input: f64
+    let i0 = OpRef::input_arg_float(0); // input: f64
     let const_half = OpRef::const_float(1);
 
     // constant 0.5 as raw bits
@@ -148,12 +148,12 @@ fn test_float_add() {
     }];
 
     let mut add_op = Op::new(OpCode::FloatAdd, &[i0, const_half]);
-    add_op.pos = OpRef::from_raw(1);
+    add_op.pos = OpRef::float_op(1);
 
-    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::from_raw(1)]);
-    finish_op.pos = OpRef::from_raw(2);
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(1)]);
+    finish_op.pos = OpRef::void_op(2);
     finish_op.fail_arg_types = Some(vec![Type::Float]);
-    finish_op.fail_args = Some(vec![OpRef::from_raw(1)].into());
+    finish_op.fail_args = Some(vec![OpRef::float_op(1)].into());
 
     let ops = vec![add_op, finish_op];
 
@@ -203,17 +203,17 @@ fn test_setarrayitem_raw_float_roundtrip() {
     let value = inputargs[1].opref();
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, const_index, value]);
-    set_op.pos = OpRef::from_raw(2);
+    set_op.pos = OpRef::void_op(2);
     set_op.descr = Some(array_descr.clone());
 
     let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, const_index]);
-    get_op.pos = OpRef::from_raw(3);
+    get_op.pos = OpRef::float_op(3);
     get_op.descr = Some(array_descr);
 
-    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::from_raw(3)]);
-    finish_op.pos = OpRef::from_raw(4);
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(3)]);
+    finish_op.pos = OpRef::void_op(4);
     finish_op.fail_arg_types = Some(vec![Type::Float]);
-    finish_op.fail_args = Some(vec![OpRef::from_raw(3)].into());
+    finish_op.fail_args = Some(vec![OpRef::float_op(3)].into());
 
     let ops = vec![set_op, get_op, finish_op];
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
@@ -256,17 +256,17 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     let value = inputargs[2].opref();
 
     let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, index, value]);
-    set_op.pos = OpRef::from_raw(3);
+    set_op.pos = OpRef::void_op(3);
     set_op.descr = Some(array_descr.clone());
 
     let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, index]);
-    get_op.pos = OpRef::from_raw(4);
+    get_op.pos = OpRef::float_op(4);
     get_op.descr = Some(array_descr);
 
-    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::from_raw(4)]);
-    finish_op.pos = OpRef::from_raw(5);
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::float_op(4)]);
+    finish_op.pos = OpRef::void_op(5);
     finish_op.fail_arg_types = Some(vec![Type::Float]);
-    finish_op.fail_args = Some(vec![OpRef::from_raw(4)].into());
+    finish_op.fail_args = Some(vec![OpRef::float_op(4)].into());
 
     let ops = vec![set_op, get_op, finish_op];
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
@@ -309,23 +309,26 @@ fn test_guard_and_loop() {
     }];
     let loop_descr = make_loop_target_descr(token.number, false);
 
-    let mut label_op = Op::new(OpCode::Label, &[OpRef::from_raw(0)]);
-    label_op.pos = OpRef::from_raw(100);
+    let mut label_op = Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]);
+    label_op.pos = OpRef::void_op(100);
     label_op.descr = Some(loop_descr.clone());
 
-    let mut add_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::const_int(1)]);
-    add_op.pos = OpRef::from_raw(1);
+    let mut add_op = Op::new(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+    );
+    add_op.pos = OpRef::int_op(1);
 
-    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), OpRef::const_int(5)]);
-    lt_op.pos = OpRef::from_raw(2);
+    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(5)]);
+    lt_op.pos = OpRef::int_op(2);
 
-    let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
-    guard_op.pos = OpRef::from_raw(3);
+    let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
+    guard_op.pos = OpRef::void_op(3);
     guard_op.fail_arg_types = Some(vec![Type::Int]);
-    guard_op.fail_args = Some(vec![OpRef::from_raw(1)].into());
+    guard_op.fail_args = Some(vec![OpRef::int_op(1)].into());
 
-    let mut jump_op = Op::new(OpCode::Jump, &[OpRef::from_raw(1)]);
-    jump_op.pos = OpRef::from_raw(4);
+    let mut jump_op = Op::new(OpCode::Jump, &[OpRef::int_op(1)]);
+    jump_op.pos = OpRef::void_op(4);
     jump_op.descr = Some(loop_descr);
 
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
@@ -340,7 +343,7 @@ fn test_guard_and_loop() {
     let descr = backend.get_latest_descr(&frame);
     assert!(!descr.is_finish(), "should be guard failure, not finish");
 
-    // fail_args = [OpRef::from_raw(1)], so fail_arg index 0 = the IntAdd result.
+    // fail_args = [OpRef::int_op(1)], so fail_arg index 0 = the IntAdd result.
     let result_val = backend.get_int_value(&frame, 0);
     assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
 }
@@ -369,35 +372,47 @@ fn test_float_loop_carried_across_jump() {
     ];
     let loop_descr = make_loop_target_descr(token.number, false);
 
-    let mut label_op = Op::new(OpCode::Label, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-    label_op.pos = OpRef::from_raw(100);
+    let mut label_op = Op::new(
+        OpCode::Label,
+        &[OpRef::input_arg_float(0), OpRef::input_arg_int(1)],
+    );
+    label_op.pos = OpRef::void_op(100);
     label_op.descr = Some(loop_descr.clone());
 
-    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), OpRef::const_int(5)]);
-    lt_op.pos = OpRef::from_raw(2);
+    let mut lt_op = Op::new(
+        OpCode::IntLt,
+        &[OpRef::input_arg_int(1), OpRef::const_int(5)],
+    );
+    lt_op.pos = OpRef::int_op(2);
 
-    let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
-    guard_op.pos = OpRef::from_raw(3);
+    let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
+    guard_op.pos = OpRef::void_op(3);
     guard_op.fail_arg_types = Some(vec![Type::Float, Type::Int]);
-    guard_op.fail_args = Some(vec![OpRef::from_raw(0), OpRef::from_raw(1)].into());
+    guard_op.fail_args = Some(vec![OpRef::input_arg_float(0), OpRef::input_arg_int(1)].into());
 
-    let mut cast_op = Op::new(OpCode::CastIntToFloat, &[OpRef::from_raw(1)]);
-    cast_op.pos = OpRef::from_raw(4);
+    let mut cast_op = Op::new(OpCode::CastIntToFloat, &[OpRef::input_arg_int(1)]);
+    cast_op.pos = OpRef::float_op(4);
 
     let mut mul_op = Op::new(
         OpCode::FloatMul,
-        &[OpRef::from_raw(4), OpRef::const_float(10)],
+        &[OpRef::float_op(4), OpRef::const_float(10)],
     );
-    mul_op.pos = OpRef::from_raw(5);
+    mul_op.pos = OpRef::float_op(5);
 
-    let mut add_op = Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(5)]);
-    add_op.pos = OpRef::from_raw(6);
+    let mut add_op = Op::new(
+        OpCode::FloatAdd,
+        &[OpRef::input_arg_float(0), OpRef::float_op(5)],
+    );
+    add_op.pos = OpRef::float_op(6);
 
-    let mut inc_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::const_int(1)]);
-    inc_op.pos = OpRef::from_raw(7);
+    let mut inc_op = Op::new(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(1), OpRef::const_int(1)],
+    );
+    inc_op.pos = OpRef::int_op(7);
 
-    let mut jump_op = Op::new(OpCode::Jump, &[OpRef::from_raw(6), OpRef::from_raw(7)]);
-    jump_op.pos = OpRef::from_raw(8);
+    let mut jump_op = Op::new(OpCode::Jump, &[OpRef::float_op(6), OpRef::int_op(7)]);
+    jump_op.pos = OpRef::void_op(8);
     jump_op.descr = Some(loop_descr);
 
     let ops = vec![
@@ -453,22 +468,22 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     let i0 = inputargs[0].opref();
 
     let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
-    guard_gc_type.pos = OpRef::from_raw(1);
+    guard_gc_type.pos = OpRef::void_op(1);
     guard_gc_type.fail_arg_types = Some(vec![]);
     guard_gc_type.fail_args = Some(vec![].into());
 
     let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
-    guard_is_object.pos = OpRef::from_raw(2);
+    guard_is_object.pos = OpRef::void_op(2);
     guard_is_object.fail_arg_types = Some(vec![]);
     guard_is_object.fail_args = Some(vec![].into());
 
     let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_vtable]);
-    guard_subclass.pos = OpRef::from_raw(3);
+    guard_subclass.pos = OpRef::void_op(3);
     guard_subclass.fail_arg_types = Some(vec![]);
     guard_subclass.fail_args = Some(vec![].into());
 
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::from_raw(4);
+    finish_op.pos = OpRef::void_op(4);
     finish_op.fail_arg_types = Some(vec![]);
     finish_op.fail_args = Some(vec![].into());
 
@@ -507,11 +522,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         }];
         let i0 = inputargs[0].opref();
         let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
-        guard_gc_type.pos = OpRef::from_raw(1);
+        guard_gc_type.pos = OpRef::void_op(1);
         guard_gc_type.fail_arg_types = Some(vec![Type::Ref]);
         guard_gc_type.fail_args = Some(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos = OpRef::from_raw(2);
+        finish_op.pos = OpRef::void_op(2);
         finish_op.fail_arg_types = Some(vec![]);
         finish_op.fail_args = Some(vec![].into());
 
@@ -541,11 +556,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         }];
         let i0 = inputargs[0].opref();
         let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
-        guard_is_object.pos = OpRef::from_raw(1);
+        guard_is_object.pos = OpRef::void_op(1);
         guard_is_object.fail_arg_types = Some(vec![Type::Ref]);
         guard_is_object.fail_args = Some(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos = OpRef::from_raw(2);
+        finish_op.pos = OpRef::void_op(2);
         finish_op.fail_arg_types = Some(vec![]);
         finish_op.fail_args = Some(vec![].into());
 
@@ -585,11 +600,11 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         }];
         let i0 = inputargs[0].opref();
         let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_a_vtable]);
-        guard_subclass.pos = OpRef::from_raw(1);
+        guard_subclass.pos = OpRef::void_op(1);
         guard_subclass.fail_arg_types = Some(vec![Type::Ref]);
         guard_subclass.fail_args = Some(vec![i0].into());
         let mut finish_op = Op::new(OpCode::Finish, &[]);
-        finish_op.pos = OpRef::from_raw(2);
+        finish_op.pos = OpRef::void_op(2);
         finish_op.fail_arg_types = Some(vec![]);
         finish_op.fail_args = Some(vec![].into());
 
@@ -622,14 +637,14 @@ fn test_exception_guards_use_dynasm_emit() {
     let inputargs = vec![];
 
     let mut guard_exception = Op::new(OpCode::GuardException, &[const_expected_class]);
-    guard_exception.pos = OpRef::from_raw(0);
+    guard_exception.pos = OpRef::ref_op(0);
     guard_exception.fail_arg_types = Some(vec![]);
     guard_exception.fail_args = Some(vec![].into());
 
-    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::from_raw(0)]);
-    finish_op.pos = OpRef::from_raw(1);
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef::ref_op(0)]);
+    finish_op.pos = OpRef::void_op(1);
     finish_op.fail_arg_types = Some(vec![Type::Ref]);
-    finish_op.fail_args = Some(vec![OpRef::from_raw(0)].into());
+    finish_op.fail_args = Some(vec![OpRef::ref_op(0)].into());
 
     let ops = vec![guard_exception, finish_op];
     let result = backend.compile_loop(&inputargs, &ops, &mut token);
@@ -659,12 +674,12 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let inputargs = vec![];
     let mut guard_no_exception = Op::new(OpCode::GuardNoException, &[]);
-    guard_no_exception.pos = OpRef::from_raw(0);
+    guard_no_exception.pos = OpRef::void_op(0);
     guard_no_exception.fail_arg_types = Some(vec![]);
     guard_no_exception.fail_args = Some(vec![].into());
 
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::from_raw(1);
+    finish_op.pos = OpRef::void_op(1);
     finish_op.fail_arg_types = Some(vec![]);
     finish_op.fail_args = Some(vec![].into());
 
@@ -691,11 +706,11 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     always_backend.attach_default_test_descrs();
     let mut always_token = JitCellToken::new(44);
     let mut guard_always_fails = Op::new(OpCode::GuardAlwaysFails, &[]);
-    guard_always_fails.pos = OpRef::from_raw(0);
+    guard_always_fails.pos = OpRef::void_op(0);
     guard_always_fails.fail_arg_types = Some(vec![]);
     guard_always_fails.fail_args = Some(vec![].into());
     let mut finish_op = Op::new(OpCode::Finish, &[]);
-    finish_op.pos = OpRef::from_raw(1);
+    finish_op.pos = OpRef::void_op(1);
     finish_op.fail_arg_types = Some(vec![]);
     finish_op.fail_args = Some(vec![].into());
     let ops = vec![guard_always_fails, finish_op];

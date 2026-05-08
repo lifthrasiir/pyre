@@ -3929,7 +3929,7 @@ fn assemble_peeled_trace_with_jump_args(
                 let pos = inputarg_base + i as u32;
                 match ctx.inputarg_type_at(i) {
                     Some(tp) => OpRef::input_arg_typed(pos, tp),
-                    None => OpRef::from_raw(pos),
+                    None => OpRef::int_op(pos),
                 }
             })
             .collect();
@@ -4047,7 +4047,7 @@ fn assemble_peeled_trace_with_jump_args(
     // showed this block fires 0 times after Commit D1/D2's disjoint Phase
     // 2 OpRef range eliminated the divergence cases. Removed.
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
-    label_op.pos = OpRef::from_raw(label_pos);
+    label_op.pos = OpRef::int_op(label_pos);
     label_op.descr = loop_label_descr;
     result.push(label_op);
 
@@ -4124,7 +4124,7 @@ fn assemble_peeled_trace_with_jump_args(
         // Void ops (SetfieldGc, guards, Jump) don't define values at
         // their position — mapping them creates phantom OpRefs.
         if op.pos.raw() != u32::MAX && op.result_type() != Type::Void {
-            let fresh = OpRef::from_raw(next_body_pos);
+            let fresh = OpRef::int_op(next_body_pos);
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
             body_result_remap.insert(op.pos, fresh);
         }
@@ -4660,7 +4660,7 @@ mod tests {
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::from_raw(base + i as u32);
+            op.pos = OpRef::op_typed(base + i as u32, op.opcode.result_type());
         }
     }
 
@@ -4681,14 +4681,14 @@ mod tests {
     #[test]
     fn test_exported_state_high_water_covers_retrace_namespace() {
         let exported = ExportedState::new(
-            vec![OpRef::from_raw(52)],
-            vec![OpRef::from_raw(109), OpRef::from_const(3)],
+            vec![OpRef::int_op(52)],
+            vec![OpRef::int_op(109), OpRef::const_int(3)],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             HashMap::new(),
             Vec::new(),
-            vec![OpRef::from_raw(14)],
+            vec![OpRef::int_op(14)],
             Vec::new(),
-            vec![OpRef::from_raw(23)],
+            vec![OpRef::int_op(23)],
         );
 
         assert_eq!(exported.opref_high_water(), 110);
@@ -4726,11 +4726,8 @@ mod tests {
         // Without a Jump back-edge, the pass just buffers and nothing is emitted.
         // (In practice, traces always end with Jump or Finish.)
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -4761,13 +4758,13 @@ mod tests {
     fn test_jump_to_preamble_preserves_jump_args() {
         let body_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-                op.pos = OpRef::from_raw(2);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+                op.pos = OpRef::int_op(2);
                 op
             },
             Op::new(
                 OpCode::Jump,
-                &[OpRef::from_raw(0), OpRef::from_raw(2), OpRef::from_raw(50)],
+                &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)],
             ),
         ];
         let preamble_target = TargetToken::new_preamble(7);
@@ -4776,7 +4773,7 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1].args.as_slice(),
-            &[OpRef::from_raw(0), OpRef::from_raw(2), OpRef::from_raw(50)]
+            &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)]
         );
         assert_eq!(
             result[1].descr.as_ref().map(|descr| descr.repr()),
@@ -4786,32 +4783,26 @@ mod tests {
 
     #[test]
     fn test_reshape_jump_args_for_preamble_pads_missing_invariants() {
-        let mut jump_args = vec![OpRef::from_raw(0)];
-        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        assert_eq!(
-            jump_args.as_slice(),
-            &[OpRef::from_raw(0), OpRef::from_raw(1)]
-        );
+        let mut jump_args = vec![OpRef::int_op(0)];
+        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        assert_eq!(jump_args.as_slice(), &[OpRef::int_op(0), OpRef::int_op(1)]);
     }
 
     #[test]
     fn test_reshape_jump_args_for_preamble_truncates_extra_slots() {
-        let mut jump_args = vec![OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)];
-        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::from_raw(10), OpRef::from_raw(11)]);
-        assert_eq!(
-            jump_args.as_slice(),
-            &[OpRef::from_raw(0), OpRef::from_raw(1)]
-        );
+        let mut jump_args = vec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)];
+        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::int_op(10), OpRef::int_op(11)]);
+        assert_eq!(jump_args.as_slice(), &[OpRef::int_op(0), OpRef::int_op(1)]);
     }
 
     #[test]
     fn test_replace_terminal_jump_appends_when_body_prefix_has_no_jump() {
         let body_ops = vec![{
-            let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-            op.pos = OpRef::from_raw(2);
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+            op.pos = OpRef::int_op(2);
             op
         }];
-        let mut jump = Op::new(OpCode::Jump, &[OpRef::from_raw(2)]);
+        let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(2)]);
         jump.descr = Some(TargetToken::new_preamble(7).as_jump_target_descr());
 
         let result = replace_terminal_jump(&body_ops, jump);
@@ -4819,7 +4810,7 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
         assert_eq!(result[1].opcode, OpCode::Jump);
-        assert_eq!(result[1].args.as_slice(), &[OpRef::from_raw(2)]);
+        assert_eq!(result[1].args.as_slice(), &[OpRef::int_op(2)]);
         assert_eq!(
             result[1].descr.as_ref().map(|descr| descr.repr()),
             Some("LoopTargetDescr(start:7)".to_string())
@@ -4876,10 +4867,7 @@ mod tests {
         // A simple loop: one add op, then Jump.
         // Expected output: peeled_add, Label, original_add, Jump
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 0);
@@ -4900,14 +4888,8 @@ mod tests {
     #[test]
     fn test_peeled_ops_have_different_positions() {
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(
-                OpCode::IntSub,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 0);
@@ -4948,11 +4930,8 @@ mod tests {
         // body_v1 = IntMul(body_v0, v101)    -- v0 remapped to body_v0
         // Jump()
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(101)]), // references op0
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(0), OpRef::int_op(101)]), // references op0
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 0);
@@ -4969,7 +4948,7 @@ mod tests {
         // peeled_mul should reference peeled_add's position, not original op0.
         assert_eq!(peeled_mul.args[0], peeled_add.pos);
         // Second arg (input ref) should be unchanged.
-        assert_eq!(peeled_mul.args[1], OpRef::from_raw(101));
+        assert_eq!(peeled_mul.args[1], OpRef::int_op(101));
 
         // Original body:
         let body_add = &result[3];
@@ -4978,17 +4957,14 @@ mod tests {
         assert_eq!(body_mul.opcode, OpCode::IntMul);
         // body_mul should reference body_add's position.
         assert_eq!(body_mul.args[0], body_add.pos);
-        assert_eq!(body_mul.args[1], OpRef::from_raw(101));
+        assert_eq!(body_mul.args[1], OpRef::int_op(101));
     }
 
     #[test]
     fn test_external_refs_preserved() {
         // Refs to ops outside the buffer (input arguments) should not be remapped.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 0);
@@ -4996,12 +4972,12 @@ mod tests {
         let result = run_unroll_pass(&ops);
 
         // Peeled add should still reference v100 and v101.
-        assert_eq!(result[0].args[0], OpRef::from_raw(100));
-        assert_eq!(result[0].args[1], OpRef::from_raw(101));
+        assert_eq!(result[0].args[0], OpRef::int_op(100));
+        assert_eq!(result[0].args[1], OpRef::int_op(101));
 
         // Body add should also reference v100 and v101.
-        assert_eq!(result[2].args[0], OpRef::from_raw(100));
-        assert_eq!(result[2].args[1], OpRef::from_raw(101));
+        assert_eq!(result[2].args[0], OpRef::int_op(100));
+        assert_eq!(result[2].args[1], OpRef::int_op(101));
     }
 
     // ── Guard preservation ────────────────────────────────────────────
@@ -5010,11 +4986,8 @@ mod tests {
     fn test_guards_duplicated_in_peel() {
         // Guards in the preamble serve as type checks.
         let mut ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(100)]),
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 0);
@@ -5038,13 +5011,10 @@ mod tests {
     fn test_guard_fail_args_remapped() {
         // Guards with fail_args should have those refs remapped too.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
             {
-                let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(100)]);
-                guard.fail_args = Some(vec![OpRef::from_raw(0)].into()); // refs op0
+                let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]);
+                guard.fail_args = Some(vec![OpRef::int_op(0)].into()); // refs op0
                 guard
             },
             Op::new(OpCode::Jump, &[]),
@@ -5080,11 +5050,8 @@ mod tests {
     fn test_jump_args_remapped_to_body() {
         // Jump args should reference the body's ops, not the original positions.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]), // carries v0 (the add result)
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]), // carries v0 (the add result)
         ];
         assign_positions(&mut ops, 0);
 
@@ -5107,11 +5074,8 @@ mod tests {
     fn test_label_args_match_jump_args() {
         // The Label should carry the same args as the Jump.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0), OpRef::from_raw(100)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(100)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -5131,14 +5095,11 @@ mod tests {
     #[test]
     fn test_multi_op_loop() {
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(101)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(2)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(0), OpRef::int_op(101)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -5168,7 +5129,7 @@ mod tests {
 
         // Simulate some state.
         pass.buffer
-            .push(Op::new(OpCode::IntAdd, &[OpRef::from_raw(0)]));
+            .push(Op::new(OpCode::IntAdd, &[OpRef::int_op(0)]));
         pass.seen_jump = true;
 
         pass.setup();
@@ -5183,12 +5144,9 @@ mod tests {
     fn test_unroll_standalone_optimizer() {
         // Run the unroll pass through the optimizer infrastructure.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -5226,7 +5184,7 @@ mod tests {
         let descr = crate::compile::make_resume_guard_descr_typed(Vec::new());
         let original_index = descr.index();
         let mut ops = vec![
-            Op::with_descr(OpCode::GuardTrue, &[OpRef::from_raw(100)], descr.clone()),
+            Op::with_descr(OpCode::GuardTrue, &[OpRef::int_op(100)], descr.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
         assign_positions(&mut ops, 0);
@@ -5269,13 +5227,10 @@ mod tests {
         // In the peeled copy, all internal refs must point to peeled positions.
         // In the body copy, all internal refs must point to body positions.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(100)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(2)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(100)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::int_op(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
         ];
         assign_positions(&mut ops, 0);
 
@@ -5310,13 +5265,13 @@ mod tests {
         let mut unroll_opt = UnrollOptimizer::new();
         // IntAdd operates on Int-typed inputs — seed the inner phase1/2
         // optimizers' trace_inputarg_types via UnrollOptimizer so the
-        // intbounds pass sees Int on OpRef::from_raw(0), OpRef::from_raw(1).
+        // intbounds pass sees Int on OpRef::int_op(0), OpRef::void_op(1).
         unroll_opt.trace_inputarg_types = vec![majit_ir::Type::Int; 2];
         // Use optimize_trace_with_constants_and_inputs to properly set
         // num_inputs so input args don't collide with op positions.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::void_op(1)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops, 2);
         let mut constants = std::collections::HashMap::new();
@@ -5329,10 +5284,10 @@ mod tests {
     #[test]
     fn test_unroll_optimizer_count_guards() {
         let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::GuardNonnull, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::GuardNonnull, &[OpRef::int_op(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         assert_eq!(UnrollOptimizer::count_guards(&ops), 2);
     }
@@ -5344,10 +5299,10 @@ mod tests {
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
         let mut exported_bounds = std::collections::HashMap::new();
-        exported_bounds.insert(OpRef::from_raw(21), IntBound::bounded(10, 20));
+        exported_bounds.insert(OpRef::int_op(21), IntBound::bounded(10, 20));
 
         let exported = export_state(
-            &[OpRef::from_raw(21)],
+            &[OpRef::int_op(21)],
             &[],
             &mut optimizer,
             &mut ctx,
@@ -5355,7 +5310,7 @@ mod tests {
         );
 
         assert_eq!(
-            match &exported.exported_infos[&OpRef::from_raw(21)] {
+            match &exported.exported_infos[&OpRef::int_op(21)] {
                 crate::optimizeopt::info::OpInfo::IntBound(b) => Some((b.lower, b.upper)),
                 _ => None,
             },
@@ -5363,13 +5318,13 @@ mod tests {
         );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
-        let label_args = import_state(&[OpRef::from_raw(0)], &exported, &mut optimizer, &mut ctx2);
-        assert_eq!(label_args, vec![OpRef::from_raw(21)]);
+        let label_args = import_state(&[OpRef::int_op(0)], &exported, &mut optimizer, &mut ctx2);
+        assert_eq!(label_args, vec![OpRef::int_op(21)]);
         // unroll.py:93-96: IntBound IS imported with widen() and stored
         // directly on the box's _forwarded slot via setintbound.
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
-        let imported_bound = ctx2.getintbound(OpRef::from_raw(21));
+        let imported_bound = ctx2.getintbound(OpRef::int_op(21));
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
     }
 
@@ -5377,11 +5332,11 @@ mod tests {
     fn test_export_state_uses_forced_end_args_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref]);
-        ctx.preamble_end_args = Some(vec![OpRef::from_raw(21)]);
+        ctx.preamble_end_args = Some(vec![OpRef::int_op(21)]);
 
-        let exported = export_state(&[OpRef::from_raw(0)], &[], &mut optimizer, &mut ctx, None);
+        let exported = export_state(&[OpRef::int_op(0)], &[], &mut optimizer, &mut ctx, None);
 
-        assert_eq!(exported.end_args, vec![OpRef::from_raw(21)]);
+        assert_eq!(exported.end_args, vec![OpRef::int_op(21)]);
     }
 
     #[test]
@@ -5404,10 +5359,10 @@ mod tests {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcI,
-                        &[OpRef::from_raw(10)],
+                        &[OpRef::int_op(10)],
                         field_descr.clone(),
                     );
-                    op.pos = OpRef::from_raw(11);
+                    op.pos = OpRef::int_op(11);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -5417,7 +5372,7 @@ mod tests {
             });
 
         let exported = export_state(
-            &[OpRef::from_raw(10), OpRef::from_raw(11)],
+            &[OpRef::int_op(10), OpRef::int_op(11)],
             &[],
             &mut optimizer,
             &mut ctx,
@@ -5425,20 +5380,20 @@ mod tests {
         );
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Ref, Type::Ref]);
-        let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1)];
+        let targetargs = [OpRef::int_op(0), OpRef::int_op(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
-        assert_eq!(label_args, vec![OpRef::from_raw(10), OpRef::from_raw(11)]);
+        assert_eq!(label_args, vec![OpRef::int_op(10), OpRef::int_op(11)]);
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
-        let obj_resolved = ctx2.get_box_replacement(OpRef::from_raw(10));
+        let obj_resolved = ctx2.get_box_replacement(OpRef::int_op(10));
         let pop = ctx2
             .with_ptr_info_mut(obj_resolved, |info| info.take_preamble_field(0))
             .flatten();
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
-        assert_eq!(pop.op, OpRef::from_raw(11)); // Phase 1 source — pop.op
+        assert_eq!(pop.op, OpRef::int_op(11)); // Phase 1 source — pop.op
         // forwards via replace_op to the body-visible OpRef.
         drop(parent);
     }
@@ -5449,16 +5404,16 @@ mod tests {
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
         let ptr = GcRef(0x1234_5678);
         let field_descr = majit_ir::descr::make_field_descr_full(88, 0, 8, Type::Int, false);
-        ctx.seed_constant(OpRef::from_const(23), Value::Ref(ptr));
+        ctx.seed_constant(OpRef::const_ptr(23), Value::Ref(ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcPureI,
-                        &[OpRef::from_const(23)],
+                        &[OpRef::const_ptr(23)],
                         field_descr.clone(),
                     );
-                    op.pos = OpRef::from_raw(11);
+                    op.pos = OpRef::int_op(11);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -5468,7 +5423,7 @@ mod tests {
             });
 
         let exported = export_state(
-            &[OpRef::from_raw(12), OpRef::from_raw(11)],
+            &[OpRef::int_op(12), OpRef::int_op(11)],
             &[],
             &mut optimizer,
             &mut ctx,
@@ -5476,10 +5431,10 @@ mod tests {
         );
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref]);
-        let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1)];
+        let targetargs = [OpRef::int_op(0), OpRef::int_op(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
-        assert_eq!(label_args, vec![OpRef::from_raw(12), OpRef::from_raw(11)]);
+        assert_eq!(label_args, vec![OpRef::int_op(12), OpRef::int_op(11)]);
         // unroll.py:454: the imported constant must land in a fresh
         // const-pool slot in the consumer trace, not reuse the producer
         // trace's slot index — majit OpRef is a trace-local index, not
@@ -5497,8 +5452,8 @@ mod tests {
                     Value::Ref(ptr),
                     fresh_const,
                 )],
-                OpRef::from_raw(11),
-                OpRef::from_raw(11),
+                OpRef::int_op(11),
+                OpRef::int_op(11),
                 false
             )]
         );
@@ -5508,14 +5463,14 @@ mod tests {
     fn test_import_short_loopinvariant_uses_producer_const_snapshot() {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(8, 0);
-        let func = OpRef::from_const(7);
+        let func = OpRef::const_int(7);
         let func_ptr = 0xCAFE;
         ctx.seed_constant(func, Value::Int(func_ptr));
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[func]);
-                    op.pos = OpRef::from_raw(11);
+                    op.pos = OpRef::int_op(11);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
@@ -5525,7 +5480,7 @@ mod tests {
             });
 
         let exported = export_state(
-            &[OpRef::from_raw(10), OpRef::from_raw(11)],
+            &[OpRef::int_op(10), OpRef::int_op(11)],
             &[],
             &mut optimizer,
             &mut ctx,
@@ -5533,27 +5488,27 @@ mod tests {
         );
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(8, &[Type::Ref, Type::Ref]);
-        let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1)];
+        let targetargs = [OpRef::int_op(0), OpRef::int_op(1)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
 
         assert_eq!(
             ctx2.imported_loop_invariant_results.get(&func_ptr),
-            Some(&OpRef::from_raw(11))
+            Some(&OpRef::int_op(11))
         );
         assert_eq!(ctx2.get_constant(func), None);
         assert_eq!(
-            ctx2.get_constant(OpRef::from_const(0)),
+            ctx2.get_constant(OpRef::const_int(0)),
             Some(Value::Int(func_ptr))
         );
     }
 
     #[test]
     fn test_import_short_loopinvariant_result_uses_short_inputarg_slot() {
-        let func = OpRef::from_const(7);
+        let func = OpRef::const_int(7);
         let func_ptr = 0xBEEF;
-        let source = OpRef::from_raw(11);
-        let phase2_result = OpRef::from_raw(3);
+        let source = OpRef::int_op(11);
+        let phase2_result = OpRef::int_op(3);
         let exported = ExportedState::new(
             vec![source],
             vec![source],
@@ -5580,7 +5535,7 @@ mod tests {
         );
         ctx.seed_constant(func, Value::Int(func_ptr));
 
-        import_short_preamble_state(&[OpRef::from_raw(0)], &[phase2_result], &exported, &mut ctx);
+        import_short_preamble_state(&[OpRef::int_op(0)], &[phase2_result], &exported, &mut ctx);
 
         // Path B (B.6.7-loopinv): imported_loop_invariant_results stores the
         // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
@@ -5604,16 +5559,12 @@ mod tests {
             &[Type::Ref, Type::Ref, Type::Ref],
         );
         ctx.initialize_imported_short_preamble_builder(
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
-            &[
-                OpRef::from_raw(10),
-                OpRef::from_raw(11),
-                OpRef::from_raw(12),
-            ],
+            &[OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
+            &[OpRef::int_op(10), OpRef::int_op(11), OpRef::int_op(12)],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-                    op.pos = OpRef::from_raw(20);
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+                    op.pos = OpRef::int_op(20);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
@@ -5627,15 +5578,15 @@ mod tests {
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(OpRef::from_raw(20))
+            .produced_short_op(OpRef::int_op(20))
             .unwrap();
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::from_raw(20),
+            op: OpRef::int_op(20),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
-        assert_eq!(forced, OpRef::from_raw(20));
+        assert_eq!(forced, OpRef::int_op(20));
 
         // RPython `unroll.py:32` `use_box` populates `self.short`.
         let sp = ctx.build_imported_short_preamble().unwrap();
@@ -5643,7 +5594,7 @@ mod tests {
         // RPython `unroll.py:34-37` seeds `potential_extra_ops` so a later
         // `force_box` will run `add_preamble_op` (shortpreamble.py:432-440).
         assert!(
-            ctx.potential_extra_ops.contains_key(&OpRef::from_raw(20)),
+            ctx.potential_extra_ops.contains_key(&OpRef::int_op(20)),
             "force_op_from_preamble_op must seed potential_extra_ops"
         );
         // RPython parity: `force_op_from_preamble` does NOT call
@@ -5653,15 +5604,15 @@ mod tests {
         assert!(sp.jump_args.is_empty());
 
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let _ = optimizer.force_box(OpRef::from_raw(20), &mut ctx);
+        let _ = optimizer.force_box(OpRef::int_op(20), &mut ctx);
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         // After force_box: orthodox `add_preamble_op` (shortpreamble.py:432-440)
         // populated all three lists in lock-step.
-        assert_eq!(sp.used_boxes, vec![OpRef::from_raw(20)]);
-        assert_eq!(sp.jump_args, vec![OpRef::from_raw(20)]);
+        assert_eq!(sp.used_boxes, vec![OpRef::int_op(20)]);
+        assert_eq!(sp.jump_args, vec![OpRef::int_op(20)]);
         assert!(
-            !ctx.potential_extra_ops.contains_key(&OpRef::from_raw(20)),
+            !ctx.potential_extra_ops.contains_key(&OpRef::int_op(20)),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -5682,25 +5633,25 @@ mod tests {
         );
         ctx.initialize_imported_short_preamble_builder(
             &[
-                OpRef::from_raw(0),
-                OpRef::from_raw(1),
-                OpRef::from_raw(2),
-                OpRef::from_raw(3),
+                OpRef::ref_op(0),
+                OpRef::ref_op(1),
+                OpRef::ref_op(2),
+                OpRef::ref_op(3),
             ],
             &[
-                OpRef::from_raw(10),
-                OpRef::from_raw(11),
-                OpRef::from_raw(12),
-                OpRef::from_raw(13),
+                OpRef::ref_op(10),
+                OpRef::ref_op(11),
+                OpRef::ref_op(12),
+                OpRef::ref_op(13),
             ],
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::with_descr(
                         OpCode::GetfieldGcR,
-                        &[OpRef::from_raw(3)],
+                        &[OpRef::ref_op(3)],
                         majit_ir::descr::make_field_descr_full(56, 0, 8, Type::Ref, false),
                     );
-                    op.pos = OpRef::from_raw(19);
+                    op.pos = OpRef::ref_op(19);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
@@ -5713,22 +5664,22 @@ mod tests {
             .imported_short_preamble_builder
             .as_ref()
             .unwrap()
-            .produced_short_op(OpRef::from_raw(19))
+            .produced_short_op(OpRef::ref_op(19))
             .unwrap();
         // Path B (B.6.7-heap-field): produce_heap_field no longer installs
         // replace_op, but the test still walks the get_box_replacement
         // chain inside force_box's add_preamble_op, so install a manual
         // forwarding to the body-visible OpRef to exercise that path.
-        ctx.replace_op(OpRef::from_raw(19), OpRef::from_raw(14));
+        ctx.replace_op(OpRef::ref_op(19), OpRef::ref_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
-            op: OpRef::from_raw(19),
+            op: OpRef::ref_op(19),
             invented_name: produced.invented_name,
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
         // RPython `unroll.py:38 return preamble_op.op` ≡ self.res.
         // pyre's Phase 1 source IS self.res for the imported short box.
-        assert_eq!(forced, OpRef::from_raw(19));
+        assert_eq!(forced, OpRef::ref_op(19));
 
         let sp = ctx.build_imported_short_preamble().unwrap();
         assert_eq!(sp.ops.len(), 1);
@@ -5739,7 +5690,7 @@ mod tests {
         // `force_op_from_preamble_op` keys potential_extra_ops by
         // `preamble_source` (non-invented) per `unroll.py:34-37`.
         assert!(
-            ctx.potential_extra_ops.contains_key(&OpRef::from_raw(19)),
+            ctx.potential_extra_ops.contains_key(&OpRef::ref_op(19)),
             "force_op_from_preamble_op must seed potential_extra_ops by source"
         );
 
@@ -5751,10 +5702,10 @@ mod tests {
         // pop.op=19 forwards to body-visible 14 via the producer's replace_op,
         // so used_boxes carries the resolved body-visible OpRef while
         // jump_args carries the unresolved Phase 1 source.
-        assert_eq!(sp.used_boxes, vec![OpRef::from_raw(14)]);
-        assert_eq!(sp.jump_args, vec![OpRef::from_raw(19)]);
+        assert_eq!(sp.used_boxes, vec![OpRef::ref_op(14)]);
+        assert_eq!(sp.jump_args, vec![OpRef::ref_op(19)]);
         assert!(
-            !ctx.potential_extra_ops.contains_key(&OpRef::from_raw(19)),
+            !ctx.potential_extra_ops.contains_key(&OpRef::ref_op(19)),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -5766,38 +5717,33 @@ mod tests {
         ctx.exported_short_boxes
             .push(crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
-                    let mut op =
-                        Op::new(OpCode::IntAdd, &[OpRef::from_raw(12), OpRef::from_raw(13)]);
-                    op.pos = OpRef::from_raw(30);
+                    let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(12), OpRef::int_op(13)]);
+                    op.pos = OpRef::int_op(30);
                     op
                 },
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
                 invented_name: true,
-                same_as_source: Some(OpRef::from_raw(14)),
+                same_as_source: Some(OpRef::int_op(14)),
             });
 
         let exported = export_state(
-            &[
-                OpRef::from_raw(12),
-                OpRef::from_raw(13),
-                OpRef::from_raw(14),
-            ],
+            &[OpRef::int_op(12), OpRef::int_op(13), OpRef::int_op(14)],
             &[],
             &mut optimizer,
             &mut ctx,
             None,
         );
         // Generous Ref-typed inputarg pool — the test only consumes slots 0..3
-        // as `targetargs` and walks `OpRef::from_raw(K)` for various large K
+        // as `targetargs` and walks `OpRef::int_op(K)` for various large K
         // as opaque opref handles. Ref matches the producer shape.
         let mut ctx2 =
             crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Ref; 1024]);
-        let targetargs = [OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)];
+        let targetargs = [OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         let imported_result = ctx2.imported_short_pure_ops[0].result;
-        assert_ne!(imported_result, OpRef::from_raw(30));
+        assert_ne!(imported_result, OpRef::int_op(30));
         let pop = ctx2.imported_short_pure_ops[0].pop.clone();
         let forced = ctx2.force_op_from_preamble_op(&pop);
         // force_op_from_preamble may return the imported position (not necessarily 30)
@@ -5811,37 +5757,37 @@ mod tests {
         let _ = optimizer.force_box(forced, &mut ctx2);
         let aliases = ctx2.used_imported_short_aliases();
         assert_eq!(aliases.len(), 1);
-        assert_eq!(aliases[0].same_as_source, OpRef::from_raw(14));
+        assert_eq!(aliases[0].same_as_source, OpRef::int_op(14));
         assert_eq!(aliases[0].same_as_opcode, OpCode::SameAsI);
     }
 
     #[test]
     fn test_assemble_peeled_trace_emits_extra_same_as_before_label() {
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-            op.pos = OpRef::from_raw(3);
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+            op.pos = OpRef::int_op(3);
             op
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntMul, &[OpRef::from_raw(50), OpRef::from_raw(0)]);
-                op.pos = OpRef::from_raw(1);
+                let mut op = Op::new(OpCode::IntMul, &[OpRef::int_op(50), OpRef::int_op(0)]);
+                op.pos = OpRef::int_op(1);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(50)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(50)]),
         ];
 
         let combined = assemble_peeled_trace(
             &p1_ops,
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
             &[],
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: OpRef::from_raw(50),
-                same_as_source: OpRef::from_raw(10),
+                result: OpRef::int_op(50),
+                same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &std::collections::HashMap::new(),
@@ -5851,7 +5797,7 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::IntAdd);
         assert_eq!(combined[1].opcode, OpCode::SameAsI);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::from_raw(10)]);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(10)]);
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(combined[3].opcode, OpCode::IntMul);
         assert_eq!(combined[3].args[0], combined[1].pos);
@@ -5862,33 +5808,33 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_label_arg_until_body_redef() {
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-            op.pos = OpRef::from_raw(11);
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+            op.pos = OpRef::int_op(11);
             op
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntGe, &[OpRef::from_raw(11), OpRef::from_const(0)]);
-                op.pos = OpRef::from_raw(4);
+                let mut op = Op::new(OpCode::IntGe, &[OpRef::int_op(11), OpRef::const_int(0)]);
+                op.pos = OpRef::int_op(4);
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(11), OpRef::from_const(1)]);
-                op.pos = OpRef::from_raw(11);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(11), OpRef::const_int(1)]);
+                op.pos = OpRef::int_op(11);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(11)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(11)]),
         ];
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::from_const(0).raw(), 2);
-        constants.insert(OpRef::from_const(1).raw(), 1);
+        constants.insert(OpRef::const_int(0).raw(), 2);
+        constants.insert(OpRef::const_int(1).raw(), 1);
 
         let combined = assemble_peeled_trace(
             &p1_ops,
             &p2_ops,
-            &[OpRef::from_raw(11)],
-            &[OpRef::from_raw(0)],
+            &[OpRef::int_op(11)],
+            &[OpRef::int_op(0)],
             &[],
             1,
             true,
@@ -5899,12 +5845,12 @@ mod tests {
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::from_raw(11)]);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(11)]);
         assert_eq!(combined[2].opcode, OpCode::IntGe);
-        assert_eq!(combined[2].args[0], OpRef::from_raw(11));
+        assert_eq!(combined[2].args[0], OpRef::int_op(11));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_eq!(combined[3].args[0], OpRef::from_raw(11));
-        assert_ne!(combined[3].pos, OpRef::from_raw(11));
+        assert_eq!(combined[3].args[0], OpRef::int_op(11));
+        assert_ne!(combined[3].pos, OpRef::int_op(11));
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(combined[4].args[0], combined[3].pos);
     }
@@ -5912,8 +5858,8 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_preserves_visible_preamble_box_over_body_collision() {
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::GetfieldGcR, &[OpRef::from_raw(3)]);
-            op.pos = OpRef::from_raw(19);
+            let mut op = Op::new(OpCode::GetfieldGcR, &[OpRef::int_op(3)]);
+            op.pos = OpRef::int_op(19);
             op.descr = Some(majit_ir::descr::make_field_descr_full(
                 56,
                 0,
@@ -5925,10 +5871,7 @@ mod tests {
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(
-                    OpCode::SetfieldGc,
-                    &[OpRef::from_raw(25), OpRef::from_raw(19)],
-                );
+                let mut op = Op::new(OpCode::SetfieldGc, &[OpRef::int_op(25), OpRef::int_op(19)]);
                 op.descr = Some(majit_ir::descr::make_field_descr_full(
                     57,
                     8,
@@ -5939,21 +5882,21 @@ mod tests {
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_const(1)]);
-                op.pos = OpRef::from_raw(19);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::const_int(1)]);
+                op.pos = OpRef::int_op(19);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(19)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(19)]),
         ];
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::from_const(1).raw(), 1);
+        constants.insert(OpRef::const_int(1).raw(), 1);
 
         let combined = assemble_peeled_trace(
             &p1_ops,
             &p2_ops,
-            &[OpRef::from_raw(0)],
-            &[OpRef::from_raw(0)],
+            &[OpRef::int_op(0)],
+            &[OpRef::int_op(0)],
             &[],
             1,
             true,
@@ -5965,9 +5908,9 @@ mod tests {
 
         assert_eq!(combined[1].opcode, OpCode::Label);
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(combined[2].args[1], OpRef::from_raw(19));
+        assert_eq!(combined[2].args[1], OpRef::int_op(19));
         assert_eq!(combined[3].opcode, OpCode::IntAdd);
-        assert_ne!(combined[3].pos, OpRef::from_raw(19));
+        assert_ne!(combined[3].pos, OpRef::int_op(19));
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(combined[4].args[0], combined[3].pos);
     }
@@ -5977,33 +5920,33 @@ mod tests {
         // Production caller passes body ops whose args have already been
         // resolved through ctx.get_box_replacement (optimizer.rs:2236-2262
         // forwarding-resolve pass). We mirror that here by writing the
-        // resolved label_arg (OpRef::from_raw(10)) directly into the body op rather
-        // than the raw inputarg position OpRef::from_raw(0).
+        // resolved label_arg (OpRef::int_op(10)) directly into the body op rather
+        // than the raw inputarg position OpRef::int_op(0).
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-            op.pos = OpRef::from_raw(3);
+            let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+            op.pos = OpRef::int_op(3);
             op
         }];
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntMul, &[OpRef::from_raw(50), OpRef::from_raw(10)]);
-                op.pos = OpRef::from_raw(1);
+                let mut op = Op::new(OpCode::IntMul, &[OpRef::int_op(50), OpRef::int_op(10)]);
+                op.pos = OpRef::int_op(1);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(10), OpRef::from_raw(50)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(10), OpRef::int_op(50)]),
         ];
 
         let combined = assemble_peeled_trace(
             &p1_ops,
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
-            &[OpRef::from_raw(50)],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[OpRef::int_op(50)],
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: OpRef::from_raw(50),
-                same_as_source: OpRef::from_raw(10),
+                result: OpRef::int_op(50),
+                same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &std::collections::HashMap::new(),
@@ -6014,62 +5957,54 @@ mod tests {
         assert_eq!(combined[2].opcode, OpCode::Label);
         assert_eq!(
             combined[2].args.as_slice(),
-            &[OpRef::from_raw(10), combined[1].pos]
+            &[OpRef::int_op(10), combined[1].pos]
         );
         assert_eq!(combined[4].opcode, OpCode::Jump);
         assert_eq!(
             combined[4].args.as_slice(),
-            &[OpRef::from_raw(10), combined[1].pos]
+            &[OpRef::int_op(10), combined[1].pos]
         );
     }
 
     #[test]
     fn test_assemble_peeled_trace_keeps_used_box_with_stale_constant_entry() {
         let p1_ops = vec![{
-            let mut op = Op::new(OpCode::SameAsI, &[OpRef::from_raw(37)]);
-            op.pos = OpRef::from_raw(857);
+            let mut op = Op::new(OpCode::SameAsI, &[OpRef::int_op(37)]);
+            op.pos = OpRef::void_op(857);
             op
         }];
         let p2_ops = vec![
             {
                 let mut op = Op::new(
                     OpCode::GuardValue,
-                    &[OpRef::from_raw(857), OpRef::from_const(0)],
+                    &[OpRef::void_op(857), OpRef::const_int(0)],
                 );
-                op.fail_args = Some(vec![OpRef::from_raw(857)].into());
+                op.fail_args = Some(vec![OpRef::void_op(857)].into());
                 op
             },
             Op::new(
                 OpCode::Jump,
                 &[
-                    OpRef::from_raw(10),
-                    OpRef::from_raw(853),
-                    OpRef::from_raw(857),
-                    OpRef::from_raw(850),
+                    OpRef::int_op(10),
+                    OpRef::int_op(853),
+                    OpRef::void_op(857),
+                    OpRef::int_op(850),
                 ],
             ),
         ];
         let constants = std::collections::HashMap::from([
-            (OpRef::from_raw(857).raw(), 2_i64),
-            (OpRef::from_const(0).raw(), 2_i64),
+            (OpRef::void_op(857).raw(), 2_i64),
+            (OpRef::const_int(0).raw(), 2_i64),
         ]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
-            &[
-                OpRef::from_raw(22),
-                OpRef::from_raw(857),
-                OpRef::from_raw(150),
-            ],
-            &[
-                OpRef::from_raw(853),
-                OpRef::from_raw(857),
-                OpRef::from_raw(850),
-            ],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[OpRef::int_op(22), OpRef::void_op(857), OpRef::int_op(150)],
+            &[OpRef::int_op(853), OpRef::void_op(857), OpRef::int_op(850)],
             1,
             0,
             true,
@@ -6085,25 +6020,25 @@ mod tests {
         assert_eq!(
             combined[1].args.as_slice(),
             &[
-                OpRef::from_raw(10),
-                OpRef::from_raw(22),
-                OpRef::from_raw(857),
-                OpRef::from_raw(150)
+                OpRef::int_op(10),
+                OpRef::int_op(22),
+                OpRef::void_op(857),
+                OpRef::int_op(150)
             ]
         );
         assert_eq!(combined[2].opcode, OpCode::GuardValue);
         assert_eq!(
             combined[2].args.as_slice(),
-            &[OpRef::from_raw(857), OpRef::from_const(0)]
+            &[OpRef::void_op(857), OpRef::const_int(0)]
         );
         assert_eq!(combined[3].opcode, OpCode::Jump);
         assert_eq!(
             combined[3].args.as_slice(),
             &[
-                OpRef::from_raw(10),
-                OpRef::from_raw(22),
-                OpRef::from_raw(857),
-                OpRef::from_raw(150)
+                OpRef::int_op(10),
+                OpRef::int_op(22),
+                OpRef::void_op(857),
+                OpRef::int_op(150)
             ]
         );
     }
@@ -6111,12 +6046,12 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_remaps_extra_label_source_slots() {
         // Production caller pre-resolves body args through
-        // ctx.get_box_replacement; OpRef::from_raw(0) (Phase 2 inputarg slot) is
-        // pre-replaced with OpRef::from_raw(10) (the corresponding label_arg).
+        // ctx.get_box_replacement; OpRef::int_op(0) (Phase 2 inputarg slot) is
+        // pre-replaced with OpRef::int_op(10) (the corresponding label_arg).
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::from_raw(50)]);
-                op.pos = OpRef::from_raw(1);
+                let mut op = Op::new(OpCode::GetfieldGcPureI, &[OpRef::int_op(50)]);
+                op.pos = OpRef::int_op(1);
                 op.descr = Some(majit_ir::make_field_descr(
                     0,
                     8,
@@ -6125,20 +6060,20 @@ mod tests {
                 ));
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(10), OpRef::from_raw(50)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(10), OpRef::int_op(50)]),
         ];
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
-            &[OpRef::from_raw(50)],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[OpRef::int_op(50)],
             1,
             true,
             &[crate::optimizeopt::ImportedShortAlias {
-                result: OpRef::from_raw(50),
-                same_as_source: OpRef::from_raw(10),
+                result: OpRef::int_op(50),
+                same_as_source: OpRef::int_op(10),
                 same_as_opcode: OpCode::SameAsI,
             }],
             &std::collections::HashMap::new(),
@@ -6152,10 +6087,7 @@ mod tests {
             .expect("label");
         let label = &combined[label_idx];
         let extra_label_arg = label.args[1];
-        assert_eq!(
-            label.args.as_slice(),
-            &[OpRef::from_raw(10), extra_label_arg]
-        );
+        assert_eq!(label.args.as_slice(), &[OpRef::int_op(10), extra_label_arg]);
         let body_getfield = &combined[label_idx + 1];
         assert_eq!(body_getfield.opcode, OpCode::GetfieldGcPureI);
         assert_eq!(body_getfield.args.as_slice(), &[extra_label_arg]);
@@ -6165,29 +6097,29 @@ mod tests {
     fn test_assemble_peeled_trace_carries_body_value_used_before_local_def() {
         // Production caller pre-resolves body args through
         // ctx.get_box_replacement (optimizer.rs:2236-2262), so
-        // OpRef::from_raw(0) (Phase 2 inputarg slot) would already be replaced
-        // with OpRef::from_raw(10) (the label_arg for that slot) by the time
+        // OpRef::int_op(0) (Phase 2 inputarg slot) would already be replaced
+        // with OpRef::int_op(10) (the label_arg for that slot) by the time
         // it reaches the assembler. We mirror that here.
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(64)]);
-                op.fail_args = Some(vec![OpRef::from_raw(64)].into());
+                let mut op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(64)]);
+                op.fail_args = Some(vec![OpRef::int_op(64)].into());
                 op
             },
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_const(0)]);
-                op.pos = OpRef::from_raw(64);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::const_int(0)]);
+                op.pos = OpRef::int_op(64);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(64)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(64)]),
         ];
-        let constants = std::collections::HashMap::from([(OpRef::from_const(0).raw(), 1_i64)]);
+        let constants = std::collections::HashMap::from([(OpRef::const_int(0).raw(), 1_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
             &[],
             1,
             true,
@@ -6200,20 +6132,20 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0].args.as_slice(),
-            &[OpRef::from_raw(10), OpRef::from_raw(64)]
+            &[OpRef::int_op(10), OpRef::int_op(64)]
         );
         assert_eq!(combined[1].opcode, OpCode::GuardTrue);
-        assert_eq!(combined[1].args.as_slice(), &[OpRef::from_raw(64)]);
+        assert_eq!(combined[1].args.as_slice(), &[OpRef::int_op(64)]);
         assert_eq!(
             combined[1]
                 .fail_args
                 .as_ref()
                 .expect("guard fail args")
                 .as_slice(),
-            &[OpRef::from_raw(64)]
+            &[OpRef::int_op(64)]
         );
         assert_eq!(combined[2].opcode, OpCode::IntAdd);
-        assert_ne!(combined[2].pos, OpRef::from_raw(64));
+        assert_ne!(combined[2].pos, OpRef::int_op(64));
     }
 
     #[test]
@@ -6223,11 +6155,11 @@ mod tests {
             let mut jump = Op::new(
                 OpCode::Jump,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(2),
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(4),
+                    OpRef::int_op(0),
+                    OpRef::int_op(1),
+                    OpRef::int_op(2),
+                    OpRef::int_op(3),
+                    OpRef::int_op(4),
                 ],
             );
             jump.descr = Some(start_descr.clone());
@@ -6238,18 +6170,14 @@ mod tests {
             &[],
             &p2_ops,
             &[
-                OpRef::from_raw(10),
-                OpRef::from_raw(11),
-                OpRef::from_raw(12),
-                OpRef::from_raw(13),
-                OpRef::from_raw(14),
+                OpRef::int_op(10),
+                OpRef::int_op(11),
+                OpRef::int_op(12),
+                OpRef::int_op(13),
+                OpRef::int_op(14),
             ],
-            &[
-                OpRef::from_raw(100),
-                OpRef::from_raw(101),
-                OpRef::from_raw(102),
-            ],
-            &[OpRef::from_raw(13), OpRef::from_raw(14)],
+            &[OpRef::int_op(100), OpRef::int_op(101), OpRef::int_op(102)],
+            &[OpRef::int_op(13), OpRef::int_op(14)],
             5,
             false,
             &[],
@@ -6268,11 +6196,11 @@ mod tests {
         assert_eq!(
             combined[2].args.as_slice(),
             &[
-                OpRef::from_raw(100),
-                OpRef::from_raw(101),
-                OpRef::from_raw(102),
-                OpRef::from_raw(3),
-                OpRef::from_raw(4)
+                OpRef::int_op(100),
+                OpRef::int_op(101),
+                OpRef::int_op(102),
+                OpRef::int_op(3),
+                OpRef::int_op(4)
             ]
         );
     }
@@ -6283,12 +6211,12 @@ mod tests {
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-                op.pos = OpRef::from_raw(2);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+                op.pos = OpRef::int_op(2);
                 op
             },
             {
-                let mut jump = Op::new(OpCode::Jump, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+                let mut jump = Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]);
                 jump.descr = Some(start_descr.clone());
                 jump
             },
@@ -6297,8 +6225,8 @@ mod tests {
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(0)],
-            &[OpRef::from_raw(100), OpRef::from_raw(101)],
+            &[OpRef::int_op(0)],
+            &[OpRef::int_op(100), OpRef::int_op(101)],
             &[],
             2,
             false,
@@ -6312,7 +6240,7 @@ mod tests {
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
             jump.args.as_slice(),
-            &[OpRef::from_raw(100), OpRef::from_raw(101)]
+            &[OpRef::int_op(100), OpRef::int_op(101)]
         );
     }
 
@@ -6322,34 +6250,26 @@ mod tests {
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let p2_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_const(0)]);
-                op.pos = OpRef::from_raw(20);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::const_int(0)]);
+                op.pos = OpRef::int_op(20);
                 op
             },
             {
                 let mut jump = Op::new(
                     OpCode::Jump,
-                    &[
-                        OpRef::from_raw(10),
-                        OpRef::from_raw(50),
-                        OpRef::from_raw(60),
-                    ],
+                    &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)],
                 );
                 jump.descr = Some(start_descr.clone());
                 jump
             },
         ];
-        let constants = std::collections::HashMap::from([(OpRef::from_const(0).raw(), 1_i64)]);
+        let constants = std::collections::HashMap::from([(OpRef::const_int(0).raw(), 1_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[
-                OpRef::from_raw(100),
-                OpRef::from_raw(101),
-                OpRef::from_raw(102),
-            ],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(100), OpRef::int_op(101), OpRef::int_op(102)],
             &[],
             1,
             false,
@@ -6367,17 +6287,13 @@ mod tests {
                         == Some("LoopTargetDescr(1)".to_string())
             })
             .expect("body label");
-        assert_eq!(body_label.args.as_slice(), &[OpRef::from_raw(10)]);
+        assert_eq!(body_label.args.as_slice(), &[OpRef::int_op(10)]);
 
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(
             jump.args.as_slice(),
-            &[
-                OpRef::from_raw(10),
-                OpRef::from_raw(50),
-                OpRef::from_raw(60)
-            ]
+            &[OpRef::int_op(10), OpRef::int_op(50), OpRef::int_op(60)]
         );
     }
 
@@ -6386,22 +6302,19 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::New, &[]);
-                op.pos = OpRef::from_raw(1);
+                op.pos = OpRef::ref_op(1);
                 op
             },
-            Op::new(
-                OpCode::SetfieldGc,
-                &[OpRef::from_raw(1), OpRef::from_raw(0)],
-            ),
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::SetfieldGc, &[OpRef::ref_op(1), OpRef::int_op(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         let constants = std::collections::HashMap::from([(2_u32, 606_i64), (4_u32, 611_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
             &[],
             1,
             true,
@@ -6413,8 +6326,8 @@ mod tests {
 
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(combined[1].opcode, OpCode::New);
-        assert_ne!(combined[1].pos, OpRef::from_raw(2));
-        assert_ne!(combined[1].pos, OpRef::from_raw(4));
+        assert_ne!(combined[1].pos, OpRef::int_op(2));
+        assert_ne!(combined[1].pos, OpRef::int_op(4));
         assert_eq!(combined[2].opcode, OpCode::SetfieldGc);
         assert_eq!(combined[2].args[0], combined[1].pos);
     }
@@ -6422,7 +6335,7 @@ mod tests {
     #[test]
     fn test_assemble_peeled_trace_skips_constant_extra_label_args() {
         // Production caller pre-resolves the Jump's body inputarg ref
-        // (OpRef::from_raw(0)) to label_args[0] = OpRef::from_raw(10) before it reaches the
+        // (OpRef::int_op(0)) to label_args[0] = OpRef::int_op(10) before it reaches the
         // assembler.
         //
         // `extra_label_args` holds one literal Const entry and one Box.
@@ -6430,16 +6343,16 @@ mod tests {
         // literal Const entries (their value is emitted inline at use
         // sites). Mirrors `assemble_peeled_trace_with_jump_args`'s
         // `label_arg.is_constant()` predicate.
-        let const_extra = OpRef::from_const(7);
-        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::from_raw(10)])];
+        let const_extra = OpRef::const_int(7);
+        let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef::int_op(10)])];
         let constants = std::collections::HashMap::from([(const_extra.raw(), 606_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(10)],
-            &[OpRef::from_raw(0)],
-            &[const_extra, OpRef::from_raw(8)],
+            &[OpRef::int_op(10)],
+            &[OpRef::int_op(0)],
+            &[const_extra, OpRef::int_op(8)],
             1,
             true,
             &[],
@@ -6451,7 +6364,7 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0].args.as_slice(),
-            &[OpRef::from_raw(10), OpRef::from_raw(8)]
+            &[OpRef::int_op(10), OpRef::int_op(8)]
         );
     }
 
@@ -6464,24 +6377,21 @@ mod tests {
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::from_const(0).raw(), 1);
+        constants.insert(OpRef::const_int(0).raw(), 1);
         let p2_ops = vec![
             {
-                let mut op = Op::new(
-                    OpCode::IntAdd,
-                    &[OpRef::from_raw(200), OpRef::from_const(0)],
-                );
-                op.pos = OpRef::from_raw(20);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(200), OpRef::const_int(0)]);
+                op.pos = OpRef::int_op(20);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(200)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(200)]),
         ];
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
-            &[OpRef::from_raw(200), OpRef::from_raw(300)],
-            &[OpRef::from_raw(0)],
+            &[OpRef::int_op(200), OpRef::int_op(300)],
+            &[OpRef::int_op(0)],
             &[],
             6,
             true,
@@ -6494,14 +6404,14 @@ mod tests {
         assert_eq!(combined[0].opcode, OpCode::Label);
         assert_eq!(
             combined[0].args.as_slice(),
-            &[OpRef::from_raw(200), OpRef::from_raw(300)]
+            &[OpRef::int_op(200), OpRef::int_op(300)]
         );
         assert_eq!(combined[1].opcode, OpCode::IntAdd);
-        assert_eq!(combined[1].args[0], OpRef::from_raw(200));
+        assert_eq!(combined[1].args[0], OpRef::int_op(200));
         assert_eq!(combined[2].opcode, OpCode::Jump);
         assert_eq!(
             combined[2].args.as_slice(),
-            &[OpRef::from_raw(200), OpRef::from_raw(300)]
+            &[OpRef::int_op(200), OpRef::int_op(300)]
         );
     }
 
@@ -6509,19 +6419,19 @@ mod tests {
     fn test_splice_redirected_tail_replaces_terminal_jump() {
         let body_ops = vec![
             {
-                let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-                op.pos = OpRef::from_raw(3);
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+                op.pos = OpRef::void_op(3);
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Jump, &[OpRef::int_op(0)]),
         ];
         let redirected_tail = vec![
             {
-                let mut op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(3)]);
-                op.fail_args = Some(vec![OpRef::from_raw(3)].into());
+                let mut op = Op::new(OpCode::GuardTrue, &[OpRef::void_op(3)]);
+                op.fail_args = Some(vec![OpRef::void_op(3)].into());
                 op
             },
-            Op::new(OpCode::Jump, &[OpRef::from_raw(3), OpRef::from_raw(4)]),
+            Op::new(OpCode::Jump, &[OpRef::void_op(3), OpRef::int_op(4)]),
         ];
 
         let spliced = splice_redirected_tail(&body_ops, &redirected_tail);
@@ -6531,7 +6441,7 @@ mod tests {
         assert_eq!(spliced[2].opcode, OpCode::Jump);
         assert_eq!(
             spliced[2].args.as_slice(),
-            &[OpRef::from_raw(3), OpRef::from_raw(4)]
+            &[OpRef::void_op(3), OpRef::int_op(4)]
         );
     }
 
@@ -6539,7 +6449,7 @@ mod tests {
     fn test_closing_loop_contract_arity_uses_actual_jump_contract() {
         let ops = vec![Op::new(
             OpCode::Jump,
-            &[OpRef::from_raw(0), OpRef::from_raw(1), OpRef::from_raw(2)],
+            &[OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
         )];
 
         assert_eq!(closing_loop_contract_arity(&ops, 5), 3);

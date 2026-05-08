@@ -1306,7 +1306,7 @@ mod tests {
     /// Assign sequential positions to ops and pre-seed constants in OptContext.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::from_raw(i as u32);
+            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
         }
     }
 
@@ -1440,34 +1440,23 @@ mod tests {
         //   i3 = strgetitem(p0, i101) -> should resolve to i200, removed
 
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]), // op 0: p0 = newstr(3)
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0: p0 = newstr(3)
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(101), OpRef::int_op(200)],
             ), // op 1
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(201),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(102), OpRef::int_op(201)],
             ), // op 2
-            Op::new(
-                OpCode::Strgetitem,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
-            ), // op 3: get char at 0
+            Op::new(OpCode::Strgetitem, &[OpRef::ref_op(0), OpRef::int_op(101)]), // op 3: get char at 0
         ];
         assign_positions(&mut ops);
 
         let constants = vec![
-            (OpRef::from_raw(100), 3), // length = 3
-            (OpRef::from_raw(101), 0), // index 0
-            (OpRef::from_raw(102), 1), // index 1
+            (OpRef::int_op(100), 3), // length = 3
+            (OpRef::int_op(101), 0), // index 0
+            (OpRef::int_op(102), 1), // index 1
         ];
 
         let result = run_with_constants(&ops, &constants);
@@ -1488,12 +1477,12 @@ mod tests {
         // p0 = newstr(5)
         // i1 = strlen(p0) -> should be constant 5
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]), // op 0
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(0)]),   // op 1
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0
+            Op::new(OpCode::Strlen, &[OpRef::ref_op(0)]),   // op 1
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(100), 5)];
+        let constants = vec![(OpRef::int_op(100), 5)];
 
         let result = run_with_constants(&ops, &constants);
 
@@ -1515,31 +1504,23 @@ mod tests {
         // strsetitem(p0, 1, c1)
         // call_n(p0)     -> forces the string
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]), // op 0
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(101), OpRef::int_op(200)],
             ), // op 1
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(201),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(102), OpRef::int_op(201)],
             ), // op 2
-            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),    // op 3: forces
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),    // op 3: forces
         ];
         assign_positions(&mut ops);
 
         let constants = vec![
-            (OpRef::from_raw(100), 2),
-            (OpRef::from_raw(101), 0),
-            (OpRef::from_raw(102), 1),
+            (OpRef::int_op(100), 2),
+            (OpRef::int_op(101), 0),
+            (OpRef::int_op(102), 1),
         ];
 
         let result = run_with_constants(&ops, &constants);
@@ -1577,17 +1558,17 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         // Constant length refs
-        ctx.make_constant(OpRef::from_raw(100), Value::Int(3));
-        ctx.make_constant(OpRef::from_raw(101), Value::Int(4));
+        ctx.make_constant(OpRef::int_op(100), Value::Int(3));
+        ctx.make_constant(OpRef::int_op(101), Value::Int(4));
 
         // Virtual plain strings
-        let left_ref = OpRef::from_raw(10);
-        let right_ref = OpRef::from_raw(11);
+        let left_ref = OpRef::int_op(10);
+        let right_ref = OpRef::int_op(11);
         set_vstring_plain(&mut ctx, left_ref, vec![None; 3]);
         set_vstring_plain(&mut ctx, right_ref, vec![None; 4]);
 
         // Virtual concat
-        let concat_ref = OpRef::from_raw(12);
+        let concat_ref = OpRef::int_op(12);
         set_vstring_concat(&mut ctx, concat_ref, left_ref, right_ref);
 
         // Check total length = 3 + 4 = 7
@@ -1604,36 +1585,36 @@ mod tests {
         let mut ctx = OptContext::new(10);
 
         // source = "abc" (chars at indices 0, 1, 2)
-        let src_ref = OpRef::from_raw(10);
+        let src_ref = OpRef::int_op(10);
         set_vstring_plain(
             &mut ctx,
             src_ref,
             vec![
-                Some(OpRef::from_raw(200)),
-                Some(OpRef::from_raw(201)),
-                Some(OpRef::from_raw(202)),
+                Some(OpRef::int_op(200)),
+                Some(OpRef::int_op(201)),
+                Some(OpRef::int_op(202)),
             ],
         );
 
         // slice = source[1:3] (start=1, length=2)
-        ctx.make_constant(OpRef::from_raw(300), Value::Int(1)); // start
-        ctx.make_constant(OpRef::from_raw(301), Value::Int(2)); // length
-        let slice_ref = OpRef::from_raw(11);
+        ctx.make_constant(OpRef::int_op(300), Value::Int(1)); // start
+        ctx.make_constant(OpRef::int_op(301), Value::Int(2)); // length
+        let slice_ref = OpRef::int_op(11);
         set_vstring_slice(
             &mut ctx,
             slice_ref,
             src_ref,
-            OpRef::from_raw(300),
-            OpRef::from_raw(301),
+            OpRef::int_op(300),
+            OpRef::int_op(301),
         );
 
-        // Get char at index 0 of the slice -> should be source[1] = OpRef::from_raw(201)
+        // Get char at index 0 of the slice -> should be source[1] = OpRef::int_op(201)
         let ch = pass.strgetitem(slice_ref, 0, &mut ctx);
-        assert_eq!(ch, Some(OpRef::from_raw(201)));
+        assert_eq!(ch, Some(OpRef::int_op(201)));
 
-        // Get char at index 1 of the slice -> should be source[2] = OpRef::from_raw(202)
+        // Get char at index 1 of the slice -> should be source[2] = OpRef::int_op(202)
         let ch = pass.strgetitem(slice_ref, 1, &mut ctx);
-        assert_eq!(ch, Some(OpRef::from_raw(202)));
+        assert_eq!(ch, Some(OpRef::int_op(202)));
     }
 
     #[test]
@@ -1643,40 +1624,34 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let src_ref = OpRef::from_raw(10);
+        let src_ref = OpRef::int_op(10);
         set_vstring_plain(
             &mut ctx,
             src_ref,
             vec![
-                Some(OpRef::from_raw(200)),
-                Some(OpRef::from_raw(201)),
-                Some(OpRef::from_raw(202)),
+                Some(OpRef::int_op(200)),
+                Some(OpRef::int_op(201)),
+                Some(OpRef::int_op(202)),
             ],
         );
 
         // start is not a literal ConstInt box; it is only known via IntBound.
-        let start_ref = OpRef::from_raw(300);
+        let start_ref = OpRef::int_op(300);
         ctx.with_intbound_mut(start_ref, |b| {
             *b = IntBound::from_constant(1);
         });
-        ctx.make_constant(OpRef::from_raw(301), Value::Int(2)); // length
+        ctx.make_constant(OpRef::int_op(301), Value::Int(2)); // length
 
-        let slice_ref = OpRef::from_raw(11);
-        set_vstring_slice(
-            &mut ctx,
-            slice_ref,
-            src_ref,
-            start_ref,
-            OpRef::from_raw(301),
-        );
+        let slice_ref = OpRef::int_op(11);
+        set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
 
         assert_eq!(
             pass.strgetitem(slice_ref, 0, &mut ctx),
-            Some(OpRef::from_raw(201))
+            Some(OpRef::int_op(201))
         );
         assert_eq!(
             pass.strgetitem(slice_ref, 1, &mut ctx),
-            Some(OpRef::from_raw(202))
+            Some(OpRef::int_op(202))
         );
     }
 
@@ -1687,19 +1662,19 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        let src_ref = OpRef::from_raw(10);
+        let src_ref = OpRef::int_op(10);
         set_vstring_plain(&mut ctx, src_ref, vec![None; 5]);
 
-        ctx.make_constant(OpRef::from_raw(300), Value::Int(1)); // start
-        ctx.make_constant(OpRef::from_raw(301), Value::Int(3)); // length
+        ctx.make_constant(OpRef::int_op(300), Value::Int(1)); // start
+        ctx.make_constant(OpRef::int_op(301), Value::Int(3)); // length
 
-        let slice_ref = OpRef::from_raw(11);
+        let slice_ref = OpRef::int_op(11);
         set_vstring_slice(
             &mut ctx,
             slice_ref,
             src_ref,
-            OpRef::from_raw(300),
-            OpRef::from_raw(301),
+            OpRef::int_op(300),
+            OpRef::int_op(301),
         );
 
         let len = pass.get_known_length(slice_ref, &ctx);
@@ -1710,7 +1685,7 @@ mod tests {
     fn test_getstrlen_uses_unicodelen_for_unicode() {
         let pass = OptString::new();
         let mut ctx = OptContext::new(10);
-        let unicode_ref = OpRef::from_raw(7);
+        let unicode_ref = OpRef::int_op(7);
         // vstring.py:452 make_nonnull_str(op, mode_unicode) installs a
         // non-virtual StrPtrInfo with `mode = 1` so that later getstrlen
         // selects UNICODELEN instead of STRLEN.
@@ -1734,7 +1709,7 @@ mod tests {
     #[test]
     fn test_newstr_non_constant_passes_through() {
         // newstr(i0) where i0 is not a known constant -> should emit.
-        let mut ops = vec![Op::new(OpCode::Newstr, &[OpRef::from_raw(50)])];
+        let mut ops = vec![Op::new(OpCode::Newstr, &[OpRef::int_op(50)])];
         assign_positions(&mut ops);
 
         let result = run_with_constants(&ops, &[]);
@@ -1747,10 +1722,10 @@ mod tests {
 
     #[test]
     fn test_newstr_too_large_passes_through() {
-        let mut ops = vec![Op::new(OpCode::Newstr, &[OpRef::from_raw(50)])];
+        let mut ops = vec![Op::new(OpCode::Newstr, &[OpRef::int_op(50)])];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(50), (MAX_CONST_LEN + 1) as i64)];
+        let constants = vec![(OpRef::int_op(50), (MAX_CONST_LEN + 1) as i64)];
         let result = run_with_constants(&ops, &constants);
 
         assert_eq!(result.len(), 1);
@@ -1763,11 +1738,11 @@ mod tests {
     fn test_strgetitem_non_virtual() {
         let mut ops = vec![Op::new(
             OpCode::Strgetitem,
-            &[OpRef::from_raw(50), OpRef::from_raw(51)],
+            &[OpRef::int_op(50), OpRef::int_op(51)],
         )];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(51), 0)];
+        let constants = vec![(OpRef::int_op(51), 0)];
         let result = run_with_constants(&ops, &constants);
 
         assert_eq!(result.len(), 1);
@@ -1781,12 +1756,12 @@ mod tests {
         // p0 = newstr(0) -> virtual (0 chars)
         // call_n(p0)      -> force: emits newstr(0) only, no strsetitem
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]),
-            Op::new(OpCode::CallN, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
+            Op::new(OpCode::CallN, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(100), 0)];
+        let constants = vec![(OpRef::int_op(100), 0)];
         let result = run_with_constants(&ops, &constants);
 
         let newstr_count = result.iter().filter(|o| o.opcode == OpCode::Newstr).count();
@@ -1807,45 +1782,34 @@ mod tests {
         // copystrcontent(src, dst, 0, 0, 2)
         // strgetitem(dst, 0) -> c0
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]), // op 0: src
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 0: src
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(101), OpRef::int_op(200)],
             ), // op 1
             Op::new(
                 OpCode::Strsetitem,
-                &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(102),
-                    OpRef::from_raw(201),
-                ],
+                &[OpRef::ref_op(0), OpRef::int_op(102), OpRef::int_op(201)],
             ), // op 2
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]), // op 3: dst
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]), // op 3: dst
             Op::new(
                 OpCode::Copystrcontent,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(3),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(100),
+                    OpRef::ref_op(0),
+                    OpRef::ref_op(3),
+                    OpRef::int_op(101),
+                    OpRef::int_op(101),
+                    OpRef::int_op(100),
                 ],
             ), // op 4: copy src->dst
-            Op::new(
-                OpCode::Strgetitem,
-                &[OpRef::from_raw(3), OpRef::from_raw(101)],
-            ), // op 5: get dst[0]
+            Op::new(OpCode::Strgetitem, &[OpRef::ref_op(3), OpRef::int_op(101)]), // op 5: get dst[0]
         ];
         assign_positions(&mut ops);
 
         let constants = vec![
-            (OpRef::from_raw(100), 2),
-            (OpRef::from_raw(101), 0),
-            (OpRef::from_raw(102), 1),
+            (OpRef::int_op(100), 2),
+            (OpRef::int_op(101), 0),
+            (OpRef::int_op(102), 1),
         ];
 
         let result = run_with_constants(&ops, &constants);
@@ -1862,22 +1826,22 @@ mod tests {
     #[test]
     fn test_copyunicodecontent_inline_uses_unicodegetitem() {
         let mut ops = vec![
-            Op::new(OpCode::Newunicode, &[OpRef::from_raw(100)]),
-            Op::new(OpCode::Newunicode, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
+            Op::new(OpCode::Newunicode, &[OpRef::int_op(100)]),
             Op::new(
                 OpCode::Copyunicodecontent,
                 &[
-                    OpRef::from_raw(0),
-                    OpRef::from_raw(1),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(100),
+                    OpRef::ref_op(0),
+                    OpRef::ref_op(1),
+                    OpRef::int_op(101),
+                    OpRef::int_op(101),
+                    OpRef::int_op(100),
                 ],
             ),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(100), 2), (OpRef::from_raw(101), 0)];
+        let constants = vec![(OpRef::int_op(100), 2), (OpRef::int_op(101), 0)];
 
         let result = run_with_constants(&ops, &constants);
 
@@ -1902,13 +1866,13 @@ mod tests {
         // i1 = strlen(p0) -> const 3
         // i2 = strlen(p0) -> const 3
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]),
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
+            Op::new(OpCode::Strlen, &[OpRef::ref_op(0)]),
+            Op::new(OpCode::Strlen, &[OpRef::ref_op(0)]),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(100), 3)];
+        let constants = vec![(OpRef::int_op(100), 3)];
         let result = run_with_constants(&ops, &constants);
 
         // All should be removed.
@@ -1922,15 +1886,12 @@ mod tests {
         // p0 = newstr(3), no strsetitem for index 0
         // strgetitem(p0, 0) -> char not set, must force and emit
         let mut ops = vec![
-            Op::new(OpCode::Newstr, &[OpRef::from_raw(100)]),
-            Op::new(
-                OpCode::Strgetitem,
-                &[OpRef::from_raw(0), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::Newstr, &[OpRef::int_op(100)]),
+            Op::new(OpCode::Strgetitem, &[OpRef::ref_op(0), OpRef::int_op(101)]),
         ];
         assign_positions(&mut ops);
 
-        let constants = vec![(OpRef::from_raw(100), 3), (OpRef::from_raw(101), 0)];
+        let constants = vec![(OpRef::int_op(100), 3), (OpRef::int_op(101), 0)];
 
         let result = run_with_constants(&ops, &constants);
 
@@ -1948,23 +1909,23 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        ctx.make_constant(OpRef::from_raw(100), Value::Int(2));
-        ctx.make_constant(OpRef::from_raw(101), Value::Int(3));
-        ctx.make_constant(OpRef::from_raw(102), Value::Int(4));
+        ctx.make_constant(OpRef::int_op(100), Value::Int(2));
+        ctx.make_constant(OpRef::int_op(101), Value::Int(3));
+        ctx.make_constant(OpRef::int_op(102), Value::Int(4));
 
-        let a = OpRef::from_raw(10);
-        let b = OpRef::from_raw(11);
-        let c = OpRef::from_raw(12);
+        let a = OpRef::int_op(10);
+        let b = OpRef::int_op(11);
+        let c = OpRef::int_op(12);
         set_vstring_plain(&mut ctx, a, vec![None; 2]);
         set_vstring_plain(&mut ctx, b, vec![None; 3]);
         set_vstring_plain(&mut ctx, c, vec![None; 4]);
 
         // ab = concat(a, b)
-        let ab = OpRef::from_raw(20);
+        let ab = OpRef::int_op(20);
         set_vstring_concat(&mut ctx, ab, a, b);
 
         // abc = concat(ab, c)
-        let abc = OpRef::from_raw(21);
+        let abc = OpRef::int_op(21);
         set_vstring_concat(&mut ctx, abc, ab, c);
 
         assert_eq!(pass.get_known_length(abc, &ctx), Some(9));
@@ -1977,44 +1938,44 @@ mod tests {
         let mut pass = OptString::new();
         let mut ctx = OptContext::new(10);
 
-        ctx.make_constant(OpRef::from_raw(100), Value::Int(2));
-        ctx.make_constant(OpRef::from_raw(101), Value::Int(2));
+        ctx.make_constant(OpRef::int_op(100), Value::Int(2));
+        ctx.make_constant(OpRef::int_op(101), Value::Int(2));
 
-        let left = OpRef::from_raw(10);
-        let right = OpRef::from_raw(11);
+        let left = OpRef::int_op(10);
+        let right = OpRef::int_op(11);
         set_vstring_plain(
             &mut ctx,
             left,
-            vec![Some(OpRef::from_raw(200)), Some(OpRef::from_raw(201))],
+            vec![Some(OpRef::int_op(200)), Some(OpRef::int_op(201))],
         );
         set_vstring_plain(
             &mut ctx,
             right,
-            vec![Some(OpRef::from_raw(202)), Some(OpRef::from_raw(203))],
+            vec![Some(OpRef::int_op(202)), Some(OpRef::int_op(203))],
         );
 
-        let concat = OpRef::from_raw(12);
+        let concat = OpRef::int_op(12);
         set_vstring_concat(&mut ctx, concat, left, right);
 
         // Index 0 -> left[0] = 200
         assert_eq!(
             pass.strgetitem(concat, 0, &mut ctx),
-            Some(OpRef::from_raw(200))
+            Some(OpRef::int_op(200))
         );
         // Index 1 -> left[1] = 201
         assert_eq!(
             pass.strgetitem(concat, 1, &mut ctx),
-            Some(OpRef::from_raw(201))
+            Some(OpRef::int_op(201))
         );
         // Index 2 -> right[0] = 202
         assert_eq!(
             pass.strgetitem(concat, 2, &mut ctx),
-            Some(OpRef::from_raw(202))
+            Some(OpRef::int_op(202))
         );
         // Index 3 -> right[1] = 203
         assert_eq!(
             pass.strgetitem(concat, 3, &mut ctx),
-            Some(OpRef::from_raw(203))
+            Some(OpRef::int_op(203))
         );
     }
 
@@ -2025,8 +1986,8 @@ mod tests {
         // `known_lengths` cache wiring from panicking or regressing.
         // STRLEN on a non-virtual string should be cached for the second call.
         let mut ops = vec![
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(100)]),
-            Op::new(OpCode::Strlen, &[OpRef::from_raw(100)]),
+            Op::new(OpCode::Strlen, &[OpRef::int_op(100)]),
+            Op::new(OpCode::Strlen, &[OpRef::int_op(100)]),
             Op::new(OpCode::Finish, &[]),
         ];
         assign_positions(&mut ops);
@@ -2035,8 +1996,8 @@ mod tests {
         // (if running through full pipeline) or by vstring.rs known_lengths.
         // With just OptString pass, the first STRLEN passes through and
         // records in known_lengths, but the second one checks known_lengths
-        // which maps OpRef::from_raw(100) → OpRef::from_raw(0) (result of first STRLEN).
-        // Since OpRef::from_raw(0) is not a constant, it won't be removed by OptString alone.
+        // which maps OpRef::int_op(100) → OpRef::int_op(0) (result of first STRLEN).
+        // Since OpRef::int_op(0) is not a constant, it won't be removed by OptString alone.
         // This test just verifies no crash occurs.
         assert!(result.len() >= 1);
     }
@@ -2047,13 +2008,13 @@ mod tests {
         let mut pass = OptString::new();
         pass.setup();
 
-        let left = OpRef::from_raw(100);
+        let left = OpRef::int_op(100);
 
         // Simulate: NEWSTR(2) for left
-        let mut left_op = Op::new(OpCode::Newstr, &[OpRef::from_raw(200)]);
+        let mut left_op = Op::new(OpCode::Newstr, &[OpRef::int_op(200)]);
         left_op.pos = left;
         let mut ctx = OptContext::new(10);
-        ctx.make_constant(OpRef::from_raw(200), Value::Int(2));
+        ctx.make_constant(OpRef::int_op(200), Value::Int(2));
 
         // Process NEWSTR → creates virtual Plain
         let _ = pass.propagate_forward(&left_op, &mut ctx);
@@ -2067,14 +2028,14 @@ mod tests {
     #[test]
     fn test_lgtop_reuse_plain() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
-        let p0 = OpRef::from_raw(0);
+        let p0 = OpRef::int_op(0);
         set_vstring_plain(
             &mut ctx,
             p0,
             vec![
-                Some(OpRef::from_raw(10)),
-                Some(OpRef::from_raw(11)),
-                Some(OpRef::from_raw(12)),
+                Some(OpRef::int_op(10)),
+                Some(OpRef::int_op(11)),
+                Some(OpRef::int_op(12)),
             ],
         );
 
@@ -2096,7 +2057,7 @@ mod tests {
     #[test]
     fn test_lgtop_reuse_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
-        let p0 = OpRef::from_raw(0);
+        let p0 = OpRef::int_op(0);
         // Non-virtual Str with unknown length
         ctx.set_ptr_info(
             p0,
@@ -2129,25 +2090,25 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(4, 0, 0, 50);
         let pass = OptString::new();
 
-        let p0 = OpRef::from_raw(0);
-        let p1 = OpRef::from_raw(1);
+        let p0 = OpRef::int_op(0);
+        let p1 = OpRef::int_op(1);
         // Two virtual strings of the same length (3 chars).
         set_vstring_plain(
             &mut ctx,
             p0,
             vec![
-                Some(OpRef::from_raw(10)),
-                Some(OpRef::from_raw(11)),
-                Some(OpRef::from_raw(12)),
+                Some(OpRef::int_op(10)),
+                Some(OpRef::int_op(11)),
+                Some(OpRef::int_op(12)),
             ],
         );
         set_vstring_plain(
             &mut ctx,
             p1,
             vec![
-                Some(OpRef::from_raw(20)),
-                Some(OpRef::from_raw(21)),
-                Some(OpRef::from_raw(22)),
+                Some(OpRef::int_op(20)),
+                Some(OpRef::int_op(21)),
+                Some(OpRef::int_op(22)),
             ],
         );
 
@@ -2177,7 +2138,7 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
 
         // srcbox (p0): non-null string, not virtual
-        let p0 = OpRef::from_raw(0);
+        let p0 = OpRef::int_op(0);
         ctx.set_ptr_info(
             p0,
             PtrInfo::Str(StrPtrInfo {
@@ -2191,11 +2152,11 @@ mod tests {
             }),
         );
         // targetbox: non-virtual
-        let p1 = OpRef::from_raw(1);
+        let p1 = OpRef::int_op(1);
 
         // lengthbox (i2): int with constant intbound = 2
         // Use an OpRef with IntBound set (not a literal constant)
-        let i2 = OpRef::from_raw(2);
+        let i2 = OpRef::int_op(2);
         ctx.with_intbound_mut(i2, |b| {
             *b = IntBound::from_constant(2);
         });
@@ -2239,7 +2200,7 @@ mod tests {
     #[test]
     fn test_getstrlen_opref_on_nonvirtual() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
-        let arg2 = OpRef::from_raw(1);
+        let arg2 = OpRef::int_op(1);
 
         ctx.set_ptr_info(
             arg2,
@@ -2276,8 +2237,8 @@ mod tests {
     #[test]
     fn test_getstrlen_for_level2_uses_arg1_as_fallback() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
-        let arg1 = OpRef::from_raw(0);
-        let arg2 = OpRef::from_raw(1);
+        let arg1 = OpRef::int_op(0);
+        let arg2 = OpRef::int_op(1);
 
         // Attach non-virtual StrPtrInfo to arg2 with lgtop=None.
         ctx.set_ptr_info(
@@ -2317,15 +2278,15 @@ mod tests {
     fn test_force_then_strlen_reuse() {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(10, 0, 0, 50);
 
-        let p0 = OpRef::from_raw(0);
+        let p0 = OpRef::int_op(0);
         // Virtual Plain string with 3 chars.
         set_vstring_plain(
             &mut ctx,
             p0,
             vec![
-                Some(OpRef::from_raw(10)),
-                Some(OpRef::from_raw(11)),
-                Some(OpRef::from_raw(12)),
+                Some(OpRef::int_op(10)),
+                Some(OpRef::int_op(11)),
+                Some(OpRef::int_op(12)),
             ],
         );
 

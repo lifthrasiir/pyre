@@ -3454,7 +3454,7 @@ mod tests {
         rw.malloc_zero_filled = false;
         let gc_fields = vec![ref_field_descr_at(24), ref_field_descr_at(32)];
         let descr = size_descr_with_gc_fields(48, 42, gc_fields);
-        let val = OpRef::from_const(100);
+        let val = OpRef::const_ptr(100);
         let mut constants = HashMap::new();
         constants.insert(val.raw(), 0x1234);
         let ops = vec![

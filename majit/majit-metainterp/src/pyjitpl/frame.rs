@@ -1089,7 +1089,7 @@ mod tests {
         frame.int_regs[0] = Some(OpRef::int_op(5));
         frame.int_values[0] = Some(0);
         // ref_regs[0] constant pointer addr=0xdead_beef → Box::ConstPtr.
-        frame.ref_regs[0] = Some(OpRef::from_const(7));
+        frame.ref_regs[0] = Some(OpRef::const_ptr(7));
         frame.ref_values[0] = Some(0xdead_beef);
 
         let sd = Arc::new(crate::MetaInterpStaticData::new());
@@ -1572,7 +1572,7 @@ mod tests {
             vec![("g0", Type::Int), ("g1", Type::Int)],
             vec![("r0", Type::Int)],
         );
-        let greens = vec![OpRef::from_const(0), OpRef::from_const(1)];
+        let greens = vec![OpRef::const_int(0), OpRef::const_int(1)];
         // Must not panic — both opref are Const-tagged and length matches.
         MIFrame::verify_green_args(&jd, &greens);
     }
@@ -1586,7 +1586,7 @@ mod tests {
             vec![],
         );
         // Only one green provided — must fail count check.
-        MIFrame::verify_green_args(&jd, &[OpRef::from_const(0)]);
+        MIFrame::verify_green_args(&jd, &[OpRef::const_int(0)]);
     }
 
     #[test]

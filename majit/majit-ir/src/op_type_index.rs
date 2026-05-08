@@ -21,8 +21,16 @@ pub struct OpTypeIndex<'a> {
     inputargs: &'a [InputArg],
     ops: &'a [Op],
     constant_types: &'a HashMap<u32, Type>,
-    inputarg_index: Cow<'a, HashMap<u32, usize>>,
-    op_index: Cow<'a, HashMap<u32, usize>>,
+    inputarg_index: Cow<'a, HashMap<OpRef, usize>>,
+    op_index: Cow<'a, HashMap<OpRef, usize>>,
+    /// Raw-keyed fallback for legacy `OpRef::from_raw()` (`Untyped(_)`)
+    /// readers. Pre-Phase-3 storage was `HashMap<u32, usize>` and a raw
+    /// reader matched any same-raw entry regardless of variant tag; the
+    /// variant-aware typed maps reject that match. Until every
+    /// `from_raw` callsite is migrated to a typed factory, the raw maps
+    /// keep `Untyped(n)` lookups finding typed entries at raw n.
+    raw_inputarg_index: HashMap<u32, usize>,
+    raw_op_index: HashMap<u32, usize>,
 }
 
 impl<'a> OpTypeIndex<'a> {
@@ -31,18 +39,18 @@ impl<'a> OpTypeIndex<'a> {
         ops: &'a [Op],
         constant_types: &'a HashMap<u32, Type>,
     ) -> Self {
-        let inputarg_index: HashMap<u32, usize> = inputargs
-            .iter()
-            .enumerate()
-            .map(|(idx, arg)| (arg.index, idx))
-            .collect();
+        let inputarg_index = Self::build_inputarg_index(inputargs);
         let op_index = Self::build_op_index(ops);
+        let raw_inputarg_index = Self::build_raw_inputarg_index(inputargs);
+        let raw_op_index = Self::build_raw_op_index(ops);
         Self {
             inputargs,
             ops,
             constant_types,
             inputarg_index: Cow::Owned(inputarg_index),
             op_index: Cow::Owned(op_index),
+            raw_inputarg_index,
+            raw_op_index,
         }
     }
 
@@ -52,25 +60,71 @@ impl<'a> OpTypeIndex<'a> {
         inputargs: &'a [InputArg],
         ops: &'a [Op],
         constant_types: &'a HashMap<u32, Type>,
-        inputarg_index: &'a HashMap<u32, usize>,
-        op_index: &'a HashMap<u32, usize>,
+        inputarg_index: &'a HashMap<OpRef, usize>,
+        op_index: &'a HashMap<OpRef, usize>,
     ) -> Self {
+        let raw_inputarg_index = Self::build_raw_inputarg_index(inputargs);
+        let raw_op_index = Self::build_raw_op_index(ops);
         Self {
             inputargs,
             ops,
             constant_types,
             inputarg_index: Cow::Borrowed(inputarg_index),
             op_index: Cow::Borrowed(op_index),
+            raw_inputarg_index,
+            raw_op_index,
         }
+    }
+
+    /// Build the raw inputarg index in iteration order. RPython's
+    /// backend enforces `assert len(set(inputargs)) == len(inputargs)`
+    /// at loop/bridge entry (x86/assembler.py:516-518 +
+    /// aarch64/assembler.py:54-56). The raw u32 boundary is the
+    /// variant-blind dual of that assertion: pyre's regalloc/assembler
+    /// raw fallback path keys by raw u32, so an `InputArgInt(7)` +
+    /// `InputArgRef(7)` collision would silently keep only the later
+    /// one. Hard-panic on raw collision so the violation surfaces here
+    /// rather than as a wrong-type guard fail much further along,
+    /// symmetric to `build_op_index`.
+    pub fn build_raw_inputarg_index(inputargs: &[InputArg]) -> HashMap<u32, usize> {
+        let mut map: HashMap<u32, usize> = HashMap::with_capacity(inputargs.len());
+        for (idx, arg) in inputargs.iter().enumerate() {
+            if let Some(&prev_idx) = map.get(&arg.index) {
+                panic!(
+                    "OpTypeIndex: raw inputarg index {} bound to inputargs[{}] {:?} and inputargs[{}] {:?} — backend uniqueness violated",
+                    arg.index, prev_idx, inputargs[prev_idx].tp, idx, arg.tp,
+                );
+            }
+            map.insert(arg.index, idx);
+        }
+        map
+    }
+
+    /// Build the raw op index in iteration order.  `build_op_index`
+    /// hard-panics on raw collision (RPython Box identity), so this
+    /// table always agrees with the typed map; the iteration-order
+    /// build keeps the result deterministic across runs.
+    pub fn build_raw_op_index(ops: &[Op]) -> HashMap<u32, usize> {
+        let mut map = HashMap::with_capacity(ops.len());
+        for (idx, op) in ops.iter().enumerate() {
+            if op.pos.is_none() || op.type_ == Type::Void {
+                continue;
+            }
+            map.insert(op.pos.raw(), idx);
+        }
+        map
     }
 
     /// Re-export of inputarg index for callers that hold their own
     /// `OpTypeIndex` and need to pre-populate it on cache rebuild.
-    pub fn build_inputarg_index(inputargs: &[InputArg]) -> HashMap<u32, usize> {
+    /// Keys are typed `OpRef::input_arg_*(arg.index)` per `arg.tp`,
+    /// matching the variant a caller would synthesize via
+    /// `InputArg::opref()`.
+    pub fn build_inputarg_index(inputargs: &[InputArg]) -> HashMap<OpRef, usize> {
         inputargs
             .iter()
             .enumerate()
-            .map(|(idx, arg)| (arg.index, idx))
+            .map(|(idx, arg)| (OpRef::input_arg_typed(arg.index, arg.tp), idx))
             .collect()
     }
 
@@ -81,28 +135,30 @@ impl<'a> OpTypeIndex<'a> {
     /// positions collide.
     ///
     /// RPython Box identity gives a one-to-one map from a Box object to
-    /// its producing ResOperation; collapsing two Box-bearing ops onto
-    /// the same `OpRef(u32)` would silently keep the later op only and
-    /// rewrite Box.type for any earlier reader. Hard-panic on collision
-    /// (release as well as debug) so a violation surfaces here instead
-    /// of as a wrong-type guard fail much further along.
-    pub fn build_op_index(ops: &[Op]) -> HashMap<u32, usize> {
-        let mut map: HashMap<u32, usize> = HashMap::new();
+    /// its producing ResOperation; two Box-bearing ops sharing the same
+    /// raw OpRef payload (e.g. `IntOp(7)` + `RefOp(7)`) is a Box-identity
+    /// violation even though the typed variants disambiguate the type
+    /// tag, because pyre's backend boundary (regalloc/assembler/raw
+    /// fallback path) keys by raw u32 and would silently keep only the
+    /// later op. Hard-panic on raw collision (release as well as debug)
+    /// so a violation surfaces here instead of as a wrong-type guard
+    /// fail much further along.
+    pub fn build_op_index(ops: &[Op]) -> HashMap<OpRef, usize> {
+        let mut map: HashMap<OpRef, usize> = HashMap::new();
+        let mut raw_seen: HashMap<u32, usize> = HashMap::new();
         for (idx, op) in ops.iter().enumerate() {
             if op.pos.is_none() || op.type_ == Type::Void {
                 continue;
             }
-            if let Some(&prev_idx) = map.get(&op.pos.raw()) {
+            let raw = op.pos.raw();
+            if let Some(&prev_idx) = raw_seen.get(&raw) {
                 panic!(
-                    "OpTypeIndex: OpRef({}) bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
-                    op.pos.raw(),
-                    prev_idx,
-                    ops[prev_idx].opcode,
-                    idx,
-                    op.opcode,
+                    "OpTypeIndex: raw {} bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
+                    raw, prev_idx, ops[prev_idx].opcode, idx, op.opcode,
                 );
             }
-            map.insert(op.pos.raw(), idx);
+            raw_seen.insert(raw, idx);
+            map.insert(op.pos, idx);
         }
         map
     }
@@ -178,7 +234,10 @@ impl<'a> OpTypeIndex<'a> {
                     .unwrap_or(Type::Int),
             );
         }
-        if let Some(&idx) = self.op_index.get(&opref.raw()) {
+        // Variant-aware primary lookup: typed Box identity (an
+        // `IntOp(n)` is not the same Box as a `RefOp(n)` even when the
+        // raw payloads coincide).
+        if let Some(&idx) = self.op_index.get(&opref) {
             let tp = self.ops[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -187,10 +246,33 @@ impl<'a> OpTypeIndex<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref.raw()) {
+        if let Some(&idx) = self.inputarg_index.get(&opref) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref.raw()) {
+        if let Some(&idx) = self.op_index.get(&opref) {
+            let tp = self.ops[idx].type_;
+            if tp != Type::Void {
+                return Some(tp);
+            }
+        }
+        // Variant-blind raw fallback: legacy `OpRef::from_raw(n)` lands
+        // on `Untyped(n)`. Pre-Phase-3 raw-keyed storage matched that
+        // against any typed entry at raw n; preserve that until every
+        // `from_raw` reader is migrated to a typed factory.
+        let raw = opref.raw();
+        if let Some(&idx) = self.raw_op_index.get(&raw) {
+            let tp = self.ops[idx].type_;
+            if tp == Type::Void {
+                return None;
+            }
+            if op_index.map_or(true, |at| idx <= at) {
+                return Some(tp);
+            }
+        }
+        if let Some(&idx) = self.raw_inputarg_index.get(&raw) {
+            return Some(self.inputargs[idx].tp);
+        }
+        if let Some(&idx) = self.raw_op_index.get(&raw) {
             let tp = self.ops[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -200,9 +282,15 @@ impl<'a> OpTypeIndex<'a> {
     }
 
     /// Direct `OpRef → &Op` lookup; returns `None` for constants,
-    /// inputargs, or `OpRef::NONE`.
+    /// inputargs, or `OpRef::NONE`.  Variant-aware typed key first;
+    /// falls back to raw u32 so legacy `OpRef::from_raw()` `Untyped(_)`
+    /// readers (e.g. `compile.rs:1381` exit-arg ForceToken filter) keep
+    /// resolving against typed Box-bearing ops at the same raw payload.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
-        let idx = *self.op_index.get(&opref.raw())?;
+        if let Some(&idx) = self.op_index.get(&opref) {
+            return Some(&self.ops[idx]);
+        }
+        let idx = *self.raw_op_index.get(&opref.raw())?;
         Some(&self.ops[idx])
     }
 
@@ -210,8 +298,16 @@ impl<'a> OpTypeIndex<'a> {
     /// reference an inputarg. Used by callers that need to roll back to
     /// an OpRef's pre-redefinition type when an op later overwrote the
     /// same OpRef with a different type.
+    ///
+    /// **Variant-blind by design.** The collision-detection use case
+    /// (`majit-backend-cranelift` `build_type_overrides`) asks "does an
+    /// inputarg slot exist at this raw position regardless of variant
+    /// tag?" — an op's `.pos` typed as `IntOp(n)` should still surface
+    /// the inputarg at slot n even when the inputarg's typed key is
+    /// `InputArgInt(n)`. Raw lookup mirrors RPython's flat box-id
+    /// namespace where the question is purely positional.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
-        let idx = *self.inputarg_index.get(&opref.raw())?;
+        let idx = *self.raw_inputarg_index.get(&opref.raw())?;
         Some(self.inputargs[idx].tp)
     }
 }

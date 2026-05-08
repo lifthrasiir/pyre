@@ -633,8 +633,8 @@ mod tests {
     #[test]
     fn lowers_simple_integer_loop_shape() {
         let i0 = OpRef::int_op(0);
-        let c1 = OpRef::from_const(1);
-        let c10 = OpRef::from_const(10);
+        let c1 = OpRef::const_int(1);
+        let c10 = OpRef::const_int(10);
 
         let mut label = Op::new(OpCode::Label, &[i0]);
         label.pos = OpRef::int_op(10);
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn reverse_liveness_keeps_guard_fail_args_available() {
         let i0 = OpRef::int_op(0);
-        let c1 = OpRef::from_const(1);
+        let c1 = OpRef::const_int(1);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
         add.pos = OpRef::int_op(1);
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn deopt_spill_point_keeps_jump_args_on_fast_path() {
         let i0 = OpRef::int_op(0);
-        let c1 = OpRef::from_const(1);
+        let c1 = OpRef::const_int(1);
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
         add.pos = OpRef::int_op(1);
@@ -762,9 +762,9 @@ mod tests {
         let base = OpRef::int_op(0);
         let index = OpRef::int_op(1);
         let value = OpRef::int_op(2);
-        let scale = OpRef::from_const(1);
-        let offset = OpRef::from_const(16);
-        let size = OpRef::from_const(8);
+        let scale = OpRef::const_int(1);
+        let offset = OpRef::const_int(16);
+        let size = OpRef::const_int(8);
 
         let mut load = Op::new(OpCode::GcLoadIndexedI, &[base, index, scale, offset, size]);
         load.pos = OpRef::int_op(3);

@@ -4831,7 +4831,7 @@ mod tests {
     fn test_opref_to_box_orphan_constant_panics_m1() {
         let ctx = TraceCtx::for_test(0);
         // Forge a constant-namespace OpRef without touching the pool.
-        let orphan = OpRef::from_const(7);
+        let orphan = OpRef::const_int(7);
         ctx.opref_to_box(orphan);
     }
 

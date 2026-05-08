@@ -1459,13 +1459,21 @@ impl OptContext {
         opref
     }
 
-    fn const_ref_for_value(const_idx: u32, value: &Value) -> OpRef {
+    pub(crate) fn const_ref_for_value(const_idx: u32, value: &Value) -> OpRef {
         match value {
             Value::Int(_) => OpRef::const_int(const_idx),
             Value::Float(_) => OpRef::const_float(const_idx),
             Value::Ref(_) => OpRef::const_ptr(const_idx),
             Value::Void => panic!("constant pool cannot contain a ConstVoid"),
         }
+    }
+
+    /// Dispatch on a `Value`'s type tag and produce a typed `*Op` OpRef
+    /// at the given position. Counterpart to `const_ref_for_value` for
+    /// the op-position namespace (resoperation.py:564-638
+    /// IntOp/FloatOp/RefOp/VoidOp mixins).
+    pub(crate) fn op_ref_for_value(pos: u32, value: &Value) -> OpRef {
+        OpRef::op_typed(pos, value.get_type())
     }
 
     /// info.py:148,226 emit during force_box: routes through emit_extra
@@ -6381,7 +6389,7 @@ mod h3_1_mirror_tests {
     #[test]
     fn h3_1_replace_op_mirrors_box_forward() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
-        ctx.replace_op(OpRef::from_raw(0), OpRef::from_raw(1));
+        ctx.replace_op(OpRef::int_op(0), OpRef::int_op(1));
         match &*b0.get_forwarded() {
             BoxForwarded::Box(target) => assert_eq!(target, &b1),
             other => panic!("expected Forwarded::Box, got {:?}", other),
@@ -6392,8 +6400,8 @@ mod h3_1_mirror_tests {
     #[test]
     fn h3_1_replace_op_to_none_clears_box_forward() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
-        ctx.replace_op(OpRef::from_raw(0), OpRef::from_raw(1));
-        ctx.replace_op(OpRef::from_raw(0), OpRef::NONE);
+        ctx.replace_op(OpRef::int_op(0), OpRef::int_op(1));
+        ctx.replace_op(OpRef::int_op(0), OpRef::NONE);
         assert!(matches!(*b0.get_forwarded(), BoxForwarded::None));
     }
 
@@ -6404,9 +6412,9 @@ mod h3_1_mirror_tests {
     fn h3_1_replace_op_transfers_int_bound_to_new() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
-        ctx.setintbound(OpRef::from_raw(0), &bound);
+        ctx.setintbound(OpRef::int_op(0), &bound);
         // Before: forwarded[0] = IntBound, forwarded[1] = None.
-        ctx.replace_op(OpRef::from_raw(0), OpRef::from_raw(1));
+        ctx.replace_op(OpRef::int_op(0), OpRef::int_op(1));
         // After: old's IntBound transferred to new (PyPy:
         // `newop.set_forwarded(opinfo)`). old now forwards to new.
         match ctx.forwarded.get(1) {
@@ -6439,12 +6447,12 @@ mod h3_1_mirror_tests {
         let (mut ctx, _b0, _b1) = ctx_with_two_int_boxes();
         // Seed an IntBound on old.
         let bound = IntBound::from_constant(42);
-        ctx.setintbound(OpRef::from_raw(0), &bound);
+        ctx.setintbound(OpRef::int_op(0), &bound);
         // Forward to a Const target.
         let const_opref = OpRef::const_int(0);
         ctx.const_pool
             .insert(const_opref.const_index(), Value::Int(42));
-        ctx.replace_op(OpRef::from_raw(0), const_opref);
+        ctx.replace_op(OpRef::int_op(0), const_opref);
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         assert!(matches!(ctx.forwarded.get(0), Some(Forwarded::Op(_)),));
@@ -6458,7 +6466,7 @@ mod h3_1_mirror_tests {
         let b = BoxRef::new_inputarg(Type::Ref, Some(0));
         ctx.box_pool = vec![b.clone()].into();
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
-        ctx.set_ptr_info(OpRef::from_raw(0), info);
+        ctx.set_ptr_info(OpRef::int_op(0), info);
         match &*b.get_forwarded() {
             BoxForwarded::Info(OpInfo::Ptr(PtrInfo::NonNull { .. })) => {}
             other => panic!("expected Info(Ptr(NonNull)), got {:?}", other),
@@ -6470,7 +6478,7 @@ mod h3_1_mirror_tests {
     #[test]
     fn h3_1_make_constant_mirrors_box_const_forward() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
-        ctx.make_constant(OpRef::from_raw(0), Value::Int(42));
+        ctx.make_constant(OpRef::int_op(0), Value::Int(42));
         match &*b0.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert!(target.is_constant());
@@ -6485,7 +6493,7 @@ mod h3_1_mirror_tests {
     fn h3_1_setintbound_mirrors_box_info() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
         let bound = IntBound::from_constant(7);
-        ctx.setintbound(OpRef::from_raw(0), &bound);
+        ctx.setintbound(OpRef::int_op(0), &bound);
         match &*b0.get_forwarded() {
             BoxForwarded::Info(OpInfo::IntBound(b)) => {
                 assert_eq!(b.lower, 7);
@@ -6503,11 +6511,11 @@ mod h3_1_mirror_tests {
         // box_pool is empty by default.
         // No panic on these writes — mirror code paths use `box_pool.get`
         // which returns None for missing entries.
-        ctx.replace_op(OpRef::from_raw(0), OpRef::from_raw(1));
-        ctx.make_constant(OpRef::from_raw(0), Value::Int(0));
+        ctx.replace_op(OpRef::int_op(0), OpRef::int_op(1));
+        ctx.make_constant(OpRef::int_op(0), Value::Int(0));
         let info = PtrInfo::NonNull { last_guard_pos: -1 };
-        ctx.set_ptr_info(OpRef::from_raw(0), info);
-        ctx.setintbound(OpRef::from_raw(1), &IntBound::unbounded());
+        ctx.set_ptr_info(OpRef::int_op(0), info);
+        ctx.setintbound(OpRef::int_op(1), &IntBound::unbounded());
         // Legacy state still set.
         assert!(!ctx.forwarded.is_empty());
     }
@@ -6524,7 +6532,7 @@ mod h3_1_mirror_tests {
         let const_opref = OpRef::const_int(0);
         ctx.const_pool
             .insert(const_opref.const_index(), Value::Int(42));
-        ctx.replace_op(OpRef::from_raw(0), const_opref);
+        ctx.replace_op(OpRef::int_op(0), const_opref);
         match &*b0.get_forwarded() {
             BoxForwarded::Box(target) => {
                 assert!(target.is_constant());
@@ -6547,7 +6555,7 @@ mod h3_1_mirror_tests {
         let (mut ctx, _b0, _b1) = ctx_with_two_int_boxes();
         // const_pool is empty — bug in caller.
         let const_opref = OpRef::const_int(0);
-        ctx.replace_op(OpRef::from_raw(0), const_opref);
+        ctx.replace_op(OpRef::int_op(0), const_opref);
     }
 
     /// H-3.4 slice 77b follow-up: Phase 2's `box_pool` carries placeholder
@@ -6587,8 +6595,8 @@ mod h3_1_mirror_tests {
         ]
         .into();
 
-        let target_p1 = OpRef::from_raw(0);
-        let source_p2 = OpRef::from_raw(2);
+        let target_p1 = OpRef::int_op(0);
+        let source_p2 = OpRef::int_op(2);
 
         // Step 1: import_state's `source.set_forwarded(target)` equivalent.
         ctx.replace_op(source_p2, target_p1);
@@ -6656,8 +6664,8 @@ mod h3_1_mirror_tests {
         ]
         .into();
 
-        let target_p1 = OpRef::from_raw(0);
-        let source_p2 = OpRef::from_raw(2);
+        let target_p1 = OpRef::int_op(0);
+        let source_p2 = OpRef::int_op(2);
 
         // import_state's replace_op fires, but Phase 2 chose NOT to import
         // info (e.g. exported_infos didn't carry an entry for target_p1).
@@ -6717,7 +6725,7 @@ mod h3_1_mirror_tests {
     fn h3_2b_get_box_replacement_box_returns_pool_entry_when_no_forward() {
         let (ctx, b0, _b1) = ctx_with_two_int_boxes();
         let got = ctx
-            .get_box_replacement_box(OpRef::from_raw(0))
+            .get_box_replacement_box(OpRef::int_op(0))
             .expect("pool entry exists");
         // Pointer identity: same `Rc` allocation as `b0`.
         assert_eq!(got, b0);
@@ -6730,9 +6738,9 @@ mod h3_1_mirror_tests {
     #[test]
     fn h3_2b_get_box_replacement_box_walks_forwarded_chain() {
         let (mut ctx, b0, b1) = ctx_with_two_int_boxes();
-        ctx.replace_op(OpRef::from_raw(0), OpRef::from_raw(1));
+        ctx.replace_op(OpRef::int_op(0), OpRef::int_op(1));
         let got = ctx
-            .get_box_replacement_box(OpRef::from_raw(0))
+            .get_box_replacement_box(OpRef::int_op(0))
             .expect("pool entry exists");
         // b0 → b1 (via H-3.1 mirror), terminal is b1.
         assert_eq!(got, b1);
@@ -6747,7 +6755,7 @@ mod h3_1_mirror_tests {
     fn h3_2b_get_box_replacement_box_returns_none_when_pool_empty() {
         let ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         // box_pool empty + const_pool has no entry for the const OpRef.
-        assert!(ctx.get_box_replacement_box(OpRef::from_raw(0)).is_none());
+        assert!(ctx.get_box_replacement_box(OpRef::int_op(0)).is_none());
         assert!(ctx.get_box_replacement_box(OpRef::const_int(0)).is_none());
     }
 
@@ -6784,9 +6792,9 @@ mod h3_1_mirror_tests {
     #[test]
     fn h3_2b_get_box_replacement_box_stops_at_info_terminal() {
         let (mut ctx, b0, _b1) = ctx_with_two_int_boxes();
-        ctx.setintbound(OpRef::from_raw(0), &IntBound::from_constant(7));
+        ctx.setintbound(OpRef::int_op(0), &IntBound::from_constant(7));
         let got = ctx
-            .get_box_replacement_box(OpRef::from_raw(0))
+            .get_box_replacement_box(OpRef::int_op(0))
             .expect("pool entry exists");
         // Walker terminates at b0 (its `_forwarded` is Info, not Box).
         assert_eq!(got, b0);
@@ -7516,7 +7524,7 @@ mod ensure_ptr_info_arg0_tests {
     fn field_op_with_parent(parent: DescrRef) -> Op {
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::from_raw(0)], descr);
-        op.pos = OpRef::from_raw(1);
+        op.pos = OpRef::int_op(1);
         op
     }
 
@@ -7526,7 +7534,7 @@ mod ensure_ptr_info_arg0_tests {
             is_object: false,
         });
         let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::from_raw(0)], descr);
-        op.pos = OpRef::from_raw(1);
+        op.pos = OpRef::int_op(1);
         op
     }
 
@@ -7583,7 +7591,7 @@ mod ensure_ptr_info_arg0_tests {
                 is_object: false,
             });
             let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::from_raw(0)], descr);
-            op.pos = OpRef::from_raw(1);
+            op.pos = OpRef::int_op(1);
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -7612,7 +7620,7 @@ mod ensure_ptr_info_arg0_tests {
                 is_object: false,
             });
             let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::from_raw(0)], descr);
-            op.pos = OpRef::from_raw(1);
+            op.pos = OpRef::int_op(1);
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -7918,7 +7926,7 @@ mod imported_short_preamble_fallback_tests {
         );
 
         let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(7), OpRef::from_raw(8)]);
-        replay_op.pos = OpRef::from_raw(14);
+        replay_op.pos = OpRef::int_op(14);
         // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
@@ -7940,7 +7948,7 @@ mod imported_short_preamble_fallback_tests {
             sp.ops[0].op.args.as_slice(),
             &[OpRef::from_raw(7), OpRef::from_raw(8)]
         );
-        assert_eq!(sp.ops[0].op.pos, OpRef::from_raw(14));
+        assert_eq!(sp.ops[0].op.pos, OpRef::int_op(14));
     }
 }
 

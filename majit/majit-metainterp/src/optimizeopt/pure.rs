@@ -1334,8 +1334,8 @@ mod tests {
     ) {
         let source = preamble_op.pos;
         let short_inputargs: Vec<OpRef> = match label_arg_idx {
-            Some(idx) => (0..=idx as u32).map(OpRef::from_raw).collect(),
-            None => vec![OpRef::from_raw(0)],
+            Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
+            None => vec![OpRef::int_op(0)],
         };
         ctx.initialize_imported_short_preamble_builder(
             &short_inputargs,
@@ -1371,7 +1371,7 @@ mod tests {
     /// Helper: assign sequential positions to ops.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::from_raw(i as u32);
+            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
         }
     }
 
@@ -1380,8 +1380,8 @@ mod tests {
         // i2 = int_add(i0, i1)
         // i3 = int_add(i0, i1)  <- should be eliminated, replaced by i2
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         assign_positions(&mut ops);
 
@@ -1403,8 +1403,8 @@ mod tests {
         // i2 = int_add(i0, i1)
         // i3 = int_add(i0, i2)  <- different args, should NOT be eliminated
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(2)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(2)]),
         ];
         assign_positions(&mut ops);
 
@@ -1424,8 +1424,8 @@ mod tests {
         // i2 = int_add(i0, i1)
         // i3 = int_add(i1, i0)  <- commutative, should be eliminated
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1445,8 +1445,8 @@ mod tests {
         // i2 = int_sub(i0, i1)
         // i3 = int_sub(i1, i0)  <- NOT commutative, should NOT be eliminated
         let mut ops = vec![
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntSub, &[OpRef::from_raw(1), OpRef::from_raw(0)]),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntSub, &[OpRef::int_op(1), OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1466,8 +1466,8 @@ mod tests {
         // i2 = int_add(i0, i1)
         // i3 = int_mul(i0, i1)  <- different opcode, should NOT be eliminated
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntMul, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntMul, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         assign_positions(&mut ops);
 
@@ -1489,18 +1489,9 @@ mod tests {
         // i3 = int_add(i100, i101)  <- eliminated
         // i4 = int_add(i100, i101)  <- eliminated
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
         ];
         assign_positions(&mut ops);
 
@@ -1520,7 +1511,7 @@ mod tests {
         // call_pure_i(args...) -> should become call_i(args...)
         let mut ops = vec![Op::new(
             OpCode::CallPureI,
-            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
         assign_positions(&mut ops);
 
@@ -1536,13 +1527,13 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::CallI);
         assert_eq!(
             result[0].args.as_slice(),
-            &[OpRef::from_raw(0), OpRef::from_raw(1)]
+            &[OpRef::int_op(0), OpRef::int_op(1)]
         );
     }
 
     #[test]
     fn test_call_pure_r_demoted() {
-        let mut ops = vec![Op::new(OpCode::CallPureR, &[OpRef::from_raw(0)])];
+        let mut ops = vec![Op::new(OpCode::CallPureR, &[OpRef::ref_op(0)])];
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::new();
@@ -1562,7 +1553,7 @@ mod tests {
         // setfield_gc is not pure, should pass through unchanged
         let mut ops = vec![Op::new(
             OpCode::SetfieldGc,
-            &[OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::void_op(0), OpRef::int_op(1)],
         )];
         assign_positions(&mut ops);
 
@@ -1583,8 +1574,8 @@ mod tests {
         // i1 = int_neg(i0)
         // i2 = int_neg(i0)  <- should be eliminated
         let mut ops = vec![
-            Op::new(OpCode::IntNeg, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::IntNeg, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::IntNeg, &[OpRef::int_op(0)]),
+            Op::new(OpCode::IntNeg, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1604,8 +1595,8 @@ mod tests {
         // f2 = float_add(f0, f1)
         // f3 = float_add(f0, f1)  <- should be eliminated
         let mut ops = vec![
-            Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::FloatAdd, &[OpRef::float_op(0), OpRef::float_op(1)]),
+            Op::new(OpCode::FloatAdd, &[OpRef::float_op(0), OpRef::float_op(1)]),
         ];
         assign_positions(&mut ops);
 
@@ -1628,13 +1619,13 @@ mod tests {
         for i in 0..17u32 {
             ops.push(Op::new(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(i), OpRef::from_raw(i + 100)],
+                &[OpRef::int_op(i), OpRef::int_op(i + 100)],
             ));
         }
         // Re-insert op #0: same args as ops[0]
         ops.push(Op::new(
             OpCode::IntAdd,
-            &[OpRef::from_raw(0), OpRef::from_raw(100)],
+            &[OpRef::int_op(0), OpRef::int_op(100)],
         ));
         assign_positions(&mut ops);
 
@@ -1668,16 +1659,16 @@ mod tests {
         let mut pass = OptPure::new();
 
         // Simulate: op0 = int_add(a, b)
-        let op0 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+        let op0 = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
         let mut op0 = op0;
-        op0.pos = OpRef::from_raw(2);
+        op0.pos = OpRef::int_op(2);
         let result0 = pass.propagate_forward(&op0, &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
-        let op1 = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
+        let op1 = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
         let mut op1 = op1;
-        op1.pos = OpRef::from_raw(3);
+        op1.pos = OpRef::int_op(3);
         let result1 = pass.propagate_forward(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
@@ -1686,17 +1677,17 @@ mod tests {
     fn test_pure_op_key_equality() {
         let key1 = PureOpKey {
             opcode: OpCode::IntAdd,
-            args: vec![OpRef::from_raw(0), OpRef::from_raw(1)],
+            args: vec![OpRef::int_op(0), OpRef::int_op(1)],
             descr_identity: None,
         };
         let key2 = PureOpKey {
             opcode: OpCode::IntAdd,
-            args: vec![OpRef::from_raw(0), OpRef::from_raw(1)],
+            args: vec![OpRef::int_op(0), OpRef::int_op(1)],
             descr_identity: None,
         };
         let key3 = PureOpKey {
             opcode: OpCode::IntAdd,
-            args: vec![OpRef::from_raw(1), OpRef::from_raw(0)],
+            args: vec![OpRef::int_op(1), OpRef::int_op(0)],
             descr_identity: None,
         };
         assert_eq!(key1, key2);
@@ -1706,8 +1697,8 @@ mod tests {
     #[test]
     fn test_commutative_xor() {
         let mut ops = vec![
-            Op::new(OpCode::IntXor, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntXor, &[OpRef::from_raw(1), OpRef::from_raw(0)]),
+            Op::new(OpCode::IntXor, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntXor, &[OpRef::int_op(1), OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1725,8 +1716,8 @@ mod tests {
     #[test]
     fn test_commutative_int_and() {
         let mut ops = vec![
-            Op::new(OpCode::IntAnd, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntAnd, &[OpRef::from_raw(1), OpRef::from_raw(0)]),
+            Op::new(OpCode::IntAnd, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntAnd, &[OpRef::int_op(1), OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1746,8 +1737,8 @@ mod tests {
         // i2 = int_lt(i0, i1)
         // i3 = int_lt(i0, i1)  <- should be eliminated
         let mut ops = vec![
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
-            Op::new(OpCode::IntLt, &[OpRef::from_raw(0), OpRef::from_raw(1)]),
+            Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]),
+            Op::new(OpCode::IntLt, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
         assign_positions(&mut ops);
 
@@ -1765,8 +1756,8 @@ mod tests {
     #[test]
     fn test_call_pure_f_n_demoted() {
         let mut ops = vec![
-            Op::new(OpCode::CallPureF, &[OpRef::from_raw(0)]),
-            Op::new(OpCode::CallPureN, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::CallPureF, &[OpRef::float_op(0)]),
+            Op::new(OpCode::CallPureN, &[OpRef::float_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1787,12 +1778,9 @@ mod tests {
     fn test_mixed_pure_and_non_pure() {
         // Mix of pure and non-pure operations, only duplicated pure ops get CSE'd.
         let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]), // pure, kept
-            Op::new(
-                OpCode::SetfieldGc,
-                &[OpRef::from_raw(0), OpRef::from_raw(1)],
-            ), // not pure, kept
-            Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]), // pure duplicate, eliminated
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::void_op(1)]), // pure, kept
+            Op::new(OpCode::SetfieldGc, &[OpRef::int_op(0), OpRef::void_op(1)]), // not pure, kept
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::void_op(1)]), // pure duplicate, eliminated
         ];
         assign_positions(&mut ops);
 
@@ -1815,11 +1803,11 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                &[OpRef::int_op(100), OpRef::int_op(101)],
             ),
             Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                &[OpRef::int_op(100), OpRef::int_op(101)],
             ),
         ];
         assign_positions(&mut ops);
@@ -1842,11 +1830,11 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
+                &[OpRef::int_op(100), OpRef::int_op(101)],
             ),
             Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(100), OpRef::from_raw(102)],
+                &[OpRef::int_op(100), OpRef::int_op(102)],
             ),
         ];
         assign_positions(&mut ops);
@@ -1873,7 +1861,7 @@ mod tests {
             (OpCode::CallLoopinvariantF, OpCode::CallF),
             (OpCode::CallLoopinvariantN, OpCode::CallN),
         ] {
-            let mut ops = vec![Op::new(loopinv_op, &[OpRef::from_raw(0)])];
+            let mut ops = vec![Op::new(loopinv_op, &[OpRef::int_op(0)])];
             assign_positions(&mut ops);
 
             let mut opt = Optimizer::new();
@@ -1898,13 +1886,13 @@ mod tests {
         for i in 0..20u32 {
             ops.push(Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(i + 100), OpRef::from_raw(200)],
+                &[OpRef::int_op(i + 100), OpRef::int_op(200)],
             ));
         }
         // Re-insert call #0: same args as ops[0]
         ops.push(Op::new(
             OpCode::CallLoopinvariantI,
-            &[OpRef::from_raw(100), OpRef::from_raw(200)],
+            &[OpRef::int_op(100), OpRef::int_op(200)],
         ));
         assign_positions(&mut ops);
 
@@ -1926,21 +1914,15 @@ mod tests {
     fn test_call_loopinvariant_mixed_with_pure() {
         // Loop-invariant and pure CSE should coexist.
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ), // pure
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]), // pure
             Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(200), OpRef::from_raw(201)],
+                &[OpRef::int_op(200), OpRef::int_op(201)],
             ), // loopinvariant
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ), // pure dup → removed
+            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]), // pure dup → removed
             Op::new(
                 OpCode::CallLoopinvariantI,
-                &[OpRef::from_raw(200), OpRef::from_raw(201)],
+                &[OpRef::int_op(200), OpRef::int_op(201)],
             ), // loopinvariant dup → removed
         ];
         assign_positions(&mut ops);
@@ -1963,10 +1945,10 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAdd,
-                &[OpRef::from_raw(10_000), OpRef::from_raw(10_001)],
+                &[OpRef::int_op(10_000), OpRef::int_op(10_001)],
             ),
             // Use the result in a guard to prevent dead code elimination
-            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -1989,9 +1971,9 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntLt,
-                &[OpRef::from_raw(10_000), OpRef::from_raw(10_001)],
+                &[OpRef::int_op(10_000), OpRef::int_op(10_001)],
             ),
-            Op::new(OpCode::Finish, &[OpRef::from_raw(0)]),
+            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
         ];
         assign_positions(&mut ops);
 
@@ -2011,15 +1993,9 @@ mod tests {
         // INT_ADD_OVF(a, b) + GUARD_NO_OVERFLOW
         // then same INT_ADD_OVF(a, b) + GUARD_NO_OVERFLOW → CSE'd away
         let mut ops = vec![
-            Op::new(
-                OpCode::IntAddOvf,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAddOvf, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::GuardNoOverflow, &[]),
-            Op::new(
-                OpCode::IntAddOvf,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::IntAddOvf, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::GuardNoOverflow, &[]),
             Op::new(OpCode::Finish, &[]),
         ];
@@ -2049,7 +2025,7 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::IntAddOvf,
-                &[OpRef::from_raw(10_000), OpRef::from_raw(10_001)],
+                &[OpRef::int_op(10_000), OpRef::int_op(10_001)],
             ),
             Op::new(OpCode::GuardNoOverflow, &[]),
             Op::new(OpCode::Finish, &[]),
@@ -2093,12 +2069,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::from_raw(10)], descr);
-        op.pos = OpRef::from_raw(0);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(10)], descr);
+        op.pos = OpRef::int_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::from_raw(10), Value::Ref(GcRef(ptr)));
+        ctx.make_constant(OpRef::int_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -2107,7 +2083,7 @@ mod tests {
         );
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_int(OpRef::from_raw(0)), Some(123));
+        assert_eq!(ctx.get_constant_int(OpRef::int_op(0)), Some(123));
 
         unsafe {
             drop(Box::from_raw(ptr as *mut TestIntFieldObject));
@@ -2120,12 +2096,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef::from_raw(10)], descr);
-        op.pos = OpRef::from_raw(0);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef::int_op(10)], descr);
+        op.pos = OpRef::float_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::from_raw(10), Value::Ref(GcRef(ptr)));
+        ctx.make_constant(OpRef::int_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -2134,7 +2110,7 @@ mod tests {
         );
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_constant_float(OpRef::from_raw(0)), Some(3.5));
+        assert_eq!(ctx.get_constant_float(OpRef::float_op(0)), Some(3.5));
 
         unsafe {
             drop(Box::from_raw(ptr as *mut TestFloatFieldObject));
@@ -2149,12 +2125,12 @@ mod tests {
         let ptr = Box::into_raw(object) as usize;
 
         let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef::from_raw(10)], descr);
-        op.pos = OpRef::from_raw(0);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef::int_op(10)], descr);
+        op.pos = OpRef::ref_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::from_raw(10), Value::Ref(GcRef(ptr)));
+        ctx.make_constant(OpRef::int_op(10), Value::Ref(GcRef(ptr)));
         pass.setup();
 
         assert_eq!(
@@ -2164,7 +2140,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
-            ctx.get_constant(OpRef::from_raw(0)),
+            ctx.get_constant(OpRef::ref_op(0)),
             Some(Value::Ref(GcRef(0x1234_5678usize)))
         );
 
@@ -2176,33 +2152,27 @@ mod tests {
     #[test]
     fn test_constant_fold_getfield_gc_pure_does_not_treat_int_constant_as_gc_pointer() {
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
-        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::from_raw(10)], descr);
-        op.pos = OpRef::from_raw(0);
+        let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(10)], descr);
+        op.pos = OpRef::int_op(0);
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
-        ctx.make_constant(OpRef::from_raw(10), Value::Int(2));
+        ctx.make_constant(OpRef::int_op(10), Value::Int(2));
         pass.setup();
 
         assert_eq!(try_constant_fold_pure_value(&op, &ctx), None);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
-        assert_eq!(ctx.get_constant(OpRef::from_raw(0)), None);
+        assert_eq!(ctx.get_constant(OpRef::int_op(0)), None);
     }
 
     #[test]
     fn test_guard_no_exception_after_removed_call_pure() {
         // CALL_PURE_I(same args) × 2 → second removed → GUARD_NO_EXCEPTION after removed
         let mut ops = vec![
-            Op::new(
-                OpCode::CallPureI,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::CallPureI, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::GuardNoException, &[]),
-            Op::new(
-                OpCode::CallPureI,
-                &[OpRef::from_raw(100), OpRef::from_raw(101)],
-            ),
+            Op::new(OpCode::CallPureI, &[OpRef::int_op(100), OpRef::int_op(101)]),
             Op::new(OpCode::GuardNoException, &[]), // should be removed
             Op::new(OpCode::Finish, &[]),
         ];
@@ -2250,7 +2220,7 @@ mod tests {
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
         let mut q = Op::new(OpCode::IntAdd, &[c5_b, x]);
-        q.pos = OpRef::from_raw(99);
+        q.pos = OpRef::int_op(99);
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(OpRef::int_op(42)),
@@ -2259,7 +2229,7 @@ mod tests {
 
         // A non-constant slot mismatch must still miss.
         let mut q_miss = Op::new(OpCode::IntAdd, &[c5_b, OpRef::int_op(8)]);
-        q_miss.pos = OpRef::from_raw(100);
+        q_miss.pos = OpRef::int_op(100);
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
 
@@ -2292,24 +2262,24 @@ mod tests {
         let mut pass = OptPure::new();
 
         // Manually record a pure operation via the API
-        let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_raw(20)]);
-        op.pos = OpRef::from_raw(0);
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::int_op(20)]);
+        op.pos = OpRef::int_op(0);
         pass.pure(&op);
 
         let ctx = OptContext::new(0);
 
         // Should find it via get_pure_result
-        let lookup_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(10), OpRef::from_raw(20)]);
+        let lookup_op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::int_op(20)]);
         assert!(pass.get_pure_result(&lookup_op, &ctx).is_some());
 
         // pure_from_args
         pass.pure_from_args(
             OpCode::IntMul,
-            &[OpRef::from_raw(30), OpRef::from_raw(40)],
-            OpRef::from_raw(5),
+            &[OpRef::int_op(30), OpRef::int_op(40)],
+            OpRef::int_op(5),
         );
-        let mut lookup_mul = Op::new(OpCode::IntMul, &[OpRef::from_raw(30), OpRef::from_raw(40)]);
-        lookup_mul.pos = OpRef::from_raw(99);
+        let mut lookup_mul = Op::new(OpCode::IntMul, &[OpRef::int_op(30), OpRef::int_op(40)]);
+        lookup_mul.pos = OpRef::int_op(99);
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
 
@@ -2318,8 +2288,8 @@ mod tests {
         let mut pass = OptPure::new();
 
         // Inject extra_call_pure from a previous loop iteration
-        let args = vec![OpRef::from_raw(100), OpRef::from_raw(101)];
-        pass.set_extra_call_pure(vec![(args.clone(), OpRef::from_raw(50))]);
+        let args = vec![OpRef::int_op(100), OpRef::int_op(101)];
+        pass.set_extra_call_pure(vec![(args.clone(), OpRef::int_op(50))]);
 
         // extra_call_pure entries are searched via optimize_call_pure_old
         // in the CALL_PURE handler (pure.py:204-210), not via
@@ -2334,7 +2304,7 @@ mod tests {
         match &pass.extra_call_pure[0] {
             super::ExtraCallPureEntry::Direct { key: k, result } => {
                 assert_eq!(k, &key);
-                assert_eq!(*result, OpRef::from_raw(50));
+                assert_eq!(*result, OpRef::int_op(50));
             }
             _ => panic!("expected Direct entry"),
         }
@@ -2348,39 +2318,29 @@ mod tests {
         // pure.py:214: self.known_result_call_pure.append(op)
         pass.known_result_call_pure.push(super::KnownResultEntry {
             descr_identity: None,
-            args: vec![OpRef::from_raw(100), OpRef::from_raw(101)],
-            result: OpRef::from_raw(50),
+            args: vec![OpRef::int_op(100), OpRef::int_op(101)],
+            result: OpRef::int_op(50),
         });
 
         // CALL_PURE lookup: start_index=0, descr matches (both None), args match
-        let op = Op::new(
-            OpCode::CallPureI,
-            &[OpRef::from_raw(100), OpRef::from_raw(101)],
-        );
+        let op = Op::new(OpCode::CallPureI, &[OpRef::int_op(100), OpRef::int_op(101)]);
         assert_eq!(
             pass.lookup_known_result(&op, 0, &ctx),
-            Some(OpRef::from_raw(50))
+            Some(OpRef::int_op(50))
         );
 
         // COND_CALL_VALUE lookup: start_index=1, skip arg(0)
         let cond_op = Op::new(
             OpCode::CondCallValueI,
-            &[
-                OpRef::from_raw(999),
-                OpRef::from_raw(100),
-                OpRef::from_raw(101),
-            ],
+            &[OpRef::int_op(999), OpRef::int_op(100), OpRef::int_op(101)],
         );
         assert_eq!(
             pass.lookup_known_result(&cond_op, 1, &ctx),
-            Some(OpRef::from_raw(50))
+            Some(OpRef::int_op(50))
         );
 
         // Args mismatch → None
-        let bad_args = Op::new(
-            OpCode::CallPureI,
-            &[OpRef::from_raw(100), OpRef::from_raw(999)],
-        );
+        let bad_args = Op::new(OpCode::CallPureI, &[OpRef::int_op(100), OpRef::int_op(999)]);
         assert_eq!(pass.lookup_known_result(&bad_args, 0, &ctx), None);
     }
 
@@ -2398,24 +2358,24 @@ mod tests {
                 OpCode::IntAdd,
                 None,
                 vec![
-                    crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::from_raw(0)),
+                    crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
                     crate::optimizeopt::ImportedShortPureArg::Const(
                         majit_ir::Value::Int(7),
                         const_opref,
                     ),
                 ],
-                OpRef::from_raw(2),
-                OpRef::from_raw(2),
+                OpRef::int_op(2),
+                OpRef::int_op(2),
                 false,
             ));
 
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);
 
-        // Label args don't include OpRef::from_raw(2), so the pure op should be produced.
+        // Label args don't include OpRef::int_op(2), so the pure op should be produced.
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
+            OpRef::int_op(0),
+            OpRef::int_op(1),
         ]);
         sb.note_known_constants_from_ctx(&ctx);
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
@@ -2426,7 +2386,7 @@ mod tests {
             crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
         ));
         assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
-        assert_eq!(collected[0].1.preamble_op.pos, OpRef::from_raw(2));
+        assert_eq!(collected[0].1.preamble_op.pos, OpRef::int_op(2));
     }
 
     #[test]
@@ -2454,10 +2414,10 @@ mod tests {
                     majit_ir::Value::Int(0x1234),
                     const_opref,
                 ),
-                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::from_raw(0)),
+                crate::optimizeopt::ImportedShortPureArg::OpRef(OpRef::int_op(0)),
             ],
-            OpRef::from_raw(1),
-            OpRef::from_raw(1),
+            OpRef::int_op(1),
+            OpRef::int_op(1),
             false,
         );
         initialize_imported_short_pure_builder(&mut ctx, imported.pop.preamble_op.clone(), Some(1));
@@ -2466,15 +2426,12 @@ mod tests {
         pass.setup();
         pass.install_preamble_pure_ops(&ctx);
 
-        let mut op = Op::new(OpCode::CallPureI, &[const_opref, OpRef::from_raw(0)]);
-        op.pos = OpRef::from_raw(2);
+        let mut op = Op::new(OpCode::CallPureI, &[const_opref, OpRef::int_op(0)]);
+        op.pos = OpRef::int_op(2);
         op.descr = Some(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(
-            ctx.get_box_replacement(OpRef::from_raw(2)),
-            OpRef::from_raw(1)
-        );
+        assert_eq!(ctx.get_box_replacement(OpRef::int_op(2)), OpRef::int_op(1));
     }
 
     #[test]
@@ -2483,15 +2440,15 @@ mod tests {
         let mut ctx = OptContext::with_num_inputs(4, 0);
         pass.setup();
 
-        let mut op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(1)]);
-        op.pos = OpRef::from_raw(2);
+        let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
+        op.pos = OpRef::int_op(2);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
+            OpRef::int_op(0),
+            OpRef::int_op(1),
+            OpRef::int_op(2),
         ]);
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops();
@@ -2511,9 +2468,9 @@ mod tests {
 
         let mut op = Op::new(
             OpCode::CallPureI,
-            &[OpRef::from_raw(100), OpRef::from_raw(0), OpRef::from_raw(1)],
+            &[OpRef::int_op(100), OpRef::int_op(0), OpRef::int_op(1)],
         );
-        op.pos = OpRef::from_raw(2);
+        op.pos = OpRef::int_op(2);
         op.descr = Some(majit_ir::descr::make_call_descr(
             vec![
                 majit_ir::Type::Int,
@@ -2533,10 +2490,10 @@ mod tests {
         }
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(1),
-            OpRef::from_raw(2),
-            OpRef::from_raw(100),
+            OpRef::int_op(0),
+            OpRef::int_op(1),
+            OpRef::int_op(2),
+            OpRef::int_op(100),
         ]);
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops();
@@ -2554,15 +2511,15 @@ mod tests {
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
         // func pointer arg must be a known constant for OptRewrite tracking
-        ctx.seed_constant(OpRef::from_raw(100), majit_ir::Value::Int(0xCAFE));
+        ctx.seed_constant(OpRef::int_op(100), majit_ir::Value::Int(0xCAFE));
         rewrite.setup();
         pass.setup();
 
         let mut op = Op::new(
             OpCode::CallLoopinvariantI,
-            &[OpRef::from_raw(100), OpRef::from_raw(0)],
+            &[OpRef::int_op(100), OpRef::int_op(0)],
         );
-        op.pos = OpRef::from_raw(2);
+        op.pos = OpRef::int_op(2);
         op.descr = Some(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
@@ -2588,9 +2545,9 @@ mod tests {
 
         // OptRewrite tracks loopinvariant for short preamble collection
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
-            OpRef::from_raw(0),
-            OpRef::from_raw(2),
-            OpRef::from_raw(100),
+            OpRef::int_op(0),
+            OpRef::int_op(2),
+            OpRef::int_op(100),
         ]);
         rewrite.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops();
@@ -2612,8 +2569,8 @@ mod tests {
         // Record via pure_from_args
         pass.pure_from_args(
             OpCode::IntAdd,
-            &[OpRef::from_raw(10), OpRef::from_raw(20)],
-            OpRef::from_raw(30),
+            &[OpRef::int_op(10), OpRef::int_op(20)],
+            OpRef::int_op(30),
         );
 
         // same_box: identity comparison (no constants, no forwarding)
@@ -2622,8 +2579,8 @@ mod tests {
         assert!(
             pass.lookup2(
                 OpCode::IntAdd,
-                OpRef::from_raw(10),
-                OpRef::from_raw(20),
+                OpRef::int_op(10),
+                OpRef::int_op(20),
                 None,
                 false,
                 sb
@@ -2634,8 +2591,8 @@ mod tests {
         assert!(
             pass.lookup2(
                 OpCode::IntAdd,
-                OpRef::from_raw(20),
-                OpRef::from_raw(10),
+                OpRef::int_op(20),
+                OpRef::int_op(10),
                 None,
                 true,
                 sb
@@ -2646,8 +2603,8 @@ mod tests {
         assert!(
             pass.lookup2(
                 OpCode::IntAdd,
-                OpRef::from_raw(20),
-                OpRef::from_raw(10),
+                OpRef::int_op(20),
+                OpRef::int_op(10),
                 None,
                 false,
                 sb
@@ -2656,13 +2613,13 @@ mod tests {
         );
 
         // lookup1 for a unary op
-        pass.pure_from_args(OpCode::IntNeg, &[OpRef::from_raw(10)], OpRef::from_raw(40));
+        pass.pure_from_args(OpCode::IntNeg, &[OpRef::int_op(10)], OpRef::int_op(40));
         assert!(
-            pass.lookup1(OpCode::IntNeg, OpRef::from_raw(10), None, sb)
+            pass.lookup1(OpCode::IntNeg, OpRef::int_op(10), None, sb)
                 .is_some()
         );
         assert!(
-            pass.lookup1(OpCode::IntNeg, OpRef::from_raw(99), None, sb)
+            pass.lookup1(OpCode::IntNeg, OpRef::int_op(99), None, sb)
                 .is_none()
         );
     }
@@ -2674,19 +2631,11 @@ mod tests {
         let mut ops = vec![
             Op::new(
                 OpCode::CondCallValueI,
-                &[
-                    OpRef::from_raw(100),
-                    OpRef::from_raw(200),
-                    OpRef::from_raw(300),
-                ],
+                &[OpRef::int_op(100), OpRef::int_op(200), OpRef::int_op(300)],
             ),
             Op::new(
                 OpCode::CondCallValueI,
-                &[
-                    OpRef::from_raw(101),
-                    OpRef::from_raw(200),
-                    OpRef::from_raw(300),
-                ],
+                &[OpRef::int_op(101), OpRef::int_op(200), OpRef::int_op(300)],
             ),
         ];
         assign_positions(&mut ops);
@@ -2708,11 +2657,7 @@ mod tests {
     fn test_cond_call_value_uses_call_pure_results_starting_at_arg1() {
         let mut ops = vec![Op::new(
             OpCode::CondCallValueI,
-            &[
-                OpRef::from_raw(100),
-                OpRef::from_const(0),
-                OpRef::from_const(1),
-            ],
+            &[OpRef::int_op(100), OpRef::const_int(0), OpRef::const_int(1)],
         )];
         assign_positions(&mut ops);
 
@@ -2721,8 +2666,8 @@ mod tests {
         opt.add_pass(Box::new(OptPure::new()));
 
         let mut constants = std::collections::HashMap::new();
-        constants.insert(OpRef::from_const(0).raw(), 0xCAFE_i64);
-        constants.insert(OpRef::from_const(1).raw(), 7_i64);
+        constants.insert(OpRef::const_int(0).raw(), 0xCAFE_i64);
+        constants.insert(OpRef::const_int(1).raw(), 7_i64);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
 
         assert!(result.is_empty());

@@ -602,7 +602,10 @@ mod tests {
     fn h3_0a_get_trace_preserves_box_pool_identity() {
         let mut rec = Trace::new();
         let _i0 = rec.record_input_arg(Type::Int);
-        let _add = rec.record_op(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_raw(0)]);
+        let _add = rec.record_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+        );
         // Snapshot box pointers before consuming the recorder.
         let pre_box_at_1 = rec.box_for_position(1).unwrap().as_ptr();
         let trace = rec.get_trace();
@@ -1217,7 +1220,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         // Simulate a pooled constant reference.
-        let const_ref = OpRef::from_const(0);
+        let const_ref = OpRef::const_int(0);
         let add = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
 
         rec.close_loop(&[add]);
@@ -1233,7 +1236,7 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
 
-        let const_ref = OpRef::from_const(1);
+        let const_ref = OpRef::const_int(1);
         let add1 = rec.record_op(OpCode::IntAdd, &[i0, const_ref]);
         let add2 = rec.record_op(OpCode::IntAdd, &[add1, const_ref]);
 

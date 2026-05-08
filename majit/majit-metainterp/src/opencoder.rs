@@ -4037,7 +4037,7 @@ mod tests {
     fn test_record_op_oprefs_orphan_constant_panics_2b() {
         let pool = crate::constant_pool::ConstantPool::new();
         let mut buf = TraceRecordBuffer::new(1, empty_sd());
-        let orphan = OpRef::from_const(7);
+        let orphan = OpRef::const_int(7);
         buf.record_op_oprefs(OpCode::IntAdd, &[iarg(0), orphan], None, &pool);
     }
 
