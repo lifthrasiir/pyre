@@ -3610,23 +3610,24 @@ impl CodeWriter {
                     current_block.clone()
                 } else {
                     // `current_block` already closed and no joinpoint
-                    // candidate exists — synthesize a fresh SpamBlock
-                    // for `py_pc`.  Suspected dead code in current
-                    // benchmarks (the earlier `else` branch never fires
-                    // it), kept fail-loud-by-construction so a future
-                    // slice can confirm and delete after a wider
-                    // suite.  RPython parity: a fresh `SpamBlock` here
-                    // would mirror `flowcontext.py:472 newblock = self.
-                    // make_next_block(...)` minus the predecessor edge,
-                    // which is exactly the orphan-block hazard W-1
-                    // fixed.
-                    let block = SpamBlockRef::new(graph.new_block(Vec::new()), None);
-                    initialize_spam_block(code, &mut graph, &block, &current_state, py_pc);
-                    joinpoints
-                        .entry(py_pc)
-                        .or_default()
-                        .insert(0, block.clone());
-                    block
+                    // candidate exists — RPython has no equivalent
+                    // because its per-block walker (`flowcontext.py:
+                    // 407-475`) cannot re-enter PC iteration with a
+                    // dead current block: every walker pop installs a
+                    // fresh live SpamBlock from `pendingblocks`.  Pyre's
+                    // PC-sequential walker drove the prior synthesise-
+                    // fresh-block adaptation here, but with the W-1 fix
+                    // every sequential PC keeps `current_block` alive
+                    // and every branch arrival registers a joinpoint
+                    // candidate, so this arm should be unreachable.
+                    // Fail-loud per RPython invariant; a follow-up
+                    // slice deletes the arm once the bench / lib suite
+                    // confirms.
+                    panic!(
+                        "emit_mark_label_pc!(py_pc={}): no live current_block \
+                         and no joinpoint candidate — invariant violation",
+                        py_pc,
+                    );
                 };
                 if let Some(fallthrough_case) = pending_bool_fallthrough_case.take() {
                     set_last_bool_exitcase(&current_block.block(), fallthrough_case);
