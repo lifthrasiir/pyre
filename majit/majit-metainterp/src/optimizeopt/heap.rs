@@ -1445,12 +1445,13 @@ impl OptHeap {
         const FLAG_LOOKUP: i64 = 0;
         const FLAG_STORE: i64 = 1;
 
-        // heap.py:497: flag_value = self.getintbound(op.getarg(4))
+        // heap.py:497-500: flag_value = self.getintbound(op.getarg(4))
+        //   if not flag_value.is_constant(): return False
+        //   flag = flag_value.get_constant_int()
         if op.args.len() < 5 {
             return false;
         }
-        let flag_ref = ctx.get_box_replacement(op.arg(4));
-        let flag = match ctx.get_constant_int(flag_ref) {
+        let flag = match ctx.get_constant_int_or_bound(op.arg(4)) {
             Some(v) => v,
             None => return false,
         };
@@ -1488,9 +1489,10 @@ impl OptHeap {
         ];
 
         if let Some(&res_v) = d.get(&key) {
-            // heap.py:520: flag != FLAG_LOOKUP → check known_ge_const(0)
+            // heap.py:523-525: flag != FLAG_LOOKUP → self.getintbound(res_v).known_ge_const(0)
             if flag != FLAG_LOOKUP {
-                let bound = ctx.get_int_bound(res_v);
+                let resolved = ctx.get_box_replacement(res_v);
+                let bound = ctx.get_int_bound(resolved);
                 let known_ge_zero = bound.map_or(false, |b| b.known_ge_const(0));
                 if !known_ge_zero {
                     return false;
@@ -1695,6 +1697,10 @@ impl OptHeap {
                         }
                     }
                 }
+                // heap.py:547-552: del self.cached_dict_reads[fielddescr]
+                if !descr.is_always_pure() {
+                    self.cached_dict_reads.remove(&descr_identity(&descr));
+                }
             }
         }
 
@@ -1797,23 +1803,6 @@ impl OptHeap {
                     submap.clear_varindex();
                 }
             }
-        }
-
-        // heap.py:542-551: invalidate cached_dict_reads for written field descrs.
-        let field_ids_to_clear: Vec<usize> = self
-            .cached_fields
-            .iter()
-            .filter_map(|(_, descr, _)| {
-                let fid = Self::field_effect_index(descr);
-                if ei.check_write_descr_field(fid) && !descr.is_always_pure() {
-                    Some(descr_identity(descr))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for fid in field_ids_to_clear {
-            self.cached_dict_reads.remove(&fid);
         }
 
         // heap.py:560-563: invalidate cached_dict_reads via corresponding_array_descrs.
