@@ -4,7 +4,7 @@
 //! Each wraps a pyre-object or pyre-interpreter operation with the
 //! correct calling convention and integer-based parameter passing.
 
-use majit_ir::{OpCode, OpRef, Type};
+use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_metainterp::{DEFAULT_EFFECT_INFO, TraceCtx};
 
 use pyre_interpreter::{
@@ -60,6 +60,43 @@ pub fn emit_trace_call_int_typed(
     // (≡ `effectinfo.MOST_GENERAL` for unanalyzed callees: CanRaise +
     // all-writes-set bitmasks).
     ctx.call_int_typed_with_effect(helper, args, arg_types, DEFAULT_EFFECT_INFO)
+}
+
+/// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr,
+/// exc=False, pure=True)` parity for direct trace emit paths.
+///
+/// `emit_trace_call_int_typed` calls into the tracer with
+/// `DEFAULT_EFFECT_INFO` (`effectinfo.MOST_GENERAL`, CanRaise +
+/// all-writes-set), so even an `#[elidable_cannot_raise]` callee is
+/// recorded as a plain `CallI`.  This wrapper threads an explicit
+/// `ElidableCannotRaise` `EffectInfo` through
+/// `record_result_of_call_pure` (`pyjitpl.py:3553-3579`) and patches the
+/// trace to `CallPureI`.
+///
+/// `concrete_arg_values` follows `_build_allboxes`
+/// (`pyjitpl.py:1960-1993`): the funcbox's concrete value sits in slot 0
+/// and the per-argument concrete values follow.  Direct trace-emit paths
+/// have no jitcode-dispatch frame-operand-fetch, so the caller supplies
+/// the values directly.
+pub fn emit_trace_call_int_typed_elidable_cannot_raise(
+    ctx: &mut TraceCtx,
+    helper: *const (),
+    args: &[OpRef],
+    arg_types: &[Type],
+    concrete_arg_values: &[Value],
+    concrete_result: Value,
+) -> OpRef {
+    let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
+    ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        helper,
+        args,
+        arg_types,
+        Type::Int,
+        effect,
+        concrete_arg_values,
+        concrete_result,
+    )
 }
 
 pub fn emit_trace_call_ref(ctx: &mut TraceCtx, helper: *const (), args: &[OpRef]) -> OpRef {
@@ -685,11 +722,68 @@ pub fn emit_new_pyframe_inline_self_recursive(
     new_frame
 }
 
+// ── Elidable canary helper ──────────────────────────────────────────
+//
+// rlib/jit.py:13 `@jit.elidable` parity.  PyPy `intobject.py:891-895
+// wrapint` in-range check parity: returns true iff `value` falls inside
+// the prebuilt-int small cache range AND the cache is enabled.
+//
+// Deterministic for any `value`, no side effects, no raise →
+// `EF_ELIDABLE_CANNOT_RAISE` (`call.py:299`).
+//
+// Pyre's first production-crate `#[elidable_cannot_raise]` callee.  The
+// trace-side effect (`record_result_of_call_pure` patching `CallI` to
+// `CallPureI`) is exercised by
+// `pyre/pyre-jit-trace/tests/elidable_helper_canary_test.rs`, which
+// invokes the helper through `TraceCtx::call_typed_with_effect_pure`
+// with an explicit `ElidableCannotRaise` `EffectInfo`.  Production
+// `emit_trace_call_int_typed` callsites still pass
+// `DEFAULT_EFFECT_INFO` until per-helper EI registration (Task #64)
+// lands; this canary closes the macro-side gap so the EI side can
+// proceed in a separate slice.
+#[majit_macros::elidable_cannot_raise]
+pub fn jit_int_in_small_cache_range(value: i64) -> bool {
+    w_int_small_cached(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pyre_interpreter::PyExecutionContext;
     use pyre_interpreter::{ConstantData, compile_exec};
+
+    /// Verifies that `#[elidable_cannot_raise]` emits the
+    /// `INT_ELIDABLE_CANNOT_RAISE = 19` policy byte (`call.py:299`
+    /// parity / `call_policy_byte.rs:96`) and produces non-null
+    /// trace_target / concrete_target trampolines.  Lives in-crate
+    /// because external integration tests cannot reach the macro's
+    /// `pub(crate)` `__majit_call_policy_*` symbol from outside.
+    #[test]
+    fn elidable_helper_macro_emits_int_elidable_cannot_raise_byte() {
+        let (policy, _, trace_target, concrete_target, _) =
+            __majit_call_policy_jit_int_in_small_cache_range();
+        assert_eq!(policy, 19u8);
+        assert!(!trace_target.is_null());
+        assert!(!concrete_target.is_null());
+    }
+
+    /// Confirms the helper still runs correctly under the elidable
+    /// attribute and preserves the elidable invariant (same input →
+    /// same output).  With the `WITHPREBUILTINT=false` default
+    /// (`intobject.rs:44`) every input returns false.
+    #[test]
+    fn elidable_helper_is_deterministic_and_matches_pyre_object() {
+        for &value in &[0i64, 7, -3, 42, i64::MIN, i64::MAX] {
+            let r1 = jit_int_in_small_cache_range(value);
+            let r2 = jit_int_in_small_cache_range(value);
+            assert_eq!(r1, r2, "elidable helper must be deterministic");
+            assert_eq!(
+                r1,
+                w_int_small_cached(value),
+                "elidable wrapper must mirror pyre-object's underlying check",
+            );
+        }
+    }
 
     #[test]
     fn test_callable_call_helper_dispatches_builtin_without_trace_side_branching() {

@@ -107,8 +107,8 @@ pub struct PyFrame {
     /// companion `w_builtin` carries the Module identity.
     pub builtin: *mut DictStorage,
     /// Companion to `builtin`: the picked `PyObjectRef` (Module wrapping
-    /// the dict, or the default Module) returned by
-    /// `pick_builtin_w(w_globals)`.  Mirrors PyPy `frame.builtin`'s
+    /// the dict, or the default Module) returned by the PyPy-shaped
+    /// `pick_builtin(w_globals)`.  Mirrors PyPy `frame.builtin`'s
     /// identity — `frame.get_builtin()` returns this directly so callers
     /// (`exec`'s `setdefault('__builtins__', self.get_builtin())` at
     /// `pyopcode.py:773-774`) see the picked Module, not the EC's
@@ -847,12 +847,11 @@ impl PyFrame {
         let size = nlocals + ncells + 16; // small stack
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
-        // Single `pick_builtin_pair` call — for the dict-subclass
+        // Single split-adapter call — for the dict-subclass
         // `__builtins__` arm this allocates a wrapping Module, so
-        // `pick_builtin` + `pick_builtin_w` would build it twice and
-        // leak the first.  PyPy stores a single
-        // `self.builtin = pick_builtin(w_globals)`; we widen the
-        // return type to surface both halves of pyre's split.
+        // two independent `pick_builtin` calls would build it twice.
+        // PyPy stores a single `self.builtin = pick_builtin(w_globals)`;
+        // the adapter surfaces both halves of pyre's split storage.
         let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
         let mut frame = PyFrame {
             execution_context,

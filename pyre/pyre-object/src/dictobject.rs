@@ -368,15 +368,24 @@ pub fn register_dict_storage_items_hook(hook: NamespaceItemsHook) {
 
 /// Read-side counterpart of `maybe_sync_dict_storage_store`: enumerate
 /// the str-keyed entries currently in the backing storage.
-unsafe fn maybe_items_dict_storage(ns_ptr: *mut u8) -> Vec<(String, PyObjectRef)> {
+///
+/// Returns `None` when the items hook has not yet been registered (the
+/// hookless case fires for direct `w_module_new` callers and for unit
+/// tests that exercise dict surfaces before `register_dict_storage_*_hook`
+/// runs).  Callers must distinguish "hook missing" (storage view is
+/// indeterminate, fall back to entries Vec) from "hook installed, storage
+/// empty" (authoritative empty result) — collapsing the two would silently
+/// drop entries Vec str keys for proxied dicts whose hook arrives later
+/// in the bootstrap.
+unsafe fn maybe_items_dict_storage(ns_ptr: *mut u8) -> Option<Vec<(String, PyObjectRef)>> {
     if ns_ptr.is_null() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let ptr = DICT_STORAGE_ITEMS_HOOK.load(std::sync::atomic::Ordering::Acquire);
     if ptr.is_null() {
-        return Vec::new();
+        return None;
     }
-    (*ptr)(ns_ptr)
+    Some((*ptr)(ns_ptr))
 }
 
 /// Get the dict_storage_proxy pointer from a dict (used by interpreter for
@@ -539,28 +548,16 @@ pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
     if dict.dict_storage_proxy.is_null() {
         return dict.len;
     }
-    // Union of storage str keys + entries Vec str keys (deduplicated)
-    // + non-str entries Vec slots.  Mirrors PyPy's
-    // `W_DictMultiObject` behaviour where the single storage owns all
-    // entries: a str key written through `w_dict_setitem_str` lands in
-    // the entries Vec immediately, but the proxy `maybe_sync` may
-    // silently no-op if the items hook is not yet registered (early
-    // module init at process startup).  Skipping the entries Vec
-    // entirely would drop those transient str writes.
-    let storage_items = maybe_items_dict_storage(dict.dict_storage_proxy);
     let entries = &*dict.entries;
-    let mut count = storage_items.len();
-    for (k, _) in entries.iter() {
-        if !crate::is_str(*k) {
-            count += 1;
-            continue;
-        }
-        let name = crate::w_str_get_value(*k);
-        if !storage_items.iter().any(|(s, _)| s == name) {
-            count += 1;
-        }
-    }
-    count
+    // Hook missing → storage view is indeterminate; fall back to the
+    // entries Vec (keeps str keys visible during bootstrap before
+    // `register_dict_storage_items_hook` lands).  Hook installed → use
+    // its str-key authoritative count plus any non-str entries Vec slots.
+    let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
+        return dict.len;
+    };
+    let non_str = entries.iter().filter(|(k, _)| !crate::is_str(*k)).count();
+    storage_items.len() + non_str
 }
 
 /// Iterate over all (key, value) pairs without type assumptions.
@@ -577,22 +574,17 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
     if dict.dict_storage_proxy.is_null() {
         return entries.clone();
     }
-    let storage_items = maybe_items_dict_storage(dict.dict_storage_proxy);
+    // Hook missing → fall back to the entries Vec; hook installed →
+    // storage owns str keys and entries Vec contributes non-str slots.
+    let Some(storage_items) = maybe_items_dict_storage(dict.dict_storage_proxy) else {
+        return entries.clone();
+    };
     let mut out: Vec<(PyObjectRef, PyObjectRef)> = storage_items
-        .iter()
-        .map(|(name, value)| (crate::w_str_new(name), *value))
+        .into_iter()
+        .map(|(name, value)| (crate::w_str_new(&name), value))
         .collect();
-    // Append entries Vec slots that aren't already represented in
-    // storage: non-str keys (storage is str-keyed only) and any str
-    // key that hasn't been mirrored into storage yet (early init
-    // before the items hook is registered, or pending sync).
     for &(k, v) in entries.iter() {
         if !crate::is_str(k) {
-            out.push((k, v));
-            continue;
-        }
-        let name = crate::w_str_get_value(k);
-        if !storage_items.iter().any(|(s, _)| s == name) {
             out.push((k, v));
         }
     }
@@ -606,27 +598,19 @@ pub unsafe fn w_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> 
 /// signature.
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
     let dict = &*(obj as *const W_DictObject);
+    // Hook installed → storage authoritative for str keys.  Hook missing
+    // (or proxy unattached) → entries Vec is the only str-key surface.
+    if !dict.dict_storage_proxy.is_null() {
+        if let Some(items) = maybe_items_dict_storage(dict.dict_storage_proxy) {
+            return items;
+        }
+    }
     let entries = &*dict.entries;
-    if dict.dict_storage_proxy.is_null() {
-        return entries
-            .iter()
-            .filter(|(k, _)| crate::is_str(*k))
-            .map(|&(k, v)| (crate::w_str_get_value(k).to_string(), v))
-            .collect();
-    }
-    let mut out = maybe_items_dict_storage(dict.dict_storage_proxy);
-    // Union with entries Vec str keys not yet mirrored into storage —
-    // see `w_dict_items` for the early-init / pending-sync rationale.
-    for &(k, v) in entries.iter() {
-        if !crate::is_str(k) {
-            continue;
-        }
-        let name = crate::w_str_get_value(k);
-        if !out.iter().any(|(s, _)| s == name) {
-            out.push((name.to_string(), v));
-        }
-    }
-    out
+    entries
+        .iter()
+        .filter(|(k, _)| crate::is_str(*k))
+        .map(|&(k, v)| (crate::w_str_get_value(k).to_string(), v))
+        .collect()
 }
 
 #[cfg(test)]
@@ -688,5 +672,58 @@ mod tests {
             <W_DictObject as crate::lltype::GcType>::SIZE,
             W_DICT_OBJECT_SIZE
         );
+    }
+
+    /// `dict_storage_proxy` attached but `register_dict_storage_items_hook`
+    /// has not yet been called (direct `w_module_new` callers,
+    /// hookless unit/integration tests).  The pre-fix code returned an
+    /// empty storage view from `maybe_items_dict_storage` and combined it
+    /// only with the *non-str* entries Vec slots, which silently dropped
+    /// every str key written through `w_dict_setitem_str`.  The current
+    /// behaviour treats the missing hook as "storage view indeterminate"
+    /// and falls back to the entries Vec, matching PyPy's
+    /// `W_DictMultiObject` single-source-of-truth semantics during the
+    /// hookless bootstrap window.
+    ///
+    /// pyre-object alone has no caller of
+    /// `register_dict_storage_items_hook`, so within `cargo test -p
+    /// pyre-object` the hook stays null for the lifetime of the test
+    /// process — the assertion is therefore stable here.
+    #[test]
+    fn test_w_dict_proxied_hookless_falls_back_to_entries_vec() {
+        let dict = w_dict_new();
+        unsafe {
+            // Non-null sentinel; the hook never fires because no hook
+            // has been registered, so the pointer's pointee is never
+            // dereferenced.
+            let sentinel: *mut u8 = 0xdead_beef_usize as *mut u8;
+            w_dict_set_dict_storage_proxy(dict, sentinel);
+
+            w_dict_setitem_str(dict, "alpha", w_int_new(1));
+            w_dict_setitem_str(dict, "beta", w_int_new(2));
+
+            assert_eq!(
+                w_dict_len(dict),
+                2,
+                "hookless proxied dict must expose the entries Vec count, not 0",
+            );
+
+            let items = w_dict_items(dict);
+            assert_eq!(items.len(), 2);
+            let mut keys: Vec<&str> = items
+                .iter()
+                .map(|&(k, _)| crate::w_str_get_value(k))
+                .collect();
+            keys.sort();
+            assert_eq!(keys, vec!["alpha", "beta"]);
+
+            let mut str_entries = w_dict_str_entries(dict);
+            str_entries.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(str_entries.len(), 2);
+            assert_eq!(str_entries[0].0, "alpha");
+            assert_eq!(w_int_get_value(str_entries[0].1), 1);
+            assert_eq!(str_entries[1].0, "beta");
+            assert_eq!(w_int_get_value(str_entries[1].1), 2);
+        }
     }
 }

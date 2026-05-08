@@ -222,11 +222,17 @@ fn emit_helper_call_target_fn(
         converted_args.push(converted);
     }
 
+    // Wrapper visibility follows the user fn so external integration
+    // tests can use the macro-emitted `extern "C"` ABI trampoline as
+    // the actual trace function pointer (PyPy `getfunctionptr` parity
+    // verification).  `#[doc(hidden)]` + `__majit_call_target_*`
+    // naming keeps it off the user-facing surface.
+    let vis = &func.vis;
     let helper_name = &func.sig.ident;
     let wrapper = match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
-            pub(crate) extern "C" fn #trace_target_name(#(#wrapper_params),*) {
+            #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) {
                 #helper_name(#(#converted_args),*);
             }
         },
@@ -244,7 +250,7 @@ fn emit_helper_call_target_fn(
             };
             quote! {
                 #[doc(hidden)]
-                pub(crate) extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
+                #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
                     #converted_return
                 }
             }
@@ -255,7 +261,7 @@ fn emit_helper_call_target_fn(
             };
             let float_wrapper = quote! {
                 #[doc(hidden)]
-                pub(crate) extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
+                #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
                     #helper_name(#(#converted_args),*)
                 }
             };
@@ -269,7 +275,7 @@ fn emit_helper_call_target_fn(
             };
             let concrete_wrapper = quote! {
                 #[doc(hidden)]
-                pub(crate) extern "C" fn #concrete_target_name(#(#wrapper_params),*) -> i64 {
+                #vis extern "C" fn #concrete_target_name(#(#wrapper_params),*) -> i64 {
                     #concrete_return
                 }
             };
@@ -442,12 +448,17 @@ fn helper_policy_tokens_for_fn(
 
 fn emit_helper_policy_fn(
     path: &Path,
+    vis: &syn::Visibility,
     body: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let helper_name = helper_policy_fn_name(path)?;
+    // `__majit_call_policy_*` visibility follows the user fn so
+    // external integration tests can read the 4-tuple's trace_target /
+    // concrete_target function pointers for PyPy `getfunctionptr`
+    // parity verification.
     Ok(quote! {
         #[doc(hidden)]
-        pub(crate) fn #helper_name() -> (u8, *const (), *const (), *const (), *const ()) {
+        #vis fn #helper_name() -> (u8, *const (), *const (), *const (), *const ()) {
             #body
         }
     })
@@ -753,6 +764,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
         };
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
+        vis,
         match helper_policy_tokens_for_fn(
             &func,
             attr_name,
@@ -830,6 +842,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
         };
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
+        vis,
         match helper_policy_tokens_for_fn(
             &func,
             attr_name,
@@ -881,6 +894,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
         };
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
+        vis,
         match helper_policy_tokens_for_fn(
             &func,
             attr_name,
@@ -1156,6 +1170,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     let policy_path = Path::from(orig_name.clone());
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
+        vis,
         match helper_policy_tokens_for_fn(
             &orig_func,
             "elidable",
@@ -1565,6 +1580,14 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "elidable_cannot_raise",
     "elidable_or_memerror",
     "elidable_promote",
+    // ImplItemFn-friendly pass-through variant (lib.rs:993).  The
+    // `#[elidable]` family emits a module-level trampoline, so attaching
+    // it inside an `impl` block fails with `not found in this scope`.
+    // `#[jit_elidable]` flows the hint without a trampoline, so it can
+    // be attached to a method — but discovery requires registering it
+    // in this list.  `front::ast::collect_jit_hints` (front/ast.rs:1971)
+    // then normalises "jit_elidable" → "elidable".
+    "jit_elidable",
     "dont_look_inside",
     "dont_look_inside_cannot_raise",
     "unroll_safe",
@@ -1905,9 +1928,42 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! { #module }.into()
 }
 
+/// Helper attributes that are pure pass-throughs and therefore do not
+/// emit a `__majit_call_policy_<name>()` trampoline.  When `#[jit_module]`
+/// discovers a free fn carrying one of these, the registry must take the
+/// direct function address instead of the policy-fn indirection — the
+/// indirection symbol simply does not exist for these.
+///
+/// Impl methods always take the direct address regardless (`impl_addr_expr`
+/// only enters this branch on the free-fn path).
+fn attr_is_passthrough(attr_name: &str) -> bool {
+    matches!(
+        attr_name,
+        // lib.rs:1008 `#[jit_elidable]` — ImplItemFn-friendly pass-through.
+        "jit_elidable"
+        // lib.rs:1018 `#[unroll_safe]`.
+        | "unroll_safe"
+        // lib.rs:1047 `#[not_in_trace]`.
+        | "not_in_trace"
+        // lib.rs:1243 `#[oopspec(...)]` — body untouched, only `_MAJIT_OOPSPEC`
+        // marker constant added.
+        | "oopspec"
+        // lib.rs:1281 `#[look_inside_iff(...)]` — emits dispatch wrapper around
+        // `_orig_<name>` / `<name>_trampoline`; the public name keeps its body
+        // but no policy fn is generated.
+        | "look_inside_iff"
+    )
+}
+
 /// Emit the runtime address expression for a `DiscoveredHelper`:
 ///
-/// * Free fn: route through `__majit_call_policy_<name>()` (no change).
+/// * Free fn carrying a policy-emitting attribute: route through
+///   `__majit_call_policy_<name>()`.
+/// * Free fn carrying a pass-through attribute (`#[jit_elidable]`,
+///   `#[unroll_safe]`, `#[not_in_trace]`, `#[oopspec]`,
+///   `#[look_inside_iff]`): take the direct fn address — the policy
+///   symbol is not emitted by these macros and routing through it would
+///   fail with `not found in this scope` at expansion time.
 /// * Inherent impl (`impl Type { ... }`): `<Type>::method as *const ()`.
 /// * Trait impl (`impl Trait for Type { ... }`):
 ///   `<Type as Trait>::method as *const ()` — fully-qualified trait
@@ -1918,6 +1974,11 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 fn impl_addr_expr(h: &DiscoveredHelper) -> proc_macro2::TokenStream {
     let fn_name = &h.fn_name;
     let Some(impl_segs) = h.impl_type_segments.as_ref() else {
+        if attr_is_passthrough(&h.attr_name) {
+            return quote! {
+                #fn_name as *const () as usize as i64
+            };
+        }
         let policy_fn = format_ident!("__majit_call_policy_{}", fn_name);
         return quote! {
             {

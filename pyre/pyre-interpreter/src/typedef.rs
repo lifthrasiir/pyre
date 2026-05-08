@@ -2706,15 +2706,18 @@ fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "bit_count",
+        // PyPy `intobject.py:649-650 descr_bit_count` parity:
+        // `space.newint(_bit_count(self.intval))`.  Routes through
+        // `pyre_object::int_bit_count` (`@jit.elidable` parity port of
+        // `_bit_count`) so the call graph matches upstream
+        // `descr_bit_count -> _bit_count` 1:1.
         make_builtin_function("bit_count", |args| {
             let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
                 unsafe { pyre_object::w_int_get_value(args[0]) }
             } else {
                 0
             };
-            Ok(pyre_object::w_int_new(
-                val.unsigned_abs().count_ones() as i64
-            ))
+            Ok(pyre_object::w_int_new(pyre_object::int_bit_count(val)))
         }),
     );
     // int.to_bytes(length=1, byteorder='big', *, signed=False)

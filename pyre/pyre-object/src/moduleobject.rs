@@ -99,13 +99,13 @@ pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
 /// module.Module(space, None, w_builtin)`: the Module's dict identity
 /// IS the user dict (PyPy `module.w_dict = w_builtin`).
 ///
-/// `dict_ptr` is the storage-proxy mirror that callers attach to the
-/// user dict (see `w_dict_set_dict_storage_proxy` +
-/// `maybe_sync_dict_storage_{store,delete}` for the sync contract); the
-/// storage-keyed fastpath (`LOAD_GLOBAL` builtins fallback,
-/// `frame.builtin`) reaches that proxy via the `dict` field, while
-/// observers (`getdict(space)`, `__dict__`, `f_builtins`) prefer
-/// `w_dict` so the user dict identity survives.
+/// `dict_ptr` is optional.  When non-null, storage-keyed callers may
+/// reach that mirror via the `dict` field.  When null, the Module is
+/// still valid and callers must route through `w_dict` with the normal
+/// object-space operations.  The null-storage shape is the closer port
+/// of PyPy's `Module(space, None, w_builtin)` for dict subclasses:
+/// `LOAD_GLOBAL` falls through to `space.finditem_str(module.w_dict,
+/// name)` so subclass `__getitem__` overrides are not bypassed.
 pub fn w_module_new_aliasing_dict(
     name: &str,
     dict_ptr: *mut u8,

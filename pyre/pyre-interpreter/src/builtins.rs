@@ -2178,7 +2178,41 @@ fn exec_or_eval(
         }
     }
 
-    fn ensure_builtins(
+    fn ensure_eval_builtins(
+        ns: &mut crate::DictStorage,
+        w_globals_obj: pyre_object::PyObjectRef,
+        exec_ctx: *const crate::PyExecutionContext,
+    ) -> Result<(), crate::PyError> {
+        // pypy/module/__builtin__/compiling.py:109-110 eval:
+        //
+        //   if not space.contains_w(w_globals, space.newtext("__builtins__")):
+        //       space.setitem_str(w_globals, "__builtins__", space.builtin)
+        //
+        // This is intentionally NOT pyopcode.py:773's `setdefault`
+        // call-method path; dict-subclass `setdefault` overrides do
+        // not fire for eval() in PyPy.
+        let w_builtin = if !exec_ctx.is_null() {
+            unsafe { (*exec_ctx).get_builtin() }
+        } else {
+            pyre_object::PY_NULL
+        };
+        if w_builtin.is_null() {
+            return Ok(());
+        }
+        if !w_globals_obj.is_null() {
+            let key = pyre_object::w_str_new("__builtins__");
+            if !crate::baseobjspace::contains(w_globals_obj, key)? {
+                crate::baseobjspace::setitem(w_globals_obj, key, w_builtin)?;
+            }
+            return Ok(());
+        }
+        if crate::dict_storage_get(ns, "__builtins__").is_none() {
+            crate::dict_storage_store(ns, "__builtins__", w_builtin);
+        }
+        Ok(())
+    }
+
+    fn ensure_exec_builtins(
         ns: &mut crate::DictStorage,
         w_globals_obj: pyre_object::PyObjectRef,
         caller_frame: *const crate::PyFrame,
@@ -2202,15 +2236,11 @@ fn exec_or_eval(
         if w_builtin.is_null() {
             return Ok(());
         }
-        // PyPy `pyopcode.py:773 space.call_method(w_globals, 'setdefault',
-        // '__builtins__', self.get_builtin())` — the receiver is the
-        // ORIGINAL `w_globals` argument the caller passed, not the
+        // PyPy `space.call_method(w_globals, 'setdefault', ...)` —
+        // the receiver is the ORIGINAL `w_globals` object, not the
         // backing W_DictObject that GlobalsBinding strips off via
-        // `resolve_dict_backing`.  Dispatching on the user object
-        // (e.g. a dict subclass instance) lets a `setdefault`
-        // override fire; dispatching on the backing would bypass it.
-        // Anonymous storage (no user object) has nothing to dispatch
-        // through and goes direct.
+        // `resolve_dict_backing`.  Dispatching on the user object lets
+        // dict-subclass `setdefault` overrides fire.
         if !w_globals_obj.is_null() {
             let key = pyre_object::w_str_new("__builtins__");
             let setdefault = crate::baseobjspace::getattr(w_globals_obj, "setdefault")?;
@@ -2274,25 +2304,22 @@ fn exec_or_eval(
         anon_globals = Some(storage);
         globals_ptr = raw;
     }
-    // Attach the forward proxy BEFORE seeding `__builtins__` so that
-    // `space.call_method(w_globals, 'setdefault', ...)` (PyPy
-    // pyopcode.py:773) lands in BOTH the user dict's W_DictObject AND
-    // the frame storage that `pick_builtin` / LOAD_GLOBAL will consult.
-    // PyPy's single `W_DictMultiObject` makes this a non-issue; pyre's
-    // split storage requires the proxy bridge live before the
-    // `setdefault` write.  `GlobalsBinding::Drop` detaches even on
-    // `?` early-return from `ensure_builtins` / `createframe`.
+    // Attach the forward proxy BEFORE seeding `__builtins__` so PyPy's
+    // eval `setitem_str` / exec `call_method(..., 'setdefault', ...)`
+    // lands in BOTH the user dict's W_DictObject AND the frame storage
+    // that `pick_builtin` / LOAD_GLOBAL will consult.  PyPy's single
+    // `W_DictMultiObject` makes this a non-issue; pyre's split storage
+    // requires the proxy bridge live before the write.  Drop detaches
+    // even on `?` early-return from builtins seeding / createframe.
     unsafe {
         globals_binding.attach_forward_proxy();
     }
     if !globals_ptr.is_null() {
         // Pass the ORIGINAL `globals_arg` (the user's PyObjectRef —
-        // possibly a dict subclass instance) so `ensure_builtins` can
-        // dispatch `setdefault` on it via PyPy `pyopcode.py:773
-        // space.call_method(w_globals, 'setdefault', ...)`.  When the
-        // caller omits globals, fall back to the caller frame's
-        // w_globals object (or PY_NULL for the no-frame case, which
-        // forces the storage-direct write below).
+        // possibly a dict subclass instance) so eval/exec dispatch
+        // through the same receiver PyPy uses.  When the caller omits
+        // globals, Pyre only has the caller frame's `*mut DictStorage`,
+        // so this falls back to storage-direct seeding.
         let w_globals_obj = if !is_none_or_null(globals_arg) {
             globals_arg
         } else if !caller_frame.is_null() {
@@ -2303,12 +2330,16 @@ fn exec_or_eval(
         } else {
             pyre_object::PY_NULL
         };
-        ensure_builtins(
-            unsafe { &mut *globals_ptr },
-            w_globals_obj,
-            caller_frame,
-            exec_ctx,
-        )?;
+        if is_eval {
+            ensure_eval_builtins(unsafe { &mut *globals_ptr }, w_globals_obj, exec_ctx)?;
+        } else {
+            ensure_exec_builtins(
+                unsafe { &mut *globals_ptr },
+                w_globals_obj,
+                caller_frame,
+                exec_ctx,
+            )?;
+        }
     }
 
     // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,

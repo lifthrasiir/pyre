@@ -5493,13 +5493,21 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 ///      `builtin = module.Module(space, None); space.setitem(builtin
 ///      .w_dict, 'None', w_None); return builtin`.
 ///
-/// Pyre's split-storage variant returns BOTH the storage_ptr (for the
-/// LOAD_GLOBAL fast path) AND the picked Module identity (for
-/// `frame.get_builtin()` / `exec`'s `__builtins__` seeding) so that
-/// PyFrame::new can fill `frame.builtin` (storage) and `frame.w_builtin`
-/// (Module) with a single allocation — the user-dict subclass arm
-/// builds a wrapping Module, which a paired `pick_builtin` +
-/// `pick_builtin_w` would otherwise allocate twice.
+pub fn pick_builtin(
+    w_globals: *mut crate::DictStorage,
+    exec_ctx: *const crate::PyExecutionContext,
+) -> PyObjectRef {
+    pick_builtin_pair(w_globals, exec_ctx).1
+}
+
+/// Pyre's split-storage adapter for the PyPy-shaped `pick_builtin`
+/// above.  It returns BOTH the storage_ptr (for the LOAD_GLOBAL fast
+/// path) AND the picked Module identity (for `frame.get_builtin()` /
+/// `exec`'s `__builtins__` seeding) so that PyFrame construction can
+/// fill `frame.builtin` (storage) and `frame.w_builtin` (Module) with
+/// a single allocation — the user-dict subclass arm builds a wrapping
+/// Module, which two independent `pick_builtin` calls would otherwise
+/// allocate twice.
 pub fn pick_builtin_pair(
     w_globals: *mut crate::DictStorage,
     exec_ctx: *const crate::PyExecutionContext,

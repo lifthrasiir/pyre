@@ -302,3 +302,135 @@ fn test_jit_module_disambiguates_trait_impl_with_as_trait_cast() {
         "<Widget as NameCollider>::conflict entry missing"
     );
 }
+
+// ── `#[jit_elidable]` impl-method attachment ──────────────────────
+//
+// `#[elidable]` / `#[elidable_cannot_raise]` and friends emit a
+// module-level trampoline (`__majit_call_target_*`), so they cannot be
+// attached inside an `impl` block (probe result: `not found in this
+// scope`).  `#[jit_elidable]` (lib.rs:993) is a pure pass-through and
+// only relies on `front::ast::collect_jit_hints`'s hint flip, so it can
+// safely sit on impl methods.  This fixture verifies that live wire.
+#[jit_module]
+mod elidable_method_module {
+    use majit_macros::jit_elidable;
+
+    pub struct PureCalc {
+        pub seed: i64,
+    }
+
+    impl PureCalc {
+        // Free-style impl method (no receiver).
+        #[jit_elidable]
+        pub fn compute_xor(a: i64, b: i64) -> i64 {
+            a ^ b
+        }
+
+        // `&self` instance method.
+        #[jit_elidable]
+        pub fn shifted(&self, x: i64) -> i64 {
+            self.seed.wrapping_add(x)
+        }
+    }
+}
+
+#[test]
+fn test_jit_elidable_on_impl_methods_is_discovered() {
+    let helpers = elidable_method_module::__MAJIT_DISCOVERED_HELPERS;
+    assert!(
+        helpers.contains(&"PureCalc::compute_xor"),
+        "free-style elidable method must be discovered, got {helpers:?}"
+    );
+    assert!(
+        helpers.contains(&"PureCalc::shifted"),
+        "&self elidable method must be discovered, got {helpers:?}"
+    );
+
+    let policies = elidable_method_module::__MAJIT_HELPER_POLICIES;
+    // jit_module records the raw attribute name; normalisation happens
+    // in `front::ast::collect_jit_hints` (front/ast.rs:1971), which
+    // flips "jit_elidable" → "elidable" before mark_elidable consumes
+    // the hint.
+    assert!(policies.contains(&("PureCalc::compute_xor", "jit_elidable")));
+    assert!(policies.contains(&("PureCalc::shifted", "jit_elidable")));
+}
+
+#[test]
+fn test_jit_elidable_method_runtime_callable() {
+    // `#[jit_elidable]` is pass-through, so runtime behaviour is unchanged.
+    assert_eq!(
+        elidable_method_module::PureCalc::compute_xor(0xff, 0x0f),
+        0xf0
+    );
+    let calc = elidable_method_module::PureCalc { seed: 100 };
+    assert_eq!(calc.shifted(7), 107);
+}
+
+// ── pass-through attribute on a *free* fn under `#[jit_module]` ───
+//
+// `#[jit_elidable]` (lib.rs:1008) is a pure pass-through and emits no
+// `__majit_call_policy_<name>()` trampoline.  `__majit_helper_trace_fnaddrs()`
+// must therefore record the function's direct address (impl_addr_expr's
+// pass-through branch) instead of routing through the missing policy fn —
+// without that branch the `#[jit_module]` expansion fails to compile with
+// `cannot find function __majit_call_policy_*`.  Other pass-through attrs
+// (`#[unroll_safe]`, `#[not_in_trace]`) must take the same direct path; the
+// fixture exercises one of each to pin the static surface in tests.
+#[jit_module]
+mod passthrough_free_fn_module {
+    use majit_macros::{jit_elidable, not_in_trace, unroll_safe};
+
+    #[jit_elidable]
+    pub fn pure_xor(a: i64, b: i64) -> i64 {
+        a ^ b
+    }
+
+    #[unroll_safe]
+    pub fn unrolled(x: i64) -> i64 {
+        x.wrapping_add(1)
+    }
+
+    #[not_in_trace]
+    pub fn out_of_trace(x: i64) -> i64 {
+        x.wrapping_mul(2)
+    }
+}
+
+#[test]
+fn test_passthrough_free_fn_discovery_uses_direct_fn_address() {
+    let helpers = passthrough_free_fn_module::__MAJIT_DISCOVERED_HELPERS;
+    assert!(helpers.contains(&"pure_xor"));
+    assert!(helpers.contains(&"unrolled"));
+    assert!(helpers.contains(&"out_of_trace"));
+
+    let policies = passthrough_free_fn_module::__MAJIT_HELPER_POLICIES;
+    // jit_module records the raw attribute name; normalisation lives
+    // in front/ast.rs:2147.
+    assert!(policies.contains(&("pure_xor", "jit_elidable")));
+    assert!(policies.contains(&("unrolled", "unroll_safe")));
+    assert!(policies.contains(&("out_of_trace", "not_in_trace")));
+
+    let trace_fnaddrs = passthrough_free_fn_module::__majit_helper_trace_fnaddrs();
+    assert_eq!(trace_fnaddrs.len(), 3);
+    // No `__majit_call_policy_*` exists for any of these, so the only
+    // legal address is the function's direct cast.
+    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
+        *path == concat!(module_path!(), "::passthrough_free_fn_module::pure_xor")
+            && *addr == passthrough_free_fn_module::pure_xor as *const () as usize as i64
+    }));
+    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
+        *path == concat!(module_path!(), "::passthrough_free_fn_module::unrolled")
+            && *addr == passthrough_free_fn_module::unrolled as *const () as usize as i64
+    }));
+    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
+        *path == concat!(module_path!(), "::passthrough_free_fn_module::out_of_trace")
+            && *addr == passthrough_free_fn_module::out_of_trace as *const () as usize as i64
+    }));
+}
+
+#[test]
+fn test_passthrough_free_fn_callable() {
+    assert_eq!(passthrough_free_fn_module::pure_xor(0b1010, 0b0110), 0b1100);
+    assert_eq!(passthrough_free_fn_module::unrolled(7), 8);
+    assert_eq!(passthrough_free_fn_module::out_of_trace(5), 10);
+}

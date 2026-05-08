@@ -146,6 +146,31 @@ pub fn w_int_small_cache_base_ptr() -> PyObjectRef {
     SMALL_INTS.as_ptr().cast_mut() as PyObjectRef
 }
 
+/// `intobject.py:516 _bit_count` parity — population count of an i64.
+///
+/// `@jit.elidable` (`rlib/jit.py:13`): deterministic, no allocation,
+/// no raise → `EF_ELIDABLE_CANNOT_RAISE` (`call.py:299`).
+///
+/// Line-by-line port of the upstream RPython loop; `i64::MIN` is
+/// special-cased because `-i64::MIN` overflows in two's complement,
+/// matching `val == -sys.maxint - 1` in the upstream guard.
+#[majit_macros::elidable_cannot_raise]
+pub fn int_bit_count(val: i64) -> i64 {
+    if val == i64::MIN {
+        return 1;
+    }
+    let mut val = val;
+    if val < 0 {
+        val = -val;
+    }
+    let mut count: i64 = 0;
+    while val != 0 {
+        count += val & 1;
+        val >>= 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +251,47 @@ mod tests {
         // `W_IntObject` and the id that `pyre-jit/src/eval.rs`
         // asserts at JitDriver init. See `descr.rs` re-export.
         assert_eq!(W_INT_GC_TYPE_ID, 1);
+    }
+
+    /// `intobject.py:516 _bit_count` parity — verifies the popcount
+    /// against `i64::count_ones`, including the `i64::MIN` sentinel
+    /// which the upstream short-circuits to `1`.
+    #[test]
+    fn test_int_bit_count_matches_intrinsic_popcount() {
+        for &v in &[
+            0i64,
+            1,
+            -1,
+            42,
+            -42,
+            i64::MAX,
+            i64::MAX - 1,
+            // i64::MIN is the upstream `-sys.maxint - 1` guard: the
+            // bit_count of i64::MIN in two's complement is 1.
+            i64::MIN,
+        ] {
+            let abs = if v == i64::MIN { i64::MAX } else { v.abs() };
+            let expected = if v == i64::MIN {
+                1
+            } else {
+                abs.count_ones() as i64
+            };
+            assert_eq!(
+                int_bit_count(v),
+                expected,
+                "int_bit_count({v}) must match the upstream popcount",
+            );
+        }
+    }
+
+    /// `#[elidable_cannot_raise]` macro on a production helper must
+    /// emit `INT_ELIDABLE_CANNOT_RAISE = 19` (`call_policy_byte.rs:96`)
+    /// and a non-null trace_target / concrete_target trampoline pair.
+    #[test]
+    fn test_int_bit_count_advertises_int_elidable_cannot_raise_byte() {
+        let (policy, _, trace_target, concrete_target, _) = __majit_call_policy_int_bit_count();
+        assert_eq!(policy, 19u8);
+        assert!(!trace_target.is_null());
+        assert!(!concrete_target.is_null());
     }
 }
