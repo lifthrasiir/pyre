@@ -708,8 +708,8 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "same_as" || unop_name == "deref" => {
-                // RPython `jtransform.py:246-248 rewrite_op_same_as`:
+            } if unop_name == "same_as" => {
+                // `jtransform.py:246-248 rewrite_op_same_as`:
                 //
                 //     def rewrite_op_same_as(self, op):
                 //         if op.args[0] in self.vable_array_vars:
@@ -720,19 +720,19 @@ impl<'a> Transformer<'a> {
                 // `optimize_block` that means "remove the op and rename
                 // the result to args[0]" (`jtransform.py:106-111`).
                 //
-                // Pyre instead drops the op (`RewriteResult::Identity`)
-                // and records `op.result -> *operand` in `self.aliases`
+                // Pyre drops the op (`RewriteResult::Identity`) and
+                // records `op.result -> *operand` in `self.aliases`
                 // (line 446-450). Subsequent ops in the same block
                 // (and `block.exitswitch` / `link.args` via
-                // `remap_control_flow_metadata`) go through
-                // `remap_op` at line 441 before dispatch, so a
-                // consumer that originally referenced `op.result` is
-                // rewritten to reference `*operand` directly. The
-                // later `vable_array_vars.get(&base)` lookup in
-                // `rewrite_op_getarrayitem`/`_setarrayitem` then
-                // hits the original `(*operand)` entry — same outcome
-                // as RPython's explicit propagation, without keeping
-                // a redundant alias key.
+                // `remap_control_flow_metadata`) go through `remap_op`
+                // at line 441 before dispatch, so a consumer that
+                // originally referenced `op.result` is rewritten to
+                // reference `*operand` directly. The later
+                // `vable_array_vars.get(&base)` lookup in
+                // `rewrite_op_getarrayitem`/`_setarrayitem` then hits
+                // the original `(*operand)` entry — same outcome as
+                // upstream's explicit propagation, without keeping a
+                // redundant alias key.
                 RewriteResult::Identity(*operand)
             }
             // RPython `jtransform.py:1243-1255` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`

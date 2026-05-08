@@ -31,24 +31,51 @@ pub fn vref_gc_type_id() -> u32 {
     VREF_GC_TYPE_ID.load(Ordering::Relaxed)
 }
 
-/// rpython/rlib/jit.py JitVirtualRef: heap-allocated virtual reference.
-/// Contains a type tag for identity checking (RPython uses typeptr),
-/// a force token (active JIT frame), and a forced pointer
-/// (materialized object, initially null).
+/// `rpython/rlib/jit.py JitVirtualRef`: heap-allocated virtual reference.
+/// Contains a type tag for identity checking (typeptr), a force token
+/// (active JIT frame), and a forced pointer (materialized object,
+/// initially null).
+///
+/// `virtualref.py:17-20` registers `virtual_token` and `forced` both as
+/// `llmemory.GCREF`/`OBJECTPTR` slots — pointer fields, not int.  Pyre
+/// stores `virtual_token` as `*mut u8` so the runtime layout, the
+/// `VREF_FIELD_VIRTUAL_TOKEN` descriptor encoding (Ref bit), and the
+/// optimizer-side `make_vref_field_descr` (`Type::Ref` per
+/// `optimizeopt/virtualize.rs:1659`) all agree.
+///
+/// PRE-EXISTING-ADAPTATION (GC trace).  Upstream traces both fields as
+/// real GC pointers; pyre traces only `forced`.  `eval.rs:241-247`
+/// registers JIT_VIRTUAL_REF with `gc_ptr_offsets = [16]` (forced
+/// only).  The reason is that every value `virtual_token` ever holds
+/// at runtime falls outside the GC heap:
+///   - `TOKEN_NONE` — null, safe to walk.
+///   - `token_tracing_rescall()` — static `u64` storage address (see
+///     below), not a GC-allocated `_dummy` GcStruct.
+///   - an active JITFRAME address — `libc::calloc`'d on a host-side
+///     pool (eval.rs:232-240), not nursery/oldgen.
+/// Routing it through `trace_and_update_object` would either be a
+/// no-op or trip a poison-address check.  The optimizer-side
+/// `Type::Ref` is intentionally retained so that
+/// `setfield_gc_r` / `getfield_gc_r` ops emit correctly during
+/// tracing; only the collector's view of the slot diverges.
+/// Convergence path: would require allocating `_dummy` via the GC
+/// AND routing JITFRAMEs through GC-managed allocation, both outside
+/// the current parity scope.
 #[repr(C)]
 pub struct JitVirtualRef {
-    /// Type identity tag — RPython equivalent of inst.typeptr == jit_virtual_ref_vtable.
+    /// Type identity tag — `inst.typeptr == jit_virtual_ref_vtable` peer.
     pub type_tag: u64,
-    pub virtual_token: i64,
+    pub virtual_token: *mut u8,
     pub forced: *mut u8,
 }
 
 /// Magic value stored in JitVirtualRef.type_tag for type identity.
-/// virtualref.py:94-98: is_virtual_ref checks inst.typeptr == jit_virtual_ref_vtable.
+/// `virtualref.py:94-98 is_virtual_ref` checks
+/// `inst.typeptr == jit_virtual_ref_vtable`.
 pub const VREF_TYPE_TAG: u64 = 0x4A49_5456_5245_4621; // "JITVREF!"
 
 /// Allocate a concrete JitVirtualRef on the heap.
-/// virtualref.py:85-91: virtual_ref_during_tracing(real_object).
+/// `virtualref.py:85-91 virtual_ref_during_tracing(real_object)`.
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
 pub fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
@@ -61,17 +88,50 @@ pub fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
 }
 
 /// Token value indicating no JIT frame is active.
-pub const TOKEN_NONE: i64 = 0;
+/// `virtualizable.py:329 TOKEN_NONE = lltype.nullptr(llmemory.GCREF.TO)`.
+pub const TOKEN_NONE: *mut u8 = std::ptr::null_mut();
+
+/// Static dummy backing `TOKEN_TRACING_RESCALL`.
+///
+/// `virtualizable.py:326-327`:
+/// ```python
+/// _DUMMY = lltype.GcStruct('JITFRAME_DUMMY')
+/// _dummy = lltype.malloc(_DUMMY)
+/// ```
+/// allocates a real GC object whose address serves as the tracing
+/// sentinel.  A `static u64` gives us a stable lifetime-of-program
+/// address that is non-null, distinguishable from any heap allocation,
+/// and (unlike `usize::MAX as *mut u8`) actually points at memory we
+/// own — so any non-GC machinery that loads the slot and chases it
+/// sees a valid pointer rather than tripping on a poison address.
+///
+/// PRE-EXISTING-ADAPTATION.  This is NOT 1:1 with upstream's
+/// `lltype.malloc(_DUMMY)`: PyPy's `_dummy` is a real GcStruct that
+/// the collector knows about, while pyre's static is host-process
+/// memory the GC has no record of.  The adaptation is internally
+/// consistent because `virtual_token` is also not GC-traced (see
+/// `JitVirtualRef` doc-comment); if either side flips — making the
+/// slot GC-traced or making `_dummy` a GcStruct — both must flip
+/// together.
+static TRACING_RESCALL_DUMMY: u64 = 0;
 
 /// Token value used during tracing when a residual call is in progress.
-pub const TOKEN_TRACING_RESCALL: i64 = -1;
+/// `virtualizable.py:330`:
+/// ```python
+/// TOKEN_TRACING_RESCALL = lltype.cast_opaque_ptr(llmemory.GCREF, _dummy)
+/// ```
+#[inline]
+pub fn token_tracing_rescall() -> *mut u8 {
+    &TRACING_RESCALL_DUMMY as *const u64 as *mut u8
+}
 
 /// Well-known field descriptor indices for JitVirtualRef fields.
 /// Properly encoded: FIELD_DESCR_TAG | (byte_offset << 4) | type_bits
 ///
 /// Layout: type_tag(0) | virtual_token(8) | forced(16)
 pub const VREF_FIELD_TYPE_TAG: u32 = 0x1000_0000; // offset=0, Int
-pub const VREF_FIELD_VIRTUAL_TOKEN: u32 = 0x1000_0080; // offset=8, Int
+/// `virtualref.py:17-20` declares `virtual_token` as `llmemory.GCREF`.
+pub const VREF_FIELD_VIRTUAL_TOKEN: u32 = 0x1000_0081; // offset=8, Ref
 pub const VREF_FIELD_FORCED: u32 = 0x1000_0101; // offset=16, Ref
 
 /// Descriptor indices for the virtual ref struct fields.
@@ -142,14 +202,14 @@ impl VirtualRefInfo {
     pub unsafe fn force_virtual(
         &self,
         vref_ptr: *mut u8,
-        force_fn: impl FnOnce(i64) -> *mut u8,
+        force_fn: impl FnOnce(*mut u8) -> *mut u8,
     ) -> *mut u8 {
         unsafe {
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
             if vref.virtual_token == TOKEN_NONE {
                 return vref.forced;
             }
-            if vref.virtual_token == TOKEN_TRACING_RESCALL {
+            if vref.virtual_token == token_tracing_rescall() {
                 vref.virtual_token = TOKEN_NONE;
                 return vref.forced;
             }
@@ -180,7 +240,7 @@ impl VirtualRefInfo {
     pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
         unsafe {
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-            vref.virtual_token = TOKEN_TRACING_RESCALL;
+            vref.virtual_token = token_tracing_rescall();
         }
     }
 
@@ -194,7 +254,7 @@ impl VirtualRefInfo {
     pub unsafe fn tracing_after_residual_call(&self, vref_ptr: *mut u8) -> bool {
         unsafe {
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-            if vref.virtual_token != TOKEN_TRACING_RESCALL {
+            if vref.virtual_token != token_tracing_rescall() {
                 // Token was modified during the call — vref was forced
                 return true;
             }
@@ -221,18 +281,18 @@ impl VirtualRefInfo {
     /// Check if a virtual reference is currently active (has a JIT frame token).
     ///
     /// virtualref.py: token != TOKEN_NONE and token != TOKEN_TRACING_RESCALL
-    pub fn is_active(token: i64) -> bool {
-        token != TOKEN_NONE && token != TOKEN_TRACING_RESCALL
+    pub fn is_active(token: *mut u8) -> bool {
+        token != TOKEN_NONE && token != token_tracing_rescall()
     }
 
     /// Check if a virtual reference is forced (token == TOKEN_NONE).
-    pub fn is_forced(token: i64) -> bool {
+    pub fn is_forced(token: *mut u8) -> bool {
         token == TOKEN_NONE
     }
 
     /// Check if a virtual reference is in a residual call.
-    pub fn is_in_residual_call(token: i64) -> bool {
-        token == TOKEN_TRACING_RESCALL
+    pub fn is_in_residual_call(token: *mut u8) -> bool {
+        token == token_tracing_rescall()
     }
 
     /// virtualref.py:94-98 is_virtual_ref(gcref)
@@ -263,14 +323,14 @@ impl VirtualRefInfo {
     pub unsafe fn force_virtual_full(
         &self,
         vref_ptr: *mut u8,
-        force_fn: impl FnOnce(i64) -> *mut u8,
+        force_fn: impl FnOnce(*mut u8) -> *mut u8,
     ) -> *mut u8 {
         unsafe {
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
             if vref.virtual_token == TOKEN_NONE {
                 return vref.forced;
             }
-            if vref.virtual_token == TOKEN_TRACING_RESCALL {
+            if vref.virtual_token == token_tracing_rescall() {
                 vref.virtual_token = TOKEN_NONE;
                 return vref.forced;
             }
@@ -288,8 +348,29 @@ mod tests {
 
     #[test]
     fn test_token_constants() {
-        assert_eq!(TOKEN_NONE, 0);
-        assert_eq!(TOKEN_TRACING_RESCALL, -1);
+        assert!(
+            TOKEN_NONE.is_null(),
+            "TOKEN_NONE = nullptr(GCREF) per virtualizable.py:329"
+        );
+        let rescall = token_tracing_rescall();
+        assert!(
+            !rescall.is_null(),
+            "token_tracing_rescall() = cast_opaque_ptr(_dummy) per virtualizable.py:330 — non-null sentinel",
+        );
+        assert_ne!(
+            TOKEN_NONE, rescall,
+            "TOKEN_NONE and token_tracing_rescall() must be distinguishable",
+        );
+        // Stable across calls — `_dummy = lltype.malloc(_DUMMY)` is a single
+        // program-lifetime allocation, so repeated reads must yield the
+        // same address.
+        assert_eq!(rescall, token_tracing_rescall());
+        // Address must point at memory we own (the static dummy), not a
+        // poison value like `usize::MAX as *mut u8`.  Read-back is the
+        // simplest probe that a real `_dummy` allocation backs the token.
+        unsafe {
+            assert_eq!(*(rescall as *const u64), 0);
+        }
     }
 
     #[test]

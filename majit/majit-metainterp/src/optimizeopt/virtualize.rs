@@ -1112,9 +1112,15 @@ impl OptVirtualize {
         };
         // tokeninfo = getptrinfo(tokenop)
         // if tokeninfo is not None and tokeninfo.is_constant() and not tokeninfo.is_nonnull():
-        // The token field is stored as an integer in majit; constant null is
-        // represented by `emit_constant_int(0)` (see optimize_virtual_ref_finish).
-        if !ctx.get_constant_int(token_ref).is_some_and(|v| v == 0) {
+        // The token field is `llmemory.GCREF` upstream
+        // (`virtualref.py:17 _virtualref_descrs`); pyre stores it as a
+        // `Type::Ref` slot whose constant null is `Value::Ref(GcRef(0))`
+        // (see `optimize_virtual_ref_finish`).
+        let token_is_constant_null = matches!(
+            ctx.get_constant(token_ref),
+            Some(Value::Ref(r)) if r.0 == 0
+        );
+        if !token_is_constant_null {
             return false;
         }
         // forcedinfo = getptrinfo(forcedop)
@@ -1648,7 +1654,24 @@ impl FieldDescr for VRefFieldDescr {
 
 fn make_vref_field_descr(index: u32) -> DescrRef {
     let (offset, field_type) = match index {
-        VREF_VIRTUAL_TOKEN_FIELD_INDEX => (8, Type::Int),
+        // `virtualref.py:17` registers `virtual_token` and `forced` both
+        // as `llmemory.GCREF` slots; the rtyper writes them through
+        // `setfield_gc_r`.  Pyre's slot type must match so
+        // `optimize_virtual_ref_finish`'s `Value::Ref(GcRef(0))` write
+        // and `optimize_jit_force_virtual`'s constant-null read agree
+        // on the value tag.
+        //
+        // PRE-EXISTING-ADAPTATION (GC trace divergence).  The optimizer
+        // descriptor is `Type::Ref` for parity with the rtyper's
+        // setfield_gc_r emit, but the actual GC tracer at
+        // `pyre/pyre-jit/src/eval.rs:241-247` registers JIT_VIRTUAL_REF
+        // with `gc_ptr_offsets = [16]` (forced only).  See
+        // `JitVirtualRef` doc-comment in `majit-metainterp/src/virtualref.rs`
+        // for why `virtual_token` is intentionally outside the GC's
+        // view: every value it holds at runtime (TOKEN_NONE,
+        // `token_tracing_rescall()` static address, libc::calloc'd
+        // JITFRAME address) lives outside any GC heap.
+        VREF_VIRTUAL_TOKEN_FIELD_INDEX => (8, Type::Ref),
         VREF_FORCED_FIELD_INDEX => (16, Type::Ref),
         _ => panic!("invalid JitVirtualRef field slot {index}"),
     };

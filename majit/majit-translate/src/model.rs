@@ -4,6 +4,7 @@
 //! to model only the semantics needed by majit's translation/codewriter layer.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::flowspace::model::ConstValue;
@@ -964,11 +965,36 @@ impl FrameState {
     ///   - `(Some(s), Some(o))` with disagreeing vids →
     ///     `NeedsPhi` (`framestate.py:113-114 return Variable()`).
     ///
-    /// `ValueType` mismatch raises `UnionError::TypeMismatch` —
-    /// pyre-specific stricter guard not present in RPython because
-    /// RPython's `Variable` is untyped at flowspace level; the
-    /// pyre-typed pipeline cannot represent a slot whose register
-    /// bank disagrees across predecessors.
+    /// `ValueType` disagreement is partitioned into two regimes:
+    ///   - `Unknown` is a wildcard: a slot bound by inference on one
+    ///     arm and by annotation on the other is structurally one
+    ///     slot, not a conflict, so the merged kind adopts the
+    ///     concrete side.  Mirrors PyPy where flowspace `Variable`
+    ///     carries no kind at all — annotation- and inference-driven
+    ///     types unify trivially because the common ancestor is the
+    ///     untyped `Variable` itself.
+    ///   - **Concrete vs concrete** with disagreeing kinds (e.g.
+    ///     `Int` vs `Ref`) returns `Err(UnionError::TypeMismatch)`.
+    ///     RPython parity: `flowspace/framestate.py:88 FrameState.union`
+    ///     wraps `_union` in `try/except UnionError: return None`, and
+    ///     the caller `flowcontext.py:430-436 mergeblock` reads the
+    ///     `None` as "this candidate did not unify, generalize the
+    ///     existing block / retry / make_next_block".  The signal is a
+    ///     **whole-state failure**, not a per-slot drop — silently
+    ///     dropping one slot would let post-merge reads of the dropped
+    ///     name surface as undefined-local instead of blocking the
+    ///     merge.  Pyre's single-candidate static AST lowering has no
+    ///     retry surface, so production callers `.expect(...)` the
+    ///     `Result` after asserting rustc's type checker has already
+    ///     rejected sources that bind the same local to two different
+    ///     concrete kinds across arms; the `Result` exists so the
+    ///     parity contract stays honest at the model layer and tests
+    ///     that bypass the Rust frontend can exercise the failure
+    ///     path explicitly via `expect_err`.
+    ///
+    /// `MergedFrameState.entries[i]` is `None` only for the one-sided
+    /// None-kill (RPython `framestate.py:110-111`); concrete kind
+    /// disagreement surfaces through the `Err` arm instead.
     ///
     /// Caller (Stage C1+) allocates fresh `ValueId`s for the
     /// `NeedsPhi` slots when materialising the successor block's
@@ -992,13 +1018,26 @@ impl FrameState {
                         s_entry.name, o_entry.name,
                         "graph-wide first-bind invariant broken at slot {i}"
                     );
-                    if s_entry.value_type != o_entry.value_type {
-                        return Err(UnionError::TypeMismatch {
-                            name: s_entry.name.clone(),
-                            self_type: s_entry.value_type.clone(),
-                            other_type: o_entry.value_type.clone(),
-                        });
-                    }
+                    // `Unknown` is a wildcard (annotation-side missing
+                    // bind paired with a concrete-typed arm).  Concrete
+                    // vs concrete kind disagreement raises
+                    // `UnionError::TypeMismatch` — the whole-state
+                    // failure shape from PyPy `framestate.py:88
+                    // try/except UnionError: return None`.  See the
+                    // doc comment above for why this is not a per-slot
+                    // None-kill.
+                    let value_type = match (&s_entry.value_type, &o_entry.value_type) {
+                        (a, b) if a == b => a.clone(),
+                        (ValueType::Unknown, b) => b.clone(),
+                        (a, ValueType::Unknown) => a.clone(),
+                        _ => {
+                            return Err(UnionError::TypeMismatch {
+                                name: s_entry.name.clone(),
+                                self_type: s_entry.value_type.clone(),
+                                other_type: o_entry.value_type.clone(),
+                            });
+                        }
+                    };
                     let merge = if s_entry.value_id == o_entry.value_id {
                         SlotMerge::CarryThrough(s_entry.value_id)
                     } else {
@@ -1007,10 +1046,101 @@ impl FrameState {
                     merged.push(Some(MergedFrameStateEntry {
                         name: s_entry.name.clone(),
                         merge,
-                        value_type: s_entry.value_type.clone(),
+                        value_type,
                     }));
                 }
             }
+        }
+        Ok(MergedFrameState { entries: merged })
+    }
+
+    /// N-way generalisation of `union` for join points where more than
+    /// two predecessors meet (e.g. `Expr::Match` with three or more
+    /// open arms).  Per-slot semantics fold the same RPython rules
+    /// (`flowspace/framestate.py:14 _union` positional zip,
+    /// `:105-128 union` per-slot classification) across `states`:
+    ///   - None-kill if **any** predecessor has `None` at slot `i`
+    ///     (`framestate.py:110-111`).
+    ///   - `CarryThrough(vid)` iff **every** predecessor agrees on the
+    ///     same `value_id` (`framestate.py:108 if w1 == w2: return
+    ///     w1`); otherwise `NeedsPhi` (`framestate.py:113-114 return
+    ///     Variable()`).
+    ///   - `value_type` folds via the wildcard rule: `Unknown` absorbs
+    ///     concrete kinds; concrete-vs-concrete disagreement returns
+    ///     `Err(UnionError::TypeMismatch)` for the whole result (PyPy
+    ///     `framestate.py:88 try/except UnionError: return None`
+    ///     surfaces a whole-state failure, not a per-slot drop — see
+    ///     `union` doc comment for the parity rationale).
+    ///
+    /// RPython's `flowspace/flowcontext.py:430-436 mergeblock` reaches
+    /// the same fixpoint by iteratively unioning each new candidate
+    /// against the running state.  For pyre's static AST shape every
+    /// open arm is known at lowering time, so a single-pass n-way
+    /// union over the whole set is equivalent and avoids the
+    /// `MergedFrameState` → `FrameState` round-trip a fold over the
+    /// 2-way `union` would require.
+    ///
+    /// Returns `Ok(MergedFrameState { entries: [] })` when `states` is
+    /// empty — callers must guard `len() >= 2` themselves if they rely
+    /// on merge semantics being meaningful (a single predecessor's
+    /// state is its own merged state by definition; a no-predecessor
+    /// merge is structurally dead and returns no entries).
+    pub fn union_many(states: &[&FrameState]) -> Result<MergedFrameState, UnionError> {
+        if states.is_empty() {
+            return Ok(MergedFrameState {
+                entries: Vec::new(),
+            });
+        }
+        let len = states.iter().map(|s| s.entries.len()).max().unwrap_or(0);
+        let mut merged = Vec::with_capacity(len);
+        for i in 0..len {
+            let slots: Vec<Option<&FrameStateEntry>> = states
+                .iter()
+                .map(|s| s.entries.get(i).and_then(|e| e.as_ref()))
+                .collect();
+            if slots.iter().any(|s| s.is_none()) {
+                merged.push(None);
+                continue;
+            }
+            let entries: Vec<&FrameStateEntry> = slots.into_iter().map(Option::unwrap).collect();
+            let name = entries[0].name.clone();
+            debug_assert!(
+                entries.iter().all(|e| e.name == name),
+                "graph-wide first-bind invariant broken at slot {i}"
+            );
+            let mut value_type = ValueType::Unknown;
+            for e in &entries {
+                value_type = match (&value_type, &e.value_type) {
+                    (a, b) if a == b => a.clone(),
+                    (ValueType::Unknown, b) => b.clone(),
+                    (a, ValueType::Unknown) => a.clone(),
+                    _ => {
+                        // Concrete-vs-concrete disagreement: whole-state
+                        // failure mirroring PyPy `framestate.py:88
+                        // try/except UnionError: return None`.  See
+                        // `union` doc comment for the parity rationale
+                        // (silent per-slot drop would let post-merge
+                        // reads of `name` surface as undefined-local
+                        // instead of blocking the merge).
+                        return Err(UnionError::TypeMismatch {
+                            name: name.clone(),
+                            self_type: value_type.clone(),
+                            other_type: e.value_type.clone(),
+                        });
+                    }
+                };
+            }
+            let first_vid = entries[0].value_id;
+            let merge = if entries.iter().all(|e| e.value_id == first_vid) {
+                SlotMerge::CarryThrough(first_vid)
+            } else {
+                SlotMerge::NeedsPhi
+            };
+            merged.push(Some(MergedFrameStateEntry {
+                name,
+                merge,
+                value_type,
+            }));
         }
         Ok(MergedFrameState { entries: merged })
     }
@@ -1049,6 +1179,362 @@ impl FrameState {
                 })
             })
             .collect()
+    }
+}
+
+/// Remove dead operations and dead inputargs from `graph` per
+/// backward dataflow over operation operands + exitswitches +
+/// `Link.args`-as-dependencies.  Line-by-line port of
+/// `simplify.transform_dead_op_vars_in_blocks(blocks, graphs,
+/// translator=None)` (`rpython/translator/simplify.py:422-524`).
+///
+/// `blocks` is the BFS-reachable closure of every entry block (mirrors
+/// `flowspace/model.py:66 iterblocks()`).
+///
+/// PRE-EXISTING-ADAPTATION: `start_blocks` is `{graph.startblock} ∪
+/// {blocks with no incoming link}` rather than the strict single-graph
+/// `{graphs[0].startblock}` of `simplify.py:428`.  The `generated::*`
+/// pipeline emits closures / specialisations as secondary entries
+/// (function parameters at a non-zero block id with no predecessors)
+/// that are calling-convention contracts but are not registered with
+/// the simplification pass as separate graphs.  Pinning them as
+/// additional starts matches the *intent* of `simplify.py:431-433`'s
+/// multi-graph branch (which pins one start per graph in the input
+/// set) without requiring a `translator.annotator` to enumerate the
+/// secondary entries.  Convergence: surface the secondary entries via
+/// an explicit `start_blocks: HashSet<BlockId>` parameter or migrate
+/// `generated::*` to register secondary entries with the simplifier
+/// directly.
+///
+///   1. Walk every reachable block.  For each operation, evaluate
+///      `canremove(op, block)` per `simplify.py:435-436`:
+///
+///          op.opname in CanRemove and op is not block.raising_op
+///
+///      where `block.raising_op` is `block.operations[-1]` whenever
+///      `block.canraise` (`flowspace/model.py:218-221`).  Pyre's
+///      `Block::canraise()` mirrors the upstream
+///      `block.exitswitch is c_last_exception` check; the raising
+///      op is the last entry in `block.operations`.
+///        - If `is_pure_op(kind)` AND the op is not the raising_op
+///          AND `op.result.is_some()`: route operands via
+///          `dependencies[op.result] += operands`
+///          (`simplify.py:444-445 dependencies[op.result].
+///          update(op.args)` for `canremove`-classified ops).
+///          Operands become live only if `op.result` becomes live.
+///        - Otherwise: operands join `read_vars` immediately
+///          (`simplify.py:442-443 read_vars.update(op.args)`
+///          for non-`canremove` ops).  Raising-op operands therefore
+///          stay live unconditionally — the raise side-effect is
+///          observable.
+///      The `exitswitch` (if a Variable) joins `read_vars`.  For
+///      each block with no exits (`returnblock` / `exceptblock` /
+///      otherwise terminal), the inputargs are also added — return
+///      and except blocks implicitly use their inputs
+///      (`simplify.py:459-462`).
+///   2. For every Link, record `dependencies[targetarg].add(linkarg)`
+///      mapping (`simplify.py:457-458`).  This is the key
+///      difference from a naïve forward pass — link args are NOT
+///      direct reads, they are dependencies whose liveness flows
+///      backward from a live target inputarg.  A self-referential
+///      phi (back-edge `Link.args[i] == phi_i`) is therefore kept
+///      alive only if `phi_i` itself is reached by some external
+///      reader; without one, the dependency cycle dies.
+///   3. The `startblock`'s inputargs are pinned to `read_vars` as a
+///      calling-convention contract (`simplify.py:463-467`,
+///      single-graph case `simplify.py:428-429 start_blocks =
+///      {graphs[0].startblock}`).  `returnblock` / `exceptblock`
+///      contracts are already covered by the empty-exits rule
+///      above.
+///   4. Backward-flow `read_vars` over `dependencies` to a fixpoint
+///      (`simplify.py:471-479 flow_read_var_backward`).
+///   5. Drop every pure op whose result is not in `read_vars`
+///      (`simplify.py:484-488` removable-op drop), gated by the
+///      same `canremove(op, block)` predicate from Step 1 — the
+///      raising op of a `canraise` block is preserved here even if
+///      its result is dead.  Inputarg-shaped `OpKind::Input` ops
+///      are protected by Step 1+3+dependency-routing pinning their
+///      result vid in `read_vars`; the dead ones are swept here
+///      alongside Step 7's inputarg trim (the matching
+///      `block.inputargs[i]` removal becomes a no-op when the
+///      Input op is already gone).  Naked `OpKind::Input` ops
+///      (legacy frontend fallback for cross-block reads not yet
+///      routed through the lazy installer) are likewise removed
+///      when their result vid is dead — `simplify.py` itself has
+///      no standalone Input shape, but the line-by-line port
+///      sweeps them under the same canremove rule.
+///   6. For each reachable block, walk its exits and drop
+///      `Link.args[i]` for every `i` where `target.inputargs[i]`
+///      is not in `read_vars` — inputarg-side trim happens in a
+///      second pass to preserve the `len(link.args) ==
+///      len(link.target.inputargs)` invariant (`simplify.py:
+///      512-516`, the explicit assertion at `:513`).
+///   7. Walk each reachable non-terminal block once more and drop
+///      `block.inputargs[i]` (and its matching `OpKind::Input` op
+///      if still present in `block.operations`) for every dead
+///      vid (`simplify.py:520-524`).
+pub fn prune_dead_phis(graph: &mut FunctionGraph) {
+    use crate::inline::{is_pure_op, op_value_refs};
+    use std::collections::HashMap;
+    let start = graph.startblock;
+    let return_block = graph.returnblock;
+    let except_block = graph.exceptblock;
+    let block_index: HashMap<BlockId, usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    // `start_blocks` mirrors `simplify.py:431-433`'s multi-graph branch:
+    // `graph.startblock` plus every block with no incoming link
+    // (calling-convention entries the `generated::*` pipeline emits
+    // for closures / specialisations).  Each is a BFS root, so `blocks`
+    // (the union of `iterblocks()` over each entry) covers every block
+    // reachable from any entry.
+    let with_predecessor: HashSet<BlockId> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.exits.iter().map(|e| e.target))
+        .collect();
+    let start_blocks: HashSet<BlockId> = std::iter::once(start)
+        .chain(
+            graph
+                .blocks
+                .iter()
+                .map(|b| b.id)
+                .filter(|id| !with_predecessor.contains(id)),
+        )
+        .collect();
+
+    // BFS reachability mirrors `flowspace/model.py:66 iterblocks()`,
+    // unioned across `start_blocks`:
+    //
+    //     def iterblocks(self):
+    //         block = self.startblock
+    //         yield block
+    //         seen = {block: True}
+    //         stack = list(block.exits[::-1])
+    //         while stack:
+    //             block = stack.pop().target
+    //             if block not in seen:
+    //                 yield block
+    //                 seen[block] = True
+    //                 stack += block.exits[::-1]
+    let reachable: HashSet<BlockId> = {
+        let mut seen: HashSet<BlockId> = HashSet::new();
+        let mut stack: Vec<BlockId> = Vec::new();
+        for &sb in &start_blocks {
+            if seen.insert(sb) {
+                if let Some(&i) = block_index.get(&sb) {
+                    stack.extend(graph.blocks[i].exits.iter().rev().map(|e| e.target));
+                }
+            }
+        }
+        while let Some(target) = stack.pop() {
+            if seen.insert(target) {
+                if let Some(&i) = block_index.get(&target) {
+                    stack.extend(graph.blocks[i].exits.iter().rev().map(|e| e.target));
+                }
+            }
+        }
+        seen
+    };
+
+    // Step 1 + 2: gather initial `read_vars` (op operands of non-pure
+    // ops + exitswitches + terminal-block inputargs) and
+    // `dependencies` (target inputarg ← link arg, plus pure-op
+    // operands routed via `op.result`).
+    //
+    // `simplify.py:435-436 canremove`:
+    //
+    //     def canremove(op, block):
+    //         return op.opname in CanRemove and op is not block.raising_op
+    //
+    // `block.raising_op` (`flowspace/model.py:218-221`) is
+    // `block.operations[-1]` whenever `block.canraise` (i.e.
+    // `block.exitswitch is c_last_exception`).  Pure-classified
+    // ops parked there as overflow / zero-divide checks
+    // (`int_add_ovf`, `int_floordiv_zer`, ...) MUST NOT be DCE'd
+    // even if their result vid is unread — the raise side-effect
+    // is observable.
+    let mut read_vars: HashSet<ValueId> = HashSet::new();
+    let mut dependencies: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for block in &graph.blocks {
+        if !reachable.contains(&block.id) {
+            continue;
+        }
+        let raising_op_idx = if block.canraise() && !block.operations.is_empty() {
+            Some(block.operations.len() - 1)
+        } else {
+            None
+        };
+        for (i, op) in block.operations.iter().enumerate() {
+            let operands = op_value_refs(&op.kind);
+            // `simplify.py:441-445`:
+            //   if not canremove(op, block):    read_vars.update(args)
+            //   else:                           dependencies[result] += args
+            let removable = is_pure_op(&op.kind) && Some(i) != raising_op_idx;
+            if let Some(result) = op.result
+                && removable
+            {
+                dependencies.entry(result).or_default().extend(operands);
+            } else {
+                for vid in operands {
+                    read_vars.insert(vid);
+                }
+            }
+        }
+        if let Some(ExitSwitch::Value(vid)) = &block.exitswitch {
+            read_vars.insert(*vid);
+        }
+        // `simplify.py:459-462`: terminal blocks (no exits)
+        // implicitly use every inputarg.
+        if block.exits.is_empty() {
+            for &iarg in &block.inputargs {
+                read_vars.insert(iarg);
+            }
+        }
+        for link in &block.exits {
+            // `simplify.py:512-513` len-equality is asserted at the
+            // exits-walk; the dependency-routing pass exercises the
+            // same invariant by zipping `link.args` with
+            // `link.target.inputargs`.
+            let &target_idx = block_index
+                .get(&link.target)
+                .expect("simplify.py:512 — link.target must be a graph block");
+            let target_block = &graph.blocks[target_idx];
+            assert_eq!(
+                link.args.len(),
+                target_block.inputargs.len(),
+                "simplify.py:513 — len(link.args) == len(link.target.inputargs)",
+            );
+            for (arg, &target_iarg) in link.args.iter().zip(target_block.inputargs.iter()) {
+                if let LinkArg::Value(arg_vid) = arg {
+                    dependencies.entry(target_iarg).or_default().push(*arg_vid);
+                }
+            }
+        }
+    }
+    // Step 3: pin every `start_blocks` inputarg (multi-graph branch
+    // `simplify.py:431-433`, with `graph.startblock` and orphan-entry
+    // blocks treated as additional starts per the function-level doc
+    // comment).
+    for &sb in &start_blocks {
+        if let Some(&i) = block_index.get(&sb) {
+            for &iarg in &graph.blocks[i].inputargs {
+                read_vars.insert(iarg);
+            }
+        }
+    }
+
+    // Step 4: backward flow.
+    // `simplify.py:471-479 flow_read_var_backward`.
+    let mut pending: Vec<ValueId> = read_vars.iter().copied().collect();
+    while let Some(var) = pending.pop() {
+        if let Some(deps) = dependencies.get(&var) {
+            for &dep in deps {
+                if read_vars.insert(dep) {
+                    pending.push(dep);
+                }
+            }
+        }
+    }
+
+    // Step 5: drop every pure op whose result is dead.
+    // `simplify.py:484-488 if op.result not in read_vars: if
+    // canremove(op, block): del block.operations[i]`.
+    // Inputarg-shaped Input ops keep their result vid in `read_vars`
+    // via Step 1+3+dependency-routing, so the live ones survive
+    // unconditionally; dead ones get removed alongside their
+    // matching inputarg trim in Step 7.  Naked Input ops (the
+    // legacy fallback at `front/ast.rs` for cross-block reads not
+    // yet routed through `lazy_install_local_at_current_block`) do
+    // NOT have inputarg pinning, so the same `result not in
+    // read_vars` predicate retires them — `simplify.py` itself has
+    // no standalone Input op shape, but the line-by-line port
+    // sweeps them under the same canremove rule.
+    //
+    // The reverse `for i in range(len-1, -1, -1)` walk
+    // (`simplify.py:484`) is preserved: we resolve `raising_op_idx`
+    // before the loop and check `Some(i) != raising_op_idx` so a
+    // pure op that happens to be the block's raising_op
+    // (`canremove`'s `op is not block.raising_op` clause,
+    // `simplify.py:436`) survives even when its result is unread.
+    for block in &mut graph.blocks {
+        if !reachable.contains(&block.id) {
+            continue;
+        }
+        let raising_op_idx = if block.canraise() && !block.operations.is_empty() {
+            Some(block.operations.len() - 1)
+        } else {
+            None
+        };
+        for i in (0..block.operations.len()).rev() {
+            let op = &block.operations[i];
+            let dead = match op.result {
+                Some(r) => !read_vars.contains(&r),
+                None => false,
+            };
+            if dead && is_pure_op(&op.kind) && Some(i) != raising_op_idx {
+                block.operations.remove(i);
+            }
+        }
+    }
+
+    // Step 6: trim Link.args at indices whose target inputarg is dead.
+    // `simplify.py:512-516`.  Walk in reverse so removals don't shift
+    // surviving indices.
+    for block_idx in 0..graph.blocks.len() {
+        if !reachable.contains(&graph.blocks[block_idx].id) {
+            continue;
+        }
+        let exits_len = graph.blocks[block_idx].exits.len();
+        for exit_idx in 0..exits_len {
+            let target = graph.blocks[block_idx].exits[exit_idx].target;
+            let target_iargs = {
+                let &i = block_index
+                    .get(&target)
+                    .expect("simplify.py:512 — link.target must be a graph block");
+                graph.blocks[i].inputargs.clone()
+            };
+            assert_eq!(
+                graph.blocks[block_idx].exits[exit_idx].args.len(),
+                target_iargs.len(),
+                "simplify.py:513 — len(link.args) == len(link.target.inputargs)",
+            );
+            for i in (0..target_iargs.len()).rev() {
+                let target_vid = target_iargs[i];
+                if !read_vars.contains(&target_vid) {
+                    graph.blocks[block_idx].exits[exit_idx].args.remove(i);
+                }
+            }
+        }
+    }
+
+    // Step 7: drop dead inputargs + their matching `OpKind::Input` ops.
+    // `simplify.py:520-524`.  Walk every reachable block; startblock is
+    // already pinned in Step 3, return / except blocks in Step 1.
+    for block_idx in 0..graph.blocks.len() {
+        let block_id = graph.blocks[block_idx].id;
+        if !reachable.contains(&block_id) || block_id == return_block || block_id == except_block {
+            continue;
+        }
+        let inputargs = graph.blocks[block_idx].inputargs.clone();
+        for i in (0..inputargs.len()).rev() {
+            let vid = inputargs[i];
+            if read_vars.contains(&vid) {
+                continue;
+            }
+            graph.blocks[block_idx].inputargs.remove(i);
+            if let Some(op_idx) = graph.blocks[block_idx]
+                .operations
+                .iter()
+                .position(|op| matches!(op.kind, OpKind::Input { .. }) && op.result == Some(vid))
+            {
+                graph.blocks[block_idx].operations.remove(op_idx);
+            }
+        }
     }
 }
 
@@ -1094,8 +1580,19 @@ pub enum SlotMerge {
     NeedsPhi,
 }
 
-/// Reasons `FrameState::union` may refuse to merge — pyre's analogue
-/// of RPython `framestate.py:101 UnionError`.
+/// Reasons `FrameState::union` / `FrameState::union_many` may refuse to
+/// merge — pyre's analogue of RPython `framestate.py:101 UnionError`.
+/// PyPy `framestate.py:88 FrameState.union` wraps `_union` in
+/// `try/except UnionError: return None`; `flowcontext.py:430-436
+/// mergeblock` reads the `None` as a whole-state "this candidate did
+/// not unify, generalize the existing block / retry / make_next_block"
+/// signal.  Pyre's single-candidate static AST lowering has no retry
+/// surface, so production callers `.expect(...)` the `Err` arm after
+/// asserting rustc's type checker has already rejected sources that
+/// bind the same local to two different concrete kinds across arms;
+/// the `Result` exists so the parity contract stays honest at the
+/// model layer and tests that bypass the Rust frontend can exercise
+/// the failure path explicitly via `expect_err`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnionError {
     /// Two predecessor states disagree on a slot's `ValueType` (e.g.
@@ -1731,7 +2228,7 @@ mod tests {
         };
         let merged = self_state
             .union(&other_state)
-            .expect("union with type-compatible common slot must succeed");
+            .expect("type-compatible slots must union cleanly");
         assert_eq!(
             merged.entries.len(),
             3,
@@ -1753,6 +2250,336 @@ mod tests {
                 .map(|s| s.name != "self_only" && s.name != "other_only")
                 .unwrap_or(true)),
             "one-sided slot names must not appear among surviving entries"
+        );
+    }
+
+    /// Convenience helper: install an `OpKind::Input` op AND register its
+    /// vid as a phi inputarg on the same block.  Mirrors what the
+    /// Slice 2 eager-phi installer at union sites does.
+    fn install_phi(graph: &mut FunctionGraph, block: BlockId, name: &str) -> ValueId {
+        let vid = graph
+            .push_op(
+                block,
+                OpKind::Input {
+                    name: name.to_string(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(block).inputargs.push(vid);
+        vid
+    }
+
+    #[test]
+    fn prune_dead_phis_drops_orphan_phi_and_link_arg() {
+        // entry → merge (phi 'x' never read) → returnblock(void)
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let const_v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+        let merge = graph.create_block();
+        graph.set_goto(entry, merge, vec![const_v]);
+        install_phi(&mut graph, merge, "x");
+        graph.set_return(merge, None);
+
+        prune_dead_phis(&mut graph);
+
+        assert!(
+            graph.block(merge).inputargs.is_empty(),
+            "orphan phi inputarg must be removed"
+        );
+        let entry_exit = &graph.block(entry).exits[0];
+        assert!(
+            entry_exit.args.is_empty(),
+            "predecessor link arg matching the pruned phi must be removed"
+        );
+        let has_phi_op = graph
+            .block(merge)
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::Input { name, .. } if name == "x"));
+        assert!(!has_phi_op, "orphan phi `OpKind::Input` must be dropped");
+    }
+
+    #[test]
+    fn prune_dead_phis_keeps_phi_with_reader() {
+        // entry → merge(phi 'x' read by a BinOp whose result is the
+        // function return value) → returnblock(reads return value).
+        // The BinOp's result is genuinely live — it flows through the
+        // returnblock's terminal-inputarg pin — so backward dataflow
+        // marks it `read_vars`, then propagates back through the
+        // pure-op dependencies entry to phi_x, keeping phi_x alive.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let const_v = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let merge = graph.create_block();
+        graph.set_goto(entry, merge, vec![const_v]);
+        let phi_x = install_phi(&mut graph, merge, "x");
+        // BinOp whose result IS read (by `set_return`).  Backward
+        // dataflow needs a live consumer of the BinOp result for the
+        // pure-op-args→dependencies routing to keep phi_x alive.
+        let doubled = graph
+            .push_op(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: phi_x,
+                    rhs: phi_x,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(merge, Some(doubled));
+
+        prune_dead_phis(&mut graph);
+
+        assert_eq!(
+            graph.block(merge).inputargs,
+            vec![phi_x],
+            "phi with a live downstream reader must stay"
+        );
+        let entry_exit = &graph.block(entry).exits[0];
+        assert_eq!(
+            entry_exit.args.len(),
+            1,
+            "predecessor link arg matching a kept phi must stay"
+        );
+    }
+
+    #[test]
+    fn prune_dead_phis_collapses_dead_phi_feeding_dead_pure_op() {
+        // A phi whose only "reader" is a pure op whose result is itself
+        // dead.  Both must collapse together — `simplify.py:441-445`'s
+        // `dependencies[op.result] += op.args` for `canremove` ops
+        // means the phi vid never enters `read_vars` (because the
+        // pure op's result never enters either), and Step 5's blanket
+        // pure-op DCE removes the orphan op so the phi can be safely
+        // trimmed at Step 7.
+        //
+        // entry → merge(phi 'x', dead-result BinOp reading phi_x) →
+        // returnblock(void).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let const_v = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
+        let merge = graph.create_block();
+        graph.set_goto(entry, merge, vec![const_v]);
+        let phi_x = install_phi(&mut graph, merge, "x");
+        let doubled = graph
+            .push_op(
+                merge,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: phi_x,
+                    rhs: phi_x,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        // Void return — `doubled` has no live consumer.
+        graph.set_return(merge, None);
+
+        prune_dead_phis(&mut graph);
+
+        assert!(
+            graph.block(merge).inputargs.is_empty(),
+            "phi feeding only a dead pure op must collapse"
+        );
+        let has_binop = graph
+            .block(merge)
+            .operations
+            .iter()
+            .any(|op| op.result == Some(doubled) && matches!(op.kind, OpKind::BinOp { .. }));
+        assert!(!has_binop, "dead pure op must be removed alongside the phi");
+        let entry_exit = &graph.block(entry).exits[0];
+        assert!(
+            entry_exit.args.is_empty(),
+            "predecessor link arg matching the pruned phi must be removed"
+        );
+    }
+
+    #[test]
+    fn prune_dead_phis_collapses_chained_dead_phis() {
+        // entry → merge1(phi 'x') → merge2(phi 'y' fed by phi 'x') → returnblock(void)
+        // Neither 'x' nor 'y' is read.  Backward dataflow correctly
+        // identifies both as dead in a single pass: 'y' is unread, so
+        // its dependency `phi_x` (link arg from merge1) doesn't get
+        // promoted, and 'x' itself is unread either.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let const_v = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let merge1 = graph.create_block();
+        graph.set_goto(entry, merge1, vec![const_v]);
+        let phi_x = install_phi(&mut graph, merge1, "x");
+        let merge2 = graph.create_block();
+        graph.set_goto(merge1, merge2, vec![phi_x]);
+        install_phi(&mut graph, merge2, "y");
+        graph.set_return(merge2, None);
+
+        prune_dead_phis(&mut graph);
+
+        assert!(
+            graph.block(merge1).inputargs.is_empty(),
+            "chained dead phi 'x' must collapse after 'y' goes"
+        );
+        assert!(
+            graph.block(merge2).inputargs.is_empty(),
+            "leaf dead phi 'y' must be pruned"
+        );
+        assert!(
+            graph.block(entry).exits[0].args.is_empty(),
+            "entry → merge1 link arg dropped after 'x' pruned"
+        );
+        assert!(
+            graph.block(merge1).exits[0].args.is_empty(),
+            "merge1 → merge2 link arg dropped after 'y' pruned"
+        );
+    }
+
+    #[test]
+    fn prune_dead_phis_preserves_special_blocks() {
+        // Function-entry inputargs (startblock), return-value
+        // (returnblock), and exception escape (exceptblock) inputargs
+        // are part of the calling convention / runtime contract and
+        // must NEVER be pruned even if locally unread.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        // Add an Input op at startblock that never gets read — emulates
+        // an unused function parameter.
+        let unused_param = graph
+            .push_op(
+                entry,
+                OpKind::Input {
+                    name: "param".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(entry).inputargs.push(unused_param);
+        graph.set_return(entry, None);
+
+        let pre_returnblock_args = graph.block(graph.returnblock).inputargs.clone();
+        let pre_exceptblock_args = graph.block(graph.exceptblock).inputargs.clone();
+
+        prune_dead_phis(&mut graph);
+
+        assert_eq!(
+            graph.block(entry).inputargs,
+            vec![unused_param],
+            "startblock inputargs are calling-convention; never pruned"
+        );
+        assert_eq!(
+            graph.block(graph.returnblock).inputargs,
+            pre_returnblock_args,
+            "returnblock inputargs are runtime contract; never pruned"
+        );
+        assert_eq!(
+            graph.block(graph.exceptblock).inputargs,
+            pre_exceptblock_args,
+            "exceptblock inputargs are runtime contract; never pruned"
+        );
+    }
+
+    #[test]
+    fn prune_dead_phis_preserves_pure_raising_op() {
+        // `simplify.py:435-436 canremove`'s `op is not block.raising_op`
+        // clause: a pure-classified op (e.g. `int_add` modelling
+        // `int_add_ovf`) parked as the LAST op of a `canraise` block
+        // must NOT be DCE'd even when its result is unread.  The raise
+        // side-effect is observable, so removing the op would be a
+        // semantic regression.
+        //
+        // Shape: entry — int_add(unread result) — exitswitch=LastException;
+        //   normal exit → returnblock; except exit → exceptblock.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let lhs = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let raising = graph
+            .push_op(
+                entry,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        // Mark the entry block as canraise: exitswitch=LastException,
+        // exits=[normal → returnblock, except → exceptblock].
+        let returnblock = graph.returnblock;
+        let exceptblock = graph.exceptblock;
+        // Synthesize the (etype, evalue) pair that exceptblock expects
+        // — values flow as Constants from the front-end raise site,
+        // but for the test we need only the link arity to match.
+        let etype = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
+        let evalue = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
+        {
+            let block = graph.block_mut(entry);
+            block.exitswitch = Some(ExitSwitch::LastException);
+            block.exits = vec![
+                Link::new_mixed(vec![LinkArg::Value(raising)], returnblock, None),
+                Link::new_mixed(
+                    vec![LinkArg::Value(etype), LinkArg::Value(evalue)],
+                    exceptblock,
+                    None,
+                ),
+            ];
+        }
+
+        prune_dead_phis(&mut graph);
+
+        let still_present = graph
+            .block(entry)
+            .operations
+            .iter()
+            .any(|op| op.result == Some(raising));
+        assert!(
+            still_present,
+            "pure raising_op (last op of canraise block) must survive DCE per \
+             simplify.py:436 `op is not block.raising_op`",
+        );
+    }
+
+    #[test]
+    fn prune_dead_phis_skips_non_canonical_entry_blocks() {
+        // Closure / generic-specialisation lowering can put function
+        // parameters at a non-zero block id with no incoming link
+        // (the `generated::*` pipeline does this for `eval_loop_jit`'s
+        // body block).  Even if the parameter isn't read graph-side,
+        // pruning must NOT remove it — the calling convention assumes
+        // every inputarg is supplied.  The block is identified as
+        // "entry-like" by having no link targeting it.
+        let mut graph = FunctionGraph::new("test");
+        // Build: startblock → returnblock(void).  Add an extra
+        // orphan-entry block with one Input op + one inputarg, no
+        // predecessors at all (not even from startblock).  The block
+        // is unreachable but represents the "non-canonical entry"
+        // shape pyre emits in some generated pipelines.
+        graph.set_return(graph.startblock, None);
+        let orphan_entry = graph.create_block();
+        let unused_param = graph
+            .push_op(
+                orphan_entry,
+                OpKind::Input {
+                    name: "captured".into(),
+                    ty: ValueType::Ref,
+                },
+                true,
+            )
+            .unwrap();
+        graph.block_mut(orphan_entry).inputargs.push(unused_param);
+
+        prune_dead_phis(&mut graph);
+
+        assert_eq!(
+            graph.block(orphan_entry).inputargs,
+            vec![unused_param],
+            "non-canonical entry block (no incoming link) must keep its inputargs"
         );
     }
 }

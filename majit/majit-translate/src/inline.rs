@@ -878,6 +878,306 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     }
 }
 
+/// `true` iff `kind` is side-effect-free and may be removed from the
+/// graph when its result has no readers.  Direct port of RPython
+/// `simplify.py:405-417 CanRemove` set + the lltype-level
+/// `lloperation.enum_ops_without_sideeffects()` extension that
+/// `simplify.py:414-416` unions in.
+///
+/// Pure ops correspond to RPython:
+///   - flowspace pure: `add sub mul div mod ... lt le eq ... bool len
+///     hash getattr getitem`-family (`simplify.py:407-412`).
+///   - lltype pure: `int_add int_lt ... getfield(_pure)
+///     getarrayitem(_pure) getinteriorfield ... cast_*` from
+///     `enum_ops_without_sideeffects`.
+///
+/// Side-effecting ops correspond to RPython `setfield setarrayitem
+/// setinteriorfield` (writes), `direct_call indirect_call` (calls
+/// without elidable EI), every `*guard*` opname (control-flow guards),
+/// and the JIT marker family (`jit_marker`, `debug_merge_point`,
+/// `loop_header`, `live`, `record_known_result`,
+/// `record_quasiimmut_field`, `jit_debug`).
+///
+/// Used by `model::prune_dead_phis` to mirror PyPy
+/// `simplify.py:441-445`'s split: pure ops route their args via
+/// `dependencies[op.result] += op.args` (args become live only if
+/// the result becomes live), while non-pure ops add their args
+/// directly to `read_vars` (args always live).  Without the split,
+/// a phi feeding only a dead pure op would be kept alive via the
+/// pure op's args even though both should die together.
+pub fn is_pure_op(kind: &OpKind) -> bool {
+    match kind {
+        // Pure sources / values — `int_constant` analogue (always
+        // removable).  `Input` is structurally pure: inputarg-shaped
+        // Input ops are protected from `model::prune_dead_phis` Step
+        // 5 sweep by their result vid being pinned in `read_vars`
+        // (Step 1+3+dependency-routing); naked Input ops (legacy
+        // frontend fallback) are removed by Step 5 when their result
+        // is dead.  Returned as `true` here for consistency
+        // with the dependency-routing classification.
+        OpKind::Input { .. }
+        | OpKind::ConstInt(_)
+        | OpKind::ConstFloat(_)
+        // Pure reads — `getfield(_pure) getarrayitem(_pure)
+        // getinteriorfield` in `enum_ops_without_sideeffects`.
+        | OpKind::FieldRead { .. }
+        | OpKind::ArrayRead { .. }
+        | OpKind::InteriorFieldRead { .. }
+        // Pure virtualizable reads — no heap mutation.
+        | OpKind::VableFieldRead { .. }
+        | OpKind::VableArrayRead { .. }
+        // Pure vtable slot read — `cast_pointer + getfield` chain
+        // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
+        | OpKind::VtableMethodPtr { .. } => true,
+        // Per-opname classification for `OpKind::BinOp` mirrors
+        // `simplify.CanRemove` (`simplify.py:405-417`) +
+        // `enum_ops_without_sideeffects()` for binary ops.  Pyre's
+        // `OpKind::BinOp` carries the opname as a string field, so
+        // the parity-correct classification is opname-keyed rather
+        // than enum-blanket — short-circuit `&&` / `||` (Rust
+        // logical-and / -or) emit `BinOp{op:"and"/"or"}` which have
+        // no flowspace peer and must surface a fail-loud TyperError
+        // at the rtyper rather than be silently DCE'd.
+        OpKind::BinOp { op, .. } => is_pure_binop_opname(op),
+        // Per-opname classification mirrors `enum_ops_without_sideeffects()`'s
+        // `LL_OPERATIONS[opname].sideeffects` lookup
+        // (`rpython/rtyper/lltypesystem/lloperation.py:128-134`).
+        // Pyre's `OpKind::UnaryOp` carries the opname as a string
+        // field, so the parity-correct classification is opname-keyed
+        // rather than enum-blanket.
+        OpKind::UnaryOp { op, .. } => is_pure_unary_opname(op),
+        // Side-effecting writes / calls / guards / markers / aborts.
+        // `direct_call`-family ops are routed here even when the
+        // callee is elidable: `simplify.py:441-445`'s `canremove`
+        // split treats `direct_call` as side-effecting (args go
+        // straight to `read_vars`), and `simplify.py:500` performs a
+        // separate elidable-graph removal that requires `translator`
+        // to be supplied (pyre's call site passes `translator=None`,
+        // so the removal arm is unreachable).  The post-jtransform
+        // `OpKind::CallElidable` shape arrives after `prune_dead_phis`
+        // has already run, so its classification here is moot for the
+        // current pipeline ordering.
+        OpKind::FieldWrite { .. }
+        | OpKind::ArrayWrite { .. }
+        | OpKind::InteriorFieldWrite { .. }
+        | OpKind::VableFieldWrite { .. }
+        | OpKind::VableArrayWrite { .. }
+        | OpKind::Call { .. }
+        | OpKind::IndirectCall { .. }
+        | OpKind::CallResidual { .. }
+        | OpKind::CallMayForce { .. }
+        | OpKind::CallElidable { .. }
+        | OpKind::InlineCall { .. }
+        | OpKind::RecursiveCall { .. }
+        | OpKind::ConditionalCall { .. }
+        | OpKind::ConditionalCallValue { .. }
+        | OpKind::RecordKnownResult { .. }
+        | OpKind::RecordQuasiImmutField { .. }
+        | OpKind::GuardTrue { .. }
+        | OpKind::GuardFalse { .. }
+        | OpKind::GuardValue { .. }
+        | OpKind::AssertGreen { .. }
+        | OpKind::IsConstant { .. }
+        | OpKind::IsVirtual { .. }
+        | OpKind::CurrentTraceLength
+        | OpKind::JitDebug { .. }
+        | OpKind::JitMergePoint { .. }
+        | OpKind::LoopHeader { .. }
+        | OpKind::Live
+        | OpKind::VableForce { .. }
+        | OpKind::Abort { .. } => false,
+    }
+}
+
+/// Whitelist of `OpKind::UnaryOp` opnames that are side-effect-free
+/// upstream — direct port of the unary entries in
+/// `simplify.CanRemove` (`rpython/translator/simplify.py:405-417`)
+/// + `enum_ops_without_sideeffects()`
+/// (`rpython/rtyper/lltypesystem/lloperation.py:128-134`).
+///
+/// Any opname not in this list is treated as side-effecting so the
+/// dead-op DCE pass does not silently remove it.  Notably absent:
+/// `not` — Python's `not` is control flow, `operation.py:465-474`
+/// does not register it; pyre's adapter
+/// (`translator/rtyper/flowspace_adapter.rs:344-353`) requires the
+/// frontend to desugar `!x` away before reaching the rtyper, so DCE
+/// must surface a live `not` op to the rtyper rather than silently
+/// dropping a dead one.  Frontend gate at `front/ast.rs:3285`
+/// already retires Rust `*x` (no flowspace peer); when frontend
+/// stops emitting `not`, this whitelist will only retain
+/// post-jtransform / rtyper-emitted opnames.
+/// Whitelist of `OpKind::BinOp` opnames that are side-effect-free
+/// upstream — direct port of the binary entries in
+/// `simplify.CanRemove` (`simplify.py:405-417`) +
+/// `enum_ops_without_sideeffects()`.
+///
+/// Notable omissions:
+///   - `and` / `or` (no trailing underscore): Rust `&&` / `||`
+///     short-circuit operators; `operation.py:475-510` does not
+///     register them as binary operators (they are control flow),
+///     and `translator/rtyper/flowspace_adapter.rs:392-400` requires
+///     the frontend to desugar them before reaching the rtyper.  DCE
+///     must keep dead occurrences alive so the rtyper surfaces the
+///     fail-loud TyperError instead of silently dropping them.  The
+///     trailing-underscore canonical names `and_` / `or_` (PyPy's
+///     bitwise AND/OR registered at `operation.py:485-486`) ARE
+///     pure and listed below.
+///   - `*_assign` (Rust compound assignments): `inplace_*` upstream;
+///     `simplify.py:CanRemove` does not include `inplace_*`, and
+///     compound assignments mutate their LHS so DCE shouldn't drop
+///     a live-LHS write just because the result vid is unread.
+///   - `unknown_binop`: pyre fallback for unsupported ops;
+///     fail-loud territory.
+///
+/// CanRemove entries that do not surface as `OpKind::BinOp` or
+/// `OpKind::UnaryOp` (handled elsewhere or shape-incompatible):
+///   - `newtuple` / `newlist` / `newdict` — collection constructors,
+///     surfaced by frontend lowering passes, not via BinOp/UnaryOp.
+///   - `getattr` — variable arity (`getattr(o, name [, default])`),
+///     pyre lowers as `OpKind::FieldRead` / Call rather than BinOp.
+///   - `get` (`operation.py:514`) — 3-arg descriptor `__get__`; pyre
+///     has no TernaryOp surface.  Drop is the call-DCE's concern.
+fn is_pure_binop_opname(opname: &str) -> bool {
+    if matches!(
+        opname,
+        // `simplify.py:405-417` CanRemove — every entry registered as
+        // a 2-arg `add_operator(...)` at `flowspace/operation.py`.
+        // Arithmetic — `operation.py:475-484`.
+        "add"
+        | "sub"
+        | "mul"
+        | "div"
+        | "truediv"
+        | "floordiv"
+        | "mod"
+        | "divmod"
+        | "pow"
+        | "lshift"
+        | "rshift"
+        // Canonical PyPy bitwise binops — `simplify.py:410-411`
+        // `and_ or_ xor` (`operation.py:485-487`).  These are the
+        // trailing-underscore forms that surface after
+        // `flowspace_adapter.rs:379-381 normalize_binop_name` rewrites
+        // pyre's `bitand`/`bitor`/`bitxor`; both forms are pure so the
+        // DCE whitelist accepts pre- and post-normalize names.
+        | "and_"
+        | "or_"
+        | "xor"
+        | "bitand"
+        | "bitor"
+        | "bitxor"
+        // Comparisons — `simplify.py:411 lt le eq ne gt ge`.
+        | "lt"
+        | "le"
+        | "eq"
+        | "ne"
+        | "gt"
+        | "ge"
+        // Remaining 2-arg CanRemove entries:
+        //   is_       operation.py:445  (identity test)
+        //   issubtype operation.py:448  (issubclass for new-style classes)
+        //   isinstance operation.py:449
+        //   getitem   operation.py:457
+        //   cmp       operation.py:511  (`simplify.py:411`)
+        //   coerce    operation.py:512  (`simplify.py:411`)
+        //   contains  operation.py:513  (`simplify.py:411`)
+        | "is_"
+        | "issubtype"
+        | "isinstance"
+        | "getitem"
+        | "cmp"
+        | "coerce"
+        | "contains"
+    ) {
+        return true;
+    }
+    // Post-rtyper / lltype binops — `enum_ops_without_sideeffects()`
+    // (`lloperation.py:128-134`) registers `int_add int_sub int_mul
+    // int_lt ... uint_add ... float_add ...` with sideeffects=False.
+    // Pyre's BinOp arrives here pre-rtyper (frontend names like
+    // `add`); the post-rtyper shape is also accepted so a future
+    // post-rtyper DCE call site requires no further widening.
+    let prefix_match = opname
+        .strip_prefix("int_")
+        .or_else(|| opname.strip_prefix("uint_"))
+        .or_else(|| opname.strip_prefix("float_"));
+    if let Some(suffix) = prefix_match {
+        return matches!(
+            suffix,
+            "add"
+                | "sub"
+                | "mul"
+                | "floordiv"
+                | "mod"
+                | "lshift"
+                | "rshift"
+                | "and"
+                | "or"
+                | "xor"
+                | "lt"
+                | "le"
+                | "eq"
+                | "ne"
+                | "gt"
+                | "ge"
+        );
+    }
+    false
+}
+
+fn is_pure_unary_opname(opname: &str) -> bool {
+    matches!(
+        opname,
+        // `simplify.py:405-417` CanRemove — every entry registered as
+        // a 1-arg `add_operator(...)` at `flowspace/operation.py`.
+        //   id     operation.py:446
+        //   type   operation.py:447
+        //   repr   operation.py:450
+        //   str    operation.py:451
+        //   len    operation.py:453
+        //   hash   operation.py:454
+        //   pos    operation.py:465
+        //   neg    operation.py:466
+        //   bool   operation.py:467
+        //   abs    operation.py:469
+        //   hex    operation.py:470
+        //   oct    operation.py:471
+        //   ord    operation.py:473
+        //   invert operation.py:474
+        //   int    operation.py:488
+        //   float  operation.py:490
+        //   long   operation.py:491
+        //   iter   operation.py:582 (Iter HLOperation, arity=1)
+        "id"
+        | "type"
+        | "repr"
+        | "str"
+        | "len"
+        | "hash"
+        | "pos"
+        | "neg"
+        | "bool"
+        | "abs"
+        | "hex"
+        | "oct"
+        | "ord"
+        | "invert"
+        | "int"
+        | "float"
+        | "long"
+        | "iter"
+        // `same_as` — `jtransform.py:246-248 rewrite_op_same_as`
+        // explicitly drops the op + aliases the result.
+        | "same_as"
+        // `cast_pointer cast_ptr_to_int cast_int_to_ptr ...` — pure
+        // RPython `enum_ops_without_sideeffects` peers.
+        | "cast_pointer"
+        | "cast_ptr_to_int"
+        | "cast_int_to_ptr"
+        | "cast_opaque_ptr"
+    )
+}
+
 /// Replace all occurrences of `old` with `new` in ops within the specified blocks.
 fn remap_value_in_graph(
     graph: &mut FunctionGraph,

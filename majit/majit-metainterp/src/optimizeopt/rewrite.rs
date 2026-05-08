@@ -2923,9 +2923,11 @@ impl Optimization for OptRewrite {
             //   self.make_constant(box, expectedconstbox)
             OpCode::RecordExactValueI | OpCode::RecordExactValueR => {
                 let box_ref = ctx.get_box_replacement(op.arg(0));
-                if let Some(val) = ctx.get_constant(op.arg(1)) {
-                    ctx.make_constant(box_ref, val);
-                }
+                let val = ctx.get_constant(op.arg(1)).expect(
+                    "rewrite.py:391 — RECORD_EXACT_VALUE expectedconstbox \
+                     must be a Const",
+                );
+                ctx.make_constant(box_ref, val);
                 OptimizationResult::Remove
             }
 

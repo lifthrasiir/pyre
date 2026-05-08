@@ -239,8 +239,24 @@ thread_local! {
             pyre_libc_jitframe_tracer,
         );
         // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
-        // Layout: type_tag(u64, offset 0) | virtual_token(i64, offset 8) | forced(Ref, offset 16)
-        // `forced` is a GC pointer → gc_ptr_offsets = [16].
+        // Layout: type_tag(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
+        //
+        // PRE-EXISTING-ADAPTATION (GC trace divergence).  Upstream
+        // `virtualref.py:17-20` declares both `virtual_token` and
+        // `forced` as GC slots (`llmemory.GCREF` / `OBJECTPTR`); pyre
+        // registers only `forced` (offset 16) in `gc_ptr_offsets`.
+        // The `virtual_token` slot is intentionally outside the GC's
+        // view because every runtime value it can hold lives outside
+        // any GC heap: TOKEN_NONE (null), `token_tracing_rescall()`
+        // (static-backed dummy, see `majit-metainterp/src/virtualref.rs`
+        // `TRACING_RESCALL_DUMMY`), and active JITFRAME addresses
+        // (libc::calloc'd, see `register_libc_jitframe_tracer` above).
+        // The optimizer-side descriptor at
+        // `majit-metainterp/src/optimizeopt/virtualize.rs:make_vref_field_descr`
+        // still uses `Type::Ref` so `setfield_gc_r` / `getfield_gc_r`
+        // emit correctly; only the collector's view of the slot
+        // diverges.  Convergence requires both `_dummy` and JITFRAME
+        // allocation to move under the GC.
         let vref_tid = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
             std::mem::size_of::<majit_metainterp::virtualref::JitVirtualRef>(),
             vec![std::mem::offset_of!(majit_metainterp::virtualref::JitVirtualRef, forced)],

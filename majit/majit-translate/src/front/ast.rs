@@ -950,21 +950,18 @@ struct GraphBuildContext<'a> {
 struct LoopFrame {
     /// Block that `continue` jumps to.  For `while` / `for` this is
     /// the header; for `loop` this is the body entry (which also acts
-    /// as the loop head).
+    /// as the loop head).  The current header-phi name list is
+    /// recomputed on demand from `continue_target.inputargs` at
+    /// every close site (back-edge / `Expr::Continue`) via
+    /// `header_phi_name_list(graph, continue_target)` — Cat 2-2
+    /// Phase B α.1 (`audit_cat2_2_loop_header_phi_workl_fixpoint_*`).
+    /// RPython parity: `flowspace/flowcontext.py:399-465 mergeblock`
+    /// queries the merge target's current state at close time, not
+    /// at frame push, so any phi that lazy-install added to the
+    /// header during body walk is automatically threaded.
     continue_target: BlockId,
     /// Block that `break` jumps to — the loop's exit block.
     break_target: BlockId,
-    /// Ordered list of local names corresponding to
-    /// `continue_target.inputargs` after eager phi pre-allocation
-    /// (Slice 5b.3) and any cond-driven cross-block lazy installs.
-    /// `Expr::Continue` and the back-edge close fetch each name's
-    /// current `ctx.local_value_ids[name].0` to thread per-name
-    /// `Link.args` matching the header's phi list.  Empty for
-    /// constructs that have not yet been switched to eager
-    /// pre-allocation (currently `Expr::ForLoop`, slated for 5c.3).
-    /// RPython parity for the slot-by-slot mapping:
-    /// `flowspace/framestate.py:92 getoutputargs`.
-    header_phi_names: Vec<String>,
 }
 
 /// Names statically reachable as locals from inside a loop body —
@@ -1285,8 +1282,15 @@ fn is_compound_assign(op: syn::BinOp) -> bool {
 /// present in `pre_loop_snapshot`.  The walk visits
 /// `pre_loop_snapshot.entries` in order so the resulting header
 /// inputarg slot order mirrors Stage A2's first-bind positional
-/// invariant — RPython parity with `flowspace/framestate.py:14 _union`'s
-/// positional zip over `locals_w`.
+/// invariant — RPython parity with `flowspace/framestate.py:14
+/// _union`'s positional zip over `locals_w`.
+///
+/// Mirrors `flowcontext.py:430 mergeblock`'s "create phi for every
+/// mergeable local, then let `simplify.transform_dead_op_vars` DCE
+/// the unread ones".  Names rebound in the body but never read still
+/// receive a transient header phi; `model::prune_dead_phis`
+/// (`simplify.py:484-524` blanket DCE) removes the phi + matching
+/// link.args slot when no graph-level reader appears.
 ///
 /// For each surviving name this routine:
 ///   1. emits `OpKind::Input { name, ty: pre_loop_entry.value_type }`
@@ -1300,9 +1304,9 @@ fn is_compound_assign(op: syn::BinOp) -> bool {
 ///   5. updates `ctx.local_value_types[name]` to the carried
 ///      `value_type`.
 ///
-/// Names in `must_merge.rebound_names` that are absent from
-/// `pre_loop_snapshot` are skipped — they are body-only locals (e.g.
-/// the binding pattern of an inner `for` / `let` inside the body) that
+/// Names in `must_merge.read_names ∪ must_merge.rebound_names` that are
+/// absent from `pre_loop_snapshot` are skipped — they are body-only locals
+/// (e.g. the binding pattern of an inner `for` / `let` inside the body) that
 /// have no pre-loop counterpart to merge with.  RPython parity:
 /// `framestate.py:110-111` "if w1 is None or w2 is None: return None"
 /// drops one-sided slots; here the pre-scan saw the binding but the
@@ -1339,9 +1343,14 @@ fn allocate_loop_header_phis(
 ) -> Vec<String> {
     let mut header_phi_names = Vec::new();
     for entry in pre_loop_snapshot.entries.iter().filter_map(|e| e.as_ref()) {
-        let referenced = must_merge.read_names.contains(&entry.name)
-            || must_merge.rebound_names.contains(&entry.name);
-        if !referenced {
+        // `flowcontext.py:430 mergeblock` allocates a phi for every
+        // mergeable local; `simplify.transform_dead_op_vars` then
+        // DCEs the unread ones.  Pyre mirrors that: predicate is
+        // `read_names ∪ rebound_names`, prune_dead_phis prunes the
+        // transient `rebound-only-no-read` phi.
+        if !must_merge.read_names.contains(&entry.name)
+            && !must_merge.rebound_names.contains(&entry.name)
+        {
             continue;
         }
         let value_type = entry.value_type.clone();
@@ -1650,21 +1659,34 @@ fn lazy_install_local_at_current_block(
         return None;
     }
 
-    // For each predecessor edge, resolve a `ValueId` that is in
-    // `pred_block`'s scope (either its inputarg or an op result).
-    // When the snapshot returns a vid inherited from a dominator,
-    // recurse so `pred_block` gets `name` as its own inputarg first.
-    // Matching arity across all predecessor `Link.args` is essential,
-    // so partial threading is forbidden — a missing snapshot returns
-    // `None` and the caller falls back to the legacy naked-`Input`
-    // emit.
+    // Audit Cat 2-1 cycle-safe shape: split into two phases.  The
+    // outer `OpKind::Input` is pushed and the inputarg slot is
+    // reserved BEFORE any recursive predecessor walk, so a recursion
+    // back into `current_block` (e.g. a back-edge predecessor whose
+    // own pred-walk reaches `current_block`) finds the in-progress
+    // phi via the graph-state idempotency check above and short-
+    // circuits with the pre-allocated vid.  RPython
+    // `flowspace/flowcontext.py:438-451 mergeblock` reaches the same
+    // fixpoint by iteratively applying `union` until predecessor
+    // links converge — pyre's static AST collapses that to a single
+    // pass with the in-flight inputarg slot acting as the iteration
+    // checkpoint.
     //
-    // All predecessor snapshots must agree on `value_type` for the
-    // freshly-installed inputarg to match every incoming link arg's
-    // kind classification (`int`/`ref`/`float` register banks); a
-    // disagreement signals a rebind merge (Slice 3+ phi territory)
-    // and falls back to legacy.
-    let mut pred_vids: Vec<(BlockId, usize, ValueId)> = Vec::with_capacity(pred_edges.len());
+    // Phase 1 (read-only): collect each predecessor's `(snap_vid,
+    // snap_type)` and decide whether the snapshot's vid is directly
+    // usable in `pred_block` or whether `pred_block` will need its
+    // own recursive install.  All predecessor snapshots must agree
+    // on `value_type` via the wildcard rule (`Unknown` is a wildcard
+    // — concrete-vs-concrete disagreement aborts before we mutate
+    // graph state).
+    struct PredSnap {
+        pred_block: BlockId,
+        exit_idx: usize,
+        snap_vid: ValueId,
+        snap_type: ValueType,
+        needs_recurse: bool,
+    }
+    let mut pred_snaps: Vec<PredSnap> = Vec::with_capacity(pred_edges.len());
     let mut shared_value_type: Option<ValueType> = None;
     for (pred_block, exit_idx) in &pred_edges {
         // Stage A1: predecessor framestate is now per-block, captured
@@ -1680,28 +1702,50 @@ fn lazy_install_local_at_current_block(
             })?;
             (entry.value_id, entry.value_type.clone())
         };
-        let resolved_vid = if value_id_defined_in_block(graph, snap_vid, *pred_block) {
-            snap_vid
+        let needs_recurse = !value_id_defined_in_block(graph, snap_vid, *pred_block);
+        // Tentative type from snap-only fold for non-recursive preds
+        // we can also consult `graph_value_type(snap_vid)`; for
+        // recursive preds the recursive install's value_type isn't
+        // known yet and we use snap_type as the best estimate.  The
+        // wildcard rule (`Unknown` absorbs concrete) is symmetric and
+        // never produces a kind disagreement when one side is
+        // Unknown.
+        let observed_type = if needs_recurse {
+            snap_type.clone()
         } else {
-            lazy_install_local_at_current_block(graph, ctx, *pred_block, name)?
+            graph_value_type(graph, snap_vid).unwrap_or_else(|| snap_type.clone())
         };
-        // Prefer the graph-recoverable type of the actual link-arg vid
-        // (its allocation-site `OpKind::*::ty`) over the snapshot's
-        // captured `ctx.local_value_types[name]`, which can be `Unknown`
-        // when the local was originally bound by inference rather than
-        // an explicit annotation.  All predecessors must agree so the
-        // freshly-installed inputarg's `i`/`r`/`f` kind matches every
-        // incoming link arg's kind classification.
-        let resolved_type = graph_value_type(graph, resolved_vid).unwrap_or(snap_type);
-        match &shared_value_type {
-            None => shared_value_type = Some(resolved_type),
-            Some(prior) if prior == &resolved_type => {}
-            Some(_) => return None,
+        match (&shared_value_type, &observed_type) {
+            (None, _) => shared_value_type = Some(observed_type.clone()),
+            (Some(prior), new) if prior == new => {}
+            (Some(ValueType::Unknown), _) => shared_value_type = Some(observed_type.clone()),
+            (Some(_), ValueType::Unknown) => {}
+            (Some(_), _) => return None,
         }
-        pred_vids.push((*pred_block, *exit_idx, resolved_vid));
+        pred_snaps.push(PredSnap {
+            pred_block: *pred_block,
+            exit_idx: *exit_idx,
+            snap_vid,
+            snap_type,
+            needs_recurse,
+        });
     }
 
     let value_type = shared_value_type.unwrap_or(ValueType::Unknown);
+
+    // Phase 2 (graph mutation): push the outer `OpKind::Input` +
+    // inputarg slot first, snapshot the prior ctx binding for
+    // rollback, then walk predecessors (recursively installing where
+    // needed).  The recursion's same-block idempotency check on
+    // `block.inputargs` finds this outer call's freshly-installed
+    // inputarg and returns its vid, breaking the
+    // `current_block → pred → ... → current_block` cycle that
+    // arises when a back-edge predecessor's snap_vid is defined in
+    // `current_block` (e.g. body_tail / continue source whose
+    // framestate snap for a header-phi name points back at the
+    // header).
+    let prior_ctx_lvi = ctx.local_value_ids.get(name).copied();
+    let prior_ctx_lvt = ctx.local_value_types.get(name).cloned();
     let new_vid = graph.push_op(
         current_block,
         OpKind::Input {
@@ -1713,9 +1757,112 @@ fn lazy_install_local_at_current_block(
     graph.name_value(new_vid, name.to_string());
     graph.block_mut(current_block).inputargs.push(new_vid);
     ctx.bind_local_id(name.to_string(), new_vid, current_block);
-    ctx.local_value_types.insert(name.to_string(), value_type);
+    ctx.local_value_types
+        .insert(name.to_string(), value_type.clone());
+    // Predecessor source vids whose graph result type was Unknown when
+    // observed.  If the wildcard rule above promoted `value_type` to
+    // a concrete kind from a sibling predecessor, every Unknown
+    // source must be retagged so the freshly-installed merge
+    // inputarg's `i`/`r`/`f` kind matches every incoming link arg at
+    // codegen.  Without retag, the merge inputarg gets concrete `ty`
+    // but a predecessor's source op still produces an Unknown-banked
+    // value, tripping the assembler's `int_copy` / `ref_copy` /
+    // `float_copy` same-kind invariant.
+    let mut unknown_predecessor_vids: Vec<ValueId> = Vec::new();
+    let mut pred_link_args: Vec<(BlockId, usize, ValueId)> = Vec::with_capacity(pred_snaps.len());
+    let mut rollback = false;
+    for snap in pred_snaps {
+        let resolved_vid = if snap.needs_recurse {
+            match lazy_install_local_at_current_block(graph, ctx, snap.pred_block, name) {
+                Some(v) => v,
+                None => {
+                    rollback = true;
+                    break;
+                }
+            }
+        } else {
+            snap.snap_vid
+        };
+        let resolved_type =
+            graph_value_type(graph, resolved_vid).unwrap_or_else(|| snap.snap_type.clone());
+        // Phase 2 re-validation: Phase 1's `value_type` for needs_recurse
+        // preds was estimated from `snap_type` because the recursive
+        // install hadn't run yet.  The actual `resolved_type` after
+        // recursion may surface a concrete kind that disagrees with
+        // `value_type` (e.g. a deeper predecessor's snap stored
+        // `Unknown` but the install resolved to `Int`, or two recursive
+        // chains converged on disagreeing concrete kinds).  Concrete-
+        // vs-concrete disagreement here MUST roll back the outer
+        // Phase-2 push: otherwise the freshly-installed inputarg's
+        // `ty` mismatches the incoming link arg's kind classification
+        // and the assembler's `int_copy` / `ref_copy` / `float_copy`
+        // same-kind invariant trips at codegen.  `Unknown` remains a
+        // wildcard on either side — matches Phase 1's wildcard rule
+        // and `FrameState::union`'s per-slot semantics.
+        let kind_clash = match (&value_type, &resolved_type) {
+            (a, b) if a == b => false,
+            (ValueType::Unknown, _) | (_, ValueType::Unknown) => false,
+            _ => true,
+        };
+        if kind_clash {
+            rollback = true;
+            break;
+        }
+        if matches!(resolved_type, ValueType::Unknown) {
+            unknown_predecessor_vids.push(resolved_vid);
+        }
+        pred_link_args.push((snap.pred_block, snap.exit_idx, resolved_vid));
+    }
 
-    for (pred_block, exit_idx, pred_vid) in pred_vids {
+    if rollback {
+        // Undo Phase 2's graph + ctx mutations so the caller's
+        // naked-`Input` fallback emits without a dangling inputarg
+        // at `current_block`.  Recursive installs that succeeded at
+        // sibling pred_blocks before the failing one are NOT rolled
+        // back — those are valid installs at their own blocks and
+        // remain useful for any later read.  The only orphan to
+        // clean is `current_block`'s own outer inputarg.
+        let block = graph.block_mut(current_block);
+        let popped_op = block.operations.pop();
+        debug_assert!(
+            matches!(popped_op.as_ref().map(|op| &op.kind), Some(OpKind::Input { name: n, .. }) if n == name),
+            "rollback expected Input op for {name:?} at the operations tail",
+        );
+        let popped_inputarg = block.inputargs.pop();
+        debug_assert_eq!(popped_inputarg, Some(new_vid));
+        match prior_ctx_lvi {
+            Some((vid, def_block)) => {
+                ctx.bind_local_id(name.to_string(), vid, def_block);
+            }
+            None => {
+                ctx.local_value_ids.remove(name);
+            }
+        }
+        match prior_ctx_lvt {
+            Some(vt) => {
+                ctx.local_value_types.insert(name.to_string(), vt);
+            }
+            None => {
+                ctx.local_value_types.remove(name);
+            }
+        }
+        return None;
+    }
+
+    // If the wildcard rule promoted `value_type` to a concrete kind,
+    // retag every Unknown-typed predecessor source so the assembler's
+    // same-kind copy invariant holds across each incoming link arg.
+    // Mirrors the `Expr::Try` `retag_result_value_type` widening used
+    // after `?` unwraps a `Result<T, E>` — same operation, here
+    // driven by cross-arm wildcard widening rather than the
+    // type-extractor's `Ok`-arm narrowing.
+    if !matches!(value_type, ValueType::Unknown) {
+        for vid in &unknown_predecessor_vids {
+            retag_result_value_type(graph, *vid, value_type.clone());
+        }
+    }
+
+    for (pred_block, exit_idx, pred_vid) in pred_link_args {
         graph.block_mut(pred_block).exits[exit_idx]
             .args
             .push(crate::model::LinkArg::Value(pred_vid));
@@ -1943,6 +2090,35 @@ fn build_function_graph(
     // Scan #[jit_*] attributes to detect elidable, loopinvariant,
     // close_stack, cannot_collect, gc_effects.
     let hints = collect_jit_hints(&func.attrs);
+
+    // Direct port of `simplify.transform_dead_op_vars_in_blocks`
+    // (`rpython/translator/simplify.py:422`) — the dead-op subset of
+    // upstream's `simplify_graph` (`simplify.py:1075`).  The
+    // upstream algorithm uses backward dataflow with
+    // link-args-as-dependencies (not direct reads), which correctly
+    // retires body-dead phis whose only "reader" is the back-edge
+    // itself.  Running it here ensures downstream rtyper / jtransform
+    // / flatten / regalloc never see an unread phi or its dangling
+    // `Link.args` slot.
+    //
+    // PRE-EXISTING-ADAPTATION (subset of `simplify_graph`).  The full
+    // upstream `simplify_graph` runs `all_passes`
+    // (`simplify.py:1060-1073`):
+    //
+    //     transform_dead_op_vars, eliminate_empty_blocks,
+    //     remove_assertion_errors, remove_identical_vars_SSA,
+    //     constfold_exitswitch, remove_trivial_links, SSA_to_SSI,
+    //     coalesce_bool, transform_ovfcheck, simplify_exceptions,
+    //     transform_xxxitem, remove_dead_exceptions
+    //
+    // pyre only ports the first.  The remainder are either deferred
+    // (no-op pyre IR doesn't need them yet) or handled by later
+    // phases under different names (e.g. constant folding lives in
+    // optimizeopt rather than as a flowspace-level
+    // constfold_exitswitch).  Convergence path: port each remaining
+    // pass under its upstream name as the corresponding pyre IR
+    // construct lands.
+    crate::model::prune_dead_phis(&mut graph);
 
     Ok(SemanticFunction {
         name: func.sig.ident.to_string(),
@@ -2762,44 +2938,121 @@ fn lower_expr(
                 (merge, None)
             };
 
-            // Stage C1 (minimal): None-kill locals introduced by only
-            // one arm.  Stage B1 already restored ctx to pre-branch
-            // before the else-arm, so any then-arm-only name is gone.
-            // Symmetric kill of else-arm-only names happens here:
-            // names present in the post-else ctx but absent from
-            // `then_exit_snapshot` are dropped so post-merge code
-            // does not read a local that exists on only one path.
-            // RPython parity: `framestate.py:110-111` returns None
-            // (kill) when `union(w1, w2)` sees one side missing.
-            //
-            // Slot-level merge of the surviving names into merge-block
-            // inputargs is deferred to the lazy installer / Slice 3+
-            // — this minimal pass only fixes the dangling-binding
-            // hazard.
+            // FrameState::union-driven merge when both arms reach the
+            // merge block.  Routes through `FrameState::union` for
+            // explicit per-slot classification per RPython
+            // `flowspace/framestate.py:105-128 union`:
+            //   - One-sided None → None-kill (`framestate.py:110-111`):
+            //     the slot is dropped from `ctx` so post-merge reads
+            //     of that name surface as undefined-local.
+            //   - CarryThrough (same vid both arms): kept; the merged
+            //     entry's `value_type` may have widened from `Unknown`
+            //     to a concrete kind via the wildcard rule and the
+            //     source `OpKind`'s `ty` is retagged below to keep
+            //     `graph_value_type` in agreement with the framestate.
+            //   - NeedsPhi (disagreeing vids): eager phi install at
+            //     union time per `framestate.py:113-114 union`'s
+            //     fresh `Variable()` semantics —
+            //     `lazy_install_local_at_current_block` allocates the
+            //     merge-block inputarg, threads per-arm vids onto
+            //     each predecessor's goto args, and rebinds ctx so
+            //     post-merge reads of the name resolve to the new
+            //     phi vid without re-driving the lazy installer.
+            //   - Concrete-vs-concrete kind disagreement returns
+            //     `Err(UnionError::TypeMismatch)` from
+            //     `FrameState::union` — a whole-state failure mirroring
+            //     PyPy `framestate.py:88 try/except UnionError: return
+            //     None` (see the `model::FrameState::union` doc comment
+            //     for the parity rationale).  rustc's type checker
+            //     rejects any valid Rust source that binds the same
+            //     local to two different concrete kinds across `if` /
+            //     `else` arms, so the `Err` arm is unreachable from
+            //     real input; `.expect(...)` documents the contract
+            //     and panics loudly if a hand-built fixture or a
+            //     frontend change ever breaks it.
             if then_open && else_open {
-                let then_names: std::collections::HashSet<&str> = then_exit_snapshot
-                    .entries
-                    .iter()
-                    .filter_map(|slot| slot.as_ref().map(|e| e.name.as_str()))
-                    .collect();
-                let to_drop: Vec<String> = ctx
-                    .local_value_ids
-                    .keys()
-                    .filter(|n| !then_names.contains(n.as_str()))
-                    .cloned()
-                    .collect();
-                for name in &to_drop {
-                    ctx.local_value_ids.remove(name);
-                    ctx.local_value_types.remove(name);
-                    // NB: `local_first_bind_order` /
+                let merged = then_exit_snapshot.union(&else_exit_snapshot).expect(
+                    "rustc must have rejected differing concrete kinds across if/else arms",
+                );
+                // CarryThrough Unknown→concrete widening at the union
+                // (`model::FrameState::union` wildcard rule) leaves
+                // `MergedFrameStateEntry.value_type` concrete while the
+                // shared source `OpKind`'s `ty` may still be `Unknown`
+                // — `local_value_types` snapshots can disagree across
+                // arms even for the same vid (one arm bound the slot
+                // with an annotation, the other inferred-only).
+                // Retag the source op now so `graph_value_type(vid)`
+                // agrees with the merged framestate at every consumer
+                // (mirrors the `Expr::Try` widening pattern used after
+                // `?` unwraps a `Result<T, E>`).  NeedsPhi slots are
+                // handled by the lazy installer's own retag pass at
+                // first post-merge read; they intentionally do not
+                // mutate the predecessor source here.
+                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
+                    if let crate::model::SlotMerge::CarryThrough(vid) = slot.merge {
+                        if !matches!(slot.value_type, ValueType::Unknown)
+                            && !matches!(
+                                graph_value_type(graph, vid),
+                                Some(ref t) if t == &slot.value_type,
+                            )
+                        {
+                            retag_result_value_type(graph, vid, slot.value_type.clone());
+                        }
+                    }
+                }
+                for (slot_idx, slot) in merged.entries.iter().enumerate() {
+                    if slot.is_some() {
+                        continue;
+                    }
+                    // None-kill: name present on at most one side —
+                    // drop from ctx so post-merge reads do not return
+                    // a stale binding.  `local_first_bind_order` /
                     // `local_first_bind_seen` are graph-wide
-                    // append-only and intentionally NOT mutated here —
-                    // a None-killed slot stays in the order so future
-                    // snapshots push `None` for it (RPython
-                    // `framestate.py:110-111` undefined-local
-                    // sentinel).  Removing the slot would break the
-                    // graph-wide invariant that two predecessors of
-                    // the same merge agree on slot indices.
+                    // append-only and stay untouched (the slot index
+                    // remains valid; future snapshots push `None` for
+                    // it).
+                    let name = then_exit_snapshot
+                        .entries
+                        .get(slot_idx)
+                        .and_then(|e| e.as_ref())
+                        .or_else(|| {
+                            else_exit_snapshot
+                                .entries
+                                .get(slot_idx)
+                                .and_then(|e| e.as_ref())
+                        })
+                        .map(|e| e.name.clone());
+                    if let Some(name) = name {
+                        ctx.local_value_ids.remove(&name);
+                        ctx.local_value_types.remove(&name);
+                    }
+                }
+
+                // Eager phi install for every `SlotMerge::NeedsPhi`
+                // slot.  `flowspace/framestate.py:113-114 union`
+                // returns a fresh `Variable()` whenever per-slot vids
+                // disagree; pyre's eager equivalent calls
+                // `lazy_install_local_at_current_block` per such name
+                // at union time, which allocates the merge-block
+                // inputarg, threads predecessor link args (recursing
+                // to install at predecessors when the snapshot vid is
+                // not pred-block-defined), and rebinds ctx so
+                // post-merge reads of `name` resolve to the new phi
+                // vid without re-driving the lazy installer.
+                // CarryThrough slots agreed on a single vid so no
+                // fresh phi is emitted (`framestate.py:108-109 if w1
+                // == w2: return w1`); first post-merge read of those
+                // names still drives the lazy installer's same-block
+                // reuse path.
+                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
+                    if matches!(slot.merge, crate::model::SlotMerge::NeedsPhi) {
+                        let _ = lazy_install_local_at_current_block(
+                            graph,
+                            ctx,
+                            merge_block,
+                            &slot.name,
+                        );
+                    }
                 }
             }
 
@@ -2997,14 +3250,15 @@ fn lower_expr(
             // current block, subsequent reads of the same name in the
             // same block must return the same Variable — RPython's
             // bytecode reads the slot, not a fresh copy.  Pyre's
-            // single-segment `Expr::Path` lowers to `OpKind::Input` when
-            // the name has no same-block defining `ValueId`; we now
+            // single-segment `Expr::Path` reaches this fallback only
+            // when the same-block reuse and cross-block lazy install
+            // both decline (no recorded predecessor framestate, or
+            // graph-recoverable kind disagreement at
+            // `lazy_install_local_at_current_block:1751-1757`); we
             // register the freshly-emitted `Input` result as the
             // authoritative `(ValueId, current_block)` so further reads
             // of `name` within the same block dedup against this
-            // Input.  Cross-block threading (`Link.args` /
-            // target-`inputarg` join after a control-flow split)
-            // remains the deferred follow-up.
+            // synthetic Input.
             //
             // `LocalBindingSnapshot` saves and restores
             // `ctx.local_value_ids` across `If` / `Match` / `Loop` /
@@ -3039,9 +3293,25 @@ fn lower_expr(
         // ── parenthesized (expr) ──
         syn::Expr::Paren(p) => lower_expr(graph, block, &p.expr, options, ctx),
 
-        // ── unary !x, -x ──
+        // ── unary !x, -x, *x ──
         syn::Expr::Unary(u) => {
-            let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+            let lowered = lower_expr(graph, block, &u.expr, options, ctx)?;
+            // `*x` has no flowspace counterpart: `flowspace/operation.py:
+            // 465-474` registers `pos` / `neg` / `invert` / `bool` only.
+            // RPython sources never emit `*x` because Python has no
+            // dereference operator; pyre's frontend sees Rust `*x` as a
+            // type-only operation (re-borrow `&*ptr` is the dominant
+            // pattern in production source — same pointer value), so
+            // propagate the operand vid directly without emitting an op.
+            // Any consumer (`FieldRead`, `Call`, etc.) sees the operand
+            // pointer as the receiver and lowers correctly.  This mirrors
+            // the cutover anchor `anchor_unary_deref_surfaces_failloud_no_flowspace_peer`
+            // intent ("frontend must remove `deref` before reaching the
+            // rtyper") cited at `translator/rtyper/flowspace_adapter.rs:344`.
+            if matches!(u.op, syn::UnOp::Deref(_)) {
+                return Ok(lowered);
+            }
+            let operand = get_value!(lowered);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
@@ -3219,11 +3489,19 @@ fn lower_expr(
             };
 
             let mut any_open = false;
+            // Collect open-arm exit snapshots before `set_goto` closes
+            // each arm, so the post-loop n-way `FrameState::union_many`
+            // sees every reaching predecessor's locals state.  Parity
+            // port of Expr::If's both-open-arm merge generalised to N
+            // arms — see the union block below for the per-slot
+            // semantics.
+            let mut open_arm_snapshots: Vec<FrameState> = Vec::new();
             for (tail, result, exit_snapshot) in &arm_tails {
                 if !graph.block(*tail).is_open() {
                     continue;
                 }
                 any_open = true;
+                open_arm_snapshots.push(exit_snapshot.clone());
                 let goto_args = if all_open_arms_have_value {
                     // Safe: the filter above guarantees every open arm's
                     // `result` is `Some`.
@@ -3292,6 +3570,77 @@ fn lower_expr(
                 );
             }
 
+            // FrameState::union_many-driven merge when 2+ arms reach the
+            // merge block.  Per-slot semantics mirror Expr::If's
+            // both-open-arm merge, generalised to N arms via the n-way
+            // wildcard fold (`model.rs:union_many`) — RPython
+            // `flowspace/flowcontext.py:430-436 mergeblock` reaches the
+            // same fixpoint by iteratively unioning arriving candidates;
+            // pyre's static AST shape collapses that loop into a
+            // single-pass union.
+            //
+            //   - CarryThrough Unknown→concrete retag keeps
+            //     `graph_value_type(vid)` in agreement with the merged
+            //     framestate when an inferred-only arm is unioned with
+            //     an annotated arm.
+            //   - None-kill drops slots that any arm left unbound
+            //     (RPython `framestate.py:110-111`); post-merge reads of
+            //     those names surface as undefined-local.
+            //   - NeedsPhi eager phi install allocates the merge-block
+            //     inputarg, threads predecessor link args via
+            //     `lazy_install_local_at_current_block`, and rebinds
+            //     ctx so post-merge reads resolve to the new phi.
+            //
+            // Single-open-arm case is intentionally NOT handled here:
+            // that's the audit's pre-existing one-open-arm fragility
+            // shared with Expr::If, requiring a separate ctx-restore
+            // strategy that lives outside this slice.
+            if open_arm_snapshots.len() >= 2 {
+                let snapshot_refs: Vec<&FrameState> = open_arm_snapshots.iter().collect();
+                // Concrete-vs-concrete kind disagreement returns
+                // `Err(UnionError::TypeMismatch)` (whole-state failure
+                // mirroring PyPy `framestate.py:88 try/except
+                // UnionError: return None`).  rustc's type checker
+                // rejects any valid Rust source that binds the same
+                // local to two different concrete kinds across match
+                // arms, so the `Err` arm is unreachable from real
+                // input; `.expect(...)` documents the contract.
+                let merged = FrameState::union_many(&snapshot_refs)
+                    .expect("rustc must have rejected differing concrete kinds across match arms");
+                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
+                    if let crate::model::SlotMerge::CarryThrough(vid) = slot.merge {
+                        if !matches!(slot.value_type, ValueType::Unknown)
+                            && !matches!(
+                                graph_value_type(graph, vid),
+                                Some(ref t) if t == &slot.value_type,
+                            )
+                        {
+                            retag_result_value_type(graph, vid, slot.value_type.clone());
+                        }
+                    }
+                }
+                for (slot_idx, slot) in merged.entries.iter().enumerate() {
+                    if slot.is_some() {
+                        continue;
+                    }
+                    let name = open_arm_snapshots.iter().find_map(|s| {
+                        s.entries
+                            .get(slot_idx)
+                            .and_then(|e| e.as_ref())
+                            .map(|e| e.name.clone())
+                    });
+                    if let Some(name) = name {
+                        ctx.local_value_ids.remove(&name);
+                        ctx.local_value_types.remove(&name);
+                    }
+                }
+                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
+                    if matches!(slot.merge, crate::model::SlotMerge::NeedsPhi) {
+                        let _ = lazy_install_local_at_current_block(graph, ctx, merge, &slot.name);
+                    }
+                }
+            }
+
             *block = merge;
             if !any_open {
                 // All arms terminated — the enclosing walk has no open
@@ -3357,31 +3706,20 @@ fn lower_expr(
             graph.set_branch(header_tail, cond, body_entry, vec![], exit, vec![]);
             graph.block_mut(header_tail).framestate = Some(header_branch_snapshot);
 
-            // Capture the FROZEN header inputarg name list now (after
-            // cond, before body).  Body reads of cross-block names
-            // lazy-install at body-side blocks (their predecessor is
-            // `header_tail`, whose framestate we just stamped), NOT
-            // at `header_entry`, so this list is final for the rest
-            // of the loop's lowering.  The list is the union of phis
-            // allocated by `allocate_loop_header_phis` (from
-            // must_merge ∩ pre_loop) and any phis the cond lowering
-            // installed via the cross-block lazy reader (cond-only
-            // reads of pre-loop names not in must_merge).  Both the
-            // back-edge close and `Expr::Continue` fetch per-name
-            // args from `ctx.local_value_ids[name]` using this list.
-            let header_phi_names = header_phi_name_list(graph, header_entry);
-
             // Body → back to header_entry (entry, not tail —
             // header_entry is the back-edge target).  Each stmt may
             // close its path (inner `return` / `break` / `panic!`); on
             // closure we stop walking the body and the back-edge is
             // skipped via the `is_open` check below.  The loop frame
             // makes `break` / `continue` in the body route to exit /
-            // header.
+            // header.  Cat 2-2 Phase B α.1: header-phi name list is
+            // computed on-demand at each close site (back-edge below,
+            // `Expr::Continue`) via `header_phi_name_list(graph, ...)`
+            // so any lazy-install addition to `header_entry.inputargs`
+            // during the body walk is automatically threaded.
             ctx.loop_stack.push(LoopFrame {
                 continue_target: header_entry,
                 break_target: exit,
-                header_phi_names: header_phi_names.clone(),
             });
             let mut body_tail = body_entry;
             for stmt in &w.body.stmts {
@@ -3400,8 +3738,22 @@ fn lower_expr(
                 // `flowspace/framestate.py:92 getoutputargs` produces
                 // the same slot-by-slot mapping for the closing
                 // predecessor link.
+                let body_tail_snapshot = ctx.snapshot_locals_for_link();
+                let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 graph.set_goto(body_tail, header_entry, back_edge_args);
+                // Audit Cat 2-1: stamp the body-tail's framestate
+                // so the post-loop lazy installer can thread reads
+                // of pre-loop locals through this back-edge.  Same
+                // role as the break / continue stamps; the cycle
+                // hazard cited by the prior cycle-breaker comment
+                // is now closed structurally by the lazy installer's
+                // push-first refactor (`lazy_install_local_at_current_block`
+                // installs the outer phi's inputarg slot before
+                // recursing into predecessors, so a back-edge
+                // recursion finds it via the same-block graph-state
+                // idempotency check).
+                graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
 
             *block = exit;
@@ -3434,18 +3786,13 @@ fn lower_expr(
             );
             graph.block_mut(pre_loop_block).framestate = Some(pre_loop_snapshot);
 
-            // No cond → no extra lazy installs at body_entry between
-            // allocator and frame push, so the allocator's installed
-            // ops are the final inputarg list at this point.  We
-            // re-derive from `body_entry.inputargs` for symmetry with
-            // `Expr::While` and to stay robust against future code
-            // that interposes additional lazy installs here.
-            let header_phi_names = header_phi_name_list(graph, body_entry);
-
+            // Cat 2-2 Phase B α.1: header-phi name list recomputed on
+            // demand at the back-edge close below, so any lazy install
+            // that adds an inputarg to `body_entry` during the body
+            // walk is automatically threaded.
             ctx.loop_stack.push(LoopFrame {
                 continue_target: body_entry,
                 break_target: exit,
-                header_phi_names: header_phi_names.clone(),
             });
             let mut body_tail = body_entry;
             for stmt in &l.body.stmts {
@@ -3456,8 +3803,14 @@ fn lower_expr(
             }
             ctx.loop_stack.pop();
             if graph.block(body_tail).is_open() {
+                // Audit Cat 2-1: stamp body-tail's framestate (see
+                // the matching `Expr::While` body-tail stamp for the
+                // cycle-safety rationale).
+                let body_tail_snapshot = ctx.snapshot_locals_for_link();
+                let header_phi_names = header_phi_name_list(graph, body_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 graph.set_goto(body_tail, body_entry, back_edge_args);
+                graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
 
             *block = exit;
@@ -3534,17 +3887,11 @@ fn lower_expr(
             }
             graph.block_mut(header_entry).framestate = Some(header_branch_snapshot);
 
-            // Capture the FROZEN header inputarg name list.  The
-            // for-cond op is a single placeholder that does not
-            // emit further cross-block lazy installs, so the list
-            // already matches what `allocate_loop_header_phis`
-            // installed.
-            let header_phi_names = header_phi_name_list(graph, header_entry);
-
+            // Cat 2-2 Phase B α.1: header-phi name list recomputed on
+            // demand at the back-edge close below.
             ctx.loop_stack.push(LoopFrame {
                 continue_target: header_entry,
                 break_target: exit,
-                header_phi_names: header_phi_names.clone(),
             });
             let mut body_tail = body_entry;
             for stmt in &f.body.stmts {
@@ -3555,8 +3902,14 @@ fn lower_expr(
             }
             ctx.loop_stack.pop();
             if graph.block(body_tail).is_open() {
+                // Audit Cat 2-1: stamp body-tail's framestate (see
+                // the matching `Expr::While` body-tail stamp for the
+                // cycle-safety rationale).
+                let body_tail_snapshot = ctx.snapshot_locals_for_link();
+                let header_phi_names = header_phi_name_list(graph, header_entry);
                 let back_edge_args = link_args_from_ctx(ctx, &header_phi_names);
                 graph.set_goto(body_tail, header_entry, back_edge_args);
+                graph.block_mut(body_tail).framestate = Some(body_tail_snapshot);
             }
 
             *block = exit;
@@ -3615,33 +3968,38 @@ fn lower_expr(
                     // for `while` / `loop` (Slice 5c.1+) this is the
                     // header with its eager-phi inputargs.  Thread
                     // per-name args from `ctx.local_value_ids[name]`
-                    // using the FROZEN `header_phi_names` captured at
-                    // frame push.  RPython parity for the slot-by-slot
-                    // mapping: `flowspace/framestate.py:92
-                    // getoutputargs`.  For `for` (still on the legacy
-                    // shape until Slice 5c.3), `header_phi_names` is
-                    // empty so this collapses to the prior empty-args
-                    // behaviour.
+                    // using the header's CURRENT inputarg name list
+                    // (Cat 2-2 Phase B α.1: recomputed on demand from
+                    // `frame.continue_target.inputargs` at close time
+                    // so any lazy install that added an inputarg
+                    // during body walk is automatically threaded).
+                    // RPython parity for the slot-by-slot mapping:
+                    // `flowspace/framestate.py:92 getoutputargs`.
                     //
-                    // STRUCTURAL-CYCLE-BREAKER: the continue source's
-                    // `block.framestate` is intentionally left None.
-                    // Stamping it would create a back-edge framestate
-                    // pointing at the header's eager-phi inputargs,
-                    // and the lazy installer's predecessor walk would
-                    // recurse from `header_entry` → continue source's
-                    // framestate → header phi vid → recurse into
-                    // header_entry, overflowing the stack.  The
-                    // installer's `framestate.as_ref()?` early-return
-                    // on None is the natural cycle breaker (Slice 5
-                    // epic memory: "un-stamped body_tail.framestate is
-                    // a natural cycle breaker").  RPython
+                    // Audit Cat 2-1: stamp the continue source's
+                    // framestate so the post-loop lazy installer can
+                    // thread reads of pre-loop locals (NOT in
+                    // `must_merge`) back through this back-edge —
+                    // same role as the break source's framestate
+                    // stamp at line 3872.  RPython parity:
                     // `flowspace/flowcontext.py:399-465 mergeblock`
-                    // does not have this problem because its
-                    // work-list iteration converges on FrameState
-                    // unions producing fresh phi Variables, not by
-                    // recursive predecessor walk.
-                    let args = link_args_from_ctx(ctx, &frame.header_phi_names);
+                    // requires every closing predecessor of the
+                    // merge target to carry a FrameState so
+                    // `getoutputargs` can resolve the target's
+                    // inputargs slot-by-slot.  The earlier "stamping
+                    // would overflow the stack" cycle hazard is now
+                    // closed structurally by the lazy installer's
+                    // Phase-2 push-first refactor: the back-edge's
+                    // snap_vid for a header-phi name points at the
+                    // header's already-installed phi inputarg, so
+                    // the recursive install at the header short-
+                    // circuits via the same-block graph-state
+                    // idempotency check on `block.inputargs`.
+                    let pre_continue_snapshot = ctx.snapshot_locals_for_link();
+                    let header_phi_names = header_phi_name_list(graph, frame.continue_target);
+                    let args = link_args_from_ctx(ctx, &header_phi_names);
                     graph.set_goto(*block, frame.continue_target, args);
+                    graph.block_mut(*block).framestate = Some(pre_continue_snapshot);
                 }
             }
             Ok(Lowered::path_closed())
@@ -6489,6 +6847,87 @@ mod tests {
     }
 
     #[test]
+    fn match_three_arm_rebind_routes_through_union_many_n_way_merge() {
+        // Audit Cat 2-3 fix: a 3-arm match whose arms each rebind a
+        // pre-existing local must produce a single merge-block phi
+        // that unifies all three arm vids — exercising the n-way
+        // `FrameState::union_many` path (NeedsPhi when ≥2 arms
+        // disagree on the slot's vid) plus eager phi install at
+        // union time.  RPython parity:
+        // `flowspace/flowcontext.py:430-436 mergeblock` reaches the
+        // same fixpoint by iteratively unioning each candidate; pyre
+        // collapses that loop into a single n-way union over the
+        // open arm exit snapshots.
+        //
+        // Without the union_many path, the merge would carry no ctx
+        // update at union time and the post-merge `x` read would
+        // depend on the lazy installer firing post-hoc — the audit's
+        // exact "PyPy-style merge state not reflected in ctx" gap.
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(tag: i64) -> i64 {
+                let mut x = 0;
+                match tag {
+                    1 => { x = 10; }
+                    2 => { x = 20; }
+                    _ => { x = 30; }
+                }
+                x
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|func| func.name == "example")
+            .expect("example graph")
+            .graph;
+        // The merge block must own an `x` phi inputarg installed
+        // eagerly by union_many's NeedsPhi path.
+        let phi_block = graph.blocks.iter().find(|block| {
+            block.operations.iter().any(|op| {
+                op.result.is_some_and(|r| block.inputargs.contains(&r))
+                    && matches!(
+                        &op.kind,
+                        OpKind::Input { name, .. } if name == "x"
+                    )
+            })
+        });
+        assert!(
+            phi_block.is_some(),
+            "expected 3-arm match merge to allocate an `x` phi inputarg via union_many; graph:\n{}",
+            graph.dump()
+        );
+        // All three arms must thread their per-arm rebind value as
+        // `Link.args` into the merge — each predecessor edge must
+        // carry ≥1 arg (the rebound `x`).  ≥3 predecessors covers
+        // the n-way generalisation; the ≥1 per-edge contract pins
+        // that the eager install threaded through every arm rather
+        // than only a subset.
+        let phi_block_id = phi_block.unwrap().id;
+        let pred_arg_count: Vec<usize> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| {
+                b.exits.iter().filter_map(move |exit| {
+                    if exit.target == phi_block_id {
+                        Some(exit.args.len())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        assert!(
+            pred_arg_count.len() >= 3 && pred_arg_count.iter().all(|&n| n >= 1),
+            "expected ≥3 predecessor links (3-arm match) with ≥1 Link.args each; got {:?}\ngraph:\n{}",
+            pred_arg_count,
+            graph.dump()
+        );
+    }
+
+    #[test]
     fn match_arm_rebind_threads_phi_inputarg_through_lazy_installer() {
         // Slice 4 / Stage D parity test: a pre-match local rebound on
         // every match arm must resolve to a merge-block phi inputarg
@@ -7747,9 +8186,7 @@ mod tests {
         let b = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
-        let merged = a
-            .union(&b)
-            .expect("agreeing predecessors must union cleanly");
+        let merged = a.union(&b).expect("matching states must union cleanly");
         assert_eq!(
             merged.entries,
             vec![Some(MergedFrameStateEntry {
@@ -7772,7 +8209,9 @@ mod tests {
         let b = FrameState {
             entries: vec![frame_entry("x", 8, ValueType::Int)],
         };
-        let merged = a.union(&b).expect("disagreeing vids must produce NeedsPhi");
+        let merged = a
+            .union(&b)
+            .expect("disagreeing vids must produce NeedsPhi without TypeMismatch");
         assert_eq!(
             merged.entries,
             vec![Some(MergedFrameStateEntry {
@@ -7809,7 +8248,7 @@ mod tests {
         };
         let merged = a
             .union(&b)
-            .expect("merge with one-sided names must succeed");
+            .expect("type-compatible slots must union cleanly");
         assert_eq!(
             merged.entries.len(),
             3,
@@ -7851,7 +8290,7 @@ mod tests {
         };
         let merged = early
             .union(&late)
-            .expect("padded zip must succeed; tail slot None-killed");
+            .expect("type-compatible slots must union cleanly");
         assert_eq!(
             merged.entries.len(),
             2,
@@ -7867,11 +8306,23 @@ mod tests {
     }
 
     #[test]
-    fn frame_state_union_rejects_value_type_mismatch() {
-        // RPython `framestate.py:117 raise UnionError` fires when
-        // upstream cannot reconcile two values; pyre extends the case
-        // to ValueType disagreement because that pins int/ref/float
-        // register bank selection.
+    fn frame_state_union_concrete_kind_disagreement_returns_type_mismatch() {
+        // RPython `flowspace/framestate.py:88 FrameState.union` wraps
+        // its inner `_union` in `try/except UnionError: return None`,
+        // and `flowcontext.py:430-436 mergeblock` reads that `None` as
+        // a **whole-state** "this candidate did not unify, retry /
+        // make_next_block" signal — NOT a per-slot drop.  Silently
+        // None-killing the slot would let post-merge reads of `x`
+        // surface as undefined-local instead of blocking the merge,
+        // which would reorder PyPy's mergeblock contract.
+        //
+        // Pyre surfaces the same shape as `Err(UnionError::TypeMismatch)`
+        // for the whole call.  Under valid Rust input rustc rejects
+        // any source that binds the same local to two different
+        // concrete kinds across arms (`Int` vs `Ref` here), so
+        // production callers `.expect(...)` the `Err` arm; this
+        // fixture bypasses the Rust frontend by constructing the
+        // framestates by hand to verify the failure path.
         use crate::model::UnionError;
         let a = FrameState {
             entries: vec![frame_entry("x", 1, ValueType::Int)],
@@ -7881,18 +8332,152 @@ mod tests {
         };
         let err = a
             .union(&b)
-            .expect_err("type mismatch must surface UnionError");
-        match err {
+            .expect_err("concrete kind disagreement must surface UnionError::TypeMismatch");
+        assert_eq!(
+            err,
             UnionError::TypeMismatch {
-                name,
-                self_type,
-                other_type,
-            } => {
-                assert_eq!(name, "x");
-                assert_eq!(self_type, ValueType::Int);
-                assert_eq!(other_type, ValueType::Ref);
-            }
-        }
+                name: "x".to_string(),
+                self_type: ValueType::Int,
+                other_type: ValueType::Ref,
+            },
+        );
+    }
+
+    #[test]
+    fn frame_state_union_treats_unknown_as_wildcard() {
+        // RPython `flowspace/Variable` is untyped at flowspace level,
+        // so `framestate.py:union` never raises on type mismatch — it
+        // produces a fresh `Variable` for any disagreement.  Pyre
+        // tracks ValueType to pin int/ref/float register banks for
+        // the typed pipeline, but `Unknown` is the explicit "no
+        // annotation captured" sentinel and is structurally a
+        // wildcard: an inferred-only bind on one arm and an annotated
+        // bind on the other are still the same slot.  TypeMismatch
+        // fires only when both sides are concrete and disagree.
+        use crate::model::{MergedFrameStateEntry, SlotMerge};
+        let inferred = FrameState {
+            entries: vec![frame_entry("x", 1, ValueType::Unknown)],
+        };
+        let annotated = FrameState {
+            entries: vec![frame_entry("x", 1, ValueType::Int)],
+        };
+        // Carry-through: same vid, Unknown vs Int → resolves to Int.
+        let merged = inferred
+            .union(&annotated)
+            .expect("Unknown wildcard against concrete kind must union cleanly");
+        assert_eq!(
+            merged.entries,
+            vec![Some(MergedFrameStateEntry {
+                name: "x".to_string(),
+                merge: SlotMerge::CarryThrough(ValueId(1)),
+                value_type: ValueType::Int,
+            })]
+        );
+        // Symmetric: concrete on self, Unknown on other → still Int.
+        let merged_swap = annotated
+            .union(&inferred)
+            .expect("Unknown wildcard against concrete kind must union cleanly");
+        assert_eq!(
+            merged_swap.entries[0].as_ref().unwrap().value_type,
+            ValueType::Int
+        );
+    }
+
+    #[test]
+    fn frame_state_union_many_three_arms_carry_through_when_all_agree() {
+        // N-way analogue of the 2-way `CarryThrough` rule.  All three
+        // arms bind `x` to the same vid → merged slot is
+        // `CarryThrough(7)`, mirroring RPython `framestate.py:108
+        // if w1 == w2: return w1` extended to N candidates.
+        use crate::model::{MergedFrameStateEntry, SlotMerge};
+        let a = FrameState {
+            entries: vec![frame_entry("x", 7, ValueType::Int)],
+        };
+        let b = FrameState {
+            entries: vec![frame_entry("x", 7, ValueType::Int)],
+        };
+        let c = FrameState {
+            entries: vec![frame_entry("x", 7, ValueType::Int)],
+        };
+        let merged =
+            FrameState::union_many(&[&a, &b, &c]).expect("matching arms must union cleanly");
+        assert_eq!(
+            merged.entries,
+            vec![Some(MergedFrameStateEntry {
+                name: "x".to_string(),
+                merge: SlotMerge::CarryThrough(ValueId(7)),
+                value_type: ValueType::Int,
+            })]
+        );
+    }
+
+    #[test]
+    fn frame_state_union_many_needs_phi_when_any_arm_disagrees() {
+        // Two arms agree on vid=7 but the third arm bound vid=8 — any
+        // disagreement triggers `NeedsPhi` (RPython `framestate.py:
+        // 113-114 return Variable()`).  Asymmetric in vid but
+        // symmetric in name + kind so the wildcard fold leaves
+        // `value_type` at `Int`.
+        use crate::model::{MergedFrameStateEntry, SlotMerge};
+        let a = FrameState {
+            entries: vec![frame_entry("x", 7, ValueType::Int)],
+        };
+        let b = FrameState {
+            entries: vec![frame_entry("x", 7, ValueType::Int)],
+        };
+        let c = FrameState {
+            entries: vec![frame_entry("x", 8, ValueType::Int)],
+        };
+        let merged = FrameState::union_many(&[&a, &b, &c])
+            .expect("disagreeing vids must produce NeedsPhi without TypeMismatch");
+        assert_eq!(
+            merged.entries,
+            vec![Some(MergedFrameStateEntry {
+                name: "x".to_string(),
+                merge: SlotMerge::NeedsPhi,
+                value_type: ValueType::Int,
+            })]
+        );
+    }
+
+    #[test]
+    fn frame_state_union_many_kills_slot_if_any_arm_unbound() {
+        // RPython `framestate.py:110-111` None-kill extended to N
+        // arms: ANY arm with `None` at slot `i` collapses the merged
+        // slot to None, matching the conservative "must be defined on
+        // every reaching path" semantics of the bytecode flowspace.
+        // Slot 0 (`survivor`) is bound on every arm → kept.  Slot 1
+        // (`only_ab`) is bound on the first two arms but `None` on the
+        // third → None-kill.  The third arm padded its slot 1 by
+        // taking the snapshot before `only_ab` was first bound — same
+        // shorter-side rule as the 2-way test but applied to the
+        // n-way fold.
+        let a = FrameState {
+            entries: vec![
+                frame_entry("survivor", 1, ValueType::Int),
+                frame_entry("only_ab", 2, ValueType::Int),
+            ],
+        };
+        let b = FrameState {
+            entries: vec![
+                frame_entry("survivor", 1, ValueType::Int),
+                frame_entry("only_ab", 2, ValueType::Int),
+            ],
+        };
+        let c = FrameState {
+            entries: vec![frame_entry("survivor", 1, ValueType::Int)],
+        };
+        let merged = FrameState::union_many(&[&a, &b, &c])
+            .expect("type-compatible slots must union cleanly");
+        assert_eq!(merged.entries.len(), 2);
+        assert_eq!(
+            merged.entries[0].as_ref().map(|e| e.name.as_str()),
+            Some("survivor"),
+        );
+        assert!(
+            merged.entries[1].is_none(),
+            "any-None slot collapses to None-kill"
+        );
     }
 
     #[test]
@@ -7917,7 +8502,9 @@ mod tests {
                 frame_entry("b", 2, ValueType::Int),
             ],
         };
-        let merged = a.union(&b).expect("matching states must union cleanly");
+        let merged = a
+            .union(&b)
+            .expect("type-compatible slots must union cleanly");
         let order: Vec<&str> = merged
             .entries
             .iter()
@@ -7952,7 +8539,9 @@ mod tests {
                 frame_entry("c", 30, ValueType::Int),
             ],
         };
-        let merged = pred.union(&other).expect("union must succeed");
+        let merged = pred
+            .union(&other)
+            .expect("type-compatible slots must union cleanly");
         let link_args = pred.getoutputargs(&merged);
         assert_eq!(
             link_args,
@@ -7981,7 +8570,9 @@ mod tests {
                 frame_entry("only_b", 33, ValueType::Int),
             ],
         };
-        let merged = a.union(&b).expect("union must succeed");
+        let merged = a
+            .union(&b)
+            .expect("type-compatible slots must union cleanly");
         let link_args = a.getoutputargs(&merged);
         assert_eq!(
             link_args,
@@ -8224,6 +8815,304 @@ mod tests {
         }
     }
 
+    /// A name rebound in the loop body but never read (neither in the
+    /// body nor post-loop) gets a transient loop-header phi during
+    /// lowering, then `prune_dead_phis` removes that phi and its matching
+    /// link-arg before downstream passes see the graph.  This mirrors
+    /// `flowcontext.py:430 mergeblock` + `simplify.transform_dead_op_vars`.
+    #[test]
+    fn rebound_only_no_post_read_skips_header_phi() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(n: i64) -> i64 {
+                let mut x: i64 = 0;
+                let mut count: i64 = 0;
+                while count < n {
+                    count = count + 1;
+                    x = 5;
+                }
+                count
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|f| f.name == "example")
+            .expect("example graph")
+            .graph;
+        // The single loop header is the block with non-empty inputargs
+        // that is not the start / return / except.
+        let header = graph
+            .blocks
+            .iter()
+            .find(|b| {
+                !b.inputargs.is_empty()
+                    && b.id != graph.startblock
+                    && b.id != graph.returnblock
+                    && b.id != graph.exceptblock
+            })
+            .expect("loop header must exist");
+        let header_phi_names: Vec<&str> = header
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if header.inputargs.contains(&op.result.unwrap()) => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            header_phi_names.contains(&"count"),
+            "`count` is read in the body, so its header phi must exist; got {:?}",
+            header_phi_names,
+        );
+        assert!(
+            !header_phi_names.contains(&"x"),
+            "`x` is rebound-only-no-read; prune_dead_phis must remove the \
+             transient header phi before the final graph. Got {:?}",
+            header_phi_names,
+        );
+    }
+
+    /// A name rebound in the body that is read post-loop (but not
+    /// inside the body) must still get a header phi.
+    /// `flowcontext.py:430 mergeblock`'s `union` of pre-loop and
+    /// body-tail framestates reports `NeedsPhi` (different vids),
+    /// creating the phi at union time.  Pyre's read∪rebound
+    /// allocator emits the phi at the header eagerly; the post-loop
+    /// reader of `x` resolves to the eager phi vid.
+    #[test]
+    fn rebound_only_with_post_loop_read_lazy_installs_header_phi() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(n: i64) -> i64 {
+                let mut x: i64 = 0;
+                let mut count: i64 = 0;
+                while count < n {
+                    count = count + 1;
+                    x = 5;
+                }
+                x + count
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|f| f.name == "example")
+            .expect("example graph")
+            .graph;
+        let header = graph
+            .blocks
+            .iter()
+            .find(|b| {
+                !b.inputargs.is_empty()
+                    && b.id != graph.startblock
+                    && b.id != graph.returnblock
+                    && b.id != graph.exceptblock
+            })
+            .expect("loop header must exist");
+        let header_phi_names: Vec<&str> = header
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if header.inputargs.contains(&op.result.unwrap()) => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            header_phi_names.contains(&"count"),
+            "`count` is read in the body; got {:?}",
+            header_phi_names,
+        );
+        assert!(
+            header_phi_names.contains(&"x"),
+            "`x` is rebound in the body and read post-loop; the eager \
+             allocator must emit a header phi for it. Got {:?}",
+            header_phi_names,
+        );
+    }
+
+    /// Nested while loops where the inner loop reads outer-loop
+    /// locals.  `loop_body_locals`'s recursive AST visit propagates
+    /// the inner loop's reads to the outer body's `read_names`, so
+    /// both loops allocate header phis for shared locals
+    /// consistently.  Positive-path probe — the existing
+    /// `nested_loops_per_header_phi_arity_consistent` covers the
+    /// arity invariant; this one pins the
+    /// `read_names ∪ rebound_names` allocation scope.
+    #[test]
+    fn nested_while_inner_reads_outer_local_threads_header_phi() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(n: i64) -> i64 {
+                let mut outer: i64 = 0;
+                let mut inner: i64 = 0;
+                while outer < n {
+                    inner = 0;
+                    while inner < outer {
+                        inner = inner + 1;
+                    }
+                    outer = outer + 1;
+                }
+                outer + inner
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|f| f.name == "example")
+            .expect("example graph")
+            .graph;
+        // Two non-special blocks should carry inputargs (the two loop
+        // headers).  Both must include `inner` and `outer` per
+        // `read_names` (inner loop's `inner < outer` reads outer; outer
+        // loop's `while outer < n` reads outer; both reads propagate).
+        // A "loop header" is any block whose inputargs include a phi
+        // for `outer` AND has a back-edge predecessor (a predecessor
+        // whose block id is greater — back-edges close to lower-id
+        // blocks).  At least two such blocks must exist (outer and
+        // inner loop headers).
+        let mut loop_headers_with_outer = 0;
+        for header in &graph.blocks {
+            let has_outer_phi = header.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::Input { name, .. } if name == "outer")
+                    && op
+                        .result
+                        .map(|r| header.inputargs.contains(&r))
+                        .unwrap_or(false)
+            });
+            if !has_outer_phi {
+                continue;
+            }
+            let has_back_edge = graph.blocks.iter().any(|pred| {
+                pred.id.0 > header.id.0 && pred.exits.iter().any(|e| e.target == header.id)
+            });
+            if has_back_edge {
+                loop_headers_with_outer += 1;
+            }
+        }
+        assert!(
+            loop_headers_with_outer >= 2,
+            "expected at least two loop headers carrying `outer` phi; got {}",
+            loop_headers_with_outer,
+        );
+    }
+
+    /// Cat 2-2 Phase A.2 probe: closure inside the loop body must NOT
+    /// influence header phi allocation.  `visit_expr_for_loop_locals`
+    /// explicitly skips `Expr::Closure`; a name read only inside a
+    /// closure body should not appear in `read_names` and therefore
+    /// should not get a header phi.  RPython parity: a closure
+    /// compiles to its own bytecode with `LOAD_DEREF` / `STORE_DEREF`,
+    /// distinct from the outer `LOAD_FAST` / `STORE_FAST` sequence, so
+    /// captures do not flow through the loop's straight-line control
+    /// path.
+    ///
+    /// Positive-path version: reads of a captured-only name inside a
+    /// closure body do NOT count as read on the loop's header.  We
+    /// pin the negative — closure-only-captured name is absent from
+    /// `read_names` and therefore not a phi candidate.
+    #[test]
+    fn closure_captured_name_excluded_from_loop_header_phi() {
+        // `loop_body_locals` is the unit under test; build a body
+        // directly without going through `build_semantic_program` so
+        // the probe stays orthogonal to the rest of the pipeline.
+        let body: syn::Block = syn::parse_quote! {
+            {
+                let _f = || {
+                    captured_only
+                };
+                straight_local = 1;
+            }
+        };
+        let result = loop_body_locals(&body);
+        assert!(
+            !result.read_names.contains("captured_only"),
+            "`captured_only` read only inside the closure body must not \
+             appear in read_names; got {:?}",
+            result.read_names,
+        );
+        assert!(
+            result.rebound_names.contains("straight_local"),
+            "`straight_local` rebound on the body's straight path must \
+             appear in rebound_names; got {:?}",
+            result.rebound_names,
+        );
+    }
+
+    /// Cat 2-2 Phase A.2 probe: Rust lexical shadowing — the audit's
+    /// primary Phase B motivator.  `let x: i64 = count + 100` inside
+    /// a loop body shadows the pre-loop `let x: i64 = 7` for the
+    /// duration of the body's scope, but pyre's `loop_body_locals`
+    /// AST scan collapses both into the single name `"x"`.  Under
+    /// the current shape, the loop header allocates a phi for `x`
+    /// (because the body rebinds + reads `x`), and the back-edge
+    /// close threads the inner `x`'s vid through the same slot as
+    /// the outer pre-loop binding.  The post-loop read of outer `x`
+    /// then resolves to the merged loop-header phi instead of the
+    /// pre-loop `ConstInt(7)`.
+    ///
+    /// Marked `#[ignore]` because the current shape DOES NOT match
+    /// Rust semantics: the test documents the gap until Phase B
+    /// (back-edge worklist + scope-aware tracking) closes it.
+    /// Removing `#[ignore]` is the regression-anchor handshake when
+    /// Phase B lands.
+    ///
+    /// The Phase B post-fix expectation: NO loop-header phi for `x`
+    /// exists in the final graph, because the inner `let x` lives in
+    /// its own lexical scope that ends at the body block boundary
+    /// and therefore has no back-edge.
+    #[test]
+    #[ignore = "Cat 2-2 Phase B: lexical shadowing not yet supported \
+                — current AST scan collapses outer/inner `x` into one \
+                slot, so the loop header allocates a phi for `x`."]
+    fn lexical_shadowing_in_loop_body_does_not_emit_x_header_phi() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(n: i64) -> i64 {
+                let x: i64 = 7;
+                let mut count: i64 = 0;
+                while count < n {
+                    let x: i64 = count + 100;
+                    count = count + x;
+                }
+                x
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|f| f.name == "example")
+            .expect("example graph")
+            .graph;
+        // Phase B post-fix expectation: no block carries a phi named
+        // `x`.  Today the loop header carries one because the AST
+        // scan collapses both `let x` bindings into the same name.
+        let any_x_phi = graph.blocks.iter().any(|b| {
+            b.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::Input { name, .. } if name == "x")
+                    && op.result.map(|r| b.inputargs.contains(&r)).unwrap_or(false)
+            })
+        });
+        assert!(
+            !any_x_phi,
+            "Phase B post-fix: inner `let x` is a lexically-scoped \
+             shadow that must not produce a loop-header phi for `x`; \
+             currently the AST scan collapses outer/inner into one slot.",
+        );
+    }
+
     /// Slice 5d nested-pattern coverage #2: `break` from a deeply
     /// nested `if` arm whose framestate has been mutated by a sibling
     /// arm's `LocalBindingSnapshot::restore`.  The lowering must close
@@ -8338,6 +9227,136 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Audit Cat 2-1 probe: a `while` loop whose body contains
+    /// `continue`, with a pre-loop local read after the loop that the
+    /// body never touches.  Lazy installer must thread the post-loop
+    /// read all the way back to the pre-loop binding via the loop
+    /// header — and through each header predecessor (pre-loop edge,
+    /// body-tail back-edge, AND continue back-edge).  RPython parity:
+    /// `flowspace/flowcontext.py:399-465 mergeblock` requires every
+    /// closing predecessor of the merge target to carry a FrameState
+    /// so `getoutputargs` can resolve the target's inputargs slot-by-
+    /// slot.  Pre-fix, body_tail and continue source both have
+    /// `framestate = None` (intentional cycle breaker), so the
+    /// installer's `framestate.as_ref()?` short-circuit aborts at
+    /// the header's predecessor walk and the post-loop read drops to
+    /// the naked-`Input` fallback (disconnected from pre-loop's vid).
+    #[test]
+    fn while_with_continue_threads_post_loop_read_through_header_phi() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn example(n: i64) -> i64 {
+                let y: i64 = 7;
+                let mut count: i64 = 0;
+                while count < n {
+                    if count % 2 == 0 {
+                        count = count + 1;
+                        continue;
+                    }
+                    count = count + 1;
+                }
+                y
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program
+            .functions
+            .iter()
+            .find(|func| func.name == "example")
+            .expect("example graph")
+            .graph;
+        // Find the return block: ends with `Return` and reads `y`.
+        let (returnblock_id, _ret_arg) = graph.returnblock_arg();
+        // The closing predecessor of the returnblock is the post-loop
+        // exit block that produces the return value (`y`).  In the
+        // canonical Slice-2 lazy-install path, the post-loop block
+        // owns `y` as an inputarg threaded back through the loop
+        // header phi via every header predecessor (pre-loop, body-
+        // tail, continue source).  In the pre-fix path, the
+        // installer short-circuits at the header predecessor walk
+        // because body_tail and continue source both have
+        // `framestate = None`, and the post-loop block emits a naked
+        // `OpKind::Input { name: "y" }` op as a synthetic disconnected
+        // Variable.
+        //
+        // Probe: walk the returnblock's predecessor link.  Its single
+        // arg is the post-loop block's `y` value.  Verify that vid is
+        // an inputarg of the post-loop block (i.e. lazy install
+        // succeeded).  Pre-fix, the vid would be the result of a
+        // standalone `OpKind::Input` op NOT in inputargs.
+        let pred_link: Option<(BlockId, ValueId)> = graph.blocks.iter().find_map(|b| {
+            b.exits.iter().find_map(|exit| {
+                if exit.target == returnblock_id {
+                    let arg_vid = match &exit.args[0] {
+                        crate::model::LinkArg::Value(v) => *v,
+                        _ => return None,
+                    };
+                    Some((b.id, arg_vid))
+                } else {
+                    None
+                }
+            })
+        });
+        let (post_loop_id, ret_value_vid) =
+            pred_link.expect("returnblock must have one closing predecessor");
+        let post_loop_block = graph.block(post_loop_id);
+        let is_inputarg = post_loop_block.inputargs.contains(&ret_value_vid);
+        assert!(
+            is_inputarg,
+            "post-loop block must own `y` as an inputarg threaded back to \
+             pre-loop; got naked-`Input` fallback (vid {:?} not in \
+             inputargs {:?}). graph:\n{}",
+            ret_value_vid,
+            post_loop_block.inputargs,
+            graph.dump()
+        );
+        // Audit Cat 2-1 also stamps continue + body_tail framestate
+        // on the SOURCE blocks of every back-edge link into the loop
+        // header.  Confirm directly that every header predecessor
+        // has a stamped framestate; pre-fix at least one of them
+        // (the continue source AND the body_tail) would be `None`,
+        // and the residual fallback at the post-loop block was the
+        // observable consequence.
+        let header_id = graph
+            .blocks
+            .iter()
+            .find_map(|b| {
+                let owns_count_phi = b.operations.iter().any(|op| {
+                    matches!(&op.kind, OpKind::Input { name, .. } if name == "count")
+                        && op.result.is_some_and(|r| b.inputargs.contains(&r))
+                });
+                let pred_count = graph
+                    .blocks
+                    .iter()
+                    .flat_map(|p| p.exits.iter().filter(|e| e.target == b.id).map(|_| ()))
+                    .count();
+                (owns_count_phi && pred_count >= 2).then_some(b.id)
+            })
+            .expect("loop header with `count` phi + ≥2 preds");
+        let header_pred_ids: Vec<BlockId> = graph
+            .blocks
+            .iter()
+            .filter_map(|b| {
+                b.exits
+                    .iter()
+                    .any(|e| e.target == header_id)
+                    .then_some(b.id)
+            })
+            .collect();
+        for pred_id in &header_pred_ids {
+            let pred = graph.block(*pred_id);
+            assert!(
+                pred.framestate.is_some(),
+                "header predecessor block {:?} must have framestate \
+                 stamped (continue + body_tail Cat 2-1 stamps); \
+                 graph:\n{}",
+                pred_id,
+                graph.dump()
+            );
         }
     }
 }
