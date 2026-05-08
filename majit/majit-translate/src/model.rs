@@ -951,19 +951,21 @@ impl FrameState {
     /// Compute a state at least as general as both `self` and `other`
     /// via positional zip over slots — direct port of RPython
     /// `framestate.py:14 _union` (`return [union(v1, v2) for v1, v2
-    /// in zip(seq1, seq2)]`).  When one side has fewer slots than the
-    /// other (a name appended after the shorter side's snapshot was
-    /// taken), the missing slots are treated as `None` so the
-    /// positional zip extends to `max(len(self), len(other))`.
+    /// in zip(seq1, seq2)]`) and `framestate.py:73-90 FrameState.union`.
+    /// When one side has fewer slots than the other (a name appended
+    /// after the shorter side's snapshot was taken), the missing
+    /// slots are treated as `None` so the positional zip extends to
+    /// `max(len(self), len(other))`.
     ///
     /// Per-slot semantics (RPython `framestate.py:105-128 union`):
     ///   - `(None, _) | (_, None)` → None-kill (`framestate.py:
-    ///     110-111`); slot dropped from the merged state.
+    ///     110-111`); merged slot is `None`.
     ///   - `(Some(s), Some(o))` with `s.value_id == o.value_id` →
-    ///     `CarryThrough(vid)` (`framestate.py:108 if w1 == w2:
+    ///     carry through that vid (`framestate.py:108 if w1 == w2:
     ///     return w1`).
     ///   - `(Some(s), Some(o))` with disagreeing vids →
-    ///     `NeedsPhi` (`framestate.py:113-114 return Variable()`).
+    ///     `graph.alloc_value()` for a fresh `ValueId` at the slot
+    ///     (`framestate.py:113-114 return Variable()` analogue).
     ///
     /// `ValueType` disagreement is partitioned into two regimes:
     ///   - `Unknown` is a wildcard: a slot bound by inference on one
@@ -992,40 +994,47 @@ impl FrameState {
     ///     that bypass the Rust frontend can exercise the failure
     ///     path explicitly via `expect_err`.
     ///
-    /// `MergedFrameState.entries[i]` is `None` only for the one-sided
-    /// None-kill (RPython `framestate.py:110-111`); concrete kind
-    /// disagreement surfaces through the `Err` arm instead.
-    ///
-    /// Caller (Stage C1+) allocates fresh `ValueId`s for the
-    /// `NeedsPhi` slots when materialising the successor block's
-    /// inputargs; `union` itself is purely descriptive and does not
-    /// mutate the graph.
-    pub fn union(&self, other: &FrameState) -> Result<MergedFrameState, UnionError> {
+    /// Returns `FrameState` directly with phi vids materialised:
+    /// agreement slots carry the predecessor's vid, disagreement
+    /// slots get a freshly-allocated vid (the upstream `Variable()`
+    /// analogue).  Callers detect "this slot is a fresh phi" by
+    /// comparing the merged `value_id` against the predecessor's vid
+    /// for the same slot — when they differ, the union allocated a
+    /// fresh vid.  The install is then driven via
+    /// `lazy_install_local_at_current_block(.., Some(merged_vid))`
+    /// so the Input op carries the same vid the merged state already
+    /// refers to.
+    pub fn union(
+        &self,
+        other: &FrameState,
+        graph: &mut FunctionGraph,
+    ) -> Result<FrameState, UnionError> {
+        // Two-pass implementation: Pass 1 validates every slot (no
+        // graph mutation), Pass 2 allocates fresh vids for
+        // disagreement slots.  This keeps `graph.next_value()` from
+        // advancing when a later slot trips `UnionError::TypeMismatch`
+        // — atomic on failure, parity-equivalent to upstream where
+        // `framestate.py:73-89 try/except UnionError: return None`
+        // discards a partially-built result.
         let len = std::cmp::max(self.entries.len(), other.entries.len());
-        let mut merged = Vec::with_capacity(len);
+        // Pass 1: per-slot decisions without mutating `graph`.
+        // `Some(Ok(entry))` → carry-through (vid known).
+        // `Some(Err((name, value_type)))` → fresh vid required (Pass 2 allocates).
+        // `None` → None-kill.
+        #[allow(clippy::type_complexity)]
+        let mut tentative: Vec<Option<Result<FrameStateEntry, (String, ValueType)>>> =
+            Vec::with_capacity(len);
         for i in 0..len {
             let s = self.entries.get(i).and_then(|e| e.as_ref());
             let o = other.entries.get(i).and_then(|e| e.as_ref());
             match (s, o) {
-                // RPython `framestate.py:110-111`: one side is None →
-                // None-kill.  Slot is preserved positionally with `None`
-                // so `MergedFrameState.entries` stays the same length as
-                // the wider predecessor and downstream positional walks
-                // (`getoutputargs`) keep slot indices stable.
-                (None, _) | (_, None) => merged.push(None),
+                // `framestate.py:110-111`: one side None → None-kill.
+                (None, _) | (_, None) => tentative.push(None),
                 (Some(s_entry), Some(o_entry)) => {
                     debug_assert_eq!(
                         s_entry.name, o_entry.name,
                         "graph-wide first-bind invariant broken at slot {i}"
                     );
-                    // `Unknown` is a wildcard (annotation-side missing
-                    // bind paired with a concrete-typed arm).  Concrete
-                    // vs concrete kind disagreement raises
-                    // `UnionError::TypeMismatch` — the whole-state
-                    // failure shape from PyPy `framestate.py:88
-                    // try/except UnionError: return None`.  See the
-                    // doc comment above for why this is not a per-slot
-                    // None-kill.
                     let value_type = match (&s_entry.value_type, &o_entry.value_type) {
                         (a, b) if a == b => a.clone(),
                         (ValueType::Unknown, b) => b.clone(),
@@ -1038,111 +1047,35 @@ impl FrameState {
                             });
                         }
                     };
-                    let merge = if s_entry.value_id == o_entry.value_id {
-                        SlotMerge::CarryThrough(s_entry.value_id)
+                    if s_entry.value_id == o_entry.value_id {
+                        // `framestate.py:108-109 if w1 == w2: return w1`
+                        tentative.push(Some(Ok(FrameStateEntry {
+                            name: s_entry.name.clone(),
+                            value_id: s_entry.value_id,
+                            value_type,
+                        })));
                     } else {
-                        SlotMerge::NeedsPhi
-                    };
-                    merged.push(Some(MergedFrameStateEntry {
-                        name: s_entry.name.clone(),
-                        merge,
-                        value_type,
-                    }));
+                        // `framestate.py:113-114 return Variable()` —
+                        // defer ValueId allocation until Pass 2.
+                        tentative.push(Some(Err((s_entry.name.clone(), value_type))));
+                    }
                 }
             }
         }
-        Ok(MergedFrameState { entries: merged })
-    }
-
-    /// N-way generalisation of `union` for join points where more than
-    /// two predecessors meet (e.g. `Expr::Match` with three or more
-    /// open arms).  Per-slot semantics fold the same RPython rules
-    /// (`flowspace/framestate.py:14 _union` positional zip,
-    /// `:105-128 union` per-slot classification) across `states`:
-    ///   - None-kill if **any** predecessor has `None` at slot `i`
-    ///     (`framestate.py:110-111`).
-    ///   - `CarryThrough(vid)` iff **every** predecessor agrees on the
-    ///     same `value_id` (`framestate.py:108 if w1 == w2: return
-    ///     w1`); otherwise `NeedsPhi` (`framestate.py:113-114 return
-    ///     Variable()`).
-    ///   - `value_type` folds via the wildcard rule: `Unknown` absorbs
-    ///     concrete kinds; concrete-vs-concrete disagreement returns
-    ///     `Err(UnionError::TypeMismatch)` for the whole result (PyPy
-    ///     `framestate.py:88 try/except UnionError: return None`
-    ///     surfaces a whole-state failure, not a per-slot drop — see
-    ///     `union` doc comment for the parity rationale).
-    ///
-    /// RPython's `flowspace/flowcontext.py:430-436 mergeblock` reaches
-    /// the same fixpoint by iteratively unioning each new candidate
-    /// against the running state.  For pyre's static AST shape every
-    /// open arm is known at lowering time, so a single-pass n-way
-    /// union over the whole set is equivalent and avoids the
-    /// `MergedFrameState` → `FrameState` round-trip a fold over the
-    /// 2-way `union` would require.
-    ///
-    /// Returns `Ok(MergedFrameState { entries: [] })` when `states` is
-    /// empty — callers must guard `len() >= 2` themselves if they rely
-    /// on merge semantics being meaningful (a single predecessor's
-    /// state is its own merged state by definition; a no-predecessor
-    /// merge is structurally dead and returns no entries).
-    pub fn union_many(states: &[&FrameState]) -> Result<MergedFrameState, UnionError> {
-        if states.is_empty() {
-            return Ok(MergedFrameState {
-                entries: Vec::new(),
-            });
-        }
-        let len = states.iter().map(|s| s.entries.len()).max().unwrap_or(0);
-        let mut merged = Vec::with_capacity(len);
-        for i in 0..len {
-            let slots: Vec<Option<&FrameStateEntry>> = states
-                .iter()
-                .map(|s| s.entries.get(i).and_then(|e| e.as_ref()))
-                .collect();
-            if slots.iter().any(|s| s.is_none()) {
-                merged.push(None);
-                continue;
-            }
-            let entries: Vec<&FrameStateEntry> = slots.into_iter().map(Option::unwrap).collect();
-            let name = entries[0].name.clone();
-            debug_assert!(
-                entries.iter().all(|e| e.name == name),
-                "graph-wide first-bind invariant broken at slot {i}"
-            );
-            let mut value_type = ValueType::Unknown;
-            for e in &entries {
-                value_type = match (&value_type, &e.value_type) {
-                    (a, b) if a == b => a.clone(),
-                    (ValueType::Unknown, b) => b.clone(),
-                    (a, ValueType::Unknown) => a.clone(),
-                    _ => {
-                        // Concrete-vs-concrete disagreement: whole-state
-                        // failure mirroring PyPy `framestate.py:88
-                        // try/except UnionError: return None`.  See
-                        // `union` doc comment for the parity rationale
-                        // (silent per-slot drop would let post-merge
-                        // reads of `name` surface as undefined-local
-                        // instead of blocking the merge).
-                        return Err(UnionError::TypeMismatch {
-                            name: name.clone(),
-                            self_type: value_type.clone(),
-                            other_type: e.value_type.clone(),
-                        });
-                    }
-                };
-            }
-            let first_vid = entries[0].value_id;
-            let merge = if entries.iter().all(|e| e.value_id == first_vid) {
-                SlotMerge::CarryThrough(first_vid)
-            } else {
-                SlotMerge::NeedsPhi
-            };
-            merged.push(Some(MergedFrameStateEntry {
-                name,
-                merge,
-                value_type,
-            }));
-        }
-        Ok(MergedFrameState { entries: merged })
+        // Pass 2: commit allocations now that Pass 1 succeeded.
+        let merged: Vec<Option<FrameStateEntry>> = tentative
+            .into_iter()
+            .map(|t| match t {
+                None => None,
+                Some(Ok(entry)) => Some(entry),
+                Some(Err((name, value_type))) => Some(FrameStateEntry {
+                    name,
+                    value_id: graph.alloc_value(),
+                    value_type,
+                }),
+            })
+            .collect();
+        Ok(FrameState { entries: merged })
     }
 
     /// Output arguments to thread `self` (a predecessor's exit state)
@@ -1159,7 +1092,7 @@ impl FrameState {
     /// `self.entries[i]` is `None` or out of range — that would mean
     /// `target` was not produced by `self.union(_)`, which violates the
     /// merge invariant.
-    pub fn getoutputargs(&self, target: &MergedFrameState) -> Vec<ValueId> {
+    pub fn getoutputargs(&self, target: &FrameState) -> Vec<ValueId> {
         target
             .entries
             .iter()
@@ -1263,6 +1196,29 @@ impl FrameState {
 ///      when their result vid is dead — `simplify.py` itself has
 ///      no standalone Input shape, but the line-by-line port
 ///      sweeps them under the same canremove rule.
+///
+///      PRE-EXISTING-ADAPTATION (translator-gated arms not ported).
+///      Upstream's Step 5 has two further `elif` arms after the
+///      canremove drop:
+///        - `simplify.py:489-499 elif op.opname == 'simple_call'`
+///          removes `simple_call(builtin, ...)` whose first arg is
+///          a `Constant` whose value is in `CanRemoveBuiltins`
+///          (`simplify.py:418-420 = {hasattr: True}`).  The
+///          `FunctionGraph` IR pyre's prune_dead_phis operates on
+///          carries call shapes as `OpKind::Call` /
+///          `OpKind::IndirectCall` etc., not as `simple_call`-named
+///          ops, and pyre's frontend never emits a Call to `hasattr`
+///          — the arm is structurally inapplicable.
+///        - `simplify.py:500-506 elif op.opname == 'direct_call'`
+///          removes the call when `has_no_side_effects(translator,
+///          graph) and op is not block.raising_op`.  Gated on
+///          `translator is not None`; pyre's caller passes
+///          `translator=None`, so the arm is unreachable.  The
+///          `op is not block.raising_op` clause is moot for the
+///          same reason.
+///      Convergence path: surface a translator-equivalent (callee
+///      effect classifier) and route `OpKind::Call`-with-elidable-EI
+///      through this Step's drop path.
 ///   6. For each reachable block, walk its exits and drop
 ///      `Link.args[i]` for every `i` where `target.inputargs[i]`
 ///      is not in `read_vars` — inputarg-side trim happens in a
@@ -1538,49 +1494,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     }
 }
 
-/// One slot of a `MergedFrameState` — see `FrameState::union` for
-/// production semantics.  `merge` distinguishes slots where the
-/// predecessors agreed on the same `ValueId` (carry-through, no phi
-/// needed at the merge block) from slots where they disagreed (a
-/// fresh inputarg / phi must be allocated by the caller).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergedFrameStateEntry {
-    pub name: String,
-    pub merge: SlotMerge,
-    pub value_type: ValueType,
-}
-
-/// Result of `FrameState::union` — entries are densely positioned at
-/// graph-wide first-bind slot indices (same shape as `FrameState`), with
-/// `None` at slots that the union killed (RPython `framestate.py:
-/// 110-111` None-kill semantics) and `Some(MergedFrameStateEntry)` at
-/// surviving slots.  Positional walks (`FrameState::getoutputargs`)
-/// rely on slot indices lining up with the source predecessor's
-/// `entries` directly, mirroring RPython's equal-length `locals_w`
-/// shape across union/getoutputargs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MergedFrameState {
-    pub entries: Vec<Option<MergedFrameStateEntry>>,
-}
-
-/// Per-slot merge classification produced by `FrameState::union`.
-/// RPython parity: `framestate.py:105-128 union` returns either the
-/// shared value (`CarryThrough`) or a fresh `Variable` (`NeedsPhi`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SlotMerge {
-    /// Both predecessors agreed on the same `ValueId`; the successor
-    /// inputarg can adopt that vid directly without a phi node
-    /// (RPython `framestate.py:108 if w1 == w2: return w1`).
-    CarryThrough(ValueId),
-    /// Predecessors disagree on `ValueId`; the successor must
-    /// allocate a fresh inputarg (RPython `framestate.py:113-114
-    /// return Variable()`).  The fresh `ValueId` is allocated by the
-    /// caller when materialising the merge block, so `union` itself
-    /// stays pure data.
-    NeedsPhi,
-}
-
-/// Reasons `FrameState::union` / `FrameState::union_many` may refuse to
+/// Reasons `FrameState::union` may refuse to
 /// merge — pyre's analogue of RPython `framestate.py:101 UnionError`.
 /// PyPy `framestate.py:88 FrameState.union` wraps `_union` in
 /// `try/except UnionError: return None`; `flowcontext.py:430-436
@@ -1830,6 +1744,17 @@ impl FunctionGraph {
             .operations
             .push(SpaceOperation { result, kind });
         result
+    }
+
+    /// Push an op with a caller-supplied `result` ValueId.  Used when
+    /// the vid was allocated upstream (e.g. `FrameState::union`
+    /// pre-allocates phi vids) and the op now needs to be emitted with
+    /// the same vid.
+    pub fn push_op_with_result(&mut self, block: BlockId, kind: OpKind, result: ValueId) {
+        self.blocks[block.0].operations.push(SpaceOperation {
+            result: Some(result),
+            kind,
+        });
     }
 
     /// RPython `flowspace/model.py:250 recloseblock(*exits)` — stamp
@@ -2226,8 +2151,13 @@ mod tests {
                 }),
             ],
         };
+        let mut graph = FunctionGraph::new("test");
+        // Reserve vid space past the test fixtures' hardcoded vids so
+        // a fresh allocation for the disagreement on slot 0 picks an
+        // id distinguishable from both predecessors.
+        graph.set_next_value(100);
         let merged = self_state
-            .union(&other_state)
+            .union(&other_state, &mut graph)
             .expect("type-compatible slots must union cleanly");
         assert_eq!(
             merged.entries.len(),
@@ -2238,7 +2168,11 @@ mod tests {
             .as_ref()
             .expect("slot 0 (x) is bound on both sides and must survive");
         assert_eq!(surviving.name, "x");
-        assert_eq!(surviving.merge, SlotMerge::NeedsPhi);
+        // Slot 0's predecessors disagreed on `value_id` (0 vs 2), so
+        // `union` allocated a fresh vid via `graph.alloc_value()`.
+        assert_ne!(surviving.value_id, ValueId(0));
+        assert_ne!(surviving.value_id, ValueId(2));
+        assert_eq!(surviving.value_id, ValueId(100));
         assert_eq!(surviving.value_type, ValueType::Int);
         assert!(
             merged.entries[1].is_none() && merged.entries[2].is_none(),

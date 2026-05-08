@@ -907,14 +907,30 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
 /// pure op's args even though both should die together.
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
-        // Pure sources / values — `int_constant` analogue (always
-        // removable).  `Input` is structurally pure: inputarg-shaped
-        // Input ops are protected from `model::prune_dead_phis` Step
-        // 5 sweep by their result vid being pinned in `read_vars`
-        // (Step 1+3+dependency-routing); naked Input ops (legacy
-        // frontend fallback) are removed by Step 5 when their result
-        // is dead.  Returned as `true` here for consistency
-        // with the dependency-routing classification.
+        // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
+        // `ValueId` for a literal in pyre's ValueId-based IR.  There
+        // is NO upstream `int_constant` op — RPython's `Constant` is
+        // a value class (`flowmodel.py Constant(rfloat)`), not an
+        // operation, so it appears inline in `op.args` rather than
+        // as a standalone op in `block.operations`.  Pyre's
+        // op-shaped representation is forced by the
+        // `Block.operations: Vec<Op>` /
+        // `Op.result: Option<ValueId>` design: every value the
+        // graph produces must be materialised through an op so a
+        // ValueId can be allocated for it.  Returning `true` here
+        // is the dataflow-equivalent of upstream's "Constant args
+        // pin nothing" behaviour: the const op is removed by
+        // `prune_dead_phis` Step 5 when its result is unread, which
+        // mirrors upstream's "dead Constant simply doesn't appear in
+        // any live op's args" outcome.
+        //
+        // `Input` is structurally pure: inputarg-shaped Input ops
+        // are protected from `model::prune_dead_phis` Step 5 sweep
+        // by their result vid being pinned in `read_vars` (Step
+        // 1+3+dependency-routing); naked Input ops (legacy frontend
+        // fallback) are removed by Step 5 when their result is
+        // dead.  Returned as `true` here for consistency with the
+        // dependency-routing classification.
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstFloat(_)

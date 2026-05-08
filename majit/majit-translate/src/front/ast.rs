@@ -1600,11 +1600,19 @@ impl<'a> GraphBuildContext<'a> {
 /// a recorded snapshot or whose snapshot lacks `name`, or the
 /// snapshots disagree on `value_type`.  The call site falls back to
 /// the legacy naked-`Input` emit when `None` is returned.
+/// `pre_allocated_vid`: when `Some(vid)`, use the caller-supplied
+/// ValueId for the fresh phi instead of allocating a new one.  Used
+/// by union callers (`Expr::If`, `Expr::Match`) that pre-allocate
+/// phi vids inside `FrameState::union(_into)` so the merged state
+/// can be returned with vids materialised; the install is then
+/// emitted with the same vid the merged state already carries.
+/// `None` preserves the legacy behaviour (allocate inside).
 fn lazy_install_local_at_current_block(
     graph: &mut crate::model::FunctionGraph,
     ctx: &mut GraphBuildContext<'_>,
     current_block: BlockId,
     name: &str,
+    pre_allocated_vid: Option<ValueId>,
 ) -> Option<ValueId> {
     // Reuse — `name` may already have been installed at `current_block`
     // by an earlier read in the same block (prior recursion into a
@@ -1746,14 +1754,26 @@ fn lazy_install_local_at_current_block(
     // header).
     let prior_ctx_lvi = ctx.local_value_ids.get(name).copied();
     let prior_ctx_lvt = ctx.local_value_types.get(name).cloned();
-    let new_vid = graph.push_op(
-        current_block,
-        OpKind::Input {
-            name: name.to_string(),
-            ty: value_type.clone(),
-        },
-        true,
-    )?;
+    let new_vid = if let Some(vid) = pre_allocated_vid {
+        graph.push_op_with_result(
+            current_block,
+            OpKind::Input {
+                name: name.to_string(),
+                ty: value_type.clone(),
+            },
+            vid,
+        );
+        vid
+    } else {
+        graph.push_op(
+            current_block,
+            OpKind::Input {
+                name: name.to_string(),
+                ty: value_type.clone(),
+            },
+            true,
+        )?
+    };
     graph.name_value(new_vid, name.to_string());
     graph.block_mut(current_block).inputargs.push(new_vid);
     ctx.bind_local_id(name.to_string(), new_vid, current_block);
@@ -1773,7 +1793,7 @@ fn lazy_install_local_at_current_block(
     let mut rollback = false;
     for snap in pred_snaps {
         let resolved_vid = if snap.needs_recurse {
-            match lazy_install_local_at_current_block(graph, ctx, snap.pred_block, name) {
+            match lazy_install_local_at_current_block(graph, ctx, snap.pred_block, name, None) {
                 Some(v) => v,
                 None => {
                     rollback = true;
@@ -2971,33 +2991,51 @@ fn lower_expr(
             //     and panics loudly if a hand-built fixture or a
             //     frontend change ever breaks it.
             if then_open && else_open {
-                let merged = then_exit_snapshot.union(&else_exit_snapshot).expect(
+                let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
                     "rustc must have rejected differing concrete kinds across if/else arms",
                 );
-                // CarryThrough Unknown→concrete widening at the union
-                // (`model::FrameState::union` wildcard rule) leaves
-                // `MergedFrameStateEntry.value_type` concrete while the
-                // shared source `OpKind`'s `ty` may still be `Unknown`
-                // — `local_value_types` snapshots can disagree across
-                // arms even for the same vid (one arm bound the slot
-                // with an annotation, the other inferred-only).
-                // Retag the source op now so `graph_value_type(vid)`
-                // agrees with the merged framestate at every consumer
-                // (mirrors the `Expr::Try` widening pattern used after
-                // `?` unwraps a `Result<T, E>`).  NeedsPhi slots are
+                // Carry-through Unknown→concrete widening at the
+                // union (`model::FrameState::union` wildcard
+                // rule) leaves the merged `value_type` concrete while
+                // the shared source `OpKind`'s `ty` may still be
+                // `Unknown` — `local_value_types` snapshots can
+                // disagree across arms even for the same vid (one
+                // arm bound the slot with an annotation, the other
+                // inferred-only).  Retag the source op now so
+                // `graph_value_type(vid)` agrees with the merged
+                // framestate at every consumer (mirrors the
+                // `Expr::Try` widening pattern used after `?`
+                // unwraps a `Result<T, E>`).  Fresh-phi slots
+                // (vid disagrees with then-arm's predecessor) are
                 // handled by the lazy installer's own retag pass at
                 // first post-merge read; they intentionally do not
                 // mutate the predecessor source here.
-                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
-                    if let crate::model::SlotMerge::CarryThrough(vid) = slot.merge {
-                        if !matches!(slot.value_type, ValueType::Unknown)
-                            && !matches!(
-                                graph_value_type(graph, vid),
-                                Some(ref t) if t == &slot.value_type,
-                            )
-                        {
-                            retag_result_value_type(graph, vid, slot.value_type.clone());
-                        }
+                //
+                // Detection: a slot's vid was carry-through iff it
+                // matches the then-arm predecessor's vid for the
+                // same slot (`union` keeps the predecessor's
+                // vid on agreement, allocates a fresh one on
+                // disagreement).  Detection is symmetric — checking
+                // either predecessor works because agreement implies
+                // both predecessors share the vid.
+                for (slot_idx, slot) in merged.entries.iter().enumerate() {
+                    let Some(slot) = slot.as_ref() else {
+                        continue;
+                    };
+                    let then_vid = then_exit_snapshot
+                        .entries
+                        .get(slot_idx)
+                        .and_then(|e| e.as_ref())
+                        .map(|e| e.value_id);
+                    let is_carry_through = then_vid == Some(slot.value_id);
+                    if is_carry_through
+                        && !matches!(slot.value_type, ValueType::Unknown)
+                        && !matches!(
+                            graph_value_type(graph, slot.value_id),
+                            Some(ref t) if t == &slot.value_type,
+                        )
+                    {
+                        retag_result_value_type(graph, slot.value_id, slot.value_type.clone());
                     }
                 }
                 for (slot_idx, slot) in merged.entries.iter().enumerate() {
@@ -3028,29 +3066,36 @@ fn lower_expr(
                     }
                 }
 
-                // Eager phi install for every `SlotMerge::NeedsPhi`
-                // slot.  `flowspace/framestate.py:113-114 union`
-                // returns a fresh `Variable()` whenever per-slot vids
-                // disagree; pyre's eager equivalent calls
-                // `lazy_install_local_at_current_block` per such name
-                // at union time, which allocates the merge-block
-                // inputarg, threads predecessor link args (recursing
-                // to install at predecessors when the snapshot vid is
-                // not pred-block-defined), and rebinds ctx so
-                // post-merge reads of `name` resolve to the new phi
-                // vid without re-driving the lazy installer.
-                // CarryThrough slots agreed on a single vid so no
+                // Eager phi install for every fresh-phi slot.
+                // `flowspace/framestate.py:113-114 union` returns a
+                // fresh `Variable()` whenever per-slot vids
+                // disagree; pyre's `union` already allocated
+                // the fresh ValueId, so we drive the lazy installer
+                // with `Some(slot.value_id)` to emit the Input op +
+                // inputarg + predecessor link args using the same
+                // vid the merged state already refers to.
+                // Carry-through slots agreed on a single vid so no
                 // fresh phi is emitted (`framestate.py:108-109 if w1
                 // == w2: return w1`); first post-merge read of those
                 // names still drives the lazy installer's same-block
                 // reuse path.
-                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
-                    if matches!(slot.merge, crate::model::SlotMerge::NeedsPhi) {
+                for (slot_idx, slot) in merged.entries.iter().enumerate() {
+                    let Some(slot) = slot.as_ref() else {
+                        continue;
+                    };
+                    let then_vid = then_exit_snapshot
+                        .entries
+                        .get(slot_idx)
+                        .and_then(|e| e.as_ref())
+                        .map(|e| e.value_id);
+                    let is_fresh_phi = then_vid != Some(slot.value_id);
+                    if is_fresh_phi {
                         let _ = lazy_install_local_at_current_block(
                             graph,
                             ctx,
                             merge_block,
                             &slot.name,
+                            Some(slot.value_id),
                         );
                     }
                 }
@@ -3225,7 +3270,7 @@ fn lower_expr(
                     .get(&name)
                     .is_some_and(|&(_, defining_block)| defining_block != *block)
                 && let Some(threaded_vid) =
-                    lazy_install_local_at_current_block(graph, ctx, *block, &name)
+                    lazy_install_local_at_current_block(graph, ctx, *block, &name, None)
             {
                 return Ok(Lowered {
                     value: Some(threaded_vid),
@@ -3490,11 +3535,11 @@ fn lower_expr(
 
             let mut any_open = false;
             // Collect open-arm exit snapshots before `set_goto` closes
-            // each arm, so the post-loop n-way `FrameState::union_many`
-            // sees every reaching predecessor's locals state.  Parity
-            // port of Expr::If's both-open-arm merge generalised to N
-            // arms — see the union block below for the per-slot
-            // semantics.
+            // each arm, so the post-loop iterative-fold over 2-way
+            // `FrameState::union` sees every reaching predecessor's
+            // locals state.  Parity port of Expr::If's both-open-arm
+            // merge generalised to N arms — see the union block below
+            // for the per-slot semantics.
             let mut open_arm_snapshots: Vec<FrameState> = Vec::new();
             for (tail, result, exit_snapshot) in &arm_tails {
                 if !graph.block(*tail).is_open() {
@@ -3570,33 +3615,33 @@ fn lower_expr(
                 );
             }
 
-            // FrameState::union_many-driven merge when 2+ arms reach the
+            // Iterative-fold-driven merge when 2+ arms reach the
             // merge block.  Per-slot semantics mirror Expr::If's
-            // both-open-arm merge, generalised to N arms via the n-way
-            // wildcard fold (`model.rs:union_many`) — RPython
-            // `flowspace/flowcontext.py:430-436 mergeblock` reaches the
-            // same fixpoint by iteratively unioning arriving candidates;
-            // pyre's static AST shape collapses that loop into a
-            // single-pass union.
+            // both-open-arm merge, generalised to N arms by left-
+            // folding `acc.union(arm)` against each open-arm
+            // snapshot — direct port of `flowspace/flowcontext.py:
+            // 430-436 mergeblock`'s repeated 2-way union over
+            // arriving candidates.
             //
-            //   - CarryThrough Unknown→concrete retag keeps
-            //     `graph_value_type(vid)` in agreement with the merged
-            //     framestate when an inferred-only arm is unioned with
-            //     an annotated arm.
+            //   - Carry-through Unknown→concrete retag keeps
+            //     `graph_value_type(vid)` in agreement with the
+            //     merged framestate when an inferred-only arm is
+            //     unioned with an annotated arm.
             //   - None-kill drops slots that any arm left unbound
-            //     (RPython `framestate.py:110-111`); post-merge reads of
+            //     (`framestate.py:110-111`); post-merge reads of
             //     those names surface as undefined-local.
-            //   - NeedsPhi eager phi install allocates the merge-block
-            //     inputarg, threads predecessor link args via
-            //     `lazy_install_local_at_current_block`, and rebinds
-            //     ctx so post-merge reads resolve to the new phi.
+            //   - Fresh-phi install (per-slot vid disagreement)
+            //     allocates the merge-block inputarg, threads
+            //     predecessor link args via
+            //     `lazy_install_local_at_current_block`, and
+            //     rebinds ctx so post-merge reads resolve to the
+            //     new phi.
             //
-            // Single-open-arm case is intentionally NOT handled here:
-            // that's the audit's pre-existing one-open-arm fragility
-            // shared with Expr::If, requiring a separate ctx-restore
-            // strategy that lives outside this slice.
+            // Single-open-arm case is intentionally NOT handled
+            // here: that's the audit's pre-existing one-open-arm
+            // fragility shared with Expr::If, requiring a separate
+            // ctx-restore strategy that lives outside this slice.
             if open_arm_snapshots.len() >= 2 {
-                let snapshot_refs: Vec<&FrameState> = open_arm_snapshots.iter().collect();
                 // Concrete-vs-concrete kind disagreement returns
                 // `Err(UnionError::TypeMismatch)` (whole-state failure
                 // mirroring PyPy `framestate.py:88 try/except
@@ -3605,18 +3650,79 @@ fn lower_expr(
                 // local to two different concrete kinds across match
                 // arms, so the `Err` arm is unreachable from real
                 // input; `.expect(...)` documents the contract.
-                let merged = FrameState::union_many(&snapshot_refs)
-                    .expect("rustc must have rejected differing concrete kinds across match arms");
-                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
-                    if let crate::model::SlotMerge::CarryThrough(vid) = slot.merge {
-                        if !matches!(slot.value_type, ValueType::Unknown)
-                            && !matches!(
-                                graph_value_type(graph, vid),
-                                Some(ref t) if t == &slot.value_type,
-                            )
-                        {
-                            retag_result_value_type(graph, vid, slot.value_type.clone());
-                        }
+                // Iterative left-fold over 2-way `FrameState::union`
+                // — direct port of upstream's `flowspace/
+                // flowcontext.py:430-436 mergeblock` loop:
+                //
+                //     for block in candidates:
+                //         newstate = block.framestate.union(currentstate)
+                //         if newstate is not None:
+                //             break
+                //
+                // Pyre's static AST shape knows every open arm at
+                // lowering time, so the fold runs them in order
+                // (first arm = initial running state; each
+                // subsequent arm = `acc.union(arm)`).  rustc has
+                // already rejected source whose arms bind the same
+                // local to two different concrete kinds, so the
+                // `.expect(...)` documents the contract.
+                //
+                // PRE-EXISTING-ADAPTATION (no SpamBlock /
+                // recloseblock chain).  Upstream's mergeblock
+                // generalises by creating a fresh `SpamBlock(newstate)`
+                // (`flowcontext.py:443`), marking the prior block
+                // dead via `block.dead = True` + `block.operations =
+                // ()` (`:455-456`), and patching the dead block's
+                // exits to forward to the new block via
+                // `block.recloseblock(Link(outputargs, newblock))`
+                // (`:458-459`).  The post-cleanup CFG (after
+                // `simplify.eliminate_empty_blocks`) collapses the
+                // dead-block forwarding chain into a single
+                // multi-incoming merge block — which is exactly the
+                // shape pyre's static AST produces directly.
+                //
+                // Convergence path: introduce a pendingblock-style
+                // worklist at `Expr::Match` lowering, emit one
+                // SpamBlock per fold step, mark intermediate blocks
+                // dead, and run an `eliminate_empty_blocks` pass
+                // before downstream rtyper / flatten / regalloc see
+                // the graph.  Multi-session — touches Expr::Match
+                // traversal, block lifecycle, and adds a
+                // `simplify_graph` pass equivalent.  Until then,
+                // pyre produces the post-cleanup CFG directly and
+                // the dataflow is parity-correct.
+                let mut acc = open_arm_snapshots[0].clone();
+                for arm in &open_arm_snapshots[1..] {
+                    acc = acc.union(arm, graph).expect(
+                        "rustc must have rejected differing concrete kinds across match arms",
+                    );
+                }
+                let merged = acc;
+                // Detection of "fresh phi" (vid allocated by `union`
+                // because per-arm vids disagreed): the merged slot's
+                // vid does NOT match the first arm's vid for the
+                // same slot.  When all arms agreed, the fold carried
+                // the agreed vid through, so the comparison is
+                // False and no fresh phi is emitted.
+                let first_arm = &open_arm_snapshots[0];
+                for (slot_idx, slot) in merged.entries.iter().enumerate() {
+                    let Some(slot) = slot.as_ref() else {
+                        continue;
+                    };
+                    let first_vid = first_arm
+                        .entries
+                        .get(slot_idx)
+                        .and_then(|e| e.as_ref())
+                        .map(|e| e.value_id);
+                    let is_carry_through = first_vid == Some(slot.value_id);
+                    if is_carry_through
+                        && !matches!(slot.value_type, ValueType::Unknown)
+                        && !matches!(
+                            graph_value_type(graph, slot.value_id),
+                            Some(ref t) if t == &slot.value_type,
+                        )
+                    {
+                        retag_result_value_type(graph, slot.value_id, slot.value_type.clone());
                     }
                 }
                 for (slot_idx, slot) in merged.entries.iter().enumerate() {
@@ -3634,9 +3740,24 @@ fn lower_expr(
                         ctx.local_value_types.remove(&name);
                     }
                 }
-                for slot in merged.entries.iter().filter_map(|e| e.as_ref()) {
-                    if matches!(slot.merge, crate::model::SlotMerge::NeedsPhi) {
-                        let _ = lazy_install_local_at_current_block(graph, ctx, merge, &slot.name);
+                for (slot_idx, slot) in merged.entries.iter().enumerate() {
+                    let Some(slot) = slot.as_ref() else {
+                        continue;
+                    };
+                    let first_vid = first_arm
+                        .entries
+                        .get(slot_idx)
+                        .and_then(|e| e.as_ref())
+                        .map(|e| e.value_id);
+                    let is_fresh_phi = first_vid != Some(slot.value_id);
+                    if is_fresh_phi {
+                        let _ = lazy_install_local_at_current_block(
+                            graph,
+                            ctx,
+                            merge,
+                            &slot.name,
+                            Some(slot.value_id),
+                        );
                     }
                 }
             }
@@ -6847,19 +6968,20 @@ mod tests {
     }
 
     #[test]
-    fn match_three_arm_rebind_routes_through_union_many_n_way_merge() {
+    fn match_three_arm_rebind_routes_through_iterative_fold_merge() {
         // Audit Cat 2-3 fix: a 3-arm match whose arms each rebind a
         // pre-existing local must produce a single merge-block phi
-        // that unifies all three arm vids — exercising the n-way
-        // `FrameState::union_many` path (NeedsPhi when ≥2 arms
-        // disagree on the slot's vid) plus eager phi install at
-        // union time.  RPython parity:
-        // `flowspace/flowcontext.py:430-436 mergeblock` reaches the
-        // same fixpoint by iteratively unioning each candidate; pyre
-        // collapses that loop into a single n-way union over the
-        // open arm exit snapshots.
+        // that unifies all three arm vids — exercising the iterative
+        // left-fold over 2-way `FrameState::union` (vid disagreement
+        // at any fold step allocates a fresh phi) plus eager phi
+        // install at union time.  RPython parity:
+        // `flowspace/flowcontext.py:430-436 mergeblock` repeatedly
+        // 2-way-unions arriving candidates against the running
+        // state; pyre's static AST shape applies the same fold over
+        // the open-arm exit snapshots in a single Expr::Match
+        // lowering visit.
         //
-        // Without the union_many path, the merge would carry no ctx
+        // Without the iterative fold, the merge would carry no ctx
         // update at union time and the post-merge `x` read would
         // depend on the lazy installer firing post-hoc — the audit's
         // exact "PyPy-style merge state not reflected in ctx" gap.
@@ -6884,7 +7006,8 @@ mod tests {
             .expect("example graph")
             .graph;
         // The merge block must own an `x` phi inputarg installed
-        // eagerly by union_many's NeedsPhi path.
+        // eagerly by the iterative fold's fresh-phi step (the
+        // disagreeing-vid branch of 2-way `union`).
         let phi_block = graph.blocks.iter().find(|block| {
             block.operations.iter().any(|op| {
                 op.result.is_some_and(|r| block.inputargs.contains(&r))
@@ -6896,7 +7019,7 @@ mod tests {
         });
         assert!(
             phi_block.is_some(),
-            "expected 3-arm match merge to allocate an `x` phi inputarg via union_many; graph:\n{}",
+            "expected 3-arm match merge to allocate an `x` phi inputarg via the iterative fold; graph:\n{}",
             graph.dump()
         );
         // All three arms must thread their per-arm rebind value as
@@ -8179,22 +8302,27 @@ mod tests {
         // Both predecessors bound `x` to the same ValueId — successor
         // need not allocate a phi.  RPython `framestate.py:108
         // if w1 == w2: return w1`.
-        use crate::model::{MergedFrameStateEntry, SlotMerge};
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
         let b = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
-        let merged = a.union(&b).expect("matching states must union cleanly");
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
+        let merged = a
+            .union(&b, &mut graph)
+            .expect("matching states must union cleanly");
         assert_eq!(
             merged.entries,
-            vec![Some(MergedFrameStateEntry {
+            vec![Some(crate::model::FrameStateEntry {
                 name: "x".to_string(),
-                merge: SlotMerge::CarryThrough(ValueId(7)),
+                value_id: ValueId(7),
                 value_type: ValueType::Int,
             })]
         );
+        // No fresh allocation: `next_value` cursor stays at 100.
+        assert_eq!(graph.next_value(), 100);
     }
 
     #[test]
@@ -8202,24 +8330,27 @@ mod tests {
         // Predecessors disagree on `x`'s ValueId — successor must
         // allocate a fresh phi inputarg.  RPython `framestate.py:
         // 113-114 return Variable()`.
-        use crate::model::{MergedFrameStateEntry, SlotMerge};
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
         let b = FrameState {
             entries: vec![frame_entry("x", 8, ValueType::Int)],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let merged = a
-            .union(&b)
-            .expect("disagreeing vids must produce NeedsPhi without TypeMismatch");
+            .union(&b, &mut graph)
+            .expect("disagreeing vids must produce a fresh phi vid without TypeMismatch");
         assert_eq!(
             merged.entries,
-            vec![Some(MergedFrameStateEntry {
+            vec![Some(crate::model::FrameStateEntry {
                 name: "x".to_string(),
-                merge: SlotMerge::NeedsPhi,
+                value_id: ValueId(100),
                 value_type: ValueType::Int,
             })]
         );
+        // Fresh allocation consumed exactly one vid.
+        assert_eq!(graph.next_value(), 101);
     }
 
     #[test]
@@ -8246,8 +8377,10 @@ mod tests {
                 frame_entry("only_b", 3, ValueType::Int),
             ],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let merged = a
-            .union(&b)
+            .union(&b, &mut graph)
             .expect("type-compatible slots must union cleanly");
         assert_eq!(
             merged.entries.len(),
@@ -8288,8 +8421,10 @@ mod tests {
                 frame_entry("y_added_later", 2, ValueType::Int),
             ],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let merged = early
-            .union(&late)
+            .union(&late, &mut graph)
             .expect("type-compatible slots must union cleanly");
         assert_eq!(
             merged.entries.len(),
@@ -8330,8 +8465,10 @@ mod tests {
         let b = FrameState {
             entries: vec![frame_entry("x", 2, ValueType::Ref)],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let err = a
-            .union(&b)
+            .union(&b, &mut graph)
             .expect_err("concrete kind disagreement must surface UnionError::TypeMismatch");
         assert_eq!(
             err,
@@ -8340,6 +8477,52 @@ mod tests {
                 self_type: ValueType::Int,
                 other_type: ValueType::Ref,
             },
+        );
+        // `framestate.py:73-89 try/except UnionError: return None`
+        // discards a partially-built result; pyre's atomic two-pass
+        // implementation must not advance `graph.next_value()` when
+        // the union ultimately fails.  Slot 0 disagrees on vid (1 vs
+        // 2) which would have allocated a fresh vid in Pass 2, but
+        // Pass 1's TypeMismatch detection runs before any
+        // `graph.alloc_value()` call.
+        assert_eq!(
+            graph.next_value(),
+            100,
+            "no fresh allocation must occur when union returns Err"
+        );
+    }
+
+    #[test]
+    fn frame_state_union_does_not_advance_vid_counter_on_late_type_mismatch() {
+        // Slot 0 disagrees on vid only (would allocate a fresh vid in
+        // Pass 2); slot 1 disagrees on concrete kind (TypeMismatch).
+        // The atomic-on-error contract requires that slot 0's
+        // hypothetical fresh allocation is NOT committed because
+        // slot 1's failure aborts before Pass 2 runs.
+        use crate::model::UnionError;
+        let a = FrameState {
+            entries: vec![
+                frame_entry("x", 1, ValueType::Int),
+                frame_entry("y", 3, ValueType::Int),
+            ],
+        };
+        let b = FrameState {
+            entries: vec![
+                frame_entry("x", 2, ValueType::Int),
+                frame_entry("y", 4, ValueType::Ref),
+            ],
+        };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
+        let err = a
+            .union(&b, &mut graph)
+            .expect_err("late-slot kind disagreement must surface UnionError::TypeMismatch");
+        assert!(matches!(err, UnionError::TypeMismatch { .. }));
+        assert_eq!(
+            graph.next_value(),
+            100,
+            "no fresh allocation must occur when union returns Err — \
+             even when an earlier slot would have triggered one in Pass 2"
         );
     }
 
@@ -8354,28 +8537,29 @@ mod tests {
         // wildcard: an inferred-only bind on one arm and an annotated
         // bind on the other are still the same slot.  TypeMismatch
         // fires only when both sides are concrete and disagree.
-        use crate::model::{MergedFrameStateEntry, SlotMerge};
         let inferred = FrameState {
             entries: vec![frame_entry("x", 1, ValueType::Unknown)],
         };
         let annotated = FrameState {
             entries: vec![frame_entry("x", 1, ValueType::Int)],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         // Carry-through: same vid, Unknown vs Int → resolves to Int.
         let merged = inferred
-            .union(&annotated)
+            .union(&annotated, &mut graph)
             .expect("Unknown wildcard against concrete kind must union cleanly");
         assert_eq!(
             merged.entries,
-            vec![Some(MergedFrameStateEntry {
+            vec![Some(crate::model::FrameStateEntry {
                 name: "x".to_string(),
-                merge: SlotMerge::CarryThrough(ValueId(1)),
+                value_id: ValueId(1),
                 value_type: ValueType::Int,
             })]
         );
         // Symmetric: concrete on self, Unknown on other → still Int.
         let merged_swap = annotated
-            .union(&inferred)
+            .union(&inferred, &mut graph)
             .expect("Unknown wildcard against concrete kind must union cleanly");
         assert_eq!(
             merged_swap.entries[0].as_ref().unwrap().value_type,
@@ -8384,12 +8568,13 @@ mod tests {
     }
 
     #[test]
-    fn frame_state_union_many_three_arms_carry_through_when_all_agree() {
-        // N-way analogue of the 2-way `CarryThrough` rule.  All three
-        // arms bind `x` to the same vid → merged slot is
-        // `CarryThrough(7)`, mirroring RPython `framestate.py:108
-        // if w1 == w2: return w1` extended to N candidates.
-        use crate::model::{MergedFrameStateEntry, SlotMerge};
+    fn frame_state_union_three_arm_fold_carries_through_when_all_agree() {
+        // Three-arm iterative fold mirroring upstream `flowspace/
+        // flowcontext.py:430-436 mergeblock`'s repeated 2-way union
+        // against each arriving candidate.  All three arms bind `x`
+        // to the same vid → every fold step carries the vid through
+        // (`framestate.py:108 if w1 == w2: return w1`).  No fresh
+        // allocation along the chain.
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
@@ -8399,26 +8584,32 @@ mod tests {
         let c = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
-        let merged =
-            FrameState::union_many(&[&a, &b, &c]).expect("matching arms must union cleanly");
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
+        let acc = a
+            .union(&b, &mut graph)
+            .expect("matching arms must union cleanly")
+            .union(&c, &mut graph)
+            .expect("matching arms must union cleanly");
         assert_eq!(
-            merged.entries,
-            vec![Some(MergedFrameStateEntry {
+            acc.entries,
+            vec![Some(crate::model::FrameStateEntry {
                 name: "x".to_string(),
-                merge: SlotMerge::CarryThrough(ValueId(7)),
+                value_id: ValueId(7),
                 value_type: ValueType::Int,
             })]
         );
+        assert_eq!(graph.next_value(), 100, "no fresh allocation expected");
     }
 
     #[test]
-    fn frame_state_union_many_needs_phi_when_any_arm_disagrees() {
-        // Two arms agree on vid=7 but the third arm bound vid=8 — any
-        // disagreement triggers `NeedsPhi` (RPython `framestate.py:
-        // 113-114 return Variable()`).  Asymmetric in vid but
-        // symmetric in name + kind so the wildcard fold leaves
-        // `value_type` at `Int`.
-        use crate::model::{MergedFrameStateEntry, SlotMerge};
+    fn frame_state_union_fold_allocates_fresh_vid_at_disagreement_step() {
+        // Iterative fold: a + b agree on vid=7, c brings vid=8 — the
+        // SECOND fold step (`acc.union(c)`) is where vids disagree, so
+        // the fresh vid is allocated there (mirrors upstream's
+        // `framestate.py:113-114 return Variable()` triggered by the
+        // generalising `mergeblock` step that introduces a new
+        // SpamBlock).
         let a = FrameState {
             entries: vec![frame_entry("x", 7, ValueType::Int)],
         };
@@ -8428,30 +8619,41 @@ mod tests {
         let c = FrameState {
             entries: vec![frame_entry("x", 8, ValueType::Int)],
         };
-        let merged = FrameState::union_many(&[&a, &b, &c])
-            .expect("disagreeing vids must produce NeedsPhi without TypeMismatch");
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
+        let acc = a
+            .union(&b, &mut graph)
+            .expect("first fold step (carry-through) must succeed");
         assert_eq!(
-            merged.entries,
-            vec![Some(MergedFrameStateEntry {
+            graph.next_value(),
+            100,
+            "carry-through step must not allocate"
+        );
+        let acc = acc
+            .union(&c, &mut graph)
+            .expect("disagreeing vids must produce a fresh phi without TypeMismatch");
+        assert_eq!(
+            acc.entries,
+            vec![Some(crate::model::FrameStateEntry {
                 name: "x".to_string(),
-                merge: SlotMerge::NeedsPhi,
+                value_id: ValueId(100),
                 value_type: ValueType::Int,
             })]
+        );
+        assert_eq!(
+            graph.next_value(),
+            101,
+            "disagreement step allocates exactly one vid"
         );
     }
 
     #[test]
-    fn frame_state_union_many_kills_slot_if_any_arm_unbound() {
-        // RPython `framestate.py:110-111` None-kill extended to N
-        // arms: ANY arm with `None` at slot `i` collapses the merged
-        // slot to None, matching the conservative "must be defined on
-        // every reaching path" semantics of the bytecode flowspace.
-        // Slot 0 (`survivor`) is bound on every arm → kept.  Slot 1
-        // (`only_ab`) is bound on the first two arms but `None` on the
-        // third → None-kill.  The third arm padded its slot 1 by
-        // taking the snapshot before `only_ab` was first bound — same
-        // shorter-side rule as the 2-way test but applied to the
-        // n-way fold.
+    fn frame_state_union_fold_kills_slot_if_any_arm_unbound() {
+        // `framestate.py:110-111` None-kill propagates through the
+        // iterative fold: once any fold step encounters a side with
+        // `None` at slot `i`, the merged slot is None for the rest of
+        // the chain.  Here slot 1 (`only_ab`) is bound on a + b but
+        // unbound on c — the second fold step collapses it to None.
         let a = FrameState {
             entries: vec![
                 frame_entry("survivor", 1, ValueType::Int),
@@ -8467,16 +8669,21 @@ mod tests {
         let c = FrameState {
             entries: vec![frame_entry("survivor", 1, ValueType::Int)],
         };
-        let merged = FrameState::union_many(&[&a, &b, &c])
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
+        let acc = a
+            .union(&b, &mut graph)
+            .expect("type-compatible slots must union cleanly")
+            .union(&c, &mut graph)
             .expect("type-compatible slots must union cleanly");
-        assert_eq!(merged.entries.len(), 2);
+        assert_eq!(acc.entries.len(), 2);
         assert_eq!(
-            merged.entries[0].as_ref().map(|e| e.name.as_str()),
+            acc.entries[0].as_ref().map(|e| e.name.as_str()),
             Some("survivor"),
         );
         assert!(
-            merged.entries[1].is_none(),
-            "any-None slot collapses to None-kill"
+            acc.entries[1].is_none(),
+            "any-None slot collapses to None-kill across the fold chain"
         );
     }
 
@@ -8502,8 +8709,10 @@ mod tests {
                 frame_entry("b", 2, ValueType::Int),
             ],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let merged = a
-            .union(&b)
+            .union(&b, &mut graph)
             .expect("type-compatible slots must union cleanly");
         let order: Vec<&str> = merged
             .entries
@@ -8539,8 +8748,10 @@ mod tests {
                 frame_entry("c", 30, ValueType::Int),
             ],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let merged = pred
-            .union(&other)
+            .union(&other, &mut graph)
             .expect("type-compatible slots must union cleanly");
         let link_args = pred.getoutputargs(&merged);
         assert_eq!(
@@ -8570,8 +8781,10 @@ mod tests {
                 frame_entry("only_b", 33, ValueType::Int),
             ],
         };
+        let mut graph = crate::model::FunctionGraph::new("test");
+        graph.set_next_value(100);
         let merged = a
-            .union(&b)
+            .union(&b, &mut graph)
             .expect("type-compatible slots must union cleanly");
         let link_args = a.getoutputargs(&merged);
         assert_eq!(

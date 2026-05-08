@@ -309,7 +309,7 @@ pub fn non_virtual_ref<T>(x: &T) -> DirectVRef<T> {
 /// virtual_ref_finish.
 ///
 /// rlib/jit.py:487
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidVirtualRef;
 
 impl std::fmt::Display for InvalidVirtualRef {
