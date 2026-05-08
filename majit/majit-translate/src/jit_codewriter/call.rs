@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
+use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
@@ -2804,6 +2804,7 @@ impl CallControl {
         oopspecindex: OopSpecIndex,
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
+        extradescrs: Option<Vec<DescrRef>>,
     ) -> CallDescriptor {
         // Extract the direct-call target (if any) and indirect-call family
         // (if any).  Exactly one is Some after the initial dispatch;
@@ -3060,6 +3061,7 @@ impl CallControl {
             oopspecindex,
             can_invalidate,
             can_collect,
+            extradescrs,
         );
 
         // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
@@ -3237,6 +3239,7 @@ fn effectinfo_from_writeanalyze(
     oopspecindex: OopSpecIndex,
     can_invalidate: bool,
     can_collect: bool,
+    extradescrs: Option<Vec<DescrRef>>,
 ) -> EffectInfo {
     // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
@@ -3250,7 +3253,7 @@ fn effectinfo_from_writeanalyze(
             readonly_descrs_interiorfields: !0,
             write_descrs_interiorfields: !0,
             single_write_descr_array: None,
-            extradescrs: None,
+            extradescrs: extradescrs.clone(),
             can_invalidate,
             can_collect: true, // effectinfo.py:364-365: forces → can_collect = True
             call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
@@ -3307,7 +3310,7 @@ fn effectinfo_from_writeanalyze(
         readonly_descrs_interiorfields,
         write_descrs_interiorfields,
         single_write_descr_array,
-        extradescrs: None,
+        extradescrs,
         can_invalidate,
         can_collect,
         call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
@@ -4694,6 +4697,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(!descriptor.extra_info.can_invalidate);
@@ -4716,6 +4720,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
@@ -4738,6 +4743,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4763,6 +4769,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4788,6 +4795,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4817,6 +4825,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4841,6 +4850,7 @@ mod tests {
             OopSpecIndex::None,
             Some(ExtraEffect::ElidableCannotRaise),
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4882,6 +4892,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
@@ -4902,6 +4913,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         // RandomEffects is false, QuasiImmut is false → can_invalidate is false.
@@ -4948,6 +4960,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         // Should have non-zero bitsets for field reads and writes.
         assert_ne!(descriptor.extra_info.readonly_descrs_fields, 0);
@@ -5011,6 +5024,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -5107,6 +5121,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         // Write is set, but readonly should NOT have the same bit set.
         // RPython: readonly = reads & ~writes
@@ -5559,6 +5574,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
     }
 
