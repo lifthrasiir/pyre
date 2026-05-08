@@ -4583,11 +4583,11 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(1).raw(), (42i64, majit_ir::Type::Int));
+            .insert(OpRef::const_int(1).raw(), (42i64, majit_ir::Type::Int));
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::from_const(1), OpRef::int_op(1), OpRef::int_op(2)],
+            vec![OpRef::const_int(1), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // Should have: [size, num_failargs, 0(vable), 0(vref), 0(jitcode), 8(pc), tagged...]
@@ -4605,7 +4605,7 @@ mod tests {
         assert_eq!(items[4], 0);
         // items[5] = pc = 8
         assert_eq!(items[5], 8);
-        // items[6] = OpRef::from_const(1) tagged as TAGINT(42) since 42 fits in 13 bits
+        // items[6] = OpRef::const_int(1) tagged as TAGINT(42) since 42 fits in 13 bits
         let (val, tagbits) = untag(items[6] as i16);
         assert_eq!(tagbits, TAGINT);
         assert_eq!(val, 42);
@@ -4625,11 +4625,11 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(1).raw(), (42i64, majit_ir::Type::Int));
+            .insert(OpRef::const_int(1).raw(), (42i64, majit_ir::Type::Int));
         let snapshot = Snapshot::single_frame(
             0,
             8,
-            vec![OpRef::from_const(1), OpRef::int_op(1), OpRef::int_op(2)],
+            vec![OpRef::const_int(1), OpRef::int_op(1), OpRef::int_op(2)],
         );
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // RPython: ResumeDataVirtualAdder.finish() patches slot 1 with num_boxes.
@@ -4727,7 +4727,7 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(0).raw(), (99i64, majit_ir::Type::Int));
+            .insert(OpRef::const_int(0).raw(), (99i64, majit_ir::Type::Int));
 
         let snapshot = Snapshot {
             vable_array: vec![],
@@ -4736,7 +4736,7 @@ mod tests {
                 SnapshotFrame {
                     jitcode_index: 0,
                     pc: 10,
-                    boxes: vec![OpRef::int_op(1).into(), OpRef::from_const(0).into()],
+                    boxes: vec![OpRef::int_op(1).into(), OpRef::const_int(0).into()],
                 },
                 SnapshotFrame {
                     jitcode_index: 1,
@@ -4792,7 +4792,7 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.constants
-            .insert(OpRef::from_const(1).raw(), (42i64, majit_ir::Type::Int));
+            .insert(OpRef::const_int(1).raw(), (42i64, majit_ir::Type::Int));
         env.virtuals.insert(2);
         env.types.insert(2, majit_ir::Type::Ref);
 
@@ -4800,7 +4800,7 @@ mod tests {
             0,
             8,
             vec![
-                OpRef::from_const(1),
+                OpRef::const_int(1),
                 OpRef::int_op(1),
                 OpRef::ref_op(2),
                 OpRef::int_op(3),

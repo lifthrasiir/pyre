@@ -15259,7 +15259,7 @@ mod metainterp_static_data_tests {
         // ConstPtr / ConstFloat at this slot.
         let allboxes = [
             (JitArgKind::Int, OpRef::from_raw(0), 0),
-            (JitArgKind::Int, OpRef::from_const(1), 0xfeed),
+            (JitArgKind::Int, OpRef::const_int(1), 0xfeed),
         ];
         let _ = meta.do_recursive_call(&jd, &allboxes, descr_ref, &descr_view, 0, 0, false);
     }

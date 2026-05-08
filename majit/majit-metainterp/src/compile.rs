@@ -2660,21 +2660,21 @@ mod tests {
         env.types.insert(0, Type::Ref);
         env.types.insert(1, Type::Int);
         env.constants
-            .insert(OpRef::from_const(1).raw(), (8, Type::Int));
+            .insert(OpRef::const_int(1).raw(), (8, Type::Int));
         env.constants
-            .insert(OpRef::from_const(2).raw(), (777, Type::Int)); // code object payload
+            .insert(OpRef::const_int(2).raw(), (777, Type::Int)); // code object payload
         env.constants
-            .insert(OpRef::from_const(3).raw(), (2, Type::Int));
+            .insert(OpRef::const_int(3).raw(), (2, Type::Int));
         env.constants
-            .insert(OpRef::from_const(4).raw(), (999, Type::Int)); // namespace payload
+            .insert(OpRef::const_int(4).raw(), (999, Type::Int)); // namespace payload
 
         let snapshot = Snapshot {
             vable_array: vec![
                 OpRef::input_arg_ref(0).into(),
-                OpRef::from_const(1).into(),
-                OpRef::from_const(2).into(),
-                OpRef::from_const(3).into(),
-                OpRef::from_const(4).into(),
+                OpRef::const_int(1).into(),
+                OpRef::const_int(2).into(),
+                OpRef::const_int(3).into(),
+                OpRef::const_int(4).into(),
             ],
             vref_array: vec![],
             framestack: vec![SnapshotFrame {

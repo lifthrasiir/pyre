@@ -51,11 +51,11 @@ fn test_simple_int_add() {
 
     // Simple trace: i1 = int_add(i0, CONST_1)
     // finish(i1)  [fail_arg_types: [Int], fail_args: [i1]]
-    let const_1 = OpRef::from_const(1);
+    let const_1 = OpRef::const_int(1);
 
-    // Set constant: OpRef::from_const(1) = 1
+    // Set constant: OpRef::const_int(1) = 1
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(1).raw(), 1i64);
+    constants.insert(OpRef::const_int(1).raw(), 1i64);
     backend.set_constants(constants);
 
     let inputargs = vec![InputArg {
@@ -96,7 +96,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(11);
 
-    let const_1 = OpRef::from_const(1);
+    let const_1 = OpRef::const_int(1);
 
     let mut constants = HashMap::new();
     constants.insert(const_1.raw(), 1i64);
@@ -135,11 +135,11 @@ fn test_float_add() {
     let mut token = JitCellToken::new(1);
 
     let i0 = OpRef::from_raw(0); // input: f64
-    let const_half = OpRef::from_const(1);
+    let const_half = OpRef::const_float(1);
 
     // constant 0.5 as raw bits
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(1).raw(), 0.5f64.to_bits() as i64);
+    constants.insert(OpRef::const_float(1).raw(), 0.5f64.to_bits() as i64);
     backend.set_constants(constants);
 
     let inputargs = vec![InputArg {
@@ -181,7 +181,7 @@ fn test_setarrayitem_raw_float_roundtrip() {
     backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(23);
 
-    let const_index = OpRef::from_const(3);
+    let const_index = OpRef::const_int(3);
 
     let mut constants = HashMap::new();
     constants.insert(const_index.raw(), 3i64);
@@ -299,8 +299,8 @@ fn test_guard_and_loop() {
     let mut token = JitCellToken::new(1);
 
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(1).raw(), 1i64);
-    constants.insert(OpRef::from_const(5).raw(), 5i64);
+    constants.insert(OpRef::const_int(1).raw(), 1i64);
+    constants.insert(OpRef::const_int(5).raw(), 5i64);
     backend.set_constants(constants);
 
     let inputargs = vec![InputArg {
@@ -313,10 +313,10 @@ fn test_guard_and_loop() {
     label_op.pos = OpRef::from_raw(100);
     label_op.descr = Some(loop_descr.clone());
 
-    let mut add_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::from_const(1)]);
+    let mut add_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(0), OpRef::const_int(1)]);
     add_op.pos = OpRef::from_raw(1);
 
-    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), OpRef::from_const(5)]);
+    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), OpRef::const_int(5)]);
     lt_op.pos = OpRef::from_raw(2);
 
     let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
@@ -352,9 +352,9 @@ fn test_float_loop_carried_across_jump() {
     let mut token = JitCellToken::new(1);
 
     let mut constants = HashMap::new();
-    constants.insert(OpRef::from_const(5).raw(), 5i64);
-    constants.insert(OpRef::from_const(10).raw(), 0.5f64.to_bits() as i64);
-    constants.insert(OpRef::from_const(1).raw(), 1i64);
+    constants.insert(OpRef::const_int(5).raw(), 5i64);
+    constants.insert(OpRef::const_float(10).raw(), 0.5f64.to_bits() as i64);
+    constants.insert(OpRef::const_int(1).raw(), 1i64);
     backend.set_constants(constants);
 
     let inputargs = vec![
@@ -373,7 +373,7 @@ fn test_float_loop_carried_across_jump() {
     label_op.pos = OpRef::from_raw(100);
     label_op.descr = Some(loop_descr.clone());
 
-    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), OpRef::from_const(5)]);
+    let mut lt_op = Op::new(OpCode::IntLt, &[OpRef::from_raw(1), OpRef::const_int(5)]);
     lt_op.pos = OpRef::from_raw(2);
 
     let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::from_raw(2)]);
@@ -386,14 +386,14 @@ fn test_float_loop_carried_across_jump() {
 
     let mut mul_op = Op::new(
         OpCode::FloatMul,
-        &[OpRef::from_raw(4), OpRef::from_const(10)],
+        &[OpRef::from_raw(4), OpRef::const_float(10)],
     );
     mul_op.pos = OpRef::from_raw(5);
 
     let mut add_op = Op::new(OpCode::FloatAdd, &[OpRef::from_raw(0), OpRef::from_raw(5)]);
     add_op.pos = OpRef::from_raw(6);
 
-    let mut inc_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::from_const(1)]);
+    let mut inc_op = Op::new(OpCode::IntAdd, &[OpRef::from_raw(1), OpRef::const_int(1)]);
     inc_op.pos = OpRef::from_raw(7);
 
     let mut jump_op = Op::new(OpCode::Jump, &[OpRef::from_raw(6), OpRef::from_raw(7)]);
@@ -439,8 +439,8 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     backend.set_gc_allocator(Box::new(gc));
     let mut token = JitCellToken::new(41);
 
-    let const_child_tid = OpRef::from_const(1);
-    let const_root_vtable = OpRef::from_const(2);
+    let const_child_tid = OpRef::const_int(1);
+    let const_root_vtable = OpRef::const_int(2);
     let mut constants = HashMap::new();
     constants.insert(const_child_tid.raw(), child_tid as i64);
     constants.insert(const_root_vtable.raw(), root_vtable as i64);
@@ -496,7 +496,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         backend.set_gc_allocator(Box::new(gc));
         let mut token = JitCellToken::new(45);
 
-        let const_child_tid = OpRef::from_const(1);
+        let const_child_tid = OpRef::const_int(1);
         let mut constants = HashMap::new();
         constants.insert(const_child_tid.raw(), child_tid as i64);
         backend.set_constants(constants);
@@ -574,7 +574,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         backend.set_gc_allocator(Box::new(gc));
         let mut token = JitCellToken::new(47);
 
-        let const_root_a_vtable = OpRef::from_const(1);
+        let const_root_a_vtable = OpRef::const_int(1);
         let mut constants = HashMap::new();
         constants.insert(const_root_a_vtable.raw(), root_a_vtable as i64);
         backend.set_constants(constants);
@@ -614,7 +614,7 @@ fn test_exception_guards_use_dynasm_emit() {
     let mut token = JitCellToken::new(42);
 
     let expected_class = 0x5151_0000_i64;
-    let const_expected_class = OpRef::from_const(1);
+    let const_expected_class = OpRef::const_int(1);
     let mut constants = HashMap::new();
     constants.insert(const_expected_class.raw(), expected_class);
     backend.set_constants(constants);
