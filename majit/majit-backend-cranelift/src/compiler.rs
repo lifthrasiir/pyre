@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 /// executes them as ordinary function pointers.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -675,6 +675,15 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
     // Write to both the Rust wrapper AND the actual jf_frame header so
     // get_latest_descr (reading wrapper) and raw jf_descr consumers agree.
     let overlay_descr = overlay_deadframe_fail_descr(&layout, recovery_layout);
+    // The overlay's Arc address can flow through the C-ABI guard-fail
+    // boundary (`call_jit.rs:1711` `Backend::fail_descr_arc_from_addr`)
+    // when the BH callback consumes this deadframe.  Register it in the
+    // active backend's `fail_descr_registry` so that lookup is
+    // infallible — without this, the registry miss would panic.  PyPy
+    // dispatches `descr.handle_fail` via object identity (`compile.py:701`)
+    // so it has no equivalent indirection; this is a Rust C-ABI
+    // necessity acknowledged in the parity audit.
+    register_overlay_in_active_registry(&overlay_descr);
     if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
         // llmodel.py:270 parity: frame.jf_descr = descr  (writes to frame header)
         let descr_ptr = Arc::as_ptr(&overlay_descr) as usize;
@@ -1098,6 +1107,28 @@ thread_local! {
     /// the GC sees its first JITFRAME, cleared when the active GC is
     /// replaced or torn down.
     static CRANELIFT_JITFRAME_TYPE_ID: Cell<Option<u32>> = const { Cell::new(None) };
+    /// Active backend's `fail_descr_registry` handle. Set by
+    /// `execute_token*` entry points around compiled-code dispatch so
+    /// the runtime helper `wrap_call_assembler_deadframe_with_caller_prefix`
+    /// (`compiler.rs:646`) can register the freshly-allocated overlay
+    /// `CraneliftFailDescr` it attaches to the deadframe at line 682.
+    /// Without registration, `Backend::fail_descr_arc_from_addr`
+    /// (`compiler.rs:14200`) panics when the BH callback (`call_jit.rs:1711`)
+    /// looks up the overlay's address. PyPy's `compile.py:701
+    /// descr.handle_fail()` dispatches via descr object identity and has
+    /// no addr→Arc indirection — pyre's Rust C-ABI carries `descr_addr`
+    /// across the FFI boundary so the registry round-trip is needed for
+    /// ABI safety.
+    static CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY: RefCell<
+        Option<Arc<Mutex<HashMap<usize, Arc<CraneliftFailDescr>>>>>,
+    > = const { RefCell::new(None) };
+    /// Active backend's transient overlay registry.  Unlike
+    /// `CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY`, this stores Weak refs: the
+    /// JitFrameDeadFrame owns the overlay strongly, and the table only
+    /// exists to rebuild identity while that deadframe is alive.
+    static CRANELIFT_ACTIVE_OVERLAY_FAIL_DESCR_REGISTRY: RefCell<
+        Option<Arc<Mutex<HashMap<usize, Weak<CraneliftFailDescr>>>>>,
+    > = const { RefCell::new(None) };
 }
 
 fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
@@ -1132,6 +1163,66 @@ fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
 
 fn cranelift_gc_active() -> bool {
     CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some())
+}
+
+/// Set/clear the active backend's `fail_descr_registry` handle for the
+/// duration of compiled-code dispatch. Mirrors `set_cranelift_active_gc`.
+fn set_cranelift_active_fail_descr_registry(
+    registry: Option<Arc<Mutex<HashMap<usize, Arc<CraneliftFailDescr>>>>>,
+) {
+    CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY.with(|cell| *cell.borrow_mut() = registry);
+}
+
+fn set_cranelift_active_overlay_fail_descr_registry(
+    registry: Option<Arc<Mutex<HashMap<usize, Weak<CraneliftFailDescr>>>>>,
+) {
+    CRANELIFT_ACTIVE_OVERLAY_FAIL_DESCR_REGISTRY.with(|cell| *cell.borrow_mut() = registry);
+}
+
+/// RAII guard that clears `CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY` on drop.
+/// Used by `execute_token*` so the TLS handle is restored on panic /
+/// early return, not just on the normal-completion path.
+struct FailDescrRegistryGuard;
+impl Drop for FailDescrRegistryGuard {
+    fn drop(&mut self) {
+        set_cranelift_active_fail_descr_registry(None);
+        set_cranelift_active_overlay_fail_descr_registry(None);
+    }
+}
+
+/// Insert `overlay` into the active backend's overlay registry so
+/// `Backend::fail_descr_arc_from_addr` (a `cpu.get_latest_descr`
+/// equivalent — `warmspot.py:1021`) can resolve the overlay's address
+/// when the BH callback hits the C-ABI lookup at `call_jit.rs:1711`.
+///
+/// PyPy parity: `compile.py:701 descr.handle_fail()` dispatches via
+/// descr object identity, never an addr→Arc table.  pyre carries
+/// `descr_addr` across the FFI boundary, so it needs a lookup table to
+/// rebuild identity on the callee side.  The table must not own overlays:
+/// the `JitFrameDeadFrame` already stores the strong Arc, matching the
+/// deadframe-scoped lifetime PyPy gets from GC.  Storing Weak refs keeps
+/// lookup valid while the deadframe is alive without leaking one strong
+/// overlay Arc per nested CALL_ASSEMBLER fire.
+///
+/// Idempotent: `or_insert_with` is a no-op when the same address is
+/// already registered.  This is also a no-op when the thread-local is
+/// unset (off-runtime contexts such as compile-time tests that build
+/// deadframes directly).
+fn register_overlay_in_active_registry(overlay: &Arc<CraneliftFailDescr>) {
+    CRANELIFT_ACTIVE_OVERLAY_FAIL_DESCR_REGISTRY.with(|cell| {
+        let guard = cell.borrow();
+        let Some(registry) = guard.as_ref() else {
+            return;
+        };
+        let key = Arc::as_ptr(overlay) as usize;
+        let mut registry = registry
+            .lock()
+            .expect("overlay_fail_descr_registry mutex poisoned");
+        registry.retain(|_, weak| weak.strong_count() != 0);
+        registry
+            .entry(key)
+            .or_insert_with(|| Arc::downgrade(overlay));
+    });
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`. Dispatches
@@ -1809,28 +1900,34 @@ const CALL_ASSEMBLER_OUTCOME_DEADFRAME: i64 = 1;
 /// to completion, returning the result as an i64.
 static CALL_ASSEMBLER_FORCE_FN: OnceLock<extern "C" fn(i64) -> i64> = OnceLock::new();
 
-/// RPython resume_in_blackhole parity: callback to resume execution
-/// from the guard failure point using the blackhole interpreter.
-/// Args: (green_key, trace_id, fail_index, fail_values_ptr, num_fail_values) → result i64.
-/// This reads the guard's resume data, restores state from fail_values (deadframe),
-/// and executes the remaining IR ops from the guard point to Finish.
-/// bh_fn(green_key, trace_id, fail_index, rebuilt_values, num_rebuilt, raw_deadframe, num_raw)
-/// Unbox a Ref (boxed int pointer) to a raw i64 int value.
+/// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` parity:
+/// callback to resume execution from the guard failure point using the
+/// blackhole interpreter.  Args: `(descr_addr, rebuilt_values_ptr,
+/// num_rebuilt, raw_deadframe_ptr, num_raw)` → `Option<result>`.  The
+/// receiver recovers the failed descr from `descr_addr` via
+/// `Backend::fail_descr_arc_from_addr` (`history.py:125`
+/// `cpu.get_latest_descr` parity) and derives green_key / trace_id /
+/// fail_index from the descr identity (`descr_owning_jct`).  No
+/// surrogate triple crosses the C-ABI.
 static CALL_ASSEMBLER_BLACKHOLE_FN: OnceLock<
-    fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
+    fn(usize, *const i64, usize, *const i64, usize) -> Option<i64>,
 > = OnceLock::new();
 
 /// Register a blackhole callback for call_assembler guard failure resume.
 pub fn register_call_assembler_blackhole(
-    f: fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>,
+    f: fn(usize, *const i64, usize, *const i64, usize) -> Option<i64>,
 ) {
     let _ = CALL_ASSEMBLER_BLACKHOLE_FN.set(f);
 }
 
 /// compile.py:701-717 handle_fail callback for call_assembler guard failures.
-/// (green_key, trace_id, fail_index, raw_values_ptr, num_values, descr_addr) -> bridge_compiled.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(u64, u64, u32, *const i64, usize, usize) -> bool> =
-    OnceLock::new();
+/// (raw_values_ptr, num_values, descr_addr) -> bridge_compiled.
+///
+/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr, deadframe)`
+/// receives the descr directly; the C-ABI delivers the same shape via
+/// `descr_addr` (recovered to `Arc<dyn FailDescr>` by the receiver)
+/// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize) -> bool> = OnceLock::new();
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
 // for force_fn to re-box before interpreter execution.
@@ -2180,7 +2277,7 @@ pub fn execute_call_assembler_direct(
     }
 }
 
-pub fn register_call_assembler_bridge(f: fn(u64, u64, u32, *const i64, usize, usize) -> bool) {
+pub fn register_call_assembler_bridge(f: fn(*const i64, usize, usize) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -2647,11 +2744,24 @@ fn raw_values_from_deadframe_typed(
 }
 
 fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendError> {
-    let fail_arg_types = {
+    let (fail_arg_types, is_exit_frame_with_exception) = {
         let descr = get_latest_descr_from_deadframe(frame)?;
         assert!(descr.is_finish(), "expected finish deadframe");
-        descr.fail_arg_types().to_vec()
+        (
+            descr.fail_arg_types().to_vec(),
+            descr.is_exit_frame_with_exception(),
+        )
     };
+    if is_exit_frame_with_exception {
+        let value = get_ref_from_deadframe(frame, 0)?.0 as i64;
+        // compile.py:658-662 ExitFrameWithExceptionDescrRef.handle_fail:
+        // raise jitexc.ExitFrameWithExceptionRef(value).  Dynasm's
+        // CALL_ASSEMBLER helper publishes the same pending exception;
+        // Cranelift must do it here instead of routing this FINISH descr
+        // through guard-only blackhole resume.
+        jit_exc_raise(value);
+        return Ok(value);
+    }
     match fail_arg_types.as_slice() {
         [] => Ok(0),
         [Type::Int] => get_int_from_deadframe(frame, 0),
@@ -2672,36 +2782,28 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
 }
 
 fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<i64> {
-    let (is_normal_finish, green_key, trace_id, fail_index, fail_arg_types) = {
+    // `compile.py:710-716 resume_in_blackhole(descr, deadframe)` parity:
+    // the descr is the sole identity carrier crossing the C-ABI; the
+    // receiver derives green_key (memmgr-evicted JCT recovery via
+    // `frame.pycode`), trace_id, and fail_index from the descr Arc.
+    let (is_finish, descr_addr, fail_arg_types) = {
         let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
         let fail_descr = &jf.fail_descr;
-        // pyjitpl.py:2897-2899 parity: `rd_loop_token.loop_token_wref()` may be
-        // dead (memmgr-evicted JCT) — `compile.giveup()` raises
-        // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29) and falls
-        // through to blackhole resume.  Pass `green_key=0` to the blackhole
-        // callback so it derives the key from the deadframe's pyframe pointer
-        // (call_jit.rs:1694-1704); never substitute the parent CALL_ASSEMBLER
-        // target's green_key here — that would mis-route resume storage.
+        let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
         (
-            fail_descr.is_finish() && !fail_descr.is_exit_frame_with_exception,
-            majit_backend::descr_owning_jct(fail_descr.as_ref())
-                .map(|jct| jct.green_key)
-                .unwrap_or(0),
-            fail_descr.trace_id(),
-            fail_descr.fail_index,
+            fail_descr.is_finish(),
+            descr_addr,
             fail_descr.fail_arg_types().to_vec(),
         )
     };
-    if is_normal_finish {
+    if is_finish {
         return finish_result_from_deadframe(&mut frame).ok();
     }
 
     let raw_values = raw_values_from_deadframe_typed(&frame, &fail_arg_types).ok()?;
     let blackhole = CALL_ASSEMBLER_BLACKHOLE_FN.get()?;
     blackhole(
-        green_key,
-        trace_id,
-        fail_index,
+        descr_addr,
         raw_values.as_ptr(),
         raw_values.len(),
         raw_values.as_ptr(),
@@ -2800,6 +2902,16 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.fail_descr.as_ref())
+}
+
+pub fn get_latest_descr_arc_from_deadframe(
+    frame: &DeadFrame,
+) -> Result<Arc<dyn FailDescr>, BackendError> {
+    let jf = frame
+        .data
+        .downcast_ref::<JitFrameDeadFrame>()
+        .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    Ok(Arc::clone(&jf.fail_descr) as Arc<dyn FailDescr>)
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
@@ -3131,7 +3243,6 @@ fn call_assembler_guard_failure_inner(
     // Do not re-index through the root CALL_ASSEMBLER target here: when a
     // bridge has just returned another guard failure, `fail_descr_ptr` is
     // the bridge descriptor, not necessarily `target.fail_descrs[fail_index]`.
-    let fail_index = fail_descr_ref.fail_index();
     let fail_descr = fail_descr_ref;
     // pyjitpl.py:2897-2899 parity: recover the owning Arc<JitCellToken>
     // identity from the descr.  When the weakref is dead (memmgr-evicted
@@ -3146,29 +3257,21 @@ fn call_assembler_guard_failure_inner(
     // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
     // (pyjitpl/mod.rs:8297-8301).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
-    let trace_id = fail_descr.trace_id();
     fail_descr.increment_fail_count();
 
     // compile.py:701-717 handle_fail → must_compile → bridge tracing.
     // Check jitcounter threshold; if reached, trace alternate path and
     // compile bridge. The bridge is attached to fail_descr for fast
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
-    if let (Some(jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
+    if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
         let raw_num = fail_descr.fail_arg_types().len();
-        if bridge_fn(
-            jct.green_key,
-            trace_id,
-            fail_index,
-            outputs_ptr,
-            raw_num,
-            fail_descr_ptr as usize,
-        ) {
+        if bridge_fn(outputs_ptr, raw_num, fail_descr_ptr as usize) {
             // compile.py:704-716 / dynasm parity: the hook traces and
             // attaches the bridge; the current occurrence still resumes
             // through blackhole instead of re-entering the new bridge.
         }
     }
-    let green_key = owning_jct.as_ref().map(|j| j.green_key).unwrap_or(0);
+    let _ = owning_jct;
 
     // resume.py:1312 blackhole_from_resumedata parity: materialize
     // virtuals before blackhole resume.
@@ -3199,9 +3302,7 @@ fn call_assembler_guard_failure_inner(
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let raw_num = fail_descr.fail_arg_types().len();
         if let Some(result) = bh_fn(
-            green_key,
-            trace_id,
-            fail_index,
+            fail_descr_ptr as usize,
             outputs_ptr,
             raw_num,
             outputs_ptr,
@@ -3274,6 +3375,7 @@ fn call_assembler_fast_path_heap(
         attachments,
     );
     let fail_index = exec.fail_index;
+    let direct_descr = exec.direct_descr.clone();
     let outputs = exec.extract_outputs(actual_outputs);
 
     if fail_index == CALL_ASSEMBLER_DEADFRAME_SENTINEL {
@@ -3287,7 +3389,9 @@ fn call_assembler_fast_path_heap(
         return 0;
     }
 
-    let fail_descr = &target.fail_descrs[fail_index as usize];
+    let fail_descr_arc =
+        direct_descr.unwrap_or_else(|| target.fail_descrs[fail_index as usize].clone());
+    let fail_descr = &fail_descr_arc;
 
     if fail_descr.is_finish() {
         unsafe {
@@ -3341,8 +3445,7 @@ fn call_assembler_fast_path_heap(
 
     // resume.py:1312 blackhole_from_resumedata parity.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
-        let green_key = target.green_key;
-        let trace_id = target.trace_id;
+        let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
         let raw_num = fail_descr.fail_arg_types().len();
         let raw_outputs = outputs.to_vec();
         let mut bh_outputs = outputs.to_vec();
@@ -3354,9 +3457,7 @@ fn call_assembler_fast_path_heap(
         );
         let num_outputs = bh_outputs.len();
         if let Some(result) = bh_fn(
-            green_key,
-            trace_id,
-            fail_index,
+            descr_addr,
             bh_outputs.as_ptr(),
             num_outputs,
             raw_outputs.as_ptr(),
@@ -3484,10 +3585,12 @@ fn call_assembler_shim_inner(
             .and_then(|d| d.recovery_layout_ref().as_ref().cloned());
         rebuild_state_after_failure(&mut bh_outputs, fail_types, recovery.as_ref(), raw_num);
         let num_outputs = bh_outputs.len();
+        // `descr` is the deadframe's attached `&dyn FailDescr`; the
+        // data portion of the fat pointer matches the `Arc::as_ptr`
+        // address registered in `fail_descr_registry` (compiler.rs:6685).
+        let descr_addr = descr as *const dyn FailDescr as *const () as usize;
         if let Some(result) = bh_fn(
-            target.green_key,
-            target.trace_id,
-            fail_index,
+            descr_addr,
             bh_outputs.as_ptr(),
             num_outputs,
             raw_outputs.as_ptr(),
@@ -6506,6 +6609,15 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
+    /// Native guards carry raw `CraneliftFailDescr` addresses.  Keep the
+    /// corresponding Arcs alive and recoverable across call-assembler
+    /// guard failures, matching PyPy's CPU-held descr object identity.
+    fail_descr_registry: Arc<Mutex<HashMap<usize, Arc<CraneliftFailDescr>>>>,
+    /// Transient CALL_ASSEMBLER overlay descrs keyed by raw address.
+    /// Values are Weak because the owning `JitFrameDeadFrame` is the
+    /// lifetime root; the registry is only an addr→identity adapter for
+    /// C-ABI callbacks while that deadframe is alive.
+    overlay_fail_descr_registry: Arc<Mutex<HashMap<usize, Weak<CraneliftFailDescr>>>>,
 }
 
 impl CraneliftBackend {
@@ -6676,7 +6788,25 @@ impl CraneliftBackend {
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
             descr_attachments: Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
+            fail_descr_registry: Arc::new(Mutex::new(HashMap::new())),
+            overlay_fail_descr_registry: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn register_fail_descrs(&self, descrs: &[Arc<CraneliftFailDescr>]) {
+        let mut registry = self.fail_descr_registry.lock().unwrap();
+        for descr in descrs {
+            registry
+                .entry(Arc::as_ptr(descr) as usize)
+                .or_insert_with(|| Arc::clone(descr));
+        }
+    }
+
+    fn sweep_stale_overlay_fail_descrs(&self) {
+        self.overlay_fail_descr_registry
+            .lock()
+            .expect("overlay_fail_descr_registry mutex poisoned")
+            .retain(|_, descr| descr.strong_count() != 0);
     }
 
     /// compile.py plumbing: register the shared `CallInfoCollection` so
@@ -13190,6 +13320,7 @@ impl majit_backend::Backend for CraneliftBackend {
             return Err(err);
         }
         self.registered_call_assembler_tokens.insert(token.number);
+        self.register_fail_descrs(&compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
@@ -13383,6 +13514,7 @@ impl majit_backend::Backend for CraneliftBackend {
         )?;
         self.registered_call_assembler_bridge_traces
             .insert(compiled.trace_id);
+        self.register_fail_descrs(&compiled.fail_descrs);
 
         // Attach the bridge to the original guard's fail descriptor so that
         // execute_token can dispatch to it on subsequent guard failures.
@@ -13670,6 +13802,16 @@ impl majit_backend::Backend for CraneliftBackend {
             });
         }
 
+        // Publish the backend's `fail_descr_registry` handle for the
+        // duration of dispatch so `wrap_call_assembler_deadframe_with_caller_prefix`
+        // can register transient overlay descrs at construction
+        // (compiler.rs:646 — see `register_overlay_in_active_registry`).
+        // RAII guard so a panic in `execute_with_inputs` still clears the TLS.
+        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
+        set_cranelift_active_overlay_fail_descr_registry(Some(Arc::clone(
+            &self.overlay_fail_descr_registry,
+        )));
+        let _registry_guard = FailDescrRegistryGuard;
         Self::execute_with_inputs(compiled, &inputs)
     }
 
@@ -13681,6 +13823,11 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
+        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
+        set_cranelift_active_overlay_fail_descr_registry(Some(Arc::clone(
+            &self.overlay_fail_descr_registry,
+        )));
+        let _registry_guard = FailDescrRegistryGuard;
         Self::execute_with_inputs(compiled, args)
     }
 
@@ -13695,6 +13842,12 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
+
+        set_cranelift_active_fail_descr_registry(Some(Arc::clone(&self.fail_descr_registry)));
+        set_cranelift_active_overlay_fail_descr_registry(Some(Arc::clone(
+            &self.overlay_fail_descr_registry,
+        )));
+        let _registry_guard = FailDescrRegistryGuard;
 
         // PRE-EXISTING-ADAPTATION (parity exception): RPython
         // `llgraph/runner.py:1120-1201` has only one `LLFrame.execute`
@@ -13749,7 +13902,8 @@ impl majit_backend::Backend for CraneliftBackend {
                     &cur_inputs,
                     compiled.caller_prefix_layout.as_ref(),
                 );
-                let descr = self.get_latest_descr(&frame);
+                let descr_arc = self.get_latest_descr_arc(&frame);
+                let descr: &dyn FailDescr = &*descr_arc;
                 let exit_layout = self.describe_deadframe(&frame);
                 let savedata = self.get_savedata_ref(&frame);
                 let exception_value = self.grab_exc_value(&frame);
@@ -13779,6 +13933,7 @@ impl majit_backend::Backend for CraneliftBackend {
                         }
                     }
                 }
+                let descr_addr = Arc::as_ptr(&descr_arc) as *const () as usize;
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
@@ -13791,7 +13946,8 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: descr.is_finish(),
                     is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
                     status: descr.get_status(),
-                    descr_addr: descr as *const dyn FailDescr as *const () as usize,
+                    descr_addr,
+                    descr_arc,
                 };
             }
 
@@ -13859,6 +14015,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
+                let descr_addr = Arc::as_ptr(&fail_descr_arc) as usize;
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
@@ -13871,7 +14028,8 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: true,
                     is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
                     status: fail_descr.get_status(),
-                    descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
+                    descr_addr,
+                    descr_arc: Arc::clone(&fail_descr_arc) as Arc<dyn FailDescr>,
                 };
             }
 
@@ -13914,6 +14072,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
+            let descr_addr = Arc::as_ptr(&fail_descr_arc) as usize;
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
@@ -13926,7 +14085,8 @@ impl majit_backend::Backend for CraneliftBackend {
                 is_finish: false,
                 is_exit_frame_with_exception: fail_descr.is_exit_frame_with_exception(),
                 status: fail_descr.get_status(),
-                descr_addr: Arc::as_ptr(&fail_descr_arc) as usize,
+                descr_addr,
+                descr_arc: Arc::clone(&fail_descr_arc) as Arc<dyn FailDescr>,
             };
         }
     }
@@ -14157,6 +14317,47 @@ impl majit_backend::Backend for CraneliftBackend {
         get_latest_descr_from_deadframe(frame).expect("get_latest_descr_from_deadframe failed")
     }
 
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr> {
+        get_latest_descr_arc_from_deadframe(frame)
+            .expect("get_latest_descr_arc_from_deadframe failed")
+    }
+
+    fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> Arc<dyn FailDescr> {
+        // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity:
+        // compiled guard descrs are held strongly for the lifetime of
+        // their owning machine code.  CALL_ASSEMBLER overlays are
+        // deadframe-scoped and live in a Weak side registry, so lookup
+        // checks both tables without extending overlay lifetime.
+        {
+            let registry = self
+                .fail_descr_registry
+                .lock()
+                .expect("fail_descr_registry mutex poisoned");
+            if let Some(descr) = registry.get(&descr_addr).cloned() {
+                return descr;
+            }
+        }
+
+        let mut overlay_registry = self
+            .overlay_fail_descr_registry
+            .lock()
+            .expect("overlay_fail_descr_registry mutex poisoned");
+        if let Some(descr) = overlay_registry
+            .get(&descr_addr)
+            .and_then(|weak| weak.upgrade())
+        {
+            return descr;
+        }
+        overlay_registry.remove(&descr_addr);
+        panic!(
+            "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
+             fail_descr_registry or live overlay_fail_descr_registry — every emitted \
+             FailDescr must be strongly registered, and every transient overlay \
+             descr must still be owned by its deadframe when it crosses the C-ABI \
+             guard-fail boundary"
+        )
+    }
+
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
         get_int_from_deadframe(frame, index).expect("get_int_from_deadframe failed")
     }
@@ -14198,6 +14399,37 @@ impl majit_backend::Backend for CraneliftBackend {
     fn free_loop(&mut self, token: &JitCellToken) {
         unregister_call_assembler_target(token.number);
         self.registered_call_assembler_tokens.remove(&token.number);
+        // memmgr.py:9 `MemoryManager.alive_loops` parity: when a JCT is
+        // evicted, RPython's GC reclaims the token's compiled code and
+        // every dependent FailDescr naturally because nothing keeps a
+        // strong ref past `alive_loops`.  Pyre's `fail_descr_registry`
+        // holds strong Arcs to every emitted descr for the C-ABI
+        // recovery path (`fail_descr_arc_from_addr` parity with
+        // `cpu.get_latest_descr`), so we must explicitly release the
+        // entries belonging to this token here — otherwise the descrs
+        // (and their `rd_loop_token_clt` chain) outlive their owning
+        // loop and pyre keeps memory PyPy would have freed.
+        //
+        // Sweep strong entries whose owning-JCT upgrade points back at
+        // this token. Ownerless strong entries (`descr_owning_jct == None`)
+        // are PRESERVED: in PyPy these correspond to FINISH descrs
+        // (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
+        // `compile.py:185` skipped via `isinstance(descr, ResumeDescr)`)
+        // which are module-level singletons not subject to per-loop GC.
+        // Transient CALL_ASSEMBLER overlays are not stored here; their
+        // separate Weak registry is swept below.
+        let mut registry = self
+            .fail_descr_registry
+            .lock()
+            .expect("fail_descr_registry mutex poisoned");
+        registry.retain(
+            |_, descr| match majit_backend::descr_owning_jct(descr.as_ref()) {
+                Some(owner) => owner.number != token.number,
+                None => true,
+            },
+        );
+        drop(registry);
+        self.sweep_stale_overlay_fail_descrs();
     }
 
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).

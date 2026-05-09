@@ -45,6 +45,15 @@ pub struct RawExecResult {
     pub status: u64,
     /// compile.py:780: current_object_addr_as_int(self) — descriptor pointer.
     pub descr_addr: usize,
+    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`, `compile.py:701`)
+    /// — the runtime descr Arc owning this exit.  Always set: routes
+    /// through `Backend::get_latest_descr_arc` rather than the
+    /// `fail_descr_addr` registry, so FINISH / `DoneWithThisFrame*` /
+    /// `ExitFrameWithExceptionDescrRef` singletons return their global
+    /// Arc identity instead of `None`.  Bridge consumers
+    /// (`start_bridge_tracing`, `_trace_and_compile_from_bridge`) read
+    /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
+    pub descr_arc: Arc<dyn FailDescr>,
 }
 
 /// Backend-neutral static metadata for a compiled trace.
@@ -1063,6 +1072,44 @@ pub struct JitCellToken {
     /// covered by the existing `unsafe impl Sync for JitCellToken`
     /// at line 1130 — single-threaded JIT scheduler invariant.
     pub generation: Cell<i64>,
+    /// `history.py:435` `JitCellToken.retraced_count = 0`.
+    /// Incremented at `unroll.py` retrace boundaries (compile_retrace
+    /// path) when a previously compiled loop is re-traced.  RPython
+    /// packs `FORCE_BRIDGE_SEGMENTING` (history.py:431) into bit 0
+    /// of this field; the count itself is stored shifted left by one,
+    /// accessed via `get_retraced_count` / `set_retraced_count`
+    /// (history.py:464/467).  Interior mutability via `Cell<u32>`
+    /// mirrors the RPython attribute write through `&JitCellToken`;
+    /// same `unsafe impl Sync` covers it as `generation`.  Callers
+    /// must use the accessors (not `.get()` / `.set()` directly) to
+    /// keep the bit-packing invariant.
+    pub retraced_count: Cell<u32>,
+}
+
+impl JitCellToken {
+    /// `history.py:431` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed into
+    /// `retraced_count`.  Set at `pyjitpl.py:2833` (pyre:
+    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge trace
+    /// aborts without an inlinable function; read at `compile.py:729`
+    /// (pyre: `MetaInterp::start_retrace_from_guard`) to decide whether
+    /// the next bridge from this loop should `force_finish_trace`.
+    pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
+
+    /// `history.py:464` `def get_retraced_count(self): return
+    /// self.retraced_count >> 1`.
+    #[inline]
+    pub fn get_retraced_count(&self) -> u32 {
+        self.retraced_count.get() >> 1
+    }
+
+    /// `history.py:467` `def set_retraced_count(self, value):
+    /// self.retraced_count = (value << 1) | (self.retraced_count & 1)`.
+    /// Preserves the FORCE_BRIDGE_SEGMENTING bit.
+    #[inline]
+    pub fn set_retraced_count(&self, value: u32) {
+        let flag = self.retraced_count.get() & Self::FORCE_BRIDGE_SEGMENTING;
+        self.retraced_count.set((value << 1) | flag);
+    }
 }
 
 impl JitCellToken {
@@ -1086,6 +1133,8 @@ impl JitCellToken {
             _ll_function_addr: 0,
             // memmgr.py:38 default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
+            // history.py:435 `retraced_count = 0`.
+            retraced_count: Cell::new(0),
         }
     }
 
@@ -1550,7 +1599,8 @@ pub trait Backend: Send {
     /// avoiding explicit deadframe decoding in the caller.
     fn execute_token_raw(&self, token: &JitCellToken, args: &[Value]) -> RawExecResult {
         let frame = self.execute_token(token, args);
-        let descr = self.get_latest_descr(&frame);
+        let descr_arc = self.get_latest_descr_arc(&frame);
+        let descr: &dyn FailDescr = &*descr_arc;
         let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
@@ -1580,6 +1630,7 @@ pub trait Backend: Send {
                 }
             }
         }
+        let descr_addr = Arc::as_ptr(&descr_arc) as *const () as usize;
         RawExecResult {
             outputs,
             typed_outputs,
@@ -1592,7 +1643,8 @@ pub trait Backend: Send {
             is_finish: descr.is_finish(),
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
             status: descr.get_status(),
-            descr_addr: descr as *const dyn majit_ir::descr::FailDescr as *const () as usize,
+            descr_addr,
+            descr_arc,
         }
     }
 
@@ -1624,9 +1676,9 @@ pub trait Backend: Send {
     /// `cpu.get_latest_descr(deadframe)` parity for the bridge-source path.
     ///
     /// `pyjitpl/mod.rs::bridge_source_descr` looks up the failed guard's
-    /// descr through the metainterp trace ops (`trace.guard_op_indices →
-    /// trace.ops[idx].descr`), the line-by-line port of `op.getdescr()`
-    /// at `compile.py:184`.  When the metainterp side cannot produce the
+    /// descr through the metainterp trace ops (`trace.exit_layouts.descr`,
+    /// or a `trace.ops` walk via `descr.fail_index()` match), the
+    /// line-by-line port of `op.getdescr()` at `compile.py:184`.  When the metainterp side cannot produce the
     /// descr (synthetic / cut-tentative ops, post-retrace stale traces),
     /// the backend still owns the live `Arc<dyn Descr>` that pyre's
     /// runtime guard-failure helpers received as `descr_addr`.  This
@@ -1786,6 +1838,70 @@ pub trait Backend: Send {
 
     /// Read the FailDescr from the last guard failure.
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
+
+    /// Owned Arc counterpart of `get_latest_descr`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (split-descr): `cpu.get_latest_descr(deadframe)`
+    /// in RPython (`history.py:125`, consumed at `pyjitpl.py:2890`) returns
+    /// the `ResumeGuardDescr` object the metainterp stamped — the same
+    /// object that owns `rd_numb` / `rd_consts` / `rd_loop_token` etc.,
+    /// kept alive by the GC across the deopt boundary.  Pyre runs a
+    /// *split-descr* model: the backend (dynasm `DynasmFailDescr` /
+    /// cranelift `CraneliftFailDescr`) and the metainterp
+    /// `ResumeGuardDescr` are distinct objects, with the metainterp
+    /// descr forwarded onto the backend descr via `meta_descr` for the
+    /// fields that flow through native code.  Consequently, this method
+    /// returns the *backend-side* `Arc<dyn FailDescr>`, not the
+    /// metainterp ResumeGuardDescr — close enough for descr-identity
+    /// routing (each backend descr is unique per guard, and
+    /// `meta_descr`/`fail_index_per_trace` chase upward to the
+    /// metainterp side) but not byte-for-byte the same object PyPy
+    /// reads in `pyjitpl.py:2890`.
+    ///
+    /// The split exists because pyre emits and registers the backend
+    /// descr at codegen time (it has to be reachable from native fault
+    /// stubs), whereas the metainterp ResumeGuardDescr lives on the
+    /// frontend op-record side; unifying them is the multi-session
+    /// goal that the descr-Arc routing convergence (Task #137 + Task
+    /// #235 + T-series) is approaching one slice at a time.
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr>;
+
+    /// Resolve a raw fail-descr address to its owning `Arc<dyn FailDescr>`.
+    ///
+    /// PRE-EXISTING-ADAPTATION (no upstream counterpart): RPython dispatches
+    /// the CA bridge entry as a method on the descr — `compile.py:706-732
+    /// _trace_and_compile_from_bridge(self, deadframe, ...)`, where `self`
+    /// IS the descr — so the metainterp receives the descr object directly
+    /// (`pyjitpl.py:2890 handle_guard_failure(self, resumedescr, ...)`)
+    /// without any addr→object lookup.  Pyre's bridge crosses native code
+    /// through function pointers (`majit-backend-dynasm/src/lib.rs`
+    /// `BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) ->
+    /// Option<i64>` and `BridgeFn = fn(*const i64, usize, usize) -> bool`)
+    /// which can only carry primitive types, so the descr identity has to
+    /// be transported as a raw `usize` (`descr_addr`) and recovered here
+    /// via this method.
+    ///
+    /// `descr_addr` is the `usize` identity captured at native-code emission
+    /// time (e.g. embedded in a recovery stub or stamped into `jf_descr`).
+    /// Backends that maintain an `addr → Arc` registry (mirroring RPython's
+    /// `cpu` keeping descr objects alive while their pointers are live in
+    /// emitted code) override this to upgrade the raw address back to its
+    /// owning Arc.
+    ///
+    /// `warmspot.py:1021 cpu.get_latest_descr(deadframe)` has no failure
+    /// mode — every live deadframe carries a valid descr handle.  Pyre
+    /// backends mirror this contract by holding strong `Arc` refs in the
+    /// registry for the full lifetime of every emitted FailDescr; the
+    /// lookup is therefore infallible.  Default panics so backends that
+    /// receive C-ABI guard-fail callbacks must opt in explicitly;
+    /// `SyntheticCpu` and `wasm` never reach this path.
+    fn fail_descr_arc_from_addr(&self, _descr_addr: usize) -> Arc<dyn FailDescr> {
+        panic!(
+            "Backend::fail_descr_arc_from_addr default invoked: backend wired into a runtime \
+             guard-fail path must register every emitted FailDescr in an addr→Arc table and \
+             override this method (warmspot.py:1021 cpu.get_latest_descr parity)"
+        )
+    }
 
     /// Read an integer value from a dead frame at the given index.
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64;

@@ -1067,34 +1067,19 @@ fn dispatch_op(
             let vable_reg = expect_reg(&args[0], Kind::Ref);
             state.builder.vable_force_with_base(vable_reg);
         }
-        // `int_floordiv` / `int_mod` are intentionally NOT in the
-        // canonical-binop arm below.  RPython `jtransform.py:575-577`
+        // `int_floordiv` / `int_mod` are intentionally absent from the
+        // canonical-binop arm below.  `jtransform.py:575-577`
         // (`rewrite_op_int_floordiv = _do_builtin_call`,
         // `rewrite_op_int_mod = _do_builtin_call`) replaces both
         // primitives with a `direct_call(prepare_builtin_call(...))` to
-        // `ll_int_py_div` / `ll_int_py_mod` (`rint.py:398/496`) — the
-        // bare opname never reaches the jitcode emitter upstream.  In
+        // `ll_int_py_div` / `ll_int_py_mod` (`rint.py:398/496`); the
+        // bare opname never reaches the SSARepr emitter upstream.  In
         // pyre the runtime trace path goes through the β' redirect at
-        // `majit-translate/src/codegen.rs:980-1028
-        // generated_binary_int_value`, which emits
-        // `CallPureI(bhimpl_int_floordiv|bhimpl_int_mod)` with
-        // `INT_PY_DIV_EFFECT_INFO`/`INT_PY_MOD_EFFECT_INFO` plus the
-        // `int_eq(rhs, 0) -> guard_false` and `INT_MIN / -1` overflow
-        // guards from the `_ovf_zer` wrapper.  No SSARepr producer
-        // emits `"int_floordiv"` or `"int_mod"` opnames in production;
-        // this fail-loud arm catches any new producer that bypasses the
-        // β' redirect so the divergence surfaces immediately instead of
-        // silently re-introducing the upstream-absent BC_INT_FLOORDIV /
-        // BC_INT_MOD bytecode path.  When Task #97 finishes the IR /
-        // backend cleanup the arm — and the OpCode variants behind it —
-        // can be deleted entirely.
-        "int_floordiv" | "int_mod" => panic!(
-            "SSARepr producer emitted `{opname}`; upstream `jtransform.py:575-577` \
-             rewrites both primitives to `direct_call(ll_int_py_*)` and pyre's \
-             trace path goes through `codegen.rs::generated_binary_int_value`'s \
-             β' redirect (Task #94a-1).  See Task #97 for the IR cleanup that \
-             retires `OpCode::IntFloorDiv` / `OpCode::IntMod` and this arm."
-        ),
+        // `majit-translate/src/codegen.rs::generated_binary_int_value`,
+        // which emits `CallPureI(bhimpl_int_floordiv|bhimpl_int_mod)`
+        // with `INT_PY_DIV_EFFECT_INFO`/`INT_PY_MOD_EFFECT_INFO` plus
+        // the `int_eq(rhs, 0) -> guard_false` and `INT_MIN / -1`
+        // overflow guards from the `_ovf_zer` wrapper.
         // Per-OpCode opname dispatch for integer / float primitives —
         // RPython `rpython/jit/metainterp/blackhole.py:459-723` defines
         // one `bhimpl_*` per opname; `assembler.py:162-222` routes each

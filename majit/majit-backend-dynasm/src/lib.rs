@@ -152,13 +152,29 @@ pub(crate) fn jit_threadlocalref_base() -> *const i64 {
 
 use std::sync::OnceLock;
 
-/// Blackhole resume: (green_key, trace_id, fail_index, raw_values, len,
-/// typed_outputs, typed_len) → Option<result>
-pub type BlackholeFn = fn(u64, u64, u32, *const i64, usize, *const i64, usize) -> Option<i64>;
+/// Blackhole resume: (descr_addr, raw_values, len, typed_outputs, typed_len)
+/// → Option<result>.
+///
+/// The receiving handler recovers the failed descr from `descr_addr`
+/// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
+/// `cpu.get_latest_descr` parity) and derives the resume identity
+/// (`jct.green_key` / `descr.trace_id()` /
+/// `descr.fail_index_per_trace()`) from that Arc, mirroring
+/// `compile.py:710-716 resume_in_blackhole(descr, deadframe)` where
+/// the descr is the sole identity carrier.  No surrogate triple
+/// crosses the C-ABI.
+pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) -> Option<i64>;
 
-/// Bridge compilation: (green_key, trace_id, fail_index, raw_values, len,
-/// descr_addr) → compiled?
-pub type BridgeFn = fn(u64, u64, u32, *const i64, usize, usize) -> bool;
+/// Bridge compilation: (raw_values, len, descr_addr) → compiled?
+///
+/// The receiving handler recovers the failed descr from `descr_addr`
+/// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
+/// `cpu.get_latest_descr` parity) and derives the bridge source
+/// identity (`jct.green_key` / `descr.trace_id()` /
+/// `descr.fail_index_per_trace()`) from that Arc, mirroring
+/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr,
+/// deadframe)`.  No surrogate triple crosses the C-ABI.
+pub type BridgeFn = fn(*const i64, usize, usize) -> bool;
 
 /// Force callee: (callee_frame_ptr) → result
 pub type ForceFn = extern "C" fn(i64) -> i64;
@@ -585,25 +601,17 @@ fn handle_fail_resume_guard(
     // compile.py:704-709 `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
     // Skipped on giveup (None).
-    if let (Some(jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
-        bridge_fn(
-            jct.green_key,
-            trace_id,
-            fail_index,
-            raw_values.as_ptr(),
-            raw_values.len(),
-            descr_raw,
-        );
+    if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
+        bridge_fn(raw_values.as_ptr(), raw_values.len(), descr_raw);
     }
 
-    let bh_green_key = owning_jct.as_ref().map(|j| j.green_key).unwrap_or(0);
-
-    // compile.py:710-716 `resume_in_blackhole`.
+    // compile.py:710-716 `resume_in_blackhole(descr, deadframe)`: the
+    // descr is the sole identity carrier; the receiver derives green_key /
+    // trace_id / fail_index from it via `fail_descr_arc_from_addr` and
+    // `descr_owning_jct`.
     if let Some(blackhole) = CA_BLACKHOLE_FN.get() {
         if let Some(bh_result) = blackhole(
-            bh_green_key,
-            trace_id,
-            fail_index,
+            descr_raw,
             raw_values.as_ptr(),
             raw_values.len(),
             raw_values.as_ptr(),

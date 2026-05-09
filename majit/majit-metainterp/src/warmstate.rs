@@ -75,6 +75,25 @@ pub struct BaseJitCell {
     /// Used to detect stale tracing sessions.
     pub tracing_generation: u64,
     /// Compiled loop token, if compilation has completed.
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream `warmstate.py:188` stores
+    /// `wref_procedure_token` as a `weakref.ref(token)` so the warmstate
+    /// holds only a weak handle and the strong owner is the
+    /// `MemoryManager`'s `alive_loops` list (`memmgr.py:13`).  Pyre
+    /// stores `Arc<JitCellToken>` here because:
+    ///   1. `MetaInterp.compiled_loops: HashMap<u64, CompiledEntry>`
+    ///      already holds a separate strong owner (the T-final.F retire
+    ///      target), so the warmstate-side ref must also be strong to
+    ///      keep the cell-routed lookup path
+    ///      (`get_procedure_token` → `loop_token.as_ref()`) live until
+    ///      `compiled_loops` is fully retired.
+    ///   2. After F.6 (drop `compiled_loops` field), this Arc becomes
+    ///      the canonical strong owner; the convergence target is to
+    ///      downgrade to `Weak<JitCellToken>` so eviction by
+    ///      `MemoryManager` matches `should_remove_jitcell`'s dead-weakref
+    ///      check (`warmstate.py:212-225`).  See
+    ///      `slice_x_f_landed_2026_05_02.md` memo Issue 3.3 for the
+    ///      remaining weak-ref convergence work.
     pub loop_token: Option<Arc<JitCellToken>>,
     /// Number of times tracing was aborted for this key.
     ///
@@ -753,26 +772,6 @@ impl WarmEnterState {
         }
     }
 
-    /// pyjitpl.py:2809 prepare_trace_segmenting — called when a trace is
-    /// too long and no inlinable function was found. Marks the green key
-    /// for force-finish on the next tracing attempt.
-    ///
-    /// RPython flow:
-    /// 1. trace_next_iteration(greenkey)     — boost counter
-    /// 2. mark_force_finish_tracing(greenkey) — set JC_FORCE_FINISH
-    /// 3. dont_trace_here(greenkey)           — set JC_DONT_TRACE_HERE
-    ///
-    /// Next tracing run sees FORCE_FINISH, segments the trace at 80% of
-    /// trace_limit via _create_segmented_trace_and_blackhole (GUARD_ALWAYS_FAILS).
-    pub fn prepare_trace_segmenting(&mut self, green_key_hash: u64) {
-        // warmstate.py:2819: trace_next_iteration
-        self.trace_next_iteration(green_key_hash);
-        // warmstate.py:2820: mark_force_finish_tracing
-        self.mark_force_finish_tracing(green_key_hash);
-        // warmstate.py:2822: dont_trace_here
-        self.disable_noninlinable_function(green_key_hash);
-    }
-
     /// Install a compiled loop token for a green key.
     ///
     /// The cell transitions to Compiled state and takes ownership of
@@ -833,10 +832,20 @@ impl WarmEnterState {
     }
 
     /// Get a reference to the compiled loop token for a green key.
+    ///
+    /// `warmstate.py:191-196 get_procedure_token` parity: returns `None`
+    /// when the cell has no procedure token AND when the token has been
+    /// invalidated (`token and not token.invalidated`).  Pyre routes
+    /// through `BaseJitCell::get_procedure_token` (which applies the
+    /// `is_invalidated` filter) so every entry-path consumer of the
+    /// "current compiled token at this key" sees the same filtered view
+    /// PyPy provides — invalidated tokens never reach the warm-entry
+    /// runner, the CALL_ASSEMBLER inline gate, or the bridge stitch
+    /// surface.
     pub fn get_compiled(&self, green_key_hash: u64) -> Option<&Arc<JitCellToken>> {
         self.cells
             .get(&green_key_hash)
-            .and_then(|cell| cell.loop_token.as_ref())
+            .and_then(|cell| cell.get_procedure_token())
     }
 
     /// warmstate.py:191-196 `get_procedure_token`.
@@ -1238,23 +1247,15 @@ impl WarmEnterState {
         cell.flags |= jc_flags::FORCE_FINISH;
     }
 
+    /// warmstate.py:439 `bool(cell.flags & JC_FORCE_FINISH)` — read the sticky
+    /// segmenting flag at loop entry.  RPython never clears this flag
+    /// explicitly: `should_remove_jitcell` (warmstate.py:222) keeps the cell
+    /// alive while it is set, and once set it persists until the cell itself
+    /// is removed.
     pub fn should_force_finish_tracing(&self, green_key_hash: u64) -> bool {
         self.cells
             .get(&green_key_hash)
             .is_some_and(|cell| cell.flags & jc_flags::FORCE_FINISH != 0)
-    }
-
-    /// Consume the one-shot segmented-trace request for `green_key_hash`.
-    ///
-    /// Mirrors how RPython's `mark_force_finish_tracing()` affects the next
-    /// tracing run only.
-    pub fn take_force_finish_tracing(&mut self, green_key_hash: u64) -> bool {
-        let Some(cell) = self.cells.get_mut(&green_key_hash) else {
-            return false;
-        };
-        let was_set = cell.flags & jc_flags::FORCE_FINISH != 0;
-        cell.flags &= !jc_flags::FORCE_FINISH;
-        was_set
     }
 
     /// Boost the current loop/function green key so the next execution

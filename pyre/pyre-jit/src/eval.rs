@@ -2627,6 +2627,7 @@ fn handle_fail(
     _green_key: u64,
     trace_id: u64,
     fail_index: u32,
+    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
     should_bridge: bool,
     owning_key: u64,
     descr_addr: usize,
@@ -2652,9 +2653,7 @@ fn handle_fail(
             let compiled = {
                 let _plain = pyre_interpreter::call::force_plain_eval();
                 crate::call_jit::trace_and_compile_from_bridge(
-                    owning_key,
-                    trace_id,
-                    fail_index,
+                    descr_arc,
                     frame,
                     raw_values,
                     exit_layout,
@@ -2883,6 +2882,7 @@ fn execute_assembler(
         DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,
+            ref descr_arc,
             should_bridge,
             owning_key,
             descr_addr,
@@ -2894,6 +2894,7 @@ fn execute_assembler(
                 green_key,
                 trace_id,
                 fail_index,
+                descr_arc,
                 should_bridge,
                 owning_key,
                 descr_addr,
@@ -3124,6 +3125,7 @@ fn bound_reached(
         if let DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,
+            ref descr_arc,
             should_bridge,
             owning_key,
             descr_addr,
@@ -3136,6 +3138,7 @@ fn bound_reached(
                 green_key,
                 trace_id,
                 fail_index,
+                descr_arc,
                 should_bridge,
                 owning_key,
                 descr_addr,
@@ -3292,6 +3295,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         if let DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,
+            ref descr_arc,
             should_bridge,
             owning_key,
             descr_addr,
@@ -3304,6 +3308,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 green_key,
                 trace_id,
                 fail_index,
+                descr_arc,
                 should_bridge,
                 owning_key,
                 descr_addr,

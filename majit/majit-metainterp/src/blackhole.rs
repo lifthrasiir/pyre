@@ -2052,27 +2052,9 @@ impl BlackholeInterpreter {
             jitcode::BC_INT_ADD => self.bh_binop_i(OpCode::IntAdd),
             jitcode::BC_INT_SUB => self.bh_binop_i(OpCode::IntSub),
             jitcode::BC_INT_MUL => self.bh_binop_i(OpCode::IntMul),
-            // Upstream `blackhole.py` has no `bhimpl_int_floordiv` /
-            // `bhimpl_int_mod`: `jtransform.py:575-577` rewrites both
-            // primitives to `direct_call(ll_int_py_*)` before jitcode
-            // emission, so the bytecode never appears in real RPython
-            // jitcodes.  Pyre's β' redirect at
-            // `majit-translate/src/codegen.rs::generated_binary_int_value`
-            // covers the runtime trace path; Slice 4 + Slice 5 + the
-            // sibling pyjitpl arm trap producers earlier in the chain.
-            // Reaching this dispatch arm in the BH interpreter means
-            // the upstream-absent `BC_INT_FLOORDIV` / `BC_INT_MOD` byte
-            // somehow got into a jitcode array — fail loud immediately.
-            jitcode::BC_INT_FLOORDIV => panic!(
-                "BC_INT_FLOORDIV reached blackhole::run; upstream `blackhole.py` has no \
-                 `bhimpl_int_floordiv` (rewritten to `direct_call(ll_int_py_div)` at \
-                 `jtransform.py:576`).  See Task #97 for the deletion sequence."
-            ),
-            jitcode::BC_INT_MOD => panic!(
-                "BC_INT_MOD reached blackhole::run; upstream `blackhole.py` has no \
-                 `bhimpl_int_mod` (rewritten to `direct_call(ll_int_py_mod)` at \
-                 `jtransform.py:577`).  See Task #97 for the deletion sequence."
-            ),
+            // `int_floordiv` / `int_mod` have no `bhimpl_*` upstream:
+            // `jtransform.py:575-577` rewrites both to
+            // `direct_call(ll_int_py_*)` before jitcode emission.
             jitcode::BC_INT_AND => self.bh_binop_i(OpCode::IntAnd),
             jitcode::BC_INT_OR => self.bh_binop_i(OpCode::IntOr),
             jitcode::BC_INT_XOR => self.bh_binop_i(OpCode::IntXor),

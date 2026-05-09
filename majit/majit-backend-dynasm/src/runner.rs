@@ -1878,6 +1878,8 @@ impl Backend for DynasmBackend {
         majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
+        let descr_addr = Arc::as_ptr(&descr) as usize;
+        let descr_arc: Arc<dyn FailDescr> = descr.clone();
         majit_backend::RawExecResult {
             outputs,
             typed_outputs,
@@ -1890,13 +1892,79 @@ impl Backend for DynasmBackend {
             is_finish: descr.is_finish,
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception,
             status: descr.get_status(),
-            descr_addr: Arc::as_ptr(&descr) as usize,
+            descr_addr,
+            descr_arc,
         }
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
         &*data.fail_descr
+    }
+
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr> {
+        let data = frame.data.downcast_ref::<FrameData>().unwrap();
+        Arc::clone(&data.fail_descr) as Arc<dyn FailDescr>
+    }
+
+    /// `fail_descr_registry` is the `addr → Arc<DynasmFailDescr>` table
+    /// populated by `register_fail_descrs` at compile time, keeping every
+    /// emitted descr alive for the lifetime of its owning compiled code
+    /// (mirroring RPython's `cpu` retaining descr objects).  Returning the
+    /// upcast `Arc<dyn FailDescr>` lets the CA bridge entry route descr
+    /// identity into `_trace_and_compile_from_bridge` (compile.py:704-709)
+    /// without going through the `(trace_id, fail_index)` surrogate key.
+    fn free_loop(&mut self, token: &JitCellToken) {
+        // memmgr.py:9 `MemoryManager.alive_loops` parity: when a JCT is
+        // evicted, RPython's GC reclaims the token's compiled code and
+        // every dependent FailDescr naturally because nothing keeps a
+        // strong ref past `alive_loops`.  Pyre's `fail_descr_registry`
+        // holds strong Arcs to every emitted descr for the C-ABI
+        // recovery path (`fail_descr_arc_from_addr` parity with
+        // `cpu.get_latest_descr`), so we must explicitly release the
+        // entries belonging to this token here — otherwise the descrs
+        // (and their `rd_loop_token_clt` chain) outlive their owning
+        // loop and pyre keeps memory PyPy would have freed.
+        //
+        // Sweep entries whose owning-JCT upgrade points back at this
+        // token. Ownerless entries (`descr_owning_jct == None`) are
+        // PRESERVED: in PyPy these correspond to FINISH descrs
+        // (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
+        // `compile.py:185` skipped via `isinstance(descr, ResumeDescr)`)
+        // which are module-level singletons not subject to per-loop GC.
+        // Treating `None` as "delete" would over-shoot PyPy's lifetime
+        // contract.
+        let mut registry = self
+            .fail_descr_registry
+            .lock()
+            .expect("fail_descr_registry mutex poisoned");
+        registry.retain(|_, descr| {
+            let dyn_descr: &dyn FailDescr = descr.as_ref();
+            match majit_backend::descr_owning_jct(dyn_descr) {
+                Some(owner) => owner.number != token.number,
+                None => true,
+            }
+        });
+    }
+
+    fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> Arc<dyn FailDescr> {
+        // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity: the
+        // dynasm registry holds a strong Arc for every emitted DynasmFailDescr
+        // through its full lifetime, so a `descr_addr` arriving from the
+        // C-ABI guard-fail path is always present in the table.  A miss
+        // is an invariant violation, not a recoverable runtime mode.
+        let registry = self
+            .fail_descr_registry
+            .lock()
+            .expect("fail_descr_registry mutex poisoned");
+        let descr = registry.get(&descr_addr).cloned().unwrap_or_else(|| {
+            panic!(
+                "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
+                 fail_descr_registry — every emitted DynasmFailDescr must be \
+                 registered before its address reaches the C-ABI guard-fail boundary"
+            )
+        });
+        descr as Arc<dyn FailDescr>
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {

@@ -32,7 +32,6 @@
 //! | `int_<binop>/ii>i`  | PARITY        | int_add/int_sub/int_mul/int_and/int_or/int_xor/int_lshift/int_rshift + comparisons int_eq/int_ne/int_lt/int_le/int_gt/int_ge (14 ops). Reads two `i`-coded regs, records `OpCode::Int<Binop>` with `[a, b]`, writes recorder result into dst (`pyjitpl.py:279-336`). Mixed shapes such as `int_lshift/ri>i` stay unwired: those are Task #85 kind-flow bugs and must stay unsupported. |
 //! | `float_<binop>/ff>f` + `float_neg/f>f` | PARITY | float_add/float_sub/float_truediv binops + float_neg unary (4 ops total — float_mul, float comparisons, float_abs all absent from codewriter today, would land mechanically when emitted). Read on `registers_f` bank, record `OpCode::Float<Binop>`, write dst (`pyjitpl.py:284-292`). |
 //! | `int_neg/i>i`, `int_invert/i>i` | PARITY | unary i→i ops via `unop_int_record`. RPython `pyjitpl.py:356-368` exec-generated unary opimpls. `int_same_as/i>i` has a dormant walker arm for forward-prep, but the generated table should not contain it because RPython `jtransform.py:246 rewrite_op_same_as` removes `same_as` before assembly. |
-//! | `int_mod/ii>i` | PARITY | binary modulo via `binop_int_record`. RPython `pyjitpl.py:279 int_mod` exec-generated binop. `int_div/ii>i` intentionally absent — pyre-specific opname (RPython is `int_floordiv`). |
 //! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py:357 cast_int_to_float` (same exec-generated unary opimpl loop). |
 //! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls (b1 is b2 fast path omitted, same rationale as int comparisons). |
 //! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow Task #85) stays unsupported. |
@@ -3514,24 +3513,10 @@ fn handle(
         "int_neg/i>i" => unop_int_record(code, op, ctx, OpCode::IntNeg),
         "int_invert/i>i" => unop_int_record(code, op, ctx, OpCode::IntInvert),
         "int_same_as/i>i" => unop_int_record(code, op, ctx, OpCode::SameAsI),
-        // `int_mod/ii>i` and the absent `int_floordiv/ii>i` are upstream
-        // residual_call rewrites — `jtransform.py:575-577` replaces
-        // both with `direct_call(ll_int_py_*)` so the bare bytecodes
-        // never appear in real RPython jitcodes.  Pyre's β' redirect
-        // at `majit-translate/src/codegen.rs::generated_binary_int_value`
-        // (Task #94a-1) covers the runtime trace path; Slice 4-6
-        // (Task #97) trapped the SSARepr producer, `record_binop_i`,
-        // and the pyjitpl/blackhole BC dispatchers.  This walker arm
-        // closes the loop: any future regression that emits an
-        // `int_mod/ii>i` byte and reaches this dispatcher panics
-        // immediately instead of silently recording an upstream-absent
-        // `IntMod` op.
-        "int_mod/ii>i" => panic!(
-            "int_mod/ii>i reached jitcode_dispatch::walk; upstream `jtransform.py:577` \
-             rewrites this to `direct_call(ll_int_py_mod)` and pyre routes via the β' \
-             redirect at codegen.rs::generated_binary_int_value (Task #94a-1).  \
-             See Task #97 for the deletion sequence."
-        ),
+        // `int_floordiv/ii>i` and `int_mod/ii>i` intentionally absent:
+        // `jtransform.py:575-577` rewrites both to
+        // `direct_call(ll_int_py_*)` before jitcode emission, so neither
+        // opname is registered in the insns table.
         "cast_int_to_float/i>f" => cast_int_to_float_record(code, op, ctx),
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
@@ -5629,7 +5614,6 @@ mod tests {
             "int_neg/i>i",
             "int_invert/i>i",
             "int_same_as/i>i",
-            "int_mod/ii>i",
             "cast_int_to_float/i>f",
             "ptr_eq/rr>i",
             "ptr_ne/rr>i",
@@ -6517,22 +6501,6 @@ mod tests {
             "`int_same_as/i>i` appeared in the generated insns table; \
              verify same_as elimination before adding a decode test"
         );
-    }
-
-    /// Slice 7 retired the dispatcher arm.  Upstream
-    /// `jtransform.py:577` rewrites `int_mod` to
-    /// `direct_call(ll_int_py_mod)` before jitcode emission, so the
-    /// bare `int_mod/ii>i` bytecode never appears in production
-    /// jitcodes; pyre's β' redirect at
-    /// `majit-translate/src/codegen.rs::generated_binary_int_value`
-    /// (Task #94a-1) routes the trace through `CallI` and Slice 4-6
-    /// trapped every upstream producer.  This test now verifies the
-    /// fail-loud trap fires when a synthetic byte stream reaches the
-    /// dispatcher.
-    #[test]
-    #[should_panic(expected = "int_mod/ii>i reached jitcode_dispatch::walk")]
-    fn int_mod_dispatcher_now_fails_loud() {
-        drive_int_binop("int_mod/ii>i", majit_ir::OpCode::IntMod);
     }
 
     #[test]

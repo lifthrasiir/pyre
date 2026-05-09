@@ -121,6 +121,13 @@ impl crate::Backend for SyntheticCpu {
         unreachable!("SyntheticCpu does not produce DeadFrames; get_latest_descr unreachable")
     }
 
+    fn get_latest_descr_arc(
+        &self,
+        _frame: &crate::DeadFrame,
+    ) -> std::sync::Arc<dyn majit_ir::FailDescr> {
+        unreachable!("SyntheticCpu does not produce DeadFrames; get_latest_descr_arc unreachable")
+    }
+
     fn get_int_value(&self, _frame: &crate::DeadFrame, _index: usize) -> i64 {
         unreachable!("SyntheticCpu does not produce DeadFrames; get_int_value unreachable")
     }

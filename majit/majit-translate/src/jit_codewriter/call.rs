@@ -77,16 +77,24 @@ pub struct AnalysisCache {
 /// RPython: readwrite_analyzer.analyze(op) return value.
 ///
 /// Represents the set of read/write effects collected from graph traversal.
-/// RPython uses a set of tuples like ("struct", T, fieldname); we use bitsets.
-/// This is passed as the first argument to effectinfo_from_writeanalyze(),
-/// matching RPython's `effects` parameter (effectinfo.py:276).
+/// RPython uses a set of tuples like `("struct", T, fieldname)` and
+/// `compute_bitstrings(all_descrs)` (`effectinfo.py:465`) materializes
+/// the EffectInfo bitstrings at the end via
+/// `bitstring.make_bitstring([descr.ei_index for descr in set])`.  Pyre
+/// telescopes that pipeline by collecting the per-descr `ei_index`
+/// values directly (DescrIndexRegistry already holds them); each `Vec<u32>`
+/// is the running equivalent of one of PyPy's `_readonly_*`/`_write_*`
+/// frozensets, deduped + sorted at conversion time.  Storing as `Vec<u32>`
+/// rather than `u64` removes the 64-descr ceiling so bitstrings scale
+/// with the global descr count, matching PyPy's arbitrary-length
+/// `bitstring.py:3-13 make_bitstring` output.
 pub struct WriteAnalysis {
-    pub read_fields: u64,
-    pub write_fields: u64,
-    pub read_arrays: u64,
-    pub write_arrays: u64,
-    pub read_interiorfields: u64,
-    pub write_interiorfields: u64,
+    pub read_fields: Vec<u32>,
+    pub write_fields: Vec<u32>,
+    pub read_arrays: Vec<u32>,
+    pub write_arrays: Vec<u32>,
+    pub read_interiorfields: Vec<u32>,
+    pub write_interiorfields: Vec<u32>,
     pub array_write_descrs: Vec<majit_ir::descr::DescrRef>,
     /// RPython: `effects is top_set` — unanalyzable (random effects).
     pub is_top: bool,
@@ -721,11 +729,16 @@ pub struct DescrIndexRegistry {
 }
 
 impl DescrIndexRegistry {
-    /// RPython: `cpu.fielddescrof(T, fieldname).get_ei_index()`
+    /// RPython: `cpu.fielddescrof(T, fieldname).get_ei_index()`.
+    ///
+    /// Returns the unbounded per-descr `ei_index` matching PyPy's
+    /// `bitstring.py:3-13 make_bitstring(lst)` — the bitstring length
+    /// scales with the maximum index, not capped at any width
+    /// (`effectinfo.py:465 compute_bitstrings`).
     pub fn field_index(&mut self, owner_root: &Option<String>, field_name: &str) -> u32 {
         let key = (owner_root.clone(), field_name.to_string());
         *self.field_indices.entry(key).or_insert_with(|| {
-            let idx = self.next_field_index % 64;
+            let idx = self.next_field_index;
             self.next_field_index += 1;
             idx
         })
@@ -741,7 +754,7 @@ impl DescrIndexRegistry {
     pub fn array_index(&mut self, item_ty_discriminant: u8, array_type_id: &Option<String>) -> u32 {
         let key = (item_ty_discriminant, array_type_id.clone());
         *self.array_indices.entry(key).or_insert_with(|| {
-            let idx = self.next_array_index % 64;
+            let idx = self.next_array_index;
             self.next_array_index += 1;
             idx
         })
@@ -756,7 +769,7 @@ impl DescrIndexRegistry {
     pub fn interiorfield_index(&mut self, array_type_id: &Option<String>, field_name: &str) -> u32 {
         let key = (array_type_id.clone(), field_name.to_string());
         *self.interiorfield_indices.entry(key).or_insert_with(|| {
-            let idx = self.next_interiorfield_index % 64;
+            let idx = self.next_interiorfield_index;
             self.next_interiorfield_index += 1;
             idx
         })
@@ -3127,12 +3140,12 @@ fn analyze_readwrite(
     descr_indices: &mut DescrIndexRegistry,
 ) -> WriteAnalysis {
     let mut analysis = WriteAnalysis {
-        read_fields: 0,
-        write_fields: 0,
-        read_arrays: 0,
-        write_arrays: 0,
-        read_interiorfields: 0,
-        write_interiorfields: 0,
+        read_fields: Vec::new(),
+        write_fields: Vec::new(),
+        read_arrays: Vec::new(),
+        write_arrays: Vec::new(),
+        read_interiorfields: Vec::new(),
+        write_interiorfields: Vec::new(),
         array_write_descrs: Vec::new(),
         is_top: false,
     };
@@ -3171,12 +3184,12 @@ fn analyze_readwrite_indirect_family(
     descr_indices: &mut DescrIndexRegistry,
 ) -> WriteAnalysis {
     let mut analysis = WriteAnalysis {
-        read_fields: 0,
-        write_fields: 0,
-        read_arrays: 0,
-        write_arrays: 0,
-        read_interiorfields: 0,
-        write_interiorfields: 0,
+        read_fields: Vec::new(),
+        write_fields: Vec::new(),
+        read_arrays: Vec::new(),
+        write_arrays: Vec::new(),
+        read_interiorfields: Vec::new(),
+        write_interiorfields: Vec::new(),
         array_write_descrs: Vec::new(),
         is_top: false,
     };
@@ -3259,10 +3272,12 @@ fn effectinfo_from_writeanalyze(
     }
 
     // effectinfo.py:345-360: readonly = reads that have NO corresponding write.
-    let readonly_descrs_fields = effects.read_fields & !effects.write_fields;
-    let readonly_descrs_arrays = effects.read_arrays & !effects.write_arrays;
+    // PyPy semantics: `tupw not in effects` — set difference at the per-tuple
+    // level.  Pyre operates on the descr-index lift of the same sets.
+    let readonly_descrs_fields = subtract_index_set(&effects.read_fields, &effects.write_fields);
+    let readonly_descrs_arrays = subtract_index_set(&effects.read_arrays, &effects.write_arrays);
     let readonly_descrs_interiorfields =
-        effects.read_interiorfields & !effects.write_interiorfields;
+        subtract_index_set(&effects.read_interiorfields, &effects.write_interiorfields);
 
     let mut write_descrs_fields = effects.write_fields;
     let mut write_descrs_arrays = effects.write_arrays;
@@ -3277,9 +3292,9 @@ fn effectinfo_from_writeanalyze(
             | ExtraEffect::ElidableCanRaise
             | ExtraEffect::LoopInvariant
     ) {
-        write_descrs_fields = 0;
-        write_descrs_arrays = 0;
-        write_descrs_interiorfields = 0;
+        write_descrs_fields.clear();
+        write_descrs_arrays.clear();
+        write_descrs_interiorfields.clear();
         array_write_descrs.clear();
     }
 
@@ -3301,12 +3316,16 @@ fn effectinfo_from_writeanalyze(
     EffectInfo {
         extraeffect,
         oopspecindex,
-        readonly_descrs_fields: Some(u64_to_bitstring(readonly_descrs_fields)),
-        write_descrs_fields: Some(u64_to_bitstring(write_descrs_fields)),
-        readonly_descrs_arrays: Some(u64_to_bitstring(readonly_descrs_arrays)),
-        write_descrs_arrays: Some(u64_to_bitstring(write_descrs_arrays)),
-        readonly_descrs_interiorfields: Some(u64_to_bitstring(readonly_descrs_interiorfields)),
-        write_descrs_interiorfields: Some(u64_to_bitstring(write_descrs_interiorfields)),
+        readonly_descrs_fields: Some(majit_ir::bitstring::make_bitstring(&readonly_descrs_fields)),
+        write_descrs_fields: Some(majit_ir::bitstring::make_bitstring(&write_descrs_fields)),
+        readonly_descrs_arrays: Some(majit_ir::bitstring::make_bitstring(&readonly_descrs_arrays)),
+        write_descrs_arrays: Some(majit_ir::bitstring::make_bitstring(&write_descrs_arrays)),
+        readonly_descrs_interiorfields: Some(majit_ir::bitstring::make_bitstring(
+            &readonly_descrs_interiorfields,
+        )),
+        write_descrs_interiorfields: Some(majit_ir::bitstring::make_bitstring(
+            &write_descrs_interiorfields,
+        )),
         single_write_descr_array,
         extradescrs: None,
         can_invalidate,
@@ -3315,16 +3334,22 @@ fn effectinfo_from_writeanalyze(
     }
 }
 
-/// Translate a `WriteAnalysis` u64 accumulator (bit `n` set ↔ descr index
-/// `n` touched) into the `bitstring.py:3-13` byte representation that
-/// `EffectInfo.bitstring_*` consumers expect.
-fn u64_to_bitstring(mask: u64) -> Vec<u8> {
-    let bytes = mask.to_le_bytes();
-    let mut len = bytes.len();
-    while len > 0 && bytes[len - 1] == 0 {
-        len -= 1;
-    }
-    bytes[..len].to_vec()
+/// `effectinfo.py:345-360` set difference (`tupw not in effects`).
+///
+/// Returns the deduped sorted list of indices in `read` that have no
+/// matching entry in `write`.  PyPy's reference implementation works on
+/// frozensets of descr objects; pyre operates on the descr-index lift
+/// already produced by `DescrIndexRegistry`.
+fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
+    let write_set: std::collections::HashSet<u32> = write.iter().copied().collect();
+    let mut diff: Vec<u32> = read
+        .iter()
+        .copied()
+        .filter(|idx| !write_set.contains(idx))
+        .collect();
+    diff.sort_unstable();
+    diff.dedup();
+    diff
 }
 
 /// RPython: `op.args[0].concretetype` — resolve full ARRAY identity.
@@ -3459,13 +3484,13 @@ fn collect_readwrite_effects(
     cc: &CallControl,
     descr_indices: &mut DescrIndexRegistry,
     seen: &mut HashSet<CallPath>,
-    read_fields: &mut u64,
-    write_fields: &mut u64,
-    read_arrays: &mut u64,
-    write_arrays: &mut u64,
-    // effectinfo.py:313-325: interiorfield descriptor bitsets.
-    read_interiorfields: &mut u64,
-    write_interiorfields: &mut u64,
+    read_fields: &mut Vec<u32>,
+    write_fields: &mut Vec<u32>,
+    read_arrays: &mut Vec<u32>,
+    write_arrays: &mut Vec<u32>,
+    // effectinfo.py:313-325: interiorfield descriptor sets.
+    read_interiorfields: &mut Vec<u32>,
+    write_interiorfields: &mut Vec<u32>,
     // effectinfo.py:201-206: collect actual array write DescrRefs
     // for single_write_descr_array population.
     array_write_descrs: &mut Vec<majit_ir::descr::DescrRef>,
@@ -3520,12 +3545,12 @@ fn collect_readwrite_effects(
                 OpKind::FieldRead { field, .. } => {
                     // RPython: cpu.fielddescrof(T, fieldname).get_ei_index()
                     let idx = descr_indices.field_index(&field.owner_root, &field.name);
-                    *read_fields |= 1u64 << idx;
+                    read_fields.push(idx);
                 }
                 // RPython: ("struct", T, fieldname)
                 OpKind::FieldWrite { field, .. } => {
                     let idx = descr_indices.field_index(&field.owner_root, &field.name);
-                    *write_fields |= 1u64 << idx;
+                    write_fields.push(idx);
                 }
                 // RPython: ("readarray", T)
                 OpKind::ArrayRead {
@@ -3544,7 +3569,7 @@ fn collect_readwrite_effects(
                     );
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
-                    *read_arrays |= 1u64 << idx;
+                    read_arrays.push(idx);
                 }
                 // RPython: ("array", T)
                 OpKind::ArrayWrite {
@@ -3562,7 +3587,7 @@ fn collect_readwrite_effects(
                     );
                     let idx =
                         descr_indices.array_index(value_type_discriminant(item_ty), &resolved_id);
-                    *write_arrays |= 1u64 << idx;
+                    write_arrays.push(idx);
                     // RPython: effectinfo.py:307-311 — cpu.arraydescrof(ARRAY).
                     // Dedup by descriptor index (frozenset semantics).
                     if !array_write_descrs.iter().any(|d| d.index() == idx) {
@@ -3598,7 +3623,7 @@ fn collect_readwrite_effects(
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
-                    *read_interiorfields |= 1u64 << ifield_idx;
+                    read_interiorfields.push(ifield_idx);
                     // effectinfo.py:327-340: implicit array read.
                     // RPython: cpu.arraydescrof(ARRAY) uses get_type_flag(ARRAY.OF).
                     // Interior fields only exist in struct arrays → element type is Ref.
@@ -3606,7 +3631,7 @@ fn collect_readwrite_effects(
                         value_type_discriminant(&crate::model::ValueType::Ref),
                         &resolved_id,
                     );
-                    *read_arrays |= 1u64 << arr_idx;
+                    read_arrays.push(arr_idx);
                 }
                 // RPython: ("interiorfield", T, fieldname)
                 // effectinfo.py:349-350: records interiorfield descriptor.
@@ -3627,14 +3652,14 @@ fn collect_readwrite_effects(
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
-                    *write_interiorfields |= 1u64 << ifield_idx;
+                    write_interiorfields.push(ifield_idx);
                     // effectinfo.py:327-340: implicit array write.
                     // RPython: cpu.arraydescrof(ARRAY) — struct arrays are always Ref.
                     let arr_idx = descr_indices.array_index(
                         value_type_discriminant(&crate::model::ValueType::Ref),
                         &resolved_id,
                     );
-                    *write_arrays |= 1u64 << arr_idx;
+                    write_arrays.push(arr_idx);
                 }
                 // Recursive: follow calls.
                 OpKind::Call { target, .. } => {

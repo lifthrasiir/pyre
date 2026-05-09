@@ -756,11 +756,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.front_target_inputarg_types(green_key)
     }
 
-    /// Get the compiled loop's num_inputs (after preamble patching).
-    pub fn get_compiled_num_inputs(&self, green_key: u64) -> Option<usize> {
-        self.meta.get_compiled_num_inputs(green_key)
-    }
-
     /// RPython resume_in_blackhole parity: resume execution from the guard
     /// failure point using the blackhole interpreter.
     pub fn blackhole_guard_failure(
@@ -1820,6 +1815,7 @@ impl<S: JitState> JitDriver<S> {
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
             let descr_addr = result.descr_addr;
+            let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             drop(result);
 
             // must_compile tick for bridge threshold counting.
@@ -1832,18 +1828,14 @@ impl<S: JitState> JitDriver<S> {
                     raw_values.len()
                 );
             }
-            let guard_loop_key = if exit_layout.rd_loop_token != 0 {
+            let fallback_green_key = if exit_layout.rd_loop_token != 0 {
                 exit_layout.rd_loop_token
             } else {
                 green_key
             };
-            let (must_compile, owning_key) = self.meta.must_compile_with_values(
-                guard_loop_key,
-                trace_id,
-                fail_index,
-                &raw_values,
-                descr_addr,
-            );
+            let (must_compile, owning_key) =
+                self.meta
+                    .must_compile_with_values(&descr_arc, &raw_values, fallback_green_key);
             // compile.py:702-703: must_compile() and not stack_almost_full().
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
@@ -1857,15 +1849,8 @@ impl<S: JitState> JitDriver<S> {
 
             if should_bridge {
                 // compile.py:704-709: _trace_and_compile_from_bridge
-                let bridge_ok = self.start_bridge_tracing(
-                    owning_key,
-                    trace_id,
-                    fail_index,
-                    state,
-                    env,
-                    &raw_values,
-                    guard_resume_pc,
-                );
+                let bridge_ok =
+                    self.start_bridge_tracing(&descr_arc, state, env, &raw_values, guard_resume_pc);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
@@ -2262,7 +2247,16 @@ impl<S: JitState> JitDriver<S> {
         descriptor: Option<&JitDriverStaticData>,
         mut live_values: Vec<Value>,
     ) -> Option<Vec<Value>> {
-        let compiled_inputs = self.meta.get_compiled_num_inputs(green_key)?;
+        // `warmstate.py:188 cell.loop_token` is the single PyPy source of
+        // truth for the entry-path inputarg shape; route through
+        // `warm_state.get_compiled` so this site never consults pyre's
+        // `compiled_loops` side table (the F.7-orthodox retirement target).
+        let compiled_inputs = self
+            .meta
+            .warm_state_ref()
+            .get_compiled(green_key)?
+            .inputarg_types
+            .len();
         if compiled_inputs <= live_values.len() {
             return Some(live_values);
         }
@@ -2840,6 +2834,7 @@ impl<S: JitState> JitDriver<S> {
         let exit_meta = result.meta.clone();
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
+        let descr_arc = std::sync::Arc::clone(&result.descr_arc);
         let exit_layout = result.exit_layout.clone();
         let typed_values = result.typed_values.clone();
         let raw_values = result.values.clone();
@@ -2868,18 +2863,14 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py:701-717 handle_fail / must_compile: single tick+check.
-        let guard_loop_key = if exit_layout.rd_loop_token != 0 {
+        let fallback_green_key = if exit_layout.rd_loop_token != 0 {
             exit_layout.rd_loop_token
         } else {
             green_key
         };
-        let (must_compile, owning_key) = self.meta.must_compile_with_values(
-            guard_loop_key,
-            trace_id,
-            fail_index,
-            &raw_values,
-            descr_addr,
-        );
+        let (must_compile, owning_key) =
+            self.meta
+                .must_compile_with_values(&descr_arc, &raw_values, fallback_green_key);
         // compile.py:702-703: must_compile() and not stack_almost_full().
         let should_bridge =
             must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
@@ -2889,6 +2880,7 @@ impl<S: JitState> JitDriver<S> {
         DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,
+            descr_arc,
             should_bridge,
             owning_key,
             descr_addr,
@@ -3037,14 +3029,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta
             .compiled_loops
             .retain(|_, entry| entry.root_trace_id != trace_id);
-    }
-
-    /// Remove the compiled entry for a specific green key.
-    /// Unlike invalidate_loop (which flags the token), this removes the
-    /// entry entirely so both has_compiled_loop and has_compiled_targets
-    /// return false, allowing recompilation.
-    pub fn remove_compiled_loop(&mut self, green_key: u64) {
-        self.meta.compiled_loops.remove(&green_key);
     }
 
     /// warmspot.py:449 — set the per-driver result_type.
@@ -3307,14 +3291,29 @@ impl<S: JitState> JitDriver<S> {
     /// `resume_pc` is where interpretation resumes after the guard failure.
     pub fn start_bridge_tracing(
         &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
+        // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+        // threads the descr (`resumedescr`) as the canonical bridge-source
+        // identity.  The pyre backend FailDescr Arc plays the same role —
+        // `descr_owning_jct(arc).green_key`, `arc.trace_id()` and
+        // `arc.fail_index_per_trace()` are the line-by-line readers — so
+        // start_bridge_tracing now consumes the descr Arc directly and
+        // derives the legacy surrogate triple internally.
+        descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
         state: &mut S,
         env: &S::Env,
         raw_fail_values: &[i64],
         resume_pc: usize,
     ) -> bool {
+        // compile.py:725-729 `_trace_and_compile_from_bridge` raises
+        // `compile.giveup()` when the descr's owning JitCellToken weakref
+        // is dead (memmgr-evicted).  Pyre signals the same outcome by
+        // returning false.
+        let Some(jct) = majit_backend::descr_owning_jct(descr_arc.as_ref()) else {
+            return false;
+        };
+        let green_key = jct.green_key;
+        let trace_id = descr_arc.trace_id();
+        let fail_index = descr_arc.fail_index_per_trace();
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             return false;
         };
@@ -3568,7 +3567,7 @@ impl<S: JitState> JitDriver<S> {
             let typed_values = result.typed_values;
             let raw_values = result.values;
             let exit_layout = result.exit_layout;
-            let descr_addr = result.descr_addr;
+            let descr_arc = result.descr_arc.clone();
 
             if is_finish || fail_index == u32::MAX {
                 state.restore_values(&result_meta, &typed_values);
@@ -3606,14 +3605,19 @@ impl<S: JitState> JitDriver<S> {
             //   else:
             //       resume_in_blackhole(...)
             //   assert 0, "unreachable"
-
-            let (must_compile, owning_key) = self.meta.must_compile_with_values(
-                key_hash,
-                trace_id,
-                fail_index,
-                &raw_values,
-                descr_addr,
-            );
+            //
+            // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr,
+            // deadframe)` reads the bridge source identity directly off
+            // `resumedescr` (`compile.py:707-708`
+            // `_trace_and_compile_from_bridge` chases
+            // `resumedescr.rd_loop_token.loop_token_wref()` for the
+            // owning JCT).  `must_compile_with_values` derives identity
+            // from `descr_arc` internally; `key_hash` is the fallback
+            // only when the JCT was evicted (`compile.py:725-729
+            // compile.giveup()` parity).
+            let (must_compile, owning_key) =
+                self.meta
+                    .must_compile_with_values(&descr_arc, &raw_values, key_hash);
             // compile.py:702-703: must_compile() and not stack_almost_full().
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
@@ -3633,15 +3637,8 @@ impl<S: JitState> JitDriver<S> {
                 materialize_pending_fields(&exit_layout, &raw_values);
                 self.sync_after(state, &result_meta, descriptor.as_ref());
 
-                let bridge_ok = self.start_bridge_tracing(
-                    owning_key,
-                    trace_id,
-                    fail_index,
-                    state,
-                    env,
-                    &raw_values,
-                    resume_pc,
-                );
+                let bridge_ok =
+                    self.start_bridge_tracing(&descr_arc, state, env, &raw_values, resume_pc);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[bridge] start_bridge_tracing key={} trace={} fail={} resume_pc={} ok={}",
@@ -4551,19 +4548,12 @@ mod tests {
             .meta
             .run_compiled_detailed(green_key, &[0])
             .expect("guard should fail");
-        let trace_id = failure.trace_id;
-        let fail_index = failure.fail_index;
         let fail_values = failure.values.clone();
+        let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
+        drop(failure);
 
-        let started = driver.start_bridge_tracing(
-            green_key,
-            trace_id,
-            fail_index,
-            &mut NonTraceableState,
-            &(),
-            &fail_values,
-            0,
-        );
+        let started =
+            driver.start_bridge_tracing(&descr_arc, &mut NonTraceableState, &(), &fail_values, 0);
         assert!(!started);
         assert!(!driver.meta.is_tracing());
     }

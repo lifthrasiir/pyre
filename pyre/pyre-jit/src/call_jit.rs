@@ -1667,9 +1667,7 @@ pub fn install_jit_call_bridge() {
 /// When rd_numb is available, uses ResumeDataDirectReader for exact
 /// frame decoding (resume.py:1312 parity).
 fn jit_blackhole_resume_from_guard(
-    green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
+    descr_addr: usize,
     fail_values_ptr: *const i64,
     num_fail_values: usize,
     raw_deadframe_ptr: *const i64,
@@ -1699,10 +1697,26 @@ fn jit_blackhole_resume_from_guard(
     } else {
         fail_values
     };
-    // `green_key == 0` is the giveup sentinel passed by the
-    // CALL_ASSEMBLER guard-failure helpers (compiler.rs:2674,
-    // dynasm/lib.rs:579) when `descr_owning_jct` returned `None`
-    // (memmgr-evicted weakref — pyjitpl.py:2898 should-be-rare path).
+
+    // compile.py:710-716 `resume_in_blackhole(descr, deadframe)` parity:
+    // recover the failed descr from `descr_addr` (history.py:125
+    // `cpu.get_latest_descr` is the C-ABI carrier) and derive
+    // (trace_id, fail_index) from descr identity.  The lookup is
+    // infallible — `Backend::fail_descr_arc_from_addr` panics on a
+    // registry miss, matching RPython's `cpu.get_latest_descr(deadframe)`
+    // (warmspot.py:1021) which has no failure mode.
+    use majit_backend::Backend;
+    let (driver, _) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let descr_arc = backend.fail_descr_arc_from_addr(descr_addr);
+    let trace_id = descr_arc.trace_id();
+    let fail_index = descr_arc.fail_index_per_trace();
+
+    // `descr_owning_jct == None` is the giveup signal: the descr's
+    // `rd_loop_token.loop_token_wref()` is dead (memmgr-evicted JCT —
+    // pyjitpl.py:2898 should-be-rare path). compile.giveup() raises
+    // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29) and falls
+    // through here.
     //
     // PRE-EXISTING-ADAPTATION (Pyre-only, Python-portal-specific):
     // pyre's resume storage is keyed by `(green_key, trace_id, fail_index)`,
@@ -1710,28 +1724,30 @@ fn jit_blackhole_resume_from_guard(
     // `resume_in_blackhole` uses descr identity directly (descr.rd_data),
     // so it has no such recovery problem.
     //
-    // The recovery exploits pyre's CALL_ASSEMBLER virtualizable layout
-    // `vable_boxes = [frame, ni, code, vsd, ns, locals..., stack...]`
-    // (call_jit.rs:2471-2472) — `fail_values[0]` IS the callee's
-    // `PyFrame*`, so `frame.pycode` plus `pc=0` reconstructs the
-    // entry green_key.  This contract is Python-portal-specific and
-    // would NOT hold for a non-virtualizable JIT or a portal whose
-    // first fail arg is a scalar.  Convergence: Phase E.3+ unification
-    // (Task #235) replaces `(green_key, trace_id, fail_index)` keying
-    // with descr identity — at which point this whole recovery block
-    // collapses.
-    let actual_green_key = if green_key == 0 && num_fail_values >= 1 {
-        let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
-        if !frame_ptr.is_null() {
-            let code = unsafe { (*frame_ptr).pycode };
-            crate::eval::make_green_key(code, 0)
-        } else {
-            green_key
-        }
-    } else {
-        green_key
-    };
-    let (driver, _) = crate::eval::driver_pair();
+    // When the JCT weakref is dead we exploit pyre's CALL_ASSEMBLER
+    // virtualizable layout `vable_boxes = [frame, ni, code, vsd, ns,
+    // locals..., stack...]` (call_jit.rs:2471-2472) — `fail_values[0]`
+    // IS the callee's `PyFrame*`, so `frame.pycode` plus `pc=0`
+    // reconstructs the entry green_key.  This contract is
+    // Python-portal-specific and would NOT hold for a non-virtualizable
+    // JIT or a portal whose first fail arg is a scalar.  Convergence:
+    // Phase E.3+ unification (Task #235) replaces `(green_key, trace_id,
+    // fail_index)` keying with descr identity — at which point this
+    // whole recovery block collapses.
+    let actual_green_key =
+        match majit_backend::descr_owning_jct(descr_arc.as_ref()).map(|j| j.green_key) {
+            Some(gk) => gk,
+            None if num_fail_values >= 1 => {
+                let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
+                if !frame_ptr.is_null() {
+                    let code = unsafe { (*frame_ptr).pycode };
+                    crate::eval::make_green_key(code, 0)
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -2184,6 +2200,34 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
     }
 }
 
+/// Derive the (`green_key`, `trace_id`, `fail_index`) bridge-source identity
+/// strictly from the failing guard's descr Arc.
+///
+/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr, deadframe)`
+/// reads identity from `resumedescr` directly: `resumedescr.rd_loop_token
+/// .loop_token_wref()` (line 2897) yields the owning `JitCellToken`,
+/// `resumedescr.get_resumestorage()` (line 2893) yields the `ResumeGuardDescr`
+/// carrying the per-trace `fail_index`, and `record_loop_or_bridge`
+/// (`compile.py:183-185`) stamps `trace_id` onto each `ResumeDescr`.
+/// Pyre's `descr_owning_jct(arc).green_key`, `arc.fail_index_per_trace()`
+/// and `arc.trace_id()` are the line-by-line equivalents — together they
+/// constitute the canonical bridge-source identity.
+///
+/// Returns `None` when the owning loop's `JitCellToken` weakref is dead
+/// (the loop was evicted by the memory manager): RPython raises
+/// `compile.giveup()` from `_trace_and_compile_from_bridge`
+/// (`compile.py:725-729`) in the same case, falling through to
+/// `resume_in_blackhole`.  Pyre's caller signals the same intent by
+/// returning `false` to drop into blackhole resume.
+fn bridge_source_identity_from_descr(
+    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+) -> Option<(u64, u64, u32)> {
+    let green_key = majit_backend::descr_owning_jct(descr_arc.as_ref())?.green_key;
+    let trace_id = descr_arc.trace_id();
+    let fail_index = descr_arc.fail_index_per_trace();
+    Some((green_key, trace_id, fail_index))
+}
+
 /// compile.py:714 (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -2204,15 +2248,37 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// falls through to resume_in_blackhole (RPython pyjitpl.py:2906-2907
 /// SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing).
 pub fn trace_and_compile_from_bridge(
-    green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
+    // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+    // threads `resumedescr` (the descr) as the canonical identity source
+    // through the entire bridge tracer.  Pyre's backend FailDescr Arc
+    // plays the same role: `descr_owning_jct(arc).green_key` (mirroring
+    // `pyjitpl.py:2897 resumedescr.rd_loop_token.loop_token_wref()`),
+    // `arc.fail_index_per_trace()` (mirroring `compile.py:854
+    // ResumeGuardDescr._attrs_`), and `arc.trace_id()` (mirroring the
+    // `compile.py:183-185 record_loop_or_bridge` stamp) are the line-by-
+    // line readers.  Both production callers — the general guard path
+    // (eval.rs `handle_fail`) and the CALL_ASSEMBLER bridge entry
+    // (call_jit.rs `jit_ca_handle_guard_failure`) — have an Arc available
+    // before reaching this function (T-CA + T-CA.cranelift gave both
+    // backends the `Backend::fail_descr_arc_from_addr` registry), so the
+    // surrogate `(green_key, trace_id, fail_index)` parameters retired
+    // in T-final.B.
+    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
     frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
 ) -> bool {
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
+
+    let Some((green_key, trace_id, fail_index)) = bridge_source_identity_from_descr(descr_arc)
+    else {
+        // compile.py:725-729 `_trace_and_compile_from_bridge` raises
+        // `compile.giveup()` when `loop_token` is None (memmgr-evicted).
+        // Pyre signals the same outcome by returning `false`, dropping
+        // the caller into `resume_in_blackhole` (pyjitpl.py:711).
+        return false;
+    };
 
     let info = {
         let (_, info) = crate::eval::driver_pair();
@@ -2300,15 +2366,7 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.start_bridge_tracing(
-            green_key,
-            trace_id,
-            fail_index,
-            &mut jit_state,
-            &env,
-            raw_values,
-            resume_pc,
-        )
+        driver.start_bridge_tracing(descr_arc, &mut jit_state, &env, raw_values, resume_pc)
     };
     if !started {
         if majit_metainterp::majit_log_enabled() {
@@ -2452,10 +2510,14 @@ pub fn trace_and_compile_from_bridge(
 /// compile.py:701-717 handle_fail for call_assembler guard failures.
 /// Checks must_compile (jitcounter.tick), and if threshold reached,
 /// traces the alternate path via trace_and_compile_from_bridge.
+///
+/// pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+/// — descr identity is the only argument crossing the C-ABI boundary;
+/// the receiver derives `(green_key, trace_id, fail_index)` from the
+/// recovered Arc, mirroring `compile.py:706-708 _trace_and_compile_
+/// from_bridge` which walks `resumedescr.rd_loop_token.loop_token_wref()`
+/// for the owning JCT.
 fn jit_ca_handle_guard_failure(
-    green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
     raw_values_ptr: *const i64,
     num_values: usize,
     descr_addr: usize,
@@ -2465,12 +2527,34 @@ fn jit_ca_handle_guard_failure(
     }
     let raw_values = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
 
+    // compile.py:706-708 _trace_and_compile_from_bridge.  Native CA code
+    // crosses the backend boundary with only the raw descr pointer; recover
+    // the backend FailDescr Arc before any guard-failure routing so identity
+    // is read from the descr just like PyPy reads `resumedescr`.  The
+    // lookup is infallible — `Backend::fail_descr_arc_from_addr` panics
+    // on a registry miss, matching RPython's `cpu.get_latest_descr(deadframe)`
+    // (warmspot.py:1021) which has no failure mode.  T-final.B made
+    // `trace_and_compile_from_bridge` itself descr-only.
+    let descr_arc = {
+        use majit_backend::Backend;
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp()
+            .backend()
+            .fail_descr_arc_from_addr(descr_addr)
+    };
+    let Some((source_green_key, source_trace_id, source_fail_index)) =
+        bridge_source_identity_from_descr(&descr_arc)
+    else {
+        return false;
+    };
+
     // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp_mut()
-            .must_compile_with_values(green_key, trace_id, fail_index, raw_values, descr_addr)
+            .must_compile_with_values(&descr_arc, raw_values, source_green_key)
     };
     // compile.py:702-703: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
@@ -2480,7 +2564,7 @@ fn jit_ca_handle_guard_failure(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][ca-bridge] must_compile fired: key={} trace={} fail={}",
-            green_key, trace_id, fail_index,
+            source_green_key, source_trace_id, source_fail_index,
         );
     }
 
@@ -2489,9 +2573,11 @@ fn jit_ca_handle_guard_failure(
     // may belong to a different compiled entry than green_key.
     let exit_layout = {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp()
-            .get_compiled_exit_layout_in_trace(owning_key, trace_id, fail_index)
+        driver.meta_interp().get_compiled_exit_layout_in_trace(
+            owning_key,
+            source_trace_id,
+            source_fail_index,
+        )
     };
     let Some(exit_layout) = exit_layout else {
         return false;
@@ -2512,15 +2598,7 @@ fn jit_ca_handle_guard_failure(
         driver.meta_interp_mut().start_guard_compiling(descr_addr);
     }
 
-    // compile.py:706-708 _trace_and_compile_from_bridge
-    let compiled = trace_and_compile_from_bridge(
-        owning_key,
-        trace_id,
-        fail_index,
-        frame,
-        raw_values,
-        &exit_layout,
-    );
+    let compiled = trace_and_compile_from_bridge(&descr_arc, frame, raw_values, &exit_layout);
 
     // compile.py:790-795 self.done_compiling(): clear ST_BUSY_FLAG
     {
@@ -2531,7 +2609,7 @@ fn jit_ca_handle_guard_failure(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][ca-bridge] compiled={} key={} trace={} fail={}",
-            compiled, green_key, trace_id, fail_index,
+            compiled, source_green_key, source_trace_id, source_fail_index,
         );
     }
 

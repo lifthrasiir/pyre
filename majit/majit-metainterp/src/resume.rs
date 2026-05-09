@@ -396,9 +396,11 @@ const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 ///
 /// Canonical, guard-owned resume payload (`storage.rd_numb/rd_consts/
 /// rd_virtuals/rd_pendingfields`). Shared via `Arc<ResumeStorage>` so
-/// every reader — `StoredResumeData`, `StoredExitLayout`, bridge
-/// retrace, blackhole resume, GC root walker — observes the **same**
-/// pool, matching RPython's guard-owned `ResumeGuardDescr` singleton.
+/// every reader — `StoredExitLayout` (the sole carrier on the trace
+/// surrogate after T4.4 retired the parallel `StoredResumeData` side
+/// table), bridge retrace, blackhole resume, GC root walker —
+/// observes the **same** pool, matching RPython's guard-owned
+/// `ResumeGuardDescr` singleton.
 ///
 /// `rd_consts` uses `UnsafeCell` because the GC root walker
 /// (framework.py `root_walker.walk_roots` parity) rewrites `Const::Ref`
@@ -1990,6 +1992,292 @@ impl EncodedResumeData {
             &rd.frames,
             &rd.virtuals,
             &rd.pending_fields,
+        )
+    }
+
+    /// Build the guard-owned storage shape consumed by
+    /// `ResumeDataDirectReader`.
+    ///
+    /// This is used only by the MetaInterp test helper that injects
+    /// `ResumeData` after compilation. The production path obtains the
+    /// same fields directly from `ResumeDataVirtualAdder::finish`.
+    ///
+    /// `EncodedResumeData` carries pending fields without their live
+    /// field/array descriptors, so this helper cannot safely synthesize
+    /// `GuardPendingFieldEntry` replay entries. Production pending-field
+    /// replay still comes from `store_final_boxes_in_guard`.
+    pub fn to_resume_storage(&self) -> Arc<ResumeStorage> {
+        fn const_pool_tag(c: &Const, rd_consts: &mut Vec<Const>) -> i16 {
+            let idx = rd_consts
+                .iter()
+                .position(|existing| existing == c)
+                .unwrap_or_else(|| {
+                    rd_consts.push(*c);
+                    rd_consts.len() - 1
+                });
+            tag((idx as i32) + TAG_CONST_OFFSET, TAGCONST).unwrap_or(UNASSIGNED)
+        }
+
+        fn source_tag(
+            source: &ResumeValueSource,
+            liveboxes: &[usize],
+            rd_consts: &mut Vec<Const>,
+        ) -> i16 {
+            match source {
+                ResumeValueSource::FailArg(index) => liveboxes
+                    .iter()
+                    .position(|live| live == index)
+                    .and_then(|compact| tag(compact as i32, TAGBOX).ok())
+                    .unwrap_or(UNASSIGNED),
+                ResumeValueSource::Constant(Const::Int(value)) => i32::try_from(*value)
+                    .ok()
+                    .and_then(|v| tag(v, TAGINT).ok())
+                    .unwrap_or_else(|| const_pool_tag(&Const::Int(*value), rd_consts)),
+                ResumeValueSource::Constant(Const::Ref(gcref)) if gcref.is_null() => NULLREF,
+                ResumeValueSource::Constant(c) => const_pool_tag(c, rd_consts),
+                ResumeValueSource::Virtual(index) => {
+                    tag(*index as i32, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL)
+                }
+                ResumeValueSource::Uninitialized => UNINITIALIZED_TAG,
+                ResumeValueSource::Unavailable => UNASSIGNED,
+            }
+        }
+
+        fn fieldnums(
+            sources: impl IntoIterator<Item = VirtualFieldSource>,
+            liveboxes: &[usize],
+            rd_consts: &mut Vec<Const>,
+        ) -> Vec<i16> {
+            sources
+                .into_iter()
+                .map(|source| source_tag(&source, liveboxes, rd_consts))
+                .collect()
+        }
+
+        fn rd_virtual(
+            info: &VirtualInfo,
+            liveboxes: &[usize],
+            rd_consts: &mut Vec<Const>,
+        ) -> std::rc::Rc<majit_ir::RdVirtualInfo> {
+            let rd = match info {
+                VirtualInfo::VirtualObj {
+                    descr,
+                    type_id,
+                    descr_index,
+                    known_class,
+                    fields,
+                    fielddescrs,
+                    descr_size,
+                } => majit_ir::RdVirtualInfo::VirtualInfo {
+                    descr: descr.clone(),
+                    type_id: *type_id,
+                    descr_index: *descr_index,
+                    known_class: *known_class,
+                    fielddescrs: fielddescrs.clone(),
+                    fieldnums: fieldnums(
+                        fields.iter().map(|(_, source)| source.clone()),
+                        liveboxes,
+                        rd_consts,
+                    ),
+                    descr_size: *descr_size,
+                },
+                VirtualInfo::VStruct {
+                    typedescr,
+                    type_id,
+                    descr_index,
+                    fields,
+                    fielddescrs,
+                    descr_size,
+                } => majit_ir::RdVirtualInfo::VStructInfo {
+                    typedescr: typedescr.clone(),
+                    type_id: *type_id,
+                    descr_index: *descr_index,
+                    fielddescrs: fielddescrs.clone(),
+                    fieldnums: fieldnums(
+                        fields.iter().map(|(_, source)| source.clone()),
+                        liveboxes,
+                        rd_consts,
+                    ),
+                    descr_size: *descr_size,
+                },
+                VirtualInfo::VArray {
+                    arraydescr,
+                    descr_index,
+                    clear,
+                    items,
+                } => {
+                    let fieldnums = fieldnums(items.iter().cloned(), liveboxes, rd_consts);
+                    if *clear {
+                        majit_ir::RdVirtualInfo::VArrayInfoClear {
+                            arraydescr: arraydescr.clone(),
+                            descr_index: *descr_index,
+                            kind: array_kind_from_descr(arraydescr.as_ref()),
+                            fieldnums,
+                        }
+                    } else {
+                        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
+                            arraydescr: arraydescr.clone(),
+                            descr_index: *descr_index,
+                            kind: array_kind_from_descr(arraydescr.as_ref()),
+                            fieldnums,
+                        }
+                    }
+                }
+                VirtualInfo::VArrayStruct {
+                    arraydescr,
+                    descr_index,
+                    fielddescrs,
+                    element_fields,
+                } => {
+                    let mut flat = Vec::new();
+                    for element in element_fields {
+                        flat.extend(fieldnums(
+                            element.iter().map(|(_, source)| source.clone()),
+                            liveboxes,
+                            rd_consts,
+                        ));
+                    }
+                    // resume.py:740 self.fielddescrs — live InteriorFieldDescr
+                    // objects expose offset/field_size/field_type via the
+                    // FieldDescr trait (descr.py:273 / llmodel.py:648-649).
+                    // Recover the per-field metadata from the live Arc rather
+                    // than emitting placeholders; PyPy `make_virtual_info`
+                    // (resume.py:488) forwards `fielddescrs[j]` to the
+                    // VArrayStructInfo materialiser which reads
+                    // `is_pointer_field`/`is_float_field`/offset/field_size
+                    // through the same accessors at replay time
+                    // (resume.py:751-757).
+                    let field_types: Vec<u8> = fielddescrs
+                        .iter()
+                        .map(|fd| match fd.as_field_descr().map(|f| f.field_type()) {
+                            Some(majit_ir::Type::Ref) => 0,
+                            Some(majit_ir::Type::Float) => 2,
+                            _ => 1,
+                        })
+                        .collect();
+                    let field_offsets: Vec<usize> = fielddescrs
+                        .iter()
+                        .map(|fd| fd.as_field_descr().map(|f| f.offset()).unwrap_or(0))
+                        .collect();
+                    let field_sizes: Vec<usize> = fielddescrs
+                        .iter()
+                        .map(|fd| fd.as_field_descr().map(|f| f.field_size()).unwrap_or(8))
+                        .collect();
+                    majit_ir::RdVirtualInfo::VArrayStructInfo {
+                        arraydescr: arraydescr.clone(),
+                        descr_index: *descr_index,
+                        size: element_fields.len(),
+                        fielddescrs: fielddescrs.clone(),
+                        fielddescr_indices: (0..fielddescrs.len()).map(|i| i as u32).collect(),
+                        field_types,
+                        base_size: arraydescr
+                            .as_ref()
+                            .and_then(|d| d.as_array_descr())
+                            .map(|ad| ad.base_size())
+                            .unwrap_or(0),
+                        item_size: arraydescr
+                            .as_ref()
+                            .and_then(|d| d.as_array_descr())
+                            .map(|ad| ad.item_size())
+                            .unwrap_or(0),
+                        field_offsets,
+                        field_sizes,
+                        fieldnums: flat,
+                    }
+                }
+                VirtualInfo::VRawBuffer {
+                    func,
+                    size,
+                    offsets,
+                    descrs,
+                    values,
+                } => majit_ir::RdVirtualInfo::VRawBufferInfo {
+                    func: *func,
+                    size: *size,
+                    offsets: offsets.clone(),
+                    descrs: descrs.clone(),
+                    fieldnums: fieldnums(values.iter().cloned(), liveboxes, rd_consts),
+                },
+                VirtualInfo::VRawSlice { offset, parent } => {
+                    majit_ir::RdVirtualInfo::VRawSliceInfo {
+                        offset: *offset as usize,
+                        fieldnums: fieldnums(std::iter::once(parent.clone()), liveboxes, rd_consts),
+                    }
+                }
+                VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
+                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
+                },
+                VirtualInfo::VStrConcat { left, right } => {
+                    majit_ir::RdVirtualInfo::VStrConcatInfo {
+                        fieldnums: fieldnums(
+                            [left.as_ref().clone(), right.as_ref().clone()],
+                            liveboxes,
+                            rd_consts,
+                        ),
+                    }
+                }
+                VirtualInfo::VStrSlice {
+                    source,
+                    start,
+                    length,
+                } => majit_ir::RdVirtualInfo::VStrSliceInfo {
+                    fieldnums: fieldnums(
+                        [
+                            source.as_ref().clone(),
+                            start.as_ref().clone(),
+                            length.as_ref().clone(),
+                        ],
+                        liveboxes,
+                        rd_consts,
+                    ),
+                },
+                VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
+                    fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
+                },
+                VirtualInfo::VUniConcat { left, right } => {
+                    majit_ir::RdVirtualInfo::VUniConcatInfo {
+                        fieldnums: fieldnums(
+                            [left.as_ref().clone(), right.as_ref().clone()],
+                            liveboxes,
+                            rd_consts,
+                        ),
+                    }
+                }
+                VirtualInfo::VUniSlice {
+                    source,
+                    start,
+                    length,
+                } => majit_ir::RdVirtualInfo::VUniSliceInfo {
+                    fieldnums: fieldnums(
+                        [
+                            source.as_ref().clone(),
+                            start.as_ref().clone(),
+                            length.as_ref().clone(),
+                        ],
+                        liveboxes,
+                        rd_consts,
+                    ),
+                },
+            };
+            std::rc::Rc::new(rd)
+        }
+
+        let mut writer = crate::resumecode::Writer::new(self.rd_numb.len());
+        for &item in &self.rd_numb {
+            writer.append_int(item);
+        }
+        let mut rd_consts = self.rd_consts.clone();
+        let rd_virtuals = self
+            .rd_virtuals
+            .iter()
+            .map(|info| rd_virtual(info, &self.liveboxes, &mut rd_consts))
+            .collect();
+
+        ResumeStorage::new(
+            writer.create_numbering(),
+            rd_consts,
+            rd_virtuals,
+            Vec::new(),
         )
     }
 

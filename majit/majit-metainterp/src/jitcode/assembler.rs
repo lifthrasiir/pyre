@@ -744,19 +744,13 @@ impl JitCodeBuilder {
     /// the canonical `opname/ii>i` key so the opcode byte comes from the
     /// shared insns table rather than a hand-assigned `BC_*` constant.
     ///
-    /// `OpCode::IntFloorDiv` and `OpCode::IntMod` are intentionally not
-    /// in the match: upstream `jtransform.py:575-577` rewrites both
-    /// primitives to `direct_call(ll_int_py_*)` so RPython
-    /// `blackhole.py` has no `bhimpl_int_floordiv` / `bhimpl_int_mod`
-    /// entry to mirror.  Pyre's β' redirect at
-    /// `majit-translate/src/codegen.rs:980-1028
-    /// generated_binary_int_value` (Task #94a-1) covers the runtime
-    /// trace path; the SSARepr fail-loud arm at
-    /// `pyre-jit/src/jit/assembler.rs::record_op_with_args` traps any
-    /// remaining producer.  Reaching this match with those OpCodes
-    /// would re-introduce the upstream-absent `BC_INT_FLOORDIV` /
-    /// `BC_INT_MOD` lowering path; the catch-all `panic!` below makes
-    /// that surface immediately.
+    /// `OpCode::IntFloorDiv` / `OpCode::IntMod` are intentionally absent:
+    /// `jtransform.py:575-577` rewrites both to
+    /// `direct_call(ll_int_py_*)` before jitcode emission, so neither
+    /// `bhimpl_*` nor the corresponding `int_(floordiv|mod)/ii>i` insns
+    /// key exists upstream.  Pyre's β' redirect at
+    /// `majit-translate/src/codegen.rs::generated_binary_int_value`
+    /// covers the runtime trace path.
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
         let key = match opcode {
             OpCode::IntAdd => "int_add/ii>i",

@@ -30,7 +30,7 @@ use majit_ir::{
 };
 
 use crate::blackhole::ExceptionState;
-use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
+use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
 use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary, ResumeValueSource,
@@ -146,6 +146,12 @@ pub struct CompileResult<'a, M> {
     pub meta: &'a M,
     pub fail_index: u32,
     pub trace_id: u64,
+    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
+    /// backend-side guard descr recovered from the failing frame.  Pyre
+    /// currently has split metainterp/backend descr objects, so this is
+    /// the runtime descr carrying the same `rd_loop_token_clt` /
+    /// `fail_index_per_trace` identity used for bridge routing.
+    pub descr_arc: std::sync::Arc<dyn majit_ir::FailDescr>,
     pub is_finish: bool,
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity:
     /// true when the FINISH descriptor was
@@ -170,6 +176,15 @@ pub struct RawCompileResult<'a, M> {
     pub meta: &'a M,
     pub fail_index: u32,
     pub trace_id: u64,
+    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
+    /// `compile.py:701`) — runtime descr Arc owning this exit.  Always
+    /// set: routed through `Backend::get_latest_descr_arc` via
+    /// `RawExecResult::descr_arc`, so FINISH / `DoneWithThisFrame*` /
+    /// `ExitFrameWithExceptionDescrRef` singletons return their global
+    /// Arc identity instead of `None`.  Bridge consumers
+    /// (`start_bridge_tracing`, `_trace_and_compile_from_bridge`) read
+    /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
+    pub descr_arc: std::sync::Arc<dyn majit_ir::FailDescr>,
     pub is_finish: bool,
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity —
     /// mirrors `CompileResult::is_exit_frame_with_exception`.
@@ -225,12 +240,10 @@ pub(crate) fn build_guard_metadata(
     constant_types: &std::collections::HashMap<u32, Type>,
     callinfocollection: Option<&majit_ir::CallInfoCollection>,
 ) -> (
-    HashMap<u32, StoredResumeData>,
-    HashMap<u32, usize>,
+    HashMap<u32, crate::resume::ResumeLayoutSummary>,
     HashMap<u32, StoredExitLayout>,
 ) {
     let mut result = HashMap::new();
-    let mut guard_op_indices = HashMap::new();
     let mut exit_layouts = HashMap::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
@@ -266,7 +279,21 @@ pub(crate) fn build_guard_metadata(
         }
 
         if is_guard {
-            guard_op_indices.insert(fail_index, op_idx);
+            // F.5-orthodox.1: drop the `guard_op_indices` HashMap.
+            // Every reader is now routed through descr-side identity
+            // (`op.descr.as_fail_descr().fail_index_per_trace()`
+            // forward; op-position lookup
+            // `trace.ops[guard_index].descr.as_fail_descr()
+            // .fail_index_per_trace()` reverse).  Mirrors RPython's
+            // `compile.py:184 op.getdescr()` predicate where the descr
+            // identity replaces the side table entirely.
+            //
+            // The readers compare against `fail_index_per_trace()`
+            // (this slot, set by `set_fail_index_per_trace` below),
+            // not `fail_index()` (which is the global
+            // `alloc_fail_index()` id at `descr.rs:1065` — a separate
+            // structural slot the readers do not consult).
+            //
             // Pyre-only: stamp the per-trace `fail_index` onto the
             // metainterp ResumeGuardDescr so `(trace_id, fail_index)`
             // lookups can resolve through the descr Arc directly.
@@ -473,16 +500,16 @@ pub(crate) fn build_guard_metadata(
                 }
             }
 
-            let mut stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
-            resume_layout = Some(stored.layout.clone());
+            let layout = resume_memo.encode_shared(&builder.build()).layout_summary();
+            resume_layout = Some(layout.clone());
             // compile.py:853 `ResumeGuardDescr` storage — build the shared
             // Arc once from the guard op's `rd_*` fields so every reader
-            // (StoredResumeData, StoredExitLayout, bridge retrace,
-            // blackhole resume, GC root walker) observes the same pool.
-            // Resolve through descr.prev (`resolved_rd_*` chases the
-            // copied-descr chain) so a sharing-path guard's
-            // ResumeStorage points at the same byte stream the donor was
-            // built from (RPython compile.py:832 ResumeGuardCopiedDescr).
+            // (StoredExitLayout, bridge retrace, blackhole resume, GC
+            // root walker) observes the same pool.  Resolve through
+            // descr.prev (`resolved_rd_*` chases the copied-descr chain)
+            // so a sharing-path guard's ResumeStorage points at the same
+            // byte stream the donor was built from (RPython compile.py:832
+            // ResumeGuardCopiedDescr).
             let storage_for_guard = if let Some(numb) = op.resolved_rd_numb() {
                 Some(crate::resume::ResumeStorage::new(
                     numb.to_vec(),
@@ -499,8 +526,7 @@ pub(crate) fn build_guard_metadata(
             } else {
                 None
             };
-            stored.storage = storage_for_guard.clone();
-            result.insert(fail_index, stored);
+            result.insert(fail_index, layout);
             storage_for_guard
         } else {
             resume_layout = None;
@@ -964,22 +990,23 @@ pub(crate) fn build_guard_metadata(
                     .filter_map(|(slot, tp)| (*tp == Type::Ref).then_some(slot))
                     .collect(),
                 force_token_slots: Vec::new(),
-                exit_types,
-                is_finish,
                 recovery_layout,
                 resume_layout,
                 storage,
+                descr: op.descr.clone(),
+                op_arg_types_for_jump: None,
             },
         );
         fail_index += 1;
     }
 
-    (result, guard_op_indices, exit_layouts)
+    (result, exit_layouts)
 }
 
 pub(crate) fn merge_backend_exit_layouts(
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
+    ops: &[majit_ir::Op],
 ) {
     for layout in backend_layouts {
         // compile.py:861 copy_all_attributes_from parity: when the backend
@@ -996,27 +1023,54 @@ pub(crate) fn merge_backend_exit_layouts(
                 layout.rd_pendingfields.clone().unwrap_or_default(),
             )
         });
+        // Pre-resolve the source-op `descr` for backend-only entries so
+        // `entry.descr` matches what `build_guard_metadata` would have
+        // primed had the frontend seen this exit.  When the source op
+        // is no longer reachable (frontend trace evicted but backend
+        // exit layout persists across previous-token fallback) the
+        // backend's `fail_arg_types` is the canonical typed-data
+        // carrier; mint a fresh `MetaFailDescr` carrying that vector
+        // so descr-side readers stay populated.  Branch on
+        // `layout.is_finish` so a backend-only FINISH entry synthesizes
+        // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true)
+        // — matching the terminal path at compile.rs:1305-1311.
+        // Without the branch, `pyjitpl/mod.rs:262 descr.is_finish()`
+        // returns false on the synthesized guard descr and breaks
+        // PyPy's `DoneWithThisFrameDescr` /
+        // `ExitFrameWithExceptionDescrRef` identity check
+        // (compile.py:658-662 / compile.py:701-784).
+        let descr_from_op = layout
+            .source_op_index
+            .and_then(|idx| ops.get(idx))
+            .and_then(|op| op.descr.clone())
+            .or_else(|| {
+                Some(if layout.is_finish {
+                    make_finish_fail_descr_typed(layout.fail_arg_types.clone())
+                } else {
+                    make_fail_descr_typed(layout.fail_arg_types.clone())
+                })
+            });
         let entry: &mut StoredExitLayout =
             exit_layouts
                 .entry(layout.fail_index)
                 .or_insert_with(|| StoredExitLayout {
                     source_op_index: layout.source_op_index,
-                    exit_types: layout.fail_arg_types.clone(),
-                    is_finish: layout.is_finish,
                     gc_ref_slots: layout.gc_ref_slots.clone(),
                     force_token_slots: layout.force_token_slots.clone(),
                     recovery_layout: layout.recovery_layout.clone(),
                     resume_layout: None,
                     storage: storage_from_backend.clone(),
+                    descr: descr_from_op.clone(),
+                    op_arg_types_for_jump: None,
                 });
         entry.source_op_index = layout.source_op_index;
-        // Preserve exit_types from build_guard_metadata (which reconciles
-        // optimizer types with inputarg types after unbox_call_assembler).
-        // Backend fail_arg_types may have stale Ref for unboxed CA results.
-        if entry.exit_types.is_empty() {
-            entry.exit_types = layout.fail_arg_types.clone();
+        // Backfill descr if the entry was inserted before `op.descr` was
+        // available (or the op walk produced a fresh handle). Keeps
+        // descr-side identity in sync with `build_guard_metadata`'s
+        // priority-1 source.
+        if entry.descr.is_none() {
+            entry.descr = descr_from_op;
         }
-        entry.is_finish = layout.is_finish;
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
         entry.recovery_layout = layout.recovery_layout.clone();
@@ -1046,7 +1100,7 @@ pub(crate) fn merge_backend_exit_layouts(
 /// in unit tests with mock backends) are warned but not fatal.
 pub(crate) fn validate_exit_layouts(exit_layouts: &HashMap<u32, StoredExitLayout>) {
     for (&fail_index, layout) in exit_layouts {
-        if layout.is_finish {
+        if layout.resolve_is_finish() {
             continue;
         }
         let Some(ref recovery) = layout.recovery_layout else {
@@ -1250,26 +1304,60 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 pub(crate) fn merge_backend_terminal_exit_layouts(
     terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
+    ops: &[majit_ir::Op],
 ) {
     for layout in backend_layouts {
+        // Pre-resolve the source-op `descr` for backend-only entries so
+        // `entry.descr` matches what `build_terminal_exit_layouts` would
+        // have primed had the frontend seen this exit.  Source op
+        // priority: a frontend `op.descr` (LoopTargetDescr for JUMP,
+        // _DoneWithThisFrameDescr* / ExitFrameWithExceptionDescrRef for
+        // FINISH).  Fallback when source op evicted or its descr handle
+        // was dropped: synthesize per the backend layout's own
+        // `is_finish` discriminator — a `_DoneWithThisFrameDescr`-flavored
+        // `make_finish_fail_descr_typed` (is_finish=true) for FINISH; a
+        // guard-flavored `make_fail_descr_typed` (is_finish=false) for
+        // JUMP, since `LoopTargetDescr` (history.py:470) carries no
+        // `fail_arg_types` and a synthetic FINISH descr would silently
+        // mark the exit as terminating.  Both retain `descr=Some` so
+        // downstream readers that probe `entry.descr.is_some_and(...)`
+        // (e.g. `assign_guard_hashes` via the backend layout, exit-type
+        // resolution paths) keep working uniformly.
+        let source_op = ops.get(layout.op_index);
+        let is_jump = match source_op {
+            Some(op) => op.opcode == OpCode::Jump,
+            None => !layout.is_finish,
+        };
+        let descr_from_op = source_op.and_then(|op| op.descr.clone()).or_else(|| {
+            Some(if layout.is_finish {
+                make_finish_fail_descr_typed(layout.exit_types.clone())
+            } else {
+                make_fail_descr_typed(layout.exit_types.clone())
+            })
+        });
+        let op_arg_types_for_jump = is_jump.then(|| layout.exit_types.clone());
         let entry = terminal_exit_layouts
             .entry(layout.op_index)
             .or_insert_with(|| StoredExitLayout {
                 source_op_index: Some(layout.op_index),
-                exit_types: layout.exit_types.clone(),
-                is_finish: layout.is_finish,
                 gc_ref_slots: layout.gc_ref_slots.clone(),
                 force_token_slots: layout.force_token_slots.clone(),
                 recovery_layout: layout.recovery_layout.clone(),
                 resume_layout: None,
                 storage: None,
+                descr: descr_from_op.clone(),
+                op_arg_types_for_jump: op_arg_types_for_jump.clone(),
             });
         entry.source_op_index = Some(layout.op_index);
-        entry.exit_types = layout.exit_types.clone();
-        entry.is_finish = layout.is_finish;
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
         entry.recovery_layout = layout.recovery_layout.clone();
+        if entry.descr.is_none() {
+            entry.descr = descr_from_op;
+        }
+        if entry.op_arg_types_for_jump.is_none() && is_jump {
+            entry.op_arg_types_for_jump = op_arg_types_for_jump;
+        }
     }
 }
 
@@ -1419,17 +1507,26 @@ pub(crate) fn build_terminal_exit_layouts(
         if let Some(layout) =
             infer_terminal_exit_layout(inputargs, ops, constant_types, 0, 0, op_index)
         {
+            // For JUMP exits the descr is `LoopTargetDescr`
+            // (`history.py:470`), which has no `fail_arg_types`.  Cache
+            // the per-arg types so `StoredExitLayout::resolve_exit_types()`
+            // can fall back to them — see the field's docstring.
+            // FINISH carries `_DoneWithThisFrameDescr*` /
+            // `ExitFrameWithExceptionDescrRef`, both of which expose
+            // `fail_arg_types()` directly, so the cache stays `None`.
+            let op_arg_types_for_jump =
+                (op.opcode == OpCode::Jump).then(|| layout.exit_types.clone());
             layouts.insert(
                 op_index,
                 StoredExitLayout {
                     source_op_index: Some(op_index),
-                    exit_types: layout.exit_types,
-                    is_finish: layout.is_finish,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
                     storage: None,
+                    descr: op.descr.clone(),
+                    op_arg_types_for_jump,
                 },
             );
         }
@@ -1918,25 +2015,25 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
-    resume_data: &mut HashMap<u32, StoredResumeData>,
+    resume_layouts: &mut HashMap<u32, crate::resume::ResumeLayoutSummary>,
     exit_layouts: &mut HashMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
 ) {
-    for (fail_index, stored) in resume_data.iter_mut() {
+    for (fail_index, layout) in resume_layouts.iter_mut() {
         let recovery_layout = exit_layouts
             .get(fail_index)
-            .and_then(|layout| layout.recovery_layout.clone());
+            .and_then(|exit_layout| exit_layout.recovery_layout.clone());
         enrich_resume_layout_with_trace_metadata(
-            &mut stored.layout,
+            layout,
             trace_id,
             inputargs,
             trace_info,
             recovery_layout.as_ref(),
         );
         if let Some(exit_layout) = exit_layouts.get_mut(fail_index) {
-            exit_layout.resume_layout = Some(stored.layout.clone());
+            exit_layout.resume_layout = Some(layout.clone());
         }
     }
 }
@@ -2702,7 +2799,7 @@ mod tests {
         ]);
         guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, _guard_indices, exit_layouts) =
+        let (_resume_data, exit_layouts) =
             build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new(), None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
@@ -2753,13 +2850,13 @@ mod tests {
         ]);
         guard.fail_arg_types = Some(fail_arg_types);
 
-        let (_resume_data, _guard_indices, exit_layouts) =
+        let (_resume_data, exit_layouts) =
             build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new(), None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(
-            exit.exit_types,
-            vec![Type::Ref, Type::Ref, Type::Int, Type::Int]
+            exit.resolve_exit_types(),
+            &[Type::Ref, Type::Ref, Type::Int, Type::Int][..]
         );
     }
 
@@ -3070,6 +3167,12 @@ struct MetaFailDescr {
     /// schedule.py:654: vector accumulation info attached during vectorization.
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+    /// FINISH-vs-guard discriminator. Set by `make_finish_fail_descr_typed`
+    /// when this descr stands in for an evicted FINISH op (terminal exit
+    /// previous-token fallback) or for a test fallback that bypasses
+    /// `MetaInterp::new`'s FINISH-singleton attachment. Default `false`
+    /// matches the guard-exit case used by `make_fail_descr_typed`.
+    is_finish: bool,
     /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
     /// for the dynasm-backend payload that future sessions migrate
     /// from `DynasmFailDescr` (`majit-backend-dynasm/src/guard.rs:25`)
@@ -3097,6 +3200,7 @@ impl majit_ir::Descr for MetaFailDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+            is_finish: self.is_finish,
             dynasm: DynasmDescrPayload::default(),
             cranelift: CraneliftDescrPayload::default(),
         }))
@@ -3114,6 +3218,9 @@ impl FailDescr for MetaFailDescr {
     fn set_fail_arg_types(&self, types: Vec<Type>) {
         // Safety: single-threaded JIT, no concurrent readers.
         unsafe { *self.types.get() = types }
+    }
+    fn is_finish(&self) -> bool {
+        self.is_finish
     }
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
@@ -3362,6 +3469,7 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(vec![Type::Int; num_live]),
         vector_info: UnsafeCell::new(None),
+        is_finish: false,
         dynasm: DynasmDescrPayload::default(),
         cranelift: CraneliftDescrPayload::default(),
     })
@@ -3376,6 +3484,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         fail_index,
         types: UnsafeCell::new(vec![Type::Int; num_live]),
         vector_info: UnsafeCell::new(None),
+        is_finish: false,
         dynasm: DynasmDescrPayload::default(),
         cranelift: CraneliftDescrPayload::default(),
     })
@@ -3387,6 +3496,24 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),
         vector_info: UnsafeCell::new(None),
+        is_finish: false,
+        dynasm: DynasmDescrPayload::default(),
+        cranelift: CraneliftDescrPayload::default(),
+    })
+}
+
+/// FINISH-flavored variant of [`make_fail_descr_typed`]. Used by the
+/// terminal-exit fallback in `merge_backend_terminal_exit_layouts` when
+/// the FINISH op has been evicted, and by FINISH-singleton fallbacks in
+/// tests that bypass `MetaInterp::new` (so the resulting descr's
+/// `is_finish()` matches `compile.py:658-662 ExitFrameWithExceptionDescrRef`
+/// / `pyjitpl.py:3198-3220 compile_done_with_this_frame` semantics).
+pub fn make_finish_fail_descr_typed(types: Vec<Type>) -> DescrRef {
+    Arc::new(MetaFailDescr {
+        fail_index: alloc_fail_index(),
+        types: UnsafeCell::new(types),
+        vector_info: UnsafeCell::new(None),
+        is_finish: true,
         dynasm: DynasmDescrPayload::default(),
         cranelift: CraneliftDescrPayload::default(),
     })
@@ -4711,16 +4838,19 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     })
 }
 
-/// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
-///
-/// The recommended pattern for resume data lookup:
-/// 1. The guard's FailDescr carries a unique `fail_index`
-/// 2. The MetaInterp stores `ResumeData` in a `HashMap<u32, ResumeData>`
-///    keyed by `fail_index`
-/// 3. On guard failure, look up `fail_index` in the map
-///
-/// This matches RPython's approach where `ResumeGuardDescr` points to
-/// snapshot data stored alongside the compiled loop.
+/// Resume data for a guard now lives on `StoredExitLayout.resume_layout`
+/// (per-guard `ResumeLayoutSummary`) rather than a separate trace-side
+/// `HashMap<u32, ResumeData>`.  See `pyjitpl/mod.rs CompiledTrace`.
+/// `enrich_guard_resume_layouts_for_trace` and
+/// `attach_resume_data_to_trace` are the two producers; readers go
+/// through `exit_layout.resume_layout.{reconstruct_state,
+/// materialize_virtuals, resolve_pending_field_writes}` in
+/// `handle_guard_failure_in_trace_with_savedata` and the blackhole
+/// fallback paths.  This collapses the prior two-store model
+/// (`CompiledTrace.resume_data` + `StoredExitLayout.resume_layout`)
+/// onto the descr-owned layer, mirroring RPython where
+/// `ResumeGuardDescr` (`compile.py:855`) is the single guard-owned
+/// resume container.
 
 #[cfg(test)]
 mod fail_descr_tests {

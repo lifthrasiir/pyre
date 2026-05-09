@@ -213,6 +213,15 @@ pub struct TraceCtx {
     /// byte-stream form carried by `TraceRecordBuffer` alongside the
     /// eventual field swap (Task #59 / #70).
     pub(crate) snapshots: Vec<crate::recorder::Snapshot>,
+    /// pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
+    /// The source loop token of the bridge trace, populated at
+    /// `start_retrace_from_guard` from the failed guard descr's
+    /// `rd_loop_token`.  `None` for loop-entry traces (RPython
+    /// `isinstance(self.resumekey, compile.ResumeFromInterpDescr)` is
+    /// True).  Used by `prepare_trace_segmenting` (pyjitpl.py:2825-
+    /// 2834) to set the `FORCE_BRIDGE_SEGMENTING` bit on the loop
+    /// token when bridge tracing aborts without an inlinable function.
+    pub(crate) resumekey_original_loop_token: Option<std::sync::Arc<JitCellToken>>,
 }
 
 /// rlib/jit.py:592 default `trace_limit` — mirrored here so standalone
@@ -560,6 +569,7 @@ impl TraceCtx {
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
+            resumekey_original_loop_token: None,
         }
     }
 
@@ -616,6 +626,7 @@ impl TraceCtx {
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
+            resumekey_original_loop_token: None,
         }
     }
 
@@ -1329,6 +1340,21 @@ impl TraceCtx {
     /// pyjitpl.py:1618 force_finish_trace flag.
     pub fn force_finish_trace(&self) -> bool {
         self.force_finish
+    }
+
+    /// pyjitpl.py:2898 `metainterp.resumekey_original_loop_token` accessor.
+    /// Returns `Some` when this is a bridge trace, `None` for a loop-entry
+    /// trace.  Read by `prepare_trace_segmenting` (pyjitpl.py:2825-2834) to
+    /// decide whether to set `FORCE_BRIDGE_SEGMENTING` on the source token.
+    pub fn resumekey_original_loop_token(&self) -> Option<&std::sync::Arc<JitCellToken>> {
+        self.resumekey_original_loop_token.as_ref()
+    }
+
+    /// Stash the source loop token at bridge-tracing entry
+    /// (`start_retrace_from_guard`) so the segmenting setter can find it
+    /// later.
+    pub fn set_resumekey_original_loop_token(&mut self, token: std::sync::Arc<JitCellToken>) {
+        self.resumekey_original_loop_token = Some(token);
     }
 
     /// Set force_finish_trace flag.

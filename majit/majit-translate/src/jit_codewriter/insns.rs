@@ -201,8 +201,12 @@ pub const BC_FLOAT_POP: u8 = 112;
 pub const BC_INT_ADD: u8 = 113;
 pub const BC_INT_SUB: u8 = 114;
 pub const BC_INT_MUL: u8 = 115;
-pub const BC_INT_FLOORDIV: u8 = 116;
-pub const BC_INT_MOD: u8 = 117;
+// 116 / 117 free — RPython `jtransform.py:575-577` rewrites
+// `int_floordiv` / `int_mod` to `direct_call(ll_int_py_*)` before
+// jitcode emission, so `blackhole.py` has no `bhimpl_int_floordiv`
+// / `bhimpl_int_mod` and no `int_(floordiv|mod)/ii>i` insns key.
+// Pyre's runtime trace path goes through the β' redirect at
+// `majit-translate/src/codegen.rs::generated_binary_int_value`.
 pub const BC_INT_AND: u8 = 118;
 pub const BC_INT_OR: u8 = 119;
 pub const BC_INT_XOR: u8 = 120;
@@ -500,8 +504,9 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("int_add/ii>i", BC_INT_ADD);
     m.insert("int_sub/ii>i", BC_INT_SUB);
     m.insert("int_mul/ii>i", BC_INT_MUL);
-    m.insert("int_floordiv/ii>i", BC_INT_FLOORDIV);
-    m.insert("int_mod/ii>i", BC_INT_MOD);
+    // `int_floordiv/ii>i` and `int_mod/ii>i` intentionally absent:
+    // `jtransform.py:575-577` rewrites both to `direct_call(ll_int_py_*)`
+    // before jitcode emission so neither key reaches the assembler.
     m.insert("int_and/ii>i", BC_INT_AND);
     m.insert("int_or/ii>i", BC_INT_OR);
     m.insert("int_xor/ii>i", BC_INT_XOR);

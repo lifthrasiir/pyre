@@ -56,7 +56,7 @@ pub use call_descr::{
     make_call_assembler_descr_with_vable_by_number, make_call_descr,
     make_call_descr_from_target_slot, make_call_descr_with_effect,
 };
-pub use compile::{make_fail_descr, make_fail_descr_typed};
+pub use compile::{make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed};
 pub use constant_pool::ConstantPool;
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
