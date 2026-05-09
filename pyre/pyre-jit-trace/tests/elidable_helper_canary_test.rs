@@ -104,7 +104,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
 /// Confirms that the `emit_trace_call_int_typed_elidable_cannot_raise`
 /// production emitter is auto-patched to `CallPureI` in the trace.
 /// Unlike `helpers.rs::emit_trace_call_int_typed`'s conservative
-/// `DEFAULT_EFFECT_INFO` call, this wrapper threads an explicit
+/// `default_effect_info` call, this wrapper threads an explicit
 /// elidable EffectInfo through `record_result_of_call_pure`.
 #[test]
 fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {

@@ -713,12 +713,15 @@ impl StructLayout {
 /// ARRAY identity (e.g. `GcArray(Signed)` vs `GcArray(Ptr(STRUCT_X))`).
 #[derive(Default)]
 pub struct DescrIndexRegistry {
-    /// (owner_root, field_name) → bit index (0..63)
+    /// (owner_root, field_name) → unbounded `ei_index` per
+    /// `effectinfo.py:465 compute_bitstrings`. The value scales with the
+    /// global descr count; `bitstring.make_bitstring` (`bitstring.py:3-13`)
+    /// produces a bytestring whose length matches the largest index.
     field_indices: HashMap<(Option<String>, String), u32>,
-    /// (item_ty_discriminant, array_type_id) → bit index (0..63)
+    /// (item_ty_discriminant, array_type_id) → unbounded `ei_index`.
     /// RPython: cpu.arraydescrof(ARRAY).get_ei_index()
     array_indices: HashMap<(u8, Option<String>), u32>,
-    /// (array_type_id, field_name) → bit index (0..63)
+    /// (array_type_id, field_name) → unbounded `ei_index`.
     /// RPython: cpu.interiorfielddescrof(ARRAY, fieldname).get_ei_index()
     /// Separate from field_indices — RPython keys on (ARRAY, fieldname)
     /// not (STRUCT, fieldname).

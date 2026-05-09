@@ -3929,7 +3929,21 @@ fn assemble_peeled_trace_with_jump_args(
                 let pos = inputarg_base + i as u32;
                 match ctx.inputarg_type_at(i) {
                     Some(tp) => OpRef::input_arg_typed(pos, tp),
-                    None => OpRef::int_op(pos),
+                    // resoperation.py:719/727/739 InputArg{Int,Ref,Float}.type
+                    // — upstream inputargs intrinsically carry a type tag.
+                    // A None here means `inputarg_types` was not seeded for
+                    // slot `i`, which is a structural bug in the optimizer
+                    // setup, not something to recover from with a guessed
+                    // default. Fail loud so the missing-seed bug surfaces
+                    // here instead of as a wrong-type guard fail downstream.
+                    None => panic!(
+                        "assemble_peeled_trace_with_jump_args: inputarg slot {} \
+                         has no type — `inputarg_types` must be populated by \
+                         setup_optimizations before peeling. Upstream invariant: \
+                         `box.type` always exists on InputArg* boxes \
+                         (history.py:220 / resoperation.py:719/727/739).",
+                        i
+                    ),
                 }
             })
             .collect();
@@ -4047,7 +4061,11 @@ fn assemble_peeled_trace_with_jump_args(
     // showed this block fires 0 times after Commit D1/D2's disjoint Phase
     // 2 OpRef range eliminated the divergence cases. Removed.
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
-    label_op.pos = OpRef::int_op(label_pos);
+    // resoperation.py:260 AbstractResOp.type = 'v' default — Label has no
+    // result Box, so its OpRef position carries the Void tag rather than
+    // a stray Int tag. `op_index` filters Void ops so this OpRef never
+    // shadows a real Box-bearing op at the same raw position.
+    label_op.pos = OpRef::op_typed(label_pos, label_op.result_type());
     label_op.descr = loop_label_descr;
     result.push(label_op);
 
@@ -4124,7 +4142,11 @@ fn assemble_peeled_trace_with_jump_args(
         // Void ops (SetfieldGc, guards, Jump) don't define values at
         // their position — mapping them creates phantom OpRefs.
         if op.pos.raw() != u32::MAX && op.result_type() != Type::Void {
-            let fresh = OpRef::int_op(next_body_pos);
+            // resoperation.py:564 IntOp.type / 567 RefOp.type / 570 FloatOp.type
+            // — the fresh result Box must carry the producing op's type tag
+            // so downstream readers (`opref_type` typed-first arm) see the
+            // correct `box.type` instead of a default-int guess.
+            let fresh = OpRef::op_typed(next_body_pos, op.result_type());
             next_body_pos = next_free_pos(next_body_pos.saturating_add(1));
             body_result_remap.insert(op.pos, fresh);
         }

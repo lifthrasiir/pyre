@@ -659,9 +659,10 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // `optimize_CALL_MAY_FORCE_*` branch.
         //
         // PRE-EXISTING-ADAPTATION (Slice γ): saturate the
-        // `read/write_descrs_*` bitsets to `u64::MAX`, matching the
-        // `Plain` / `cannot_raise_effect_info()` analyzer-absent
-        // fallback (`call_descr.rs:175-207 default_effect_info()`).
+        // `read/write_descrs_*` bitsets to `Some(vec![0xff; 8])`,
+        // matching the `Plain` / `cannot_raise_effect_info()`
+        // analyzer-absent fallback
+        // (`call_descr.rs:175-207 default_effect_info()`).
         // RPython's `effectinfo.py:172-177` only clears
         // `_write_descrs_*` for elidable / loopinvariant extraeffects;
         // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` keeps the analyzer's

@@ -394,41 +394,21 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     (builder, unwired)
 }
 
-/// Production-side blackhole builder for pyre's guard-failure resume
-/// path.  Wires the minimal pyre-compatible dispatch subset:
-/// `inline_call_pyre_nested/P`, byte-identical canonical control ops
-/// (`live/`, `loop_header/i`, `goto/L`, `catch_exception/L`,
-/// `jit_merge_point/cIRFIRF`), and pyre-u16 misc-family adapters.  Other
-/// bytes continue to fall through `BlackholeInterpreter::
-/// dispatch_step_with_fallback` to the legacy `dispatch_one` arms.
+/// Production-side strict blackhole builder for pyre's guard-failure
+/// resume path.  It delegates to `build_inline_call_only_bh_builder`,
+/// which installs the audited pyre dispatch surface: byte-identical
+/// canonical keys, pyre-u16 register-width adapters, residual_call/vable
+/// families, state-field adapters, and the pyre nested inline-call
+/// handler.
 ///
-/// Why minimal install: pyre's runtime `JitCodeBuilder` emits
-/// vable / call / move / etc. opcodes whose payload format diverges
-/// from the canonical RPython `r`/`d` argcode contract decoded by the
-/// canonical handlers.  Two divergence axes block bulk routing:
-///   1. **Register width** — Sub-slice C.1 misc family widens to
-///      pyre-u16 variants; vable/residual_call families are still
-///      audited per family (Task #45 Stage 2 Slice 2.3 Sub-slice C).
-///   2. **Storage layout** — pyre's `vable_write_array_item`
-///      EmbeddedArray storage uses 2-level pointer indirection
-///      (`virtualizable.rs:2504`) that canonical
-///      `cpu.bh_setarrayitem_gc_r` single-indirection cannot bridge
-///      (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`).
-/// Sub-slice C.2.0 (`6a863779cdf`) wired `bh.cpu` via thread-local
-/// leaked `BackendImpl`, so the cpu-trait dispatch path is now
-/// available — the remaining blocker for vable canonical-routing is
-/// the storage layout mismatch.  Wiring the full canonical
-/// dispatch_table (`build_default_bh_builder()`) would still route
-/// every opcode through canonical handlers and produce wrong values
-/// (or panic) on the first vable encountered during resume.  The
-/// format unification is tracked as the `pipeline.insns` ↔
-/// `wellknown_bh_insns` table-unification epic (see
-/// `pyre-jit-trace/src/jitcode_dispatch.rs:5988-5996`).
-///
-/// The subset setup_insns table leaves all non-registered opcodes as
-/// placeholders or out-of-range entries.  Those paths converge on
-/// `dispatch_one`; registered bytes route through their wired handlers
-/// without re-entering `dispatch_one`.
+/// Why not `build_default_bh_builder()`: pyre runtime bytecode still
+/// contains helper-side layouts that are not canonical RPython argcodes.
+/// This builder therefore registers only shapes with an explicit handler
+/// contract.  Any emitted byte outside that setup surface now reaches
+/// `dispatch_step`'s unwired-opcode panic; there is no legacy fallback.
+/// `cond_call_*` / `record_known_result_*` bytes are now wired through
+/// `_pyre/P` adapter handlers (`insns.rs:674-678`,
+/// payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     majit_metainterp::blackhole::build_inline_call_only_bh_builder()
 }
@@ -477,6 +457,58 @@ pub struct DecodedOp {
     /// instruction reads a variable-length operand (`I`/`R`/`F`) that
     /// overflowed the code slice.
     pub next_pc: usize,
+}
+
+/// Decode the byte length of a `/P` adapter payload starting at
+/// `cursor`.  Each `_pyre/P` opname has its own pyre helper-side flat
+/// payload shape; the `P` pseudo-argcode is just an opt-out from the
+/// canonical RPython argcode alphabet.  Producers and shapes:
+///
+/// | opname                              | producer (`assembler.rs`)             | payload bytes |
+/// |-------------------------------------|---------------------------------------|---------------|
+/// | `inline_call_pyre_nested`           | `:nested_inline_call_*_typed_args`    | `4 + num_args*5 + 6`  (`sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src u16, callee_dst u16) + return_i u16 + return_r u16 + return_f u16`) |
+/// | `call_assembler_int_pyre`           | `:3429 call_assembler_int_like`       | `6 + num_args*3`  (`target_idx u16 + dst u16 + num_args u16 + num_args × (kind u8, reg u16)`) |
+/// | `call_assembler_ref_pyre`           | `:3451 call_assembler_ref_like`       | same as int |
+/// | `call_assembler_float_pyre`         | `:3489 call_assembler_float_like`     | same as int |
+/// | `call_assembler_void_pyre`          | `:3370 call_assembler_void_like`      | `4 + num_args*3`  (omits `dst u16`) |
+/// | `cond_call_void_pyre`               | `:2642 call_cond_like`                | `5 + arg_count*3`  (`first_reg u16 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u16)`) |
+/// | `record_known_result_int_pyre`      | `:2618 call_cond_like`                | same as cond_call |
+/// | `record_known_result_ref_pyre`      | `:2630 call_cond_like`                | same as cond_call |
+/// | `cond_call_value_int_pyre`          | `:2660 call_cond_value_like`          | `7 + arg_count*3`  (cond_call layout + trailing `dst u16`) |
+/// | `cond_call_value_ref_pyre`          | `:2660 call_cond_value_like`          | same as int variant |
+fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize> {
+    match opname {
+        "inline_call_pyre_nested" => {
+            // sub_idx u16 + num_args u16 + num_args × (kind u8, caller_src
+            // u16, callee_dst u16) + return_i u16 + return_r u16 + return_f u16
+            let num_args =
+                u16::from_le_bytes([*code.get(cursor + 2)?, *code.get(cursor + 3)?]) as usize;
+            Some(4 + num_args * 5 + 6)
+        }
+        "call_assembler_int_pyre" | "call_assembler_ref_pyre" | "call_assembler_float_pyre" => {
+            // target_idx u16 + dst u16 + num_args u16 + num_args × (kind u8, reg u16)
+            let num_args =
+                u16::from_le_bytes([*code.get(cursor + 4)?, *code.get(cursor + 5)?]) as usize;
+            Some(6 + num_args * 3)
+        }
+        "call_assembler_void_pyre" => {
+            // target_idx u16 + num_args u16 + num_args × (kind u8, reg u16)
+            let num_args =
+                u16::from_le_bytes([*code.get(cursor + 2)?, *code.get(cursor + 3)?]) as usize;
+            Some(4 + num_args * 3)
+        }
+        "cond_call_void_pyre" | "record_known_result_int_pyre" | "record_known_result_ref_pyre" => {
+            // first_reg u16 + fn_ptr_idx u16 + arg_count u8 + arg_count × (kind u8) + arg_count × (reg u16)
+            let arg_count = *code.get(cursor + 4)? as usize;
+            Some(5 + arg_count * 3)
+        }
+        "cond_call_value_int_pyre" | "cond_call_value_ref_pyre" => {
+            // cond_call shape + trailing dst u16
+            let arg_count = *code.get(cursor + 4)? as usize;
+            Some(7 + arg_count * 3)
+        }
+        _ => None,
+    }
 }
 
 /// Statically walk one jitcode instruction starting at `pc`. Returns
@@ -538,18 +570,12 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
                 }
                 cursor += 1;
             }
-            // PRE-EXISTING-ADAPTATION pseudo-argcode for the pyre-only
-            // `inline_call_pyre_nested` opname.  Payload (little-endian):
-            //   sub_idx u16 + num_args u16
-            //   + num_args × (kind u8, caller_src u16, callee_dst u16)
-            //   + return_i u16 + return_r u16 + return_f u16
-            // Total length: 4 + num_args*5 + 6 bytes.
+            // PRE-EXISTING-ADAPTATION pseudo-argcode for pyre-only
+            // helper-side opnames.  Each `*_pyre/P` opname carries its
+            // own flat payload shape; see `pyre_p_payload_len` for the
+            // table.
             'P' => {
-                cursor += 2;
-                let lo = *code.get(cursor)? as usize;
-                let hi = *code.get(cursor + 1)? as usize;
-                let num_args = lo | (hi << 8);
-                cursor += 2 + num_args * 5 + 6;
+                cursor += pyre_p_payload_len(opname, code, cursor)?;
             }
             _ => return None,
         }
@@ -777,19 +803,14 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
                     _ => return None,
                 });
             }
-            // PRE-EXISTING-ADAPTATION: pyre `inline_call_pyre_nested/P`
-            // payload is opaque to the canonical operand-resolver — no
-            // matching `ResolvedOperand` variant exists.  Advance the
-            // cursor by the computed length so the trailing
-            // `cursor == decoded.next_pc` invariant holds; consumers can
-            // route on `decoded.opname == "inline_call_pyre_nested"` for
-            // payload-aware handling.
+            // PRE-EXISTING-ADAPTATION: pyre `*_pyre/P` payloads are
+            // opaque to the canonical operand-resolver — no matching
+            // `ResolvedOperand` variant exists.  Advance the cursor by
+            // the per-opname computed length so the trailing
+            // `cursor == decoded.next_pc` invariant holds; consumers
+            // dispatch on `decoded.opname` for payload-aware handling.
             'P' => {
-                cursor += 2;
-                let lo = *code.get(cursor)? as usize;
-                let hi = *code.get(cursor + 1)? as usize;
-                let num_args = lo | (hi << 8);
-                cursor += 2 + num_args * 5 + 6;
+                cursor += pyre_p_payload_len(decoded.opname, code, cursor)?;
             }
             _ => return None,
         }

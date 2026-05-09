@@ -1136,6 +1136,27 @@ impl BhDescr {
         }
     }
 
+    /// `llmodel.py:369-374 unpack_fielddescr_size`: return `(offset,
+    /// field_size, is_field_signed)`.  Backend `bh_getfield_gc_i` /
+    /// `bh_setfield_gc_i` thread the tuple to `read_int_at_mem` /
+    /// `write_int_at_mem` so the per-field byte width and signedness
+    /// reach the load/store, matching `llmodel.py:693-696,718-721`.
+    /// Panics on non-`Field` variants — vable scalars synthesize a
+    /// fixed-size 8-byte signed-zero placeholder via
+    /// `read_descr_vable_field` (`blackhole.rs:5597`) and still go
+    /// through this method.
+    pub fn unpack_fielddescr_size(&self) -> (usize, usize, bool) {
+        match self {
+            BhDescr::Field {
+                offset,
+                field_size,
+                is_field_signed,
+                ..
+            } => (*offset, *field_size, *is_field_signed),
+            _ => panic!("BhDescr::unpack_fielddescr_size called on {:?}", self),
+        }
+    }
+
     pub fn as_size(&self) -> usize {
         match self {
             BhDescr::Size { size, .. } => *size,

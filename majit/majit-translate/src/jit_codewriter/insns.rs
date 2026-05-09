@@ -651,5 +651,45 @@ pub fn pyre_extension_insns() -> HashMap<&'static str, u8> {
     // Generic walkers must consult `decode_op_at` (which knows `P`) for
     // length, not the canonical argcodes table.
     m.insert("inline_call_pyre_nested/P", BC_INLINE_CALL);
+    // PRE-EXISTING-ADAPTATION: pyre `call_assembler_*` adapters.
+    //
+    // `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
+    // (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat
+    // payload: typed `[target_idx u16, dst u16, num_args u16,
+    // (kind u8, reg u16) × num_args]`; void omits `dst`.  RPython has
+    // no `bhimpl_call_assembler_*`; pyre re-interprets the recorded
+    // operation by direct-calling `target.concrete_ptr` via the
+    // shared `call_int_function` / `call_void_function` helpers.
+    // `P` pseudo-argcode mirrors `inline_call_pyre_nested`'s opaque
+    // pyre-payload classification.
+    m.insert("call_assembler_int_pyre/P", BC_CALL_ASSEMBLER_INT);
+    m.insert("call_assembler_ref_pyre/P", BC_CALL_ASSEMBLER_REF);
+    m.insert("call_assembler_float_pyre/P", BC_CALL_ASSEMBLER_FLOAT);
+    m.insert("call_assembler_void_pyre/P", BC_CALL_ASSEMBLER_VOID);
+    // PRE-EXISTING-ADAPTATION: pyre `cond_call` / `record_known_result`
+    // adapters.
+    //
+    // `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
+    // (`assembler.rs:2642,2660`) emit a pyre-only flat payload that
+    // does not match canonical `iiIRd` / `riIRd>r` argcodes.  The
+    // `_pyre/P` handlers split semantically:
+    //
+    //   * `cond_call_*_pyre` (`blackhole.rs:9965` onward) execute the
+    //     conditional call directly, mirroring upstream
+    //     `bhimpl_conditional_call_ir_v` /
+    //     `bhimpl_conditional_call_value_ir_{i,r}`
+    //     (`blackhole.py:1257-1276`).
+    //   * `record_known_result_*_pyre` (`blackhole.rs:10068` onward)
+    //     are no-ops that skip the operand bytes, mirroring the
+    //     `pass`-bodied `bhimpl_record_known_result_{i,r}_ir_v`
+    //     (`blackhole.py:621-628`).
+    //
+    // Producers: `majit-macros/src/jit_interp/jitcode_lower.rs:2166-2458`,
+    // `pyre/pyre-jit/src/jit/assembler.rs:1181`.
+    m.insert("cond_call_void_pyre/P", BC_COND_CALL_VOID);
+    m.insert("cond_call_value_int_pyre/P", BC_COND_CALL_VALUE_INT);
+    m.insert("cond_call_value_ref_pyre/P", BC_COND_CALL_VALUE_REF);
+    m.insert("record_known_result_int_pyre/P", BC_RECORD_KNOWN_RESULT_INT);
+    m.insert("record_known_result_ref_pyre/P", BC_RECORD_KNOWN_RESULT_REF);
     m
 }

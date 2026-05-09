@@ -14652,6 +14652,94 @@ impl majit_backend::Backend for CraneliftBackend {
         self.write_float_at_mem(addr, offset, newvalue);
     }
 
+    /// llmodel.py:692-712 bh_getfield_gc_i / bh_getfield_gc_r /
+    /// bh_setfield_gc_i / bh_setfield_gc_r — direct pointer-arithmetic
+    /// reads matching dynasm `runner.rs` byte-for-byte.
+    ///
+    /// `bh_getfield_gc_i` / `bh_setfield_gc_i` honour
+    /// `unpack_fielddescr_size(descr) → (ofs, size, sign)` and call
+    /// `read_int_at_mem(struct, ofs, size, sign)` /
+    /// `write_int_at_mem(struct, ofs, size, newvalue)` so non-word-sized
+    /// integer fields (i32, i16, u8, signed/unsigned variants) are read
+    /// with the proper width + extension.
+    ///
+    /// Without these overrides, CraneliftBackend's default Backend
+    /// trait stubs would return 0 / `GcRef::NULL` and the canonical
+    /// handlers `blackhole.rs::handler_getfield_vable_*` /
+    /// `handler_setfield_vable_*` would propagate zero-reads through
+    /// every vable scalar field.  Sub-slice C.2.1 Path 3 wires this
+    /// chain end-to-end via the inline-call-only builder's
+    /// `getfield_vable_{i,r,f}` / `setfield_vable_{i,r,f}` setup_insns
+    /// entries.
+    fn bh_getfield_gc_i(
+        &self,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) -> i64 {
+        let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
+        self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
+    }
+
+    fn bh_getfield_gc_r(
+        &self,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) -> majit_ir::GcRef {
+        let offset = fielddescr.as_offset();
+        majit_ir::GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
+    }
+
+    fn bh_setfield_gc_i(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
+        self.write_int_at_mem(struct_ptr, offset as i64, size, value);
+    }
+
+    fn bh_setfield_gc_r(
+        &self,
+        struct_ptr: i64,
+        value: majit_ir::GcRef,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let offset = fielddescr.as_offset();
+        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+    }
+
+    /// llmodel.py:705-707 bh_getfield_gc_f delegates to read_float_at_mem.
+    /// `getfield_vable_f/rd>f` and the floating-point array reader rely
+    /// on this — the trait default returns 0.0, which silently produces
+    /// wrong results during blackhole resume on float vable fields.
+    /// Mirrors the dynasm override at `runner.rs` so blackhole resume
+    /// reads the same byte-for-byte semantics regardless of backend.
+    fn bh_getfield_gc_f(
+        &self,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) -> f64 {
+        let offset = fielddescr.as_offset();
+        // Route through `read_float_at_mem` (`compiler.rs:6677` —
+        // `llmodel.py:490-491` parity) for the same `read_unaligned`
+        // safety guarantee as the dynasm sibling.
+        self.read_float_at_mem(struct_ptr, offset as i64)
+    }
+
+    /// llmodel.py:728-730 bh_setfield_gc_f delegates to write_float_at_mem.
+    /// Mirror of `bh_getfield_gc_f`; the trait default is a silent no-op
+    /// which loses writes from `setfield_vable_f/rfd` during resume.
+    fn bh_setfield_gc_f(
+        &self,
+        struct_ptr: i64,
+        value: f64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let offset = fielddescr.as_offset();
+        self.write_float_at_mem(struct_ptr, offset as i64, value);
+    }
+
     /// llsupport/gc.py:563 GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves the typeid via the active GC runtime, mirroring how

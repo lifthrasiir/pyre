@@ -693,12 +693,12 @@ pub fn resume_in_blackhole(
     thread_local! {
         // RPython `blackhole.py:55-65` constructs a fully-initialized
         // `BlackholeInterpBuilder` (setup_insns + setup_descrs +
-        // wire_bhimpl_handlers) at metainterp startup; pyre's strict
-        // analogue is `build_default_bh_builder()`.  Earlier this slot
-        // held a bare `BlackholeInterpBuilder::new()` whose
-        // `dispatch_table` was empty, so every acquired interpreter
-        // routed every byte through `dispatch_step_with_fallback` to
-        // the legacy `dispatch_one`.
+        // wire_bhimpl_handlers) at metainterp startup; pyre's production
+        // analogue is `build_pyre_production_bh_builder()`.  Earlier this
+        // slot held a bare `BlackholeInterpBuilder::new()` whose
+        // `dispatch_table` was empty; under strict dispatch that would panic
+        // on the first byte, so production guard resume uses the audited
+        // pyre builder.
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
     }
@@ -1155,7 +1155,7 @@ pub fn resume_in_blackhole(
 
         // blackhole.py:1752 _run_forever exception propagation:
         // Exception not handled in this frame (no handler found by
-        // dispatch_one's handle_exception_in_frame). Propagate to caller.
+        // `handle_exception_in_frame`). Propagate to caller.
         if bh.got_exception {
             let exc_value = bh.exception_last_value;
             let next = bh.nextblackholeinterp.take();

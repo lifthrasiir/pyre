@@ -1350,6 +1350,12 @@ impl OptContext {
             .map(|(i, &tp)| crate::r#box::BoxRef::new_inputarg(tp, Some(i as u32)))
             .collect();
         ctx.box_pool = seed.into();
+        // Mirror the production setup at `optimizer.rs:1859`
+        // `ctx.inputarg_types = self.trace_inputarg_types.clone()` — the
+        // typed-Box parity contract requires the field to be populated
+        // alongside the BoxRef pool so `inputarg_type_at(i)` returns
+        // `Some(tp)` matching `box.type` for slot i.
+        ctx.inputarg_types = inputarg_types.to_vec();
         ctx
     }
 

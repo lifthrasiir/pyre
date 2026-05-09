@@ -2319,13 +2319,17 @@ impl Backend for DynasmBackend {
         self.write_float_at_mem(addr, offset, newvalue);
     }
 
+    /// `llmodel.py:693-696 bh_getfield_gc_i` →
+    /// `read_int_at_mem(struct, ofs, size, sign)`.  Threads the per-field
+    /// `(offset, size, sign)` tuple from `BhDescr.unpack_fielddescr_size`
+    /// to the size dispatch in `llmodel.py:467-478`.
     fn bh_getfield_gc_i(
         &self,
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        let offset = fielddescr.as_offset();
-        unsafe { *((struct_ptr as *const u8).add(offset) as *const i64) }
+        let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
+        self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
     }
 
     fn bh_getfield_gc_r(
@@ -2337,14 +2341,18 @@ impl Backend for DynasmBackend {
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
 
+    /// `llmodel.py:718-721 bh_setfield_gc_i` →
+    /// `write_int_at_mem(struct, ofs, size, value)`.  Sign discarded by
+    /// `unpack_fielddescr_size` consumer (`llmodel.py:651`); only
+    /// `(offset, size)` reach the store.
     fn bh_setfield_gc_i(
         &self,
         struct_ptr: i64,
         value: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = value };
+        let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
+        self.write_int_at_mem(struct_ptr, offset as i64, size, value);
     }
 
     fn bh_setfield_gc_r(
@@ -2355,6 +2363,39 @@ impl Backend for DynasmBackend {
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+    }
+
+    /// llmodel.py:705-707 bh_getfield_gc_f delegates to read_float_at_mem.
+    /// `getfield_vable_f/rd>f` and the floating-point array reader rely
+    /// on this — the trait default returns 0.0, which silently produces
+    /// wrong results during blackhole resume on float vable fields.
+    fn bh_getfield_gc_f(
+        &self,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) -> f64 {
+        let offset = fielddescr.as_offset();
+        // Route through `read_float_at_mem` (`runner.rs:611-615` —
+        // `llmodel.py:490-491` parity) so misaligned struct fields use
+        // `read_unaligned`. Direct `*const f64` deref was UB-prone on
+        // misaligned vable float slots.
+        self.read_float_at_mem(struct_ptr, offset as i64)
+    }
+
+    /// llmodel.py:728-730 bh_setfield_gc_f delegates to write_float_at_mem.
+    /// Mirror of `bh_getfield_gc_f`; the trait default is a silent no-op
+    /// which loses writes from `setfield_vable_f/rfd` during resume.
+    fn bh_setfield_gc_f(
+        &self,
+        struct_ptr: i64,
+        value: f64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
+    ) {
+        let offset = fielddescr.as_offset();
+        // Route through `write_float_at_mem` (`runner.rs:617-621` —
+        // `llmodel.py:493-494` parity); see read sibling above for
+        // alignment rationale.
+        self.write_float_at_mem(struct_ptr, offset as i64, value);
     }
 
     /// compile_tmp_callback parity: register a placeholder for a pending

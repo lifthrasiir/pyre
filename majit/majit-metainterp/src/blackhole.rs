@@ -793,7 +793,8 @@ fn blackhole_with_recovery_layout(
 use crate::jitcode::{self, JitArgKind, JitCode, JitCodeRuntimeExt};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
-    call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i,
+    call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
+    eval_unary_f, eval_unary_i,
 };
 
 // ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────
@@ -880,7 +881,7 @@ impl Default for BhReturnType {
     }
 }
 
-/// Signal from dispatch_one to run().
+/// Signal raised by handlers and propagated up through `dispatch_step` to `run`.
 ///
 /// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
 #[derive(Debug)]
@@ -1000,14 +1001,14 @@ pub struct BlackholeInterpreter {
     /// without going back to the builder.
     ///
     /// `Default::default()` and `for_inline_callee` start with an empty
-    /// table; `dispatch_step_with_fallback` falls back to `dispatch_one`
-    /// when the table is empty or the opcode is out of range.
+    /// table; the builder owns the wired table and propagates an `Arc`
+    /// clone via `acquire_interp`.
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
 }
 
 // blackhole.py: last exception value from a residual call.
 // Set by pyre call helpers (bh_call_fn_impl etc.) on error.
-// Read by dispatch_one to populate exception_last_value on handler dispatch.
+// Read by handler dispatch to populate exception_last_value.
 thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
@@ -1903,7 +1904,7 @@ impl BlackholeInterpreter {
                     self.registers_i.get(1).copied().unwrap_or(-1),
                 );
             }
-            match self.dispatch_step_with_fallback(opcode) {
+            match self.dispatch_step(opcode) {
                 Ok(()) => {}
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
@@ -1941,28 +1942,24 @@ impl BlackholeInterpreter {
     }
 
     /// Dispatch a single bytecode instruction through the per-instance
-    /// `dispatch_table`, falling back to the legacy `dispatch_one` match
-    /// when the table entry is the unwired placeholder or the table is
-    /// shorter than `opcode + 1`.
+    /// `dispatch_table`.
     ///
     /// RPython parity: `blackhole.py:83-100` `dispatch_loop` calls
     /// `self.dispatch_table[opcode_byte](self, code, position)`
     /// unconditionally — every opcode is wired before the loop runs.
-    /// Pyre's pyre-legacy assembler (`majit-metainterp/src/jitcode/
-    /// assembler.rs::JitCodeBuilder`) emits `BC_*` bytes that have no
-    /// canonical opname-key registration yet, so wired-handler coverage
-    /// is incomplete.  The placeholder fallback bridges that gap by
-    /// routing unwired opcodes through `dispatch_one` until the
-    /// per-family migration of Stage 2 closes them.
+    /// Pyre matches that contract: every dispatching builder
+    /// (`build_inline_call_only_bh_builder` for production, the unit
+    /// `build_test_bh_builder` for `bh_interp_tests`) installs a full
+    /// setup_insns surface before its first dispatch, so the placeholder
+    /// branch panics on the post-C.5.2 codebase.
     ///
     /// `position` invariant: caller is `run_inner`, which has already
     /// advanced `self.position` past the opcode byte via `next_u8`.
     /// Wired handlers expect `position` to point at the first operand
     /// byte (handler signature `(bh, code, position) -> Result<usize>`)
     /// and return the post-operand position; we then store it back into
-    /// `self.position`.  Fallback handlers (`dispatch_one`) mutate
-    /// `self.position` directly, so no sync is needed for that branch.
-    fn dispatch_step_with_fallback(&mut self, opcode: u8) -> Result<(), DispatchError> {
+    /// `self.position`.
+    fn dispatch_step(&mut self, opcode: u8) -> Result<(), DispatchError> {
         let placeholder_addr = unwired_handler_placeholder as *const () as usize;
         let table_handler = self
             .dispatch_table
@@ -1970,20 +1967,19 @@ impl BlackholeInterpreter {
             .copied()
             .filter(|h| (*h as *const () as usize) != placeholder_addr);
         let Some(handler) = table_handler else {
-            // Stage 2 Slice 2.1 probe — env-gated logging of fallback
-            // arrivals so Slice 2.2/2.3 can decide whether the legacy
-            // `dispatch_one` path is reachable in production.  Removed in
-            // Slice 2.3 once the fallback turns into a panic.
-            if std::env::var_os("MAJIT_DISPATCH_ONE_PROBE").is_some() {
-                eprintln!(
-                    "[bh-probe] dispatch_one fallback byte={opcode:#x} \
-                     pos={} table_len={} jitcode={:?}",
-                    self.last_opcode_position,
-                    self.dispatch_table.len(),
-                    self.jitcode.name,
-                );
-            }
-            return self.dispatch_one(opcode);
+            // RPython parity (`blackhole.py:66-100 setup_insns`
+            // resolving every key via `_get_method`): a missing handler
+            // is `AttributeError` at builder-construction time.  pyre
+            // hits this branch only when a builder has not registered
+            // every BC_* it intends to emit.
+            panic!(
+                "dispatch_step: unwired opcode={opcode:#x} pos={} \
+                 table_len={} jitcode={:?} — extend the builder's \
+                 setup_insns to cover this opname",
+                self.last_opcode_position,
+                self.dispatch_table.len(),
+                self.jitcode.name,
+            );
         };
         // Clone the Arc to detach the `code` borrow from `self`, so the
         // handler can take `&mut self` without aliasing the code slice.
@@ -1992,1129 +1988,6 @@ impl BlackholeInterpreter {
         let code: &[u8] = &jitcode_arc.code;
         let new_pos = handler(self, code, self.position)?;
         self.position = new_pos;
-        Ok(())
-    }
-
-    /// Dispatch a single bytecode instruction with concrete execution.
-    ///
-    /// RPython: bytecode dispatch in `dispatch_loop()`, each `bhimpl_*` method
-    fn dispatch_one(&mut self, opcode: u8) -> Result<(), DispatchError> {
-        match opcode {
-            jitcode::BC_LIVE => {
-                // blackhole.py:1605 bhimpl_live(pc): return pc + OFFSET_SIZE.
-                self.position += majit_translate::liveness::OFFSET_SIZE;
-            }
-            jitcode::BC_CATCH_EXCEPTION => {
-                // blackhole.py:969 bhimpl_catch_exception(target): no-op in
-                // normal execution; skip the 2-byte label operand.
-                self.position += 2;
-            }
-            jitcode::BC_LAST_EXCEPTION => {
-                let dst = self.next_u16() as usize;
-                let exc_obj = self.exception_last_value;
-                let typeptr = if let Some(cpu) = self.cpu {
-                    cpu.bh_classof(exc_obj)
-                } else {
-                    exc_obj
-                };
-                self.registers_i[dst] = typeptr;
-            }
-            jitcode::BC_LAST_EXC_VALUE => {
-                let dst = self.next_u16() as usize;
-                self.registers_r[dst] = self.exception_last_value;
-            }
-            jitcode::BC_RVMPROF_CODE => {
-                let leaving_idx = self.next_u8() as usize;
-                let unique_id_idx = self.next_u8() as usize;
-                let leaving = self.registers_i[leaving_idx];
-                let unique_id = self.registers_i[unique_id_idx];
-                self.bhimpl_rvmprof_code(leaving, unique_id);
-            }
-            // RPython `blackhole.py:638-646` `bhimpl_{int,ref,float}_copy`.
-            // Operand order follows the `i>i` / `r>r` / `f>f` argcodes
-            // (`assembler.py:165-174`): source register is encoded
-            // first, destination last.
-            jitcode::BC_MOVE_I => {
-                let src = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
-                self.registers_i[dst] = self.registers_i[src];
-            }
-            jitcode::BC_MOVE_R => {
-                let src = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
-                self.registers_r[dst] = self.registers_r[src];
-            }
-            jitcode::BC_MOVE_F => {
-                let src = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
-                self.registers_f[dst] = self.registers_f[src];
-            }
-            jitcode::BC_INT_ADD => self.bh_binop_i(OpCode::IntAdd),
-            jitcode::BC_INT_SUB => self.bh_binop_i(OpCode::IntSub),
-            jitcode::BC_INT_MUL => self.bh_binop_i(OpCode::IntMul),
-            // `int_floordiv` / `int_mod` have no `bhimpl_*` upstream:
-            // `jtransform.py:575-577` rewrites both to
-            // `direct_call(ll_int_py_*)` before jitcode emission.
-            jitcode::BC_INT_AND => self.bh_binop_i(OpCode::IntAnd),
-            jitcode::BC_INT_OR => self.bh_binop_i(OpCode::IntOr),
-            jitcode::BC_INT_XOR => self.bh_binop_i(OpCode::IntXor),
-            jitcode::BC_INT_LSHIFT => self.bh_binop_i(OpCode::IntLshift),
-            jitcode::BC_INT_RSHIFT => self.bh_binop_i(OpCode::IntRshift),
-            jitcode::BC_INT_EQ => self.bh_binop_i(OpCode::IntEq),
-            jitcode::BC_INT_NE => self.bh_binop_i(OpCode::IntNe),
-            jitcode::BC_INT_LT => self.bh_binop_i(OpCode::IntLt),
-            jitcode::BC_INT_LE => self.bh_binop_i(OpCode::IntLe),
-            jitcode::BC_INT_GT => self.bh_binop_i(OpCode::IntGt),
-            jitcode::BC_INT_GE => self.bh_binop_i(OpCode::IntGe),
-            jitcode::BC_UINT_RSHIFT => self.bh_binop_i(OpCode::UintRshift),
-            jitcode::BC_UINT_MUL_HIGH => self.bh_binop_i(OpCode::UintMulHigh),
-            jitcode::BC_UINT_LT => self.bh_binop_i(OpCode::UintLt),
-            jitcode::BC_UINT_LE => self.bh_binop_i(OpCode::UintLe),
-            jitcode::BC_UINT_GT => self.bh_binop_i(OpCode::UintGt),
-            jitcode::BC_UINT_GE => self.bh_binop_i(OpCode::UintGe),
-            jitcode::BC_INT_NEG => {
-                let dst = self.next_u16() as usize;
-                let src_idx = self.next_u16() as usize;
-                let value = self.registers_i[src_idx];
-                self.registers_i[dst] = eval_unary_i(OpCode::IntNeg, value);
-            }
-            jitcode::BC_INT_INVERT => {
-                let dst = self.next_u16() as usize;
-                let src_idx = self.next_u16() as usize;
-                let value = self.registers_i[src_idx];
-                self.registers_i[dst] = eval_unary_i(OpCode::IntInvert, value);
-            }
-            // Ref-valued comparison / nullity primitives — RPython
-            // `blackhole.py` `bhimpl_{ptr_eq,ptr_ne,instance_ptr_eq,
-            // instance_ptr_ne,ptr_iszero,ptr_nonzero}`.
-            jitcode::BC_PTR_EQ => self.bh_binop_r_to_i(OpCode::PtrEq),
-            jitcode::BC_PTR_NE => self.bh_binop_r_to_i(OpCode::PtrNe),
-            jitcode::BC_INSTANCE_PTR_EQ => self.bh_binop_r_to_i(OpCode::InstancePtrEq),
-            jitcode::BC_INSTANCE_PTR_NE => self.bh_binop_r_to_i(OpCode::InstancePtrNe),
-            jitcode::BC_PTR_ISZERO => self.bh_ptr_nullity(false),
-            jitcode::BC_PTR_NONZERO => self.bh_ptr_nullity(true),
-            jitcode::BC_FLOAT_ADD => self.bh_binop_f(OpCode::FloatAdd),
-            jitcode::BC_FLOAT_SUB => self.bh_binop_f(OpCode::FloatSub),
-            jitcode::BC_FLOAT_MUL => self.bh_binop_f(OpCode::FloatMul),
-            jitcode::BC_FLOAT_TRUEDIV => self.bh_binop_f(OpCode::FloatTrueDiv),
-            jitcode::BC_FLOAT_NEG => {
-                let dst = self.next_u16() as usize;
-                let src_idx = self.next_u16() as usize;
-                let value = self.registers_f[src_idx];
-                self.registers_f[dst] = eval_unary_f(OpCode::FloatNeg, value);
-            }
-            jitcode::BC_FLOAT_ABS => {
-                let dst = self.next_u16() as usize;
-                let src_idx = self.next_u16() as usize;
-                let value = self.registers_f[src_idx];
-                self.registers_f[dst] = eval_unary_f(OpCode::FloatAbs, value);
-            }
-            jitcode::BC_GOTO_IF_NOT_INT_IS_TRUE => {
-                let cond_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let cond = self.registers_i[cond_idx];
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[bh-trace] GOTO_IF_NOT_INT_IS_TRUE cond_idx={} cond={} target={} taken={}",
-                        cond_idx,
-                        cond,
-                        target,
-                        cond == 0
-                    );
-                }
-                if cond == 0 {
-                    self.position = target;
-                }
-            }
-            // blackhole.py:872-911 bhimpl_goto_if_not_int_*:
-            //   if a <cmp> b: return pc else return target
-            // i.e. take the target when the comparison is FALSE.
-            jitcode::BC_GOTO_IF_NOT_INT_LT => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                let b = self.registers_i[b_idx];
-                if !(a < b) {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_INT_LE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                let b = self.registers_i[b_idx];
-                if !(a <= b) {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_INT_EQ => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                let b = self.registers_i[b_idx];
-                if a != b {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_INT_NE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                let b = self.registers_i[b_idx];
-                if a == b {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_INT_GT => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                let b = self.registers_i[b_idx];
-                if !(a > b) {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_INT_GE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                let b = self.registers_i[b_idx];
-                if !(a >= b) {
-                    self.position = target;
-                }
-            }
-            // blackhole.py:916-920 bhimpl_goto_if_not_int_is_zero:
-            //   if not a: return pc else return target
-            // i.e. take the target when `a != 0` (truthy).
-            jitcode::BC_GOTO_IF_NOT_INT_IS_ZERO => {
-                let a_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_i[a_idx];
-                if a != 0 {
-                    self.position = target;
-                }
-            }
-            // blackhole.py:751-798 bhimpl_goto_if_not_float_*:
-            //   a = longlong.getrealfloat(a); b = longlong.getrealfloat(b)
-            //   if a <cmp> b: return pc else return target
-            jitcode::BC_GOTO_IF_NOT_FLOAT_LT => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = f64::from_bits(self.registers_f[a_idx] as u64);
-                let b = f64::from_bits(self.registers_f[b_idx] as u64);
-                if !(a < b) {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_FLOAT_LE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = f64::from_bits(self.registers_f[a_idx] as u64);
-                let b = f64::from_bits(self.registers_f[b_idx] as u64);
-                if !(a <= b) {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_FLOAT_EQ => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = f64::from_bits(self.registers_f[a_idx] as u64);
-                let b = f64::from_bits(self.registers_f[b_idx] as u64);
-                if a != b {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_FLOAT_NE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = f64::from_bits(self.registers_f[a_idx] as u64);
-                let b = f64::from_bits(self.registers_f[b_idx] as u64);
-                if a == b {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_FLOAT_GT => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = f64::from_bits(self.registers_f[a_idx] as u64);
-                let b = f64::from_bits(self.registers_f[b_idx] as u64);
-                if !(a > b) {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_FLOAT_GE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = f64::from_bits(self.registers_f[a_idx] as u64);
-                let b = f64::from_bits(self.registers_f[b_idx] as u64);
-                if !(a >= b) {
-                    self.position = target;
-                }
-            }
-            // blackhole.py:922-934 bhimpl_goto_if_not_ptr_{eq,ne}.
-            jitcode::BC_GOTO_IF_NOT_PTR_EQ => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_r[a_idx];
-                let b = self.registers_r[b_idx];
-                if a != b {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_PTR_NE => {
-                let a_idx = self.next_u16() as usize;
-                let b_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_r[a_idx];
-                let b = self.registers_r[b_idx];
-                if a == b {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_PTR_ISZERO => {
-                let a_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_r[a_idx];
-                if a != 0 {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_GOTO_IF_NOT_PTR_NONZERO => {
-                let a_idx = self.next_u16() as usize;
-                let target = self.next_u16() as usize;
-                let a = self.registers_r[a_idx];
-                if a == 0 {
-                    self.position = target;
-                }
-            }
-            jitcode::BC_JUMP => {
-                let target = self.next_u16() as usize;
-                self.position = target;
-            }
-            jitcode::BC_JIT_MERGE_POINT | jitcode::BC_JIT_MERGE_POINT_C => {
-                self.bhimpl_jit_merge_point(opcode)?;
-            }
-            jitcode::BC_LOOP_HEADER => {
-                // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
-                // Argument byte is a `registers_i` index pointing at the
-                // constants pool slot holding the jitdriver index
-                // (upstream `@arguments("i")`).
-                let jdindex_reg = self.next_u8() as usize;
-                let _jdindex = self.registers_i[jdindex_reg];
-            }
-            jitcode::BC_REF_RETURN => {
-                // RPython bhimpl_ref_return: return ref value to caller.
-                let src = self.next_u16() as usize;
-                self.tmpreg_r = self.registers_r[src];
-                self.return_type = BhReturnType::Ref;
-                return Err(DispatchError::LeaveFrame);
-            }
-            jitcode::BC_INT_RETURN => {
-                // RPython bhimpl_int_return (blackhole.py:841): stash the
-                // int result in tmpreg_i, tag the frame as int-returning,
-                // and unwind via LeaveFrame.
-                let src = self.next_u16() as usize;
-                self.tmpreg_i = self.registers_i[src];
-                self.return_type = BhReturnType::Int;
-                return Err(DispatchError::LeaveFrame);
-            }
-            jitcode::BC_FLOAT_RETURN => {
-                // RPython bhimpl_float_return (blackhole.py:853).
-                let src = self.next_u16() as usize;
-                self.tmpreg_f = self.registers_f[src];
-                self.return_type = BhReturnType::Float;
-                return Err(DispatchError::LeaveFrame);
-            }
-            jitcode::BC_VOID_RETURN => {
-                // RPython bhimpl_void_return (blackhole.py:859).
-                self.return_type = BhReturnType::Void;
-                return Err(DispatchError::LeaveFrame);
-            }
-            jitcode::BC_ABORT => {
-                self.aborted = true;
-                return Err(DispatchError::LeaveFrame);
-            }
-            jitcode::BC_ABORT_PERMANENT => {
-                self.bhimpl_abort_permanent()?;
-            }
-            jitcode::BC_UNREACHABLE => {
-                // blackhole.py:962 `bhimpl_unreachable()` raises
-                // `AssertionError("unreachable")`. A jitcode reaching this
-                // opcode is a codegen bug — there is no recovery path.
-                panic!("bhimpl_unreachable reached");
-            }
-            // blackhole.py:1000 bhimpl_raise(excvalue)
-            jitcode::BC_RAISE => {
-                let src = self.next_u16() as usize;
-                let exc = self.registers_r[src];
-                if exc != 0 {
-                    return Err(DispatchError::RaiseException(exc));
-                }
-                self.aborted = true;
-                return Err(DispatchError::LeaveFrame);
-            }
-            // blackhole.py:1006 bhimpl_reraise()
-            jitcode::BC_RERAISE => {
-                let exc = self.exception_last_value;
-                if exc != 0 {
-                    return Err(DispatchError::RaiseException(exc));
-                }
-                self.aborted = true;
-                return Err(DispatchError::LeaveFrame);
-            }
-            // BC_INLINE_CALL is wired to `handler_inline_call_pyre_nested`
-            // (`blackhole.rs::handler_inline_call_pyre_nested`).  Slice 3.2.1
-            // gave the callee `clone_context_from(parent)` so a nested
-            // `BC_INLINE_CALL` byte fires the same handler instead of
-            // falling through here, retiring the legacy arm.
-            // -- Int-typed calls --
-            // Parity #14 Slice C.5 retired BC_CALL_PURE_INT (Pure now flows
-            // through canonical BC_RESIDUAL_CALL_*_I); only
-            // BC_CALL_ASSEMBLER_INT reaches this arm.
-            jitcode::BC_CALL_ASSEMBLER_INT => {
-                let fn_ptr_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
-                let num_args = self.next_u16() as usize;
-                let args = self.read_call_args(num_args);
-                let target = self.jitcode.call_target(fn_ptr_idx);
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                let result = call_int_function(target.concrete_ptr, &args);
-                // Check if call raised an exception (TLS set by helper).
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                self.registers_i[dst] = result;
-            }
-            // -- Ref-typed calls --
-            // Parity #14 Slice C.5: see Int arm above.  Only
-            // BC_CALL_ASSEMBLER_REF reaches this arm.
-            jitcode::BC_CALL_ASSEMBLER_REF => {
-                let fn_ptr_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
-                let num_args = self.next_u16() as usize;
-                let args = self.read_call_args(num_args);
-                let target = self.jitcode.call_target(fn_ptr_idx);
-                // Clear stale exception before call to prevent false positives.
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[bh] call_ref fn={} dst={} nargs={} args={:?} pos={}",
-                        fn_ptr_idx,
-                        dst,
-                        num_args,
-                        &args[..args.len().min(4)],
-                        self.last_opcode_position,
-                    );
-                }
-                let result = call_int_function(target.concrete_ptr, &args);
-                // Check if call raised an exception (TLS set by helper).
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[bh] call_ref EXCEPTION fn={} pos={} nargs={} exc={:#x}",
-                            fn_ptr_idx, self.last_opcode_position, num_args, exc_val,
-                        );
-                    }
-                    // Actual exception: try handler dispatch.
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                // result == 0 without exception is a legitimate null ref
-                // (e.g., None object has non-zero address in pyre, so this
-                // only happens for actual PY_NULL returns which are rare
-                // but legal in generic majit jitcode::BC_CALL_REF semantics).
-                if crate::majit_log_enabled() {
-                    // Heuristic: assume W_IntObject layout (intval at +0x10).
-                    let intval_at_10 = if result != 0 {
-                        unsafe { Some(*((result + 0x10) as *const i64)) }
-                    } else {
-                        None
-                    };
-                    eprintln!(
-                        "[bh] call_ref result fn={} pos={} ref=0x{:x} maybe_intval={:?}",
-                        fn_ptr_idx, self.last_opcode_position, result, intval_at_10
-                    );
-                }
-                self.registers_r[dst] = result;
-            }
-            // -- Float-typed calls --
-            // PRE-EXISTING-ADAPTATION: blackhole reads `target.concrete_ptr`,
-            // which `#[jit_module]` (majit-macros/src/lib.rs:267) emits as
-            // `extern "C" fn(...) -> i64` — the helper's f64 result is
-            // already pre-packed via `f64::to_bits()` inside the wrapper.
-            // We therefore call through `call_int_function` and store the
-            // i64 directly into `registers_f` (i64-carrier convention
-            // identical to RPython's `longlong.ZEROF` packing).  The f64-ABI
-            // wrapper lives at `target.trace_ptr` and is consumed only by
-            // the tracing path; using `call_float_function` here would
-            // transmute the i64-returning concrete wrapper through an
-            // `extern "C" fn(...) -> f64` signature and break the ABI.
-            // Parity #14 Slice C.5: see Int arm above.  Only
-            // BC_CALL_ASSEMBLER_FLOAT reaches this arm.
-            jitcode::BC_CALL_ASSEMBLER_FLOAT => {
-                let fn_ptr_idx = self.next_u16() as usize;
-                let dst = self.next_u16() as usize;
-                let num_args = self.next_u16() as usize;
-                let args = self.read_call_args(num_args);
-                let target = self.jitcode.call_target(fn_ptr_idx);
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                let result = call_int_function(target.concrete_ptr, &args);
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                self.registers_f[dst] = result;
-            }
-            // -- Void-typed calls --
-            // RPython blackhole.py:1218-1222 routes void CALL_* through
-            // `cpu.bh_call_v` (no return register at all).  Pyre's
-            // `call_void_function` does the same.  Using the int variant
-            // here would force an `extern "C" fn(...) -> i64` ABI on a
-            // helper that may genuinely return nothing.
-            // BC_CALL_ASSEMBLER_VOID retains the legacy
-            // `(fn_ptr_idx:u16, num_args:u16, [(kind:u8, reg:u16)]...)`
-            // layout — Slice 4 of pyre-call-family-canonical-migration.md
-            // owns its migration.
-            jitcode::BC_CALL_ASSEMBLER_VOID => {
-                let fn_ptr_idx = self.next_u16() as usize;
-                let num_args = self.next_u16() as usize;
-                let args = self.read_call_args(num_args);
-                let target = self.jitcode.call_target(fn_ptr_idx);
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                call_void_function(target.concrete_ptr, &args);
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-            }
-            // Slices 1-2 of `pyre-call-family-canonical-migration.md`:
-            // canonical *_v opcodes (=159..=170) live outside the
-            // translator-allocated insns range (max byte 74), so
-            // dispatch_step_with_fallback always lands here.
-            //
-            // Decode the canonical byte layout (`blackhole.rs:6459-6481
-            // read_list_*` + `blackhole.rs:5853 read_descr` parity), then
-            // dispatch through `majit_backend::call_stub::bh_call_i_dispatch`
-            // for ABI-correct (separate int/float register-file) call —
-            // the same arity table cranelift's `bh_call_i` and dynasm's
-            // Slice 0d `bh_call_v` ride on. We cannot delegate to the
-            // wired handler bodies because production `BlackholeInterpreter`
-            // has `cpu = None` (`builder.cpu` is never set in pyre's
-            // resume path — `pyjitpl.py:2247-2253` parity is satisfied
-            // via direct dispatch rather than cpu.bh_call_v).
-            //
-            // Wrap with the `BH_LAST_EXC_VALUE` TLS handshake so any
-            // exception pyre-jit's call helpers stash into the TLS
-            // (`pyre/pyre-jit/src/call_jit.rs:514, 2976, 3129`)
-            // propagates as a frame-level exception.
-            //
-            // The blackhole side does not distinguish residual_call /
-            // may_force / release_gil / loopinvariant by opcode. RPython
-            // carries that policy on `calldescr.extra_info`; the bytecode
-            // remains the canonical `residual_call_*_v` family.
-            jitcode::BC_RESIDUAL_CALL_R_V
-            | jitcode::BC_RESIDUAL_CALL_IR_V
-            | jitcode::BC_RESIDUAL_CALL_IRF_V => {
-                let has_int = matches!(
-                    opcode,
-                    jitcode::BC_RESIDUAL_CALL_IR_V | jitcode::BC_RESIDUAL_CALL_IRF_V
-                );
-                let has_float = opcode == jitcode::BC_RESIDUAL_CALL_IRF_V;
-                let funcptr_reg = self.next_u8() as usize;
-                let func = self.registers_i[funcptr_reg];
-                let mut args_i: Vec<i64> = Vec::new();
-                let mut args_r: Vec<i64> = Vec::new();
-                let mut args_f: Vec<i64> = Vec::new();
-                if has_int {
-                    let count = self.next_u8() as usize;
-                    for _ in 0..count {
-                        let reg = self.next_u8() as usize;
-                        args_i.push(self.registers_i[reg]);
-                    }
-                }
-                let count_r = self.next_u8() as usize;
-                for _ in 0..count_r {
-                    let reg = self.next_u8() as usize;
-                    args_r.push(self.registers_r[reg]);
-                }
-                if has_float {
-                    let count = self.next_u8() as usize;
-                    for _ in 0..count {
-                        let reg = self.next_u8() as usize;
-                        args_f.push(self.registers_f[reg]);
-                    }
-                }
-                let descr_idx_lo = self.next_u8() as usize;
-                let descr_idx_hi = self.next_u8() as usize;
-                let descr_idx = descr_idx_lo | (descr_idx_hi << 8);
-                // blackhole.py:150-157 + read_descr (`blackhole.rs:5931-5940`)
-                // parity: `descrs[idx]` first looks at the per-jitcode
-                // runtime pool (`JitCodeBuilder` output), then falls
-                // back to the builder-shared `bh.descrs` for
-                // build-time / global jitcodes.
-                let calldescr = match self.jitcode.exec.descrs.get(descr_idx) {
-                    Some(entry) => entry
-                        .as_bh_descr()
-                        .expect("BC_RESIDUAL_CALL_*_V descr is not BhDescr")
-                        .as_calldescr()
-                        .clone(),
-                    None => self
-                        .descrs
-                        .get(descr_idx)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_*_V descr index {descr_idx} \
-                                 out of range in jitcode.exec.descrs ({}) \
-                                 and bh.descrs ({})",
-                                self.jitcode.exec.descrs.len(),
-                                self.descrs.len(),
-                            )
-                        })
-                        .as_calldescr()
-                        .clone(),
-                };
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                if func != 0 {
-                    let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                        &calldescr.arg_classes,
-                        Some(&args_i),
-                        Some(&args_r),
-                        Some(&args_f),
-                    );
-                    // llmodel.py:834 bh_call_v: void-returning callees
-                    // require the void-typed dispatcher; reading rax/x0
-                    // through `bh_call_i_dispatch` for a genuinely void
-                    // helper is undefined behavior.
-                    unsafe {
-                        majit_backend::call_stub::bh_call_v_dispatch(
-                            func as usize,
-                            &int_args,
-                            &float_args,
-                        );
-                    }
-                }
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-            }
-            // ── Slice 4 Slice 1c.1: canonical typed (i/r/f) blackhole arms ──
-            //
-            // Mirror of the void arm above for the int / ref / float
-            // result kinds.  Identical bytecode decode + BH_LAST_EXC_VALUE
-            // handshake; the only differences are:
-            //   * dispatcher: `bh_call_v_dispatch` →
-            //     `bh_call_i_dispatch` (int / ref) or
-            //     `bh_call_f_dispatch` (float)
-            //   * trailing `dst` register byte after the descr index
-            //     (`emit_canonical_call_typed` /
-            //     `emit_canonical_call_typed_irf_f` at
-            //     `jitcode/assembler.rs:1932 / 2100` always emit it)
-            //   * register write-back: `registers_i[dst]` /
-            //     `registers_r[dst]` / `registers_f[dst]`
-            //   * float arm reads all three (count, regs) pairs
-            //     unconditionally — only `IRF_F` exists per
-            //     `resoperation.py:1238-1248`
-            //
-            // The blackhole side does not distinguish residual_call /
-            // may_force / release_gil / loopinvariant by opcode (matches
-            // the void arm comment at line 2566); the policy lives on
-            // `calldescr.extra_info`.
-            jitcode::BC_RESIDUAL_CALL_R_I
-            | jitcode::BC_RESIDUAL_CALL_IR_I
-            | jitcode::BC_RESIDUAL_CALL_IRF_I => {
-                let has_int = matches!(
-                    opcode,
-                    jitcode::BC_RESIDUAL_CALL_IR_I | jitcode::BC_RESIDUAL_CALL_IRF_I
-                );
-                let has_float = opcode == jitcode::BC_RESIDUAL_CALL_IRF_I;
-                let funcptr_reg = self.next_u8() as usize;
-                let func = self.registers_i[funcptr_reg];
-                let mut args_i: Vec<i64> = Vec::new();
-                let mut args_r: Vec<i64> = Vec::new();
-                let mut args_f: Vec<i64> = Vec::new();
-                if has_int {
-                    let count = self.next_u8() as usize;
-                    for _ in 0..count {
-                        let reg = self.next_u8() as usize;
-                        args_i.push(self.registers_i[reg]);
-                    }
-                }
-                let count_r = self.next_u8() as usize;
-                for _ in 0..count_r {
-                    let reg = self.next_u8() as usize;
-                    args_r.push(self.registers_r[reg]);
-                }
-                if has_float {
-                    let count = self.next_u8() as usize;
-                    for _ in 0..count {
-                        let reg = self.next_u8() as usize;
-                        args_f.push(self.registers_f[reg]);
-                    }
-                }
-                let descr_idx_lo = self.next_u8() as usize;
-                let descr_idx_hi = self.next_u8() as usize;
-                let descr_idx = descr_idx_lo | (descr_idx_hi << 8);
-                let dst = self.next_u8() as usize;
-                let calldescr = match self.jitcode.exec.descrs.get(descr_idx) {
-                    Some(entry) => entry
-                        .as_bh_descr()
-                        .expect("BC_RESIDUAL_CALL_*_I descr is not BhDescr")
-                        .as_calldescr()
-                        .clone(),
-                    None => self
-                        .descrs
-                        .get(descr_idx)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_*_I descr index {descr_idx} \
-                                 out of range in jitcode.exec.descrs ({}) \
-                                 and bh.descrs ({})",
-                                self.jitcode.exec.descrs.len(),
-                                self.descrs.len(),
-                            )
-                        })
-                        .as_calldescr()
-                        .clone(),
-                };
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                let result = if func != 0 {
-                    let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                        &calldescr.arg_classes,
-                        Some(&args_i),
-                        Some(&args_r),
-                        Some(&args_f),
-                    );
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_dispatch(
-                            func as usize,
-                            &int_args,
-                            &float_args,
-                        )
-                    }
-                } else {
-                    0
-                };
-                // blackhole.py:351-361 run() — exceptions raised inside
-                // bhimpl propagate via the host runtime's try/except in
-                // run(), so the bhimpl returns early and never reaches
-                // the destination-register store.  Pyre transports the
-                // exception via BH_LAST_EXC_VALUE TLS and does the same:
-                // only write the result when no exception is pending.
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                self.registers_i[dst] = result;
-            }
-            jitcode::BC_RESIDUAL_CALL_R_R
-            | jitcode::BC_RESIDUAL_CALL_IR_R
-            | jitcode::BC_RESIDUAL_CALL_IRF_R => {
-                let has_int = matches!(
-                    opcode,
-                    jitcode::BC_RESIDUAL_CALL_IR_R | jitcode::BC_RESIDUAL_CALL_IRF_R
-                );
-                let has_float = opcode == jitcode::BC_RESIDUAL_CALL_IRF_R;
-                let funcptr_reg = self.next_u8() as usize;
-                let func = self.registers_i[funcptr_reg];
-                let mut args_i: Vec<i64> = Vec::new();
-                let mut args_r: Vec<i64> = Vec::new();
-                let mut args_f: Vec<i64> = Vec::new();
-                if has_int {
-                    let count = self.next_u8() as usize;
-                    for _ in 0..count {
-                        let reg = self.next_u8() as usize;
-                        args_i.push(self.registers_i[reg]);
-                    }
-                }
-                let count_r = self.next_u8() as usize;
-                for _ in 0..count_r {
-                    let reg = self.next_u8() as usize;
-                    args_r.push(self.registers_r[reg]);
-                }
-                if has_float {
-                    let count = self.next_u8() as usize;
-                    for _ in 0..count {
-                        let reg = self.next_u8() as usize;
-                        args_f.push(self.registers_f[reg]);
-                    }
-                }
-                let descr_idx_lo = self.next_u8() as usize;
-                let descr_idx_hi = self.next_u8() as usize;
-                let descr_idx = descr_idx_lo | (descr_idx_hi << 8);
-                let dst = self.next_u8() as usize;
-                let calldescr = match self.jitcode.exec.descrs.get(descr_idx) {
-                    Some(entry) => entry
-                        .as_bh_descr()
-                        .expect("BC_RESIDUAL_CALL_*_R descr is not BhDescr")
-                        .as_calldescr()
-                        .clone(),
-                    None => self
-                        .descrs
-                        .get(descr_idx)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_*_R descr index {descr_idx} \
-                                 out of range in jitcode.exec.descrs ({}) \
-                                 and bh.descrs ({})",
-                                self.jitcode.exec.descrs.len(),
-                                self.descrs.len(),
-                            )
-                        })
-                        .as_calldescr()
-                        .clone(),
-                };
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                // Ref-result returns as i64 (PyObjectRef pointer value).
-                let result = if func != 0 {
-                    let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                        &calldescr.arg_classes,
-                        Some(&args_i),
-                        Some(&args_r),
-                        Some(&args_f),
-                    );
-                    unsafe {
-                        majit_backend::call_stub::bh_call_i_dispatch(
-                            func as usize,
-                            &int_args,
-                            &float_args,
-                        )
-                    }
-                } else {
-                    0
-                };
-                // blackhole.py:351-361 run() — see int sibling above for
-                // the full citation.  Exception path skips the register
-                // write so a raising bhimpl does not clobber `dst`.
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                self.registers_r[dst] = result;
-            }
-            // Float result: only `IRF_F` exists per
-            // `resoperation.py:1238-1248`.  Reads all three
-            // (count, regs) pairs unconditionally —
-            // `emit_canonical_call_typed_irf_f`
-            // (`jitcode/assembler.rs:2100`) always emits them.
-            jitcode::BC_RESIDUAL_CALL_IRF_F => {
-                let funcptr_reg = self.next_u8() as usize;
-                let func = self.registers_i[funcptr_reg];
-                let mut args_i: Vec<i64> = Vec::new();
-                let mut args_r: Vec<i64> = Vec::new();
-                let mut args_f: Vec<i64> = Vec::new();
-                let count_i = self.next_u8() as usize;
-                for _ in 0..count_i {
-                    let reg = self.next_u8() as usize;
-                    args_i.push(self.registers_i[reg]);
-                }
-                let count_r = self.next_u8() as usize;
-                for _ in 0..count_r {
-                    let reg = self.next_u8() as usize;
-                    args_r.push(self.registers_r[reg]);
-                }
-                let count_f = self.next_u8() as usize;
-                for _ in 0..count_f {
-                    let reg = self.next_u8() as usize;
-                    args_f.push(self.registers_f[reg]);
-                }
-                let descr_idx_lo = self.next_u8() as usize;
-                let descr_idx_hi = self.next_u8() as usize;
-                let descr_idx = descr_idx_lo | (descr_idx_hi << 8);
-                let dst = self.next_u8() as usize;
-                let calldescr = match self.jitcode.exec.descrs.get(descr_idx) {
-                    Some(entry) => entry
-                        .as_bh_descr()
-                        .expect("BC_RESIDUAL_CALL_IRF_F descr is not BhDescr")
-                        .as_calldescr()
-                        .clone(),
-                    None => self
-                        .descrs
-                        .get(descr_idx)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "BC_RESIDUAL_CALL_IRF_F descr index {descr_idx} \
-                                 out of range in jitcode.exec.descrs ({}) \
-                                 and bh.descrs ({})",
-                                self.jitcode.exec.descrs.len(),
-                                self.descrs.len(),
-                            )
-                        })
-                        .as_calldescr()
-                        .clone(),
-                };
-                BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                let result_f = if func != 0 {
-                    let (int_args, float_args) = majit_backend::call_stub::collect_call_args(
-                        &calldescr.arg_classes,
-                        Some(&args_i),
-                        Some(&args_r),
-                        Some(&args_f),
-                    );
-                    unsafe {
-                        majit_backend::call_stub::bh_call_f_dispatch(
-                            func as usize,
-                            &int_args,
-                            &float_args,
-                        )
-                    }
-                } else {
-                    0.0f64
-                };
-                // blackhole.py:351-361 run() — see int sibling above for
-                // the full citation.  Exception path skips the register
-                // write so a raising bhimpl does not clobber `dst`.
-                let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
-                if exc_val != 0 {
-                    if self.handle_exception_in_frame(exc_val) {
-                        return Ok(());
-                    }
-                    self.exception_last_value = exc_val;
-                    self.got_exception = true;
-                    return Err(DispatchError::LeaveFrame);
-                }
-                self.registers_f[dst] = result_f.to_bits() as i64;
-            }
-            // -- State field access --
-            // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
-            // `i` = u8 register index (`assembler.py:165-167`).
-            jitcode::BC_LOAD_STATE_FIELD => {
-                // /di : u16 descr + u8 dst = 3 bytes
-                let _field_idx = self.next_u16();
-                let _dst = self.next_u8();
-                // No-op in blackhole: state fields are only meaningful
-                // during tracing with a JitCodeSym.
-            }
-            jitcode::BC_STORE_STATE_FIELD => {
-                let _field_idx = self.next_u16();
-                let _src = self.next_u8();
-            }
-            jitcode::BC_LOAD_STATE_ARRAY | jitcode::BC_LOAD_STATE_VARRAY => {
-                // /dii : u16 descr + u8 index + u8 dst = 4 bytes
-                let _array_idx = self.next_u16();
-                let _elem_idx = self.next_u8();
-                let _dst = self.next_u8();
-            }
-            jitcode::BC_STORE_STATE_ARRAY | jitcode::BC_STORE_STATE_VARRAY => {
-                let _array_idx = self.next_u16();
-                let _elem_idx = self.next_u8();
-                let _src = self.next_u8();
-            }
-            // -- Virtualizable field/array access --
-            // blackhole.py:1446-1458 bhimpl_getfield_vable_i/r/f:
-            //   fielddescr.get_vinfo().clear_vable_token(struct)
-            //   return cpu.bh_getfield_gc_i/r/f(struct, fielddescr)
-            jitcode::BC_GETFIELD_VABLE_I => {
-                let field_idx = self.vable_field_index_at(self.position + 1);
-                let base = self.next_u8() as usize;
-                self.position += 2;
-                let dst = self.next_u8() as usize;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                // virtualizable.py:218-222 clear_vable_token
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let offset = vinfo.static_fields[field_idx].offset;
-                let value = unsafe { *(ptr.add(offset) as *const i64) };
-                self.registers_i[dst] = value;
-            }
-            jitcode::BC_GETFIELD_VABLE_R => {
-                let field_idx = self.vable_field_index_at(self.position + 1);
-                let base = self.next_u8() as usize;
-                self.position += 2;
-                let dst = self.next_u8() as usize;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let offset = vinfo.static_fields[field_idx].offset;
-                let value = unsafe { *(ptr.add(offset) as *const i64) };
-                self.registers_r[dst] = value;
-            }
-            jitcode::BC_GETFIELD_VABLE_F => {
-                let field_idx = self.vable_field_index_at(self.position + 1);
-                let base = self.next_u8() as usize;
-                self.position += 2;
-                let dst = self.next_u8() as usize;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let offset = vinfo.static_fields[field_idx].offset;
-                let value = unsafe { *(ptr.add(offset) as *const i64) };
-                self.registers_f[dst] = value;
-            }
-            // blackhole.py:1485-1495 bhimpl_setfield_vable_i/r/f
-            jitcode::BC_SETFIELD_VABLE_I => {
-                let field_idx = self.vable_field_index_at(self.position + 2);
-                let base = self.next_u8() as usize;
-                let src = self.next_u8() as usize;
-                self.position += 2;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let offset = vinfo.static_fields[field_idx].offset;
-                let value = self.registers_i[src];
-                unsafe { *(ptr.add(offset) as *mut i64) = value };
-            }
-            jitcode::BC_SETFIELD_VABLE_R => {
-                let field_idx = self.vable_field_index_at(self.position + 2);
-                let base = self.next_u8() as usize;
-                let src = self.next_u8() as usize;
-                self.position += 2;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let offset = vinfo.static_fields[field_idx].offset;
-                let value = self.registers_r[src];
-                unsafe { *(ptr.add(offset) as *mut i64) = value };
-            }
-            jitcode::BC_SETFIELD_VABLE_F => {
-                let field_idx = self.vable_field_index_at(self.position + 2);
-                let base = self.next_u8() as usize;
-                let src = self.next_u8() as usize;
-                self.position += 2;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let offset = vinfo.static_fields[field_idx].offset;
-                let value = self.registers_f[src];
-                unsafe { *(ptr.add(offset) as *mut i64) = value };
-            }
-            // blackhole.py:1374-1387 bhimpl_getarrayitem_vable_i/r/f:
-            //   fielddescr.get_vinfo().clear_vable_token(vable)
-            //   array = cpu.bh_getfield_gc_r(vable, fielddescr)
-            //   return cpu.bh_getarrayitem_gc_i/r/f(array, index, arraydescr)
-            jitcode::BC_GETARRAYITEM_VABLE_I
-            | jitcode::BC_GETARRAYITEM_VABLE_R
-            | jitcode::BC_GETARRAYITEM_VABLE_F => {
-                let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
-                let array_idx =
-                    self.vable_array_index_pair_at(self.position + 2, self.position + 4);
-                let base = self.next_u8() as usize;
-                let index_reg = self.next_u8() as usize;
-                self.position += 4;
-                let dst = self.next_u8() as usize;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let ainfo = &vinfo.array_fields[array_idx];
-                let index = self.registers_i[index_reg] as usize;
-                let value = unsafe {
-                    crate::virtualizable::vable_read_array_item(ptr as *const u8, ainfo, index)
-                };
-                if nbody_debug && array_idx == 0 && matches!(index, 5 | 6 | 8 | 9) {
-                    eprintln!(
-                        "[nbody-debug][bh-vable-get-inline] position={} opcode={} index={} value={:#x}",
-                        self.position, opcode, index, value as usize
-                    );
-                }
-                match opcode {
-                    jitcode::BC_GETARRAYITEM_VABLE_I => self.registers_i[dst] = value,
-                    jitcode::BC_GETARRAYITEM_VABLE_R => self.registers_r[dst] = value,
-                    _ => self.registers_f[dst] = value,
-                }
-            }
-            // blackhole.py:1390-1403 bhimpl_setarrayitem_vable_i/r/f
-            jitcode::BC_SETARRAYITEM_VABLE_I
-            | jitcode::BC_SETARRAYITEM_VABLE_R
-            | jitcode::BC_SETARRAYITEM_VABLE_F => {
-                let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
-                let array_idx =
-                    self.vable_array_index_pair_at(self.position + 3, self.position + 5);
-                let base = self.next_u8() as usize;
-                let index_reg = self.next_u8() as usize;
-                let src = self.next_u8() as usize;
-                self.position += 4;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let ainfo = &vinfo.array_fields[array_idx];
-                let index = self.registers_i[index_reg] as usize;
-                let value = match opcode {
-                    jitcode::BC_SETARRAYITEM_VABLE_I => self.registers_i[src],
-                    jitcode::BC_SETARRAYITEM_VABLE_R => self.registers_r[src],
-                    _ => self.registers_f[src],
-                };
-                if nbody_debug && array_idx == 0 && matches!(index, 5 | 6 | 8 | 9) {
-                    eprintln!(
-                        "[nbody-debug][bh-vable-set-inline] position={} opcode={} index={} value={:#x}",
-                        self.position, opcode, index, value as usize
-                    );
-                }
-                unsafe {
-                    crate::virtualizable::vable_write_array_item(ptr, ainfo, index, value);
-                }
-            }
-            // blackhole.py:1406-1409 bhimpl_arraylen_vable
-            jitcode::BC_ARRAYLEN_VABLE => {
-                let array_idx =
-                    self.vable_array_index_pair_at(self.position + 1, self.position + 3);
-                let base = self.next_u8() as usize;
-                self.position += 4;
-                let dst = self.next_u8() as usize;
-                let ptr = self.registers_r[base] as *mut u8;
-                let vinfo = unsafe { &*self.virtualizable_info };
-                unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
-                let ainfo = &vinfo.array_fields[array_idx];
-                let len =
-                    unsafe { crate::virtualizable::bhimpl_arraylen_vable(ptr as *const u8, ainfo) };
-                self.registers_i[dst] = len as i64;
-            }
-            jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {
-                let _vable_reg = self.next_u8();
-                // No-op in blackhole
-            }
-            other => {
-                panic!("blackhole: unknown jitcode bytecode {other}");
-            }
-        }
         Ok(())
     }
 
@@ -4963,6 +3836,52 @@ mod tests {
     mod bh_interp_tests {
         use super::super::*;
         use crate::jitcode::JitCodeBuilder;
+        use std::collections::HashMap;
+
+        /// C.5.1 — strict-dispatch builder for bare-new() unit fixtures.
+        ///
+        /// Mirrors `build_inline_call_only_bh_builder` for the BC_*
+        /// universe these fixtures emit via `JitCodeBuilder` helpers
+        /// (`load_const_i_value`, `record_binop_i`, `record_unary_i`,
+        /// `move_i`, `jump`, `goto_if_not_int_is_true`,
+        /// `load_const_r_value`, `ptr_nonzero`, `goto_if_not_ptr_nonzero`).
+        /// Mirrors the RPython contract that every emitted bytecode key
+        /// is wired before `dispatch_loop` runs (`blackhole.py:66-100
+        /// setup_insns` resolving every key via `_get_method`).
+        ///
+        /// PRE-EXISTING-ADAPTATION: the keys carry the `_pyre_u16`
+        /// suffix because `JitCodeBuilder::push_u16` emits 2-byte
+        /// register operands instead of RPython's 1-byte operands.
+        /// `wire_bhimpl_handlers` resolves these suffixed keys to the
+        /// `handler_*_pyre_u16` family and stores them at the same
+        /// `BC_*` slots that `JitCodeBuilder::write_insn` writes via
+        /// `insn_byte`.
+        fn build_test_bh_builder() -> BlackholeInterpBuilder {
+            use majit_translate::insns;
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut entries: HashMap<String, u8> = HashMap::new();
+            entries.insert("int_copy_pyre_u16/i>i".to_string(), insns::BC_MOVE_I);
+            entries.insert("ref_copy_pyre_u16/r>r".to_string(), insns::BC_MOVE_R);
+            entries.insert("int_add_pyre_u16/ii>i".to_string(), insns::BC_INT_ADD);
+            entries.insert("int_mul_pyre_u16/ii>i".to_string(), insns::BC_INT_MUL);
+            entries.insert("int_neg_pyre_u16/i>i".to_string(), insns::BC_INT_NEG);
+            entries.insert(
+                "ptr_nonzero_pyre_u16/r>i".to_string(),
+                insns::BC_PTR_NONZERO,
+            );
+            entries.insert("goto/L".to_string(), insns::BC_JUMP);
+            entries.insert(
+                "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
+                insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
+            );
+            entries.insert(
+                "goto_if_not_ptr_nonzero_pyre_u16/rL".to_string(),
+                insns::BC_GOTO_IF_NOT_PTR_NONZERO,
+            );
+            builder.setup_insns(&entries);
+            wire_bhimpl_handlers(&mut builder);
+            builder
+        }
 
         #[test]
         fn test_bh_interp_load_const_and_binop() {
@@ -4973,7 +3892,7 @@ mod tests {
             b.record_binop_i(2, OpCode::IntAdd, 0, 1);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -4993,7 +3912,7 @@ mod tests {
             b.load_const_i_value(2, 99);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5013,7 +3932,7 @@ mod tests {
             b.load_const_i_value(2, 99);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5032,7 +3951,7 @@ mod tests {
             b.load_const_i_value(1, 99);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5048,7 +3967,7 @@ mod tests {
             b.move_i(1, 0);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5063,7 +3982,7 @@ mod tests {
             b.record_unary_i(1, OpCode::IntNeg, 0);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5078,7 +3997,7 @@ mod tests {
             b.ptr_nonzero(1, 0);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5097,7 +4016,7 @@ mod tests {
             b.load_const_i_value(2, 99);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             let _ = bh.run();
@@ -5113,7 +4032,7 @@ mod tests {
             b.record_binop_i(2, OpCode::IntMul, 0, 1);
             let jitcode = b.finish();
 
-            let mut builder = BlackholeInterpBuilder::new();
+            let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), 0);
             bh.setarg_i(0, 7);
@@ -5169,9 +4088,8 @@ mod tests {
             let jitcode = b.finish();
 
             // Slice 3.1d: route through `handler_inline_call_pyre_nested`
-            // (the production builder shape) instead of the legacy
-            // `dispatch_one::BC_INLINE_CALL` fallback so this test
-            // exercises the same path as the production blackhole resume.
+            // (the production builder shape) so this test exercises the
+            // same path as the production blackhole resume.
             let mut builder = super::build_inline_call_only_bh_builder();
             assert!(
                 builder.unwired_opnames().is_empty(),
@@ -5394,11 +4312,9 @@ mod tests {
 
         /// Slice 3.1g Tier 2.3: callee `abort/` propagates aborted=true.
         /// Slice 3.2.1: callee shares the parent's dispatch_table, so
-        /// byte `BC_ABORT` either fires the wired handler
-        /// (`handler_abort_marker_pyre`, blackhole.rs:5837) or falls
-        /// back to `dispatch_one`'s legacy arm
-        /// (blackhole.rs:2284-2287); both set `aborted = true` +
-        /// LeaveFrame after Slice 3.2.0 unified the two paths.  The
+        /// byte `BC_ABORT` fires the wired handler
+        /// (`handler_abort_marker_pyre`), which sets `aborted = true` +
+        /// LeaveFrame.  The
         /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm
         /// inside `handler_inline_call_pyre_nested` then propagates to
         /// the caller.
@@ -5431,8 +4347,7 @@ mod tests {
         /// criterion for Slice 3.2.1's callee runtime context clone:
         /// the inner-most callee inherits the parent's dispatch_table
         /// via `clone_context_from`, so byte 17 routes to
-        /// `handler_inline_call_pyre_nested` recursively instead of
-        /// only working through `dispatch_one`'s legacy arm.  The
+        /// `handler_inline_call_pyre_nested` recursively.  The
         /// caller-side ground truth is that the int value threaded
         /// through three frames lands in the outermost caller's
         /// destination register.
@@ -5506,9 +4421,8 @@ mod tests {
             assert_eq!(callee.jitdrivers_sd.len(), parent.jitdrivers_sd.len());
         }
 
-        /// Slice 3.2.0: `handler_abort_marker_pyre` mirrors
-        /// `dispatch_one::BC_ABORT` arm semantics
-        /// (blackhole.rs:2284-2287).  Reaching `OpKind::Abort` at
+        /// Slice 3.2.0: `handler_abort_marker_pyre` defines the pyre
+        /// `BC_ABORT` marker semantics.  Reaching `OpKind::Abort` at
         /// runtime sets `aborted = true` and exits the frame —
         /// continuing dispatch past it would misread the next bytes
         /// as opcodes.
@@ -5929,8 +4843,8 @@ bhhandler_i_i!(handler_int_deref_pyre, bhimpl_int_same_as);
 // bytes (empty argcodes). Reaching here at runtime means a graph that
 // made it through rtyper still has an untranslatable op — abort the
 // frame rather than continue dispatching past it: subsequent bytes
-// would be misread as opcodes. Mirror of dispatch_one::BC_ABORT arm
-// (blackhole.rs:2284): `aborted = true` + `LeaveFrame`. RPython has no
+// would be misread as opcodes. Pyre marker semantics are
+// `aborted = true` + `LeaveFrame`. RPython has no
 // direct analog: its codewriter raises before lowering, so a jitcode
 // never carries an unrecognized op.
 fn handler_abort_marker_pyre(
@@ -5956,8 +4870,7 @@ fn handler_abort_result_marker_i(
 // pyre-only: `state_field` family. RPython has no counterpart — these are
 // emitted by `#[jit_interp]`'s `jitcode_lower` macro to express loads/stores
 // against a Rust-port `state_fields` register file used during tracing.
-// Blackhole has nothing to do for them (the dispatch_one arm at
-// blackhole.rs:2505-2524 is also a no-op): the state-field semantics live
+// Blackhole has nothing to do for them: the state-field semantics live
 // only in the trace path with a `JitCodeSym`. Handlers exist solely so the
 // dispatch_table entry is wired (not placeholder), keeping RPython
 // `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`'s
@@ -5987,8 +4900,8 @@ fn handler_state_array_noop_dii(
 
 /// Handler for `jit_merge_point/iIRFIRF` — `BC_JIT_MERGE_POINT`.
 /// Forwards to `bhimpl_jit_merge_point` which uses `self.position`-mutating
-/// helpers; `dispatch_step_with_fallback` already passes `self.position`
-/// as the `position` argument so the local copy stays in sync.
+/// helpers; `dispatch_step` already passes `self.position` as the
+/// `position` argument so the local copy stays in sync.
 fn handler_jit_merge_point_i(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
@@ -6242,6 +5155,16 @@ fn bhimpl_uint_gt(a: i64, b: i64) -> i64 {
 }
 fn bhimpl_uint_ge(a: i64, b: i64) -> i64 {
     ((a as u64) >= (b as u64)) as i64
+}
+
+/// `blackhole.py:471 bhimpl_uint_mul_high` — high 64 bits of unsigned
+/// 128-bit product.  Extracted from the inline body of
+/// `handler_uint_mul_high` so the pyre-u16 macro can target a named
+/// bhimpl uniformly with the rest of the binop family.
+fn bhimpl_uint_mul_high(a: i64, b: i64) -> i64 {
+    let a = a as u64 as u128;
+    let b = b as u64 as u128;
+    ((a * b) >> 64) as i64
 }
 
 bhhandler_ii_i!(handler_uint_lt, bhimpl_uint_lt);
@@ -6664,24 +5587,49 @@ fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a
 /// with the resolved byte offset via VirtualizableInfo.
 /// RPython: fielddescr carries byte offset directly; pyre VableField.index
 /// needs vinfo.static_fields[index].offset resolution.
+///
+/// Vable scalar word-size invariant: `field_size: 8`, `field_type: Ref`,
+/// `field_flag: Pointer`, `is_field_signed: false`.  Every vable scalar
+/// field in pyre is laid out as a single machine word, so the synthesized
+/// BhDescr can hard-code these.  The dynasm / cranelift `bh_getfield_gc_*`
+/// overrides on this BhDescr therefore read i64 / GcRef / f64 at the
+/// resolved offset without consulting size/sign — equivalent to the
+/// llmodel.py:705 `read_int_at_mem(struct, ofs, 8, False)` call.
+/// Non-word-sized vable fields would require porting RPython's
+/// `unpack_fielddescr_size` ((ofs, size, sign) tuple) into BhDescr +
+/// updating both backends to honor `size`/`sign`.
 #[inline]
 fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let field_index = descr.as_vable_field_index();
-    // Resolve field_index → byte offset via VirtualizableInfo.
-    let offset = if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        vinfo
-            .static_fields
-            .get(field_index)
-            .map(|f| f.offset)
-            .unwrap_or(field_index)
+    // Resolve field_index -> byte offset via VirtualizableInfo.  PyPy gets
+    // this from fielddescr.get_vinfo(); pyre stores the equivalent vinfo on
+    // the active blackhole frame, so absence is a contract bug, not a
+    // byte-offset fallback.
+    let vinfo = if bh.virtualizable_info.is_null() {
+        panic!(
+            "read_descr_vable_field: virtualizable_info must be set for VableField index {} \
+             (RPython blackhole.py:1446 fielddescr.get_vinfo() parity)",
+            field_index
+        );
     } else {
-        field_index
+        unsafe { &*bh.virtualizable_info }
     };
+    let offset = vinfo
+        .static_fields
+        .get(field_index)
+        .unwrap_or_else(|| {
+            panic!(
+                "read_descr_vable_field: VableField index {} out of bounds for {} static fields",
+                field_index,
+                vinfo.static_fields.len()
+            )
+        })
+        .offset;
     (
         BhDescr::Field {
             offset,
+            // Vable scalar word-size invariant — see fn doc-block.
             field_size: 8,
             field_type: majit_ir::value::Type::Ref,
             field_flag: majit_ir::descr::ArrayFlag::Pointer,
@@ -6705,16 +5653,26 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
 fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let array_index = descr.as_vable_array_index();
-    let offset = if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        vinfo
-            .array_fields
-            .get(array_index)
-            .map(|a| a.field_offset)
-            .unwrap_or(array_index)
+    let vinfo = if bh.virtualizable_info.is_null() {
+        panic!(
+            "read_descr_vable_array: virtualizable_info must be set for VableArray index {} \
+             (RPython blackhole.py:1374 fielddescr.get_vinfo() parity)",
+            array_index
+        );
     } else {
-        array_index
+        unsafe { &*bh.virtualizable_info }
     };
+    let offset = vinfo
+        .array_fields
+        .get(array_index)
+        .unwrap_or_else(|| {
+            panic!(
+                "read_descr_vable_array: VableArray index {} out of bounds for {} array fields",
+                array_index,
+                vinfo.array_fields.len()
+            )
+        })
+        .field_offset;
     (
         BhDescr::Field {
             offset,
@@ -7560,11 +6518,9 @@ fn handler_raise_pyre_u16(
     let exc = bh.registers_r[src];
     bh.position = p + 2;
     // `blackhole.py:1000` `bhimpl_raise(excvalue)` — `assert e` requires
-    // a non-null exception object.  The legacy `dispatch_one`
-    // `BC_RAISE` arm (`blackhole.rs:2362-2366`) gates `exc != 0` and
-    // routes a null `exc` through `aborted = true` + `LeaveFrame`;
-    // mirror that here so the pyre-u16 production builder path keeps
-    // the same fallback semantics.
+    // a non-null exception object.  Pyre's flat `BC_RAISE` encoding keeps
+    // the existing null-exception behavior by routing a null `exc` through
+    // `aborted = true` + `LeaveFrame`.
     if exc != 0 {
         Err(DispatchError::RaiseException(exc))
     } else {
@@ -7595,7 +6551,463 @@ fn handler_goto_if_not_int_is_true_pyre_u16(
     if a != 0 { Ok(pc) } else { Ok(target) }
 }
 
-/// Process-global Backend instance for blackhole's `bh_getfield_gc_*` /
+// Sub-slice C.5: extra pyre-u16 handlers wired into
+// `build_inline_call_only_bh_builder` so its `setup_insns` covers
+// every BC_* the inline_call test fixtures emit.  Register-width
+// rationale lives at the C.1 block-header.
+
+fn handler_int_return_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.tmpreg_i = bh.registers_i[src];
+    bh.return_type = BhReturnType::Int;
+    bh.position = position + 2;
+    Err(DispatchError::LeaveFrame)
+}
+
+fn handler_float_return_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.tmpreg_f = bh.registers_f[src];
+    bh.return_type = BhReturnType::Float;
+    bh.position = position + 2;
+    Err(DispatchError::LeaveFrame)
+}
+
+fn handler_float_copy_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let dst = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    bh.registers_f[dst] = bh.registers_f[src];
+    Ok(position + 4)
+}
+
+/// pyre-u16 mirror of `bhhandler_ii_i!` for `record_binop_i` emit
+/// shape (`assembler.rs:746`): `dst, lhs, rhs` as 2-byte register
+/// indices each (6 bytes total), opposite to the canonical
+/// `lhs, rhs, dst` 1-byte order.  Generates a fn-pointer handler for
+/// every `int_*/ii>i` and `uint_*/ii>i` opname JitCodeBuilder ever
+/// produces.
+macro_rules! bhhandler_ii_i_pyre_u16 {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let a = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let b = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
+            let lhs = bh.registers_i[a];
+            let rhs = bh.registers_i[b];
+            bh.registers_i[dst] = $bhimpl(lhs, rhs);
+            Ok(position + 6)
+        }
+    };
+}
+
+bhhandler_ii_i_pyre_u16!(handler_int_add_pyre_u16, bhimpl_int_add);
+bhhandler_ii_i_pyre_u16!(handler_int_sub_pyre_u16, bhimpl_int_sub);
+bhhandler_ii_i_pyre_u16!(handler_int_mul_pyre_u16, bhimpl_int_mul);
+bhhandler_ii_i_pyre_u16!(handler_int_floordiv_pyre_u16, bhimpl_int_floordiv);
+bhhandler_ii_i_pyre_u16!(handler_int_mod_pyre_u16, bhimpl_int_mod);
+bhhandler_ii_i_pyre_u16!(handler_int_and_pyre_u16, bhimpl_int_and);
+bhhandler_ii_i_pyre_u16!(handler_int_or_pyre_u16, bhimpl_int_or);
+bhhandler_ii_i_pyre_u16!(handler_int_xor_pyre_u16, bhimpl_int_xor);
+bhhandler_ii_i_pyre_u16!(handler_int_lshift_pyre_u16, bhimpl_int_lshift);
+bhhandler_ii_i_pyre_u16!(handler_int_rshift_pyre_u16, bhimpl_int_rshift);
+bhhandler_ii_i_pyre_u16!(handler_int_eq_pyre_u16, bhimpl_int_eq);
+bhhandler_ii_i_pyre_u16!(handler_int_ne_pyre_u16, bhimpl_int_ne);
+bhhandler_ii_i_pyre_u16!(handler_int_lt_pyre_u16, bhimpl_int_lt);
+bhhandler_ii_i_pyre_u16!(handler_int_le_pyre_u16, bhimpl_int_le);
+bhhandler_ii_i_pyre_u16!(handler_int_gt_pyre_u16, bhimpl_int_gt);
+bhhandler_ii_i_pyre_u16!(handler_int_ge_pyre_u16, bhimpl_int_ge);
+bhhandler_ii_i_pyre_u16!(handler_uint_lt_pyre_u16, bhimpl_uint_lt);
+bhhandler_ii_i_pyre_u16!(handler_uint_le_pyre_u16, bhimpl_uint_le);
+bhhandler_ii_i_pyre_u16!(handler_uint_gt_pyre_u16, bhimpl_uint_gt);
+bhhandler_ii_i_pyre_u16!(handler_uint_ge_pyre_u16, bhimpl_uint_ge);
+bhhandler_ii_i_pyre_u16!(handler_uint_rshift_pyre_u16, bhimpl_uint_rshift);
+bhhandler_ii_i_pyre_u16!(handler_uint_mul_high_pyre_u16, bhimpl_uint_mul_high);
+
+/// pyre-u16 mirror of `bhhandler_i_i!` for `record_unary_i` emit
+/// shape (`assembler.rs:784`): `dst, src` as 2-byte register indices
+/// each (4 bytes total), opposite to the canonical `src, dst` 1-byte
+/// order.
+macro_rules! bhhandler_i_i_pyre_u16 {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let src = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            bh.registers_i[dst] = $bhimpl(bh.registers_i[src]);
+            Ok(position + 4)
+        }
+    };
+}
+
+bhhandler_i_i_pyre_u16!(handler_int_neg_pyre_u16, bhimpl_int_neg);
+bhhandler_i_i_pyre_u16!(handler_int_invert_pyre_u16, bhimpl_int_invert);
+
+/// pyre-u16 mirror of `bhhandler_ff_f!` for `record_binop_f` emit
+/// shape (`assembler.rs:2956`): `dst, lhs, rhs` as 2-byte register
+/// indices each (6 bytes total).  `registers_f` stores f64 bit
+/// patterns as i64; helpers reinterpret-cast each direction.
+macro_rules! bhhandler_ff_f_pyre_u16 {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let a = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let b = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
+            let lhs = f64::from_bits(bh.registers_f[a] as u64);
+            let rhs = f64::from_bits(bh.registers_f[b] as u64);
+            bh.registers_f[dst] = $bhimpl(lhs, rhs).to_bits() as i64;
+            Ok(position + 6)
+        }
+    };
+}
+
+bhhandler_ff_f_pyre_u16!(handler_float_add_pyre_u16, bhimpl_float_add);
+bhhandler_ff_f_pyre_u16!(handler_float_sub_pyre_u16, bhimpl_float_sub);
+bhhandler_ff_f_pyre_u16!(handler_float_mul_pyre_u16, bhimpl_float_mul);
+bhhandler_ff_f_pyre_u16!(handler_float_truediv_pyre_u16, bhimpl_float_truediv);
+
+/// pyre-u16 mirror of `bhhandler_f_f!` for `record_unary_f` emit shape
+/// (`assembler.rs:2974`): `dst, src` as 2-byte register indices each
+/// (4 bytes total).
+macro_rules! bhhandler_f_f_pyre_u16 {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let src = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let a = f64::from_bits(bh.registers_f[src] as u64);
+            bh.registers_f[dst] = $bhimpl(a).to_bits() as i64;
+            Ok(position + 4)
+        }
+    };
+}
+
+bhhandler_f_f_pyre_u16!(handler_float_neg_pyre_u16, bhimpl_float_neg);
+bhhandler_f_f_pyre_u16!(handler_float_abs_pyre_u16, bhimpl_float_abs);
+
+/// pyre-u16 mirror of `bhhandler_rr_i!` for `record_binop_r` emit
+/// shape (`assembler.rs:799`): `dst, lhs, rhs` as 2-byte register
+/// indices each (6 bytes total).  `registers_r` stores raw GcRef
+/// pointer bits.
+macro_rules! bhhandler_rr_i_pyre_u16 {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let a = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let b = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
+            let lhs = bh.registers_r[a];
+            let rhs = bh.registers_r[b];
+            bh.registers_i[dst] = $bhimpl(lhs, rhs);
+            Ok(position + 6)
+        }
+    };
+}
+
+// `instance_ptr_eq` / `instance_ptr_ne` reuse `bhimpl_ptr_eq` /
+// `bhimpl_ptr_ne` mirroring the canonical wiring at `bhhandler_rr_i`
+// invocations near the bhimpl definitions.
+bhhandler_rr_i_pyre_u16!(handler_ptr_eq_pyre_u16, bhimpl_ptr_eq);
+bhhandler_rr_i_pyre_u16!(handler_ptr_ne_pyre_u16, bhimpl_ptr_ne);
+bhhandler_rr_i_pyre_u16!(handler_instance_ptr_eq_pyre_u16, bhimpl_ptr_eq);
+bhhandler_rr_i_pyre_u16!(handler_instance_ptr_ne_pyre_u16, bhimpl_ptr_ne);
+
+/// pyre-u16 mirror of the canonical `r>i` 1-byte handler shape used
+/// by `ptr_iszero` / `ptr_nonzero` (`assembler.rs:817,825`):
+/// `dst, src` as 2-byte register indices each (4 bytes total).
+macro_rules! bhhandler_r_i_pyre_u16 {
+    ($name:ident, $bhimpl:ident) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let src = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            bh.registers_i[dst] = $bhimpl(bh.registers_r[src]);
+            Ok(position + 4)
+        }
+    };
+}
+
+bhhandler_r_i_pyre_u16!(handler_ptr_iszero_pyre_u16, bhimpl_ptr_iszero);
+bhhandler_r_i_pyre_u16!(handler_ptr_nonzero_pyre_u16, bhimpl_ptr_nonzero);
+
+/// pyre-u16 mirror of `bhhandler_goto_if_not_ii!` for `iiL` argcode
+/// shape (`assembler.rs:880`-): `a, b, target` as 2-byte indices each
+/// (6 bytes total), opposite to canonical 1-byte registers + 2-byte
+/// label.  RPython parity: `blackhole.py:871-911 bhimpl_goto_if_not_*`.
+macro_rules! bhhandler_goto_if_not_ii_pyre_u16 {
+    ($name:ident, $cmp:expr) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a_idx = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let b_idx = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let a = bh.registers_i[a_idx];
+            let b = bh.registers_i[b_idx];
+            let target = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
+            let pc = position + 6;
+            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
+        }
+    };
+}
+
+bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_lt_pyre_u16, |a: i64, b: i64| a < b);
+bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_le_pyre_u16, |a: i64, b: i64| a <= b);
+bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_eq_pyre_u16, |a: i64, b: i64| a == b);
+bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_ne_pyre_u16, |a: i64, b: i64| a != b);
+bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_gt_pyre_u16, |a: i64, b: i64| a > b);
+bhhandler_goto_if_not_ii_pyre_u16!(handler_goto_if_not_int_ge_pyre_u16, |a: i64, b: i64| a >= b);
+
+/// pyre-u16 mirror of `bhhandler_goto_if_not_ff!` for `ffL` argcode
+/// shape: `a, b, target` as 2-byte indices each (6 bytes total).
+/// `registers_f` stores f64 bit patterns as i64.  RPython parity:
+/// `blackhole.py:751-798 bhimpl_goto_if_not_float_*`.
+macro_rules! bhhandler_goto_if_not_ff_pyre_u16 {
+    ($name:ident, $cmp:expr) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a_idx = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let b_idx = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let a = f64::from_bits(bh.registers_f[a_idx] as u64);
+            let b = f64::from_bits(bh.registers_f[b_idx] as u64);
+            let target = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
+            let pc = position + 6;
+            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
+        }
+    };
+}
+
+bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_lt_pyre_u16, |a: f64, b: f64| a
+    < b);
+bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_le_pyre_u16, |a: f64, b: f64| a
+    <= b);
+bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_eq_pyre_u16, |a: f64, b: f64| a
+    == b);
+bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_ne_pyre_u16, |a: f64, b: f64| a
+    != b);
+bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_gt_pyre_u16, |a: f64, b: f64| a
+    > b);
+bhhandler_goto_if_not_ff_pyre_u16!(handler_goto_if_not_float_ge_pyre_u16, |a: f64, b: f64| a
+    >= b);
+
+/// pyre-u16 mirror for `rrL` argcode shape: `a, b, target` as 2-byte
+/// indices each (6 bytes total), reading ref registers.  RPython
+/// parity: `blackhole.py:806-815 bhimpl_goto_if_not_ptr_{eq,ne}`.
+macro_rules! bhhandler_goto_if_not_rr_pyre_u16 {
+    ($name:ident, $cmp:expr) => {
+        fn $name(
+            bh: &mut BlackholeInterpreter,
+            code: &[u8],
+            position: usize,
+        ) -> Result<usize, DispatchError> {
+            let a_idx = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+            let b_idx = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+            let a = bh.registers_r[a_idx];
+            let b = bh.registers_r[b_idx];
+            let target = u16::from_le_bytes([code[position + 4], code[position + 5]]) as usize;
+            let pc = position + 6;
+            if $cmp(a, b) { Ok(pc) } else { Ok(target) }
+        }
+    };
+}
+
+bhhandler_goto_if_not_rr_pyre_u16!(handler_goto_if_not_ptr_eq_pyre_u16, |a: i64, b: i64| a == b);
+bhhandler_goto_if_not_rr_pyre_u16!(handler_goto_if_not_ptr_ne_pyre_u16, |a: i64, b: i64| a != b);
+
+fn handler_goto_if_not_int_is_zero_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let a = bh.registers_i[reg];
+    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    let pc = position + 4;
+    // blackhole.py:916-920: fall through iff `not a` (a == 0).
+    if a == 0 { Ok(pc) } else { Ok(target) }
+}
+
+fn handler_goto_if_not_ptr_iszero_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let a = bh.registers_r[reg];
+    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    let pc = position + 4;
+    if a == 0 { Ok(pc) } else { Ok(target) }
+}
+
+fn handler_goto_if_not_ptr_nonzero_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let reg = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let a = bh.registers_r[reg];
+    let target = u16::from_le_bytes([code[position + 2], code[position + 3]]) as usize;
+    let pc = position + 4;
+    if a != 0 { Ok(pc) } else { Ok(target) }
+}
+
+/// pyre-u16 mirror of `handler_goto_if_exception_mismatch` reading a
+/// 2-byte register index for the bounding vtable register and a 2-byte
+/// label.  Mirrors the canonical handler at `blackhole.rs` (uses
+/// `cpu.bh_classof` + `cpu.bh_issubclass`).
+fn handler_goto_if_exception_mismatch_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let reg = u16::from_le_bytes([code[p], code[p + 1]]) as usize;
+    let bounding_vtable = bh.registers_i[reg];
+    let target = u16::from_le_bytes([code[p + 2], code[p + 3]]) as usize;
+    let pc = p + 4;
+    let exc_obj = bh.exception_last_value;
+    let exc_typeptr = if let Some(cpu) = bh.cpu {
+        cpu.bh_classof(exc_obj)
+    } else {
+        exc_obj
+    };
+    let is_match = if let Some(cpu) = bh.cpu {
+        cpu.bh_issubclass(exc_typeptr, bounding_vtable)
+    } else {
+        exc_typeptr == bounding_vtable
+    };
+    if is_match { Ok(pc) } else { Ok(target) }
+}
+
+// P7 — push/pop/guard_value/last_exception pyre-u16 family.  pyre
+// emits these with 2-byte register operands (assembler.rs:1306,1352,
+// 2692,2738); canonical 1-byte handlers would mis-decode the second
+// operand byte as an opcode.
+
+fn handler_int_push_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.tmpreg_i = bh.registers_i[src];
+    Ok(position + 2)
+}
+
+fn handler_ref_push_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.tmpreg_r = bh.registers_r[src];
+    Ok(position + 2)
+}
+
+fn handler_float_push_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let src = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.tmpreg_f = bh.registers_f[src];
+    Ok(position + 2)
+}
+
+fn handler_int_pop_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.registers_i[dst] = bh.tmpreg_i;
+    Ok(position + 2)
+}
+
+fn handler_ref_pop_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.registers_r[dst] = bh.tmpreg_r;
+    Ok(position + 2)
+}
+
+fn handler_float_pop_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    bh.registers_f[dst] = bh.tmpreg_f;
+    Ok(position + 2)
+}
+
+/// `int_guard_value/i` / `ref_guard_value/r` / `float_guard_value/f`
+/// — blackhole-time no-op (the trace-side promotion is a tracing-only
+/// concern).  Just consume the 2-byte u16 register operand.
+fn handler_guard_value_noop_pyre_u16(
+    _bh: &mut BlackholeInterpreter,
+    _code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    Ok(position + 2)
+}
+
+/// `last_exception/>i` pyre-u16 — read 2-byte dst register, write the
+/// classof(exception_last_value) typeptr.  Mirror of
+/// `handler_last_exception` (`blackhole.rs:9536`) with widened operand.
+fn handler_last_exception_pyre_u16(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let dst = u16::from_le_bytes([code[position], code[position + 1]]) as usize;
+    let exc_obj = bh.exception_last_value;
+    let typeptr = if let Some(cpu) = bh.cpu {
+        cpu.bh_classof(exc_obj)
+    } else {
+        exc_obj
+    };
+    bh.registers_i[dst] = typeptr;
+    Ok(position + 2)
+}
+
+/// Per-thread Backend instance for blackhole's `bh_getfield_gc_*` /
 /// `bh_setfield_gc_*` / `bh_getarrayitem_gc_*` / `bh_arraylen_gc` reads.
 ///
 /// PRE-EXISTING-ADAPTATION: RPython `blackhole.py:55-56,286` reads
@@ -7608,17 +7020,18 @@ fn handler_goto_if_not_int_is_true_pyre_u16(
 /// owns trace-compilation state (descr registries, etc.) that would be
 /// inappropriate to share with the blackhole `bh.cpu` field which only
 /// needs the stateless GC memory-access methods.  We leak ONE
-/// `BackendImpl` instance for the process — its `bh_getfield_gc_*` and
-/// related methods do direct unsafe pointer arithmetic (`runner.rs:2244-2271`
-/// for dynasm), which is identical to the `dispatch_one` direct-vinfo
-/// access path that the canonical-routing migration replaces.
+/// `BackendImpl` instance per thread — its `bh_getfield_gc_*` and
+/// related methods do direct unsafe pointer arithmetic
+/// (`runner.rs:2244-2271` for dynasm).
 ///
-/// Convergence path (Task #45 Stage 2 Slice 2.3 Sub-slice C.5): once
-/// `dispatch_step_with_fallback`'s placeholder bridge retires, the
-/// metainterp-owned backend should be plumbed through to blackhole's
-/// `cpu` field — RPython parity ties them together.  Until then, this
-/// leaked instance suffices because vable handlers only invoke
-/// stateless reads.
+/// Convergence path: align with RPython's `builder.cpu` invariant by
+/// passing the metainterp-owned `BackendImpl` to `BlackholeInterpBuilder`
+/// at construction (likely as `Arc<dyn Backend>` since
+/// `BH_BUILDER3` outlives any single MetaInterp invocation).  Open
+/// architectural item; not in scope here because the change cascades
+/// through the Backend trait's `Send + Sync` bound and every callsite
+/// that holds `&'static dyn Backend` today.  The leak is functionally
+/// correct because vable handlers only invoke stateless reads.
 #[cfg(any(feature = "dynasm", feature = "cranelift"))]
 pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
     // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
@@ -7640,18 +7053,22 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
     })
 }
 
-/// Build a `BlackholeInterpBuilder` for pyre's blackhole resume path,
-/// wiring only the canonical bytes whose `JitCodeBuilder` emit-side
-/// payload matches the bhimpl handler byte-for-byte.
+/// Build a strict `BlackholeInterpBuilder` for pyre's blackhole resume path.
 ///
 /// PRE-EXISTING-ADAPTATION: pyre's `JitCodeBuilder` emits other
-/// runtime opcodes (vable, residual_call, etc.) in a 2-byte-register
-/// payload that does not match the canonical RPython argcode contract
-/// that `wire_bhimpl_handlers` would route those bytes through.  This
-/// builder's `setup_insns` registers only the byte-identical canonical
-/// keys plus the misc-family pyre-u16 variants; every other byte falls
-/// through `dispatch_step_with_fallback` to `dispatch_one`'s legacy
-/// arms.  Currently registered:
+/// runtime opcodes in fixed BC_* bytes and several pyre-only payload
+/// shapes.  This builder's `setup_insns` registers every opcode key
+/// the production producers (`pyjitpl/dispatch.rs`, `majit-macros`
+/// DSL lowerer, `pyre-jit/src/jit/assembler.rs`) can emit: byte-
+/// identical canonical keys, pyre-u16 register-width adapters,
+/// audited residual_call / vable / state-field families, the pyre
+/// nested inline-call handler, and the `_pyre/P` adapters for
+/// `BC_CALL_ASSEMBLER_*`, `BC_COND_CALL_*`, and
+/// `BC_RECORD_KNOWN_RESULT_*` (P10).  The dispatch loop has no legacy
+/// fallback; any emitted byte missing from this table reaches
+/// `dispatch_step`'s unwired-opcode panic.
+///
+/// Initially registered:
 ///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` (Slice 3.1)
 ///   - Sub-slice B byte-identical canonical: `live/`, `loop_header/i`,
 ///     `goto/L`, `catch_exception/L`, `jit_merge_point/cIRFIRF`
@@ -7686,12 +7103,58 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "inline_call_pyre_nested/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,
     );
+    // P10 — pyre call_assembler / cond_call / record_known_result
+    // adapters.  The `_pyre/P` suffix matches the inline_call adapter
+    // pattern so wire_bhimpl_handlers binds the right handler and
+    // strict dispatch resolves the byte without panic.  Producers:
+    // `pyjitpl/dispatch.rs:3062-3354` (call_assembler), `majit-macros/
+    // src/jit_interp/jitcode_lower.rs:2166-2458` + `pyre/pyre-jit/src/
+    // jit/assembler.rs:1181` (cond_call / record_known_result).
+    for (key, byte) in [
+        (
+            "call_assembler_int_pyre/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_INT,
+        ),
+        (
+            "call_assembler_ref_pyre/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_REF,
+        ),
+        (
+            "call_assembler_float_pyre/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_FLOAT,
+        ),
+        (
+            "call_assembler_void_pyre/P",
+            majit_translate::insns::BC_CALL_ASSEMBLER_VOID,
+        ),
+        (
+            "cond_call_void_pyre/P",
+            majit_translate::insns::BC_COND_CALL_VOID,
+        ),
+        (
+            "cond_call_value_int_pyre/P",
+            majit_translate::insns::BC_COND_CALL_VALUE_INT,
+        ),
+        (
+            "cond_call_value_ref_pyre/P",
+            majit_translate::insns::BC_COND_CALL_VALUE_REF,
+        ),
+        (
+            "record_known_result_int_pyre/P",
+            majit_translate::insns::BC_RECORD_KNOWN_RESULT_INT,
+        ),
+        (
+            "record_known_result_ref_pyre/P",
+            majit_translate::insns::BC_RECORD_KNOWN_RESULT_REF,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
     // Sub-slice B (`pyre-bh-setup-insns-byte-identical-subset.md`):
     // five canonical keys whose `JitCodeBuilder` emit-side payload
-    // matches the wired `bhimpl_*` handler byte-for-byte.  All other
-    // canonical bytes still fall through `dispatch_step_with_fallback`
-    // to `dispatch_one` because pyre's u16 register operands diverge
-    // from RPython's u8 register operands in `code[position]` reads.
+    // matches the wired `bhimpl_*` handler byte-for-byte.  The rest of
+    // the builder registers audited pyre families below; any byte absent
+    // from setup_insns is a strict-dispatch error.
     //   * `live/` — operand-less; both paths skip 2-byte liveness offset.
     //   * `loop_header/i` — `i` is a 1-byte const-pool slot, RPython-aligned.
     //   * `goto/L` — operand-less for registers; 2-byte label.
@@ -7745,6 +7208,410 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "goto_if_not_int_is_true_pyre_u16/iL".to_string(),
         majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
     );
+    // Sub-slice C.5: cover the BC_* set the inline_call-only test
+    // fixtures emit (`int_return`, `float_return`, `int_add`,
+    // `float_copy`, `void_return`, `abort`, `abort_permanent`) so the
+    // production builder is closed over every opname pyre's
+    // `JitCodeBuilder` can produce.  The first four use new pyre-u16
+    // handlers (defined alongside the C.1 misc family) for 2-byte
+    // register operands; the last three carry no register operands and
+    // reuse the existing canonical handlers (`handler_void_return`,
+    // `handler_abort_marker_pyre`, `handler_abort_permanent`).
+    insns.insert(
+        "int_return_pyre_u16/i".to_string(),
+        majit_translate::insns::BC_INT_RETURN,
+    );
+    insns.insert(
+        "float_return_pyre_u16/f".to_string(),
+        majit_translate::insns::BC_FLOAT_RETURN,
+    );
+    insns.insert(
+        "void_return/".to_string(),
+        majit_translate::insns::BC_VOID_RETURN,
+    );
+    insns.insert(
+        "float_copy_pyre_u16/f>f".to_string(),
+        majit_translate::insns::BC_MOVE_F,
+    );
+    // P4 — full int binop+cmp+uint family (`record_binop_i` emit shape).
+    // 22 keys covering every `ii>i` opname JitCodeBuilder produces.
+    for (key, byte) in [
+        ("int_add_pyre_u16/ii>i", majit_translate::insns::BC_INT_ADD),
+        ("int_sub_pyre_u16/ii>i", majit_translate::insns::BC_INT_SUB),
+        ("int_mul_pyre_u16/ii>i", majit_translate::insns::BC_INT_MUL),
+        // `int_floordiv_pyre_u16` / `int_mod_pyre_u16` setup_insns
+        // entries removed: byte-reservation constants `BC_INT_FLOORDIV`
+        // / `BC_INT_MOD` were retired in main's `5bcfcb3efbf` parity
+        // fix, and no producer emits the `_pyre_u16` opname variants.
+        // The canonical `int_mod/ii>i` wire below stays because pyre's
+        // build-time assembler at
+        // `jit_codewriter/assembler.rs:2778-2789` `format!("int_{op}")`
+        // emits the canonical opname for `syn::BinOp::Rem` source-level
+        // `%` operators ahead of any jtransform-style direct-call rewrite.
+        ("int_and_pyre_u16/ii>i", majit_translate::insns::BC_INT_AND),
+        ("int_or_pyre_u16/ii>i", majit_translate::insns::BC_INT_OR),
+        ("int_xor_pyre_u16/ii>i", majit_translate::insns::BC_INT_XOR),
+        (
+            "int_lshift_pyre_u16/ii>i",
+            majit_translate::insns::BC_INT_LSHIFT,
+        ),
+        (
+            "int_rshift_pyre_u16/ii>i",
+            majit_translate::insns::BC_INT_RSHIFT,
+        ),
+        ("int_eq_pyre_u16/ii>i", majit_translate::insns::BC_INT_EQ),
+        ("int_ne_pyre_u16/ii>i", majit_translate::insns::BC_INT_NE),
+        ("int_lt_pyre_u16/ii>i", majit_translate::insns::BC_INT_LT),
+        ("int_le_pyre_u16/ii>i", majit_translate::insns::BC_INT_LE),
+        ("int_gt_pyre_u16/ii>i", majit_translate::insns::BC_INT_GT),
+        ("int_ge_pyre_u16/ii>i", majit_translate::insns::BC_INT_GE),
+        ("uint_lt_pyre_u16/ii>i", majit_translate::insns::BC_UINT_LT),
+        ("uint_le_pyre_u16/ii>i", majit_translate::insns::BC_UINT_LE),
+        ("uint_gt_pyre_u16/ii>i", majit_translate::insns::BC_UINT_GT),
+        ("uint_ge_pyre_u16/ii>i", majit_translate::insns::BC_UINT_GE),
+        (
+            "uint_rshift_pyre_u16/ii>i",
+            majit_translate::insns::BC_UINT_RSHIFT,
+        ),
+        (
+            "uint_mul_high_pyre_u16/ii>i",
+            majit_translate::insns::BC_UINT_MUL_HIGH,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
+    // P5 — int unary + float arithmetic + ref/ptr pyre-u16 family.
+    // 14 keys covering record_unary_i/f, record_binop_f, record_binop_r,
+    // and ptr_iszero/nonzero (`assembler.rs:784,817,825,2956,2974,799`).
+    for (key, byte) in [
+        ("int_neg_pyre_u16/i>i", majit_translate::insns::BC_INT_NEG),
+        (
+            "int_invert_pyre_u16/i>i",
+            majit_translate::insns::BC_INT_INVERT,
+        ),
+        (
+            "float_add_pyre_u16/ff>f",
+            majit_translate::insns::BC_FLOAT_ADD,
+        ),
+        (
+            "float_sub_pyre_u16/ff>f",
+            majit_translate::insns::BC_FLOAT_SUB,
+        ),
+        (
+            "float_mul_pyre_u16/ff>f",
+            majit_translate::insns::BC_FLOAT_MUL,
+        ),
+        (
+            "float_truediv_pyre_u16/ff>f",
+            majit_translate::insns::BC_FLOAT_TRUEDIV,
+        ),
+        (
+            "float_neg_pyre_u16/f>f",
+            majit_translate::insns::BC_FLOAT_NEG,
+        ),
+        (
+            "float_abs_pyre_u16/f>f",
+            majit_translate::insns::BC_FLOAT_ABS,
+        ),
+        ("ptr_eq_pyre_u16/rr>i", majit_translate::insns::BC_PTR_EQ),
+        ("ptr_ne_pyre_u16/rr>i", majit_translate::insns::BC_PTR_NE),
+        (
+            "instance_ptr_eq_pyre_u16/rr>i",
+            majit_translate::insns::BC_INSTANCE_PTR_EQ,
+        ),
+        (
+            "instance_ptr_ne_pyre_u16/rr>i",
+            majit_translate::insns::BC_INSTANCE_PTR_NE,
+        ),
+        (
+            "ptr_iszero_pyre_u16/r>i",
+            majit_translate::insns::BC_PTR_ISZERO,
+        ),
+        (
+            "ptr_nonzero_pyre_u16/r>i",
+            majit_translate::insns::BC_PTR_NONZERO,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
+    // P6 — branch pyre-u16 family.  Every `goto_if_not_*` opname
+    // JitCodeBuilder emits, decoding 2-byte register operands +
+    // 2-byte label.  17 keys; the existing `goto_if_not_int_is_true_pyre_u16/iL`
+    // and `goto_if_not_ptr_nonzero_pyre_u16/rL` are registered above
+    // (Sub-slice C.1 + C.5.1).
+    for (key, byte) in [
+        (
+            "goto_if_not_int_lt_pyre_u16/iiL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_LT,
+        ),
+        (
+            "goto_if_not_int_le_pyre_u16/iiL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_LE,
+        ),
+        (
+            "goto_if_not_int_eq_pyre_u16/iiL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_EQ,
+        ),
+        (
+            "goto_if_not_int_ne_pyre_u16/iiL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_NE,
+        ),
+        (
+            "goto_if_not_int_gt_pyre_u16/iiL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_GT,
+        ),
+        (
+            "goto_if_not_int_ge_pyre_u16/iiL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_GE,
+        ),
+        (
+            "goto_if_not_float_lt_pyre_u16/ffL",
+            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_LT,
+        ),
+        (
+            "goto_if_not_float_le_pyre_u16/ffL",
+            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_LE,
+        ),
+        (
+            "goto_if_not_float_eq_pyre_u16/ffL",
+            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_EQ,
+        ),
+        (
+            "goto_if_not_float_ne_pyre_u16/ffL",
+            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_NE,
+        ),
+        (
+            "goto_if_not_float_gt_pyre_u16/ffL",
+            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_GT,
+        ),
+        (
+            "goto_if_not_float_ge_pyre_u16/ffL",
+            majit_translate::insns::BC_GOTO_IF_NOT_FLOAT_GE,
+        ),
+        (
+            "goto_if_not_ptr_eq_pyre_u16/rrL",
+            majit_translate::insns::BC_GOTO_IF_NOT_PTR_EQ,
+        ),
+        (
+            "goto_if_not_ptr_ne_pyre_u16/rrL",
+            majit_translate::insns::BC_GOTO_IF_NOT_PTR_NE,
+        ),
+        (
+            "goto_if_not_int_is_zero_pyre_u16/iL",
+            majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_ZERO,
+        ),
+        (
+            "goto_if_not_ptr_iszero_pyre_u16/rL",
+            majit_translate::insns::BC_GOTO_IF_NOT_PTR_ISZERO,
+        ),
+        (
+            "goto_if_exception_mismatch_pyre_u16/iL",
+            majit_translate::insns::BC_GOTO_IF_EXCEPTION_MISMATCH,
+        ),
+        (
+            "goto_if_not_ptr_nonzero_pyre_u16/rL",
+            majit_translate::insns::BC_GOTO_IF_NOT_PTR_NONZERO,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
+    // P7 — state_field family (byte-identical canonical: u16 descr +
+    // u8 register), push/pop/guard_value pyre-u16 (u16 register), and
+    // misc operand-less (reraise, unreachable) + jit_merge_point/iIRFIRF
+    // (already wired canonically).
+    for (key, byte) in [
+        // state_field/array/varray — canonical handlers wire directly.
+        (
+            "load_state_field/di",
+            majit_translate::insns::BC_LOAD_STATE_FIELD,
+        ),
+        (
+            "store_state_field/di",
+            majit_translate::insns::BC_STORE_STATE_FIELD,
+        ),
+        (
+            "load_state_array/dii",
+            majit_translate::insns::BC_LOAD_STATE_ARRAY,
+        ),
+        (
+            "store_state_array/dii",
+            majit_translate::insns::BC_STORE_STATE_ARRAY,
+        ),
+        (
+            "load_state_varray/dii",
+            majit_translate::insns::BC_LOAD_STATE_VARRAY,
+        ),
+        (
+            "store_state_varray/dii",
+            majit_translate::insns::BC_STORE_STATE_VARRAY,
+        ),
+        // push/pop pyre-u16 — 2-byte register operand.
+        ("int_push_pyre_u16/i", majit_translate::insns::BC_INT_PUSH),
+        ("int_pop_pyre_u16/>i", majit_translate::insns::BC_INT_POP),
+        ("ref_push_pyre_u16/r", majit_translate::insns::BC_REF_PUSH),
+        ("ref_pop_pyre_u16/>r", majit_translate::insns::BC_REF_POP),
+        (
+            "float_push_pyre_u16/f",
+            majit_translate::insns::BC_FLOAT_PUSH,
+        ),
+        (
+            "float_pop_pyre_u16/>f",
+            majit_translate::insns::BC_FLOAT_POP,
+        ),
+        // guard_value pyre-u16 — 2-byte register, blackhole no-op.
+        (
+            "int_guard_value_pyre_u16/i",
+            majit_translate::insns::BC_INT_GUARD_VALUE,
+        ),
+        (
+            "ref_guard_value_pyre_u16/r",
+            majit_translate::insns::BC_REF_GUARD_VALUE,
+        ),
+        (
+            "float_guard_value_pyre_u16/f",
+            majit_translate::insns::BC_FLOAT_GUARD_VALUE,
+        ),
+        // last_exception pyre-u16 — 2-byte dst register.
+        (
+            "last_exception_pyre_u16/>i",
+            majit_translate::insns::BC_LAST_EXCEPTION,
+        ),
+        // operand-less canonical (byte-identical between pyre and RPython).
+        ("reraise/", majit_translate::insns::BC_RERAISE),
+        ("unreachable/", majit_translate::insns::BC_UNREACHABLE),
+        // jit_merge_point variant 2 (jdindex via const-pool).
+        (
+            "jit_merge_point/iIRFIRF",
+            majit_translate::insns::BC_JIT_MERGE_POINT,
+        ),
+    ] {
+        insns.insert(key.to_string(), byte);
+    }
+    insns.insert("abort/".to_string(), majit_translate::insns::BC_ABORT);
+    insns.insert(
+        "abort_permanent/".to_string(),
+        majit_translate::insns::BC_ABORT_PERMANENT,
+    );
+    // Sub-slice C.3+C.4 (`subslice_c_register_width_axis_plan_2026_05_07.md`):
+    // residual_call family — `JitCodeBuilder::emit_canonical_call_void` /
+    // `emit_canonical_call_typed` (assembler.rs:1688, 1923) emit each
+    // register operand via `push_reg_u8` (asserts `reg <= u8::MAX`) and
+    // each list count as `push_u8` (asserts `len <= u8::MAX`); only the
+    // trailing `calldescr_idx` is `push_u16`.  This matches the
+    // canonical RPython argcode contract (`blackhole.py:1224-1276`)
+    // byte-for-byte, so the wired `handler_residual_call_*` decode
+    // straight via `read_list_{i,r,f}` + `read_descr` without needing
+    // pyre-u16 variants.
+    insns.insert(
+        "residual_call_r_v/iRd".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_R_V,
+    );
+    insns.insert(
+        "residual_call_r_i/iRd>i".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_R_I,
+    );
+    insns.insert(
+        "residual_call_r_r/iRd>r".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_R_R,
+    );
+    insns.insert(
+        "residual_call_ir_v/iIRd".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IR_V,
+    );
+    insns.insert(
+        "residual_call_ir_i/iIRd>i".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IR_I,
+    );
+    insns.insert(
+        "residual_call_ir_r/iIRd>r".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IR_R,
+    );
+    insns.insert(
+        "residual_call_irf_v/iIRFd".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IRF_V,
+    );
+    insns.insert(
+        "residual_call_irf_i/iIRFd>i".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IRF_I,
+    );
+    insns.insert(
+        "residual_call_irf_r/iIRFd>r".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IRF_R,
+    );
+    insns.insert(
+        "residual_call_irf_f/iIRFd>f".to_string(),
+        majit_translate::insns::BC_RESIDUAL_CALL_IRF_F,
+    );
+    // Sub-slice C.2.1 + Path 2/3 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
+    // vable family (full 14-key coverage).  Path 3 (single-indirection
+    // `getfield_vable_*` / `setfield_vable_*` / `hint_force_virtualizable`)
+    // routes through the canonical `cpu.bh_getfield_gc_*` /
+    // `bh_setfield_gc_*` chain — both `runner.rs:2244-2275` (dynasm) and
+    // `compiler.rs::bh_getfield_gc_*` (cranelift, this slice) implement
+    // the chain via direct `*(struct_ptr + descr.as_offset())` reads,
+    // matching the old inline vinfo offset path.  Path 2
+    // (2-level indirection `getarrayitem_vable_*` /
+    // `setarrayitem_vable_*` / `arraylen_vable`) bypasses the cpu chain
+    // and calls `vable_*_array_item` / `bhimpl_arraylen_vable` directly
+    // to handle pyre's `EmbeddedArray` storage — see
+    // PRE-EXISTING-ADAPTATION header at `handler_getarrayitem_vable_i`.
+    // Together this makes the vable family strict-dispatch ready.
+    insns.insert(
+        "getfield_vable_i/rd>i".to_string(),
+        majit_translate::insns::BC_GETFIELD_VABLE_I,
+    );
+    insns.insert(
+        "getfield_vable_r/rd>r".to_string(),
+        majit_translate::insns::BC_GETFIELD_VABLE_R,
+    );
+    insns.insert(
+        "getfield_vable_f/rd>f".to_string(),
+        majit_translate::insns::BC_GETFIELD_VABLE_F,
+    );
+    insns.insert(
+        "setfield_vable_i/rid".to_string(),
+        majit_translate::insns::BC_SETFIELD_VABLE_I,
+    );
+    insns.insert(
+        "setfield_vable_r/rrd".to_string(),
+        majit_translate::insns::BC_SETFIELD_VABLE_R,
+    );
+    insns.insert(
+        "setfield_vable_f/rfd".to_string(),
+        majit_translate::insns::BC_SETFIELD_VABLE_F,
+    );
+    insns.insert(
+        "getarrayitem_vable_i/ridd>i".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_VABLE_I,
+    );
+    insns.insert(
+        "getarrayitem_vable_r/ridd>r".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_VABLE_R,
+    );
+    insns.insert(
+        "getarrayitem_vable_f/ridd>f".to_string(),
+        majit_translate::insns::BC_GETARRAYITEM_VABLE_F,
+    );
+    insns.insert(
+        "setarrayitem_vable_i/riidd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_VABLE_I,
+    );
+    insns.insert(
+        "setarrayitem_vable_r/rirdd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_VABLE_R,
+    );
+    insns.insert(
+        "setarrayitem_vable_f/rifdd".to_string(),
+        majit_translate::insns::BC_SETARRAYITEM_VABLE_F,
+    );
+    insns.insert(
+        "arraylen_vable/rdd>i".to_string(),
+        majit_translate::insns::BC_ARRAYLEN_VABLE,
+    );
+    insns.insert(
+        "hint_force_virtualizable/r".to_string(),
+        majit_translate::insns::BC_HINT_FORCE_VIRTUALIZABLE,
+    );
     builder.setup_insns(&insns);
     // `setup_insns` already derives `op_live` and `op_catch_exception`
     // from the registered canonical subset above.  `rvmprof_code/ii` is
@@ -7759,6 +7626,13 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         majit_translate::insns::BC_RVMPROF_CODE as i32,
     );
     wire_bhimpl_handlers(&mut builder);
+    // The setup_insns surface above covers every BC_* opcode pyre
+    // producers emit, including the helper-side `_pyre/P` adapters
+    // for `BC_CALL_ASSEMBLER_*`, `BC_COND_CALL_*`, and
+    // `BC_RECORD_KNOWN_RESULT_*` (P10).  `dispatch_step` panics on
+    // any emitted byte missing from the table or still wired to the
+    // placeholder, mirroring `blackhole.py:66-100 setup_insns`
+    // resolving every key via `_get_method`.
     builder
 }
 
@@ -7787,9 +7661,8 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // pyre-only state_field family (no RPython counterpart). Blackhole
     // treats these as no-ops; handlers exist only to advance position past
-    // the operand bytes so dispatch_table[opcode] is wired (not placeholder)
-    // and `dispatch_step_with_fallback` no longer routes through dispatch_one
-    // for them.
+    // the operand bytes so strict dispatch sees a real handler instead of
+    // the unwired placeholder.
     builder.wire_handler("load_state_field/di", handler_state_field_noop_di);
     builder.wire_handler("store_state_field/di", handler_state_field_noop_di);
     builder.wire_handler("load_state_array/dii", handler_state_array_noop_dii);
@@ -7799,8 +7672,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // jit_merge_point + abort_permanent — bodies live on
     // `BlackholeInterpreter::bhimpl_jit_merge_point` / `bhimpl_abort_permanent`
-    // and are shared with the legacy dispatch_one arms so test fixtures that
-    // bypass `acquire_interp` continue to work.
+    // and are shared with direct test fixtures that bypass `acquire_interp`.
     builder.wire_handler("jit_merge_point/iIRFIRF", handler_jit_merge_point_i);
     builder.wire_handler("jit_merge_point/cIRFIRF", handler_jit_merge_point_c);
     builder.wire_handler("abort_permanent/", handler_abort_permanent);
@@ -8228,6 +8100,34 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // exposed via the pyre-only `inline_call_pyre_nested/P` key in
     // `pyre_extension_insns()`.
     builder.wire_handler("inline_call_pyre_nested/P", handler_inline_call_pyre_nested);
+    // P10 — pyre call_assembler / cond_call / record_known_result adapter wiring.
+    builder.wire_handler("call_assembler_int_pyre/P", handler_call_assembler_int_pyre);
+    builder.wire_handler("call_assembler_ref_pyre/P", handler_call_assembler_ref_pyre);
+    builder.wire_handler(
+        "call_assembler_float_pyre/P",
+        handler_call_assembler_float_pyre,
+    );
+    builder.wire_handler(
+        "call_assembler_void_pyre/P",
+        handler_call_assembler_void_pyre,
+    );
+    builder.wire_handler("cond_call_void_pyre/P", handler_cond_call_void_pyre);
+    builder.wire_handler(
+        "cond_call_value_int_pyre/P",
+        handler_cond_call_value_int_pyre,
+    );
+    builder.wire_handler(
+        "cond_call_value_ref_pyre/P",
+        handler_cond_call_value_ref_pyre,
+    );
+    builder.wire_handler(
+        "record_known_result_int_pyre/P",
+        handler_record_known_result_int_pyre,
+    );
+    builder.wire_handler(
+        "record_known_result_ref_pyre/P",
+        handler_record_known_result_ref_pyre,
+    );
 
     // Recursive call (stub — needs portal runner)
     // RPython `rpython/jit/metainterp/blackhole.py:1101-1132`:
@@ -8264,6 +8164,168 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler(
         "goto_if_not_int_is_true_pyre_u16/iL",
         handler_goto_if_not_int_is_true_pyre_u16,
+    );
+    // Sub-slice C.5: pyre-u16 variants for the inline_call test
+    // surface — int/float return, float_copy.  See block
+    // header comment near `handler_int_return_pyre_u16` definition.
+    builder.wire_handler("int_return_pyre_u16/i", handler_int_return_pyre_u16);
+    builder.wire_handler("float_return_pyre_u16/f", handler_float_return_pyre_u16);
+    builder.wire_handler("float_copy_pyre_u16/f>f", handler_float_copy_pyre_u16);
+    // P5 — int unary `i>i` family (`record_unary_i` emit shape).
+    builder.wire_handler("int_neg_pyre_u16/i>i", handler_int_neg_pyre_u16);
+    builder.wire_handler("int_invert_pyre_u16/i>i", handler_int_invert_pyre_u16);
+    // P5 — float arithmetic `ff>f` family (`record_binop_f` emit shape).
+    builder.wire_handler("float_add_pyre_u16/ff>f", handler_float_add_pyre_u16);
+    builder.wire_handler("float_sub_pyre_u16/ff>f", handler_float_sub_pyre_u16);
+    builder.wire_handler("float_mul_pyre_u16/ff>f", handler_float_mul_pyre_u16);
+    builder.wire_handler(
+        "float_truediv_pyre_u16/ff>f",
+        handler_float_truediv_pyre_u16,
+    );
+    // P5 — float unary `f>f` family (`record_unary_f` emit shape).
+    builder.wire_handler("float_neg_pyre_u16/f>f", handler_float_neg_pyre_u16);
+    builder.wire_handler("float_abs_pyre_u16/f>f", handler_float_abs_pyre_u16);
+    // P5 — ref binop `rr>i` family (`record_binop_r` emit shape).
+    builder.wire_handler("ptr_eq_pyre_u16/rr>i", handler_ptr_eq_pyre_u16);
+    builder.wire_handler("ptr_ne_pyre_u16/rr>i", handler_ptr_ne_pyre_u16);
+    builder.wire_handler(
+        "instance_ptr_eq_pyre_u16/rr>i",
+        handler_instance_ptr_eq_pyre_u16,
+    );
+    builder.wire_handler(
+        "instance_ptr_ne_pyre_u16/rr>i",
+        handler_instance_ptr_ne_pyre_u16,
+    );
+    // P5 — ref unary `r>i` family (ptr_iszero / ptr_nonzero).
+    builder.wire_handler("ptr_iszero_pyre_u16/r>i", handler_ptr_iszero_pyre_u16);
+    builder.wire_handler("ptr_nonzero_pyre_u16/r>i", handler_ptr_nonzero_pyre_u16);
+    builder.wire_handler(
+        "goto_if_not_ptr_nonzero_pyre_u16/rL",
+        handler_goto_if_not_ptr_nonzero_pyre_u16,
+    );
+    // P6 — branch pyre-u16 family (`record_binop_i`/`record_binop_f`/
+    // `record_binop_r` + `goto_if_not_*` emit shapes).
+    for (key, handler) in [
+        (
+            "goto_if_not_int_lt_pyre_u16/iiL",
+            handler_goto_if_not_int_lt_pyre_u16 as BhOpcodeHandler,
+        ),
+        (
+            "goto_if_not_int_le_pyre_u16/iiL",
+            handler_goto_if_not_int_le_pyre_u16,
+        ),
+        (
+            "goto_if_not_int_eq_pyre_u16/iiL",
+            handler_goto_if_not_int_eq_pyre_u16,
+        ),
+        (
+            "goto_if_not_int_ne_pyre_u16/iiL",
+            handler_goto_if_not_int_ne_pyre_u16,
+        ),
+        (
+            "goto_if_not_int_gt_pyre_u16/iiL",
+            handler_goto_if_not_int_gt_pyre_u16,
+        ),
+        (
+            "goto_if_not_int_ge_pyre_u16/iiL",
+            handler_goto_if_not_int_ge_pyre_u16,
+        ),
+        (
+            "goto_if_not_float_lt_pyre_u16/ffL",
+            handler_goto_if_not_float_lt_pyre_u16,
+        ),
+        (
+            "goto_if_not_float_le_pyre_u16/ffL",
+            handler_goto_if_not_float_le_pyre_u16,
+        ),
+        (
+            "goto_if_not_float_eq_pyre_u16/ffL",
+            handler_goto_if_not_float_eq_pyre_u16,
+        ),
+        (
+            "goto_if_not_float_ne_pyre_u16/ffL",
+            handler_goto_if_not_float_ne_pyre_u16,
+        ),
+        (
+            "goto_if_not_float_gt_pyre_u16/ffL",
+            handler_goto_if_not_float_gt_pyre_u16,
+        ),
+        (
+            "goto_if_not_float_ge_pyre_u16/ffL",
+            handler_goto_if_not_float_ge_pyre_u16,
+        ),
+        (
+            "goto_if_not_ptr_eq_pyre_u16/rrL",
+            handler_goto_if_not_ptr_eq_pyre_u16,
+        ),
+        (
+            "goto_if_not_ptr_ne_pyre_u16/rrL",
+            handler_goto_if_not_ptr_ne_pyre_u16,
+        ),
+        (
+            "goto_if_not_int_is_zero_pyre_u16/iL",
+            handler_goto_if_not_int_is_zero_pyre_u16,
+        ),
+        (
+            "goto_if_not_ptr_iszero_pyre_u16/rL",
+            handler_goto_if_not_ptr_iszero_pyre_u16,
+        ),
+        (
+            "goto_if_exception_mismatch_pyre_u16/iL",
+            handler_goto_if_exception_mismatch_pyre_u16,
+        ),
+        // P7 — push/pop/guard_value/last_exception pyre-u16 family.
+        ("int_push_pyre_u16/i", handler_int_push_pyre_u16),
+        ("ref_push_pyre_u16/r", handler_ref_push_pyre_u16),
+        ("float_push_pyre_u16/f", handler_float_push_pyre_u16),
+        ("int_pop_pyre_u16/>i", handler_int_pop_pyre_u16),
+        ("ref_pop_pyre_u16/>r", handler_ref_pop_pyre_u16),
+        ("float_pop_pyre_u16/>f", handler_float_pop_pyre_u16),
+        (
+            "int_guard_value_pyre_u16/i",
+            handler_guard_value_noop_pyre_u16,
+        ),
+        (
+            "ref_guard_value_pyre_u16/r",
+            handler_guard_value_noop_pyre_u16,
+        ),
+        (
+            "float_guard_value_pyre_u16/f",
+            handler_guard_value_noop_pyre_u16,
+        ),
+        (
+            "last_exception_pyre_u16/>i",
+            handler_last_exception_pyre_u16,
+        ),
+    ] {
+        builder.wire_handler(key, handler);
+    }
+    // P4 — full int binop+cmp+uint family (`record_binop_i` emit shape).
+    // 22 keys covering every `ii>i` opname JitCodeBuilder produces.
+    builder.wire_handler("int_add_pyre_u16/ii>i", handler_int_add_pyre_u16);
+    builder.wire_handler("int_sub_pyre_u16/ii>i", handler_int_sub_pyre_u16);
+    builder.wire_handler("int_mul_pyre_u16/ii>i", handler_int_mul_pyre_u16);
+    builder.wire_handler("int_floordiv_pyre_u16/ii>i", handler_int_floordiv_pyre_u16);
+    builder.wire_handler("int_mod_pyre_u16/ii>i", handler_int_mod_pyre_u16);
+    builder.wire_handler("int_and_pyre_u16/ii>i", handler_int_and_pyre_u16);
+    builder.wire_handler("int_or_pyre_u16/ii>i", handler_int_or_pyre_u16);
+    builder.wire_handler("int_xor_pyre_u16/ii>i", handler_int_xor_pyre_u16);
+    builder.wire_handler("int_lshift_pyre_u16/ii>i", handler_int_lshift_pyre_u16);
+    builder.wire_handler("int_rshift_pyre_u16/ii>i", handler_int_rshift_pyre_u16);
+    builder.wire_handler("int_eq_pyre_u16/ii>i", handler_int_eq_pyre_u16);
+    builder.wire_handler("int_ne_pyre_u16/ii>i", handler_int_ne_pyre_u16);
+    builder.wire_handler("int_lt_pyre_u16/ii>i", handler_int_lt_pyre_u16);
+    builder.wire_handler("int_le_pyre_u16/ii>i", handler_int_le_pyre_u16);
+    builder.wire_handler("int_gt_pyre_u16/ii>i", handler_int_gt_pyre_u16);
+    builder.wire_handler("int_ge_pyre_u16/ii>i", handler_int_ge_pyre_u16);
+    builder.wire_handler("uint_lt_pyre_u16/ii>i", handler_uint_lt_pyre_u16);
+    builder.wire_handler("uint_le_pyre_u16/ii>i", handler_uint_le_pyre_u16);
+    builder.wire_handler("uint_gt_pyre_u16/ii>i", handler_uint_gt_pyre_u16);
+    builder.wire_handler("uint_ge_pyre_u16/ii>i", handler_uint_ge_pyre_u16);
+    builder.wire_handler("uint_rshift_pyre_u16/ii>i", handler_uint_rshift_pyre_u16);
+    builder.wire_handler(
+        "uint_mul_high_pyre_u16/ii>i",
+        handler_uint_mul_high_pyre_u16,
     );
 }
 
@@ -8838,22 +8900,62 @@ fn handler_setfield_vable_f(
 // RPython: fielddescr.get_vinfo().clear_vable_token(vable)
 //          array = cpu.bh_getfield_gc_r(vable, fielddescr)
 //          return cpu.bh_getarrayitem_gc_*(array, index, arraydescr)
+//
+// PRE-EXISTING-ADAPTATION: pyre's W_ListObject `EmbeddedArray` storage
+// (`virtualizable.rs:104-113`) reaches the array data via two pointer
+// dereferences from the vable (vable→container→data + `ptr_offset`),
+// while `cpu.bh_getfield_gc_r + cpu.bh_setarrayitem_gc_*`
+// (`runner.rs:2244-2275`) only does a single indirection.  The chain
+// therefore cannot reach EmbeddedArray items.  Resolve `array_idx`
+// from the `BhDescr::VableArray` index and delegate to
+// `vable_read_array_item` / `vable_write_array_item` /
+// `bhimpl_arraylen_vable` (`virtualizable.rs:2454-2527`) — these
+// dispatch on `VableArrayStorage` and handle both EmbeddedArray and
+// DirectPointer modes.  This keeps the same direct vable-array helper
+// path under strict dispatch.
+// Convergence path (Sub-slice C.5+ epic): redesign W_ListObject to
+// single-indirection storage so the canonical cpu chain works
+// directly.
+/// Resolve `bh.virtualizable_info` to a non-null reference and clear the
+/// vable token on `vable`.  RPython parity: vable array ops obtain the
+/// `vinfo` from `fielddescr.get_vinfo()` (`blackhole.py:1374`); pyre
+/// stores the same handle on `bh.virtualizable_info` because pyre's
+/// `BhDescr::VableArray` carries only an index into the
+/// vinfo-shared `array_fields` table (`vable_array_index`) and the
+/// vinfo itself is set when the production frame enters the
+/// virtualizable scope.  Vable array opcodes therefore require
+/// `bh.virtualizable_info` to be non-null; an unset pointer means a
+/// builder constructed a vable-array bytecode outside a virtualizable
+/// context — a contract bug that should fail fast in debug builds.
+fn vable_clear_token_and_get_vinfo(
+    bh: &BlackholeInterpreter,
+    vable: i64,
+) -> &'static crate::virtualizable::VirtualizableInfo {
+    debug_assert!(
+        !bh.virtualizable_info.is_null(),
+        "vable array opcode requires `bh.virtualizable_info` to be set \
+         (RPython `blackhole.py:1374 fielddescr.get_vinfo()` parity)"
+    );
+    let vinfo = unsafe { &*bh.virtualizable_info };
+    unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
+    vinfo
+}
+
 fn handler_getarrayitem_vable_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
-    }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
-    let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(array, index, array_descr);
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 2);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    let value =
+        unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
+    bh.registers_i[code[p] as usize] = value;
     Ok(p + 1)
 }
 fn handler_getarrayitem_vable_r(
@@ -8863,16 +8965,14 @@ fn handler_getarrayitem_vable_r(
 ) -> Result<usize, DispatchError> {
     let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
-    }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
-    let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    let value = cpu.bh_getarrayitem_gc_r(array, index, array_descr).0 as i64;
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 2);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    let value =
+        unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-get-r] position={} last_opcode_position={} index={} value={:#x}",
@@ -8888,17 +8988,16 @@ fn handler_setarrayitem_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
     let value = bh.registers_i[code[p + 2] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 3);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    unsafe {
+        crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
-    let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    cpu.bh_setarrayitem_gc_i(array, index, value, array_descr);
     Ok(p)
 }
 fn handler_setarrayitem_vable_r(
@@ -8908,23 +9007,22 @@ fn handler_setarrayitem_vable_r(
 ) -> Result<usize, DispatchError> {
     let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
     let value = bh.registers_r[code[p + 2] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
-    }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
-    let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 3);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
     if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
         eprintln!(
             "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
             bh.position, bh.last_opcode_position, index, value as usize
         );
     }
-    cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), array_descr);
+    unsafe {
+        crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
+    }
     Ok(p)
 }
 fn handler_arraylen_vable(
@@ -8933,15 +9031,13 @@ fn handler_arraylen_vable(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
-    }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 1);
-    let (array_len_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    bh.registers_i[code[p] as usize] = cpu.bh_arraylen_gc(array, array_len_descr);
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 1);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    let len = unsafe { crate::virtualizable::bhimpl_arraylen_vable(vable as *const u8, ainfo) };
+    bh.registers_i[code[p] as usize] = len as i64;
     Ok(p + 1)
 }
 
@@ -9483,24 +9579,25 @@ fn handler_newlist_hint(
     Ok(p + 1)
 }
 // blackhole.py:1384-1387 bhimpl_getarrayitem_vable_f
+// PRE-EXISTING-ADAPTATION mirrored from `handler_getarrayitem_vable_i`
+// header — pyre's W_ListObject EmbeddedArray storage requires direct
+// `vable_read_array_item`.  `registers_f` stores the f64 bit-pattern
+// in i64, so the universal i64 read path round-trips losslessly.
 fn handler_getarrayitem_vable_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
-    }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 2);
-    let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    bh.registers_f[code[p] as usize] = cpu
-        .bh_getarrayitem_gc_f(array, index, array_descr)
-        .to_bits() as i64;
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 2);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    let value =
+        unsafe { crate::virtualizable::vable_read_array_item(vable as *const u8, ainfo, index) };
+    bh.registers_f[code[p] as usize] = value;
     Ok(p + 1)
 }
 // blackhole.py:1400-1403 bhimpl_setarrayitem_vable_f
@@ -9510,17 +9607,16 @@ fn handler_setarrayitem_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize];
-    let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) };
+    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let value = bh.registers_f[code[p + 2] as usize];
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 3);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    unsafe {
+        crate::virtualizable::vable_write_array_item(vable as *mut u8, ainfo, index, value);
     }
-    let (field_descr, p) = read_descr_vable_array(bh, code, p + 3);
-    let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
-    let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    cpu.bh_setarrayitem_gc_f(array, index, value, array_descr);
     Ok(p)
 }
 // blackhole.py:1204-1206 bhimpl_getlistitem_gc_f
@@ -9704,6 +9800,323 @@ fn handler_inline_call_r_v(
     Ok(p)
 }
 
+/// PRE-EXISTING-ADAPTATION: pyre `call_assembler_*` adapters.
+///
+/// `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
+/// (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat payload
+/// for `BC_CALL_ASSEMBLER_{INT,REF,FLOAT,VOID}`:
+///   typed: `[target_idx: u16, dst: u16, num_args: u16, (kind: u8, reg: u16) × num_args]`
+///   void:  `[target_idx: u16, num_args: u16, (kind: u8, reg: u16) × num_args]`
+/// RPython has no `bhimpl_call_assembler_*`; pyre re-interprets the
+/// recorded operation by direct-calling `target.concrete_ptr` via the
+/// shared `call_int_function` / `call_void_function` C-ABI helpers.
+/// The 4 handlers below are the line-by-line port of the legacy
+/// `dispatch_one::BC_CALL_ASSEMBLER_*` arms (pre-P8) into the
+/// strict-dispatch `(bh, code, position) -> Result<usize, _>` shape.
+fn handler_call_assembler_int_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let dst = jitcode::read_u16(code, &mut p) as usize;
+    let num_args = jitcode::read_u16(code, &mut p) as usize;
+    let mut args = Vec::with_capacity(num_args);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let reg = jitcode::read_u16(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg));
+    }
+    let target = bh.jitcode.call_target(fn_ptr_idx);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = call_int_function(target.concrete_ptr, &args);
+    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+    if exc_val != 0 {
+        bh.position = p;
+        if bh.handle_exception_in_frame(exc_val) {
+            return Ok(bh.position);
+        }
+        bh.exception_last_value = exc_val;
+        bh.got_exception = true;
+        return Err(DispatchError::LeaveFrame);
+    }
+    bh.registers_i[dst] = result;
+    Ok(p)
+}
+
+fn handler_call_assembler_ref_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let dst = jitcode::read_u16(code, &mut p) as usize;
+    let num_args = jitcode::read_u16(code, &mut p) as usize;
+    let mut args = Vec::with_capacity(num_args);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let reg = jitcode::read_u16(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg));
+    }
+    let target = bh.jitcode.call_target(fn_ptr_idx);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    // RPython `blackhole.py:1244 bhimpl_residual_call_irf_r` →
+    // `cpu.bh_call_r(...)`; pyre's ref ABI uses the same i64 carrier
+    // as int (`pyjitpl/dispatch.rs:4161 call_ref_function = call_int_function`),
+    // so the alias is structural-parity only.  Picking the ref-named
+    // helper here keeps the call site readable as `bh_call_r` and
+    // gives a single switch point if the ref ABI ever diverges.
+    let result = call_ref_function(target.concrete_ptr, &args);
+    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+    if exc_val != 0 {
+        bh.position = p;
+        if bh.handle_exception_in_frame(exc_val) {
+            return Ok(bh.position);
+        }
+        bh.exception_last_value = exc_val;
+        bh.got_exception = true;
+        return Err(DispatchError::LeaveFrame);
+    }
+    bh.registers_r[dst] = result;
+    Ok(p)
+}
+
+/// `target.concrete_ptr` is `extern "C" fn(...) -> i64`; the f64 result is
+/// already pre-packed via `f64::to_bits()` inside the wrapper.  Calling
+/// through `call_int_function` and storing the i64 directly into
+/// `registers_f` matches RPython's `longlong.ZEROF` packing convention.
+/// The f64-ABI wrapper at `target.trace_ptr` is consumed only by the
+/// tracing path; using `call_float_function` here would transmute the
+/// i64-returning concrete wrapper through an `extern "C" fn(...) -> f64`
+/// signature and break the ABI.
+fn handler_call_assembler_float_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let dst = jitcode::read_u16(code, &mut p) as usize;
+    let num_args = jitcode::read_u16(code, &mut p) as usize;
+    let mut args = Vec::with_capacity(num_args);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let reg = jitcode::read_u16(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg));
+    }
+    let target = bh.jitcode.call_target(fn_ptr_idx);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = call_int_function(target.concrete_ptr, &args);
+    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+    if exc_val != 0 {
+        bh.position = p;
+        if bh.handle_exception_in_frame(exc_val) {
+            return Ok(bh.position);
+        }
+        bh.exception_last_value = exc_val;
+        bh.got_exception = true;
+        return Err(DispatchError::LeaveFrame);
+    }
+    bh.registers_f[dst] = result;
+    Ok(p)
+}
+
+fn handler_call_assembler_void_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let num_args = jitcode::read_u16(code, &mut p) as usize;
+    let mut args = Vec::with_capacity(num_args);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let reg = jitcode::read_u16(code, &mut p);
+        args.push(bh.read_call_arg(kind, reg));
+    }
+    let target = bh.jitcode.call_target(fn_ptr_idx);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    call_void_function(target.concrete_ptr, &args);
+    let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+    if exc_val != 0 {
+        bh.position = p;
+        if bh.handle_exception_in_frame(exc_val) {
+            return Ok(bh.position);
+        }
+        bh.exception_last_value = exc_val;
+        bh.got_exception = true;
+        return Err(DispatchError::LeaveFrame);
+    }
+    Ok(p)
+}
+
+/// PRE-EXISTING-ADAPTATION: pyre `cond_call` / `record_known_result`
+/// adapters.
+///
+/// `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
+/// (`assembler.rs:2642,2660`) emit a pyre-only flat payload:
+///   `cond_call_*`:    `[first_reg: u16, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u16]`
+///   `cond_call_value`: `[value_reg: u16, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u16, dst: u16]`
+///   `record_known_result_*`: same shape as `cond_call_*` (no dst).
+///
+/// Producers: `majit-macros/src/jit_interp/jitcode_lower.rs:2166-2458`,
+/// `pyre/pyre-jit/src/jit/assembler.rs:1181`.
+///
+/// Semantics mirror `blackhole.py:1257-1278 bhimpl_conditional_call_*`
+/// and `blackhole.py:620-628 bhimpl_record_known_result_*`:
+///   - `cond_call_void`: if `first_reg != 0`, `cpu.bh_call_v(func, args)`;
+///     no dst.
+///   - `cond_call_value_{i,r}`: if `first_reg == 0`, dst = result of
+///     `cpu.bh_call_{i,r}(func, args)`; else dst = first_reg's value.
+///   - `record_known_result_{i,r}`: pure marker, body is `pass`.
+fn read_cond_call_args(
+    bh: &BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+    arg_count: usize,
+) -> (Vec<i64>, usize) {
+    let mut args = Vec::with_capacity(arg_count);
+    let kinds_start = p;
+    let regs_start = kinds_start + arg_count;
+    for i in 0..arg_count {
+        let kind = JitArgKind::decode(code[kinds_start + i]);
+        let reg = u16::from_le_bytes([code[regs_start + 2 * i], code[regs_start + 2 * i + 1]]);
+        args.push(bh.read_call_arg(kind, reg));
+    }
+    (args, regs_start + 2 * arg_count)
+}
+
+fn handler_cond_call_void_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let cond_reg = jitcode::read_u16(code, &mut p) as usize;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let arg_count = jitcode::read_u8(code, &mut p) as usize;
+    let condition = bh.registers_i[cond_reg];
+    let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
+    if condition != 0 {
+        let target = bh.jitcode.call_target(fn_ptr_idx);
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        call_void_function(target.concrete_ptr, &args);
+        let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+        if exc_val != 0 {
+            bh.position = p_end;
+            if bh.handle_exception_in_frame(exc_val) {
+                return Ok(bh.position);
+            }
+            bh.exception_last_value = exc_val;
+            bh.got_exception = true;
+            return Err(DispatchError::LeaveFrame);
+        }
+    }
+    Ok(p_end)
+}
+
+fn handler_cond_call_value_int_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let value_reg = jitcode::read_u16(code, &mut p) as usize;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let arg_count = jitcode::read_u8(code, &mut p) as usize;
+    let value = bh.registers_i[value_reg];
+    let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
+    let dst = u16::from_le_bytes([code[p_end], code[p_end + 1]]) as usize;
+    let result = if value == 0 {
+        let target = bh.jitcode.call_target(fn_ptr_idx);
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        let r = call_int_function(target.concrete_ptr, &args);
+        let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+        if exc_val != 0 {
+            bh.position = p_end + 2;
+            if bh.handle_exception_in_frame(exc_val) {
+                return Ok(bh.position);
+            }
+            bh.exception_last_value = exc_val;
+            bh.got_exception = true;
+            return Err(DispatchError::LeaveFrame);
+        }
+        r
+    } else {
+        value
+    };
+    bh.registers_i[dst] = result;
+    Ok(p_end + 2)
+}
+
+fn handler_cond_call_value_ref_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    let value_reg = jitcode::read_u16(code, &mut p) as usize;
+    let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
+    let arg_count = jitcode::read_u8(code, &mut p) as usize;
+    let value = bh.registers_r[value_reg];
+    let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
+    let dst = u16::from_le_bytes([code[p_end], code[p_end + 1]]) as usize;
+    let result = if value == 0 {
+        let target = bh.jitcode.call_target(fn_ptr_idx);
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        // RPython `blackhole.py:1271 bhimpl_conditional_call_value_ir_r`
+        // → `cpu.bh_call_r(...)` (ref ABI).  See note on
+        // `handler_call_assembler_ref_pyre`.
+        let r = call_ref_function(target.concrete_ptr, &args);
+        let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
+        if exc_val != 0 {
+            bh.position = p_end + 2;
+            if bh.handle_exception_in_frame(exc_val) {
+                return Ok(bh.position);
+            }
+            bh.exception_last_value = exc_val;
+            bh.got_exception = true;
+            return Err(DispatchError::LeaveFrame);
+        }
+        r
+    } else {
+        value
+    };
+    bh.registers_r[dst] = result;
+    Ok(p_end + 2)
+}
+
+/// `bhimpl_record_known_result_*` body is `pass` — pure marker for
+/// the trace optimizer's known-result table.  Resume only advances
+/// past the operand bytes.
+fn handler_record_known_result_int_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    // first_reg : u16 + fn_ptr_idx : u16
+    p += 4;
+    let arg_count = jitcode::read_u8(code, &mut p) as usize;
+    let _ = bh;
+    // kinds: arg_count × u8
+    p += arg_count;
+    // regs: arg_count × u16
+    p += arg_count * 2;
+    Ok(p)
+}
+
+fn handler_record_known_result_ref_pyre(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    handler_record_known_result_int_pyre(bh, code, p)
+}
+
 /// PRE-EXISTING-ADAPTATION: pyre nested-bytecode `inline_call`.
 ///
 /// Pyre does not compile inlined helpers into separate native functions —
@@ -9714,9 +10127,8 @@ fn handler_inline_call_r_v(
 /// handlers (`handler_inline_call_irf_i` etc.) instead expect a real
 /// C-ABI fnaddr stored on `BhDescr::JitCode`.
 ///
-/// This handler is the line-by-line port of the legacy
-/// `dispatch_one::BC_INLINE_CALL` arm under the
-/// `(bh, code, position) -> Result<usize, _>` signature.  Operand
+/// This handler is the pyre nested-bytecode `inline_call` adapter under
+/// the `(bh, code, position) -> Result<usize, _>` signature.  Operand
 /// payload (pyre-only):
 ///   `sub_idx: u16`, `num_args: u16`,
 ///   `num_args × (kind: u8, caller_src: u16, callee_dst: u16)`,
@@ -9805,10 +10217,10 @@ fn handler_inline_call_pyre_nested(
     // decoded operands and consumed the result payload, every
     // exceptional exit path must update `self.position` to the
     // post-op cursor before re-raising.  Mirror that here for the
-    // aborted / got_exception paths — `dispatch_step_with_fallback`
-    // (`blackhole.rs:1993`) only writes `self.position = new_pos`
-    // when the handler returns `Ok`, so any `Err(LeaveFrame)` that
-    // skips the assignment leaves the parent's cursor pre-op.
+    // aborted / got_exception paths — `dispatch_step` only writes
+    // `self.position = new_pos` when the handler returns `Ok`, so any
+    // `Err(LeaveFrame)` that skips the assignment leaves the parent's
+    // cursor pre-op.
     if callee.aborted {
         bh.position = p;
         bh.aborted = true;

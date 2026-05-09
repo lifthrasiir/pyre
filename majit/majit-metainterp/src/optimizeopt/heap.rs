@@ -1436,7 +1436,7 @@ impl OptHeap {
     /// do NOT escape arguments.
     fn mark_escaped_varargs(&mut self, op: &Op, ctx: &mut OptContext) {
         let oopspec = Self::get_oopspecindex(op);
-        // heapcache.py:272: `descr.get_extra_info().single_write_descr_array
+        // heapcache.py:277 `descr.get_extra_info().single_write_descr_array
         // is not None`. The check predicates on the dedicated
         // `single_write_descr_array` field, NOT on the `bitstring_write*`
         // bit-count — `effectinfo.py:201-206 set_single_write_descr_array`
