@@ -1586,17 +1586,14 @@ pub struct RegAlloc<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [Op],
-    /// OpRef → index into `inputargs`. Pre-computed at construction.
-    inputarg_index: HashMap<OpRef, usize>,
-    /// OpRef → index into `operations`. Pre-computed at construction.
-    op_index: HashMap<OpRef, usize>,
-    /// Raw u32 → index into `inputargs`. Variant-blind fallback for
-    /// legacy `OpRef::from_raw()` `Untyped(_)` readers; mirrors
-    /// `OpTypeIndex::raw_inputarg_index`.
-    raw_inputarg_index: HashMap<u32, usize>,
-    /// Raw u32 → index into `operations`. Variant-blind fallback;
-    /// mirrors `OpTypeIndex::raw_op_index`.
-    raw_op_index: HashMap<u32, usize>,
+    /// `inputarg_pos[arg.index] = idx in inputargs`, sentinel
+    /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
+    /// `OpTypeIndex::inputarg_pos`.
+    inputarg_pos: Vec<u32>,
+    /// `op_pos[op.pos.raw()] = idx in operations`, sentinel
+    /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
+    /// Mirrors `OpTypeIndex::op_pos`.
+    op_pos: Vec<u32>,
     /// x86/regalloc.py:1305 self.jump_target_descr — TargetToken descriptor
     /// of the closing JUMP. PyPy keys it by Python object identity; we use
     /// the underlying `Arc<dyn Descr>` allocation address.
@@ -1632,10 +1629,8 @@ impl<'a> RegAlloc<'a> {
         let rm = Self::make_gpr_manager();
         let xrm = Self::make_xmm_manager();
         let fm = FrameManager::new(0);
-        let inputarg_index = OpTypeIndex::build_inputarg_index(inputargs);
-        let op_index = OpTypeIndex::build_op_index(operations);
-        let raw_inputarg_index = OpTypeIndex::build_raw_inputarg_index(inputargs);
-        let raw_op_index = OpTypeIndex::build_raw_op_index(operations);
+        let inputarg_pos = OpTypeIndex::build_inputarg_pos(inputargs);
+        let op_pos = OpTypeIndex::build_op_pos(operations);
         RegAlloc {
             longevity,
             rm,
@@ -1646,10 +1641,8 @@ impl<'a> RegAlloc<'a> {
             pending_moves: Vec::new(),
             inputargs,
             operations,
-            inputarg_index,
-            op_index,
-            raw_inputarg_index,
-            raw_op_index,
+            inputarg_pos,
+            op_pos,
             jump_target_descr: None,
             final_jump_args: None,
             final_jump_op_position: -1,
@@ -1671,59 +1664,17 @@ impl<'a> RegAlloc<'a> {
 
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        if opref.is_none() {
-            return None;
+        let type_index = OpTypeIndex::from_parts(
+            self.inputargs,
+            self.operations,
+            &self.constant_types,
+            &self.inputarg_pos,
+            &self.op_pos,
+        );
+        match at_op_index {
+            Some(at) => type_index.opref_type_at(opref, at),
+            None => type_index.opref_type(opref),
         }
-        // history.py:182 / resoperation.py:29: typed `OpRef` variants
-        // (`Const{Int,Float,Ptr}` / `InputArg{Int,Float,Ref}` /
-        // `{Int,Float,Ref,Void}Op`) carry their `box.type` intrinsically.
-        // Trust the variant first; the side tables only serve `Untyped`.
-        if let Some(tp) = opref.ty() {
-            return (tp != Type::Void).then_some(tp);
-        }
-        if opref.is_constant() {
-            return self.constant_types.get(&opref.raw()).copied();
-        }
-        if let Some(&idx) = self.op_index.get(&opref) {
-            let tp = self.operations[idx].type_;
-            if tp == Type::Void {
-                return None;
-            }
-            if at_op_index.map_or(true, |at| idx <= at) {
-                return Some(tp);
-            }
-        }
-        if let Some(&idx) = self.inputarg_index.get(&opref) {
-            return Some(self.inputargs[idx].tp);
-        }
-        if let Some(&idx) = self.op_index.get(&opref) {
-            let tp = self.operations[idx].type_;
-            if tp != Type::Void {
-                return Some(tp);
-            }
-        }
-        // Variant-blind raw fallback for legacy `OpRef::from_raw(n)`
-        // `Untyped(n)` readers — mirrors `OpTypeIndex::opref_type_at_or_after`.
-        let raw = opref.raw();
-        if let Some(&idx) = self.raw_op_index.get(&raw) {
-            let tp = self.operations[idx].type_;
-            if tp == Type::Void {
-                return None;
-            }
-            if at_op_index.map_or(true, |at| idx <= at) {
-                return Some(tp);
-            }
-        }
-        if let Some(&idx) = self.raw_inputarg_index.get(&raw) {
-            return Some(self.inputargs[idx].tp);
-        }
-        if let Some(&idx) = self.raw_op_index.get(&raw) {
-            let tp = self.operations[idx].type_;
-            if tp != Type::Void {
-                return Some(tp);
-            }
-        }
-        None
     }
 
     /// x86/regalloc.py:65-75 X86_64_RegisterManager configuration.
@@ -4863,8 +4814,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -4959,8 +4910,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5022,8 +4973,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5090,8 +5041,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5143,8 +5094,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5196,8 +5147,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5246,8 +5197,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         // aarch64/regalloc.py:962: spill_or_move_registers_before_call([r.x0, r.x1])
         self.rm.spill_or_move_registers_before_call(
@@ -5288,8 +5239,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
@@ -5331,8 +5282,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         // aarch64/regalloc.py:985: only move values away from x0/x1.
         // The slow path saves/restores all managed registers except
@@ -5392,8 +5343,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
@@ -5440,8 +5391,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         // aarch64/regalloc.py:1016
         self.rm.spill_or_move_registers_before_call(
@@ -5491,8 +5442,8 @@ impl<'a> RegAlloc<'a> {
             self.inputargs,
             self.operations,
             &self.constant_types,
-            &self.inputarg_index,
-            &self.op_index,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,

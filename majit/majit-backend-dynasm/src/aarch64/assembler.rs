@@ -227,14 +227,14 @@ pub struct AssemblerARM64<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [Op],
-    /// OpRef.0 → index into `inputargs`. Pre-computed at construction.
-    inputarg_index: HashMap<OpRef, usize>,
-    /// OpRef.0 → index into `operations`. Pre-computed at construction.
-    op_index: HashMap<OpRef, usize>,
-    /// Variant-blind raw fallback maps for legacy `OpRef::from_raw()`
-    /// `Untyped(_)` readers; mirror `OpTypeIndex::raw_*_index`.
-    raw_inputarg_index: HashMap<u32, usize>,
-    raw_op_index: HashMap<u32, usize>,
+    /// `inputarg_pos[arg.index] = idx in inputargs`, sentinel
+    /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
+    /// `OpTypeIndex::inputarg_pos`.
+    inputarg_pos: Vec<u32>,
+    /// `op_pos[op.pos.raw()] = idx in operations`, sentinel
+    /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
+    /// Mirrors `OpTypeIndex::op_pos`.
+    op_pos: Vec<u32>,
     /// Constants: OpRef index (>= 10000) → i64 value.
     constants: HashMap<u32, i64>,
     /// Constant type annotations for float immediates and fail args.
@@ -356,59 +356,17 @@ impl<'a> AssemblerARM64<'a> {
 
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        if opref.is_none() {
-            return None;
+        let type_index = OpTypeIndex::from_parts(
+            self.inputargs,
+            self.operations,
+            &self.constant_types,
+            &self.inputarg_pos,
+            &self.op_pos,
+        );
+        match at_op_index {
+            Some(at) => type_index.opref_type_at(opref, at),
+            None => type_index.opref_type(opref),
         }
-        // history.py:182 / resoperation.py:29: typed `OpRef` variants
-        // (`Const{Int,Float,Ptr}` / `InputArg{Int,Float,Ref}` /
-        // `{Int,Float,Ref,Void}Op`) carry their `box.type` intrinsically.
-        // Trust the variant first; the side tables only serve `Untyped`.
-        if let Some(tp) = opref.ty() {
-            return (tp != Type::Void).then_some(tp);
-        }
-        if opref.is_constant() {
-            return self.constant_types.get(&opref.raw()).copied();
-        }
-        if let Some(&idx) = self.op_index.get(&opref) {
-            let tp = self.operations[idx].type_;
-            if tp == Type::Void {
-                return None;
-            }
-            if at_op_index.map_or(true, |at| idx <= at) {
-                return Some(tp);
-            }
-        }
-        if let Some(&idx) = self.inputarg_index.get(&opref) {
-            return Some(self.inputargs[idx].tp);
-        }
-        if let Some(&idx) = self.op_index.get(&opref) {
-            let tp = self.operations[idx].type_;
-            if tp != Type::Void {
-                return Some(tp);
-            }
-        }
-        // Variant-blind raw fallback for legacy `OpRef::from_raw(n)`
-        // `Untyped(n)` readers — mirrors `OpTypeIndex::opref_type_at_or_after`.
-        let raw_for_fallback = opref.raw();
-        if let Some(&idx) = self.raw_op_index.get(&raw_for_fallback) {
-            let tp = self.operations[idx].type_;
-            if tp == Type::Void {
-                return None;
-            }
-            if at_op_index.map_or(true, |at| idx <= at) {
-                return Some(tp);
-            }
-        }
-        if let Some(&idx) = self.raw_inputarg_index.get(&raw_for_fallback) {
-            return Some(self.inputargs[idx].tp);
-        }
-        if let Some(&idx) = self.raw_op_index.get(&raw_for_fallback) {
-            let tp = self.operations[idx].type_;
-            if tp != Type::Void {
-                return Some(tp);
-            }
-        }
-        None
     }
 
     /// assembler.py:54 __init__
@@ -425,10 +383,8 @@ impl<'a> AssemblerARM64<'a> {
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
-        let inputarg_index = OpTypeIndex::build_inputarg_index(inputargs);
-        let op_index = OpTypeIndex::build_op_index(operations);
-        let raw_inputarg_index = OpTypeIndex::build_raw_inputarg_index(inputargs);
-        let raw_op_index = OpTypeIndex::build_raw_op_index(operations);
+        let inputarg_pos = OpTypeIndex::build_inputarg_pos(inputargs);
+        let op_pos = OpTypeIndex::build_op_pos(operations);
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),
             pending_guard_tokens: Vec::new(),
@@ -442,10 +398,8 @@ impl<'a> AssemblerARM64<'a> {
             opref_to_slot: HashMap::new(),
             inputargs,
             operations,
-            inputarg_index,
-            op_index,
-            raw_inputarg_index,
-            raw_op_index,
+            inputarg_pos,
+            op_pos,
             constants,
             constant_types: HashMap::new(),
             next_slot: 0,

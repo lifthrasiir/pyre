@@ -6870,10 +6870,11 @@ impl<M: Clone> MetaInterp<M> {
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
         if let Some(front_target) = compiled.front_target_tokens.first() {
             let target_descr = front_target.as_jump_target_descr();
-            let constant_types: std::collections::HashMap<u32, Type> =
-                std::collections::HashMap::new();
-            let type_index =
-                majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops, &constant_types);
+            let type_index = majit_ir::OpTypeIndex::new(
+                &root_trace.inputargs,
+                &root_trace.ops,
+                &root_trace.constant_types,
+            );
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op

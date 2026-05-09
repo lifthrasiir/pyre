@@ -2399,21 +2399,6 @@ mod tests {
         let mut ssarepr = SSARepr::new("residual_call_ir_v");
         let mut builder = JitCodeBuilder::default();
         let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
-        // ReleaseGil EI is built with a real `(target_fn_addr, save_err)`
-        // pair (`call.py:252-258 _call_aroundstate_target_`); reuse the
-        // registered fn_ptr address so `is_call_release_gil()` triggers.
-        let release_gil_ei = majit_ir::EffectInfo {
-            extraeffect: majit_ir::ExtraEffect::RandomEffects,
-            can_invalidate: true,
-            readonly_descrs_fields: None,
-            write_descrs_fields: None,
-            readonly_descrs_arrays: None,
-            write_descrs_arrays: None,
-            readonly_descrs_interiorfields: None,
-            write_descrs_interiorfields: None,
-            call_release_gil_target: (0x7777, 0),
-            ..majit_ir::EffectInfo::default()
-        };
         ssarepr.insns.push(Insn::op(
             "residual_call_ir_v",
             vec![
@@ -2427,7 +2412,8 @@ mod tests {
                     vec![Operand::Register(Register::new(Kind::Ref, 0))],
                 )),
                 Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-                    effect_info: release_gil_ei,
+                    effect_info:
+                        super::super::flatten::unresolved_release_gil_effect_info_for_via_target(),
                     arg_kinds: vec![Kind::Int, Kind::Ref],
                     result_kind: None,
                 })),

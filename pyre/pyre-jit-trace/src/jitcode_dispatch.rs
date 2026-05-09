@@ -1972,14 +1972,13 @@ fn funcptr_concrete_int(ctx: &WalkContext<'_, '_>, funcptr: OpRef) -> Option<i64
 /// from the predicate.  This helper panics on `dst_bank == 'r'` —
 /// the closest behaviour to upstream's missing branch is fail-fast,
 /// since silently routing to a non-existent OpCode would record an
-/// IR op the optimizer / backend cannot consume.  No production
-/// caller reaches this path today (every codewriter
-/// `emit_residual_call` site uses `CallFlavor::Plain` /
-/// `CallFlavor::MayForce`; `CallFlavor::ReleaseGil` is dead in
-/// production per `flatten.rs:486` docstring), so the panic is
-/// defensive against a future producer that introduces a
-/// `'r'`-result release-gil callee without first wiring an upstream
-/// `CALL_RELEASE_GIL_R` opcode.
+/// IR op the optimizer / backend cannot consume.  Generic codewriter
+/// `emit_residual_call` sites do not manufacture release-gil EIs via
+/// `effect_info_for_call_flavor`; release-gil support is limited to
+/// explicit via-target lowering that resolves the real call target
+/// before materializing the final calldescr.  The panic is defensive
+/// against a future producer that introduces a `'r'`-result release-gil
+/// callee without first wiring an upstream `CALL_RELEASE_GIL_R` opcode.
 ///
 /// `'i'` / `'f'` / `'v'` are the three result kinds upstream's
 /// `call_release_gil_for_descr` accepts (`resoperation.py:1240-1248`).

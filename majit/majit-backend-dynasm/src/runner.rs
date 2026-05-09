@@ -876,10 +876,18 @@ impl DynasmBackend {
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;
             let constants = &self.constants;
-            let (result, new_constants) =
+            let (result, new_constants, new_constant_types) =
                 rewriter.rewrite_for_gc_with_constants(&normalized, constants);
             for (k, v) in new_constants {
                 self.constants.entry(k).or_insert(v);
+            }
+            for (k, tp) in new_constant_types {
+                // rewrite.py creates fresh ConstInt boxes for sizes, offsets
+                // and helper addresses. RPython stores the type on each
+                // ConstInt object; pyre imports the rewriter's explicit
+                // side-channel type entry instead of guessing from the raw
+                // constant key.
+                self.constant_types.entry(k).or_insert(tp);
             }
             result
         } else {

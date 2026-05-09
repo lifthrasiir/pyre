@@ -14,24 +14,32 @@ use crate::value::{InputArg, Type};
 /// index. Single source of truth: `op.type_`, `inputarg.tp`,
 /// caller-supplied `constant_types` (resume.py ResumeDataLoopMemo).
 ///
-/// `inputarg_index` and `op_index` are stored as `Cow` so callers may
+/// `inputarg_pos` and `op_pos` are stored as `Cow` so callers may
 /// either let `new` build them eagerly or share pre-built indexes that
 /// outlive the trace (e.g. `RegAlloc<'a>`).
 pub struct OpTypeIndex<'a> {
     inputargs: &'a [InputArg],
     ops: &'a [Op],
     constant_types: &'a HashMap<u32, Type>,
-    inputarg_index: Cow<'a, HashMap<OpRef, usize>>,
-    op_index: Cow<'a, HashMap<OpRef, usize>>,
-    /// Raw-keyed fallback for legacy `OpRef::from_raw()` (`Untyped(_)`)
-    /// readers. Pre-Phase-3 storage was `HashMap<u32, usize>` and a raw
-    /// reader matched any same-raw entry regardless of variant tag; the
-    /// variant-aware typed maps reject that match. Until every
-    /// `from_raw` callsite is migrated to a typed factory, the raw maps
-    /// keep `Untyped(n)` lookups finding typed entries at raw n.
-    raw_inputarg_index: HashMap<u32, usize>,
-    raw_op_index: HashMap<u32, usize>,
+    /// `inputarg_pos[raw] = slice index in inputargs`, sentinel
+    /// [`NO_POS`] for unset slots. `arg.index` raw uniqueness is
+    /// enforced at build time, mirroring RPython's backend uniqueness
+    /// assertion (x86/assembler.py:516-518 + aarch64/assembler.py:54-56
+    /// `assert len(set(inputargs)) == len(inputargs)`).
+    inputarg_pos: Cow<'a, [u32]>,
+    /// `op_pos[raw] = slice index in ops`, sentinel [`NO_POS`] for
+    /// unset slots and Void/None ops. `op.pos.raw()` raw uniqueness is
+    /// enforced at build time per RPython Box identity (Box `is`
+    /// semantics in `rpython/jit/metainterp/resoperation.py:38`).
+    op_pos: Cow<'a, [u32]>,
 }
+
+/// Sentinel for "no entry at this raw u32 slot" in `inputarg_pos` /
+/// `op_pos` arrays. Production raw u32 values come from monotonic
+/// counters; the constant-pool side sets `CONST_BIT = 1 << 31` and is
+/// gated out before reaching these arrays, so raw values land well
+/// below `u32::MAX`.
+pub const NO_POS: u32 = u32::MAX;
 
 impl<'a> OpTypeIndex<'a> {
     pub fn new(
@@ -39,128 +47,103 @@ impl<'a> OpTypeIndex<'a> {
         ops: &'a [Op],
         constant_types: &'a HashMap<u32, Type>,
     ) -> Self {
-        let inputarg_index = Self::build_inputarg_index(inputargs);
-        let op_index = Self::build_op_index(ops);
-        let raw_inputarg_index = Self::build_raw_inputarg_index(inputargs);
-        let raw_op_index = Self::build_raw_op_index(ops);
+        let inputarg_pos = Self::build_inputarg_pos(inputargs);
+        let op_pos = Self::build_op_pos(ops);
         Self {
             inputargs,
             ops,
             constant_types,
-            inputarg_index: Cow::Owned(inputarg_index),
-            op_index: Cow::Owned(op_index),
-            raw_inputarg_index,
-            raw_op_index,
+            inputarg_pos: Cow::Owned(inputarg_pos),
+            op_pos: Cow::Owned(op_pos),
         }
     }
 
     /// Construct from pre-built indexes (e.g. owned by `RegAlloc<'a>`).
-    /// Saves the O(n) HashMap rebuild on each call.
+    /// O(1) — borrows slices instead of rebuilding the position arrays.
     pub fn from_parts(
         inputargs: &'a [InputArg],
         ops: &'a [Op],
         constant_types: &'a HashMap<u32, Type>,
-        inputarg_index: &'a HashMap<OpRef, usize>,
-        op_index: &'a HashMap<OpRef, usize>,
+        inputarg_pos: &'a [u32],
+        op_pos: &'a [u32],
     ) -> Self {
-        let raw_inputarg_index = Self::build_raw_inputarg_index(inputargs);
-        let raw_op_index = Self::build_raw_op_index(ops);
         Self {
             inputargs,
             ops,
             constant_types,
-            inputarg_index: Cow::Borrowed(inputarg_index),
-            op_index: Cow::Borrowed(op_index),
-            raw_inputarg_index,
-            raw_op_index,
+            inputarg_pos: Cow::Borrowed(inputarg_pos),
+            op_pos: Cow::Borrowed(op_pos),
         }
     }
 
-    /// Build the raw inputarg index in iteration order. RPython's
-    /// backend enforces `assert len(set(inputargs)) == len(inputargs)`
+    /// Build `inputarg_pos` indexed by `arg.index`.
+    ///
+    /// RPython's backend enforces `assert len(set(inputargs)) == len(inputargs)`
     /// at loop/bridge entry (x86/assembler.py:516-518 +
-    /// aarch64/assembler.py:54-56). The raw u32 boundary is the
-    /// variant-blind dual of that assertion: pyre's regalloc/assembler
-    /// raw fallback path keys by raw u32, so an `InputArgInt(7)` +
+    /// aarch64/assembler.py:54-56). Raw u32 uniqueness is the dual
+    /// invariant in pyre's flat OpRef namespace: an `InputArgInt(7)` +
     /// `InputArgRef(7)` collision would silently keep only the later
-    /// one. Hard-panic on raw collision so the violation surfaces here
-    /// rather than as a wrong-type guard fail much further along,
-    /// symmetric to `build_op_index`.
-    pub fn build_raw_inputarg_index(inputargs: &[InputArg]) -> HashMap<u32, usize> {
-        let mut map: HashMap<u32, usize> = HashMap::with_capacity(inputargs.len());
+    /// one in any variant-blind reader. Hard-panic on raw collision so
+    /// the violation surfaces here rather than as a wrong-type guard
+    /// fail much further along.
+    pub fn build_inputarg_pos(inputargs: &[InputArg]) -> Vec<u32> {
+        if inputargs.is_empty() {
+            return Vec::new();
+        }
+        let max_raw = inputargs.iter().map(|a| a.index).max().unwrap_or(0);
+        let mut pos: Vec<u32> = vec![NO_POS; max_raw as usize + 1];
         for (idx, arg) in inputargs.iter().enumerate() {
-            if let Some(&prev_idx) = map.get(&arg.index) {
+            let r = arg.index as usize;
+            if pos[r] != NO_POS {
                 panic!(
                     "OpTypeIndex: raw inputarg index {} bound to inputargs[{}] {:?} and inputargs[{}] {:?} — backend uniqueness violated",
-                    arg.index, prev_idx, inputargs[prev_idx].tp, idx, arg.tp,
+                    arg.index, pos[r], inputargs[pos[r] as usize].tp, idx, arg.tp,
                 );
             }
-            map.insert(arg.index, idx);
+            pos[r] = idx as u32;
         }
-        map
+        pos
     }
 
-    /// Build the raw op index in iteration order.  `build_op_index`
-    /// hard-panics on raw collision (RPython Box identity), so this
-    /// table always agrees with the typed map; the iteration-order
-    /// build keeps the result deterministic across runs.
-    pub fn build_raw_op_index(ops: &[Op]) -> HashMap<u32, usize> {
-        let mut map = HashMap::with_capacity(ops.len());
-        for (idx, op) in ops.iter().enumerate() {
-            if op.pos.is_none() || op.type_ == Type::Void {
-                continue;
-            }
-            map.insert(op.pos.raw(), idx);
-        }
-        map
-    }
-
-    /// Re-export of inputarg index for callers that hold their own
-    /// `OpTypeIndex` and need to pre-populate it on cache rebuild.
-    /// Keys are typed `OpRef::input_arg_*(arg.index)` per `arg.tp`,
-    /// matching the variant a caller would synthesize via
-    /// `InputArg::opref()`.
-    pub fn build_inputarg_index(inputargs: &[InputArg]) -> HashMap<OpRef, usize> {
-        inputargs
-            .iter()
-            .enumerate()
-            .map(|(idx, arg)| (OpRef::input_arg_typed(arg.index, arg.tp), idx))
-            .collect()
-    }
-
-    /// Re-export of op index for the same purpose as
-    /// `build_inputarg_index`. Filters out Void-typed ops because RPython's
-    /// `box.type` only exists on Box-bearing ops; a Void op is not a Box
-    /// and must never shadow an inputarg slot when flat-`OpRef(u32)`
-    /// positions collide.
+    /// Build `op_pos` indexed by `op.pos.raw()`. Filters out Void-typed
+    /// ops because RPython's `box.type` only exists on Box-bearing ops;
+    /// a Void op is not a Box and must never shadow an inputarg slot.
     ///
     /// RPython Box identity gives a one-to-one map from a Box object to
     /// its producing ResOperation; two Box-bearing ops sharing the same
     /// raw OpRef payload (e.g. `IntOp(7)` + `RefOp(7)`) is a Box-identity
     /// violation even though the typed variants disambiguate the type
-    /// tag, because pyre's backend boundary (regalloc/assembler/raw
-    /// fallback path) keys by raw u32 and would silently keep only the
-    /// later op. Hard-panic on raw collision (release as well as debug)
-    /// so a violation surfaces here instead of as a wrong-type guard
-    /// fail much further along.
-    pub fn build_op_index(ops: &[Op]) -> HashMap<OpRef, usize> {
-        let mut map: HashMap<OpRef, usize> = HashMap::new();
-        let mut raw_seen: HashMap<u32, usize> = HashMap::new();
+    /// tag, because pyre's backend boundary keys by raw u32 and would
+    /// silently keep only the later op. Hard-panic on raw collision so
+    /// the violation surfaces here.
+    pub fn build_op_pos(ops: &[Op]) -> Vec<u32> {
+        let max_raw = ops
+            .iter()
+            .filter(|op| !op.pos.is_none() && op.type_ != Type::Void)
+            .map(|op| op.pos.raw())
+            .max();
+        let Some(max_raw) = max_raw else {
+            return Vec::new();
+        };
+        let mut pos: Vec<u32> = vec![NO_POS; max_raw as usize + 1];
         for (idx, op) in ops.iter().enumerate() {
             if op.pos.is_none() || op.type_ == Type::Void {
                 continue;
             }
-            let raw = op.pos.raw();
-            if let Some(&prev_idx) = raw_seen.get(&raw) {
+            let r = op.pos.raw() as usize;
+            if pos[r] != NO_POS {
                 panic!(
                     "OpTypeIndex: raw {} bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
-                    raw, prev_idx, ops[prev_idx].opcode, idx, op.opcode,
+                    op.pos.raw(),
+                    pos[r],
+                    ops[pos[r] as usize].opcode,
+                    idx,
+                    op.opcode,
                 );
             }
-            raw_seen.insert(raw, idx);
-            map.insert(op.pos, idx);
+            pos[r] = idx as u32;
         }
-        map
+        pos
     }
 
     /// Lookup priority for a fully defined value: real constants
@@ -214,30 +197,36 @@ impl<'a> OpTypeIndex<'a> {
             // variants short-circuit at the `opref.ty()` arm above, so
             // this branch only fires for `Untyped(x | CONST_BIT)` —
             // legacy `OpRef::from_const` / `OpRef::from_raw` reconstructs
-            // produced before producer-side typing was complete.
-            //
-            // PRE-EXISTING-ADAPTATION: cranelift backend has callsites
-            // that build `OpTypeIndex` with a partial `constant_types`
-            // snapshot, so a strict miss-panic here triggers caught
-            // unwinds that silently mis-execute (`fib_recursive`,
-            // `nested_loop`, `fannkuch` regress on cranelift). Fall back
-            // to `Type::Int` — the statically-most-common Const flavour —
-            // so the helper still satisfies the "Const always has a
-            // type" invariant rather than returning None.  Closing this
-            // requires every legacy `from_const` / `from_raw` const
-            // producer to be migrated to typed factories (#171) AND each
-            // cranelift caller to seed the full pool.
+            // produced before producer-side typing was complete. The
+            // canonical seeder (`ConstantPool::get_or_insert*`,
+            // constant_pool.rs:173) already guarantees that any constant
+            // present in a pool's `constants` map is also present in its
+            // `constant_types` map, so the only way to land here with a
+            // miss is for a caller to have built `OpTypeIndex` with a
+            // partial `constant_types` snapshot. Panic loudly so the
+            // misseed surfaces at the helper boundary instead of
+            // silently mis-typing the Const as Int.
             return Some(
                 self.constant_types
                     .get(&opref.raw())
                     .copied()
-                    .unwrap_or(Type::Int),
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "OpTypeIndex: untyped Const OpRef raw={} missing from constant_types — \
+                             every Const must have its type seeded (history.py:220/261/307); \
+                             producer must migrate to typed `OpRef::const_{{int,float,ref}}` \
+                             factories or seed `constant_types` in lockstep with the constant pool",
+                            opref.raw(),
+                        )
+                    }),
             );
         }
-        // Variant-aware primary lookup: typed Box identity (an
-        // `IntOp(n)` is not the same Box as a `RefOp(n)` even when the
-        // raw payloads coincide).
-        if let Some(&idx) = self.op_index.get(&opref) {
+        // raw uniqueness panic at build time means there is at most one
+        // ops[]/inputargs[] entry per raw u32, so there is no
+        // typed-vs-raw asymmetry to walk; a single positional lookup
+        // suffices.
+        let raw = opref.raw() as usize;
+        if let Some(idx) = op_pos_lookup(&self.op_pos, raw) {
             let tp = self.ops[idx].type_;
             if tp == Type::Void {
                 return None;
@@ -246,33 +235,10 @@ impl<'a> OpTypeIndex<'a> {
                 return Some(tp);
             }
         }
-        if let Some(&idx) = self.inputarg_index.get(&opref) {
+        if let Some(idx) = op_pos_lookup(&self.inputarg_pos, raw) {
             return Some(self.inputargs[idx].tp);
         }
-        if let Some(&idx) = self.op_index.get(&opref) {
-            let tp = self.ops[idx].type_;
-            if tp != Type::Void {
-                return Some(tp);
-            }
-        }
-        // Variant-blind raw fallback: legacy `OpRef::from_raw(n)` lands
-        // on `Untyped(n)`. Pre-Phase-3 raw-keyed storage matched that
-        // against any typed entry at raw n; preserve that until every
-        // `from_raw` reader is migrated to a typed factory.
-        let raw = opref.raw();
-        if let Some(&idx) = self.raw_op_index.get(&raw) {
-            let tp = self.ops[idx].type_;
-            if tp == Type::Void {
-                return None;
-            }
-            if op_index.map_or(true, |at| idx <= at) {
-                return Some(tp);
-            }
-        }
-        if let Some(&idx) = self.raw_inputarg_index.get(&raw) {
-            return Some(self.inputargs[idx].tp);
-        }
-        if let Some(&idx) = self.raw_op_index.get(&raw) {
+        if let Some(idx) = op_pos_lookup(&self.op_pos, raw) {
             let tp = self.ops[idx].type_;
             if tp != Type::Void {
                 return Some(tp);
@@ -282,15 +248,9 @@ impl<'a> OpTypeIndex<'a> {
     }
 
     /// Direct `OpRef → &Op` lookup; returns `None` for constants,
-    /// inputargs, or `OpRef::NONE`.  Variant-aware typed key first;
-    /// falls back to raw u32 so legacy `OpRef::from_raw()` `Untyped(_)`
-    /// readers (e.g. `compile.rs:1381` exit-arg ForceToken filter) keep
-    /// resolving against typed Box-bearing ops at the same raw payload.
+    /// inputargs, or `OpRef::NONE`.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
-        if let Some(&idx) = self.op_index.get(&opref) {
-            return Some(&self.ops[idx]);
-        }
-        let idx = *self.raw_op_index.get(&opref.raw())?;
+        let idx = op_pos_lookup(&self.op_pos, opref.raw() as usize)?;
         Some(&self.ops[idx])
     }
 
@@ -298,16 +258,20 @@ impl<'a> OpTypeIndex<'a> {
     /// reference an inputarg. Used by callers that need to roll back to
     /// an OpRef's pre-redefinition type when an op later overwrote the
     /// same OpRef with a different type.
-    ///
-    /// **Variant-blind by design.** The collision-detection use case
-    /// (`majit-backend-cranelift` `build_type_overrides`) asks "does an
-    /// inputarg slot exist at this raw position regardless of variant
-    /// tag?" — an op's `.pos` typed as `IntOp(n)` should still surface
-    /// the inputarg at slot n even when the inputarg's typed key is
-    /// `InputArgInt(n)`. Raw lookup mirrors RPython's flat box-id
-    /// namespace where the question is purely positional.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
-        let idx = *self.raw_inputarg_index.get(&opref.raw())?;
+        let idx = op_pos_lookup(&self.inputarg_pos, opref.raw() as usize)?;
         Some(self.inputargs[idx].tp)
     }
+}
+
+/// Look up `raw` in a position array (`inputarg_pos` / `op_pos`).
+/// Returns `Some(idx)` for a populated slot, `None` for an out-of-range
+/// raw or a sentinel slot.
+#[inline]
+fn op_pos_lookup(pos: &[u32], raw: usize) -> Option<usize> {
+    let entry = *pos.get(raw)?;
+    if entry == NO_POS {
+        return None;
+    }
+    Some(entry as usize)
 }
