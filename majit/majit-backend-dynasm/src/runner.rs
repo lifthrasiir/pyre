@@ -866,12 +866,19 @@ impl DynasmBackend {
         // `OpRef` stores types in side maps keyed by the raw u32;
         // `constant_types` already carries op-position and constant
         // types (disjoint key spaces via `OpRef::CONST_BIT = 1 << 31`).
-        // Inputargs occupy raw u32 0..num_inputs, so merging their
-        // types into the rewriter's view gives the same `v.type` lookup
-        // RPython has on inputargs.
+        //
+        // Each InputArg's raw OpRef value lives at `InputArg.index`:
+        // top-level loops occupy `[0, num_inputs)`, while Phase E.2b
+        // bridges occupy `[bridge_inputarg_base..)`. Key the merged
+        // map by `ia.index` (NOT a dense `enumerate` index) so the
+        // rewriter's `v.type` lookup matches the OpRef values that
+        // ops reference, regardless of namespace — RPython relies on
+        // Box identity here, pyre's line-by-line analog is `arg.0 ==
+        // inputargs[i].index`. Mirrors the Cranelift backend's
+        // `constant_types_with_inputargs` build at compiler.rs:7042.
         let mut constant_types = self.constant_types.clone();
-        for (i, ia) in inputargs.iter().enumerate() {
-            constant_types.entry(i as u32).or_insert(ia.tp);
+        for ia in inputargs.iter() {
+            constant_types.entry(ia.index).or_insert(ia.tp);
         }
         if let Some(rewriter) = self.gc_rewriter(&constant_types) {
             use majit_gc::GcRewriter;

@@ -63,9 +63,12 @@ fn wrapped_int_identity(value: i64) -> i64 {
 
 // Ports of the same identity helpers under the explicit cannot-raise
 // opt-in.  The function bodies are pure pass-throughs that PyPy
-// `getcalldescr` would mark `EF_CANNOT_RAISE` (`call.py:303`); pyre
-// lacks the annotation analyzer (Task #64) so users opt in via
-// `#[dont_look_inside_cannot_raise]`.
+// `getcalldescr` would mark `EF_CANNOT_RAISE` (`call.py:303`); pyre's
+// analyzer (`majit-translate/src/jit_codewriter/call.rs:3250
+// effectinfo_from_writeanalyze`) computes the equivalent in the
+// codewriter pipeline but is not yet plumbed to runtime trace
+// recording (Task #64), so users opt in via
+// `#[dont_look_inside_cannot_raise]` until the wire-up lands.
 
 #[dont_look_inside_cannot_raise]
 fn wrapped_ref_identity_cr(ptr: *const i64) -> *const i64 {

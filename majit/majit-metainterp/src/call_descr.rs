@@ -217,15 +217,20 @@ pub fn default_effect_info() -> EffectInfo {
 /// PRE-EXISTING-ADAPTATION: same `read/write_descrs_*` and `can_collect`
 /// saturation as [`default_effect_info()`].  `call.py:320-324
 /// effectinfo_from_writeanalyze` builds those bitsets from the
-/// `readwrite_analyzer` and `collect_analyzer` results; pyre has no
-/// analyzers ported yet (Task #64), so a conservative full-bitset is
-/// the line-by-line equivalent of "no analyzer ran" — it preserves
-/// `force_from_effectinfo`'s per-cached-descr flush behaviour for
-/// callees that mutate heap state but never raise, matching the same
-/// fallback semantics `default_effect_info()` uses for raising callees.
-/// When the analyzers land, this constant becomes the no-callee-info
-/// default and producers thread per-callee `EffectInfo` values through
-/// `make_call_descr_with_effect`.
+/// `readwrite_analyzer` and `collect_analyzer` results.  Pyre has the
+/// analyzer ported (`majit-translate/src/jit_codewriter/call.rs:3250
+/// effectinfo_from_writeanalyze`, exercised by 13+ `getcalldescr`
+/// fixtures); the gap is plumbing per-callsite EI from the codewriter
+/// pipeline back to runtime trace recording (Task #64
+/// analyzer-rollout). Until that wire-up lands, conservative
+/// full-bitset is the line-by-line equivalent of "no analyzer
+/// available at this callsite" — it preserves `force_from_effectinfo`'s
+/// per-cached-descr flush behaviour for callees that mutate heap
+/// state but never raise, matching the same fallback semantics
+/// `default_effect_info()` uses for raising callees.  When the
+/// codewriter→recorder plumbing lands, this constant becomes the
+/// no-callee-info default and producers thread per-callee
+/// `EffectInfo` values through `make_call_descr_with_effect`.
 pub fn cannot_raise_effect_info() -> EffectInfo {
     EffectInfo {
         extraeffect: ExtraEffect::CannotRaise,

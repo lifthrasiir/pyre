@@ -1832,10 +1832,12 @@ impl JitCodeBuilder {
                 // non-zero `tgt_func`. The actual C address is filled
                 // in by `resolve_call_release_gil_target` from the
                 // resolved `target.concrete_ptr`; the (1, 0) seed is
-                // just a probe to flip the predicate. saveerr is left
-                // 0 — pyre dispatches release-gil callees directly
-                // via `bh_call_v_dispatch` with no errno save (Task
-                // #64 will wire real saveerr through the macro DSL).
+                // just a probe to flip the predicate. saveerr stays 0
+                // by design: pyre is free-threaded with no GIL
+                // (`pyre/README.md:100`), so the `RFFI_ERR_*` errno-
+                // save modes have no release/acquire window to
+                // protect. See `resolve_call_release_gil_target` for
+                // the full no-GIL structural rationale.
                 call_release_gil_target: (1, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
@@ -3609,11 +3611,19 @@ impl JitCodeBuilder {
 /// keeping the override sentinel-conditional preserves the upstream
 /// invariant for any future analyzer-driven descr.
 ///
-/// PRE-EXISTING-ADAPTATION (`saveerr=0`): pyre dispatches release-gil
-/// callees directly via `bh_call_*_dispatch` with no errno save/restore
-/// helper, so the upstream `RFFI_ERR_*` save modes have no equivalent
-/// at this layer.  Wiring `saveerr` through the macro DSL is part of
-/// Task #64 (real EffectInfo analyzers).
+/// **No-GIL structural divergence (`saveerr=0`)**: pyre is free-threaded
+/// from day one (`pyre/README.md:100`); GIL-dependent code paths in
+/// PyPy — including the `release_gil` effect-info concept itself —
+/// "simply don't exist". `saveerr` controls the upstream `RFFI_ERR_*`
+/// errno-save modes around the GIL release/acquire window
+/// (`rpython/rlib/rffi.py`); without a GIL there is no release window
+/// for another thread to clobber `errno`/`lasterror`, so
+/// `saveerr` is **structurally moot** at runtime. `is_call_release_gil()`
+/// is preserved as a structural predicate for parity with PyPy's
+/// heapcache invalidation routing (`heapcache.py:343-353`); the
+/// `tgt_func` slot still carries the real C address, but the second
+/// tuple slot stays 0 by design — not a TODO. There is no wire-up
+/// task to schedule here.
 fn resolve_call_release_gil_target(
     mut effect_info: majit_ir::descr::EffectInfo,
     realfuncaddr: *const (),
