@@ -4962,20 +4962,29 @@ mod tests {
             None,
             &mut cache,
         );
-        // Should have non-empty bitsets for field reads and writes.
+        // Should have non-empty bitstrings for field reads and writes
+        // (effectinfo.py:185-190 bitstring_*: encodes which descrs were
+        // touched as a packed Vec<u8>, parity with frozenset of
+        // descriptor indices).  Non-elidable + observed field accesses
+        // → frozenset is populated → at least one descr-index bit is
+        // set in the bitstring.
+        let readonly = descriptor
+            .extra_info
+            .readonly_descrs_fields
+            .as_ref()
+            .expect("non-elidable getcalldescr populates readonly_descrs_fields");
+        let writes = descriptor
+            .extra_info
+            .write_descrs_fields
+            .as_ref()
+            .expect("non-elidable getcalldescr populates write_descrs_fields");
         assert!(
-            descriptor
-                .extra_info
-                .readonly_descrs_fields
-                .as_ref()
-                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+            readonly.iter().any(|&b| b != 0),
+            "readonly bitstring should have at least one descr-index bit set"
         );
         assert!(
-            descriptor
-                .extra_info
-                .write_descrs_fields
-                .as_ref()
-                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+            writes.iter().any(|&b| b != 0),
+            "write bitstring should have at least one descr-index bit set"
         );
     }
 
@@ -5041,14 +5050,16 @@ mod tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ElidableCannotRaise
         );
-        // Writes should be zeroed out for elidable functions.
-        assert!(
-            descriptor
-                .extra_info
-                .write_descrs_fields
-                .as_ref()
-                .is_some_and(|bs| bs.iter().all(|&b| b == 0)),
-        );
+        // Writes should be empty bitstring for elidable functions
+        // (effectinfo.py:175-181: elidable sets `_write_descrs_fields =
+        // frozenset()` which `compute_bitstrings` serializes to an empty
+        // bytestring → empty `Vec<u8>` in pyre's port).
+        let writes = descriptor
+            .extra_info
+            .write_descrs_fields
+            .as_ref()
+            .expect("elidable getcalldescr populates write_descrs_fields with empty bitstring");
+        assert!(writes.is_empty());
     }
 
     #[test]
@@ -5140,23 +5151,30 @@ mod tests {
             &mut cache,
         );
         // Write is set, but readonly should NOT have the same bit set.
-        // RPython: readonly = reads & ~writes
+        // RPython: readonly = reads & ~writes (effectinfo.py:181-186).
+        let readonly = descriptor
+            .extra_info
+            .readonly_descrs_fields
+            .as_ref()
+            .expect("non-elidable getcalldescr populates readonly_descrs_fields");
+        let writes = descriptor
+            .extra_info
+            .write_descrs_fields
+            .as_ref()
+            .expect("non-elidable getcalldescr populates write_descrs_fields");
         assert!(
-            descriptor
-                .extra_info
-                .write_descrs_fields
-                .as_ref()
-                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+            writes.iter().any(|&b| b != 0),
+            "write bitstring should have at least one descr-index bit set"
         );
-        let overlap = match (
-            descriptor.extra_info.readonly_descrs_fields.as_ref(),
-            descriptor.extra_info.write_descrs_fields.as_ref(),
-        ) {
-            (Some(ro), Some(wr)) => ro.iter().zip(wr.iter()).any(|(a, b)| (a & b) != 0),
-            _ => false,
-        };
+        // Per-byte AND of the two bitstrings — equivalent to RPython's
+        // `readonly & writes` set intersection on the descr-index bit
+        // positions.
+        let overlap_any = readonly
+            .iter()
+            .zip(writes.iter())
+            .any(|(r, w)| (r & w) != 0);
         assert!(
-            !overlap,
+            !overlap_any,
             "readonly and write should not overlap for same field"
         );
     }

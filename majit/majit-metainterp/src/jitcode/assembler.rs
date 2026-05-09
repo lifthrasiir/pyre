@@ -743,13 +743,25 @@ impl JitCodeBuilder {
     /// (`blackhole.py:52-81 setup_insns`). Emits via `write_insn` with
     /// the canonical `opname/ii>i` key so the opcode byte comes from the
     /// shared insns table rather than a hand-assigned `BC_*` constant.
+    ///
+    /// `OpCode::IntFloorDiv` and `OpCode::IntMod` are intentionally not
+    /// in the match: upstream `jtransform.py:575-577` rewrites both
+    /// primitives to `direct_call(ll_int_py_*)` so RPython
+    /// `blackhole.py` has no `bhimpl_int_floordiv` / `bhimpl_int_mod`
+    /// entry to mirror.  Pyre's β' redirect at
+    /// `majit-translate/src/codegen.rs:980-1028
+    /// generated_binary_int_value` (Task #94a-1) covers the runtime
+    /// trace path; the SSARepr fail-loud arm at
+    /// `pyre-jit/src/jit/assembler.rs::record_op_with_args` traps any
+    /// remaining producer.  Reaching this match with those OpCodes
+    /// would re-introduce the upstream-absent `BC_INT_FLOORDIV` /
+    /// `BC_INT_MOD` lowering path; the catch-all `panic!` below makes
+    /// that surface immediately.
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
         let key = match opcode {
             OpCode::IntAdd => "int_add/ii>i",
             OpCode::IntSub => "int_sub/ii>i",
             OpCode::IntMul => "int_mul/ii>i",
-            OpCode::IntFloorDiv => "int_floordiv/ii>i",
-            OpCode::IntMod => "int_mod/ii>i",
             OpCode::IntAnd => "int_and/ii>i",
             OpCode::IntOr => "int_or/ii>i",
             OpCode::IntXor => "int_xor/ii>i",
@@ -1803,6 +1815,22 @@ impl JitCodeBuilder {
         fn_ptr_idx: u16,
         arg_regs: &[JitCallArg],
     ) {
+        // RPython `codewriter/call.py:252-258` reads the release-gil
+        // target address off the wrapper callable's
+        // `_call_aroundstate_target_` attribute at descr construction
+        // time, populating `EffectInfo.call_release_gil_target =
+        // (tgt_func, tgt_saveerr)` directly.  Mirror that here by
+        // resolving `target.concrete_ptr` from `descrs[fn_ptr_idx]`
+        // before building the EI, so `is_call_release_gil()`
+        // (`effectinfo.py:255-257 bool(tgt_func)`) sees the real C
+        // address from the start.
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(t)) => *t,
+            other => panic!(
+                "call_release_gil_void_canonical_via_target: descrs[{fn_ptr_idx}] \
+                 expected RuntimeBhDescr::Call, got {other:?}"
+            ),
+        };
         self.emit_canonical_call_void_via_target(
             (
                 jitcode::BC_RESIDUAL_CALL_R_V,
@@ -1822,15 +1850,11 @@ impl JitCodeBuilder {
                 // `..MOST_GENERAL` matches the wildcard contract
                 // instead of inheriting `default_effect_info()`'s
                 // `Some(vec![0xff; 8])` saturation.
-                // effectinfo.py:255-257 is_call_release_gil() needs a
-                // non-zero `tgt_func`. The actual C address is filled
-                // in by `resolve_call_release_gil_target` from the
-                // resolved `target.concrete_ptr`; the (1, 0) seed is
-                // just a probe to flip the predicate. saveerr is left
-                // 0 — pyre dispatches release-gil callees directly
-                // via `bh_call_v_dispatch` with no errno save (Task
-                // #64 will wire real saveerr through the macro DSL).
-                call_release_gil_target: (1, 0),
+                // saveerr=0: pyre dispatches release-gil callees
+                // directly via `bh_call_v_dispatch` with no errno
+                // save (Task #64 will wire real saveerr through the
+                // macro DSL).
+                call_release_gil_target: (target.concrete_ptr as usize as u64, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
             "call_release_gil_void_canonical_via_target",
@@ -1892,7 +1916,6 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
-        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
 
         let arg_classes: String = arg_regs
             .iter()
@@ -1983,7 +2006,6 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
-        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -2196,7 +2218,6 @@ impl JitCodeBuilder {
             ),
         };
         let concrete_ptr = target.concrete_ptr as i64;
-        let effect_info = resolve_call_release_gil_target(effect_info, target.concrete_ptr);
         let arg_classes: String = arg_regs
             .iter()
             .map(|a| match a.kind {
@@ -2246,10 +2267,11 @@ impl JitCodeBuilder {
     }
 
     /// Emit a canonical `residual_call_*_i` whose calldescr carries the
-    /// release-gil marker.  `resolve_call_release_gil_target` fills
-    /// `realfuncaddr` from the resolved `target.concrete_ptr`; the
-    /// `(1, 0)` seed flips `is_call_release_gil()` for the resolver to
-    /// pick up.
+    /// release-gil marker.  RPython `codewriter/call.py:252-258` reads
+    /// the release-gil target address off the wrapper callable's
+    /// `_call_aroundstate_target_` attribute at descr construction time;
+    /// resolve `target.concrete_ptr` from `descrs[fn_ptr_idx]` here so
+    /// the EI carries the real C address from the start.
     #[allow(dead_code)]
     pub fn call_release_gil_int_canonical_via_target(
         &mut self,
@@ -2257,6 +2279,13 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(t)) => *t,
+            other => panic!(
+                "call_release_gil_int_canonical_via_target: descrs[{fn_ptr_idx}] \
+                 expected RuntimeBhDescr::Call, got {other:?}"
+            ),
+        };
         self.residual_call_int_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -2266,7 +2295,7 @@ impl JitCodeBuilder {
                 // readonly/write descr set as `None`; spread MOST_GENERAL
                 // for the wildcard rather than `default_effect_info()`'s
                 // saturated `Some(vec![0xff; 8])` bitstrings.
-                call_release_gil_target: (1, 0),
+                call_release_gil_target: (target.concrete_ptr as usize as u64, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
         );
@@ -2366,6 +2395,13 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
+        let target = match self.descrs.get(fn_ptr_idx as usize) {
+            Some(RuntimeBhDescr::Call(t)) => *t,
+            other => panic!(
+                "call_release_gil_float_canonical_via_target: descrs[{fn_ptr_idx}] \
+                 expected RuntimeBhDescr::Call, got {other:?}"
+            ),
+        };
         self.residual_call_float_canonical_via_target_with_effect_info(
             fn_ptr_idx,
             arg_regs,
@@ -2375,7 +2411,7 @@ impl JitCodeBuilder {
                 // readonly/write descr set as `None`; spread MOST_GENERAL
                 // for the wildcard rather than `default_effect_info()`'s
                 // saturated `Some(vec![0xff; 8])` bitstrings.
-                call_release_gil_target: (1, 0),
+                call_release_gil_target: (target.concrete_ptr as usize as u64, 0),
                 ..majit_ir::descr::EffectInfo::MOST_GENERAL
             },
         );
@@ -3572,57 +3608,6 @@ impl JitCodeBuilder {
             self.code[offset] = slot as u8;
         }
     }
-}
-
-/// pyjitpl.py:3675 `effectinfo.call_release_gil_target` parity.
-///
-/// PyPy populates `(realfuncaddr, saveerr)` at descr creation time:
-/// `codewriter/call.py:252-258` reads `_call_aroundstate_target_` off
-/// the wrapper callable and writes `(tgt_func, tgt_saveerr)` into the
-/// slot — the wrapper at `direct_call`'s `args[0]` and the real GIL-
-/// release target are intentionally distinct values.
-///
-/// Pyre's `#[jit_interp]` macro `release_gil_*` policy declarations
-/// (`majit-macros/src/jit_interp/mod.rs:226-251`) carry no `saveerr`
-/// attribute and no separate wrapper-vs-real-address distinction —
-/// the macro emits a wrapper where `func_ptr` IS the C address.  The
-/// emit-side wrappers seed `call_release_gil_target: (1, 0)` purely
-/// to flip `EffectInfo::is_call_release_gil()` (`effectinfo.rs:292-295`,
-/// `effectinfo.py:255-257`) on while the real address is unknown until
-/// `descrs[fn_ptr_idx]` resolves.  This helper substitutes the
-/// resolved `target.concrete_ptr` into that sentinel slot so the
-/// descr's IR carries `(real_addr, saveerr=0)`.
-///
-/// Sentinel-only override: any descr whose
-/// `call_release_gil_target.0` is already a real address (≠ sentinel
-/// `1`) is left untouched, mirroring PyPy's "descr already carries
-/// `(tgt_func, saveerr)` from the analyzer" structure at
-/// `call.py:252-258`.  Today the only producer of explicit targets is
-/// `trace_ctx::call_release_gil_{int,float}_typed`
-/// (`trace_ctx.rs:3795, 3824`) which bypasses this resolver, but
-/// keeping the override sentinel-conditional preserves the upstream
-/// invariant for any future analyzer-driven descr.
-///
-/// PRE-EXISTING-ADAPTATION (`saveerr=0`): pyre dispatches release-gil
-/// callees directly via `bh_call_*_dispatch` with no errno save/restore
-/// helper, so the upstream `RFFI_ERR_*` save modes have no equivalent
-/// at this layer.  Wiring `saveerr` through the macro DSL is part of
-/// Task #64 (real EffectInfo analyzers).
-fn resolve_call_release_gil_target(
-    mut effect_info: majit_ir::descr::EffectInfo,
-    realfuncaddr: *const (),
-) -> majit_ir::descr::EffectInfo {
-    // effectinfo.rs:292 is_call_release_gil checks `tgt_func != 0`, so
-    // skip the substitution for non-release-gil callers (the slot
-    // carries `_NO_CALL_RELEASE_GIL_TARGET = (0, 0)` for them).
-    // Match the sentinel `1` exclusively so descrs with an already-
-    // resolved `(tgt_func, saveerr)` from `_call_aroundstate_target_`
-    // (`call.py:252-258`) are preserved.
-    if effect_info.call_release_gil_target.0 == 1 {
-        let saveerr = effect_info.call_release_gil_target.1;
-        effect_info.call_release_gil_target = (realfuncaddr as usize as u64, saveerr);
-    }
-    effect_info
 }
 
 fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool {

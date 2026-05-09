@@ -1067,6 +1067,34 @@ fn dispatch_op(
             let vable_reg = expect_reg(&args[0], Kind::Ref);
             state.builder.vable_force_with_base(vable_reg);
         }
+        // `int_floordiv` / `int_mod` are intentionally NOT in the
+        // canonical-binop arm below.  RPython `jtransform.py:575-577`
+        // (`rewrite_op_int_floordiv = _do_builtin_call`,
+        // `rewrite_op_int_mod = _do_builtin_call`) replaces both
+        // primitives with a `direct_call(prepare_builtin_call(...))` to
+        // `ll_int_py_div` / `ll_int_py_mod` (`rint.py:398/496`) — the
+        // bare opname never reaches the jitcode emitter upstream.  In
+        // pyre the runtime trace path goes through the β' redirect at
+        // `majit-translate/src/codegen.rs:980-1028
+        // generated_binary_int_value`, which emits
+        // `CallPureI(bhimpl_int_floordiv|bhimpl_int_mod)` with
+        // `INT_PY_DIV_EFFECT_INFO`/`INT_PY_MOD_EFFECT_INFO` plus the
+        // `int_eq(rhs, 0) -> guard_false` and `INT_MIN / -1` overflow
+        // guards from the `_ovf_zer` wrapper.  No SSARepr producer
+        // emits `"int_floordiv"` or `"int_mod"` opnames in production;
+        // this fail-loud arm catches any new producer that bypasses the
+        // β' redirect so the divergence surfaces immediately instead of
+        // silently re-introducing the upstream-absent BC_INT_FLOORDIV /
+        // BC_INT_MOD bytecode path.  When Task #97 finishes the IR /
+        // backend cleanup the arm — and the OpCode variants behind it —
+        // can be deleted entirely.
+        "int_floordiv" | "int_mod" => panic!(
+            "SSARepr producer emitted `{opname}`; upstream `jtransform.py:575-577` \
+             rewrites both primitives to `direct_call(ll_int_py_*)` and pyre's \
+             trace path goes through `codegen.rs::generated_binary_int_value`'s \
+             β' redirect (Task #94a-1).  See Task #97 for the IR cleanup that \
+             retires `OpCode::IntFloorDiv` / `OpCode::IntMod` and this arm."
+        ),
         // Per-OpCode opname dispatch for integer / float primitives —
         // RPython `rpython/jit/metainterp/blackhole.py:459-723` defines
         // one `bhimpl_*` per opname; `assembler.py:162-222` routes each
@@ -1075,17 +1103,14 @@ fn dispatch_op(
         // `record_binop_*` / `record_unary_*` helper without a generic
         // OpCode-bearing wrapper insn. No `generic record_*` SSA
         // opname exists; only the canonical RPython names.
-        "int_add" | "int_sub" | "int_mul" | "int_floordiv" | "int_mod" | "int_and" | "int_or"
-        | "int_xor" | "int_lshift" | "int_rshift" | "int_eq" | "int_ne" | "int_lt" | "int_le"
-        | "int_gt" | "int_ge" | "uint_rshift" | "uint_mul_high" | "uint_lt" | "uint_le"
-        | "uint_gt" | "uint_ge" => {
+        "int_add" | "int_sub" | "int_mul" | "int_and" | "int_or" | "int_xor" | "int_lshift"
+        | "int_rshift" | "int_eq" | "int_ne" | "int_lt" | "int_le" | "int_gt" | "int_ge"
+        | "uint_rshift" | "uint_mul_high" | "uint_lt" | "uint_le" | "uint_gt" | "uint_ge" => {
             let dst = expect_result_reg(result, Kind::Int, "int binop needs result");
             let opcode = match opname {
                 "int_add" => majit_ir::OpCode::IntAdd,
                 "int_sub" => majit_ir::OpCode::IntSub,
                 "int_mul" => majit_ir::OpCode::IntMul,
-                "int_floordiv" => majit_ir::OpCode::IntFloorDiv,
-                "int_mod" => majit_ir::OpCode::IntMod,
                 "int_and" => majit_ir::OpCode::IntAnd,
                 "int_or" => majit_ir::OpCode::IntOr,
                 "int_xor" => majit_ir::OpCode::IntXor,
@@ -2389,6 +2414,21 @@ mod tests {
         let mut ssarepr = SSARepr::new("residual_call_ir_v");
         let mut builder = JitCodeBuilder::default();
         let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
+        // ReleaseGil EI is built with a real `(target_fn_addr, save_err)`
+        // pair (`call.py:252-258 _call_aroundstate_target_`); reuse the
+        // registered fn_ptr address so `is_call_release_gil()` triggers.
+        let release_gil_ei = majit_ir::EffectInfo {
+            extraeffect: majit_ir::ExtraEffect::RandomEffects,
+            can_invalidate: true,
+            readonly_descrs_fields: None,
+            write_descrs_fields: None,
+            readonly_descrs_arrays: None,
+            write_descrs_arrays: None,
+            readonly_descrs_interiorfields: None,
+            write_descrs_interiorfields: None,
+            call_release_gil_target: (0x7777, 0),
+            ..majit_ir::EffectInfo::default()
+        };
         ssarepr.insns.push(Insn::op(
             "residual_call_ir_v",
             vec![
@@ -2402,9 +2442,7 @@ mod tests {
                     vec![Operand::Register(Register::new(Kind::Ref, 0))],
                 )),
                 Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-                    effect_info: super::super::flatten::effect_info_for_call_flavor(
-                        CallFlavor::ReleaseGil,
-                    ),
+                    effect_info: release_gil_ei,
                     arg_kinds: vec![Kind::Int, Kind::Ref],
                     result_kind: None,
                 })),

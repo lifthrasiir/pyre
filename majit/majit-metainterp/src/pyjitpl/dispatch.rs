@@ -1497,8 +1497,30 @@ where
             jitcode::BC_INT_ADD => self.trace_binop_i(ctx, OpCode::IntAdd),
             jitcode::BC_INT_SUB => self.trace_binop_i(ctx, OpCode::IntSub),
             jitcode::BC_INT_MUL => self.trace_binop_i(ctx, OpCode::IntMul),
-            jitcode::BC_INT_FLOORDIV => self.trace_binop_i(ctx, OpCode::IntFloorDiv),
-            jitcode::BC_INT_MOD => self.trace_binop_i(ctx, OpCode::IntMod),
+            // RPython `jtransform.py:575-577` rewrites `int_floordiv` /
+            // `int_mod` to `direct_call(ll_int_py_*)` so upstream
+            // `blackhole.py` has no `bhimpl_int_floordiv` / `bhimpl_int_mod`
+            // and `pyjitpl.py` has no matching `opimpl_int_floordiv` /
+            // `opimpl_int_mod` either.  Pyre's β' redirect at
+            // `majit-translate/src/codegen.rs::generated_binary_int_value`
+            // (Task #94a-1) covers the runtime trace path, and Slice 4 +
+            // Slice 5 (Task #97 in progress) trapped both the SSARepr
+            // producer and `record_binop_i`.  No `BC_INT_FLOORDIV` /
+            // `BC_INT_MOD` byte is emitted in production; reaching this
+            // arm means the upstream-absent path was re-introduced
+            // somewhere up the chain.
+            jitcode::BC_INT_FLOORDIV => panic!(
+                "BC_INT_FLOORDIV reached pyjitpl::dispatch_step; upstream `jtransform.py:576` \
+                 rewrites this to `direct_call(ll_int_py_div)` and pyre routes via the β' \
+                 redirect at codegen.rs::generated_binary_int_value (Task #94a-1).  \
+                 See Task #97 for the deletion sequence."
+            ),
+            jitcode::BC_INT_MOD => panic!(
+                "BC_INT_MOD reached pyjitpl::dispatch_step; upstream `jtransform.py:577` \
+                 rewrites this to `direct_call(ll_int_py_mod)` and pyre routes via the β' \
+                 redirect at codegen.rs::generated_binary_int_value (Task #94a-1).  \
+                 See Task #97 for the deletion sequence."
+            ),
             jitcode::BC_INT_AND => self.trace_binop_i(ctx, OpCode::IntAnd),
             jitcode::BC_INT_OR => self.trace_binop_i(ctx, OpCode::IntOr),
             jitcode::BC_INT_XOR => self.trace_binop_i(ctx, OpCode::IntXor),

@@ -3506,22 +3506,32 @@ fn handle(
         "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
         "float_truediv/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatTrueDiv),
         "float_neg/f>f" => unop_float_record(code, op, ctx, OpCode::FloatNeg),
-        // Int-bank unary ops + `int_mod` binary. RPython parity:
+        // Int-bank unary ops. RPython parity:
         // `pyjitpl.py:356-368` (int_neg / int_invert) + 371-375
         // (int_same_as which calls `_record_helper(rop.SAME_AS_I, ...)`
         // explicitly — same shape, walker treats it as a regular
-        // record-and-writeback). `int_mod/ii>i` matches RPython
-        // `pyjitpl.py:279 int_mod` in the exec-generated binop loop.
+        // record-and-writeback).
         "int_neg/i>i" => unop_int_record(code, op, ctx, OpCode::IntNeg),
         "int_invert/i>i" => unop_int_record(code, op, ctx, OpCode::IntInvert),
         "int_same_as/i>i" => unop_int_record(code, op, ctx, OpCode::SameAsI),
-        "int_mod/ii>i" => binop_int_record(code, op, ctx, OpCode::IntMod),
-        // `int_div/ii>i` intentionally absent: RPython's metainterp
-        // opimpl is `int_floordiv` (pyjitpl.py:279), not `int_div`.
-        // The pyre codewriter emits `int_div` as its own opname which
-        // is a NEW-DEVIATION from RPython naming — handler land waits
-        // for the codewriter rename or for the pyre/RPython op-table
-        // mapping to be reconciled (separate slice).
+        // `int_mod/ii>i` and the absent `int_floordiv/ii>i` are upstream
+        // residual_call rewrites — `jtransform.py:575-577` replaces
+        // both with `direct_call(ll_int_py_*)` so the bare bytecodes
+        // never appear in real RPython jitcodes.  Pyre's β' redirect
+        // at `majit-translate/src/codegen.rs::generated_binary_int_value`
+        // (Task #94a-1) covers the runtime trace path; Slice 4-6
+        // (Task #97) trapped the SSARepr producer, `record_binop_i`,
+        // and the pyjitpl/blackhole BC dispatchers.  This walker arm
+        // closes the loop: any future regression that emits an
+        // `int_mod/ii>i` byte and reaches this dispatcher panics
+        // immediately instead of silently recording an upstream-absent
+        // `IntMod` op.
+        "int_mod/ii>i" => panic!(
+            "int_mod/ii>i reached jitcode_dispatch::walk; upstream `jtransform.py:577` \
+             rewrites this to `direct_call(ll_int_py_mod)` and pyre routes via the β' \
+             redirect at codegen.rs::generated_binary_int_value (Task #94a-1).  \
+             See Task #97 for the deletion sequence."
+        ),
         "cast_int_to_float/i>f" => cast_int_to_float_record(code, op, ctx),
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
@@ -6509,8 +6519,19 @@ mod tests {
         );
     }
 
+    /// Slice 7 retired the dispatcher arm.  Upstream
+    /// `jtransform.py:577` rewrites `int_mod` to
+    /// `direct_call(ll_int_py_mod)` before jitcode emission, so the
+    /// bare `int_mod/ii>i` bytecode never appears in production
+    /// jitcodes; pyre's β' redirect at
+    /// `majit-translate/src/codegen.rs::generated_binary_int_value`
+    /// (Task #94a-1) routes the trace through `CallI` and Slice 4-6
+    /// trapped every upstream producer.  This test now verifies the
+    /// fail-loud trap fires when a synthetic byte stream reaches the
+    /// dispatcher.
     #[test]
-    fn int_mod_records_intmod() {
+    #[should_panic(expected = "int_mod/ii>i reached jitcode_dispatch::walk")]
+    fn int_mod_dispatcher_now_fails_loud() {
         drive_int_binop("int_mod/ii>i", majit_ir::OpCode::IntMod);
     }
 

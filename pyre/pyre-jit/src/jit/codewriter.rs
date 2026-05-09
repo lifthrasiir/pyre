@@ -2118,13 +2118,17 @@ fn register_helper_fn_pointers(
         // `call_may_force_*` / `call_release_gil_*` paths whose EI is
         // resolved inline by the const factory at
         // `jitcode/assembler.rs::emit_canonical_call_typed_via_target*`
-        // (saturated bitsets, `(1, 0)` release-gil sentinel —
-        // `effectinfo.py:249`).  The `JitCallTarget.effect_info_slot`
-        // is unread for those families, so we register without a slot;
-        // routing them through `slot_for_call_flavor` would trip its
-        // `jtransform.py:1677` assert.  Every other flavor goes through
-        // the slot path so the runtime descriptor carries the matching
-        // `extraeffect`.
+        // — `MOST_GENERAL` for the readonly/write bitsets (`None`
+        // wildcard per `effectinfo.py:149-155`) plus, for `ReleaseGil`,
+        // a real `(realfuncaddr, save_err)` pair resolved from
+        // `descrs[fn_ptr_idx].concrete_ptr` mirroring
+        // `_call_aroundstate_target_` (`call.py:252-258`).  The
+        // `JitCallTarget.effect_info_slot` is unread for those
+        // families, so we register without a slot; routing them
+        // through `slot_for_call_flavor` would trip its
+        // `jtransform.py:1677` assert.  Every other flavor goes
+        // through the slot path so the runtime descriptor carries the
+        // matching `extraeffect`.
         let idx = match flavor {
             CallFlavor::MayForce | CallFlavor::ReleaseGil => assembler.add_fn_ptr(ptr),
             _ => assembler.add_fn_ptr_with_slot(ptr, slot_for_call_flavor(flavor)),

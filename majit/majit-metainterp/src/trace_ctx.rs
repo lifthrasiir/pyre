@@ -3714,12 +3714,12 @@ impl TraceCtx {
     /// `[savebox, realfuncaddr] + args`. The body reads
     /// `(realfuncaddr, saveerr)` directly off `effect_info.call_release_gil_target`
     /// matching `pyjitpl.py:3675` line-by-line; the descr is guaranteed
-    /// to carry a real C address by the time we read it because either
-    /// (a) the emit-side `assembler.rs::resolve_call_release_gil_target`
-    /// substituted the resolved `target.concrete_ptr` into a sentinel
-    /// `(1, 0)` slot before the descr was materialized, or (b) a
-    /// producer-side typed caller (`trace_ctx.rs::call_release_gil_int_typed`,
-    /// `_float_typed`) populated the slot directly from `func_ptr`.
+    /// to carry a real C address by the time we read it because every
+    /// release-gil EI producer (`assembler.rs::call_release_gil_*_canonical_via_target`,
+    /// `trace_ctx::call_release_gil_{int,float}_typed`) resolves
+    /// `target.concrete_ptr` / `func_ptr` into the slot directly at
+    /// EI construction time, mirroring `call.py:252-258`'s
+    /// `_call_aroundstate_target_` read.
     ///
     /// Routes heapcache invalidation through `invalidate_caches_varargs`
     /// (heapcache.py:309-340) instead of the escape-only path used by
@@ -3783,15 +3783,11 @@ impl TraceCtx {
         //   realfuncaddr, saveerr = effectinfo.call_release_gil_target
         //   funcbox = ConstInt(adr2int(realfuncaddr))
         //   savebox = ConstInt(saveerr)
-        // Pyre's emit-side `resolve_call_release_gil_target`
-        // (`jitcode/assembler.rs`) substitutes the resolved
-        // `target.concrete_ptr` into the `realfuncaddr` slot for the
-        // sentinel-(1, 0) descrs emitted by the macro DSL wrappers
-        // before the descr is materialized.  Caller-side
-        // `trace_ctx::call_release_gil_*_typed` already populates the
-        // slot with `func_ptr` directly (`trace_ctx.rs:3852, 3874`).
-        // Either way the descr carries a real C address by the time
-        // we read it here.
+        // Every release-gil EI producer
+        // (`assembler.rs::call_release_gil_*_canonical_via_target`,
+        // `trace_ctx::call_release_gil_*_typed`) populates the slot
+        // with the real C address at construction time, matching
+        // `call.py:252-258`'s `_call_aroundstate_target_` read.
         //
         // PyPy's `call.py:252-258 _call_aroundstate_target_` allows
         // the wrapper at `direct_call`'s `args[0]` and the real GIL-
@@ -3802,7 +3798,7 @@ impl TraceCtx {
         let (realfuncaddr, saveerr) = effect_info.call_release_gil_target;
         debug_assert!(
             realfuncaddr != 0,
-            "release_gil call_release_gil_target unset — emit-side resolve_call_release_gil_target should have populated realfuncaddr",
+            "release_gil call_release_gil_target unset — release-gil EI producer should have populated realfuncaddr",
         );
         let _ = func_ptr;
         let savebox = self.constants.get_or_insert(saveerr as i64);

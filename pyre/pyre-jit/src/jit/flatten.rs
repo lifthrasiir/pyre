@@ -481,8 +481,7 @@ pub fn intern_call_descr_stub(
 }
 
 /// Map a [`CallFlavor`] to the upstream-shape `EffectInfo` carrying the
-/// equivalent `extraeffect` (and `call_release_gil_target` sentinel for
-/// `ReleaseGil`). The mapping mirrors
+/// equivalent `extraeffect`. The mapping mirrors
 /// `rpython/jit/metainterp/optimizeopt/rewrite.py optimize_CALL_*`'s
 /// branch selection: each pyre `CallFlavor` corresponds to the
 /// `EffectInfo.extraeffect` value upstream's optimizer would have read
@@ -581,14 +580,16 @@ pub fn intern_call_descr_stub(
 /// `jtransform.py:1677` (`assert not
 /// calldescr.get_extra_info().check_forces_virtual_or_virtualizable()`)
 /// and `pyjitpl.py:2128-2132 do_conditional_call`'s identical assertion.
-/// Those flavors carry runtime-resolved EI fields
-/// (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` without analyzer outputs,
-/// `EF_RANDOM_EFFECTS` + non-zero `call_release_gil_target` per
-/// `effectinfo.py:249`) that the const factory at
+/// Those flavors carry per-callee EI fields
+/// (`EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` without analyzer outputs;
+/// `EF_RANDOM_EFFECTS` + a real `(realfuncaddr, save_err)` pair read
+/// off `_call_aroundstate_target_` per `call.py:252-258` and
+/// `effectinfo.py:255-257`) that the const factory at
 /// `jitcode/assembler.rs::emit_canonical_call_typed_via_target*`
-/// constructs inline (saturated read/write bitsets, `(1, 0)`
-/// release-gil sentinel).  Code paths that register helpers for
-/// residual_call dispatch (which never reads
+/// resolves inline by reading `descrs[fn_ptr_idx].concrete_ptr`
+/// (`MOST_GENERAL` keeps every readonly/write bitset `None` for the
+/// wildcard contract, mirroring `effectinfo.py:149-155`).  Code paths
+/// that register helpers for residual_call dispatch (which never reads
 /// `JitCallTarget.effect_info_slot`) must classify them through a
 /// flavor-aware split — see `register_helper_fn_pointers::bind` for
 /// the canonical pattern — instead of routing through this function.
@@ -720,57 +721,30 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // `:2063 effectinfo.is_call_release_gil()` selects the
         // `direct_call_release_gil` sub-case.
         //
-        // PRE-EXISTING-ADAPTATION: pyre's producer-side `CallFlavor`
-        // does not carry the real `(target_fn_addr, save_err)` pair
-        // that `effectinfo.py:114, 197 call_release_gil_target`
-        // demands; pyre uses a non-zero sentinel `(1, 0)` solely to
-        // make `is_call_release_gil()`
-        // (`majit-ir/src/effectinfo.rs:292-295`) return true.  The
-        // `target_fn_addr` half is resolved downstream by
-        // `resolve_call_release_gil_target`
-        // (`majit-metainterp/src/jitcode/assembler.rs:3568`), which
-        // substitutes `target.concrete_ptr` for the `1` sentinel when
-        // the EI flows through `emit_canonical_call_typed_via_target*`.
-        // The `save_err = 0` half is the genuine remaining gap: pyre
-        // dispatches release-gil callees directly via `bh_call_*_dispatch`
-        // with no `_call_aroundstate_target_` decorator equivalent
-        // (`call.py:252-258`), so the upstream `RFFI_ERR_*` save modes
-        // have no surface to plumb through. Wiring `save_err` is part
-        // of Task #64 (real EffectInfo analyzers).
-        //
-        // The round-trip property
-        // `dispatch_kind_for_effect_info(effect_info_for_call_flavor(ReleaseGil)) == ReleaseGil`
-        // holds because `dispatch_kind_for_effect_info` checks
-        // `is_call_release_gil()` first (`flatten.rs:487`), short-
-        // circuiting the `check_forces_virtual_or_virtualizable()`
-        // arm which would otherwise return `MayForce`.
-        CallFlavor::ReleaseGil => EffectInfo {
-            extraeffect: ExtraEffect::RandomEffects,
-            // call.py:286 `can_invalidate = random_effects or
-            // self.quasiimmut_analyzer.analyze(op)` — `random_effects`
-            // implies `can_invalidate`.  Sibling producer
-            // `majit-metainterp/src/jitcode/assembler.rs:1821`
-            // already sets this to `true`; leaving it `false` here
-            // would let the heapcache `clear_caches_varargs` skip the
-            // arraycopy / arraymove fast-paths for traces whose
-            // release-gil descr came from this producer.
-            can_invalidate: true,
-            // RPython `effectinfo.py:149-155` + `compute_bitstrings`
-            // line 488-489 keep the bitstrings as `None` for
-            // `EF_RANDOM_EFFECTS`; the optimizer's `has_random_effects()`
-            // gate (heap.py:460 / heap.rs:2602) routes RandomEffects
-            // calls through `clean_caches` instead of
-            // `force_from_effectinfo`, so `check_*_descr_*` is never
-            // queried on the wildcard.
-            readonly_descrs_fields: None,
-            write_descrs_fields: None,
-            readonly_descrs_arrays: None,
-            write_descrs_arrays: None,
-            readonly_descrs_interiorfields: None,
-            write_descrs_interiorfields: None,
-            call_release_gil_target: (1, 0),
-            ..EffectInfo::default()
-        },
+        // `CallFlavor::ReleaseGil` cannot be encoded without the real
+        // `(target_fn_addr, save_err)` pair that
+        // `effectinfo.py:114, 197 call_release_gil_target` demands —
+        // `is_call_release_gil()` (`majit-ir/src/effectinfo.rs:292-295`,
+        // mirroring `effectinfo.py:255-257 bool(tgt_func)`) reads the
+        // address slot directly.  Sibling producer
+        // `majit-metainterp/src/jitcode/assembler.rs::call_release_gil_*_canonical_via_target`
+        // resolves `target.concrete_ptr` from `descrs[fn_ptr_idx]` at EI
+        // construction time, mirroring `codewriter/call.py:252-258`'s
+        // `_call_aroundstate_target_` read; this flatten path has no
+        // such target available, so any callsite that wants a release-
+        // gil EI must use the assembler-side helper instead of routing
+        // through `effect_info_for_call_flavor`.  Pyre production
+        // currently never calls this branch (`slot_for_call_flavor`
+        // also panics on `MayForce | ReleaseGil` per `jtransform.py:1677
+        // _rewrite_op_cond_call`'s assertion).  Failing loud here keeps
+        // the EI free of (1, 0) sentinels.
+        CallFlavor::ReleaseGil => panic!(
+            "effect_info_for_call_flavor: ReleaseGil requires the resolved \
+             (target_fn_addr, save_err) pair from `call.py:252-258 \
+             _call_aroundstate_target_`; use \
+             `assembler.rs::call_release_gil_*_canonical_via_target` \
+             which reads `descrs[fn_ptr_idx].concrete_ptr` instead."
+        ),
     }
 }
 
@@ -782,16 +756,18 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
 /// then `check_is_elidable()`, else the plain `CALL_*` branch.
 ///
 /// Precedence note: `is_call_release_gil()` is checked **before**
-/// `check_forces_virtual_or_virtualizable()` because
-/// [`effect_info_for_call_flavor`] tags `CallFlavor::ReleaseGil`
-/// with `EF_RANDOM_EFFECTS` (mirroring `call.py:282-289 getcalldescr`'s
-/// `random_effects` upgrade for release-gil callees), which makes
+/// `check_forces_virtual_or_virtualizable()` because release-gil EIs
+/// (built by `assembler.rs::call_release_gil_*_canonical_via_target`
+/// from `_call_aroundstate_target_` per `call.py:282-289 getcalldescr`'s
+/// `random_effects` upgrade) carry `EF_RANDOM_EFFECTS`, which makes
 /// `check_forces_virtual_or_virtualizable()` (`>= 6`) also return
 /// true on those EI values.  The early `is_call_release_gil()` check
-/// keeps the round-trip property
+/// mirrors `pyjitpl.py:2063`'s structure where the release-gil
+/// sub-case is selected inside the outer forces branch.  The
+/// non-ReleaseGil round-trip property
 /// `dispatch_kind_for_effect_info(effect_info_for_call_flavor(f)) == f`
-/// AND mirrors `pyjitpl.py:2063`'s structure where the release-gil
-/// sub-case is selected inside the outer forces branch.
+/// holds for every flavor that `effect_info_for_call_flavor` accepts
+/// (i.e. all but `ReleaseGil`, which fails-loud at the producer).
 pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
     use majit_ir::ExtraEffect;
     if ei.is_call_release_gil() {
@@ -3606,12 +3582,15 @@ mod tests {
         // call.py:282-303 maps each ExtraEffect to one CallFlavor; the
         // round-trip property is `dispatch_kind_for_effect_info(
         // effect_info_for_call_flavor(f)) == f` for every flavor.
+        // ReleaseGil is excluded — it requires the resolved
+        // (target_fn_addr, save_err) pair from `call.py:252-258
+        // _call_aroundstate_target_` and is built by
+        // `assembler.rs::call_release_gil_*_canonical_via_target` instead.
         for flavor in [
             CallFlavor::Plain,
             CallFlavor::PlainCannotRaise,
             CallFlavor::MayForce,
             CallFlavor::LoopInvariant,
-            CallFlavor::ReleaseGil,
             CallFlavor::PureCannotRaise,
             CallFlavor::PureOrMemerror,
             CallFlavor::PureCanRaise,
