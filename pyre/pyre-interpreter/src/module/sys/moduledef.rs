@@ -103,6 +103,26 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
+/// pypy/module/sys/vm.py `exc_info_direct` — return the active exception
+/// as a `(type, value, traceback)` tuple.
+///
+/// Used by both the regular `sys.exc_info` builtin and the JIT direct path
+/// in `function.funccall_valuestack` (function.py:146-150). Splitting it
+/// out lets the JIT bypass invoke the same logic without going through the
+/// builtin call dispatch.
+pub fn exc_info_direct() -> PyObjectRef {
+    let exc = crate::eval::get_current_exception();
+    unsafe {
+        if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
+            w_tuple_new(vec![w_none(), w_none(), w_none()])
+        } else {
+            let w_class = (*exc).w_class;
+            let exc_type = if w_class.is_null() { w_none() } else { w_class };
+            w_tuple_new(vec![exc_type, exc, w_none()])
+        }
+    }
+}
+
 pub fn init(ns: &mut DictStorage) {
     dict_storage_store(ns, "maxsize", w_int_new(i64::MAX));
     dict_storage_store(ns, "maxunicode", w_int_new(0x10FFFF));
@@ -171,22 +191,18 @@ pub fn init(ns: &mut DictStorage) {
         }),
     );
     // sys.exc_info() → (type, value, traceback)
-    dict_storage_store(
-        ns,
-        "exc_info",
-        make_builtin_function_with_arity("exc_info", |_| {
-            let exc = crate::eval::get_current_exception();
-            unsafe {
-                if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
-                    Ok(w_tuple_new(vec![w_none(), w_none(), w_none()]))
-                } else {
-                    let w_class = (*exc).w_class;
-                    let exc_type = if w_class.is_null() { w_none() } else { w_class };
-                    Ok(w_tuple_new(vec![exc_type, exc, w_none()]))
-                }
-            }
-        }, 0),
-    );
+    //
+    // Tuple construction is shared with `exc_info_direct` (the JIT fast-path
+    // entry registered below), so the regular call path and the JIT bypass
+    // observe the same value.
+    let exc_info_fn = make_builtin_function_with_arity("exc_info", |_| Ok(exc_info_direct()), 0);
+    dict_storage_store(ns, "exc_info", exc_info_fn);
+    // baseobjspace.py: register `space._code_of_sys_exc_info` so
+    // `function.funccall_valuestack` can take the JIT direct path
+    // (function.py:146-150). The builtin code pointer lives on the
+    // `BuiltinCode` object backing `exc_info_fn`; `getcode` returns it.
+    let exc_info_code = unsafe { crate::getcode(exc_info_fn) };
+    crate::function::register_sys_exc_info_path(exc_info_code, exc_info_direct);
     // sys.flags — pypy/module/sys/app.py:99-119 `class sysflags` with
     // `__metaclass__ = structseqtype`. PyPy exposes it as a structseq
     // (immutable tuple subclass with named fields). pyre does not have
@@ -242,47 +258,59 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "getrecursionlimit",
-        make_builtin_function_with_arity("getrecursionlimit", |args| {
-            // pypy/module/sys/vm.py:72 — no arguments.
-            if !args.is_empty() {
-                return Err(crate::PyError::type_error(
-                    "getrecursionlimit() takes no arguments",
-                ));
-            }
-            Ok(w_int_new(crate::stack_check::get_recursion_limit() as i64))
-        }, 0),
+        make_builtin_function_with_arity(
+            "getrecursionlimit",
+            |args| {
+                // pypy/module/sys/vm.py:72 — no arguments.
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "getrecursionlimit() takes no arguments",
+                    ));
+                }
+                Ok(w_int_new(crate::stack_check::get_recursion_limit() as i64))
+            },
+            0,
+        ),
     );
     dict_storage_store(
         ns,
         "setrecursionlimit",
-        make_builtin_function_with_arity("setrecursionlimit", |args| {
-            // pypy/module/sys/vm.py:63 `@unwrap_spec(new_limit="c_int")`
-            // — exactly one positional argument, coerced through
-            // baseobjspace.c_int_w (gateway_int_w + 32-bit range
-            // check). `c_int_w` accepts int subclasses and any object
-            // implementing `__int__`, rejects floats, and surfaces
-            // out-of-range values as OverflowError.
-            if args.len() != 1 {
-                return Err(crate::PyError::type_error(
-                    "setrecursionlimit() takes exactly one argument",
-                ));
-            }
-            let new_limit = crate::baseobjspace::c_int_w(args[0])?;
-            crate::stack_check::set_recursion_limit(new_limit)?;
-            Ok(w_none())
-        }, 1),
+        make_builtin_function_with_arity(
+            "setrecursionlimit",
+            |args| {
+                // pypy/module/sys/vm.py:63 `@unwrap_spec(new_limit="c_int")`
+                // — exactly one positional argument, coerced through
+                // baseobjspace.c_int_w (gateway_int_w + 32-bit range
+                // check). `c_int_w` accepts int subclasses and any object
+                // implementing `__int__`, rejects floats, and surfaces
+                // out-of-range values as OverflowError.
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(
+                        "setrecursionlimit() takes exactly one argument",
+                    ));
+                }
+                let new_limit = crate::baseobjspace::c_int_w(args[0])?;
+                crate::stack_check::set_recursion_limit(new_limit)?;
+                Ok(w_none())
+            },
+            1,
+        ),
     );
     // sys.intern
     dict_storage_store(
         ns,
         "intern",
-        make_builtin_function_with_arity("intern", |args| {
-            Ok(if args.is_empty() {
-                w_str_new("")
-            } else {
-                args[0]
-            })
-        }, 1),
+        make_builtin_function_with_arity(
+            "intern",
+            |args| {
+                Ok(if args.is_empty() {
+                    w_str_new("")
+                } else {
+                    args[0]
+                })
+            },
+            1,
+        ),
     );
     // sys.implementation — structseq-like namespace with name, version, ...
     {
@@ -517,9 +545,11 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "getfilesystemencodeerrors",
-        make_builtin_function_with_arity("getfilesystemencodeerrors", |_| {
-            Ok(w_str_new("surrogateescape"))
-        }, 0),
+        make_builtin_function_with_arity(
+            "getfilesystemencodeerrors",
+            |_| Ok(w_str_new("surrogateescape")),
+            0,
+        ),
     );
     // sys.audit — no-op
     dict_storage_store(

@@ -6,7 +6,9 @@
 //! Functions are registered so `import cmath` succeeds, but complex
 //! arithmetic requires W_ComplexObject (future work).
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
+};
 use pyre_object::*;
 
 pub fn init(ns: &mut DictStorage) {
@@ -22,58 +24,82 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "phase",
-        make_builtin_function_with_arity("phase", |args| {
-            Ok(floatobject::w_float_new(
-                super::interp_math::get_double(args[0]).atan2(0.0),
-            ))
-        }, 1),
+        make_builtin_function_with_arity(
+            "phase",
+            |args| {
+                Ok(floatobject::w_float_new(
+                    super::interp_math::get_double(args[0]).atan2(0.0),
+                ))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "polar",
-        make_builtin_function_with_arity("polar", |args| {
-            let x = super::interp_math::get_double(args[0]);
-            Ok(w_tuple_new(vec![
-                floatobject::w_float_new(x.abs()),
-                floatobject::w_float_new(0.0),
-            ]))
-        }, 1),
+        make_builtin_function_with_arity(
+            "polar",
+            |args| {
+                let x = super::interp_math::get_double(args[0]);
+                Ok(w_tuple_new(vec![
+                    floatobject::w_float_new(x.abs()),
+                    floatobject::w_float_new(0.0),
+                ]))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "rect",
-        make_builtin_function_with_arity("rect", |args| {
-            let r = super::interp_math::get_double(args[0]);
-            let phi = super::interp_math::get_double(args[1]);
-            Ok(floatobject::w_float_new(r * phi.cos()))
-        }, 2),
+        make_builtin_function_with_arity(
+            "rect",
+            |args| {
+                let r = super::interp_math::get_double(args[0]);
+                let phi = super::interp_math::get_double(args[1]);
+                Ok(floatobject::w_float_new(r * phi.cos()))
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "isfinite",
-        make_builtin_function_with_arity("isfinite", |args| {
-            Ok(w_bool_from(
-                super::interp_math::get_double(args[0]).is_finite(),
-            ))
-        }, 1),
+        make_builtin_function_with_arity(
+            "isfinite",
+            |args| {
+                Ok(w_bool_from(
+                    super::interp_math::get_double(args[0]).is_finite(),
+                ))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "isinf",
-        make_builtin_function_with_arity("isinf", |args| {
-            Ok(w_bool_from(
-                super::interp_math::get_double(args[0]).is_infinite(),
-            ))
-        }, 1),
+        make_builtin_function_with_arity(
+            "isinf",
+            |args| {
+                Ok(w_bool_from(
+                    super::interp_math::get_double(args[0]).is_infinite(),
+                ))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "isnan",
-        make_builtin_function_with_arity("isnan", |args| {
-            Ok(w_bool_from(
-                super::interp_math::get_double(args[0]).is_nan(),
-            ))
-        }, 1),
+        make_builtin_function_with_arity(
+            "isnan",
+            |args| {
+                Ok(w_bool_from(
+                    super::interp_math::get_double(args[0]).is_nan(),
+                ))
+            },
+            1,
+        ),
     );
 
     // Forward trig/exp functions to math equivalents for real input
@@ -100,5 +126,9 @@ pub fn init(ns: &mut DictStorage) {
         dict_storage_store(ns, name, make_builtin_function_with_arity(name, func, 1));
     }
     // log accepts optional base argument — variable arity
-    dict_storage_store(ns, "log", make_builtin_function("log", super::interp_math::log));
+    dict_storage_store(
+        ns,
+        "log",
+        make_builtin_function("log", super::interp_math::log),
+    );
 }

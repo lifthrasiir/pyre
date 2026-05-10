@@ -11,7 +11,10 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-use crate::{DictStorage, PyError, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    DictStorage, PyError, dict_storage_store, make_builtin_function,
+    make_builtin_function_with_arity,
+};
 use pyre_object::*;
 
 use std::sync::OnceLock;
@@ -99,8 +102,16 @@ fn init_weakref_type(ns: &mut DictStorage) {
         "__init__",
         make_builtin_function("__init__", descr__init__weakref),
     );
-    dict_storage_store(ns, "__eq__", make_builtin_function_with_arity("__eq__", descr__eq__, 2));
-    dict_storage_store(ns, "__ne__", make_builtin_function_with_arity("__ne__", descr__ne__, 2));
+    dict_storage_store(
+        ns,
+        "__eq__",
+        make_builtin_function_with_arity("__eq__", descr__eq__, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__ne__",
+        make_builtin_function_with_arity("__ne__", descr__ne__, 2),
+    );
     dict_storage_store(
         ns,
         "__hash__",
@@ -1282,19 +1293,31 @@ pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// typedefs end up with the same set of methods PyPy generates.
 fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) {
     // Forward + reflected binary arithmetic — interp__weakref.py:376-389.
-    dict_storage_store(ns, "__add__", make_builtin_function_with_arity("__add__", proxy_add, 2));
+    dict_storage_store(
+        ns,
+        "__add__",
+        make_builtin_function_with_arity("__add__", proxy_add, 2),
+    );
     dict_storage_store(
         ns,
         "__radd__",
         make_builtin_function_with_arity("__radd__", proxy_radd, 2),
     );
-    dict_storage_store(ns, "__sub__", make_builtin_function_with_arity("__sub__", proxy_sub, 2));
+    dict_storage_store(
+        ns,
+        "__sub__",
+        make_builtin_function_with_arity("__sub__", proxy_sub, 2),
+    );
     dict_storage_store(
         ns,
         "__rsub__",
         make_builtin_function_with_arity("__rsub__", proxy_rsub, 2),
     );
-    dict_storage_store(ns, "__mul__", make_builtin_function_with_arity("__mul__", proxy_mul, 2));
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", proxy_mul, 2),
+    );
     dict_storage_store(
         ns,
         "__rmul__",
@@ -1320,7 +1343,11 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
         "__rfloordiv__",
         make_builtin_function_with_arity("__rfloordiv__", proxy_rfloordiv, 2),
     );
-    dict_storage_store(ns, "__mod__", make_builtin_function_with_arity("__mod__", proxy_mod, 2));
+    dict_storage_store(
+        ns,
+        "__mod__",
+        make_builtin_function_with_arity("__mod__", proxy_mod, 2),
+    );
     dict_storage_store(
         ns,
         "__rmod__",
@@ -1352,15 +1379,31 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
         "__rrshift__",
         make_builtin_function_with_arity("__rrshift__", proxy_rrshift, 2),
     );
-    dict_storage_store(ns, "__and__", make_builtin_function_with_arity("__and__", proxy_and, 2));
+    dict_storage_store(
+        ns,
+        "__and__",
+        make_builtin_function_with_arity("__and__", proxy_and, 2),
+    );
     dict_storage_store(
         ns,
         "__rand__",
         make_builtin_function_with_arity("__rand__", proxy_rand, 2),
     );
-    dict_storage_store(ns, "__or__", make_builtin_function_with_arity("__or__", proxy_or, 2));
-    dict_storage_store(ns, "__ror__", make_builtin_function_with_arity("__ror__", proxy_ror, 2));
-    dict_storage_store(ns, "__xor__", make_builtin_function_with_arity("__xor__", proxy_xor, 2));
+    dict_storage_store(
+        ns,
+        "__or__",
+        make_builtin_function_with_arity("__or__", proxy_or, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__ror__",
+        make_builtin_function_with_arity("__ror__", proxy_ror, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__xor__",
+        make_builtin_function_with_arity("__xor__", proxy_xor, 2),
+    );
     dict_storage_store(
         ns,
         "__rxor__",
@@ -1429,7 +1472,11 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
         "__iand__",
         make_builtin_function_with_arity("__iand__", proxy_iand, 2),
     );
-    dict_storage_store(ns, "__ior__", make_builtin_function_with_arity("__ior__", proxy_ior, 2));
+    dict_storage_store(
+        ns,
+        "__ior__",
+        make_builtin_function_with_arity("__ior__", proxy_ior, 2),
+    );
     dict_storage_store(
         ns,
         "__ixor__",
@@ -1442,8 +1489,16 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
         "__format__",
         make_builtin_function_with_arity("__format__", proxy_format, 2),
     );
-    dict_storage_store(ns, "__str__", make_builtin_function_with_arity("__str__", proxy_str, 1));
-    dict_storage_store(ns, "__len__", make_builtin_function_with_arity("__len__", proxy_len, 1));
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function_with_arity("__str__", proxy_str, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function_with_arity("__len__", proxy_len, 1),
+    );
     dict_storage_store(
         ns,
         "__getattribute__",
@@ -1479,20 +1534,36 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
         "__trunc__",
         make_builtin_function_with_arity("__trunc__", proxy_trunc, 1),
     );
-    dict_storage_store(ns, "__pos__", make_builtin_function_with_arity("__pos__", proxy_pos, 1));
-    dict_storage_store(ns, "__neg__", make_builtin_function_with_arity("__neg__", proxy_neg, 1));
+    dict_storage_store(
+        ns,
+        "__pos__",
+        make_builtin_function_with_arity("__pos__", proxy_pos, 1),
+    );
+    dict_storage_store(
+        ns,
+        "__neg__",
+        make_builtin_function_with_arity("__neg__", proxy_neg, 1),
+    );
     dict_storage_store(
         ns,
         "__bool__",
         make_builtin_function_with_arity("__bool__", proxy_bool, 1),
     );
-    dict_storage_store(ns, "__abs__", make_builtin_function_with_arity("__abs__", proxy_abs, 1));
+    dict_storage_store(
+        ns,
+        "__abs__",
+        make_builtin_function_with_arity("__abs__", proxy_abs, 1),
+    );
     dict_storage_store(
         ns,
         "__invert__",
         make_builtin_function_with_arity("__invert__", proxy_invert, 1),
     );
-    dict_storage_store(ns, "__int__", make_builtin_function_with_arity("__int__", proxy_int, 1));
+    dict_storage_store(
+        ns,
+        "__int__",
+        make_builtin_function_with_arity("__int__", proxy_int, 1),
+    );
     dict_storage_store(
         ns,
         "__index__",
@@ -1518,8 +1589,16 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
         "__next__",
         make_builtin_function_with_arity("__next__", proxy_next, 1),
     );
-    dict_storage_store(ns, "__get__", make_builtin_function_with_arity("__get__", proxy_get, 3));
-    dict_storage_store(ns, "__set__", make_builtin_function_with_arity("__set__", proxy_set, 3));
+    dict_storage_store(
+        ns,
+        "__get__",
+        make_builtin_function_with_arity("__get__", proxy_get, 3),
+    );
+    dict_storage_store(
+        ns,
+        "__set__",
+        make_builtin_function_with_arity("__set__", proxy_set, 3),
+    );
     dict_storage_store(
         ns,
         "__delete__",
@@ -1540,12 +1619,36 @@ fn register_proxy_typedef_dict(ns: &mut DictStorage, include_comparisons: bool) 
     // interp__weakref.py:390-391 — comparison ops are registered only on
     // `proxy_typedef_dict`, not `callable_proxy_typedef_dict`.
     if include_comparisons {
-        dict_storage_store(ns, "__lt__", make_builtin_function_with_arity("__lt__", proxy_lt, 2));
-        dict_storage_store(ns, "__le__", make_builtin_function_with_arity("__le__", proxy_le, 2));
-        dict_storage_store(ns, "__gt__", make_builtin_function_with_arity("__gt__", proxy_gt, 2));
-        dict_storage_store(ns, "__ge__", make_builtin_function_with_arity("__ge__", proxy_ge, 2));
-        dict_storage_store(ns, "__eq__", make_builtin_function_with_arity("__eq__", proxy_eq, 2));
-        dict_storage_store(ns, "__ne__", make_builtin_function_with_arity("__ne__", proxy_ne, 2));
+        dict_storage_store(
+            ns,
+            "__lt__",
+            make_builtin_function_with_arity("__lt__", proxy_lt, 2),
+        );
+        dict_storage_store(
+            ns,
+            "__le__",
+            make_builtin_function_with_arity("__le__", proxy_le, 2),
+        );
+        dict_storage_store(
+            ns,
+            "__gt__",
+            make_builtin_function_with_arity("__gt__", proxy_gt, 2),
+        );
+        dict_storage_store(
+            ns,
+            "__ge__",
+            make_builtin_function_with_arity("__ge__", proxy_ge, 2),
+        );
+        dict_storage_store(
+            ns,
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", proxy_eq, 2),
+        );
+        dict_storage_store(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", proxy_ne, 2),
+        );
     }
 }
 

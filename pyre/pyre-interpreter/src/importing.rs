@@ -154,7 +154,7 @@ fn init_gc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "collect",
-        crate::make_builtin_function_with_arity("collect", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity("collect", |_| Ok(pyre_object::w_int_new(0)), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -169,22 +169,30 @@ fn init_gc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "isenabled",
-        crate::make_builtin_function_with_arity("isenabled", |_| Ok(pyre_object::w_bool_from(false)), 0),
+        crate::make_builtin_function_with_arity(
+            "isenabled",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_objects",
-        crate::make_builtin_function_with_arity("get_objects", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function_with_arity(
+            "get_objects",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_referrers",
-        crate::make_builtin_function_with_arity("get_referrers", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function("get_referrers", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     crate::dict_storage_store(
         ns,
         "get_referents",
-        crate::make_builtin_function_with_arity("get_referents", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function("get_referents", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     crate::dict_storage_store(
         ns,
@@ -194,34 +202,50 @@ fn init_gc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "get_threshold",
-        crate::make_builtin_function_with_arity("get_threshold", |_| {
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(700),
-                pyre_object::w_int_new(10),
-                pyre_object::w_int_new(10),
-            ]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "get_threshold",
+            |_| {
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(700),
+                    pyre_object::w_int_new(10),
+                    pyre_object::w_int_new(10),
+                ]))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_count",
-        crate::make_builtin_function_with_arity("get_count", |_| {
-            Ok(pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(0),
-                pyre_object::w_int_new(0),
-                pyre_object::w_int_new(0),
-            ]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "get_count",
+            |_| {
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(0),
+                    pyre_object::w_int_new(0),
+                    pyre_object::w_int_new(0),
+                ]))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "is_tracked",
-        crate::make_builtin_function_with_arity("is_tracked", |_| Ok(pyre_object::w_bool_from(false)), 1),
+        crate::make_builtin_function_with_arity(
+            "is_tracked",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "is_finalized",
-        crate::make_builtin_function_with_arity("is_finalized", |_| Ok(pyre_object::w_bool_from(false)), 1),
+        crate::make_builtin_function_with_arity(
+            "is_finalized",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -243,19 +267,27 @@ fn init_unicodedata(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "normalize",
-        crate::make_builtin_function_with_arity("normalize", |args| {
-            if args.len() >= 2 {
-                Ok(args[1])
-            } else {
-                Ok(pyre_object::w_str_new(""))
-            }
-        }, 2),
+        crate::make_builtin_function_with_arity(
+            "normalize",
+            |args| {
+                if args.len() >= 2 {
+                    Ok(args[1])
+                } else {
+                    Ok(pyre_object::w_str_new(""))
+                }
+            },
+            2,
+        ),
     );
     // unicodedata.category(chr) → str (stub: returns "Cn" = unassigned)
     crate::dict_storage_store(
         ns,
         "category",
-        crate::make_builtin_function_with_arity("category", |_| Ok(pyre_object::w_str_new("Cn")), 1),
+        crate::make_builtin_function_with_arity(
+            "category",
+            |_| Ok(pyre_object::w_str_new("Cn")),
+            1,
+        ),
     );
     // unicodedata.name(chr, default=None) → str
     crate::dict_storage_store(
@@ -273,9 +305,11 @@ fn init_unicodedata(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "lookup",
-        crate::make_builtin_function_with_arity("lookup", |_| {
-            Err(crate::PyError::key_error("character not found"))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "lookup",
+            |_| Err(crate::PyError::key_error("character not found")),
+            1,
+        ),
     );
     // unicodedata.decimal(chr, default=None) → int
     crate::dict_storage_store(
@@ -346,24 +380,28 @@ fn init_struct(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "calcsize",
-        crate::make_builtin_function_with_arity("calcsize", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_int_new(0));
-            }
-            let fmt = unsafe {
-                if pyre_object::is_str(args[0]) {
-                    pyre_object::w_str_get_value(args[0]).to_string()
-                } else if pyre_object::bytesobject::is_bytes_like(args[0]) {
-                    let data = pyre_object::bytesobject::bytes_like_data(args[0]);
-                    String::from_utf8_lossy(data).into_owned()
-                } else {
-                    return Err(crate::PyError::type_error("calcsize: format must be str"));
+        crate::make_builtin_function_with_arity(
+            "calcsize",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_int_new(0));
                 }
-            };
-            let (_, codes) = parse_format(&fmt);
-            let total: usize = codes.iter().copied().map(code_size).sum();
-            Ok(pyre_object::w_int_new(total as i64))
-        }, 1),
+                let fmt = unsafe {
+                    if pyre_object::is_str(args[0]) {
+                        pyre_object::w_str_get_value(args[0]).to_string()
+                    } else if pyre_object::bytesobject::is_bytes_like(args[0]) {
+                        let data = pyre_object::bytesobject::bytes_like_data(args[0]);
+                        String::from_utf8_lossy(data).into_owned()
+                    } else {
+                        return Err(crate::PyError::type_error("calcsize: format must be str"));
+                    }
+                };
+                let (_, codes) = parse_format(&fmt);
+                let total: usize = codes.iter().copied().map(code_size).sum();
+                Ok(pyre_object::w_int_new(total as i64))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -455,103 +493,107 @@ fn init_struct(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "unpack",
-        crate::make_builtin_function_with_arity("unpack", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("unpack requires (fmt, buffer)"));
-            }
-            let fmt = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
-            let buf = unsafe {
-                if pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "unpack: buffer must be bytes-like",
-                    ));
+        crate::make_builtin_function_with_arity(
+            "unpack",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("unpack requires (fmt, buffer)"));
                 }
-            };
-            let (endian, codes) = parse_format(&fmt);
-            let little = matches!(endian, '<' | '=' | '@');
-            let mut out = Vec::new();
-            let mut pos = 0usize;
-            for code in codes {
-                match code {
-                    'b' | 'B' => {
-                        if pos >= buf.len() {
-                            break;
-                        }
-                        out.push(pyre_object::w_int_new(buf[pos] as i8 as i64));
-                        pos += 1;
+                let fmt = unsafe { pyre_object::w_str_get_value(args[0]).to_string() };
+                let buf = unsafe {
+                    if pyre_object::bytesobject::is_bytes_like(args[1]) {
+                        pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "unpack: buffer must be bytes-like",
+                        ));
                     }
-                    'h' | 'H' => {
-                        if pos + 2 > buf.len() {
-                            break;
+                };
+                let (endian, codes) = parse_format(&fmt);
+                let little = matches!(endian, '<' | '=' | '@');
+                let mut out = Vec::new();
+                let mut pos = 0usize;
+                for code in codes {
+                    match code {
+                        'b' | 'B' => {
+                            if pos >= buf.len() {
+                                break;
+                            }
+                            out.push(pyre_object::w_int_new(buf[pos] as i8 as i64));
+                            pos += 1;
                         }
-                        let chunk = [buf[pos], buf[pos + 1]];
-                        let v = if little {
-                            i16::from_le_bytes(chunk)
-                        } else {
-                            i16::from_be_bytes(chunk)
-                        };
-                        out.push(pyre_object::w_int_new(v as i64));
-                        pos += 2;
-                    }
-                    'i' | 'I' | 'l' | 'L' => {
-                        if pos + 4 > buf.len() {
-                            break;
+                        'h' | 'H' => {
+                            if pos + 2 > buf.len() {
+                                break;
+                            }
+                            let chunk = [buf[pos], buf[pos + 1]];
+                            let v = if little {
+                                i16::from_le_bytes(chunk)
+                            } else {
+                                i16::from_be_bytes(chunk)
+                            };
+                            out.push(pyre_object::w_int_new(v as i64));
+                            pos += 2;
                         }
-                        let chunk = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
-                        let v = if little {
-                            i32::from_le_bytes(chunk)
-                        } else {
-                            i32::from_be_bytes(chunk)
-                        };
-                        out.push(pyre_object::w_int_new(v as i64));
-                        pos += 4;
-                    }
-                    'q' | 'Q' | 'n' | 'N' => {
-                        if pos + 8 > buf.len() {
-                            break;
+                        'i' | 'I' | 'l' | 'L' => {
+                            if pos + 4 > buf.len() {
+                                break;
+                            }
+                            let chunk = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
+                            let v = if little {
+                                i32::from_le_bytes(chunk)
+                            } else {
+                                i32::from_be_bytes(chunk)
+                            };
+                            out.push(pyre_object::w_int_new(v as i64));
+                            pos += 4;
                         }
-                        let chunk: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
-                        let v = if little {
-                            i64::from_le_bytes(chunk)
-                        } else {
-                            i64::from_be_bytes(chunk)
-                        };
-                        out.push(pyre_object::w_int_new(v));
-                        pos += 8;
-                    }
-                    'f' => {
-                        if pos + 4 > buf.len() {
-                            break;
+                        'q' | 'Q' | 'n' | 'N' => {
+                            if pos + 8 > buf.len() {
+                                break;
+                            }
+                            let chunk: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
+                            let v = if little {
+                                i64::from_le_bytes(chunk)
+                            } else {
+                                i64::from_be_bytes(chunk)
+                            };
+                            out.push(pyre_object::w_int_new(v));
+                            pos += 8;
                         }
-                        let chunk = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
-                        let v = if little {
-                            f32::from_le_bytes(chunk)
-                        } else {
-                            f32::from_be_bytes(chunk)
-                        };
-                        out.push(pyre_object::w_float_new(v as f64));
-                        pos += 4;
-                    }
-                    'd' => {
-                        if pos + 8 > buf.len() {
-                            break;
+                        'f' => {
+                            if pos + 4 > buf.len() {
+                                break;
+                            }
+                            let chunk = [buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]];
+                            let v = if little {
+                                f32::from_le_bytes(chunk)
+                            } else {
+                                f32::from_be_bytes(chunk)
+                            };
+                            out.push(pyre_object::w_float_new(v as f64));
+                            pos += 4;
                         }
-                        let chunk: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
-                        let v = if little {
-                            f64::from_le_bytes(chunk)
-                        } else {
-                            f64::from_be_bytes(chunk)
-                        };
-                        out.push(pyre_object::w_float_new(v));
-                        pos += 8;
+                        'd' => {
+                            if pos + 8 > buf.len() {
+                                break;
+                            }
+                            let chunk: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
+                            let v = if little {
+                                f64::from_le_bytes(chunk)
+                            } else {
+                                f64::from_be_bytes(chunk)
+                            };
+                            out.push(pyre_object::w_float_new(v));
+                            pos += 8;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            Ok(pyre_object::w_tuple_new(out))
-        }, 2),
+                Ok(pyre_object::w_tuple_new(out))
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -561,19 +603,27 @@ fn init_struct(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "iter_unpack",
-        crate::make_builtin_function_with_arity("iter_unpack", |_| Ok(pyre_object::w_list_new(vec![])), 2),
+        crate::make_builtin_function_with_arity(
+            "iter_unpack",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            2,
+        ),
     );
     // Struct class — minimal constructor returning instance with format
     // attribute. Used by struct.Struct(fmt).pack/unpack.
     crate::dict_storage_store(
         ns,
         "Struct",
-        crate::make_builtin_function_with_arity("Struct", |args| {
-            let fmt = args.first().copied().unwrap_or(pyre_object::w_str_new(""));
-            let obj = pyre_object::w_instance_new(crate::typedef::w_object());
-            let _ = crate::baseobjspace::setattr(obj, "format", fmt);
-            Ok(obj)
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "Struct",
+            |args| {
+                let fmt = args.first().copied().unwrap_or(pyre_object::w_str_new(""));
+                let obj = pyre_object::w_instance_new(crate::typedef::w_object());
+                let _ = crate::baseobjspace::setattr(obj, "format", fmt);
+                Ok(obj)
+            },
+            1,
+        ),
     );
 }
 
@@ -643,24 +693,29 @@ fn init_random(ns: &mut DictStorage) {
                     crate::dict_storage_store(
                         ns,
                         "random",
-                        crate::make_builtin_function_with_arity("random", |args| {
-                            // Tiny xorshift PRNG — ok for import-time construction.
-                            let self_obj = args[0];
-                            let state = crate::baseobjspace::getattr(self_obj, "__rand_state__")
-                                .ok()
-                                .map(|v| unsafe { pyre_object::w_int_get_value(v) as u64 })
-                                .unwrap_or(0x1234_5678);
-                            let mut x = state;
-                            x ^= x << 13;
-                            x ^= x >> 7;
-                            x ^= x << 17;
-                            let _ = crate::baseobjspace::setattr(
-                                self_obj,
-                                "__rand_state__",
-                                pyre_object::w_int_new(x as i64),
-                            );
-                            Ok(pyre_object::w_float_new((x as f64) / (u64::MAX as f64)))
-                        }, 1),
+                        crate::make_builtin_function_with_arity(
+                            "random",
+                            |args| {
+                                // Tiny xorshift PRNG — ok for import-time construction.
+                                let self_obj = args[0];
+                                let state =
+                                    crate::baseobjspace::getattr(self_obj, "__rand_state__")
+                                        .ok()
+                                        .map(|v| unsafe { pyre_object::w_int_get_value(v) as u64 })
+                                        .unwrap_or(0x1234_5678);
+                                let mut x = state;
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                let _ = crate::baseobjspace::setattr(
+                                    self_obj,
+                                    "__rand_state__",
+                                    pyre_object::w_int_new(x as i64),
+                                );
+                                Ok(pyre_object::w_float_new((x as f64) / (u64::MAX as f64)))
+                            },
+                            1,
+                        ),
                     );
                     crate::dict_storage_store(
                         ns,
@@ -691,35 +746,43 @@ fn init_random(ns: &mut DictStorage) {
                     crate::dict_storage_store(
                         ns,
                         "getstate",
-                        crate::make_builtin_function_with_arity("getstate", |args| {
-                            let state = crate::baseobjspace::getattr(args[0], "__rand_state__")
-                                .unwrap_or_else(|_| pyre_object::w_int_new(0));
-                            Ok(pyre_object::w_tuple_new(vec![state]))
-                        }, 1),
+                        crate::make_builtin_function_with_arity(
+                            "getstate",
+                            |args| {
+                                let state = crate::baseobjspace::getattr(args[0], "__rand_state__")
+                                    .unwrap_or_else(|_| pyre_object::w_int_new(0));
+                                Ok(pyre_object::w_tuple_new(vec![state]))
+                            },
+                            1,
+                        ),
                     );
                     crate::dict_storage_store(
                         ns,
                         "setstate",
-                        crate::make_builtin_function_with_arity("setstate", |args| {
-                            if args.len() >= 2 {
-                                unsafe {
-                                    if pyre_object::is_tuple(args[1])
-                                        && pyre_object::w_tuple_len(args[1]) >= 1
-                                    {
-                                        if let Some(state) =
-                                            pyre_object::w_tuple_getitem(args[1], 0)
+                        crate::make_builtin_function_with_arity(
+                            "setstate",
+                            |args| {
+                                if args.len() >= 2 {
+                                    unsafe {
+                                        if pyre_object::is_tuple(args[1])
+                                            && pyre_object::w_tuple_len(args[1]) >= 1
                                         {
-                                            let _ = crate::baseobjspace::setattr(
-                                                args[0],
-                                                "__rand_state__",
-                                                state,
-                                            );
+                                            if let Some(state) =
+                                                pyre_object::w_tuple_getitem(args[1], 0)
+                                            {
+                                                let _ = crate::baseobjspace::setattr(
+                                                    args[0],
+                                                    "__rand_state__",
+                                                    state,
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Ok(pyre_object::w_none())
-                        }, 2),
+                                Ok(pyre_object::w_none())
+                            },
+                            2,
+                        ),
                     );
                 });
                 unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -756,34 +819,82 @@ fn init_locale(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "localeconv",
-        crate::make_builtin_function_with_arity("localeconv", |_| {
-            let d = pyre_object::w_dict_new();
-            unsafe {
-                pyre_object::w_dict_setitem_str(
-                    d,
-                    "grouping",
-                    pyre_object::w_list_new(vec![pyre_object::w_int_new(127)]),
-                );
-                pyre_object::w_dict_setitem_str(d, "currency_symbol", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "n_sign_posn", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "p_cs_precedes", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "n_cs_precedes", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "mon_grouping", pyre_object::w_list_new(vec![]));
-                pyre_object::w_dict_setitem_str(d, "n_sep_by_space", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "decimal_point", pyre_object::w_str_new("."));
-                pyre_object::w_dict_setitem_str(d, "negative_sign", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "positive_sign", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "p_sep_by_space", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "int_curr_symbol", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "p_sign_posn", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "thousands_sep", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "mon_thousands_sep", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "frac_digits", pyre_object::w_int_new(127));
-                pyre_object::w_dict_setitem_str(d, "mon_decimal_point", pyre_object::w_str_new(""));
-                pyre_object::w_dict_setitem_str(d, "int_frac_digits", pyre_object::w_int_new(127));
-            }
-            Ok(d)
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "localeconv",
+            |_| {
+                let d = pyre_object::w_dict_new();
+                unsafe {
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "grouping",
+                        pyre_object::w_list_new(vec![pyre_object::w_int_new(127)]),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "currency_symbol",
+                        pyre_object::w_str_new(""),
+                    );
+                    pyre_object::w_dict_setitem_str(d, "n_sign_posn", pyre_object::w_int_new(127));
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "p_cs_precedes",
+                        pyre_object::w_int_new(127),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "n_cs_precedes",
+                        pyre_object::w_int_new(127),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "mon_grouping",
+                        pyre_object::w_list_new(vec![]),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "n_sep_by_space",
+                        pyre_object::w_int_new(127),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "decimal_point",
+                        pyre_object::w_str_new("."),
+                    );
+                    pyre_object::w_dict_setitem_str(d, "negative_sign", pyre_object::w_str_new(""));
+                    pyre_object::w_dict_setitem_str(d, "positive_sign", pyre_object::w_str_new(""));
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "p_sep_by_space",
+                        pyre_object::w_int_new(127),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "int_curr_symbol",
+                        pyre_object::w_str_new(""),
+                    );
+                    pyre_object::w_dict_setitem_str(d, "p_sign_posn", pyre_object::w_int_new(127));
+                    pyre_object::w_dict_setitem_str(d, "thousands_sep", pyre_object::w_str_new(""));
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "mon_thousands_sep",
+                        pyre_object::w_str_new(""),
+                    );
+                    pyre_object::w_dict_setitem_str(d, "frac_digits", pyre_object::w_int_new(127));
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "mon_decimal_point",
+                        pyre_object::w_str_new(""),
+                    );
+                    pyre_object::w_dict_setitem_str(
+                        d,
+                        "int_frac_digits",
+                        pyre_object::w_int_new(127),
+                    );
+                }
+                Ok(d)
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -793,36 +904,50 @@ fn init_locale(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "nl_langinfo",
-        crate::make_builtin_function_with_arity("nl_langinfo", |_| Ok(pyre_object::w_str_new("")), 1),
+        crate::make_builtin_function_with_arity(
+            "nl_langinfo",
+            |_| Ok(pyre_object::w_str_new("")),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "strcoll",
-        crate::make_builtin_function_with_arity("strcoll", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_int_new(0));
-            }
-            unsafe {
-                if pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) {
-                    let a = pyre_object::w_str_get_value(args[0]);
-                    let b = pyre_object::w_str_get_value(args[1]);
-                    return Ok(pyre_object::w_int_new(a.cmp(b) as i64));
+        crate::make_builtin_function_with_arity(
+            "strcoll",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_int_new(0));
                 }
-            }
-            Ok(pyre_object::w_int_new(0))
-        }, 2),
+                unsafe {
+                    if pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) {
+                        let a = pyre_object::w_str_get_value(args[0]);
+                        let b = pyre_object::w_str_get_value(args[1]);
+                        return Ok(pyre_object::w_int_new(a.cmp(b) as i64));
+                    }
+                }
+                Ok(pyre_object::w_int_new(0))
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "strxfrm",
-        crate::make_builtin_function_with_arity("strxfrm", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_str_new("")))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "strxfrm",
+            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_str_new(""))),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "getencoding",
-        crate::make_builtin_function_with_arity("getencoding", |_| Ok(pyre_object::w_str_new("utf-8")), 0),
+        crate::make_builtin_function_with_arity(
+            "getencoding",
+            |_| Ok(pyre_object::w_str_new("utf-8")),
+            0,
+        ),
     );
 }
 
@@ -909,66 +1034,78 @@ fn init_pwd(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "getpwuid",
-        crate::make_builtin_function_with_arity("getpwuid", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("getpwuid() missing argument"));
-            }
-            #[cfg(unix)]
-            unsafe {
-                if !pyre_object::is_int(args[0]) {
-                    return Err(crate::PyError::type_error(
-                        "getpwuid(): uid should be an integer",
-                    ));
+        crate::make_builtin_function_with_arity(
+            "getpwuid",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("getpwuid() missing argument"));
                 }
-                let uid = pyre_object::w_int_get_value(args[0]) as u32;
-                let pw = getpwuid(uid);
-                if pw.is_null() {
-                    return Err(crate::PyError::key_error(format!(
-                        "getpwuid(): uid not found: {}",
-                        uid
-                    )));
+                #[cfg(unix)]
+                unsafe {
+                    if !pyre_object::is_int(args[0]) {
+                        return Err(crate::PyError::type_error(
+                            "getpwuid(): uid should be an integer",
+                        ));
+                    }
+                    let uid = pyre_object::w_int_get_value(args[0]) as u32;
+                    let pw = getpwuid(uid);
+                    if pw.is_null() {
+                        return Err(crate::PyError::key_error(format!(
+                            "getpwuid(): uid not found: {}",
+                            uid
+                        )));
+                    }
+                    return Ok(make_struct_passwd(pw));
                 }
-                return Ok(make_struct_passwd(pw));
-            }
-            #[cfg(not(unix))]
-            Err(crate::PyError::key_error("getpwuid(): uid not found"))
-        }, 1),
+                #[cfg(not(unix))]
+                Err(crate::PyError::key_error("getpwuid(): uid not found"))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "getpwnam",
-        crate::make_builtin_function_with_arity("getpwnam", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("getpwnam() missing argument"));
-            }
-            #[cfg(unix)]
-            unsafe {
-                if !pyre_object::is_str(args[0]) {
-                    return Err(crate::PyError::type_error(
-                        "getpwnam(): name should be a string",
-                    ));
+        crate::make_builtin_function_with_arity(
+            "getpwnam",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("getpwnam() missing argument"));
                 }
-                let name = pyre_object::w_str_get_value(args[0]);
-                let cname = std::ffi::CString::new(name).map_err(|_| {
-                    crate::PyError::value_error("getpwnam(): embedded null character in name")
-                })?;
-                let pw = getpwnam(cname.as_ptr());
-                if pw.is_null() {
-                    return Err(crate::PyError::key_error(format!(
-                        "getpwnam(): name not found: {}",
-                        name
-                    )));
+                #[cfg(unix)]
+                unsafe {
+                    if !pyre_object::is_str(args[0]) {
+                        return Err(crate::PyError::type_error(
+                            "getpwnam(): name should be a string",
+                        ));
+                    }
+                    let name = pyre_object::w_str_get_value(args[0]);
+                    let cname = std::ffi::CString::new(name).map_err(|_| {
+                        crate::PyError::value_error("getpwnam(): embedded null character in name")
+                    })?;
+                    let pw = getpwnam(cname.as_ptr());
+                    if pw.is_null() {
+                        return Err(crate::PyError::key_error(format!(
+                            "getpwnam(): name not found: {}",
+                            name
+                        )));
+                    }
+                    return Ok(make_struct_passwd(pw));
                 }
-                return Ok(make_struct_passwd(pw));
-            }
-            #[cfg(not(unix))]
-            Err(crate::PyError::key_error("getpwnam(): name not found"))
-        }, 1),
+                #[cfg(not(unix))]
+                Err(crate::PyError::key_error("getpwnam(): name not found"))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "getpwall",
-        crate::make_builtin_function_with_arity("getpwall", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function_with_arity(
+            "getpwall",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
     );
 }
 
@@ -1002,7 +1139,11 @@ fn init_atexit(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_ncallbacks",
-        crate::make_builtin_function_with_arity("_ncallbacks", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity(
+            "_ncallbacks",
+            |_| Ok(pyre_object::w_int_new(0)),
+            0,
+        ),
     );
 }
 
@@ -1025,12 +1166,16 @@ fn init_signal_stub(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "default_int_handler",
-        crate::make_builtin_function_with_arity("default_int_handler", |_| Ok(pyre_object::w_none()), 2),
+        crate::make_builtin_function_with_arity(
+            "default_int_handler",
+            |_| Ok(pyre_object::w_none()),
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "set_wakeup_fd",
-        crate::make_builtin_function_with_arity("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1)), 1),
+        crate::make_builtin_function("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1))),
     );
     crate::dict_storage_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::dict_storage_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
@@ -1068,7 +1213,11 @@ fn init_itertools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "starmap",
-        crate::make_builtin_function_with_arity("starmap", |_| Ok(pyre_object::w_list_new(vec![])), 2),
+        crate::make_builtin_function_with_arity(
+            "starmap",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            2,
+        ),
     );
     // count(start=0, step=1) — PyPy: W_Count___new__
     //
@@ -1178,39 +1327,43 @@ fn init_itertools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "combinations",
-        crate::make_builtin_function_with_arity("combinations", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_list_new(vec![]));
-            }
-            let pool = crate::builtins::collect_iterable(args[0])?;
-            let r = unsafe { pyre_object::w_int_get_value(args[1]) as usize };
-            if r > pool.len() {
-                return Ok(pyre_object::w_list_new(vec![]));
-            }
-            fn combs(
-                pool: &[pyre_object::PyObjectRef],
-                r: usize,
-                start: usize,
-            ) -> Vec<Vec<pyre_object::PyObjectRef>> {
-                if r == 0 {
-                    return vec![vec![]];
+        crate::make_builtin_function_with_arity(
+            "combinations",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_list_new(vec![]));
                 }
-                let mut out = Vec::new();
-                for i in start..pool.len() {
-                    for mut tail in combs(pool, r - 1, i + 1) {
-                        let mut v = vec![pool[i]];
-                        v.append(&mut tail);
-                        out.push(v);
+                let pool = crate::builtins::collect_iterable(args[0])?;
+                let r = unsafe { pyre_object::w_int_get_value(args[1]) as usize };
+                if r > pool.len() {
+                    return Ok(pyre_object::w_list_new(vec![]));
+                }
+                fn combs(
+                    pool: &[pyre_object::PyObjectRef],
+                    r: usize,
+                    start: usize,
+                ) -> Vec<Vec<pyre_object::PyObjectRef>> {
+                    if r == 0 {
+                        return vec![vec![]];
                     }
+                    let mut out = Vec::new();
+                    for i in start..pool.len() {
+                        for mut tail in combs(pool, r - 1, i + 1) {
+                            let mut v = vec![pool[i]];
+                            v.append(&mut tail);
+                            out.push(v);
+                        }
+                    }
+                    out
                 }
-                out
-            }
-            let all = combs(&pool, r, 0);
-            let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
-            let n = tuples.len();
-            let list = pyre_object::w_list_new(tuples);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        }, 2),
+                let all = combs(&pool, r, 0);
+                let tuples: Vec<_> = all.into_iter().map(pyre_object::w_tuple_new).collect();
+                let n = tuples.len();
+                let list = pyre_object::w_list_new(tuples);
+                Ok(pyre_object::w_seq_iter_new(list, n))
+            },
+            2,
+        ),
     );
     // product(*iterables, repeat=1)
     crate::dict_storage_store(
@@ -1290,22 +1443,26 @@ fn init_itertools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "compress",
-        crate::make_builtin_function_with_arity("compress", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_list_new(vec![]));
-            }
-            let data = crate::builtins::collect_iterable(args[0])?;
-            let selectors = crate::builtins::collect_iterable(args[1])?;
-            let mut out = Vec::new();
-            for (d, s) in data.iter().zip(selectors.iter()) {
-                if crate::baseobjspace::is_true(*s) {
-                    out.push(*d);
+        crate::make_builtin_function_with_arity(
+            "compress",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_list_new(vec![]));
                 }
-            }
-            let n = out.len();
-            let list = pyre_object::w_list_new(out);
-            Ok(pyre_object::w_seq_iter_new(list, n))
-        }, 2),
+                let data = crate::builtins::collect_iterable(args[0])?;
+                let selectors = crate::builtins::collect_iterable(args[1])?;
+                let mut out = Vec::new();
+                for (d, s) in data.iter().zip(selectors.iter()) {
+                    if crate::baseobjspace::is_true(*s) {
+                        out.push(*d);
+                    }
+                }
+                let n = out.len();
+                let list = pyre_object::w_list_new(out);
+                Ok(pyre_object::w_seq_iter_new(list, n))
+            },
+            2,
+        ),
     );
 }
 
@@ -1364,7 +1521,11 @@ fn init_abc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "get_cache_token",
-        crate::make_builtin_function_with_arity("get_cache_token", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity(
+            "get_cache_token",
+            |_| Ok(pyre_object::w_int_new(0)),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -1387,57 +1548,73 @@ fn init_abc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_abc_instancecheck",
-        crate::make_builtin_function_with_arity("_abc_instancecheck", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-            let cls = args[0];
-            let instance = args[1];
-            unsafe {
-                Ok(pyre_object::w_bool_from(crate::baseobjspace::isinstance_w(
-                    instance, cls,
-                )))
-            }
-        }, 2),
+        crate::make_builtin_function_with_arity(
+            "_abc_instancecheck",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                let cls = args[0];
+                let instance = args[1];
+                unsafe {
+                    Ok(pyre_object::w_bool_from(crate::baseobjspace::isinstance_w(
+                        instance, cls,
+                    )))
+                }
+            },
+            2,
+        ),
     );
     // _abc_subclasscheck(cls, subclass) — CPython: Modules/_abc.c _abc__abc_subclasscheck.
     crate::dict_storage_store(
         ns,
         "_abc_subclasscheck",
-        crate::make_builtin_function_with_arity("_abc_subclasscheck", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-            let cls = args[0];
-            let subclass = args[1];
-            unsafe {
-                // Walk subclass.__mro__ looking for cls.
-                let mro_ptr = pyre_object::w_type_get_mro(subclass);
-                if !mro_ptr.is_null() {
-                    for &t in &*mro_ptr {
-                        if std::ptr::eq(t, cls) {
-                            return Ok(pyre_object::w_bool_from(true));
+        crate::make_builtin_function_with_arity(
+            "_abc_subclasscheck",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                let cls = args[0];
+                let subclass = args[1];
+                unsafe {
+                    // Walk subclass.__mro__ looking for cls.
+                    let mro_ptr = pyre_object::w_type_get_mro(subclass);
+                    if !mro_ptr.is_null() {
+                        for &t in &*mro_ptr {
+                            if std::ptr::eq(t, cls) {
+                                return Ok(pyre_object::w_bool_from(true));
+                            }
                         }
                     }
                 }
-            }
-            Ok(pyre_object::w_bool_from(false))
-        }, 2),
+                Ok(pyre_object::w_bool_from(false))
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "_get_dump",
-        crate::make_builtin_function_with_arity("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![])), 1),
+        crate::make_builtin_function_with_arity(
+            "_get_dump",
+            |_| Ok(pyre_object::w_tuple_new(vec![])),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "_reset_registry",
-        crate::make_builtin_function_with_arity("_reset_registry", |_| Ok(pyre_object::w_none()), 1),
+        crate::make_builtin_function_with_arity(
+            "_reset_registry",
+            |_| Ok(pyre_object::w_none()),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "_reset_caches",
-        crate::make_builtin_function_with_arity("_reset_caches", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("_reset_caches", |_| Ok(pyre_object::w_none()), 1),
     );
 }
 
@@ -1457,11 +1634,17 @@ fn init_functools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "cmp_to_key",
-        crate::make_builtin_function_with_arity("cmp_to_key", |_args| {
-            Ok(crate::make_builtin_function_with_arity("cmp_to_key.K", |args| {
-                Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
-            }, 1))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "cmp_to_key",
+            |_args| {
+                Ok(crate::make_builtin_function_with_arity(
+                    "cmp_to_key.K",
+                    |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
+                    1,
+                ))
+            },
+            1,
+        ),
     );
 }
 
@@ -1474,12 +1657,16 @@ fn init_lock_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "__enter__",
-        crate::make_builtin_function_with_arity("__enter__", |args| {
-            if let Some(&obj) = args.first() {
-                lock_acquire_impl(obj)?;
-            }
-            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "__enter__",
+            |args| {
+                if let Some(&obj) = args.first() {
+                    lock_acquire_impl(obj)?;
+                }
+                Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -1505,40 +1692,56 @@ fn init_lock_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "release",
-        crate::make_builtin_function_with_arity("release", |args| {
-            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            lock_release_impl(obj)?;
-            Ok(pyre_object::w_none())
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "release",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                lock_release_impl(obj)?;
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
     // descr_lock_locked — PyPy: os_lock.Lock.descr_lock_locked
     crate::dict_storage_store(
         ns,
         "locked",
-        crate::make_builtin_function_with_arity("locked", |args| {
-            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            Ok(pyre_object::w_bool_from(lock_count(obj) > 0))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "locked",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(pyre_object::w_bool_from(lock_count(obj) > 0))
+            },
+            1,
+        ),
     );
     // _is_owned — used by RLock/Condition in threading.py
     crate::dict_storage_store(
         ns,
         "_is_owned",
-        crate::make_builtin_function_with_arity("_is_owned", |args| {
-            let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            Ok(pyre_object::w_bool_from(lock_count(obj) > 0))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "_is_owned",
+            |args| {
+                let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                Ok(pyre_object::w_bool_from(lock_count(obj) > 0))
+            },
+            1,
+        ),
     );
     // _at_fork_reinit — PyPy: os_lock.Lock._at_fork_reinit (reset to unlocked)
     crate::dict_storage_store(
         ns,
         "_at_fork_reinit",
-        crate::make_builtin_function_with_arity("_at_fork_reinit", |args| {
-            if let Some(&obj) = args.first() {
-                lock_set_count(obj, 0);
-            }
-            Ok(pyre_object::w_none())
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "_at_fork_reinit",
+            |args| {
+                if let Some(&obj) = args.first() {
+                    lock_set_count(obj, 0);
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
 }
 
@@ -1605,7 +1808,11 @@ fn thread_handle_type() -> PyObjectRef {
                 crate::dict_storage_store(
                     ns,
                     "is_done",
-                    crate::make_builtin_function_with_arity("is_done", |_| Ok(pyre_object::w_bool_from(true)), 1),
+                    crate::make_builtin_function_with_arity(
+                        "is_done",
+                        |_| Ok(pyre_object::w_bool_from(true)),
+                        1,
+                    ),
                 );
                 crate::dict_storage_store(
                     ns,
@@ -1615,12 +1822,20 @@ fn thread_handle_type() -> PyObjectRef {
                 crate::dict_storage_store(
                     ns,
                     "set_result",
-                    crate::make_builtin_function_with_arity("set_result", |_| Ok(pyre_object::w_none()), 2),
+                    crate::make_builtin_function_with_arity(
+                        "set_result",
+                        |_| Ok(pyre_object::w_none()),
+                        2,
+                    ),
                 );
                 crate::dict_storage_store(
                     ns,
                     "_set_done",
-                    crate::make_builtin_function_with_arity("_set_done", |_| Ok(pyre_object::w_none()), 1),
+                    crate::make_builtin_function_with_arity(
+                        "_set_done",
+                        |_| Ok(pyre_object::w_none()),
+                        1,
+                    ),
                 );
             })
         })
@@ -1634,14 +1849,20 @@ fn init_thread(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "RLock",
-        crate::make_builtin_function_with_arity("RLock", |_| Ok(pyre_object::w_instance_new(lock_type())), 0),
+        crate::make_builtin_function_with_arity(
+            "RLock",
+            |_| Ok(pyre_object::w_instance_new(lock_type())),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "allocate_lock",
-        crate::make_builtin_function_with_arity("allocate_lock", |_| {
-            Ok(pyre_object::w_instance_new(lock_type()))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "allocate_lock",
+            |_| Ok(pyre_object::w_instance_new(lock_type())),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -1663,28 +1884,34 @@ fn init_thread(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_set_sentinel",
-        crate::make_builtin_function_with_arity("_set_sentinel", |_| {
-            Ok(pyre_object::w_instance_new(lock_type()))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "_set_sentinel",
+            |_| Ok(pyre_object::w_instance_new(lock_type())),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "stack_size",
-        crate::make_builtin_function_with_arity("stack_size", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity("stack_size", |_| Ok(pyre_object::w_int_new(0)), 1),
     );
     crate::dict_storage_store(
         ns,
         "_is_main_interpreter",
-        crate::make_builtin_function_with_arity("_is_main_interpreter", |_| {
-            Ok(pyre_object::w_bool_from(true))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "_is_main_interpreter",
+            |_| Ok(pyre_object::w_bool_from(true)),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "daemon_threads_allowed",
-        crate::make_builtin_function_with_arity("daemon_threads_allowed", |_| {
-            Ok(pyre_object::w_bool_from(true))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "daemon_threads_allowed",
+            |_| Ok(pyre_object::w_bool_from(true)),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -1696,21 +1923,31 @@ fn init_thread(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_make_thread_handle",
-        crate::make_builtin_function_with_arity("_make_thread_handle", |_| {
-            Ok(pyre_object::w_instance_new(thread_handle_type()))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "_make_thread_handle",
+            |_| Ok(pyre_object::w_instance_new(thread_handle_type())),
+            1,
+        ),
     );
     // _get_main_thread_ident — threading.py:43
     crate::dict_storage_store(
         ns,
         "_get_main_thread_ident",
-        crate::make_builtin_function_with_arity("_get_main_thread_ident", |_| Ok(pyre_object::w_int_new(1)), 0),
+        crate::make_builtin_function_with_arity(
+            "_get_main_thread_ident",
+            |_| Ok(pyre_object::w_int_new(1)),
+            0,
+        ),
     );
     // get_native_id — threading.py:46
     crate::dict_storage_store(
         ns,
         "get_native_id",
-        crate::make_builtin_function_with_arity("get_native_id", |_| Ok(pyre_object::w_int_new(1)), 0),
+        crate::make_builtin_function_with_arity(
+            "get_native_id",
+            |_| Ok(pyre_object::w_int_new(1)),
+            0,
+        ),
     );
     // set_name — threading.py:52
     crate::dict_storage_store(
@@ -2087,85 +2324,102 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "close",
-        crate::make_builtin_function_with_arity("close", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("close() requires 1 argument"));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-            let ret = unsafe { libc::close(fd) };
-            if ret < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
-            }
-            Ok(pyre_object::w_none())
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "close",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("close() requires 1 argument"));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let ret = unsafe { libc::close(fd) };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
 
     // ── posix.read(fd, n) → bytes ──
     crate::dict_storage_store(
         ns,
         "read",
-        crate::make_builtin_function_with_arity("read", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("read() requires 2 arguments"));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-            let n = unsafe { pyre_object::w_int_get_value(args[1]) } as usize;
-            let mut buf = vec![0u8; n];
-            let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) };
-            if ret < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
-            }
-            buf.truncate(ret as usize);
-            Ok(pyre_object::w_bytes_from_bytes(&buf))
-        }, 2),
+        crate::make_builtin_function_with_arity(
+            "read",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("read() requires 2 arguments"));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let n = unsafe { pyre_object::w_int_get_value(args[1]) } as usize;
+                let mut buf = vec![0u8; n];
+                let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _) };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                }
+                buf.truncate(ret as usize);
+                Ok(pyre_object::w_bytes_from_bytes(&buf))
+            },
+            2,
+        ),
     );
 
     // ── posix.write(fd, data) → nbytes ──
     crate::dict_storage_store(
         ns,
         "write",
-        crate::make_builtin_function_with_arity("write", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("write() requires 2 arguments"));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-            let data = unsafe {
-                if pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
-                } else if pyre_object::is_str(args[1]) {
-                    pyre_object::w_str_get_value(args[1]).as_bytes().to_vec()
-                } else {
-                    return Err(crate::PyError::type_error(
-                        "write() arg 2 must be bytes-like",
-                    ));
+        crate::make_builtin_function_with_arity(
+            "write",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("write() requires 2 arguments"));
                 }
-            };
-            let ret =
-                unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _) };
-            if ret < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
-            }
-            Ok(pyre_object::w_int_new(ret as i64))
-        }, 2),
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let data = unsafe {
+                    if pyre_object::bytesobject::is_bytes_like(args[1]) {
+                        pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
+                    } else if pyre_object::is_str(args[1]) {
+                        pyre_object::w_str_get_value(args[1]).as_bytes().to_vec()
+                    } else {
+                        return Err(crate::PyError::type_error(
+                            "write() arg 2 must be bytes-like",
+                        ));
+                    }
+                };
+                let ret = unsafe {
+                    libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
+                };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                }
+                Ok(pyre_object::w_int_new(ret as i64))
+            },
+            2,
+        ),
     );
 
     // ── posix.lseek(fd, offset, whence) → position ──
     crate::dict_storage_store(
         ns,
         "lseek",
-        crate::make_builtin_function_with_arity("lseek", |args| {
-            if args.len() < 3 {
-                return Err(crate::PyError::type_error("lseek() requires 3 arguments"));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-            let offset = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::off_t;
-            let whence = unsafe { pyre_object::w_int_get_value(args[2]) } as libc::c_int;
-            let ret = unsafe { libc::lseek(fd, offset, whence) };
-            if ret < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
-            }
-            Ok(pyre_object::w_int_new(ret as i64))
-        }, 3),
+        crate::make_builtin_function_with_arity(
+            "lseek",
+            |args| {
+                if args.len() < 3 {
+                    return Err(crate::PyError::type_error("lseek() requires 3 arguments"));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let offset = unsafe { pyre_object::w_int_get_value(args[1]) } as libc::off_t;
+                let whence = unsafe { pyre_object::w_int_get_value(args[2]) } as libc::c_int;
+                let ret = unsafe { libc::lseek(fd, offset, whence) };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), ""));
+                }
+                Ok(pyre_object::w_int_new(ret as i64))
+            },
+            3,
+        ),
     );
 
     // ── posix.unlink(path) / posix.remove(path) ──
@@ -2226,34 +2480,42 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "rmdir",
-        crate::make_builtin_function_with_arity("rmdir", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("rmdir() requires 1 argument"));
-            }
-            let path = extract_path(args[0])?;
-            let c_path = std::ffi::CString::new(path.as_bytes())
-                .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-            let ret = unsafe { libc::rmdir(c_path.as_ptr()) };
-            if ret < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), &path));
-            }
-            Ok(pyre_object::w_none())
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "rmdir",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("rmdir() requires 1 argument"));
+                }
+                let path = extract_path(args[0])?;
+                let c_path = std::ffi::CString::new(path.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                let ret = unsafe { libc::rmdir(c_path.as_ptr()) };
+                if ret < 0 {
+                    return Err(io_err(std::io::Error::last_os_error(), &path));
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
 
     // ── posix.rename(src, dst) ──
     crate::dict_storage_store(
         ns,
         "rename",
-        crate::make_builtin_function_with_arity("rename", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("rename() requires 2 arguments"));
-            }
-            let src = extract_path(args[0])?;
-            let dst = extract_path(args[1])?;
-            std::fs::rename(&src, &dst).map_err(|e| io_err(e, &src))?;
-            Ok(pyre_object::w_none())
-        }, 2),
+        crate::make_builtin_function_with_arity(
+            "rename",
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error("rename() requires 2 arguments"));
+                }
+                let src = extract_path(args[0])?;
+                let dst = extract_path(args[1])?;
+                std::fs::rename(&src, &dst).map_err(|e| io_err(e, &src))?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
 
     // ── posix.listdir(path=".") → list of str ──
@@ -2281,36 +2543,44 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "isatty",
-        crate::make_builtin_function_with_arity("isatty", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_bool_from(false));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
-            let ret = unsafe { libc::isatty(fd) };
-            Ok(pyre_object::w_bool_from(ret != 0))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "isatty",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_int;
+                let ret = unsafe { libc::isatty(fd) };
+                Ok(pyre_object::w_bool_from(ret != 0))
+            },
+            1,
+        ),
     );
 
     // ── posix.urandom(n) → bytes ──
     crate::dict_storage_store(
         ns,
         "urandom",
-        crate::make_builtin_function_with_arity("urandom", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("urandom() requires 1 argument"));
-            }
-            let n = unsafe { pyre_object::w_int_get_value(args[0]) } as usize;
-            let mut buf = vec![0u8; n];
-            // Use /dev/urandom on Unix
-            #[cfg(unix)]
-            {
-                use std::io::Read;
-                if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-                    let _ = f.read_exact(&mut buf);
+        crate::make_builtin_function_with_arity(
+            "urandom",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("urandom() requires 1 argument"));
                 }
-            }
-            Ok(pyre_object::w_bytes_from_bytes(&buf))
-        }, 1),
+                let n = unsafe { pyre_object::w_int_get_value(args[0]) } as usize;
+                let mut buf = vec![0u8; n];
+                // Use /dev/urandom on Unix
+                #[cfg(unix)]
+                {
+                    use std::io::Read;
+                    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                        let _ = f.read_exact(&mut buf);
+                    }
+                }
+                Ok(pyre_object::w_bytes_from_bytes(&buf))
+            },
+            1,
+        ),
     );
     // os.terminal_size — namedtuple-like type with columns/lines.
     // Uses stat_result_type (hasdict instance) so setattr works.
@@ -2353,33 +2623,39 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "get_terminal_size",
-        crate::make_builtin_function_with_arity("get_terminal_size", |_args| {
-            let (cols, rows) = {
-                #[cfg(unix)]
-                {
-                    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                    let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
-                    if ret == 0 && ws.ws_col > 0 {
-                        (ws.ws_col as i64, ws.ws_row as i64)
-                    } else {
+        crate::make_builtin_function_with_arity(
+            "get_terminal_size",
+            |_args| {
+                let (cols, rows) = {
+                    #[cfg(unix)]
+                    {
+                        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                        let ret = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+                        if ret == 0 && ws.ws_col > 0 {
+                            (ws.ws_col as i64, ws.ws_row as i64)
+                        } else {
+                            (80, 24)
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
                         (80, 24)
                     }
-                }
-                #[cfg(not(unix))]
-                {
-                    (80, 24)
-                }
-            };
-            let result = pyre_object::w_tuple_new(vec![
-                pyre_object::w_int_new(cols),
-                pyre_object::w_int_new(rows),
-            ]);
-            let wrapper = pyre_object::w_instance_new(stat_result_type());
-            let _ = crate::baseobjspace::setattr(wrapper, "columns", pyre_object::w_int_new(cols));
-            let _ = crate::baseobjspace::setattr(wrapper, "lines", pyre_object::w_int_new(rows));
-            let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", result);
-            Ok(wrapper)
-        }, 0),
+                };
+                let result = pyre_object::w_tuple_new(vec![
+                    pyre_object::w_int_new(cols),
+                    pyre_object::w_int_new(rows),
+                ]);
+                let wrapper = pyre_object::w_instance_new(stat_result_type());
+                let _ =
+                    crate::baseobjspace::setattr(wrapper, "columns", pyre_object::w_int_new(cols));
+                let _ =
+                    crate::baseobjspace::setattr(wrapper, "lines", pyre_object::w_int_new(rows));
+                let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", result);
+                Ok(wrapper)
+            },
+            0,
+        ),
     );
     // os.fspath() — PyPy: posixmodule.c posix_fspath. Returns the argument
     // unchanged for str/bytes/bytearray (the protocol's identity case);
@@ -2388,22 +2664,26 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "fspath",
-        crate::make_builtin_function_with_arity("fspath", |args| {
-            let arg = args.first().copied().unwrap_or(pyre_object::w_none());
-            unsafe {
-                if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes_like(arg) {
-                    return Ok(arg);
+        crate::make_builtin_function_with_arity(
+            "fspath",
+            |args| {
+                let arg = args.first().copied().unwrap_or(pyre_object::w_none());
+                unsafe {
+                    if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes_like(arg) {
+                        return Ok(arg);
+                    }
                 }
-            }
-            // Try __fspath__ — for pathlib.Path-like objects.
-            if let Ok(method) = crate::baseobjspace::getattr(arg, "__fspath__") {
-                let result = crate::call_function(method, &[arg]);
-                if !result.is_null() {
-                    return Ok(result);
+                // Try __fspath__ — for pathlib.Path-like objects.
+                if let Ok(method) = crate::baseobjspace::getattr(arg, "__fspath__") {
+                    let result = crate::call_function(method, &[arg]);
+                    if !result.is_null() {
+                        return Ok(result);
+                    }
                 }
-            }
-            Ok(arg)
-        }, 1),
+                Ok(arg)
+            },
+            1,
+        ),
     );
     // os.stat / os.lstat / os.fstat — return stat_result structseq.
     // PyPy: posixmodule.c posix_do_stat → build_stat_result.
@@ -2603,19 +2883,32 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "uname",
-        crate::make_builtin_function_with_arity("uname", |_| {
-            let wrapper = pyre_object::w_instance_new(stat_result_type());
-            let sysname = std::env::consts::OS.to_string();
-            let machine = std::env::consts::ARCH.to_string();
-            let _ =
-                crate::baseobjspace::setattr(wrapper, "sysname", pyre_object::w_str_new(&sysname));
-            let _ = crate::baseobjspace::setattr(wrapper, "nodename", pyre_object::w_str_new(""));
-            let _ = crate::baseobjspace::setattr(wrapper, "release", pyre_object::w_str_new(""));
-            let _ = crate::baseobjspace::setattr(wrapper, "version", pyre_object::w_str_new(""));
-            let _ =
-                crate::baseobjspace::setattr(wrapper, "machine", pyre_object::w_str_new(&machine));
-            Ok(wrapper)
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "uname",
+            |_| {
+                let wrapper = pyre_object::w_instance_new(stat_result_type());
+                let sysname = std::env::consts::OS.to_string();
+                let machine = std::env::consts::ARCH.to_string();
+                let _ = crate::baseobjspace::setattr(
+                    wrapper,
+                    "sysname",
+                    pyre_object::w_str_new(&sysname),
+                );
+                let _ =
+                    crate::baseobjspace::setattr(wrapper, "nodename", pyre_object::w_str_new(""));
+                let _ =
+                    crate::baseobjspace::setattr(wrapper, "release", pyre_object::w_str_new(""));
+                let _ =
+                    crate::baseobjspace::setattr(wrapper, "version", pyre_object::w_str_new(""));
+                let _ = crate::baseobjspace::setattr(
+                    wrapper,
+                    "machine",
+                    pyre_object::w_str_new(&machine),
+                );
+                Ok(wrapper)
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -2630,31 +2923,35 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "fstat",
-        crate::make_builtin_function_with_arity("fstat", |args| {
-            if args.is_empty() {
-                return Err(crate::PyError::type_error("fstat() missing argument"));
-            }
-            let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::FromRawFd;
-                let f = unsafe { std::fs::File::from_raw_fd(fd) };
-                let meta = f.metadata();
-                let _ = std::mem::ManuallyDrop::new(f); // don't close
-                match meta {
-                    Ok(m) => Ok(make_stat_result(&m)),
-                    Err(e) => Err(crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(9),
-                        format!("{}", e),
-                    )),
+        crate::make_builtin_function_with_arity(
+            "fstat",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("fstat() missing argument"));
                 }
-            }
-            #[cfg(not(unix))]
-            Err(crate::PyError::os_error_with_errno(
-                9,
-                "fstat unsupported".to_string(),
-            ))
-        }, 1),
+                let fd = unsafe { pyre_object::w_int_get_value(args[0]) } as i32;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::FromRawFd;
+                    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+                    let meta = f.metadata();
+                    let _ = std::mem::ManuallyDrop::new(f); // don't close
+                    match meta {
+                        Ok(m) => Ok(make_stat_result(&m)),
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(9),
+                            format!("{}", e),
+                        )),
+                    }
+                }
+                #[cfg(not(unix))]
+                Err(crate::PyError::os_error_with_errno(
+                    9,
+                    "fstat unsupported".to_string(),
+                ))
+            },
+            1,
+        ),
     );
     // stat_result type — simple instance with hasdict so setattr works.
     // Exported so that `posix.stat_result` can be looked up.
@@ -2663,31 +2960,39 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "getcwd",
-        crate::make_builtin_function_with_arity("getcwd", |_| {
-            #[cfg(feature = "host_env")]
-            {
-                if let Ok(cwd) = std::env::current_dir() {
-                    return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
+        crate::make_builtin_function_with_arity(
+            "getcwd",
+            |_| {
+                #[cfg(feature = "host_env")]
+                {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        return Ok(pyre_object::w_str_new(&cwd.to_string_lossy()));
+                    }
                 }
-            }
-            Ok(pyre_object::w_str_new(""))
-        }, 0),
+                Ok(pyre_object::w_str_new(""))
+            },
+            0,
+        ),
     );
     // os.getcwdb() — bytes form of getcwd.
     crate::dict_storage_store(
         ns,
         "getcwdb",
-        crate::make_builtin_function_with_arity("getcwdb", |_| {
-            #[cfg(feature = "host_env")]
-            {
-                if let Ok(cwd) = std::env::current_dir() {
-                    return Ok(pyre_object::w_bytes_from_bytes(
-                        cwd.as_os_str().as_encoded_bytes(),
-                    ));
+        crate::make_builtin_function_with_arity(
+            "getcwdb",
+            |_| {
+                #[cfg(feature = "host_env")]
+                {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        return Ok(pyre_object::w_bytes_from_bytes(
+                            cwd.as_os_str().as_encoded_bytes(),
+                        ));
+                    }
                 }
-            }
-            Ok(pyre_object::w_bytes_from_bytes(b""))
-        }, 0),
+                Ok(pyre_object::w_bytes_from_bytes(b""))
+            },
+            0,
+        ),
     );
     // os.getuid / geteuid / getgid / getegid — real syscalls.
     #[cfg(unix)]
@@ -2700,58 +3005,76 @@ fn init_posix(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "getuid",
-        crate::make_builtin_function_with_arity("getuid", |_| {
-            #[cfg(unix)]
-            unsafe {
-                return Ok(pyre_object::w_int_new(getuid() as i64));
-            }
-            #[cfg(not(unix))]
-            Ok(pyre_object::w_int_new(0))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "getuid",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    return Ok(pyre_object::w_int_new(getuid() as i64));
+                }
+                #[cfg(not(unix))]
+                Ok(pyre_object::w_int_new(0))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "geteuid",
-        crate::make_builtin_function_with_arity("geteuid", |_| {
-            #[cfg(unix)]
-            unsafe {
-                return Ok(pyre_object::w_int_new(geteuid() as i64));
-            }
-            #[cfg(not(unix))]
-            Ok(pyre_object::w_int_new(0))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "geteuid",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    return Ok(pyre_object::w_int_new(geteuid() as i64));
+                }
+                #[cfg(not(unix))]
+                Ok(pyre_object::w_int_new(0))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "getgid",
-        crate::make_builtin_function_with_arity("getgid", |_| {
-            #[cfg(unix)]
-            unsafe {
-                return Ok(pyre_object::w_int_new(getgid() as i64));
-            }
-            #[cfg(not(unix))]
-            Ok(pyre_object::w_int_new(0))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "getgid",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    return Ok(pyre_object::w_int_new(getgid() as i64));
+                }
+                #[cfg(not(unix))]
+                Ok(pyre_object::w_int_new(0))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "getegid",
-        crate::make_builtin_function_with_arity("getegid", |_| {
-            #[cfg(unix)]
-            unsafe {
-                return Ok(pyre_object::w_int_new(getegid() as i64));
-            }
-            #[cfg(not(unix))]
-            Ok(pyre_object::w_int_new(0))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "getegid",
+            |_| {
+                #[cfg(unix)]
+                unsafe {
+                    return Ok(pyre_object::w_int_new(getegid() as i64));
+                }
+                #[cfg(not(unix))]
+                Ok(pyre_object::w_int_new(0))
+            },
+            0,
+        ),
     );
     // os.getpid — std::process::id.
     crate::dict_storage_store(
         ns,
         "getpid",
-        crate::make_builtin_function_with_arity("getpid", |_| {
-            Ok(pyre_object::w_int_new(std::process::id() as i64))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "getpid",
+            |_| Ok(pyre_object::w_int_new(std::process::id() as i64)),
+            0,
+        ),
     );
     // os.environ lookups from setenv / unsetenv / putenv / getenv — mutate
     // posix.environ (the dict) rather than calling libc; os.py writes back
@@ -2837,160 +3160,196 @@ fn init_deque_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "append",
-        crate::make_builtin_function_with_arity("append", |args| {
-            if args.len() >= 2 {
-                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                    unsafe { pyre_object::w_list_append(data, args[1]) };
+        crate::make_builtin_function_with_arity(
+            "append",
+            |args| {
+                if args.len() >= 2 {
+                    if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                        unsafe { pyre_object::w_list_append(data, args[1]) };
+                    }
                 }
-            }
-            Ok(pyre_object::w_none())
-        }, 2),
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "appendleft",
-        crate::make_builtin_function_with_arity("appendleft", |args| {
-            if args.len() >= 2 {
-                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                    unsafe {
-                        let n = pyre_object::w_list_len(data);
-                        let mut items: Vec<_> = (0..n)
-                            .filter_map(|i| pyre_object::w_list_getitem(data, i as i64))
-                            .collect();
-                        items.insert(0, args[1]);
-                        let new_list = pyre_object::w_list_new(items);
-                        let _ = crate::baseobjspace::setattr(args[0], "__data__", new_list);
+        crate::make_builtin_function_with_arity(
+            "appendleft",
+            |args| {
+                if args.len() >= 2 {
+                    if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                        unsafe {
+                            let n = pyre_object::w_list_len(data);
+                            let mut items: Vec<_> = (0..n)
+                                .filter_map(|i| pyre_object::w_list_getitem(data, i as i64))
+                                .collect();
+                            items.insert(0, args[1]);
+                            let new_list = pyre_object::w_list_new(items);
+                            let _ = crate::baseobjspace::setattr(args[0], "__data__", new_list);
+                        }
                     }
                 }
-            }
-            Ok(pyre_object::w_none())
-        }, 2),
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "pop",
-        crate::make_builtin_function_with_arity("pop", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_none());
-            }
-            if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                unsafe {
-                    let n = pyre_object::w_list_len(data);
-                    if n > 0 {
-                        let item = pyre_object::w_list_getitem(data, (n - 1) as i64)
-                            .unwrap_or(pyre_object::w_none());
-                        let items: Vec<_> = (0..n - 1)
-                            .filter_map(|i| pyre_object::w_list_getitem(data, i as i64))
-                            .collect();
-                        let new_list = pyre_object::w_list_new(items);
-                        let _ = crate::baseobjspace::setattr(args[0], "__data__", new_list);
-                        return Ok(item);
+        crate::make_builtin_function_with_arity(
+            "pop",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_none());
+                }
+                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                    unsafe {
+                        let n = pyre_object::w_list_len(data);
+                        if n > 0 {
+                            let item = pyre_object::w_list_getitem(data, (n - 1) as i64)
+                                .unwrap_or(pyre_object::w_none());
+                            let items: Vec<_> = (0..n - 1)
+                                .filter_map(|i| pyre_object::w_list_getitem(data, i as i64))
+                                .collect();
+                            let new_list = pyre_object::w_list_new(items);
+                            let _ = crate::baseobjspace::setattr(args[0], "__data__", new_list);
+                            return Ok(item);
+                        }
                     }
                 }
-            }
-            Ok(pyre_object::w_none())
-        }, 1),
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "popleft",
-        crate::make_builtin_function_with_arity("popleft", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_none());
-            }
-            if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                unsafe {
-                    let n = pyre_object::w_list_len(data);
-                    if n > 0 {
-                        let item =
-                            pyre_object::w_list_getitem(data, 0).unwrap_or(pyre_object::w_none());
-                        let items: Vec<_> = (1..n)
-                            .filter_map(|i| pyre_object::w_list_getitem(data, i as i64))
-                            .collect();
-                        let new_list = pyre_object::w_list_new(items);
-                        let _ = crate::baseobjspace::setattr(args[0], "__data__", new_list);
-                        return Ok(item);
+        crate::make_builtin_function_with_arity(
+            "popleft",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_none());
+                }
+                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                    unsafe {
+                        let n = pyre_object::w_list_len(data);
+                        if n > 0 {
+                            let item = pyre_object::w_list_getitem(data, 0)
+                                .unwrap_or(pyre_object::w_none());
+                            let items: Vec<_> = (1..n)
+                                .filter_map(|i| pyre_object::w_list_getitem(data, i as i64))
+                                .collect();
+                            let new_list = pyre_object::w_list_new(items);
+                            let _ = crate::baseobjspace::setattr(args[0], "__data__", new_list);
+                            return Ok(item);
+                        }
                     }
                 }
-            }
-            Ok(pyre_object::w_none())
-        }, 1),
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "clear",
-        crate::make_builtin_function_with_arity("clear", |args| {
-            if !args.is_empty() {
-                let _ = crate::baseobjspace::setattr(
-                    args[0],
-                    "__data__",
-                    pyre_object::w_list_new(vec![]),
-                );
-            }
-            Ok(pyre_object::w_none())
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "clear",
+            |args| {
+                if !args.is_empty() {
+                    let _ = crate::baseobjspace::setattr(
+                        args[0],
+                        "__data__",
+                        pyre_object::w_list_new(vec![]),
+                    );
+                }
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "extend",
-        crate::make_builtin_function_with_arity("extend", |args| {
-            if args.len() >= 2 {
-                let items = crate::builtins::collect_iterable(args[1])?;
-                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                    for item in items {
-                        unsafe { pyre_object::w_list_append(data, item) };
+        crate::make_builtin_function_with_arity(
+            "extend",
+            |args| {
+                if args.len() >= 2 {
+                    let items = crate::builtins::collect_iterable(args[1])?;
+                    if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                        for item in items {
+                            unsafe { pyre_object::w_list_append(data, item) };
+                        }
                     }
                 }
-            }
-            Ok(pyre_object::w_none())
-        }, 2),
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "__len__",
-        crate::make_builtin_function_with_arity("__len__", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_int_new(0));
-            }
-            if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                return Ok(pyre_object::w_int_new(
-                    unsafe { pyre_object::w_list_len(data) } as i64,
-                ));
-            }
-            Ok(pyre_object::w_int_new(0))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "__len__",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_int_new(0));
+                }
+                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                    return Ok(pyre_object::w_int_new(
+                        unsafe { pyre_object::w_list_len(data) } as i64,
+                    ));
+                }
+                Ok(pyre_object::w_int_new(0))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "__iter__",
-        crate::make_builtin_function_with_arity("__iter__", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_seq_iter_new(
+        crate::make_builtin_function_with_arity(
+            "__iter__",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_seq_iter_new(
+                        pyre_object::w_list_new(vec![]),
+                        0,
+                    ));
+                }
+                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                    return crate::baseobjspace::iter(data);
+                }
+                Ok(pyre_object::w_seq_iter_new(
                     pyre_object::w_list_new(vec![]),
                     0,
-                ));
-            }
-            if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                return crate::baseobjspace::iter(data);
-            }
-            Ok(pyre_object::w_seq_iter_new(
-                pyre_object::w_list_new(vec![]),
-                0,
-            ))
-        }, 1),
+                ))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function_with_arity("__getitem__", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_none());
-            }
-            if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                return crate::baseobjspace::getitem(data, args[1]);
-            }
-            Ok(pyre_object::w_none())
-        }, 2),
+        crate::make_builtin_function_with_arity(
+            "__getitem__",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_none());
+                }
+                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                    return crate::baseobjspace::getitem(data, args[1]);
+                }
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
 }
 
@@ -3017,42 +3376,50 @@ fn init_defaultdict_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function_with_arity("__getitem__", |args| {
-            if args.len() < 2 {
-                return Ok(pyre_object::w_none());
-            }
-            let self_obj = args[0];
-            let key = args[1];
-            if let Ok(data) = crate::baseobjspace::getattr(self_obj, "__data__") {
-                unsafe {
-                    if let Some(v) = pyre_object::w_dict_lookup(data, key) {
-                        return Ok(v);
+        crate::make_builtin_function_with_arity(
+            "__getitem__",
+            |args| {
+                if args.len() < 2 {
+                    return Ok(pyre_object::w_none());
+                }
+                let self_obj = args[0];
+                let key = args[1];
+                if let Ok(data) = crate::baseobjspace::getattr(self_obj, "__data__") {
+                    unsafe {
+                        if let Some(v) = pyre_object::w_dict_lookup(data, key) {
+                            return Ok(v);
+                        }
+                    }
+                    // Not present — try factory
+                    if let Ok(factory) = crate::baseobjspace::getattr(self_obj, "default_factory") {
+                        if !factory.is_null() && !unsafe { pyre_object::is_none(factory) } {
+                            // Can't easily call factory without frame — return None.
+                            let default = pyre_object::w_none();
+                            unsafe { pyre_object::w_dict_store(data, key, default) };
+                            return Ok(default);
+                        }
                     }
                 }
-                // Not present — try factory
-                if let Ok(factory) = crate::baseobjspace::getattr(self_obj, "default_factory") {
-                    if !factory.is_null() && !unsafe { pyre_object::is_none(factory) } {
-                        // Can't easily call factory without frame — return None.
-                        let default = pyre_object::w_none();
-                        unsafe { pyre_object::w_dict_store(data, key, default) };
-                        return Ok(default);
-                    }
-                }
-            }
-            Ok(pyre_object::w_none())
-        }, 2),
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function_with_arity("__setitem__", |args| {
-            if args.len() >= 3 {
-                if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
-                    unsafe { pyre_object::w_dict_store(data, args[1], args[2]) };
+        crate::make_builtin_function_with_arity(
+            "__setitem__",
+            |args| {
+                if args.len() >= 3 {
+                    if let Ok(data) = crate::baseobjspace::getattr(args[0], "__data__") {
+                        unsafe { pyre_object::w_dict_store(data, args[1], args[2]) };
+                    }
                 }
-            }
-            Ok(pyre_object::w_none())
-        }, 3),
+                Ok(pyre_object::w_none())
+            },
+            3,
+        ),
     );
 }
 
@@ -3064,7 +3431,11 @@ fn init_opcode_c(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "stack_effect",
-        crate::make_builtin_function_with_arity("stack_effect", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity(
+            "stack_effect",
+            |_| Ok(pyre_object::w_int_new(0)),
+            3,
+        ),
     );
     for name in [
         "has_arg",
@@ -3080,7 +3451,11 @@ fn init_opcode_c(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             name,
-            crate::make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_bool_from(false)), 0),
+            crate::make_builtin_function_with_arity(
+                name,
+                |_| Ok(pyre_object::w_bool_from(false)),
+                0,
+            ),
         );
     }
     crate::dict_storage_store(
@@ -3100,54 +3475,78 @@ fn init_opcode_c(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "get_intrinsic1_descs",
-        crate::make_builtin_function_with_arity("get_intrinsic1_descs", |_| {
-            Ok(pyre_object::w_list_new(vec![]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "get_intrinsic1_descs",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_intrinsic2_descs",
-        crate::make_builtin_function_with_arity("get_intrinsic2_descs", |_| {
-            Ok(pyre_object::w_list_new(vec![]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "get_intrinsic2_descs",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_opname",
-        crate::make_builtin_function_with_arity("get_opname", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_str_new("<0>"));
-            }
-            let code = unsafe { pyre_object::w_int_get_value(args[0]) };
-            Ok(pyre_object::w_str_new(&format!("<{code}>")))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "get_opname",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_str_new("<0>"));
+                }
+                let code = unsafe { pyre_object::w_int_get_value(args[0]) };
+                Ok(pyre_object::w_str_new(&format!("<{code}>")))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_nb_ops",
-        crate::make_builtin_function_with_arity("get_nb_ops", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function_with_arity(
+            "get_nb_ops",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_special_method_names",
-        crate::make_builtin_function_with_arity("get_special_method_names", |_| {
-            Ok(pyre_object::w_list_new(vec![
-                pyre_object::w_str_new("__enter__"),
-                pyre_object::w_str_new("__exit__"),
-                pyre_object::w_str_new("__aenter__"),
-                pyre_object::w_str_new("__aexit__"),
-            ]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "get_special_method_names",
+            |_| {
+                Ok(pyre_object::w_list_new(vec![
+                    pyre_object::w_str_new("__enter__"),
+                    pyre_object::w_str_new("__exit__"),
+                    pyre_object::w_str_new("__aenter__"),
+                    pyre_object::w_str_new("__aexit__"),
+                ]))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_executor_count",
-        crate::make_builtin_function_with_arity("get_executor_count", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity(
+            "get_executor_count",
+            |_| Ok(pyre_object::w_int_new(0)),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_hot_code",
-        crate::make_builtin_function_with_arity("get_hot_code", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function_with_arity(
+            "get_hot_code",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
     );
 }
 
@@ -3184,14 +3583,20 @@ fn init_importlib_pkg(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "invalidate_caches",
-        crate::make_builtin_function_with_arity("invalidate_caches", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity(
+            "invalidate_caches",
+            |_| Ok(pyre_object::w_none()),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "reload",
-        crate::make_builtin_function_with_arity("reload", |args| {
-            Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "reload",
+            |args| Ok(args.first().copied().unwrap_or(pyre_object::w_none())),
+            1,
+        ),
     );
     // Mark as a package so dotted imports treat it as such.
     crate::dict_storage_store(ns, "__path__", pyre_object::w_list_new(vec![]));
@@ -3202,12 +3607,20 @@ fn init_importlib_util(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "spec_from_file_location",
-        crate::make_builtin_function_with_arity("spec_from_file_location", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity(
+            "spec_from_file_location",
+            |_| Ok(pyre_object::w_none()),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "module_from_spec",
-        crate::make_builtin_function_with_arity("module_from_spec", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity(
+            "module_from_spec",
+            |_| Ok(pyre_object::w_none()),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -3273,13 +3686,17 @@ fn init_importlib_machinery(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "all_suffixes",
-        crate::make_builtin_function_with_arity("all_suffixes", |_| {
-            Ok(pyre_object::w_list_new(vec![
-                pyre_object::w_str_new(".py"),
-                pyre_object::w_str_new(".pyc"),
-                pyre_object::w_str_new(".so"),
-            ]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "all_suffixes",
+            |_| {
+                Ok(pyre_object::w_list_new(vec![
+                    pyre_object::w_str_new(".py"),
+                    pyre_object::w_str_new(".pyc"),
+                    pyre_object::w_str_new(".so"),
+                ]))
+            },
+            0,
+        ),
     );
     crate::dict_storage_store(ns, "ModuleSpec", crate::typedef::w_object());
     crate::dict_storage_store(ns, "BuiltinImporter", crate::typedef::w_object());
@@ -3303,55 +3720,83 @@ fn init_imp(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "is_builtin",
-        crate::make_builtin_function_with_arity("is_builtin", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_int_new(0));
-            }
-            let name = unsafe {
-                if pyre_object::is_str(args[0]) {
-                    pyre_object::w_str_get_value(args[0])
-                } else {
+        crate::make_builtin_function_with_arity(
+            "is_builtin",
+            |args| {
+                if args.is_empty() {
                     return Ok(pyre_object::w_int_new(0));
                 }
-            };
-            let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(name));
-            Ok(pyre_object::w_int_new(if is_builtin { 1 } else { 0 }))
-        }, 1),
+                let name = unsafe {
+                    if pyre_object::is_str(args[0]) {
+                        pyre_object::w_str_get_value(args[0])
+                    } else {
+                        return Ok(pyre_object::w_int_new(0));
+                    }
+                };
+                let is_builtin = BUILTIN_MODULES.with(|m| m.borrow().contains_key(name));
+                Ok(pyre_object::w_int_new(if is_builtin { 1 } else { 0 }))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "is_frozen",
-        crate::make_builtin_function_with_arity("is_frozen", |_| Ok(pyre_object::w_bool_from(false)), 1),
+        crate::make_builtin_function_with_arity(
+            "is_frozen",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "is_frozen_package",
-        crate::make_builtin_function_with_arity("is_frozen_package", |_| Ok(pyre_object::w_bool_from(false)), 1),
+        crate::make_builtin_function_with_arity(
+            "is_frozen_package",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "get_frozen_object",
-        crate::make_builtin_function_with_arity("get_frozen_object", |_| Ok(pyre_object::w_none()), 1),
+        crate::make_builtin_function_with_arity(
+            "get_frozen_object",
+            |_| Ok(pyre_object::w_none()),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "create_builtin",
-        crate::make_builtin_function_with_arity("create_builtin", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(args[0])
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "create_builtin",
+            |args| {
+                if args.is_empty() {
+                    return Ok(pyre_object::w_none());
+                }
+                Ok(args[0])
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "exec_builtin",
-        crate::make_builtin_function_with_arity("exec_builtin", |_| Ok(pyre_object::w_int_new(0)), 1),
+        crate::make_builtin_function_with_arity(
+            "exec_builtin",
+            |_| Ok(pyre_object::w_int_new(0)),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "exec_dynamic",
-        crate::make_builtin_function_with_arity("exec_dynamic", |_| Ok(pyre_object::w_int_new(0)), 1),
+        crate::make_builtin_function_with_arity(
+            "exec_dynamic",
+            |_| Ok(pyre_object::w_int_new(0)),
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -3366,24 +3811,38 @@ fn init_imp(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "lock_held",
-        crate::make_builtin_function_with_arity("lock_held", |_| Ok(pyre_object::w_bool_from(false)), 0),
+        crate::make_builtin_function_with_arity(
+            "lock_held",
+            |_| Ok(pyre_object::w_bool_from(false)),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "_fix_co_filename",
-        crate::make_builtin_function_with_arity("_fix_co_filename", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity(
+            "_fix_co_filename",
+            |_| Ok(pyre_object::w_none()),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "extension_suffixes",
-        crate::make_builtin_function_with_arity("extension_suffixes", |_| {
-            Ok(pyre_object::w_list_new(vec![]))
-        }, 0),
+        crate::make_builtin_function_with_arity(
+            "extension_suffixes",
+            |_| Ok(pyre_object::w_list_new(vec![])),
+            0,
+        ),
     );
     crate::dict_storage_store(
         ns,
         "source_hash",
-        crate::make_builtin_function_with_arity("source_hash", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity(
+            "source_hash",
+            |_| Ok(pyre_object::w_int_new(0)),
+            2,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -3617,15 +4076,23 @@ fn init_codecs(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "lookup_error",
-        crate::make_builtin_function_with_arity("lookup_error", |_| {
-            Ok(crate::make_builtin_function_with_arity("error_handler", |args| {
-                Ok(if args.is_empty() {
-                    pyre_object::w_none()
-                } else {
-                    args[0]
-                })
-            }, 1))
-        }, 1),
+        crate::make_builtin_function_with_arity(
+            "lookup_error",
+            |_| {
+                Ok(crate::make_builtin_function_with_arity(
+                    "error_handler",
+                    |args| {
+                        Ok(if args.is_empty() {
+                            pyre_object::w_none()
+                        } else {
+                            args[0]
+                        })
+                    },
+                    1,
+                ))
+            },
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -3644,20 +4111,28 @@ fn init_codecs(ns: &mut DictStorage) {
     );
     // encode/decode — return input unchanged. Matches PyPy _codecs.encode
     // when the codec is the identity.
-    let identity = crate::make_builtin_function_with_arity("identity", |args| {
-        Ok(if args.is_empty() {
-            pyre_object::w_none()
-        } else {
-            args[0]
-        })
-    }, 1);
+    let identity = crate::make_builtin_function_with_arity(
+        "identity",
+        |args| {
+            Ok(if args.is_empty() {
+                pyre_object::w_none()
+            } else {
+                args[0]
+            })
+        },
+        1,
+    );
     crate::dict_storage_store(ns, "encode", identity);
     crate::dict_storage_store(ns, "decode", identity);
     crate::dict_storage_store(ns, "_forget_codec", identity);
     crate::dict_storage_store(
         ns,
         "charmap_build",
-        crate::make_builtin_function_with_arity("charmap_build", |_| Ok(pyre_object::w_dict_new()), 1),
+        crate::make_builtin_function_with_arity(
+            "charmap_build",
+            |_| Ok(pyre_object::w_dict_new()),
+            1,
+        ),
     );
 }
 
@@ -3668,7 +4143,7 @@ fn init_copyreg(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "pickle",
-        crate::make_builtin_function_with_arity("pickle", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("pickle", |_| Ok(pyre_object::w_none()), 3),
     );
     crate::dict_storage_store(ns, "dispatch_table", pyre_object::w_dict_new());
 }

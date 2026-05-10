@@ -3,7 +3,9 @@
 //! PyPy equivalent: pypy/module/math/moduledef.py
 
 use super::interp_math;
-use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
+};
 
 pub fn init(ns: &mut DictStorage) {
     // ── Constants (PyPy: interp_math.State.__init__) ─────────────────
@@ -34,20 +36,56 @@ pub fn init(ns: &mut DictStorage) {
     );
 
     // ── Trigonometric ────────────────────────────────────────────────
-    dict_storage_store(ns, "sin", make_builtin_function_with_arity("sin", interp_math::sin, 1));
-    dict_storage_store(ns, "cos", make_builtin_function_with_arity("cos", interp_math::cos, 1));
-    dict_storage_store(ns, "tan", make_builtin_function_with_arity("tan", interp_math::tan, 1));
-    dict_storage_store(ns, "asin", make_builtin_function_with_arity("asin", interp_math::asin, 1));
-    dict_storage_store(ns, "acos", make_builtin_function_with_arity("acos", interp_math::acos, 1));
-    dict_storage_store(ns, "atan", make_builtin_function_with_arity("atan", interp_math::atan, 1));
+    dict_storage_store(
+        ns,
+        "sin",
+        make_builtin_function_with_arity("sin", interp_math::sin, 1),
+    );
+    dict_storage_store(
+        ns,
+        "cos",
+        make_builtin_function_with_arity("cos", interp_math::cos, 1),
+    );
+    dict_storage_store(
+        ns,
+        "tan",
+        make_builtin_function_with_arity("tan", interp_math::tan, 1),
+    );
+    dict_storage_store(
+        ns,
+        "asin",
+        make_builtin_function_with_arity("asin", interp_math::asin, 1),
+    );
+    dict_storage_store(
+        ns,
+        "acos",
+        make_builtin_function_with_arity("acos", interp_math::acos, 1),
+    );
+    dict_storage_store(
+        ns,
+        "atan",
+        make_builtin_function_with_arity("atan", interp_math::atan, 1),
+    );
     dict_storage_store(
         ns,
         "atan2",
         make_builtin_function_with_arity("atan2", interp_math::atan2, 2),
     );
-    dict_storage_store(ns, "sinh", make_builtin_function_with_arity("sinh", interp_math::sinh, 1));
-    dict_storage_store(ns, "cosh", make_builtin_function_with_arity("cosh", interp_math::cosh, 1));
-    dict_storage_store(ns, "tanh", make_builtin_function_with_arity("tanh", interp_math::tanh, 1));
+    dict_storage_store(
+        ns,
+        "sinh",
+        make_builtin_function_with_arity("sinh", interp_math::sinh, 1),
+    );
+    dict_storage_store(
+        ns,
+        "cosh",
+        make_builtin_function_with_arity("cosh", interp_math::cosh, 1),
+    );
+    dict_storage_store(
+        ns,
+        "tanh",
+        make_builtin_function_with_arity("tanh", interp_math::tanh, 1),
+    );
     dict_storage_store(
         ns,
         "asinh",
@@ -65,17 +103,37 @@ pub fn init(ns: &mut DictStorage) {
     );
 
     // ── Exponential / logarithmic ───────────────────────────────────
-    dict_storage_store(ns, "sqrt", make_builtin_function_with_arity("sqrt", interp_math::sqrt, 1));
-    dict_storage_store(ns, "cbrt", make_builtin_function_with_arity("cbrt", interp_math::cbrt, 1));
-    dict_storage_store(ns, "exp", make_builtin_function_with_arity("exp", interp_math::exp, 1));
-    dict_storage_store(ns, "exp2", make_builtin_function_with_arity("exp2", interp_math::exp2, 1));
+    dict_storage_store(
+        ns,
+        "sqrt",
+        make_builtin_function_with_arity("sqrt", interp_math::sqrt, 1),
+    );
+    dict_storage_store(
+        ns,
+        "cbrt",
+        make_builtin_function_with_arity("cbrt", interp_math::cbrt, 1),
+    );
+    dict_storage_store(
+        ns,
+        "exp",
+        make_builtin_function_with_arity("exp", interp_math::exp, 1),
+    );
+    dict_storage_store(
+        ns,
+        "exp2",
+        make_builtin_function_with_arity("exp2", interp_math::exp2, 1),
+    );
     dict_storage_store(
         ns,
         "expm1",
         make_builtin_function_with_arity("expm1", interp_math::expm1, 1),
     );
     dict_storage_store(ns, "log", make_builtin_function("log", interp_math::log));
-    dict_storage_store(ns, "log2", make_builtin_function_with_arity("log2", interp_math::log2, 1));
+    dict_storage_store(
+        ns,
+        "log2",
+        make_builtin_function_with_arity("log2", interp_math::log2, 1),
+    );
     dict_storage_store(
         ns,
         "log10",
@@ -86,11 +144,23 @@ pub fn init(ns: &mut DictStorage) {
         "log1p",
         make_builtin_function_with_arity("log1p", interp_math::log1p, 1),
     );
-    dict_storage_store(ns, "pow", make_builtin_function_with_arity("pow", interp_math::pow, 2));
+    dict_storage_store(
+        ns,
+        "pow",
+        make_builtin_function_with_arity("pow", interp_math::pow, 2),
+    );
 
     // ── Gamma / error ───────────────────────────────────────────────
-    dict_storage_store(ns, "erf", make_builtin_function_with_arity("erf", interp_math::erf, 1));
-    dict_storage_store(ns, "erfc", make_builtin_function_with_arity("erfc", interp_math::erfc, 1));
+    dict_storage_store(
+        ns,
+        "erf",
+        make_builtin_function_with_arity("erf", interp_math::erf, 1),
+    );
+    dict_storage_store(
+        ns,
+        "erfc",
+        make_builtin_function_with_arity("erfc", interp_math::erfc, 1),
+    );
     dict_storage_store(
         ns,
         "gamma",
@@ -108,7 +178,11 @@ pub fn init(ns: &mut DictStorage) {
         "floor",
         make_builtin_function_with_arity("floor", interp_math::floor, 1),
     );
-    dict_storage_store(ns, "ceil", make_builtin_function_with_arity("ceil", interp_math::ceil, 1));
+    dict_storage_store(
+        ns,
+        "ceil",
+        make_builtin_function_with_arity("ceil", interp_math::ceil, 1),
+    );
     dict_storage_store(
         ns,
         "trunc",
@@ -116,8 +190,16 @@ pub fn init(ns: &mut DictStorage) {
     );
 
     // ── Floating-point manipulation ─────────────────────────────────
-    dict_storage_store(ns, "fabs", make_builtin_function_with_arity("fabs", interp_math::fabs, 1));
-    dict_storage_store(ns, "fmod", make_builtin_function_with_arity("fmod", interp_math::fmod, 2));
+    dict_storage_store(
+        ns,
+        "fabs",
+        make_builtin_function_with_arity("fabs", interp_math::fabs, 1),
+    );
+    dict_storage_store(
+        ns,
+        "fmod",
+        make_builtin_function_with_arity("fmod", interp_math::fmod, 2),
+    );
     dict_storage_store(
         ns,
         "copysign",
@@ -138,14 +220,26 @@ pub fn init(ns: &mut DictStorage) {
         "ldexp",
         make_builtin_function_with_arity("ldexp", interp_math::ldexp, 2),
     );
-    dict_storage_store(ns, "modf", make_builtin_function_with_arity("modf", interp_math::modf, 1));
+    dict_storage_store(
+        ns,
+        "modf",
+        make_builtin_function_with_arity("modf", interp_math::modf, 1),
+    );
     dict_storage_store(
         ns,
         "nextafter",
         make_builtin_function("nextafter", interp_math::nextafter),
     );
-    dict_storage_store(ns, "ulp", make_builtin_function_with_arity("ulp", interp_math::ulp, 1));
-    dict_storage_store(ns, "fma", make_builtin_function_with_arity("fma", interp_math::fma, 3));
+    dict_storage_store(
+        ns,
+        "ulp",
+        make_builtin_function_with_arity("ulp", interp_math::ulp, 1),
+    );
+    dict_storage_store(
+        ns,
+        "fma",
+        make_builtin_function_with_arity("fma", interp_math::fma, 3),
+    );
 
     // ── Classification ──────────────────────────────────────────────
     dict_storage_store(
@@ -187,10 +281,18 @@ pub fn init(ns: &mut DictStorage) {
         "hypot",
         make_builtin_function("hypot", interp_math::hypot),
     );
-    dict_storage_store(ns, "dist", make_builtin_function_with_arity("dist", interp_math::dist, 2));
+    dict_storage_store(
+        ns,
+        "dist",
+        make_builtin_function_with_arity("dist", interp_math::dist, 2),
+    );
 
     // ── Aggregation ─────────────────────────────────────────────────
-    dict_storage_store(ns, "fsum", make_builtin_function_with_arity("fsum", interp_math::fsum, 1));
+    dict_storage_store(
+        ns,
+        "fsum",
+        make_builtin_function_with_arity("fsum", interp_math::fsum, 1),
+    );
     dict_storage_store(ns, "prod", make_builtin_function("prod", interp_math::prod));
     dict_storage_store(
         ns,
@@ -206,7 +308,11 @@ pub fn init(ns: &mut DictStorage) {
     );
     dict_storage_store(ns, "gcd", make_builtin_function("gcd", interp_math::gcd));
     dict_storage_store(ns, "lcm", make_builtin_function("lcm", interp_math::lcm));
-    dict_storage_store(ns, "comb", make_builtin_function_with_arity("comb", interp_math::comb, 2));
+    dict_storage_store(
+        ns,
+        "comb",
+        make_builtin_function_with_arity("comb", interp_math::comb, 2),
+    );
     dict_storage_store(ns, "perm", make_builtin_function("perm", interp_math::perm));
     dict_storage_store(
         ns,

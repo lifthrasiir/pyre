@@ -2,7 +2,9 @@
 //!
 //! PyPy equivalent: pypy/module/operator/
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
+};
 use pyre_object::*;
 
 fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -60,210 +62,334 @@ fn op_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 pub fn init(ns: &mut DictStorage) {
-    dict_storage_store(ns, "index", make_builtin_function_with_arity("index", op_index, 1));
-    dict_storage_store(ns, "add", make_builtin_function_with_arity("add", op_add, 2));
-    dict_storage_store(ns, "sub", make_builtin_function_with_arity("sub", op_sub, 2));
-    dict_storage_store(ns, "mul", make_builtin_function_with_arity("mul", op_mul, 2));
+    dict_storage_store(
+        ns,
+        "index",
+        make_builtin_function_with_arity("index", op_index, 1),
+    );
+    dict_storage_store(
+        ns,
+        "add",
+        make_builtin_function_with_arity("add", op_add, 2),
+    );
+    dict_storage_store(
+        ns,
+        "sub",
+        make_builtin_function_with_arity("sub", op_sub, 2),
+    );
+    dict_storage_store(
+        ns,
+        "mul",
+        make_builtin_function_with_arity("mul", op_mul, 2),
+    );
     dict_storage_store(
         ns,
         "truediv",
-        make_builtin_function_with_arity("truediv", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::truediv(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "truediv",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::truediv(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "floordiv",
-        make_builtin_function_with_arity("floordiv", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::floordiv(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "floordiv",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::floordiv(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "mod",
-        make_builtin_function_with_arity("mod", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::mod_(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "mod",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::mod_(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "pow",
-        make_builtin_function_with_arity("pow", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::pow(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "pow",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::pow(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "neg",
-        make_builtin_function_with_arity("neg", |args| {
-            assert!(args.len() == 1);
-            crate::baseobjspace::neg(args[0])
-        }, 1),
+        make_builtin_function_with_arity(
+            "neg",
+            |args| {
+                assert!(args.len() == 1);
+                crate::baseobjspace::neg(args[0])
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "pos",
-        make_builtin_function_with_arity("pos", |args| {
-            assert!(args.len() == 1);
-            crate::baseobjspace::pos(args[0])
-        }, 1),
+        make_builtin_function_with_arity(
+            "pos",
+            |args| {
+                assert!(args.len() == 1);
+                crate::baseobjspace::pos(args[0])
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "abs",
-        make_builtin_function_with_arity("abs", |args| {
-            assert!(args.len() == 1);
-            crate::builtins::builtin_abs(args)
-        }, 1),
+        make_builtin_function_with_arity(
+            "abs",
+            |args| {
+                assert!(args.len() == 1);
+                crate::builtins::builtin_abs(args)
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "invert",
-        make_builtin_function_with_arity("invert", |args| {
-            assert!(args.len() == 1);
-            crate::baseobjspace::invert(args[0])
-        }, 1),
+        make_builtin_function_with_arity(
+            "invert",
+            |args| {
+                assert!(args.len() == 1);
+                crate::baseobjspace::invert(args[0])
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "lshift",
-        make_builtin_function_with_arity("lshift", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::lshift(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "lshift",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::lshift(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "rshift",
-        make_builtin_function_with_arity("rshift", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::rshift(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "rshift",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::rshift(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "and_",
-        make_builtin_function_with_arity("and_", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::and_(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "and_",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::and_(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "or_",
-        make_builtin_function_with_arity("or_", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::or_(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "or_",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::or_(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "xor",
-        make_builtin_function_with_arity("xor", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::xor(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "xor",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::xor(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "not_",
-        make_builtin_function_with_arity("not_", |args| {
-            assert!(args.len() == 1);
-            Ok(w_bool_from(!crate::baseobjspace::is_true(args[0])))
-        }, 1),
+        make_builtin_function_with_arity(
+            "not_",
+            |args| {
+                assert!(args.len() == 1);
+                Ok(w_bool_from(!crate::baseobjspace::is_true(args[0])))
+            },
+            1,
+        ),
     );
     // interp_operator.py:138
     dict_storage_store(
         ns,
         "truth",
-        make_builtin_function_with_arity("truth", |args| {
-            assert!(args.len() == 1);
-            Ok(w_bool_from(crate::baseobjspace::is_true(args[0])))
-        }, 1),
+        make_builtin_function_with_arity(
+            "truth",
+            |args| {
+                assert!(args.len() == 1);
+                Ok(w_bool_from(crate::baseobjspace::is_true(args[0])))
+            },
+            1,
+        ),
     );
     dict_storage_store(
         ns,
         "is_",
-        make_builtin_function_with_arity("is_", |args| {
-            assert!(args.len() == 2);
-            Ok(w_bool_from(std::ptr::eq(args[0], args[1])))
-        }, 2),
+        make_builtin_function_with_arity(
+            "is_",
+            |args| {
+                assert!(args.len() == 2);
+                Ok(w_bool_from(std::ptr::eq(args[0], args[1])))
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "is_not",
-        make_builtin_function_with_arity("is_not", |args| {
-            assert!(args.len() == 2);
-            Ok(w_bool_from(!std::ptr::eq(args[0], args[1])))
-        }, 2),
+        make_builtin_function_with_arity(
+            "is_not",
+            |args| {
+                assert!(args.len() == 2);
+                Ok(w_bool_from(!std::ptr::eq(args[0], args[1])))
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "contains",
-        make_builtin_function_with_arity("contains", |args| {
-            assert!(args.len() == 2);
-            Ok(w_bool_from(crate::baseobjspace::contains(
-                args[0], args[1],
-            )?))
-        }, 2),
+        make_builtin_function_with_arity(
+            "contains",
+            |args| {
+                assert!(args.len() == 2);
+                Ok(w_bool_from(crate::baseobjspace::contains(
+                    args[0], args[1],
+                )?))
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "getitem",
-        make_builtin_function_with_arity("getitem", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::getitem(args[0], args[1])
-        }, 2),
+        make_builtin_function_with_arity(
+            "getitem",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::getitem(args[0], args[1])
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "setitem",
-        make_builtin_function_with_arity("setitem", |args| {
-            assert!(args.len() == 3);
-            crate::baseobjspace::setitem(args[0], args[1], args[2])?;
-            Ok(w_none())
-        }, 3),
+        make_builtin_function_with_arity(
+            "setitem",
+            |args| {
+                assert!(args.len() == 3);
+                crate::baseobjspace::setitem(args[0], args[1], args[2])?;
+                Ok(w_none())
+            },
+            3,
+        ),
     );
     dict_storage_store(
         ns,
         "delitem",
-        make_builtin_function_with_arity("delitem", |args| {
-            assert!(args.len() == 2);
-            crate::baseobjspace::delitem(args[0], args[1])?;
-            Ok(w_none())
-        }, 2),
+        make_builtin_function_with_arity(
+            "delitem",
+            |args| {
+                assert!(args.len() == 2);
+                crate::baseobjspace::delitem(args[0], args[1])?;
+                Ok(w_none())
+            },
+            2,
+        ),
     );
     // Underscore aliases (CPython: __add__/__sub__/... via operator module).
-    dict_storage_store(ns, "__add__", make_builtin_function_with_arity("__add__", op_add, 2));
-    dict_storage_store(ns, "__sub__", make_builtin_function_with_arity("__sub__", op_sub, 2));
-    dict_storage_store(ns, "__mul__", make_builtin_function_with_arity("__mul__", op_mul, 2));
+    dict_storage_store(
+        ns,
+        "__add__",
+        make_builtin_function_with_arity("__add__", op_add, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__sub__",
+        make_builtin_function_with_arity("__sub__", op_sub, 2),
+    );
+    dict_storage_store(
+        ns,
+        "__mul__",
+        make_builtin_function_with_arity("__mul__", op_mul, 2),
+    );
     dict_storage_store(ns, "eq", make_builtin_function_with_arity("eq", op_eq, 2));
     dict_storage_store(ns, "lt", make_builtin_function_with_arity("lt", op_lt, 2));
     dict_storage_store(ns, "gt", make_builtin_function_with_arity("gt", op_gt, 2));
     dict_storage_store(
         ns,
         "le",
-        make_builtin_function_with_arity("le", |args| {
-            crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Le)
-        }, 2),
+        make_builtin_function_with_arity(
+            "le",
+            |args| {
+                crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Le)
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "ge",
-        make_builtin_function_with_arity("ge", |args| {
-            crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ge)
-        }, 2),
+        make_builtin_function_with_arity(
+            "ge",
+            |args| {
+                crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ge)
+            },
+            2,
+        ),
     );
     dict_storage_store(
         ns,
         "ne",
-        make_builtin_function_with_arity("ne", |args| {
-            crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ne)
-        }, 2),
+        make_builtin_function_with_arity(
+            "ne",
+            |args| {
+                crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Ne)
+            },
+            2,
+        ),
     );
     // itemgetter/attrgetter stubs — return callable objects
     dict_storage_store(

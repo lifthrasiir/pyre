@@ -18,8 +18,8 @@
 //! ```
 
 use crate::DictStorage;
-use crate::module::_weakref::interp_weakref;
 use crate::make_module_builtin_function_with_arity;
+use crate::module::_weakref::interp_weakref;
 
 pub fn init(ns: &mut DictStorage) {
     // pypy/module/_weakref/moduledef.py:6-13 interpleveldefs:
@@ -45,7 +45,11 @@ pub fn init(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "getweakrefcount",
-        make_module_builtin_function_with_arity("getweakrefcount", interp_weakref::getweakrefcount, 1),
+        make_module_builtin_function_with_arity(
+            "getweakrefcount",
+            interp_weakref::getweakrefcount,
+            1,
+        ),
     );
     crate::dict_storage_store(
         ns,
@@ -58,6 +62,10 @@ pub fn init(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_remove_dead_weakref",
-        make_module_builtin_function_with_arity("_remove_dead_weakref", |_| Ok(pyre_object::w_none()), 2),
+        make_module_builtin_function_with_arity(
+            "_remove_dead_weakref",
+            |_| Ok(pyre_object::w_none()),
+            2,
+        ),
     );
 }

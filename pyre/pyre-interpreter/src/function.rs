@@ -1159,6 +1159,42 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     call_args(func, args)
 }
 
+/// baseobjspace.py: `space._code_of_sys_exc_info` — the BuiltinCode object
+/// backing `sys.exc_info`, captured at sys-module init time so the JIT
+/// fast-path in `funccall_valuestack` can recognize this specific call and
+/// inline `exc_info_direct` without going through the regular dispatch.
+///
+/// PyPy stores this on the space; pyre is single-space-per-thread, so a
+/// thread-local cell suffices. The paired `direct_fn` returns the same
+/// `(type, value, traceback)` tuple as the regular closure but skips the
+/// builtin-call setup.
+type ExcInfoDirectFn = fn() -> PyObjectRef;
+thread_local! {
+    static SYS_EXC_INFO_CODE: std::cell::Cell<*const ()> = const { std::cell::Cell::new(std::ptr::null()) };
+    static SYS_EXC_INFO_DIRECT_FN: std::cell::Cell<Option<ExcInfoDirectFn>> = const { std::cell::Cell::new(None) };
+}
+
+/// Register the BuiltinCode pointer + direct helper for `sys.exc_info`.
+///
+/// Called once during sys module init (after the builtin is created). The
+/// `code` pointer is the BuiltinCode object underlying the `exc_info`
+/// builtin function; `direct_fn` is the JIT-direct equivalent of the
+/// closure body. `funccall_valuestack` consults both to take the fast path.
+pub fn register_sys_exc_info_path(code: *const (), direct_fn: ExcInfoDirectFn) {
+    SYS_EXC_INFO_CODE.with(|cell| cell.set(code));
+    SYS_EXC_INFO_DIRECT_FN.with(|cell| cell.set(Some(direct_fn)));
+}
+
+#[inline]
+fn sys_exc_info_code() -> *const () {
+    SYS_EXC_INFO_CODE.with(|cell| cell.get())
+}
+
+#[inline]
+fn sys_exc_info_direct_fn() -> Option<ExcInfoDirectFn> {
+    SYS_EXC_INFO_DIRECT_FN.with(|cell| cell.get())
+}
+
 /// function.py:139-203 `funccall_valuestack` — fast-path call dispatcher.
 ///
 /// Dispatches based on `code.fast_natural_arity`:
@@ -1173,8 +1209,22 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
-    let _ = methodcall; // function.py:140 — only for better error messages
     let code = unsafe { crate::getcode(func) };
+
+    // function.py:146-150 — JIT direct path for `sys.exc_info()` with no
+    // arguments: skip the builtin call entirely and inline the tuple
+    // construction. PyPy uses `space._code_of_sys_exc_info`; pyre uses the
+    // thread-local cache populated during sys module init.
+    if nargs == 0
+        && majit_metainterp::jit::we_are_jitted()
+        && std::ptr::eq(code, sys_exc_info_code())
+    {
+        if let Some(direct_fn) = sys_exc_info_direct_fn() {
+            frame.dropvalues(dropvalues);
+            return direct_fn();
+        }
+    }
+
     let fast_natural_arity =
         unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
 
@@ -1266,15 +1316,36 @@ pub fn funccall_valuestack(
         }
     }
 
-    // Fallback: Vec allocation path (function.py:201-203)
-    if nargs == 0 {
+    // function.py:194-199 — PASSTHROUGHARGS1 dispatch.
+    // PyPy's BuiltinCodePassThroughArguments1.funcrun_obj receives w_obj
+    // separately from an Arguments rest, then concatenates them as
+    // `args_w = [w_obj] + _args_w` before calling the unwrapped fn. Pyre's
+    // single BuiltinCodeFn signature already takes a flat slice, so the
+    // peek/Arguments split is structural — the final closure invocation
+    // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
+    if fast_natural_arity == crate::PASSTHROUGHARGS1 as usize && nargs >= 1 {
+        let builtin_fn = unsafe { crate::builtin_code_get(code as PyObjectRef) };
+        let w_obj = frame.peekvalue(nargs - 1);
+        let rest = frame.make_arguments(nargs - 1, false, func);
+        let mut args_w = Vec::with_capacity(nargs);
+        args_w.push(w_obj);
+        args_w.extend_from_slice(&rest);
         frame.dropvalues(dropvalues);
-        funccall(func, &[])
-    } else {
-        let args = frame.peekvalues(nargs);
-        frame.dropvalues(dropvalues);
-        funccall(func, &args)
+        return match builtin_fn(&args_w) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        };
     }
+
+    // function.py:201-203 — fallback: build Arguments via make_arguments
+    // (carries methodcall + w_function for diagnostics) and dispatch through
+    // call_args.
+    let args = frame.make_arguments(nargs, methodcall, func);
+    frame.dropvalues(dropvalues);
+    funccall(func, &args)
 }
 
 /// function.py:206-214 `_flat_pycall` — create frame directly from stack.

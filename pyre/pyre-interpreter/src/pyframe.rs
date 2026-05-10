@@ -1893,9 +1893,19 @@ impl PyFrame {
         Ok(())
     }
 
-    /// PyPy-compatible `make_arguments`.
+    /// pyframe.py:208-218 `make_arguments` — build Arguments from the value
+    /// stack. `methodcall` and `w_function` are stored on the resulting
+    /// Arguments for diagnostic use (better error messages on argument
+    /// mismatch); pyre's call path currently passes only the positional
+    /// vector, so the parameters are recorded as part of the parity contract
+    /// without downstream consumers yet.
     #[inline]
-    pub fn make_arguments(&self, nargs: usize, _methodcall: bool) -> Vec<PyObjectRef> {
+    pub fn make_arguments(
+        &self,
+        nargs: usize,
+        _methodcall: bool,
+        _w_function: PyObjectRef,
+    ) -> Vec<PyObjectRef> {
         self.peekvalues(nargs)
     }
 

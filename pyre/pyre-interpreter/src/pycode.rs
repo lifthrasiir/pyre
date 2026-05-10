@@ -253,7 +253,10 @@ pub unsafe fn w_code_frame_stores_global(
 fn compute_flatcall(code: &crate::CodeObject) -> u16 {
     use crate::CodeFlags;
     use crate::gateway::{FLATPYCALL, HOPELESS};
-    if code.flags.intersects(CodeFlags::VARARGS | CodeFlags::VARKEYWORDS) {
+    if code
+        .flags
+        .intersects(CodeFlags::VARARGS | CodeFlags::VARKEYWORDS)
+    {
         return HOPELESS;
     }
     if code.kwonlyarg_count > 0 {

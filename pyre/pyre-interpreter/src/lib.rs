@@ -52,10 +52,11 @@ pub use frame_array::*;
 pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, PASSTHROUGHARGS1,
-    builtin_code_get, builtin_code_get_fast_natural_arity, builtin_code_name,
-    builtin_code_new, builtin_code_new_with_arity, is_builtin_code,
-    make_builtin_function, make_builtin_function_with_arity,
-    make_module_builtin_function, make_module_builtin_function_with_arity,
+    builtin_code_get, builtin_code_get_fast_natural_arity, builtin_code_name, builtin_code_new,
+    builtin_code_new_passthrough_args1, builtin_code_new_with_arity, is_builtin_code,
+    make_builtin_function, make_builtin_function_passthrough_args1,
+    make_builtin_function_with_arity, make_module_builtin_function,
+    make_module_builtin_function_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use malachite_bigint::BigInt as PyBigInt;

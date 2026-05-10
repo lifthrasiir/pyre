@@ -1364,12 +1364,16 @@ impl OpcodeStepExecutor for PyFrame {
             CommonConstant::BuiltinTuple => {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
             }
-            CommonConstant::BuiltinAll => {
-                crate::make_module_builtin_function_with_arity("all", crate::builtins::builtin_all_fn, 1)
-            }
-            CommonConstant::BuiltinAny => {
-                crate::make_module_builtin_function_with_arity("any", crate::builtins::builtin_any_fn, 1)
-            }
+            CommonConstant::BuiltinAll => crate::make_module_builtin_function_with_arity(
+                "all",
+                crate::builtins::builtin_all_fn,
+                1,
+            ),
+            CommonConstant::BuiltinAny => crate::make_module_builtin_function_with_arity(
+                "any",
+                crate::builtins::builtin_any_fn,
+                1,
+            ),
             CommonConstant::BuiltinList => {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
             }
@@ -2212,10 +2216,12 @@ impl OpcodeStepExecutor for PyFrame {
         if stack_items >= nargs + 2 && !self.get_is_being_profiled() {
             let null_or_self = self.peekvalue_maybe_none(nargs);
             let callable = self.peekvalue_maybe_none(nargs + 1);
-            if null_or_self.is_null() && !callable.is_null() && unsafe { crate::is_function(callable) } {
-                let result = crate::function::funccall_valuestack(
-                    callable, nargs, self, nargs + 2, false,
-                );
+            if null_or_self.is_null()
+                && !callable.is_null()
+                && unsafe { crate::is_function(callable) }
+            {
+                let result =
+                    crate::function::funccall_valuestack(callable, nargs, self, nargs + 2, false);
                 if result.is_null() {
                     return Err(crate::call::take_call_error()
                         .unwrap_or_else(|| crate::PyError::type_error("call failed"))

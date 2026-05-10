@@ -547,7 +547,10 @@ pub fn builtin_code_new_with_arity(
     func: BuiltinCodeFn,
     arity: u16,
 ) -> PyObjectRef {
-    debug_assert!(arity <= 4, "builtin arity {arity} for {name} exceeds fast-path max 4");
+    debug_assert!(
+        arity <= 4,
+        "builtin arity {arity} for {name} exceeds fast-path max 4"
+    );
     builtin_code_new_full(name, func, None, arity)
 }
 
@@ -562,6 +565,19 @@ pub fn builtin_code_new_with_doc(
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
     builtin_code_new_full(name, func, docstring, HOPELESS)
+}
+
+/// Allocate a new `BuiltinCode` with `fast_natural_arity = PASSTHROUGHARGS1`.
+///
+/// PyPy gateway.py — picks `BuiltinCodePassThroughArguments1` when the
+/// `unwrap_spec` is `[W_Root, Arguments]`. `funcrun_obj` then receives the
+/// first positional unwrapped (`w_obj`) and the rest as an `Arguments`
+/// object. Pyre's single `BuiltinCodeFn` signature already takes a flat
+/// slice, so the same closure shape works — the dispatch path in
+/// `function.rs:funccall_valuestack` peeks `args[0]` separately to mirror
+/// `function.py:194-199`, but the closure still receives `[w_obj, ...rest]`.
+pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
+    builtin_code_new_full(name, func, None, PASSTHROUGHARGS1)
 }
 
 /// Full constructor for `BuiltinCode`.
@@ -652,6 +668,16 @@ pub fn make_builtin_function_with_arity(
     arity: u16,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_arity(name, func, arity);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
+/// `make_builtin_function` with `fast_natural_arity = PASSTHROUGHARGS1` —
+/// PyPy `BuiltinCodePassThroughArguments1` registration shape.
+pub fn make_builtin_function_passthrough_args1(
+    name: &'static str,
+    func: BuiltinCodeFn,
+) -> PyObjectRef {
+    let code = builtin_code_new_passthrough_args1(name, func);
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 

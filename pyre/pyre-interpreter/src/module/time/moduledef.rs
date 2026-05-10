@@ -2,12 +2,18 @@
 //!
 //! PyPy equivalent: pypy/module/time/moduledef.py
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
+use crate::{
+    DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity,
+};
 
 use super::interp_time;
 
 pub fn init(ns: &mut DictStorage) {
-    dict_storage_store(ns, "time", make_builtin_function_with_arity("time", interp_time::time, 0));
+    dict_storage_store(
+        ns,
+        "time",
+        make_builtin_function_with_arity("time", interp_time::time, 0),
+    );
     dict_storage_store(
         ns,
         "time_ns",
