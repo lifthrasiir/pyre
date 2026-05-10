@@ -19,6 +19,7 @@
 
 use crate::DictStorage;
 use crate::module::_weakref::interp_weakref;
+use crate::make_module_builtin_function_with_arity;
 
 pub fn init(ns: &mut DictStorage) {
     // pypy/module/_weakref/moduledef.py:6-13 interpleveldefs:
@@ -44,12 +45,12 @@ pub fn init(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "getweakrefcount",
-        crate::make_builtin_function("getweakrefcount", interp_weakref::getweakrefcount),
+        make_module_builtin_function_with_arity("getweakrefcount", interp_weakref::getweakrefcount, 1),
     );
     crate::dict_storage_store(
         ns,
         "getweakrefs",
-        crate::make_builtin_function("getweakrefs", interp_weakref::getweakrefs),
+        make_module_builtin_function_with_arity("getweakrefs", interp_weakref::getweakrefs, 1),
     );
     // CPython-specific helper used by weakref.py to clean up dead refs
     // from WeakValueDictionary. PyPy doesn't expose it because PyPy's
@@ -57,6 +58,6 @@ pub fn init(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_remove_dead_weakref",
-        crate::make_builtin_function("_remove_dead_weakref", |_| Ok(pyre_object::w_none())),
+        make_module_builtin_function_with_arity("_remove_dead_weakref", |_| Ok(pyre_object::w_none()), 2),
     );
 }

@@ -509,6 +509,10 @@ pub struct BuiltinCode {
     pub name: &'static str,
     pub func: BuiltinCodeFn,
     pub docstring: Option<&'static str>,
+    /// eval.py:16-23 — `fast_natural_arity`. For builtins with fixed
+    /// positional arity 0-4, this equals the arity directly. Builtins
+    /// with optional/variadic args use HOPELESS (0x400).
+    pub fast_natural_arity: u16,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -523,9 +527,28 @@ impl pyre_object::lltype::GcType for BuiltinCode {
     const SIZE: usize = BUILTIN_CODE_OBJECT_SIZE;
 }
 
+/// eval.py:16 — `FLATPYCALL = 0x100`.
+pub const FLATPYCALL: u16 = 0x100;
+/// eval.py:17 — `PASSTHROUGHARGS1 = 0x200`.
+pub const PASSTHROUGHARGS1: u16 = 0x200;
+/// eval.py:18 — `HOPELESS = 0x400`. Default for code that cannot fast-path.
+pub const HOPELESS: u16 = 0x400;
+
 /// Allocate a new `BuiltinCode` with no docstring.
+/// `fast_natural_arity` defaults to HOPELESS (no fast path).
 pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     builtin_code_new_with_doc(name, func, None)
+}
+
+/// Allocate a new `BuiltinCode` with known fixed arity (0-4).
+/// gateway.py:843 — `self.__class__ = globals()['BuiltinCode%d' % arity]`
+pub fn builtin_code_new_with_arity(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+) -> PyObjectRef {
+    debug_assert!(arity <= 4, "builtin arity {arity} for {name} exceeds fast-path max 4");
+    builtin_code_new_full(name, func, None, arity)
 }
 
 /// Allocate a new `BuiltinCode` with an explicit docstring.
@@ -538,6 +561,16 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
+    builtin_code_new_full(name, func, docstring, HOPELESS)
+}
+
+/// Full constructor for `BuiltinCode`.
+fn builtin_code_new_full(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: Option<&'static str>,
+    fast_natural_arity: u16,
+) -> PyObjectRef {
     pyre_object::lltype::malloc_typed(BuiltinCode {
         ob: PyObject {
             ob_type: &BUILTIN_CODE_TYPE,
@@ -546,6 +579,7 @@ pub fn builtin_code_new_with_doc(
         name,
         func,
         docstring,
+        fast_natural_arity,
     }) as PyObjectRef
 }
 
@@ -566,6 +600,15 @@ pub unsafe fn is_builtin_code(obj: PyObjectRef) -> bool {
 pub unsafe fn builtin_code_get(obj: PyObjectRef) -> BuiltinCodeFn {
     let func_obj = obj as *const BuiltinCode;
     unsafe { (*func_obj).func }
+}
+
+/// eval.py:16-23 — read `fast_natural_arity` from a BuiltinCode.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
+    unsafe { (*(obj as *const BuiltinCode)).fast_natural_arity }
 }
 
 /// Get the name of a built-in function.
@@ -602,12 +645,32 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
     crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 
+/// `make_builtin_function` with known fixed arity for fast-path dispatch.
+pub fn make_builtin_function_with_arity(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_arity(name, func, arity);
+    crate::function_new_with_fixed_code(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
 /// mixedmodule.py:116 parity — wrap a BuiltinCodeFn as BuiltinFunction.
 ///
 /// Module-level builtins are not descriptors: storing them on a user class
 /// must not synthesize a bound method.
 pub fn make_module_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
+    crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
+/// `make_module_builtin_function` with known fixed arity for fast-path dispatch.
+pub fn make_module_builtin_function_with_arity(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_arity(name, func, arity);
     crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
 }
 

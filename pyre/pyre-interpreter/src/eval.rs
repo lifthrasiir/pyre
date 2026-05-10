@@ -1365,10 +1365,10 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
             }
             CommonConstant::BuiltinAll => {
-                crate::make_module_builtin_function("all", crate::builtins::builtin_all_fn)
+                crate::make_module_builtin_function_with_arity("all", crate::builtins::builtin_all_fn, 1)
             }
             CommonConstant::BuiltinAny => {
-                crate::make_module_builtin_function("any", crate::builtins::builtin_any_fn)
+                crate::make_module_builtin_function_with_arity("any", crate::builtins::builtin_any_fn, 1)
             }
             CommonConstant::BuiltinList => {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)
@@ -2193,11 +2193,41 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── call ──
-    // PyPy: CALL_FUNCTION — interpreter-only override.
-    // Handles null_or_self prepend for instance method calls.
-    // The default trait impl (opcode_call) always discards null_or_self,
-    // which is what the JIT tracer uses — no trace/concrete divergence.
+    // PyPy: baseobjspace.py:1240-1267 `call_valuestack` +
+    // function.py:139-203 `funccall_valuestack`.
+    //
+    // CPython 3.12+ CALL: stack is [callable, null_or_self, arg0..argN-1].
+    // null_or_self is NULL for plain calls, `self` for method calls.
     fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
+        // baseobjspace.py:1240-1261 fast path: Function + no method binding
+        //
+        // baseobjspace.py:1243 — skip fast path when profiling is active
+        // and the function wraps a builtin code (c_call/c_return events).
+        // Conservative: skip entire fast path if profiled, since
+        // funccall_valuestack's builtin dispatch also bypasses profiling.
+        //
+        // Guard: only enter when the value stack has at least nargs + 2
+        // items above stack_base (callable + null_or_self + args).
+        let stack_items = self.valuestackdepth.saturating_sub(self.stack_base());
+        if stack_items >= nargs + 2 && !self.get_is_being_profiled() {
+            let null_or_self = self.peekvalue_maybe_none(nargs);
+            let callable = self.peekvalue_maybe_none(nargs + 1);
+            if null_or_self.is_null() && !callable.is_null() && unsafe { crate::is_function(callable) } {
+                let result = crate::function::funccall_valuestack(
+                    callable, nargs, self, nargs + 2, false,
+                );
+                if result.is_null() {
+                    return Err(crate::call::take_call_error()
+                        .unwrap_or_else(|| crate::PyError::type_error("call failed"))
+                        .into());
+                }
+                self.push(result);
+                return Ok(());
+            }
+        }
+
+        // Slow path: method call or non-Function callable.
+        // Must allocate Vec for args.
         let mut args = Vec::with_capacity(nargs);
         for _ in 0..nargs {
             args.push(self.pop());

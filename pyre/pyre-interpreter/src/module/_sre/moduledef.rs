@@ -2,7 +2,7 @@
 //!
 //! Uses sre-engine crate (RustPython's SRE bytecode interpreter).
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function, make_module_builtin_function};
+use crate::{DictStorage, dict_storage_store, make_builtin_function, make_module_builtin_function, make_module_builtin_function_with_arity};
 use pyre_object::*;
 use sre_engine::engine::{Request, State};
 use std::cell::RefCell;
@@ -29,66 +29,66 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "ascii_iscased",
-        make_module_builtin_function("ascii_iscased", |args| {
+        make_module_builtin_function_with_arity("ascii_iscased", |args| {
             if args.is_empty() {
                 return Ok(w_bool_from(false));
             }
             let ch = unsafe { w_int_get_value(args[0]) } as u8 as char;
             Ok(w_bool_from(ch.is_ascii_alphabetic()))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "unicode_iscased",
-        make_module_builtin_function("unicode_iscased", |args| {
+        make_module_builtin_function_with_arity("unicode_iscased", |args| {
             if args.is_empty() {
                 return Ok(w_bool_from(false));
             }
             let ch = char::from_u32(unsafe { w_int_get_value(args[0]) } as u32).unwrap_or('\0');
             Ok(w_bool_from(ch.is_alphabetic()))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "ascii_tolower",
-        make_module_builtin_function("ascii_tolower", |args| {
+        make_module_builtin_function_with_arity("ascii_tolower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
             Ok(w_int_new(
                 (unsafe { w_int_get_value(args[0]) } as u8).to_ascii_lowercase() as i64,
             ))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "unicode_tolower",
-        make_module_builtin_function("unicode_tolower", |args| {
+        make_module_builtin_function_with_arity("unicode_tolower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
             let c = char::from_u32(unsafe { w_int_get_value(args[0]) } as u32).unwrap_or('\0');
             Ok(w_int_new(c.to_lowercase().next().unwrap_or(c) as i64))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "getcodesize",
-        make_module_builtin_function("getcodesize", |_| {
+        make_module_builtin_function_with_arity("getcodesize", |_| {
             Ok(w_int_new(sre_engine::CODESIZE as i64))
-        }),
+        }, 0),
     );
     dict_storage_store(
         ns,
         "getlower",
-        make_module_builtin_function("getlower", |args| {
+        make_module_builtin_function_with_arity("getlower", |args| {
             if args.is_empty() {
                 return Ok(w_int_new(0));
             }
             Ok(w_int_new(sre_engine::string::lower_unicode(
                 unsafe { w_int_get_value(args[0]) } as u32
             ) as i64))
-        }),
+        }, 2),
     );
     // Create SRE_Pattern and SRE_Match types.
     // PyPy: interp_sre.py W_SRE_Pattern, W_SRE_Match
@@ -142,15 +142,11 @@ fn init_sre_match_type(ns: &mut DictStorage) {
     // Register methods on the type so `m.group()` goes through the descriptor
     // protocol and binds `m` as the first positional argument. PyPy:
     // interp_sre.W_SRE_Match typedef — same layout.
-    for (name, func) in [
-        ("group", sre_match_group as fn(&[PyObjectRef]) -> _),
-        ("groups", sre_match_groups),
-        ("start", sre_match_start),
-        ("end", sre_match_end),
-        ("span", sre_match_span),
-    ] {
-        dict_storage_store(ns, name, make_builtin_function(name, func));
-    }
+    dict_storage_store(ns, "group", make_builtin_function("group", sre_match_group));
+    dict_storage_store(ns, "groups", make_builtin_function("groups", sre_match_groups));
+    dict_storage_store(ns, "start", make_builtin_function("start", sre_match_start));
+    dict_storage_store(ns, "end", make_builtin_function("end", sre_match_end));
+    dict_storage_store(ns, "span", make_builtin_function("span", sre_match_span));
 }
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)

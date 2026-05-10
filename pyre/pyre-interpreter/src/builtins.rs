@@ -2,7 +2,7 @@ use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::executioncontext::DictStorage;
-use crate::{PyDisplay, make_builtin_function, make_module_builtin_function};
+use crate::{PyDisplay, make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function, make_module_builtin_function_with_arity};
 use pyre_object::*;
 
 /// Install the default builtins into a namespace.
@@ -13,17 +13,17 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("range", || {
         make_module_builtin_function("range", builtin_range)
     });
-    namespace.get_or_insert_with("len", || make_module_builtin_function("len", builtin_len));
-    namespace.get_or_insert_with("abs", || make_module_builtin_function("abs", builtin_abs));
+    namespace.get_or_insert_with("len", || make_module_builtin_function_with_arity("len", builtin_len, 1));
+    namespace.get_or_insert_with("abs", || make_module_builtin_function_with_arity("abs", builtin_abs, 1));
     namespace.get_or_insert_with("min", || make_module_builtin_function("min", builtin_min));
     namespace.get_or_insert_with("max", || make_module_builtin_function("max", builtin_max));
     namespace.get_or_insert_with("type", || crate::typedef::w_type());
     namespace.get_or_insert_with("isinstance", || {
-        make_module_builtin_function("isinstance", builtin_isinstance)
+        make_module_builtin_function_with_arity("isinstance", builtin_isinstance, 2)
     });
     namespace.get_or_insert_with("str", || crate::typedef::gettypeobject(&STR_TYPE));
     namespace.get_or_insert_with("repr", || {
-        make_module_builtin_function("repr", builtin_repr)
+        make_module_builtin_function_with_arity("repr", builtin_repr, 1)
     });
     namespace.get_or_insert_with("int", || crate::typedef::gettypeobject(&INT_TYPE));
     namespace.get_or_insert_with("float", || crate::typedef::gettypeobject(&FLOAT_TYPE));
@@ -33,16 +33,16 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("None", || w_none());
     namespace.get_or_insert_with("NotImplemented", || w_not_implemented());
     namespace.get_or_insert_with("hasattr", || {
-        make_module_builtin_function("hasattr", builtin_hasattr)
+        make_module_builtin_function_with_arity("hasattr", builtin_hasattr, 2)
     });
     namespace.get_or_insert_with("getattr", || {
         make_module_builtin_function("getattr", builtin_getattr)
     });
     namespace.get_or_insert_with("setattr", || {
-        make_module_builtin_function("setattr", builtin_setattr)
+        make_module_builtin_function_with_arity("setattr", builtin_setattr, 3)
     });
     namespace.get_or_insert_with("delattr", || {
-        make_module_builtin_function("delattr", builtin_delattr)
+        make_module_builtin_function_with_arity("delattr", builtin_delattr, 2)
     });
     namespace.get_or_insert_with("tuple", || crate::typedef::gettypeobject(&TUPLE_TYPE));
     namespace.get_or_insert_with("list", || crate::typedef::gettypeobject(&LIST_TYPE));
@@ -55,19 +55,19 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("super", || {
         make_module_builtin_function("super", builtin_super)
     });
-    namespace.get_or_insert_with("id", || make_module_builtin_function("id", builtin_id));
+    namespace.get_or_insert_with("id", || make_module_builtin_function_with_arity("id", builtin_id, 1));
     namespace.get_or_insert_with("hash", || {
-        make_module_builtin_function("hash", builtin_hash)
+        make_module_builtin_function_with_arity("hash", builtin_hash, 1)
     });
-    namespace.get_or_insert_with("ord", || make_module_builtin_function("ord", builtin_ord));
-    namespace.get_or_insert_with("chr", || make_module_builtin_function("chr", builtin_chr));
+    namespace.get_or_insert_with("ord", || make_module_builtin_function_with_arity("ord", builtin_ord, 1));
+    namespace.get_or_insert_with("chr", || make_module_builtin_function_with_arity("chr", builtin_chr, 1));
     namespace.get_or_insert_with("map", || make_module_builtin_function("map", builtin_map));
     namespace.get_or_insert_with("zip", || make_module_builtin_function("zip", builtin_zip));
     namespace.get_or_insert_with("enumerate", || {
         make_module_builtin_function("enumerate", builtin_enumerate)
     });
     namespace.get_or_insert_with("reversed", || {
-        make_module_builtin_function("reversed", builtin_reversed)
+        make_module_builtin_function_with_arity("reversed", builtin_reversed, 1)
     });
     namespace.get_or_insert_with("sorted", || {
         make_module_builtin_function("sorted", builtin_sorted)
@@ -79,7 +79,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("next", builtin_next)
     });
     namespace.get_or_insert_with("callable", || {
-        make_module_builtin_function("callable", builtin_callable)
+        make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
     namespace.get_or_insert_with("vars", || {
         make_module_builtin_function("vars", builtin_vars)
@@ -131,7 +131,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             crate::dict_storage_store(
                 ns,
                 "__new__",
-                make_builtin_function("__new__", |args| {
+                make_builtin_function_with_arity("__new__", |args| {
                     // args[0] = cls (memoryview), args[1] = buffer-like
                     let cls = args.get(0).copied().unwrap_or(w_none());
                     let buf = args.get(1).copied().unwrap_or(w_none());
@@ -140,12 +140,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     crate::baseobjspace::setattr(inst, "__pyre_fmt__", w_str_new("B"))?;
                     crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(1))?;
                     Ok(inst)
-                }),
+                }, 2),
             );
             crate::dict_storage_store(
                 ns,
                 "cast",
-                make_builtin_function("cast", |args| {
+                make_builtin_function_with_arity("cast", |args| {
                     let mv = args.get(0).copied().unwrap_or(w_none());
                     let fmt_obj = args.get(1).copied().unwrap_or(w_none());
                     let fmt = if unsafe { pyre_object::is_str(fmt_obj) } {
@@ -166,12 +166,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                     crate::baseobjspace::setattr(inst, "__pyre_fmt__", w_str_new(fmt))?;
                     crate::baseobjspace::setattr(inst, "__pyre_itemsize__", w_int_new(itemsize))?;
                     Ok(inst)
-                }),
+                }, 2),
             );
             crate::dict_storage_store(
                 ns,
                 "tolist",
-                make_builtin_function("tolist", |args| {
+                make_builtin_function_with_arity("tolist", |args| {
                     let mv = args.get(0).copied().unwrap_or(w_none());
                     let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
                     let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
@@ -192,12 +192,12 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         i += itemsize;
                     }
                     Ok(w_list_new(items))
-                }),
+                }, 1),
             );
             crate::dict_storage_store(
                 ns,
                 "__len__",
-                make_builtin_function("__len__", |args| {
+                make_builtin_function_with_arity("__len__", |args| {
                     let mv = args.get(0).copied().unwrap_or(w_none());
                     let buf = crate::baseobjspace::getattr(mv, "__pyre_buf__")?;
                     let itemsize_obj = crate::baseobjspace::getattr(mv, "__pyre_itemsize__")?;
@@ -208,7 +208,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                         0
                     };
                     Ok(w_int_new((n / itemsize.max(1)) as i64))
-                }),
+                }, 1),
             );
             // memoryview.itemsize attribute — read from the per-instance
             // __pyre_itemsize__ slot via property descriptor.
@@ -216,10 +216,10 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
                 ns,
                 "itemsize",
                 pyre_object::w_property_new(
-                    make_builtin_function("itemsize", |args| {
+                    make_builtin_function_with_arity("itemsize", |args| {
                         let mv = args.get(0).copied().unwrap_or(w_none());
                         crate::baseobjspace::getattr(mv, "__pyre_itemsize__")
-                    }),
+                    }, 1),
                     pyre_object::PY_NULL,
                     pyre_object::PY_NULL,
                 ),
@@ -230,10 +230,10 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         tp
     });
     namespace.get_or_insert_with("globals", || {
-        make_module_builtin_function("globals", builtin_globals)
+        make_module_builtin_function_with_arity("globals", builtin_globals, 0)
     });
     namespace.get_or_insert_with("locals", || {
-        make_module_builtin_function("locals", builtin_locals)
+        make_module_builtin_function_with_arity("locals", builtin_locals, 0)
     });
     namespace.get_or_insert_with("exec", || {
         make_module_builtin_function("exec", builtin_exec)
@@ -577,8 +577,8 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             runtime_error,
         ),
     );
-    namespace.get_or_insert_with("any", || make_module_builtin_function("any", builtin_any));
-    namespace.get_or_insert_with("all", || make_module_builtin_function("all", builtin_all));
+    namespace.get_or_insert_with("any", || make_module_builtin_function_with_arity("any", builtin_any, 1));
+    namespace.get_or_insert_with("all", || make_module_builtin_function_with_arity("all", builtin_all, 1));
     namespace.get_or_insert_with("sum", || make_module_builtin_function("sum", builtin_sum));
     namespace.get_or_insert_with("round", || {
         make_module_builtin_function("round", builtin_round)
@@ -594,7 +594,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("format", builtin_format)
     });
     namespace.get_or_insert_with("issubclass", || {
-        make_module_builtin_function("issubclass", builtin_issubclass)
+        make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
     });
     namespace.get_or_insert_with("__import__", || {
         make_module_builtin_function("__import__", builtin_import_stub)
@@ -2978,32 +2978,32 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "readline",
-        make_builtin_function("readline", file_method_readline),
+        make_builtin_function_with_arity("readline", file_method_readline, 1),
     );
     crate::dict_storage_store(
         ns,
         "readlines",
-        make_builtin_function("readlines", file_method_readlines),
+        make_builtin_function_with_arity("readlines", file_method_readlines, 1),
     );
     crate::dict_storage_store(
         ns,
         "write",
-        make_builtin_function("write", file_method_write),
+        make_builtin_function_with_arity("write", file_method_write, 2),
     );
     crate::dict_storage_store(
         ns,
         "close",
-        make_builtin_function("close", file_method_close),
+        make_builtin_function_with_arity("close", file_method_close, 1),
     );
     crate::dict_storage_store(
         ns,
         "flush",
-        make_builtin_function("flush", file_method_close),
+        make_builtin_function_with_arity("flush", file_method_close, 1),
     );
     crate::dict_storage_store(
         ns,
         "__enter__",
-        make_builtin_function("__enter__", |args| Ok(args[0])),
+        make_builtin_function_with_arity("__enter__", |args| Ok(args[0]), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -3017,12 +3017,12 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function("__iter__", |args| Ok(args[0])),
+        make_builtin_function_with_arity("__iter__", |args| Ok(args[0]), 1),
     );
     crate::dict_storage_store(
         ns,
         "__next__",
-        make_builtin_function("__next__", |args| {
+        make_builtin_function_with_arity("__next__", |args| {
             let line = file_method_readline(args)?;
             unsafe {
                 let s = pyre_object::w_str_get_value(line);
@@ -3031,7 +3031,7 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
                 }
             }
             Ok(line)
-        }),
+        }, 1),
     );
     crate::dict_storage_store(
         ns,
@@ -3046,13 +3046,13 @@ fn init_file_wrapper_type(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "tell",
-        make_builtin_function("tell", |args| {
+        make_builtin_function_with_arity("tell", |args| {
             if let Ok(pos) = crate::baseobjspace::getattr(args[0], "__file_pos__") {
                 Ok(pos)
             } else {
                 Ok(w_int_new(0))
             }
-        }),
+        }, 1),
     );
 }
 

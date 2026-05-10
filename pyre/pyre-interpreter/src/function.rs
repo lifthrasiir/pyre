@@ -1159,8 +1159,13 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     call_args(func, args)
 }
 
-/// PyPy-compatible `funccall_valuestack` helper.
-#[inline]
+/// function.py:139-203 `funccall_valuestack` — fast-path call dispatcher.
+///
+/// Dispatches based on `code.fast_natural_arity`:
+/// - nargs == arity (0-4): direct builtin fastcall from stack (no Vec alloc)
+/// - (nargs | FLATPYCALL) == arity: _flat_pycall (user code, exact arity)
+/// - FLATPYCALL + defaults: _flat_pycall_defaults
+/// - Fallback: allocate Vec via peekvalues + generic call path
 pub fn funccall_valuestack(
     func: PyObjectRef,
     nargs: usize,
@@ -1168,34 +1173,234 @@ pub fn funccall_valuestack(
     dropvalues: usize,
     methodcall: bool,
 ) -> PyObjectRef {
-    let _ = methodcall;
-    let args = frame.peekvalues(nargs);
-    frame.dropvalues(dropvalues);
-    funccall(func, &args)
+    let _ = methodcall; // function.py:140 — only for better error messages
+    let code = unsafe { crate::getcode(func) };
+    let fast_natural_arity =
+        unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
+
+    // function.py:153-184 — nargs == fast_natural_arity: builtin fast path
+    // baseobjspace.py:1243 — skip when profiling (c_call/c_return events)
+    if nargs == fast_natural_arity && nargs <= 4 && !frame.get_is_being_profiled() {
+        debug_assert!(
+            (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
+            "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
+        );
+        let builtin_fn = unsafe { crate::builtin_code_get(code as PyObjectRef) };
+        // function.py:154-184 — BuiltinCodeN.fastcall_N dispatch.
+        // Pyre builtins share a single fn(&[PyObjectRef]) signature, so we
+        // build a fixed-size stack array instead of heap-allocating a Vec.
+        let result = match nargs {
+            0 => {
+                frame.dropvalues(dropvalues);
+                builtin_fn(&[])
+            }
+            1 => {
+                let a0 = frame.peekvalue(0);
+                frame.dropvalues(dropvalues);
+                builtin_fn(&[a0])
+            }
+            2 => {
+                // function.py:168 — peekvalue order: 0=top, 1=below top
+                let a0 = frame.peekvalue(1);
+                let a1 = frame.peekvalue(0);
+                frame.dropvalues(dropvalues);
+                builtin_fn(&[a0, a1])
+            }
+            3 => {
+                let a0 = frame.peekvalue(2);
+                let a1 = frame.peekvalue(1);
+                let a2 = frame.peekvalue(0);
+                frame.dropvalues(dropvalues);
+                builtin_fn(&[a0, a1, a2])
+            }
+            4 => {
+                let a0 = frame.peekvalue(3);
+                let a1 = frame.peekvalue(2);
+                let a2 = frame.peekvalue(1);
+                let a3 = frame.peekvalue(0);
+                frame.dropvalues(dropvalues);
+                builtin_fn(&[a0, a1, a2, a3])
+            }
+            _ => unreachable!(),
+        };
+        return match result {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        };
+    }
+
+    // function.py:185-187 — (nargs | FLATPYCALL) == fast_natural_arity
+    if (nargs | crate::FLATPYCALL as usize) == fast_natural_arity {
+        return _flat_pycall(func, code, nargs, frame, dropvalues);
+    }
+
+    // function.py:188-193 — FLATPYCALL bit set + nargs within defaults range
+    if (fast_natural_arity & crate::FLATPYCALL as usize) != 0 {
+        let natural_arity = fast_natural_arity & 0xff;
+        if nargs < natural_arity {
+            let raw_defs = unsafe { crate::function_get_defaults(func) };
+            let defs = if raw_defs.is_null() {
+                std::ptr::null_mut()
+            } else {
+                crate::baseobjspace::unwrap_cell(raw_defs)
+            };
+            let defs_len = if defs.is_null() || !unsafe { pyre_object::is_tuple(defs) } {
+                0
+            } else {
+                unsafe { pyre_object::w_tuple_len(defs) }
+            };
+            if nargs >= natural_arity.saturating_sub(defs_len) {
+                return _flat_pycall_defaults(
+                    func,
+                    code,
+                    nargs,
+                    frame,
+                    defs,
+                    natural_arity - nargs,
+                    dropvalues,
+                );
+            }
+        }
+    }
+
+    // Fallback: Vec allocation path (function.py:201-203)
+    if nargs == 0 {
+        frame.dropvalues(dropvalues);
+        funccall(func, &[])
+    } else {
+        let args = frame.peekvalues(nargs);
+        frame.dropvalues(dropvalues);
+        funccall(func, &args)
+    }
 }
 
-/// PyPy-compatible `_flat_pycall` helper.
-#[inline]
-pub fn _flat_pycall(
+/// function.py:206-214 `_flat_pycall` — create frame directly from stack.
+///
+/// For user functions with exact arity match (no defaults needed).
+/// Copies args from caller's value stack into the new frame's locals
+/// without intermediate Vec allocation.
+fn _flat_pycall(
     func: PyObjectRef,
+    code: *const (),
     nargs: usize,
     frame: &mut crate::pyframe::PyFrame,
     dropvalues: usize,
 ) -> PyObjectRef {
-    funccall_valuestack(func, nargs, frame, dropvalues, false)
+    // call.rs:423-424 parity — increment call depth for JIT depth tracking.
+    let _depth_guard = crate::call::increment_call_depth();
+    let globals = unsafe { function_get_globals(func) };
+    let closure = unsafe { function_get_closure(func) };
+
+    // function.py:208-209 — createframe(code, w_func_globals, self)
+    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure(
+        code,
+        &[], // locals filled below directly from stack
+        globals,
+        frame.execution_context,
+        closure,
+    );
+
+    // function.py:210-211 — copy from stack into locals directly
+    // peekvalue(nargs-1-i) gives bottom-to-top order (matching local slot order)
+    for i in 0..nargs {
+        new_frame.locals_w_mut()[i] = frame.peekvalue(nargs - 1 - i);
+    }
+    frame.dropvalues(dropvalues);
+    new_frame.fix_array_ptrs();
+
+    // function.py:214 — return new_frame.run(self.name, self.qualname)
+    // Check generator/coroutine: run() wraps into generator object instead
+    // of executing the body. For normal functions, use the JIT-aware eval.
+    if new_frame._is_generator_or_coroutine() {
+        match new_frame.run() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    } else {
+        let eval_fn = crate::call::get_eval_fn();
+        match eval_fn(&mut new_frame) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    }
 }
 
-/// PyPy-compatible `_flat_pycall_defaults` helper.
-#[inline]
-pub fn _flat_pycall_defaults(
+/// function.py:217-231 `_flat_pycall_defaults` — flat call with defaults.
+///
+/// Same as `_flat_pycall` but also fills missing positional args from
+/// `self.defs_w[ndefs - defs_to_load ..]`.
+/// `defs` is the pre-unwrapped defaults tuple (already null-checked and
+/// verified as a tuple by the caller in `funccall_valuestack`).
+fn _flat_pycall_defaults(
     func: PyObjectRef,
+    code: *const (),
     nargs: usize,
     frame: &mut crate::pyframe::PyFrame,
+    defs: PyObjectRef,
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
-    let _ = defs_to_load;
-    funccall_valuestack(func, nargs, frame, dropvalues, false)
+    let _depth_guard = crate::call::increment_call_depth();
+    let globals = unsafe { function_get_globals(func) };
+    let closure = unsafe { function_get_closure(func) };
+
+    let mut new_frame = crate::pyframe::PyFrame::new_for_call_with_closure(
+        code,
+        &[], // locals filled below
+        globals,
+        frame.execution_context,
+        closure,
+    );
+
+    // function.py:221-222 — copy positional args from stack
+    for i in 0..nargs {
+        new_frame.locals_w_mut()[i] = frame.peekvalue(nargs - 1 - i);
+    }
+
+    // function.py:224-229 — fill remaining from defs_w
+    if !defs.is_null() {
+        let ndefs = unsafe { pyre_object::w_tuple_len(defs) };
+        let start = ndefs - defs_to_load;
+        let mut i = nargs;
+        for j in start..ndefs {
+            if let Some(val) = unsafe { pyre_object::w_tuple_getitem(defs, j as i64) } {
+                new_frame.locals_w_mut()[i] = val;
+            }
+            i += 1;
+        }
+    }
+
+    frame.dropvalues(dropvalues);
+    new_frame.fix_array_ptrs();
+
+    // function.py:231 — return new_frame.run(self.name, self.qualname)
+    if new_frame._is_generator_or_coroutine() {
+        match new_frame.run() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    } else {
+        let eval_fn = crate::call::get_eval_fn();
+        match eval_fn(&mut new_frame) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    }
 }
 
 #[cfg(test)]

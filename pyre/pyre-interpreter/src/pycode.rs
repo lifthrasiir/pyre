@@ -49,6 +49,11 @@ pub struct W_CodeObject {
     /// field exists so that `frame.hide()` can read the canonical
     /// `pyframe.py:521-522 return self.pycode.hidden_applevel`.
     pub hidden_applevel: bool,
+    /// pycode.py:226-238 `_compute_flatcall`. Cached arity descriptor:
+    /// - 0-4: impossible (builtins only)
+    /// - FLATPYCALL | co_argcount: simple user function
+    /// - HOPELESS: has *args/**kwargs/kwonly/too many params
+    pub fast_natural_arity: u16,
 }
 
 /// Field offset of `code_ptr` within `W_CodeObject`.
@@ -120,6 +125,13 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// `code_ptr` must be a valid pointer to a `CodeObject` obtained
 /// via `Box::into_raw`.
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
+    let fast_natural_arity = if code_ptr.is_null()
+        || (code_ptr as usize) % std::mem::align_of::<crate::CodeObject>() != 0
+    {
+        crate::gateway::HOPELESS
+    } else {
+        compute_flatcall(unsafe { &*(code_ptr as *const crate::CodeObject) })
+    };
     let obj = Box::new(W_CodeObject {
         ob_header: PyObject {
             ob_type: &CODE_TYPE as *const PyType,
@@ -128,6 +140,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         code_ptr,
         w_globals: std::ptr::null_mut(),
         hidden_applevel,
+        fast_natural_arity,
     });
     Box::into_raw(obj) as PyObjectRef
 }
@@ -231,6 +244,68 @@ pub unsafe fn w_code_frame_stores_global(
         return false;
     }
     !std::ptr::eq(code.w_globals, w_globals)
+}
+
+/// pycode.py:226-238 `_compute_flatcall`.
+///
+/// Returns FLATPYCALL | co_argcount for simple user functions (no *args,
+/// **kwargs, keyword-only args). Returns HOPELESS otherwise.
+fn compute_flatcall(code: &crate::CodeObject) -> u16 {
+    use crate::CodeFlags;
+    use crate::gateway::{FLATPYCALL, HOPELESS};
+    if code.flags.intersects(CodeFlags::VARARGS | CodeFlags::VARKEYWORDS) {
+        return HOPELESS;
+    }
+    if code.kwonlyarg_count > 0 {
+        return HOPELESS;
+    }
+    if code.arg_count > 0xff {
+        return HOPELESS;
+    }
+    // pycode.py:234 — disqualify if any arg is also a cellvar.
+    // Pyre's CodeObject exposes cellvars; check for overlap.
+    let argcount = code.arg_count as usize;
+    if !code.cellvars.is_empty() && argcount > 0 {
+        for cellname in &code.cellvars {
+            for j in 0..argcount {
+                if j < code.varnames.len() && *cellname == code.varnames[j] {
+                    return HOPELESS;
+                }
+            }
+        }
+    }
+    FLATPYCALL | (code.arg_count as u16)
+}
+
+/// eval.py:16-23 — read `fast_natural_arity` from a W_CodeObject.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject`.
+#[inline]
+pub unsafe fn w_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
+    if obj.is_null() {
+        return crate::gateway::HOPELESS;
+    }
+    unsafe { (*(obj as *const W_CodeObject)).fast_natural_arity }
+}
+
+/// Unified accessor: read `fast_natural_arity` from any code object
+/// (BuiltinCode or W_CodeObject).
+///
+/// # Safety
+/// `obj` must point to a valid code object (either type).
+#[inline]
+pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
+    if obj.is_null() {
+        return crate::gateway::HOPELESS;
+    }
+    unsafe {
+        if crate::gateway::is_builtin_code(obj) {
+            crate::gateway::builtin_code_get_fast_natural_arity(obj)
+        } else {
+            w_code_get_fast_natural_arity(obj)
+        }
+    }
 }
 
 /// Check if an object is a code object.
