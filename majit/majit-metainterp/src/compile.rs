@@ -4880,19 +4880,6 @@ pub struct MergePoint {
 }
 
 impl TraceCtx {
-    /// pyjitpl.py:2991 — check if a loop header was already visited.
-    ///
-    /// PRE-EXISTING-ADAPTATION: clean Rust extraction of the inline scan
-    /// at `pyjitpl.py:2994-3036`. RPython has no method with this name
-    /// — the loop body iterates `current_merge_points` directly with
-    /// `same_greenkey` matching. The helper exists only because the
-    /// field is `pub(crate)`-private and the single caller in
-    /// pyre-jit-trace cannot reach it directly.
-    pub fn has_merge_point(&self, key: u64) -> bool {
-        self.current_merge_points
-            .iter()
-            .any(|mp| mp.green_key == key)
-    }
 
     /// pyjitpl.py:2994-2997 reverse `same_greenkey` scan.
     ///
@@ -4997,15 +4984,6 @@ impl TraceCtx {
     /// "tracing a bridge" (empty merge-points list).
     pub fn current_merge_points_first_greenkey(&self) -> Option<u64> {
         self.current_merge_points.first().map(|mp| mp.green_key)
-    }
-
-    /// pyjitpl.py:2988: find merge point by key, searching in reverse
-    /// order (most recent first, matching RPython's range(len-1, -1, -1)).
-    pub fn get_merge_point(&self, key: u64) -> Option<&MergePoint> {
-        self.current_merge_points
-            .iter()
-            .rev()
-            .find(|mp| mp.green_key == key)
     }
 
     /// pyjitpl.py:2994 same_greenkey + header identity: check if a specific
