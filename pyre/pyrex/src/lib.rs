@@ -200,14 +200,19 @@ fn run_source(source: &str, mode: Mode) {
     // Register __main__ module in sys.modules — PyPy: app_main sets
     // sys.modules['__main__'] before executing user code so that
     // enum.global_enum and similar introspection works.
-    let main_module =
-        pyre_object::moduleobject::w_module_new("__main__", frame.w_globals as *mut u8);
-    // Bind storage→W_DictObject back-mirror so STORE_NAME / STORE_GLOBAL
-    // writes during the script run surface in `__main__.__dict__`'s
-    // keys/items/lookups (PyPy `module.py:77 Module.getdict()` parity).
-    unsafe {
-        pyre_interpreter::bind_module_back_mirror(frame.w_globals, main_module);
-    }
+    //
+    // Reuse the canonical W_DictObject already paired with the
+    // frame's globals storage (`PyFrame::new_with_context` →
+    // `dict_storage_to_dict` lazy mirror_target registration) so the
+    // module's `w_dict` shares one identity with `globals()` /
+    // `function.__globals__` (PyPy `module.py:77 Module.getdict()`
+    // parity).
+    let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(frame.w_globals);
+    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        "__main__",
+        frame.w_globals as *mut u8,
+        canonical,
+    );
     importing::set_sys_module("__main__", main_module);
 
     match eval_with_jit(&mut frame) {

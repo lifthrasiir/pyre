@@ -3690,16 +3690,13 @@ fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     init_fn(&mut namespace);
 
     let ns_ptr = Box::into_raw(namespace);
-    let module = w_module_new(name, ns_ptr as *mut u8);
-    // Pre-populate the W_DictObject's entries Vec from the storage and
-    // bind the back-mirror so post-init `dict_storage_store` writes
-    // (init_fn-style late additions, dict subclass alias mutation)
-    // surface in `module.__dict__.keys()`/`items()` and the
-    // `del module.__dict__[name]` exact-match path.  Mirrors PyPy's
-    // single `module.py:77 self.w_dict` view.
-    unsafe {
-        crate::bind_module_back_mirror(ns_ptr, module);
-    }
+    // PyPy `module.py:77 Module.getdict()` parity: reuse the canonical
+    // W_DictObject paired with this storage (`dict_storage_to_dict`
+    // lazy mirror_target registration); avoid allocating a sibling
+    // W_DictObject through `w_module_new` that would shadow the
+    // canonical identity.
+    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
+    let module = pyre_object::w_module_new_aliasing_dict(name, ns_ptr as *mut u8, canonical);
     Some(module)
 }
 
@@ -4087,14 +4084,13 @@ fn load_source_module(
     // Create the module object BEFORE execution and register in sys.modules.
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
-    let module = w_module_new(modulename, ns_ptr as *mut u8);
-    // Bind the storage→W_DictObject back-mirror so STORE_NAME writes
-    // during exec_code_module surface in `module.__dict__.keys()`,
-    // `items()`, and `del module.__dict__[k]` (PyPy
-    // `module.py:77 Module.getdict()` returns the live dict).
-    unsafe {
-        crate::bind_module_back_mirror(ns_ptr, module);
-    }
+    //
+    // Reuse the canonical W_DictObject paired with the storage
+    // (`dict_storage_to_dict` lazy mirror_target registration) so the
+    // module's `w_dict` is the same identity that `function.__globals__`
+    // and `globals()` will return for code executing in this module.
+    let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr);
+    let module = pyre_object::w_module_new_aliasing_dict(modulename, ns_ptr as *mut u8, canonical);
     set_sys_module(modulename, module);
 
     // PyPy `importing.py:300` passes `pathname`/`cpathname` to
@@ -4133,17 +4129,25 @@ fn load_package(
     let init_path = dirpath.join("__init__.py");
     let module = load_source_module(modulename, &init_path, execution_context)?;
 
-    // Set __path__ and __package__ on the module namespace
-    let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
+    // Set __path__ and __package__ on the module namespace via
+    // `module.w_dict` so storage-backed and dict-subclass-backed Modules
+    // both observe the writes (`pypy/module/__builtin__/moduledef.py:102-103
+    // Module(space, None, w_builtin)`).  When the dict is storage-backed
+    // the proxy store hook propagates the entry into the underlying
+    // DictStorage; when it's a subclass instance the write lands in the
+    // entries Vec where the subclass's `__init__` placed any seeded keys.
+    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let path_str = pyre_object::w_str_new(&dirpath.to_string_lossy());
     let path_list = pyre_object::w_list_new(vec![path_str]);
     unsafe {
-        crate::dict_storage_store(&mut *ns_ptr, "__path__", path_list);
-        crate::dict_storage_store(
-            &mut *ns_ptr,
-            "__package__",
-            pyre_object::w_str_new(modulename),
-        );
+        if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
+            pyre_object::dictobject::w_dict_setitem_str(w_dict, "__path__", path_list);
+            pyre_object::dictobject::w_dict_setitem_str(
+                w_dict,
+                "__package__",
+                pyre_object::w_str_new(modulename),
+            );
+        }
     }
 
     Ok(module)
@@ -4381,12 +4385,14 @@ pub fn import_from(
     name: &str,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // First try the module's namespace dict (PyPy: space.getattr → w_dict lookup)
+    // First try the module's namespace dict (PyPy: space.getattr → w_dict lookup).
+    // Routed through `w_module.w_dict` so dict-subclass-backed Modules
+    // (`pypy/module/__builtin__/moduledef.py:102-103`) honour their
+    // `__getitem__` overrides via the same lookup path.
     if unsafe { is_module(module) } {
-        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
-        if !ns_ptr.is_null() {
-            let ns = unsafe { &*ns_ptr };
-            if let Ok(value) = dict_storage_load(ns, name) {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        if !w_dict.is_null() && unsafe { pyre_object::is_dict(w_dict) } {
+            if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) } {
                 return Ok(value);
             }
         }
@@ -4399,11 +4405,14 @@ pub fn import_from(
 
     // PyPy: pyopcode.py _import_from — try importing as a submodule.
     // Build fullname = module.__name__ + "." + name and import it.
+    // Same `w_dict` routing as the first lookup so dict-subclass-backed
+    // Modules' submodule fallback honours overridden `__getitem__`.
     if unsafe { is_module(module) } {
-        let ns_ptr = unsafe { w_module_get_dict_ptr(module) } as *mut DictStorage;
-        if !ns_ptr.is_null() {
-            let ns = unsafe { &*ns_ptr };
-            if let Some(&modname_obj) = ns.get("__name__") {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        if !w_dict.is_null() && unsafe { pyre_object::is_dict(w_dict) } {
+            if let Some(modname_obj) =
+                unsafe { pyre_object::w_dict_getitem_str(w_dict, "__name__") }
+            {
                 if !modname_obj.is_null() && unsafe { pyre_object::is_str(modname_obj) } {
                     let modname = unsafe { pyre_object::w_str_get_value(modname_obj) };
                     let fullname = format!("{modname}.{name}");
@@ -4421,7 +4430,7 @@ pub fn import_from(
                         // module from sys.modules.
                         if let Some(submod) = check_sys_modules(&fullname) {
                             unsafe {
-                                crate::dict_storage_store(&mut *ns_ptr, name, submod);
+                                pyre_object::dictobject::w_dict_setitem_str(w_dict, name, submod);
                             }
                             return Ok(submod);
                         }

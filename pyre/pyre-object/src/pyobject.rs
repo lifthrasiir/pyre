@@ -122,6 +122,7 @@ pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
 pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
 pub static MODULE_TYPE: PyType = new_pytype("module");
+pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
 pub static TYPE_TYPE: PyType = new_pytype("type");
 pub static INSTANCE_TYPE: PyType = new_pytype("object");
 
@@ -271,6 +272,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&NOTIMPLEMENTED_TYPE, &INSTANCE_TYPE),
         (&ELLIPSIS_TYPE, &INSTANCE_TYPE),
         (&MODULE_TYPE, &INSTANCE_TYPE),
+        (&MAPPING_PROXY_TYPE, &INSTANCE_TYPE),
         (&TYPE_TYPE, &INSTANCE_TYPE),
         (&crate::superobject::SUPER_TYPE, &INSTANCE_TYPE),
         (&crate::bytearrayobject::BYTEARRAY_TYPE, &INSTANCE_TYPE),

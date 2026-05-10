@@ -459,6 +459,12 @@ pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 // struct) so it has no separate id.
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
 pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
+// `W_DICT_PROXY_GC_TYPE_ID` lives in `pyre-object::dictproxyobject`
+// alongside the `W_DictProxyObject` struct it describes.  Re-exported
+// for the JIT registration site so the typeid stays in the
+// pyre-jit-trace exports table next to its sibling Module/PyFrame
+// entries.
+pub use pyre_object::dictproxyobject::W_DICT_PROXY_GC_TYPE_ID;
 pub use pyre_object::strobject::W_STR_GC_TYPE_ID;
 // `PYFRAME_GC_TYPE_ID` lives in `pyre-interpreter::pyframe` alongside
 // the `PyFrame` struct it describes. Re-exported for the JIT

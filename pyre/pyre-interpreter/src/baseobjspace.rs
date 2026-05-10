@@ -1995,6 +1995,27 @@ fn unionable(obj: PyObjectRef) -> bool {
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
     let b = unwrap_cell(b);
+    // `pypy/objspace/std/dictproxyobject.py:51 descr_or` /
+    // `pypy/objspace/std/dictproxyobject.py:60 descr_ror` —
+    // mappingproxy `|` dispatches by copying the proxy's wrapped
+    // mapping then `update`-ing with the other operand.  Pre-unwrap
+    // each side so the dict-arm below sees plain dicts and produces
+    // the same merge result.  The proxy-on-rhs case mirrors
+    // `descr_ror` (proxy wraps the rhs operand inside `__or__`).
+    let a = unsafe {
+        if pyre_object::is_dict_proxy(a) {
+            pyre_object::w_dict_proxy_get_mapping(a)
+        } else {
+            a
+        }
+    };
+    let b = unsafe {
+        if pyre_object::is_dict_proxy(b) {
+            pyre_object::w_dict_proxy_get_mapping(b)
+        } else {
+            b
+        }
+    };
     unsafe {
         // boolobject.py:75 W_BoolObject.descr_or — both operands bool
         // → space.newbool(op(a, b)).
@@ -2454,6 +2475,19 @@ pub(crate) unsafe fn normalize_slice(
 pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let obj = unwrap_cell(obj);
     let index = unwrap_cell(index);
+    // `pypy/objspace/std/dictproxyobject.py:35 descr_getitem` →
+    // `space.getitem(self.w_mapping, w_key)` — forward through the
+    // proxy to its wrapped mapping.  The unwrap happens at the
+    // entrance so all downstream dict arms (and dict-subclass
+    // overrides via the wrapped W_DictObject) see the underlying
+    // mapping unchanged.
+    let obj = unsafe {
+        if pyre_object::is_dict_proxy(obj) {
+            pyre_object::w_dict_proxy_get_mapping(obj)
+        } else {
+            obj
+        }
+    };
     unsafe {
         if is_list(obj) {
             if is_slice(index) {
@@ -2769,6 +2803,16 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
     let index = unwrap_cell(index);
     let value = unwrap_cell(value);
     unsafe {
+        // `pypy/objspace/std/dictproxyobject.py` exposes neither
+        // `__setitem__` nor `__delitem__`, so `space.setitem` on a
+        // mappingproxy raises `TypeError: 'mappingproxy' object does
+        // not support item assignment`.  Detect proxy before any
+        // dict-like assignment fallthrough.
+        if pyre_object::is_dict_proxy(obj) {
+            return Err(PyError::type_error(
+                "'mappingproxy' object does not support item assignment",
+            ));
+        }
         if is_list(obj) {
             if is_slice(index) {
                 // list[start:stop] = value — slice assignment
@@ -2940,6 +2984,15 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
 
 /// Get the length of a container: `len(obj)`.
 pub fn len(obj: PyObjectRef) -> PyResult {
+    // `pypy/objspace/std/dictproxyobject.py:32 descr_len` →
+    // `space.len(self.w_mapping)`.
+    let obj = unsafe {
+        if pyre_object::is_dict_proxy(obj) {
+            pyre_object::w_dict_proxy_get_mapping(obj)
+        } else {
+            obj
+        }
+    };
     unsafe {
         if is_list(obj) {
             Ok(w_int_new(w_list_len(obj) as i64))
@@ -3112,20 +3165,55 @@ pub fn delweakref(obj: PyObjectRef) {
     }
 }
 
-fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
+/// `pypy/interpreter/module.py:77 Module.getdict()` parity: return
+/// the **canonical** `W_DictObject` already paired with this storage,
+/// not a fresh snapshot.  When the storage was first allocated
+/// (`w_module_new`, exec/eval anonymous path, etc.) it was bound to
+/// a sibling `W_DictObject` via `set_mirror_target` so that
+/// storage-side writes back-mirror into that one dict's entries Vec.
+/// This lookup retrieves that canonical dict so
+/// `function.__globals__`, `globals()`, and the module's own
+/// `__dict__` all share **one** identity (`f.__globals__ is
+/// m.__dict__` invariant) and the iterating surfaces (`keys`,
+/// `values`, `items`, `update`, `copy`, `iter`, `repr`) line up with
+/// `lookup` / `len` on the same logical state.
+///
+/// `type.__dict__` is **not** routed through this helper: PyPy
+/// `pypy/objspace/std/typeobject.py:1277 descr_get_dict` returns
+/// `W_DictProxyObject(w_dict)` (a read-only live view), not the
+/// type's underlying `W_DictObject`.  The dictproxy keeps its own
+/// identity per call and forwards reads/iterations to the type's
+/// `w_dict`; pyre's type.__dict__ readers stay on that path.
+///
+/// Lazy-canonical fallback: a storage that has not yet been paired
+/// (the `set_mirror_target` call has not happened) gets one allocated
+/// here and registered as the `mirror_target`, so subsequent calls
+/// return the same object.
+pub fn dict_storage_to_dict(ns_ptr: *const crate::DictStorage) -> PyObjectRef {
     if ns_ptr.is_null() {
         return pyre_object::w_dict_new();
     }
-    // Create a dict backed by the storage so that dict.update() etc.
-    // can sync changes back to the original globals/type/module dict state.
+    let storage = unsafe { &mut *(ns_ptr as *mut crate::DictStorage) };
+    let target = storage.mirror_target();
+    if !target.is_null() {
+        return target;
+    }
+    // Lazy canonical: snapshot-populate a fresh W_DictObject and
+    // register it as the storage's permanent back-mirror target so
+    // every subsequent `dict_storage_to_dict` call on this storage
+    // returns this same dict.  The snapshot pre-populates the entries
+    // Vec for storage entries that pre-date this call (the only path
+    // that adds bindings to the storage without going through the
+    // back-mirror).
     let dict = pyre_object::dictobject::w_dict_new_with_dict_storage(ns_ptr as *mut u8);
     unsafe {
-        for (key, &value) in (*ns_ptr).entries() {
+        for (key, &value) in storage.entries() {
             if !value.is_null() {
-                pyre_object::w_dict_store(dict, w_str_new(key), value);
+                pyre_object::dictobject::w_dict_setitem_str_no_proxy(dict, key, value);
             }
         }
     }
+    storage.set_mirror_target(dict);
     dict
 }
 
@@ -3458,9 +3546,19 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 }
             }
             if name == "__dict__" {
-                // Return the type's namespace as a dict
+                // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
+                // returns `W_DictProxyObject(w_dict)` — a read-only
+                // **live** view of the type's namespace.  The proxy's
+                // identity is fresh per call (a new wrapper) but its
+                // `w_mapping` is the type's canonical W_DictObject, so
+                // a subsequent `cls.x = 1; d['x']` resolves through the
+                // dict_storage_proxy and surfaces the live binding.
                 let dict_ptr = w_type_get_dict_ptr(obj) as *const crate::DictStorage;
-                return Ok(dict_storage_to_dict(dict_ptr));
+                if dict_ptr.is_null() {
+                    return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
+                }
+                let canonical = dict_storage_to_dict(dict_ptr);
+                return Ok(pyre_object::w_dict_proxy_new(canonical));
             }
             if name == "__bases__" {
                 return Ok(w_type_get_bases(obj));
@@ -5492,26 +5590,10 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 ///      with only `None=w_None` defined — matches `moduledef.py:106-108`
 ///      `builtin = module.Module(space, None); space.setitem(builtin
 ///      .w_dict, 'None', w_None); return builtin`.
-///
 pub fn pick_builtin(
     w_globals: *mut crate::DictStorage,
     exec_ctx: *const crate::PyExecutionContext,
 ) -> PyObjectRef {
-    pick_builtin_pair(w_globals, exec_ctx).1
-}
-
-/// Pyre's split-storage adapter for the PyPy-shaped `pick_builtin`
-/// above.  It returns BOTH the storage_ptr (for the LOAD_GLOBAL fast
-/// path) AND the picked Module identity (for `frame.get_builtin()` /
-/// `exec`'s `__builtins__` seeding) so that PyFrame construction can
-/// fill `frame.builtin` (storage) and `frame.w_builtin` (Module) with
-/// a single allocation — the user-dict subclass arm builds a wrapping
-/// Module, which two independent `pick_builtin` calls would otherwise
-/// allocate twice.
-pub fn pick_builtin_pair(
-    w_globals: *mut crate::DictStorage,
-    exec_ctx: *const crate::PyExecutionContext,
-) -> (*mut crate::DictStorage, PyObjectRef) {
     if !w_globals.is_null() {
         if let Some(w_builtin) = crate::dict_storage_get(unsafe { &*w_globals }, "__builtins__") {
             if !w_builtin.is_null() {
@@ -5520,32 +5602,26 @@ pub fn pick_builtin_pair(
                 if !exec_ctx.is_null() {
                     let space_builtin = unsafe { (*exec_ctx).get_builtin() };
                     if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
-                        let storage = unsafe { (*exec_ctx).builtins_storage_ptr() };
-                        return (storage, w_builtin);
+                        return w_builtin;
                     }
                 }
                 // moduledef.py:104 `isinstance(w_builtin, module.Module)`.
                 if unsafe { pyre_object::is_module(w_builtin) } {
-                    let storage = unsafe { pyre_object::w_module_get_dict_ptr(w_builtin) };
-                    return (storage as *mut crate::DictStorage, w_builtin);
+                    return w_builtin;
                 }
                 // moduledef.py:102-103 `space.isinstance_w(w_builtin, w_dict)`.
                 // PyPy: `return module.Module(space, None, w_builtin)` —
-                // a Module wrapping the caller's dict.  Pyre returns
-                // `frame.builtin = NULL` so the storage-keyed
-                // `LOAD_GLOBAL` fast path is skipped for this rare
-                // case; `load_global_value` falls through to
-                // `space.finditem_str(w_module.w_dict, name)`,
-                // dispatching through any dict subclass `__getitem__`
-                // override.
+                // a Module wrapping the caller's dict.  `LOAD_GLOBAL`
+                // falls through to `space.finditem_str(w_module.w_dict,
+                // name)`, dispatching through any dict subclass
+                // `__getitem__` override.
                 let backing = crate::type_methods::resolve_dict_backing(w_builtin);
                 if !backing.is_null() {
-                    let w_module = pyre_object::w_module_new_aliasing_dict(
+                    return pyre_object::w_module_new_aliasing_dict(
                         "",
                         std::ptr::null_mut(),
                         w_builtin,
                     );
-                    return (std::ptr::null_mut(), w_module);
                 }
                 // Fall through — `__builtins__` is not Module/dict (e.g.
                 // `42`, a list, ...).  PyPy moduledef.py:106-108 builds
@@ -5564,13 +5640,12 @@ pub fn pick_builtin_pair(
 /// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
 /// `Module.__init__`; pyre's `w_module_new` requires a `&str` so use
 /// the empty string as the anonymous-name sentinel).
-fn build_default_pick_builtin_module() -> (*mut crate::DictStorage, PyObjectRef) {
+fn build_default_pick_builtin_module() -> PyObjectRef {
     let mut ns = Box::new(crate::DictStorage::new());
     crate::dict_storage_store(&mut ns, "None", unsafe { pyre_object::w_none() });
     ns.fix_ptr();
     let storage: *mut crate::DictStorage = Box::into_raw(ns);
-    let w_builtin = pyre_object::w_module_new("", storage as *mut u8);
-    (storage, w_builtin)
+    pyre_object::w_module_new("", storage as *mut u8)
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053
@@ -6052,6 +6127,15 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
     if obj.is_null() {
         return Err(PyError::type_error("'NoneType' object is not iterable"));
     }
+    // `pypy/objspace/std/dictproxyobject.py:41 descr_iter` →
+    // `space.iter(self.w_mapping)`.
+    let obj = unsafe {
+        if pyre_object::is_dict_proxy(obj) {
+            pyre_object::w_dict_proxy_get_mapping(obj)
+        } else {
+            obj
+        }
+    };
     unsafe {
         // Builtin iterables
         if is_list(obj) {
@@ -6812,6 +6896,93 @@ mod tests {
         assert!(matches!(err.kind, PyErrorKind::AttributeError));
     }
 
+    /// `pypy/interpreter/module.py:77 Module.getdict()` parity invariant:
+    /// every call to `dict_storage_to_dict(storage)` must return the
+    /// **same** `W_DictObject` (single canonical) for a given storage.
+    /// This is the foundation of `f.__globals__ is m.__dict__` and
+    /// `globals() is __main__.__dict__` — pyre's split entries Vec /
+    /// DictStorage no longer creates fresh snapshot wrappers per call.
+    ///
+    /// The first call lazy-allocates a W_DictObject and registers it as
+    /// the storage's `mirror_target`; subsequent calls retrieve that
+    /// same dict via `mirror_target` lookup.
+    #[test]
+    fn test_dict_storage_to_dict_returns_canonical_w_dict() {
+        let mut namespace = Box::new(crate::DictStorage::default());
+        namespace.fix_ptr();
+        crate::dict_storage_store(&mut namespace, "alpha", w_int_new(7));
+        let ns_ptr: *const crate::DictStorage = &*namespace;
+
+        let first = super::dict_storage_to_dict(ns_ptr);
+        let second = super::dict_storage_to_dict(ns_ptr);
+        assert!(
+            std::ptr::eq(first, second),
+            "dict_storage_to_dict must return the canonical W_DictObject \
+             (storage's mirror_target), not a fresh snapshot",
+        );
+
+        // Storage-side write after the canonical has been allocated
+        // surfaces in the same W_DictObject via the back-mirror.
+        crate::dict_storage_store(&mut namespace, "beta", w_int_new(11));
+        unsafe {
+            assert_eq!(
+                w_int_get_value(pyre_object::w_dict_lookup(first, w_str_new("beta")).unwrap()),
+                11,
+                "post-canonicalization storage write must mirror into the canonical W_DictObject's entries Vec",
+            );
+        }
+    }
+
+    /// `pypy/interpreter/module.py:77 Module.getdict()` parity invariant
+    /// for the new module-creation pattern (canonical W_DictObject reuse
+    /// via `dict_storage_to_dict` + `w_module_new_aliasing_dict`):
+    /// `module.w_dict` IS the storage's canonical W_DictObject, and
+    /// `dict_storage_to_dict(module.dict_storage)` returns that same
+    /// object on every call.
+    #[test]
+    fn test_module_w_dict_is_canonical_for_storage() {
+        let mut namespace = Box::new(crate::DictStorage::default());
+        namespace.fix_ptr();
+        crate::dict_storage_store(&mut namespace, "x", w_int_new(42));
+        let ns_ptr = Box::into_raw(namespace);
+
+        // Pattern matches the production module-creation path
+        // (executioncontext::get_builtin / importing::init_builtin_module
+        //  / pyrex::run_source __main__).
+        let canonical = super::dict_storage_to_dict(ns_ptr);
+        let module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+            "test_canonical",
+            ns_ptr as *mut u8,
+            canonical,
+        );
+
+        // Module's w_dict identity equals the canonical lazy-paired
+        // W_DictObject — `f.__globals__ is m.__dict__` invariant.
+        let module_w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        assert!(
+            std::ptr::eq(module_w_dict, canonical),
+            "Module.w_dict must alias the storage's canonical W_DictObject",
+        );
+
+        // Repeat lookup of the canonical (e.g. function.__globals__
+        // path in production) returns the same object.
+        let again = super::dict_storage_to_dict(ns_ptr);
+        assert!(
+            std::ptr::eq(again, canonical),
+            "subsequent dict_storage_to_dict on the same storage must return the same W_DictObject",
+        );
+
+        // `module.__dict__["x"]` (resolved via the canonical W_DictObject)
+        // sees the storage-pre-populated entry.
+        unsafe {
+            assert_eq!(
+                w_int_get_value(pyre_object::w_dict_lookup(module_w_dict, w_str_new("x")).unwrap()),
+                42,
+                "canonical W_DictObject must surface storage-side entries that pre-date canonicalization",
+            );
+        }
+    }
+
     #[test]
     fn test_py_contains_manual_list() {
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
@@ -7030,6 +7201,15 @@ mod tests {
 /// PyPy: space.contains_w(haystack, needle)
 pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
     use pyre_object::*;
+    // `pypy/objspace/std/dictproxyobject.py:38 descr_contains` →
+    // `space.contains(self.w_mapping, w_key)`.
+    let haystack = unsafe {
+        if pyre_object::is_dict_proxy(haystack) {
+            pyre_object::w_dict_proxy_get_mapping(haystack)
+        } else {
+            haystack
+        }
+    };
     unsafe {
         if is_list(haystack) {
             let len = w_list_len(haystack);
@@ -7123,6 +7303,15 @@ pub fn eq_w(a: PyObjectRef, b: PyObjectRef) -> bool {
 pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
+        // `pypy/objspace/std/dictproxyobject.py` exposes no
+        // `__delitem__`, so `space.delitem` on a mappingproxy raises
+        // `TypeError: 'mappingproxy' object does not support item
+        // deletion`.
+        if pyre_object::is_dict_proxy(obj) {
+            return Err(PyError::type_error(
+                "'mappingproxy' object does not support item deletion",
+            ));
+        }
         if is_list(obj) {
             if is_int(index) {
                 let i = w_int_get_value(index);

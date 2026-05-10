@@ -2569,11 +2569,33 @@ fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut names: Vec<String> = Vec::new();
     unsafe {
         if pyre_object::is_module(obj) {
-            let ns_ptr = pyre_object::moduleobject::w_module_get_dict_ptr(obj);
-            if !ns_ptr.is_null() {
-                let ns = &*(ns_ptr as *const DictStorage);
-                for (name, _) in ns.entries() {
-                    names.push(name.to_string());
+            // Route through `w_module.w_dict` so dict-subclass-backed
+            // Modules (`pypy/module/__builtin__/moduledef.py:102-103
+            // Module(space, None, w_builtin)`) surface their entries
+            // alongside storage-backed modules.  PyPy
+            // `pypy/interpreter/module.py:77 Module.getdict()` returns
+            // the dict directly regardless of subclass; pyre branches
+            // on the underlying shape:
+            //   - exact `W_DictObject` → `w_dict_str_entries` returns
+            //     the storage-proxy union view in one call.
+            //   - dict subclass instance → iterate keys via the
+            //     standard `iter()` protocol so the subclass's
+            //     `__iter__` override participates (PyPy's
+            //     `space.iter(w_dict)` would do the same).
+            let w_dict = pyre_object::w_module_get_w_dict(obj);
+            if !w_dict.is_null() {
+                if pyre_object::is_dict(w_dict) {
+                    for (name, _) in pyre_object::dictobject::w_dict_str_entries(w_dict) {
+                        names.push(name);
+                    }
+                } else if let Ok(keys_iter) = crate::baseobjspace::iter(w_dict) {
+                    if let Ok(keys) = crate::builtins::collect_iterable(keys_iter) {
+                        for k in keys {
+                            if pyre_object::is_str(k) {
+                                names.push(pyre_object::w_str_get_value(k).to_string());
+                            }
+                        }
+                    }
                 }
             }
         } else if pyre_object::is_type(obj) {

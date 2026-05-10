@@ -283,6 +283,17 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("dict", init_dict_type, object_type) as usize,
         );
 
+        // mappingproxy — `pypy/objspace/std/dictproxyobject.py:103`
+        // `W_DictProxyObject.typedef = TypeDef('mappingproxy', ...)`,
+        // bases=(object,).  The TypeDef surface (keys/values/items/get/
+        // copy/__or__/__ror__/__ior__/__reversed__/cmp methods) is
+        // populated by `init_mappingproxy_type` so `cls.__dict__.keys()`
+        // and friends dispatch through the registered descriptors.
+        reg.insert(
+            &pyre_object::MAPPING_PROXY_TYPE as *const PyType as usize,
+            new_typeobject_with_base("mappingproxy", init_mappingproxy_type, object_type) as usize,
+        );
+
         // function — PyPy: funcobject.py
         // Functions are descriptors: function.__get__ returns a bound method.
         let function_type = new_typeobject_with_base("function", init_function_type, object_type);
@@ -1732,24 +1743,7 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "copy",
-        make_builtin_function("copy", |args| {
-            if args.is_empty() {
-                return Ok(pyre_object::w_dict_new());
-            }
-            // Shallow copy — resolve backing dict for subclass instances
-            let src = crate::type_methods::resolve_dict_backing(args[0]);
-            if src.is_null() {
-                return Ok(pyre_object::w_dict_new());
-            }
-            let dst = pyre_object::w_dict_new();
-            unsafe {
-                let d = &*(src as *const pyre_object::dictobject::W_DictObject);
-                for &(k, v) in &*d.entries {
-                    pyre_object::w_dict_store(dst, k, v);
-                }
-            }
-            Ok(dst)
-        }),
+        make_builtin_function("copy", crate::type_methods::dict_method_copy),
     );
     dict_storage_store(
         ns,
@@ -1777,6 +1771,242 @@ fn init_dict_type(ns: &mut DictStorage) {
             Ok(d)
         }),
     );
+}
+
+// ── Mappingproxy TypeDef ─────────────────────────────────────────────
+//
+// `pypy/objspace/std/dictproxyobject.py:103` —
+// `W_DictProxyObject.typedef = TypeDef('mappingproxy', ...)`.  All
+// methods forward to `self.w_mapping` (the wrapped W_DictObject);
+// pyre routes through `resolve_dict_backing`, which now unwraps the
+// proxy to its inner dict so the dict-method bodies stay shared.
+
+fn init_mappingproxy_type(ns: &mut DictStorage) {
+    // dictproxyobject.py:32 descr_len → space.len(self.w_mapping)
+    dict_storage_store(
+        ns,
+        "__len__",
+        make_builtin_function("__len__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_int_new(0));
+            }
+            crate::baseobjspace::len(args[0])
+        }),
+    );
+    // dictproxyobject.py:35 descr_getitem → space.getitem(self.w_mapping, w_key)
+    dict_storage_store(
+        ns,
+        "__getitem__",
+        make_builtin_function("__getitem__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__getitem__ requires 2 args"));
+            }
+            crate::baseobjspace::getitem(args[0], args[1])
+        }),
+    );
+    // dictproxyobject.py:38 descr_contains → space.contains(self.w_mapping, w_key)
+    dict_storage_store(
+        ns,
+        "__contains__",
+        make_builtin_function("__contains__", |args| {
+            if args.len() < 2 {
+                return Ok(pyre_object::w_bool_from(false));
+            }
+            Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
+                args[0], args[1],
+            )?))
+        }),
+    );
+    // dictproxyobject.py:41 descr_iter → space.iter(self.w_mapping)
+    dict_storage_store(
+        ns,
+        "__iter__",
+        make_builtin_function("__iter__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_none());
+            }
+            crate::baseobjspace::iter(args[0])
+        }),
+    );
+    // dictproxyobject.py:47 descr_repr →
+    // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`
+    dict_storage_store(
+        ns,
+        "__repr__",
+        make_builtin_function("__repr__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_str_new("mappingproxy({})"));
+            }
+            unsafe { Ok(pyre_object::w_str_new(&crate::display::py_repr(args[0]))) }
+        }),
+    );
+    // dictproxyobject.py:44 descr_str → space.str(self.w_mapping)
+    dict_storage_store(
+        ns,
+        "__str__",
+        make_builtin_function("__str__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_str_new(""));
+            }
+            unsafe { Ok(pyre_object::w_str_new(&crate::display::py_str(args[0]))) }
+        }),
+    );
+    // dictproxyobject.py:67 descr_ior → unconditional TypeError; the
+    // proxy is read-only so in-place merge is rejected by name even
+    // when the rhs would otherwise be acceptable for `__or__`.
+    dict_storage_store(
+        ns,
+        "__ior__",
+        make_builtin_function("__ior__", |_args| {
+            Err(crate::PyError::type_error(
+                "'|=' is not supported by mappingproxy; use '|' instead",
+            ))
+        }),
+    );
+    // dictproxyobject.py:51 descr_or →
+    // `copy_self.update(w_other); return copy_self`.  Implemented via
+    // `dict_method_copy` (unwraps proxy through resolve_dict_backing)
+    // followed by an items merge from `w_other`.
+    dict_storage_store(
+        ns,
+        "__or__",
+        make_builtin_function("__or__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__or__ requires 2 args"));
+            }
+            let lhs = args[0];
+            let rhs = unsafe {
+                if pyre_object::is_dict_proxy(args[1]) {
+                    pyre_object::w_dict_proxy_get_mapping(args[1])
+                } else {
+                    args[1]
+                }
+            };
+            if !unsafe { pyre_object::is_dict(rhs) } {
+                return Ok(pyre_object::w_not_implemented());
+            }
+            let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
+            crate::type_methods::dict_method_update(&[new_dict, rhs])?;
+            Ok(new_dict)
+        }),
+    );
+    // dictproxyobject.py:60 descr_ror →
+    // `space.call_method(w_other, '__or__', self.w_mapping)`.
+    dict_storage_store(
+        ns,
+        "__ror__",
+        make_builtin_function("__ror__", |args| {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error("__ror__ requires 2 args"));
+            }
+            let self_mapping = unsafe {
+                if pyre_object::is_dict_proxy(args[0]) {
+                    pyre_object::w_dict_proxy_get_mapping(args[0])
+                } else {
+                    args[0]
+                }
+            };
+            let lhs = args[1];
+            if !unsafe { pyre_object::is_dict(lhs) } {
+                return Ok(pyre_object::w_not_implemented());
+            }
+            let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
+            crate::type_methods::dict_method_update(&[new_dict, self_mapping])?;
+            Ok(new_dict)
+        }),
+    );
+    // dictproxyobject.py:87 descr_reversed →
+    // `space.call_method(self.w_mapping, '__reversed__')`.  Pyre lacks
+    // a dedicated reverse iterator on dict, so fall back to building
+    // a list of keys in reverse insertion order.
+    dict_storage_store(
+        ns,
+        "__reversed__",
+        make_builtin_function("__reversed__", |args| {
+            if args.is_empty() {
+                return Ok(pyre_object::w_list_new(vec![]));
+            }
+            let dict = crate::type_methods::resolve_dict_backing(args[0]);
+            if dict.is_null() {
+                return Ok(pyre_object::w_list_new(vec![]));
+            }
+            let mut keys: Vec<pyre_object::PyObjectRef> = unsafe {
+                pyre_object::w_dict_items(dict)
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect()
+            };
+            keys.reverse();
+            crate::baseobjspace::iter(pyre_object::w_list_new(keys))
+        }),
+    );
+    // dictproxyobject.py:71 get_w / 75 keys_w / 78 values_w / 81 items_w /
+    // 84 copy_w — forward through `dict_method_*` (which unwraps the
+    // proxy via `resolve_dict_backing`).
+    dict_storage_store(
+        ns,
+        "get",
+        make_builtin_function("get", crate::type_methods::dict_method_get),
+    );
+    dict_storage_store(
+        ns,
+        "keys",
+        make_builtin_function("keys", crate::type_methods::dict_method_keys),
+    );
+    dict_storage_store(
+        ns,
+        "values",
+        make_builtin_function("values", crate::type_methods::dict_method_values),
+    );
+    dict_storage_store(
+        ns,
+        "items",
+        make_builtin_function("items", crate::type_methods::dict_method_items),
+    );
+    dict_storage_store(
+        ns,
+        "copy",
+        make_builtin_function("copy", crate::type_methods::dict_method_copy),
+    );
+    // dictproxyobject.py:91-100 cmp methods (eq/ne/lt/le/gt/ge) →
+    // `getattr(space, op)(self.w_mapping, w_other)`.  Pyre routes
+    // through `space.compare`; the proxy's `space.eq`/`space.lt`/etc.
+    // path runs the same `resolve_dict_backing` unwrap.  Each
+    // comparison gets its own `fn` so the pointer stays
+    // non-capturing.
+    fn cmp_helper(
+        args: &[PyObjectRef],
+        op: crate::baseobjspace::CompareOp,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        if args.len() < 2 {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+        crate::baseobjspace::compare(args[0], args[1], op)
+    }
+    fn proxy_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        cmp_helper(args, crate::baseobjspace::CompareOp::Eq)
+    }
+    fn proxy_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        cmp_helper(args, crate::baseobjspace::CompareOp::Ne)
+    }
+    fn proxy_lt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        cmp_helper(args, crate::baseobjspace::CompareOp::Lt)
+    }
+    fn proxy_le(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        cmp_helper(args, crate::baseobjspace::CompareOp::Le)
+    }
+    fn proxy_gt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        cmp_helper(args, crate::baseobjspace::CompareOp::Gt)
+    }
+    fn proxy_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        cmp_helper(args, crate::baseobjspace::CompareOp::Ge)
+    }
+    dict_storage_store(ns, "__eq__", make_builtin_function("__eq__", proxy_eq));
+    dict_storage_store(ns, "__ne__", make_builtin_function("__ne__", proxy_ne));
+    dict_storage_store(ns, "__lt__", make_builtin_function("__lt__", proxy_lt));
+    dict_storage_store(ns, "__le__", make_builtin_function("__le__", proxy_le));
+    dict_storage_store(ns, "__gt__", make_builtin_function("__gt__", proxy_gt));
+    dict_storage_store(ns, "__ge__", make_builtin_function("__ge__", proxy_ge));
 }
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────
@@ -2222,14 +2452,15 @@ fn init_type_type(ns: &mut DictStorage) {
         unsafe {
             let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(cls);
             if ns_ptr.is_null() {
-                return Ok(pyre_object::w_dict_new());
+                return Ok(pyre_object::w_dict_proxy_new(pyre_object::w_dict_new()));
             }
-            let dict = pyre_object::w_dict_new_with_dict_storage(ns_ptr);
-            let ns = &*(ns_ptr as *const DictStorage);
-            for (name, &value) in ns.entries() {
-                pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), value);
-            }
-            Ok(dict)
+            // `pypy/objspace/std/typeobject.py:1277 descr_get_dict`
+            // returns `W_DictProxyObject(w_dict)` — read-only **live**
+            // view.  Wrap the type's canonical W_DictObject so
+            // subsequent `cls.x = 1` setattrs flow through the
+            // dict_storage_proxy and become visible on the proxy.
+            let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr as *const DictStorage);
+            Ok(pyre_object::w_dict_proxy_new(canonical))
         }
     });
     dict_storage_store(ns, "__dict__", make_getset_descriptor(dict_getter));

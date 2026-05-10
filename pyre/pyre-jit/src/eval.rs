@@ -121,12 +121,12 @@ use crate::jit::descr::{
     SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
     SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID,
     W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID,
-    W_DICT_GC_TYPE_ID, W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID,
-    W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID,
-    W_METHOD_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
-    W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
-    W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID,
-    W_UNION_GC_TYPE_ID,
+    W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID, W_EXCEPTION_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID,
+    W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID,
+    W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID,
+    W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID,
+    W_STATICMETHOD_GC_TYPE_ID, W_STR_GC_TYPE_ID, W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID,
+    W_TYPE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -984,9 +984,44 @@ thread_local! {
                 pyre_interpreter::pyframe::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
                 pyre_interpreter::pyframe::PYFRAME_W_YIELDING_FROM_OFFSET,
                 pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET,
+                // Lazy-cached canonical W_DictObject sibling for
+                // `frame.w_globals`.  Once `get_w_globals_obj` resolves
+                // the pointer it stays alive for the frame's lifetime
+                // (`dict_storage_to_dict` mirror_target invariant), so
+                // the slot must be visited by the nursery tracer to
+                // forward the dict pointer if it survives a minor
+                // collection.  Excluded slots (`w_globals`,
+                // `execution_context`, `pycode`, `debugdata`,
+                // `lastblock`) all point at non-nursery memory and
+                // remain off-list.
+                pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OBJ_OFFSET,
             ],
         ));
         debug_assert_eq!(pyframe_tid, PYFRAME_GC_TYPE_ID);
+        // `W_DictProxyObject` carries a single GC-traceable
+        // `w_mapping: PyObjectRef` slot (the wrapped W_DictObject —
+        // `pypy/objspace/std/dictproxyobject.py:17 self.w_mapping =
+        // w_mapping`).  Pre-register it here so that
+        // `MAPPING_PROXY_TYPE` resolves to a TypeInfo with the
+        // correct payload size + gc_ptr offsets (the foreign-pytype
+        // loop below would otherwise approximate it as
+        // `sizeof(PyObject)` and miss the `w_mapping` trace slot,
+        // dropping the wrapped dict on minor collection).
+        let w_dict_proxy_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::dictproxyobject::W_DictProxyObject>(),
+            object_tid,
+            pyre_object::dictproxyobject::W_DICT_PROXY_GC_PTR_OFFSETS.to_vec(),
+        ));
+        debug_assert_eq!(w_dict_proxy_tid, W_DICT_PROXY_GC_TYPE_ID);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
+            w_dict_proxy_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
+            w_dict_proxy_tid,
+        );
         // W_InstanceObject is intentionally NOT pre-registered: its
         // PyType (`INSTANCE_TYPE`) is the `object` root, already
         // covered by `object_tid` (`OBJECT_GC_TYPE_ID = 0`). Adding

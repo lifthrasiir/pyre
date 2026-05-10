@@ -6870,6 +6870,14 @@ impl<M: Clone> MetaInterp<M> {
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
         if let Some(front_target) = compiled.front_target_tokens.first() {
             let target_descr = front_target.as_jump_target_descr();
+            // `root_trace.constant_types` was populated alongside `ops`
+            // / `inputargs` at compile time (`build_trace_value_maps`
+            // → `OpTypeIndex` seed) and survives in the stored trace.
+            // Passing an empty map here would let any legacy
+            // `Untyped(x | CONST_BIT)` operand fall through
+            // `OpTypeIndex::opref_type_at`'s constant_types miss to the
+            // hard-panic boundary (`history.py:220` parity), so reuse
+            // the saved map instead.
             let type_index = majit_ir::OpTypeIndex::new(
                 &root_trace.inputargs,
                 &root_trace.ops,

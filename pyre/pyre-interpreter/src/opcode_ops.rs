@@ -25,7 +25,27 @@ pub fn binary_value(
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),
         BinaryOperator::And | BinaryOperator::InplaceAnd => and_(a, b),
-        BinaryOperator::Or | BinaryOperator::InplaceOr => or_(a, b),
+        BinaryOperator::Or => or_(a, b),
+        BinaryOperator::InplaceOr => {
+            // `pypy/objspace/std/dictproxyobject.py:67 descr_ior` —
+            // mappingproxy `__ior__` raises TypeError unconditionally
+            // (the proxy is read-only, in-place merge cannot be
+            // honoured even if `__or__` would accept the rhs).  PyPy
+            // `descroperation.inplace_or` tries `__ior__` first; for
+            // mappingproxy that resolves to the raise, so the
+            // surrounding INPLACE_OR opcode propagates.  Pyre's
+            // dispatcher otherwise routes Inplace/non-Inplace to the
+            // same `or_`, so detect proxy LHS up front to preserve the
+            // raise.
+            unsafe {
+                if pyre_object::is_dict_proxy(a) {
+                    return Err(PyError::type_error(
+                        "'|=' is not supported by mappingproxy; use '|' instead",
+                    ));
+                }
+            }
+            or_(a, b)
+        }
         BinaryOperator::Xor | BinaryOperator::InplaceXor => xor(a, b),
         BinaryOperator::Subscr => getitem(a, b),
         _ => Err(PyError::type_error(format!(

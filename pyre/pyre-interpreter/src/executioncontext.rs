@@ -1445,20 +1445,24 @@ impl ExecutionContext {
             return cached;
         }
         let ns_ptr = &self.builtins as *const DictStorage as *mut u8;
-        let module = pyre_object::w_module_new("builtins", ns_ptr);
-        // Bind the back-mirror so post-init `dict_storage_store` writes
-        // on `self.builtins` (rare — most updates flow through the
-        // `W_DictObject`'s forward proxy hook) and the canonical
-        // initial fill (`install_default_builtins`) both surface in
-        // `space.builtin.__dict__.keys()` / `items()` /
-        // `del space.builtin.__dict__[name]`.  The cast strips `&self`
-        // const; this is safe because the EC keeps `self.builtins`
+        // PyPy `module.py:77 Module.getdict()` parity: single
+        // `W_DictMultiObject` per storage.  Reuse the canonical
+        // W_DictObject already paired (via `dict_storage_to_dict`'s
+        // lazy mirror_target registration) instead of allocating a
+        // fresh one through `w_module_new` (which would create a
+        // sibling W_DictObject and conflict with any earlier
+        // `dict_storage_to_dict` call on this storage).  The cast
+        // strips `&self` const; safe because the EC keeps `self.builtins`
         // alive for the program's lifetime and `mirror_target` is the
-        // only field touched (no race against `&self.builtins`
-        // readers).
-        unsafe {
-            crate::bind_module_back_mirror(ns_ptr as *mut DictStorage, module);
-        }
+        // only field touched.
+        let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr as *const DictStorage);
+        // `module.py:24 self.setdictvalue(space, '__name__', w_name)` —
+        // a single setitem inside `Module.__init__`.  Pyre routes that
+        // seed through `w_module_new_aliasing_dict`, which performs the
+        // setitem on the supplied W_DictObject when `name` is non-empty.
+        // Issuing a second `w_dict_setitem_str` here would be an extra
+        // storage-watcher invalidation with no PyPy counterpart.
+        let module = pyre_object::w_module_new_aliasing_dict("builtins", ns_ptr, canonical);
         self.builtin_dict_cache.set(module);
         module
     }

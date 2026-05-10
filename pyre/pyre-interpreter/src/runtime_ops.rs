@@ -652,62 +652,6 @@ pub fn dict_storage_delete(namespace: &mut DictStorage, name: &str) -> bool {
     namespace.remove(name).is_some()
 }
 
-/// Bind a Module's W_DictObject as the storage's back-mirror target,
-/// pre-populating the W_DictObject's entries Vec from any existing
-/// storage entries.  After this call, `dict_storage_store(storage,
-/// k, v)` mirrors into `w_module.w_dict.entries` automatically (via
-/// `DictStorage::insert` / `set_mirror_target` round-trip), so dict
-/// methods (`keys`, `values`, `items`, `del module.__dict__[k]`)
-/// stay in step with storage-side `STORE_NAME` / `STORE_GLOBAL` /
-/// `DELETE_NAME` writes — restoring `pypy/interpreter/module.py:77
-/// Module.getdict()` parity where the W_DictMultiObject IS the
-/// authoritative state.
-///
-/// Pre-population uses `w_dict_setitem_str_no_proxy` so the initial
-/// pass does not fire the forward storage-proxy store hook back into
-/// the same storage (idempotent but redundant, and would re-trigger
-/// slot watchers).
-///
-/// # Safety
-/// Caller must ensure `storage_ptr` and `w_module` outlive the
-/// binding.  The storage's `mirror_target` is a raw `PyObjectRef`
-/// with no managed lifetime; clear it (`set_mirror_target(PY_NULL)`)
-/// before either side drops.
-pub unsafe fn bind_module_back_mirror(storage_ptr: *mut DictStorage, w_module: PyObjectRef) {
-    if storage_ptr.is_null() || w_module.is_null() {
-        return;
-    }
-    let w_dict = pyre_object::w_module_get_w_dict(w_module);
-    if w_dict.is_null() {
-        return;
-    }
-    // For Modules built via `w_module_new_aliasing_dict`
-    // (`moduledef.py:102-103 Module(space, None, w_builtin)` parity),
-    // `w_dict` may be a dict subclass instance (`W_InstanceObject`
-    // with a `__dict_data__` backing dict).  Resolve to the actual
-    // `W_DictObject` so the back-mirror setitem/delitem land on the
-    // dict that the storage_proxy already addresses.
-    let backing = crate::type_methods::resolve_dict_backing(w_dict);
-    if backing.is_null() {
-        return;
-    }
-    let storage = &mut *storage_ptr;
-    // Pre-populate the backing W_DictObject's entries Vec from any
-    // existing storage entries (`install_default_builtins` writes, the
-    // post-`parse_source_module` pre-`exec_code_module` namespace
-    // seed, etc.).  Without this pass the W_DictObject would only see
-    // storage entries via the read-through hook, leaving `keys()` /
-    // `items()` / `len()` underreporting the canonical state.
-    let snapshot: Vec<(String, PyObjectRef)> = storage
-        .entries()
-        .map(|(k, v)| (k.to_string(), *v))
-        .collect();
-    for (name, value) in snapshot {
-        pyre_object::dictobject::w_dict_setitem_str_no_proxy(backing, &name, value);
-    }
-    storage.set_mirror_target(backing);
-}
-
 pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
     unsafe {
         if is_tuple(seq) {

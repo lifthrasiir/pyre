@@ -845,6 +845,18 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
         if is_dict(obj) {
             return obj;
         }
+        // `pypy/objspace/std/dictproxyobject.py:75-82 keys_w/values_w/
+        // items_w` forward through `space.call_method(self.w_mapping,
+        // ...)` — the mapping is unwrapped before any dict-method
+        // dispatch.  Surface the same shape here so
+        // `dict_method_{keys,values,items,get,copy,update,...}` work
+        // on `type.__dict__` without per-method proxy plumbing.
+        if pyre_object::is_dict_proxy(obj) {
+            let inner = pyre_object::w_dict_proxy_get_mapping(obj);
+            if !inner.is_null() && pyre_object::is_dict(inner) {
+                return inner;
+            }
+        }
         if is_instance(obj) {
             if let Ok(backing) = crate::baseobjspace::getattr(obj, "__dict_data__") {
                 if is_dict(backing) {
@@ -872,11 +884,11 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// Routes through `w_dict_items` so the storage-proxy union view
 /// (`Module.__dict__.keys()` reaching every binding the storage
 /// owns, not just the entries Vec) matches PyPy's single
-/// W_DictMultiObject.  The back-mirror wired in
-/// `bind_module_back_mirror` keeps entries Vec in sync with
-/// storage on writes/deletes; the union here is the safety net for
-/// dicts whose proxy was set without a back-mirror (rare but
-/// possible for transient `globals()` views).
+/// W_DictMultiObject.  Storage→entries Vec back-mirror is wired
+/// inside `dict_storage_to_dict` (the lazy canonical pairing point);
+/// the union here is the safety net for dicts whose proxy was set
+/// without a registered mirror_target (rare but possible for
+/// transient `globals()` views).
 pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     assert!(!args.is_empty());
     let dict = resolve_dict_backing(args[0]);
@@ -922,6 +934,31 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             .collect();
         Ok(w_list_new(items))
     }
+}
+
+/// `pypy/objspace/std/dictmultiobject.py descr_copy` — shallow copy
+/// returning a fresh `W_DictObject` with the same (k, v) pairs.  Used
+/// by `dict.copy()` and (via `resolve_dict_backing` proxy unwrap) by
+/// `mappingproxy.copy()` (`dictproxyobject.py:84 copy_w`).  Mirrors
+/// the inline closure that previously lived in `init_dict_type`.
+pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_dict_new());
+    }
+    let src = resolve_dict_backing(args[0]);
+    if src.is_null() {
+        return Ok(pyre_object::w_dict_new());
+    }
+    let dst = pyre_object::w_dict_new();
+    unsafe {
+        // Walk the union view so storage-proxy entries (e.g. on a
+        // `module.__dict__` source) make it into the copy alongside
+        // entries Vec slots.
+        for (k, v) in pyre_object::w_dict_items(src) {
+            w_dict_store(dst, k, v);
+        }
+    }
+    Ok(dst)
 }
 
 /// PyPy: dictobject.py descr_update — dict.update(other)

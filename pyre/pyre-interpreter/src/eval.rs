@@ -234,11 +234,13 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
                 visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
                 // pyframe.py:115-116 `self.builtin = ...` — the picked
-                // builtin Module is a GC root.  Pyre stashes its identity
-                // on `frame.w_builtin` so `frame.get_builtin()` returns
-                // the same object PyPy would.  (The companion
-                // `frame.builtin` is a `*mut DictStorage` — not a
-                // GCREF — used only by the LOAD_GLOBAL fast path.)
+                // builtin Module is a GC root.  Pyre stores it on
+                // `frame.w_builtin` so `frame.get_builtin()` returns
+                // the same object PyPy would; the LOAD_GLOBAL fallback
+                // (`load_global_value` at eval.rs) reaches the
+                // builtin's globals through `w_module_get_w_dict(self
+                // .w_builtin)` — there is no separate storage-keyed
+                // fast path field anymore.
                 let w_builtin_slot = &mut (*(frame)).w_builtin as *mut PyObjectRef;
                 visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
                 // pyframe.py:147 `debugdata.w_locals` (and the pyre-only
@@ -858,21 +860,14 @@ impl NamespaceOpcodeHandler for PyFrame {
             return Ok(value);
         }
         // pyopcode.py:921 `w_value = self.get_builtin().getdictvalue
-        // (self.space, varname)`.  pyre caches the picked builtin's
-        // backing storage in `frame.builtin` (a `*mut DictStorage`) so
-        // the fallback is one `dict_storage_get` — equivalent to PyPy's
-        // `module.getdictvalue` walking `module.w_dict` for the str key.
-        if !self.builtin.is_null() {
-            if let Some(value) = crate::dict_storage_get(unsafe { &*self.builtin }, name) {
-                return Ok(value);
-            }
-        } else if !self.w_builtin.is_null() && unsafe { pyre_object::is_module(self.w_builtin) } {
-            // moduledef.py:102-103 dict-subclass `__builtins__` case:
-            // `pick_builtin` returns a Module wrapping the user dict
-            // with NULL storage — go through the W_DictObject so a
-            // dict subclass `__getitem__` override surfaces and PyPy
-            // `module.getdictvalue` re-raise behaviour
-            // (`baseobjspace.py:870 finditem`) is honoured.
+        // (self.space, varname)`.  PyPy walks `module.w_dict` for the
+        // str key — pyre routes through `space.finditem_str` on the
+        // picked Module's `w_dict` so that a dict-subclass `__builtins__`
+        // (`moduledef.py:102-103`) honours the subclass `__getitem__`
+        // override.  For normal Modules backed by storage this hits the
+        // same hash index via `w_dict_getitem_str` → storage-proxy
+        // read-through, matching `module.getdictvalue`.
+        if !self.w_builtin.is_null() && unsafe { pyre_object::is_module(self.w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(self.w_builtin) };
             if !w_dict.is_null() {
                 if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {

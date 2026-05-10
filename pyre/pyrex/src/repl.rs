@@ -60,13 +60,16 @@ pub fn run_repl(quiet: bool) {
     );
     let namespace = Box::into_raw(namespace);
 
-    let main_module = pyre_object::moduleobject::w_module_new("__main__", namespace as *mut u8);
-    // Bind storage→W_DictObject back-mirror so REPL STORE_NAME writes
-    // surface in `__main__.__dict__`'s keys/items/lookups (PyPy
-    // `module.py:77 Module.getdict()` parity).
-    unsafe {
-        pyre_interpreter::bind_module_back_mirror(namespace, main_module);
-    }
+    // PyPy `module.py:77 Module.getdict()` parity: reuse the canonical
+    // W_DictObject paired with this storage so REPL STORE_NAME writes,
+    // `globals()`, `f.__globals__`, and `__main__.__dict__` all share
+    // one identity.
+    let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(namespace);
+    let main_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+        "__main__",
+        namespace as *mut u8,
+        canonical,
+    );
     importing::set_sys_module("__main__", main_module);
 
     let sys_module = match importing::importhook(
@@ -361,14 +364,17 @@ mod tests {
         namespace.fix_ptr();
         pyre_interpreter::dict_storage_store(&mut namespace, "ps1", pyre_object::w_str_new("py> "));
         let ns_ptr = Box::into_raw(namespace);
-        let sys_module = pyre_object::moduleobject::w_module_new("sys", ns_ptr as *mut u8);
-        // bind_module_back_mirror pre-populates the W_DictObject entries
-        // Vec from the storage so getattr → finditem_str(w_dict, ...)
-        // sees the pre-existing `ps1` binding without depending on the
-        // storage-proxy lookup hook (not registered in this test).
-        unsafe {
-            pyre_interpreter::bind_module_back_mirror(ns_ptr, sys_module);
-        }
+        // Use the canonical W_DictObject paired with the storage so
+        // `read_prompt` → `getattr` → `finditem_str(w_dict, ...)` sees
+        // the pre-existing `ps1` binding via the entries Vec snapshot
+        // populated by `dict_storage_to_dict`'s lazy mirror_target
+        // registration.
+        let canonical = pyre_interpreter::baseobjspace::dict_storage_to_dict(ns_ptr);
+        let sys_module = pyre_object::moduleobject::w_module_new_aliasing_dict(
+            "sys",
+            ns_ptr as *mut u8,
+            canonical,
+        );
 
         assert_eq!(read_prompt(sys_module, "ps1").as_deref(), Some("py> "));
     }

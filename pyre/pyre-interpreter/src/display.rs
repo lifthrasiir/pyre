@@ -147,6 +147,14 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
         } else if std::ptr::eq(tp, &MODULE_TYPE as *const PyType) {
             let name = pyre_object::w_module_get_name(obj);
             format!("<module '{name}'>")
+        } else if std::ptr::eq(
+            tp,
+            &pyre_object::pyobject::MAPPING_PROXY_TYPE as *const PyType,
+        ) {
+            // `pypy/objspace/std/dictproxyobject.py:47 descr_repr` →
+            // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`.
+            let inner = pyre_object::w_dict_proxy_get_mapping(obj);
+            format!("mappingproxy({})", py_repr(inner))
         } else if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType) {
             // Try __repr__ first, then __str__
             if let Some(s) = try_call_dunder(obj, "__repr__") {

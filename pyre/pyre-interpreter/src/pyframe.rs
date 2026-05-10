@@ -101,19 +101,33 @@ pub struct PyFrame {
     /// pyre runs as if the option were always on, matching CPython's
     /// unconditional `__builtins__` honoring).  Cached at frame creation
     /// from `globals['__builtins__']` and consulted by LOAD_GLOBAL's
-    /// builtins fallback (`pyopcode.py:918-927`).  PyPy stores this as a
-    /// `Module` reference; pyre keeps a `*mut DictStorage` for the fast
-    /// storage-keyed `dict_storage_get` LOAD_GLOBAL fallback.  The
-    /// companion `w_builtin` carries the Module identity.
-    pub builtin: *mut DictStorage,
-    /// Companion to `builtin`: the picked `PyObjectRef` (Module wrapping
-    /// the dict, or the default Module) returned by the PyPy-shaped
-    /// `pick_builtin(w_globals)`.  Mirrors PyPy `frame.builtin`'s
-    /// identity — `frame.get_builtin()` returns this directly so callers
-    /// (`exec`'s `setdefault('__builtins__', self.get_builtin())` at
+    /// builtins fallback (`pyopcode.py:918-927`) via
+    /// `space.finditem_str(self.w_builtin.w_dict, name)` — honouring
+    /// dict subclass `__getitem__` overrides (`moduledef.py:102-103`)
+    /// without an extra storage-keyed fast path.  `frame.get_builtin()`
+    /// returns this directly so callers (`exec`'s
+    /// `setdefault('__builtins__', self.get_builtin())` at
     /// `pyopcode.py:773-774`) see the picked Module, not the EC's
     /// default builtin.
     pub w_builtin: PyObjectRef,
+    /// Lazy-resolved canonical W_DictObject for `self.w_globals`.
+    ///
+    /// `pypy/interpreter/pyframe.py:49 self.w_globals = w_globals`
+    /// stores the dict object directly — PyPy never carries a parallel
+    /// raw storage handle.  Pyre's split DictStorage / W_DictObject
+    /// model keeps the storage pointer in `w_globals` (the JIT layout
+    /// offset reads it for STORE/LOAD_GLOBAL), and this slot caches
+    /// the canonical sibling W_DictObject so `frame.w_globals_obj()`
+    /// resolves to the same identity as `function.__globals__` and
+    /// `module.__dict__`.  Initialised lazily — `PY_NULL` until the
+    /// first reader calls `get_w_globals_obj()`, which performs the
+    /// `dict_storage_to_dict` lookup once and stores the result here.
+    /// Migration milestone for the eventual `w_globals: PyObjectRef`
+    /// type unification (Phase 5+ Task 1) — once every reader (incl.
+    /// JIT vable replay) routes through this slot, the raw storage
+    /// pointer becomes derivable from the W_DictObject's
+    /// `dict_storage_proxy` and the legacy field can retire.
+    pub w_globals_obj: PyObjectRef,
 }
 
 /// GC type id for `PyFrame`. Reserved ahead of any callsite that allocates
@@ -481,14 +495,17 @@ pub const PYFRAME_W_YIELDING_FROM_OFFSET: usize = std::mem::offset_of!(PyFrame, 
 /// reachable through this pointer.
 pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_backref);
 
-/// Byte offset of `builtin` in `PyFrame` (the picked storage_ptr — the
-/// `*mut DictStorage` consulted by the LOAD_GLOBAL builtins fast path).
-pub const PYFRAME_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, builtin);
-
 /// Byte offset of `w_builtin` in `PyFrame` (the picked builtin Module).
 /// Read by the descr GC walker so a collection survives across the
 /// guard exit / re-entry edge.
 pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_builtin);
+
+/// Byte offset of `w_globals_obj` in `PyFrame` — the canonical
+/// W_DictObject paired with the storage in `w_globals`.  Registered
+/// as a GC-traceable slot so a minor collection forwards the pointer
+/// when the dict survives.  The slot is lazy: `PY_NULL` until
+/// `get_w_globals_obj` resolves it.
+pub const PYFRAME_W_GLOBALS_OBJ_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals_obj);
 
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -566,6 +583,33 @@ impl PyFrame {
             Some(data) => data.w_globals,
             None => unsafe { crate::w_code_get_w_globals(self.pycode as PyObjectRef) },
         }
+    }
+
+    /// Resolve the canonical W_DictObject paired with `self.w_globals`,
+    /// caching the result in the adjacent `w_globals_obj` slot.
+    ///
+    /// PyPy `pyframe.py:49 self.w_globals = w_globals` stores the dict
+    /// object directly so the equivalent question never arises there.
+    /// Pyre's split storage / W_DictObject layout means callers that
+    /// want object identity (`function.__globals__ is frame.f_globals`,
+    /// `globals() is module.__dict__`, etc.) need the canonical
+    /// W_DictObject sibling.  `dict_storage_to_dict` returns the same
+    /// instance on every call (`mirror_target` invariant), and the
+    /// cache field skips the lookup on subsequent calls.
+    ///
+    /// Returns `PY_NULL` when `w_globals` is null (test stubs); callers
+    /// that expect a dict should null-check before dereferencing.
+    pub fn get_w_globals_obj(&mut self) -> PyObjectRef {
+        if !self.w_globals_obj.is_null() {
+            return self.w_globals_obj;
+        }
+        let storage = self.get_w_globals();
+        if storage.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        let resolved = crate::baseobjspace::dict_storage_to_dict(storage);
+        self.w_globals_obj = resolved;
+        resolved
     }
 
     /// pyframe.py:135 get_w_f_trace
@@ -847,12 +891,7 @@ impl PyFrame {
         let size = nlocals + ncells + 16; // small stack
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
-        // Single split-adapter call — for the dict-subclass
-        // `__builtins__` arm this allocates a wrapping Module, so
-        // two independent `pick_builtin` calls would build it twice.
-        // PyPy stores a single `self.builtin = pick_builtin(w_globals)`;
-        // the adapter surfaces both halves of pyre's split storage.
-        let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
+        let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -870,8 +909,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            builtin: __pick.0,
-            w_builtin: __pick.1,
+            w_builtin,
+            w_globals_obj: PY_NULL,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -960,7 +999,7 @@ impl PyFrame {
 
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
-        let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
+        let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -978,8 +1017,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            builtin: __pick.0,
-            w_builtin: __pick.1,
+            w_builtin,
+            w_globals_obj: PY_NULL,
         };
         if stores_global {
             frame.getorcreate_debug_data(-1).w_globals = w_globals;
@@ -1015,8 +1054,8 @@ impl PyFrame {
             f_generator_nowref: self.f_generator_nowref,
             w_yielding_from: self.w_yielding_from,
             f_backref: self.f_backref,
-            builtin: self.builtin,
             w_builtin: self.w_builtin,
+            w_globals_obj: self.w_globals_obj,
         });
         // fix_array_ptrs AFTER Box allocation: inline_buf ptr must
         // point to the heap-allocated frame, not a stale stack address.
@@ -1945,7 +1984,7 @@ impl PyFrame {
         let stores_global =
             unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, globals) };
 
-        let __pick = crate::baseobjspace::pick_builtin_pair(globals, execution_context);
+        let w_builtin = crate::baseobjspace::pick_builtin(globals, execution_context);
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
@@ -1961,8 +2000,8 @@ impl PyFrame {
             f_generator_nowref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            builtin: __pick.0,
-            w_builtin: __pick.1,
+            w_builtin,
+            w_globals_obj: PY_NULL,
         };
         frame.init_cells();
         if stores_global {
@@ -2171,7 +2210,7 @@ pub fn createframe(
         unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
 
     let size = num_locals + ncellvars + nfreevars + max_stack;
-    let __pick = crate::baseobjspace::pick_builtin_pair(w_globals, execution_context);
+    let w_builtin = crate::baseobjspace::pick_builtin(w_globals, execution_context);
     let mut frame = Box::new(PyFrame {
         execution_context,
         pycode: code,
@@ -2187,8 +2226,8 @@ pub fn createframe(
         f_generator_nowref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
-        builtin: __pick.0,
-        w_builtin: __pick.1,
+        w_builtin,
+        w_globals_obj: PY_NULL,
     });
     if stores_global {
         frame.getorcreate_debug_data(-1).w_globals = w_globals;

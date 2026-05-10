@@ -47,6 +47,17 @@ pub struct Function {
     pub w_kw_defs: PyObjectRef,
     /// function.py:56 — `self.w_module = None`
     pub w_module: PyObjectRef,
+    /// Lazy-resolved canonical W_DictObject sibling for `w_func_globals`.
+    ///
+    /// `function.py:57 self.w_func_globals = w_globals` stores the dict
+    /// object directly in PyPy.  Pyre keeps the storage pointer in
+    /// `w_func_globals` (JIT call-site layout reads it for createframe)
+    /// and caches the canonical W_DictObject here once resolved, so
+    /// `function.__globals__` returns the same identity as the module's
+    /// `__dict__` and frames built from this function share globals.
+    /// `PY_NULL` until `function_get_globals_obj()` performs the
+    /// `dict_storage_to_dict` lookup once.
+    pub w_func_globals_obj: PyObjectRef,
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -71,6 +82,10 @@ pub const FUNCTION_DEFS_W_OFFSET: usize = std::mem::offset_of!(Function, defs_w)
 pub const FUNCTION_W_KW_DEFS_OFFSET: usize = std::mem::offset_of!(Function, w_kw_defs);
 /// Field offset of `w_module` within `Function`.
 pub const FUNCTION_W_MODULE_OFFSET: usize = std::mem::offset_of!(Function, w_module);
+/// Field offset of `w_func_globals_obj` within `Function` — the
+/// lazy-cached canonical W_DictObject for `w_func_globals`.
+pub const FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET: usize =
+    std::mem::offset_of!(Function, w_func_globals_obj);
 
 /// GC type id assigned to `Function` at JitDriver init time. Held as
 /// a constant alongside the struct (rather than runtime-queried) so
@@ -108,12 +123,17 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// W_FloatObject leave the typeptr-shaped header field out of their
 /// `gc_ptr_offsets`. W_TypeObject instances are static-region and
 /// not subject to nursery relocation.
-pub const FUNCTION_GC_PTR_OFFSETS: [usize; 5] = [
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 6] = [
     FUNCTION_CODE_OFFSET,
     FUNCTION_CLOSURE_OFFSET,
     FUNCTION_DEFS_W_OFFSET,
     FUNCTION_W_KW_DEFS_OFFSET,
     FUNCTION_W_MODULE_OFFSET,
+    // Lazy-cached canonical W_DictObject sibling for the storage in
+    // `w_func_globals`.  Once resolved it must survive minor
+    // collection — the `dict_storage_to_dict` mirror_target invariant
+    // keeps the same identity across the function's lifetime.
+    FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
 ];
 
 impl pyre_object::lltype::GcType for Function {
@@ -183,6 +203,7 @@ fn function_new_impl(
         defs_w: PY_NULL,
         w_kw_defs: PY_NULL,
         w_module: PY_NULL,
+        w_func_globals_obj: PY_NULL,
     }) as PyObjectRef
 }
 
@@ -399,6 +420,36 @@ pub unsafe fn fget_func_name(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn function_get_globals(obj: PyObjectRef) -> *mut DictStorage {
     unsafe { (*(obj as *const Function)).w_func_globals }
+}
+
+/// Resolve the canonical W_DictObject paired with `function.w_func_globals`,
+/// caching the result in the adjacent `w_func_globals_obj` slot.
+///
+/// `function.py:57 self.w_func_globals = w_globals` stores the dict
+/// object directly in PyPy.  Pyre's split storage / W_DictObject
+/// model means callers that want object identity
+/// (`function.__globals__ is module.__dict__`,
+/// `f.__globals__ is g.__globals__` for sibling closures) need to
+/// reach the canonical sibling.  `dict_storage_to_dict` returns the
+/// same instance per storage (`mirror_target` invariant), and the
+/// cache field skips the lookup on subsequent calls.
+///
+/// Returns `PY_NULL` when `w_func_globals` is null (zero-arg test
+/// stubs); callers should null-check before dereferencing.
+///
+/// # Safety
+/// `obj` must point to a valid `Function`.
+pub unsafe fn function_get_globals_obj(obj: PyObjectRef) -> PyObjectRef {
+    let func = unsafe { &mut *(obj as *mut Function) };
+    if !func.w_func_globals_obj.is_null() {
+        return func.w_func_globals_obj;
+    }
+    if func.w_func_globals.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let resolved = crate::baseobjspace::dict_storage_to_dict(func.w_func_globals);
+    func.w_func_globals_obj = resolved;
+    resolved
 }
 
 /// Get the closure tuple from a function object.
@@ -1211,6 +1262,7 @@ mod tests {
                 std::mem::offset_of!(Function, defs_w),
                 std::mem::offset_of!(Function, w_kw_defs),
                 std::mem::offset_of!(Function, w_module),
+                std::mem::offset_of!(Function, w_func_globals_obj),
             ]
         );
     }
