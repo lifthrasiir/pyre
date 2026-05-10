@@ -4461,7 +4461,16 @@ impl TraceCtx {
                 .as_ref()
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
-        self.record_op_with_descr(OpCode::call_assembler_for_type(result_type), args, descr)
+        let opcode = OpCode::call_assembler_for_type(result_type);
+        let result = self.record_op_with_descr(opcode, args, descr);
+        // pyjitpl.py:2072 heapcache.invalidate_caches_varargs(opnum1, descr,
+        // allboxes).  RPython uses CALL_MAY_FORCE_* as the opnum for
+        // invalidation, but CALL_ASSEMBLER_* falls through to
+        // reset_keep_likely_virtuals in heapcache.py:372-376 — same path as
+        // CALL_MAY_FORCE_*.
+        self.heap_cache
+            .invalidate_caches_varargs(opcode, None, args);
+        result
     }
 
     pub fn call_assembler_void_by_number_typed(

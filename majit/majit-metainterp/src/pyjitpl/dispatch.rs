@@ -1260,6 +1260,52 @@ where
         self.unwind_to_exception_handler(ctx)
     }
 
+    /// pyjitpl.py:3380-3398 handle_possible_exception parity for
+    /// CALL_ASSEMBLER_* arms.  CALL_ASSEMBLER always can raise (the
+    /// callee is arbitrary compiled code), so there is no
+    /// `check_can_raise` gate — the exception path is unconditional.
+    fn finish_call_assembler_exception_path(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+    ) -> TraceAction {
+        let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+        let resume_pc = self.frames.current_mut().pc;
+
+        if exc == 0 {
+            self.record_state_guard(
+                ctx,
+                sym,
+                OpCode::GuardNoException,
+                &[],
+                resume_pc,
+                /* after_residual_call */ true,
+            );
+            return TraceAction::Continue;
+        }
+
+        self.last_exception_value = exc;
+        self.class_of_last_exc_is_const = false;
+        let class_is_const = self.class_of_last_exc_is_const;
+        let typeptr = self.read_typeptr_from_exception(exc);
+        let exc_class_box = ctx.const_int(typeptr);
+        let guard_op = self.record_state_guard(
+            ctx,
+            sym,
+            OpCode::GuardException,
+            &[exc_class_box],
+            resume_pc,
+            /* after_residual_call */ true,
+        );
+        self.last_exception_box = Some(if class_is_const {
+            ctx.const_ref(exc)
+        } else {
+            guard_op
+        });
+        self.class_of_last_exc_is_const = true;
+        self.unwind_to_exception_handler(ctx)
+    }
+
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         // Stable program-pc anchor for state-field-JIT snapshots — the
         // outer interpreter pc that `trace_jitcode` was invoked with.
@@ -3686,6 +3732,17 @@ where
             // assembler-token path is not in the canonical *_v family
             // and Slice 4 of pyre-call-family-canonical-migration.md
             // owns its migration.
+            // pyjitpl.py:1376-1432 _opimpl_recursive_call →
+            // do_recursive_call → do_residual_call(assembler_call=True).
+            // RPython's assembler_call path (py:2007-2083) unconditionally
+            // enters the vable/guard sequence:
+            //   1. clear_exception
+            //   2. vable_and_vrefs_before_residual_call
+            //   3. execute (CALL_MAY_FORCE_N via executor.execute_varargs)
+            //   4. vrefs_after_residual_call  (PRE-EXISTING-ADAPTATION: stub)
+            //   5. record (CALL_ASSEMBLER_N via direct_assembler_call)
+            //   6. vable_after_residual_call + GUARD_NOT_FORCED
+            //   7. handle_possible_exception (GUARD_NO_EXCEPTION / unwind)
             jitcode::insns::BC_CALL_ASSEMBLER_VOID => {
                 let (fn_ptr_idx, arg_regs) = {
                     let frame = self.frames.current_mut();
@@ -3713,8 +3770,29 @@ where
                     .current_mut()
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
-                ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types);
+                // 1. clear_exception (pyjitpl.py:2010)
+                self.clear_exception();
+                // 2. vable_and_vrefs_before_residual_call (pyjitpl.py:2017)
+                let active_vable =
+                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                // 3. execute (pyjitpl.py:2039-2042, tp == 'v')
                 call_void_function(concrete_ptr, &concrete_args);
+                // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
+                //    direct_assembler_call → history.record_nospec)
+                ctx.call_assembler_void_by_number_typed(token_number, &args, &arg_types);
+                // 6. vable_after_residual_call + GUARD_NOT_FORCED
+                //    (pyjitpl.py:2078-2079)
+                if matches!(
+                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    TraceAction::Abort
+                ) {
+                    return TraceAction::Abort;
+                }
+                // 7. handle_possible_exception (pyjitpl.py:2082)
+                match self.finish_call_assembler_exception_path(ctx, sym) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
             jitcode::insns::BC_COND_CALL_VOID
@@ -3887,6 +3965,9 @@ where
             // calldescr's `check_is_elidable()` and routes through
             // `record_result_of_call_pure`.  Only BC_CALL_ASSEMBLER_INT
             // survives here.
+            // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
+            // with tp == 'i'. See BC_CALL_ASSEMBLER_VOID for the full
+            // RPython sequence citation.
             jitcode::insns::BC_CALL_ASSEMBLER_INT => {
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
@@ -3915,10 +3996,23 @@ where
                     .current_mut()
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
+                self.clear_exception();
+                let active_vable =
+                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let concrete = call_int_function(concrete_ptr, &concrete_args);
                 let traced =
                     ctx.call_assembler_int_by_number_typed(token_number, &args, &arg_types);
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
                 self.set_int_reg(dst, Some(traced), Some(concrete));
+                if matches!(
+                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    TraceAction::Abort
+                ) {
+                    return TraceAction::Abort;
+                }
+                match self.finish_call_assembler_exception_path(ctx, sym) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             // -- Ref-typed bytecodes ----
             // RPython `blackhole.py:641-643` `bhimpl_ref_copy`. `[src][dst]` per `r>r`.
@@ -3932,6 +4026,8 @@ where
             }
             // Parity #14 Slice C.5 retired the Pure half — see the Int
             // sibling above for the full rationale.
+            // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
+            // with tp == 'r'. See BC_CALL_ASSEMBLER_VOID for citation.
             jitcode::insns::BC_CALL_ASSEMBLER_REF => {
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
@@ -3960,10 +4056,23 @@ where
                     .current_mut()
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
+                self.clear_exception();
+                let active_vable =
+                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let concrete = call_int_function(concrete_ptr, &concrete_args);
                 let traced =
                     ctx.call_assembler_ref_by_number_typed(token_number, &args, &arg_types);
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
                 self.set_ref_reg(dst, Some(traced), Some(concrete));
+                if matches!(
+                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    TraceAction::Abort
+                ) {
+                    return TraceAction::Abort;
+                }
+                match self.finish_call_assembler_exception_path(ctx, sym) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             // -- Float-typed bytecodes ---
             // RPython `blackhole.py:644-646` `bhimpl_float_copy`. `[src][dst]` per `f>f`.
@@ -3977,6 +4086,8 @@ where
             }
             // Parity #14 Slice C.5 retired the Pure half — see the Int
             // sibling above for the full rationale.
+            // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
+            // with tp == 'f'. See BC_CALL_ASSEMBLER_VOID for citation.
             jitcode::insns::BC_CALL_ASSEMBLER_FLOAT => {
                 let (fn_ptr_idx, dst, arg_regs) = {
                     let frame = self.frames.current_mut();
@@ -4005,10 +4116,23 @@ where
                     .current_mut()
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
+                self.clear_exception();
+                let active_vable =
+                    self.prepare_standard_virtualizable_before_residual_call(ctx);
+                let concrete = call_int_function(concrete_ptr, &concrete_args);
                 let traced =
                     ctx.call_assembler_float_by_number_typed(token_number, &args, &arg_types);
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
                 self.set_float_reg(dst, Some(traced), Some(concrete));
+                if matches!(
+                    Self::finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
+                    TraceAction::Abort
+                ) {
+                    return TraceAction::Abort;
+                }
+                match self.finish_call_assembler_exception_path(ctx, sym) {
+                    TraceAction::Continue => {}
+                    action => return action,
+                }
             }
             jitcode::insns::BC_FLOAT_ADD => self.trace_binop_f(ctx, OpCode::FloatAdd),
             jitcode::insns::BC_FLOAT_SUB => self.trace_binop_f(ctx, OpCode::FloatSub),
