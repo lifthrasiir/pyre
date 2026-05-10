@@ -1773,9 +1773,18 @@ fn init_dict_type(ns: &mut DictStorage) {
             if !args.is_empty() {
                 let d = crate::type_methods::resolve_dict_backing(args[0]);
                 if !d.is_null() {
-                    unsafe {
-                        let dict = &mut *(d as *mut pyre_object::dictobject::W_DictObject);
-                        (*dict.entries).clear();
+                    let keys: Vec<_> = unsafe { pyre_object::w_dict_items(d) }
+                        .into_iter()
+                        .filter_map(|(k, _)| {
+                            if unsafe { pyre_object::is_str(k) } {
+                                Some(unsafe { pyre_object::w_str_get_value(k).to_string() })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for key in &keys {
+                        unsafe { pyre_object::w_dict_delitem_str(d, key) };
                     }
                 }
             }
