@@ -1600,6 +1600,15 @@ impl<'a> Transformer<'a> {
         //
         // RPython reuses the same calldescr for both the op and callinfocollection.
         // We compute arg types once and clone for the collection.
+        //
+        // jtransform.py:2186 _handle_dict_lookup_call passes
+        // `extradescr=[cpu.fielddescrof(STRUCT, 'entries'), cpu.arraydescrof(STRUCT.entries.TO)]`
+        // derived from `op.args[1].concretetype.TO`. pyre's TypeResolutionState
+        // collapses lltype to four kinds, so the dict struct is not recoverable
+        // here — extradescrs stays None until full lltype propagation lands.
+        // OptHeap::_optimize_call_dict_lookup returns false on None extradescrs
+        // and the call falls through emit_residual_call (heap.py:472-475 emit
+        // → force_from_effectinfo on the call's own effectinfo).
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
         let result_ir_type = self.resolve_call_result(op.result, result_ty).ir_type;
         let descriptor = {

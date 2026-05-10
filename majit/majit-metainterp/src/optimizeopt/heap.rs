@@ -57,9 +57,30 @@ fn sort_array_index_entries_untranslated<T>(entries: &mut [(i64, T)]) {
     }
 }
 
-use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, descr::descr_identity};
+use majit_ir::{DescrRef, OopSpecIndex, Op, OpCode, OpRef, Value, descr::descr_identity};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
+
+/// util.py:100-128 args_dict() / args_eq(): same_box semantics — identity
+/// for non-Const boxes, value-equality for Const subclasses (history.py:204).
+/// Two distinct Const slots holding the same value must hash and compare
+/// equal so consecutive dict lookups with key `5` (encoded via different
+/// const slots) hit the cache.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum DictArgKey {
+    Const(Value),
+    Op(OpRef),
+}
+
+impl DictArgKey {
+    fn from_arg(arg: OpRef, ctx: &OptContext) -> Self {
+        let resolved = ctx.get_box_replacement(arg);
+        match ctx.get_constant(resolved) {
+            Some(value) => DictArgKey::Const(value),
+            None => DictArgKey::Op(resolved),
+        }
+    }
+}
 
 /// Cache key for a field access: (struct OpRef, field descriptor identity).
 ///
@@ -719,7 +740,9 @@ pub struct OptHeap {
     last_emitted_removed: bool,
     /// heap.py:337: cached_dict_reads — descr_identity(extradescrs[0]) → { [dict,key] → result_opref }.
     /// Consecutive dict lookups on the same dict+key are deduplicated.
-    cached_dict_reads: HashMap<usize, HashMap<[OpRef; 2], OpRef>>,
+    /// Inner key uses `DictArgKey` so Const args compare by value
+    /// (util.py:100 args_dict / args_eq via history.py:204 same_box).
+    cached_dict_reads: HashMap<usize, HashMap<[DictArgKey; 2], OpRef>>,
     /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] bitstring index → extradescrs[0] identity.
     /// Used in force_from_effectinfo to clear dict_reads when the entries array is written.
     corresponding_array_descrs: HashMap<u32, usize>,
@@ -1437,11 +1460,7 @@ impl OptHeap {
     /// FLAG_LOOKUP (0): always cache and reuse.
     /// FLAG_STORE  (1): don't cache new; reuse only if cached value ≥ 0.
     /// FLAG_DELETE (2+): never cache, never reuse.
-    fn _optimize_call_dict_lookup(
-        &mut self,
-        op: &Op,
-        ctx: &mut OptContext,
-    ) -> bool {
+    fn _optimize_call_dict_lookup(&mut self, op: &Op, ctx: &mut OptContext) -> bool {
         const FLAG_LOOKUP: i64 = 0;
         const FLAG_STORE: i64 = 1;
 
@@ -1473,19 +1492,34 @@ impl OptHeap {
         let descr1_id = descr_identity(&descrs[0]);
         let descr2_idx = descrs[1].index();
 
-        // heap.py:506-510: d = cached_dict_reads[descr1]; register corresponding_array_descrs
+        // heap.py:506-511 try/except KeyError:
+        //   try:
+        //       d = self.cached_dict_reads[descr1]
+        //   except KeyError:
+        //       d = self.cached_dict_reads[descr1] = args_dict()
+        //       self.corresponding_array_descrs[descrs[1]] = descr1
+        // The corresponding_array_descrs registration fires ONLY on the
+        // first encounter of `descr1` (the KeyError arm); repeated lookups
+        // skip it. Mirror this — `or_default()` would unconditionally
+        // re-register and diverge from RPython.
+        if !self.cached_dict_reads.contains_key(&descr1_id) {
+            self.cached_dict_reads.insert(descr1_id, HashMap::new());
+            self.corresponding_array_descrs
+                .insert(descr2_idx, descr1_id);
+        }
         let d = self
             .cached_dict_reads
-            .entry(descr1_id)
-            .or_default();
-        self.corresponding_array_descrs
-            .entry(descr2_idx)
-            .or_insert(descr1_id);
+            .get_mut(&descr1_id)
+            .expect("just inserted above when absent");
 
         // heap.py:513-514: key = [get_box_replacement(arg1), get_box_replacement(arg2)]
+        // util.py:100/127 args_dict() compares args via same_box: identity for
+        // non-Const, value-equality for Const (history.py:204). Encode each
+        // arg through DictArgKey so two ConstInt slots with the same value
+        // hash and compare equal.
         let key = [
-            ctx.get_box_replacement(op.arg(1)),
-            ctx.get_box_replacement(op.arg(2)),
+            DictArgKey::from_arg(op.arg(1), ctx),
+            DictArgKey::from_arg(op.arg(2), ctx),
         ];
 
         if let Some(&res_v) = d.get(&key) {
@@ -1509,6 +1543,33 @@ impl OptHeap {
             d.insert(key, op.pos);
         }
         false
+    }
+
+    /// heap.py:417-464 self.emit(op) → emitting_operation for is_call(op).
+    /// Generic residual-call emit path: mark args escaped, then route
+    /// through force_from_effectinfo / clean_caches / invalidate_for_escaped
+    /// per the same descr-aware policy as the catch-all `_` arm.
+    fn emit_residual_call(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        self.mark_escaped_varargs(op, ctx);
+        // heapcache.py:337-369 clear_caches_varargs.
+        // Plain residual calls preserve cache entries for unescaped
+        // allocations. Calls with explicit EffectInfo keep the more
+        // precise heap.py force_from_effectinfo path.
+        if op.descr.is_none() {
+            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+            self.invalidate_caches_for_escaped(ctx);
+        } else if Self::call_has_random_effects(op) {
+            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+            self.clean_caches(ctx);
+        } else {
+            // heap.py:537-571 force_from_effectinfo — selective cache
+            // invalidation using EffectInfo bitstrings.
+            self.force_from_effectinfo(op, ctx);
+        }
+        if Self::call_can_invalidate(op) {
+            self.seen_guard_not_invalidated = false;
+        }
+        OptimizationResult::Emit(op.clone())
     }
 
     /// Mark call arguments as escaped.
@@ -2638,16 +2699,16 @@ impl OptHeap {
         if opcode.is_call() {
             let oopspec = Self::get_oopspecindex(op);
             match oopspec {
-                // heap.py: DICT_LOOKUP caching — consecutive dict lookups
-                // on the same dict with the same key can be deduplicated.
+                // heap.py:472-475: DICT_LOOKUP caching — consecutive dict
+                // lookups on the same dict with the same key can be
+                // deduplicated. On a miss the call falls through to
+                // self.emit(op) → emitting_operation → force_from_effectinfo,
+                // identical to a non-DICT_LOOKUP residual call.
                 OopSpecIndex::DictLookup => {
-                    // heap.py:472-475: try caching first
                     if self._optimize_call_dict_lookup(op, ctx) {
                         return OptimizationResult::Remove;
                     }
-                    self.mark_escaped_varargs(op, ctx);
-                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                    return OptimizationResult::Emit(op.clone());
+                    return self.emit_residual_call(op, ctx);
                 }
                 OopSpecIndex::Arraycopy | OopSpecIndex::Arraymove => {
                     // ARRAYCOPY/ARRAYMOVE: only invalidate affected array entries.
@@ -2680,28 +2741,7 @@ impl OptHeap {
 
                     return OptimizationResult::Emit(op.clone());
                 }
-                _ => {
-                    self.mark_escaped_varargs(op, ctx);
-                    // heapcache.py:337-369 clear_caches_varargs
-                    // Plain residual calls preserve cache entries for
-                    // unescaped allocations. Calls with explicit EffectInfo
-                    // keep the more precise heap.py force_from_effectinfo path.
-                    if op.descr.is_none() {
-                        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                        self.invalidate_caches_for_escaped(ctx);
-                    } else if Self::call_has_random_effects(op) {
-                        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                        self.clean_caches(ctx);
-                    } else {
-                        // heap.py: force_from_effectinfo — selective cache
-                        // invalidation using EffectInfo bitstrings.
-                        self.force_from_effectinfo(op, ctx);
-                    }
-                    if Self::call_can_invalidate(op) {
-                        self.seen_guard_not_invalidated = false;
-                    }
-                    return OptimizationResult::Emit(op.clone());
-                }
+                _ => return self.emit_residual_call(op, ctx),
             }
         }
 
@@ -2983,16 +3023,8 @@ impl Default for OptHeap {
 
 impl Optimization for OptHeap {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        // Reset last_emitted_removed before non-guard ops (mirrors RPython's
-        // natural overwrite of last_emitted_operation on every emit).
-        if !matches!(
-            op.opcode,
-            OpCode::GuardNoException | OpCode::GuardException
-        ) {
-            self.last_emitted_removed = false;
-        }
         let result = self.dispatch_propagate(op, ctx);
-        // RPython heap.py:417-425 emit() override parity:
+        // heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
         // postpone comparison/ovf ops (call_may_force already handled
         // in its own match arm).
@@ -3004,8 +3036,29 @@ impl Optimization for OptHeap {
             // Step 2: postpone comparison/ovf
             if emit_op.opcode.is_comparison() || emit_op.opcode.is_ovf() {
                 self.postponed_op = Some(emit_op.clone());
+                // optimizer.py:84-87 — postponed ops do NOT call
+                // Optimization.emit, so line 86's `last_emitted_operation = op`
+                // does NOT fire. Leave `last_emitted_removed` intact so a
+                // GUARD_NO_EXCEPTION trailing a folded DICT_LOOKUP that came
+                // before this comparison still observes REMOVED.
                 return OptimizationResult::Remove;
             }
+        }
+        // optimizer.py:84-92 — `Optimization.emit(op)` and
+        // `Optimization.emit_result(opt_result)` BOTH set
+        // `self.last_emitted_operation = op` before returning. The
+        // PASS_OP_ON path (line 87) reaches that assignment too, so
+        // every dispatch result that is downstreamed (Emit non-postponed,
+        // PassOn, Replace, Restart) overwrites the REMOVED sentinel.
+        // Remove / InvalidLoop / postponed-Emit do not.
+        match &result {
+            OptimizationResult::Emit(_)
+            | OptimizationResult::PassOn
+            | OptimizationResult::Replace(_)
+            | OptimizationResult::Restart(_) => {
+                self.last_emitted_removed = false;
+            }
+            OptimizationResult::Remove | OptimizationResult::InvalidLoop => {}
         }
         result
     }
@@ -3027,9 +3080,14 @@ impl Optimization for OptHeap {
     }
 
     fn flush(&mut self, ctx: &mut OptContext) {
-        // RPython heap.py: flush() = force_all_lazy_sets(); emit_postponed_op()
+        // heap.py:348-352 flush():
+        //   self.cached_dict_reads.clear()
+        //   self.corresponding_array_descrs.clear()
+        //   self.force_all_lazy_sets()
+        //   self.emit_postponed_op()
+        self.cached_dict_reads.clear();
+        self.corresponding_array_descrs.clear();
         self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-        // RPython emit_postponed_op: route through next_optimization
         if let Some(postponed) = self.postponed_op.take() {
             ctx.emit_extra(ctx.current_pass_idx, postponed);
         }
@@ -6387,6 +6445,84 @@ mod tests {
         op2.descr = Some(descr.clone());
         op2.pos = pos2;
         assert!(!heap._optimize_call_dict_lookup(&op2, &mut ctx));
+    }
+
+    /// util.py:100/127 args_dict() / args_eq parity: same_box treats two
+    /// distinct ConstInt slots holding the same value as equal
+    /// (history.py:204 Const.same_box → same_constant). Two consecutive
+    /// dict lookups whose constant key arg is encoded via different const
+    /// slots must hit the cache.
+    #[test]
+    fn test_dict_lookup_cache_key_same_box_for_constants() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag = ctx.make_constant_int(0);
+
+        // Two distinct ConstInt slots, same value. RPython's args_dict()
+        // hashes them via _get_hash_() (value-based for Const), so they
+        // collide as the same key.
+        let key_a = ctx.make_constant_int(7);
+        let key_b = ctx.make_constant_int(7);
+        assert_ne!(key_a, key_b, "make_constant_int must mint fresh slots");
+
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key_a, hash, flag]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+
+        // Same value via a different const slot — must hit the cache.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key_b, hash, flag]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+    }
+
+    /// optimizer.py:84-87 parity: every Optimization.emit overwrite path —
+    /// including the PASS_OP_ON return at line 87 — sets
+    /// `last_emitted_operation = op` first (line 86). Heap arms returning
+    /// PassOn (NEW family, COND_CALL_N) hit that path in RPython, so a
+    /// REMOVED sentinel left over from `_optimize_CALL_DICT_LOOKUP` must
+    /// be cleared by the time a downstream GUARD_NO_EXCEPTION is dispatched
+    /// — otherwise the guard is wrongly removed across an intervening op.
+    #[test]
+    fn test_pass_on_clears_last_emitted_removed_flag() {
+        let mut heap = OptHeap::new();
+        heap.setup();
+        let mut ctx = OptContext::new(256);
+
+        // Seed the REMOVED sentinel as if a DICT_LOOKUP cache hit just fired.
+        heap.last_emitted_removed = true;
+
+        // OpCode::New is a PassOn arm in heap.rs (allocation tracking only).
+        let new_pos = ctx.reserve_pos_typed(Type::Ref);
+        let mut new_op = Op::new(OpCode::New, &[]);
+        new_op.pos = new_pos;
+        let result = heap.propagate_forward(&new_op, &mut ctx);
+        assert!(matches!(result, OptimizationResult::PassOn));
+        assert!(
+            !heap.last_emitted_removed,
+            "PassOn must clear last_emitted_removed (optimizer.py:86 fires before line 87 PASS_OP_ON)"
+        );
+
+        // Now a GUARD_NO_EXCEPTION must be emitted, not removed.
+        let mut guard = Op::new(OpCode::GuardNoException, &[]);
+        guard.pos = ctx.reserve_pos_typed(Type::Void);
+        let guard_result = heap.propagate_forward(&guard, &mut ctx);
+        assert!(
+            matches!(guard_result, OptimizationResult::Emit(_)),
+            "GUARD_NO_EXCEPTION after a PassOn-emitted op must NOT be removed"
+        );
     }
 
     /// FLAG_DELETE (2+) should never cache or reuse.
