@@ -1311,13 +1311,24 @@ fn _flat_pycall(
     new_frame.fix_array_ptrs();
 
     // function.py:214 — return new_frame.run(self.name, self.qualname)
-    // Use the JIT-aware eval override (same as call_user_function in call.rs).
-    let eval_fn = crate::call::get_eval_fn();
-    match eval_fn(&mut new_frame) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::call::set_call_error(e);
-            pyre_object::PY_NULL
+    // Check generator/coroutine: run() wraps into generator object instead
+    // of executing the body. For normal functions, use the JIT-aware eval.
+    if new_frame._is_generator_or_coroutine() {
+        match new_frame.run() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    } else {
+        let eval_fn = crate::call::get_eval_fn();
+        match eval_fn(&mut new_frame) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
         }
     }
 }
@@ -1370,12 +1381,23 @@ fn _flat_pycall_defaults(
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
-    let eval_fn = crate::call::get_eval_fn();
-    match eval_fn(&mut new_frame) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::call::set_call_error(e);
-            pyre_object::PY_NULL
+    // function.py:231 — return new_frame.run(self.name, self.qualname)
+    if new_frame._is_generator_or_coroutine() {
+        match new_frame.run() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        }
+    } else {
+        let eval_fn = crate::call::get_eval_fn();
+        match eval_fn(&mut new_frame) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
         }
     }
 }

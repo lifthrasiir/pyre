@@ -2199,12 +2199,17 @@ impl OpcodeStepExecutor for PyFrame {
     // CPython 3.12+ CALL: stack is [callable, null_or_self, arg0..argN-1].
     // null_or_self is NULL for plain calls, `self` for method calls.
     fn call(&mut self, nargs: usize) -> Result<(), Self::Error> {
-        // baseobjspace.py:1250-1261 fast path: Function + no method binding
+        // baseobjspace.py:1240-1261 fast path: Function + no method binding
+        //
+        // baseobjspace.py:1243 — skip fast path when profiling is active
+        // and the function wraps a builtin code (c_call/c_return events).
+        // Conservative: skip entire fast path if profiled, since
+        // funccall_valuestack's builtin dispatch also bypasses profiling.
         //
         // Guard: only enter when the value stack has at least nargs + 2
         // items above stack_base (callable + null_or_self + args).
         let stack_items = self.valuestackdepth.saturating_sub(self.stack_base());
-        if stack_items >= nargs + 2 {
+        if stack_items >= nargs + 2 && !self.get_is_being_profiled() {
             let null_or_self = self.peekvalue_maybe_none(nargs);
             let callable = self.peekvalue_maybe_none(nargs + 1);
             if null_or_self.is_null() && !callable.is_null() && unsafe { crate::is_function(callable) } {
