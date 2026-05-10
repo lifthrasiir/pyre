@@ -197,26 +197,111 @@ impl TreeLoop {
         )
     }
 
-    /// history.py: check_consistency()
-    /// Verify that the trace structure is valid.
+    /// history.py:552-608 check_consistency — full structural validation.
+    ///
+    /// Verifies:
+    /// - No constants in inputargs
+    /// - No duplicate inputargs
+    /// - Every op arg is either a Const or was defined earlier
+    /// - Guards have descrs (when `check_descr` is true)
+    /// - fail_args entries are non-Const and defined
+    /// - Non-guard ops have no fail_args (when `check_descr` is true)
+    /// - Overflow ops are followed by GuardNoOverflow/GuardOverflow
+    /// - LABEL resets the defined-set to its arglist
+    /// - JUMP target (if any) is present
     pub fn check_consistency(&self) -> bool {
+        self.check_consistency_impl(true)
+    }
+
+    fn check_consistency_impl(&self, check_descr: bool) -> bool {
         if self.ops.is_empty() {
             return true;
         }
-        // Last op must be Jump or Finish
+        // history.py:564-565: inputargs must not contain constants
+        let mut seen = std::collections::HashSet::new();
+        for ia in &self.inputargs {
+            let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp);
+            if ia_ref.is_constant() {
+                return false;
+            }
+            // history.py:566-568: no duplicate inputargs
+            if !seen.insert(ia_ref) {
+                return false;
+            }
+        }
+
+        // history.py:573-603: walk operations
+        for (num, op) in self.ops.iter().enumerate() {
+            // history.py:576-578: ovf ops must be followed by guard_overflow
+            if op.opcode.is_ovf() {
+                if let Some(next_op) = self.ops.get(num + 1) {
+                    if !next_op.opcode.is_guard_overflow() {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            // history.py:579-581: each arg must be Const or in seen
+            for arg in &op.args {
+                if arg.is_none() {
+                    continue;
+                }
+                if !arg.is_constant() && !seen.contains(arg) {
+                    return false;
+                }
+            }
+            // history.py:582-593: guard checks
+            if op.opcode.is_guard() {
+                if check_descr && op.descr.is_none() && !op.opcode.is_guard_overflow() {
+                    return false;
+                }
+                // history.py:588-591: fail_args validation
+                if let Some(ref fa) = op.fail_args {
+                    for arg in fa.iter() {
+                        if arg.is_none() {
+                            continue;
+                        }
+                        if arg.is_constant() {
+                            return false;
+                        }
+                        if !seen.contains(arg) {
+                            return false;
+                        }
+                    }
+                }
+            } else if check_descr {
+                // history.py:592-593: non-guard ops must have no fail_args
+                if op.fail_args.is_some() {
+                    return false;
+                }
+            }
+            // history.py:594-595: if op produces a value, add to seen
+            if op.opcode.result_type() != Type::Void {
+                if !op.pos.is_none() {
+                    seen.insert(op.pos);
+                }
+            }
+            // history.py:596-602: LABEL resets seen
+            if op.opcode == OpCode::Label {
+                seen.clear();
+                for arg in &op.args {
+                    if arg.is_constant() {
+                        return false;
+                    }
+                    if !seen.insert(*arg) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // history.py:605-608: if last op is JUMP, verify target exists
         let last = self.ops.last().unwrap();
         if !last.opcode.is_final() {
             return false;
         }
-        // No duplicate positions
-        let mut seen = std::collections::HashSet::new();
-        for op in &self.ops {
-            if !op.pos.is_none() {
-                if !seen.insert(op.pos) {
-                    return false; // duplicate position
-                }
-            }
-        }
+
         true
     }
 
@@ -544,6 +629,10 @@ impl TreeLoop {
 mod tests {
     use super::*;
     use majit_ir::Type;
+
+    #[derive(Debug)]
+    struct DummyGuardDescr;
+    impl majit_ir::Descr for DummyGuardDescr {}
 
     fn iarg(pos: u32) -> OpRef {
         OpRef::input_arg_int(pos)
@@ -1073,11 +1162,11 @@ mod tests {
 
     #[test]
     fn test_check_consistency_valid() {
-        let ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::input_arg_int(0), OpRef::int_op(1)]),
-            Op::new(OpCode::Jump, &[OpRef::input_arg_int(0)]),
-        ];
-        let trace = TreeLoop::new(vec![InputArg::new_int(0)], ops);
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(1)]);
+        op0.pos = iop(2);
+        let ops = vec![op0, Op::new(OpCode::Jump, &[iop(2)])];
+        let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
     }
 
@@ -1089,6 +1178,111 @@ mod tests {
         )];
         let trace = TreeLoop::new(vec![], ops);
         assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_undefined_arg() {
+        // history.py:579-581: arg not in seen → invalid
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[iarg(0), iop(99)]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_const_arg_ok() {
+        // history.py:580: constants are always valid args
+        let inputargs = vec![InputArg::new_int(0)];
+        let const_ref = OpRef::const_int(0);
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), const_ref]);
+        op0.pos = iop(1);
+        let ops = vec![op0, Op::new(OpCode::Finish, &[iop(1)])];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_ovf_not_followed_by_guard() {
+        // history.py:576-578: ovf must be followed by guard_overflow
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
+        op0.pos = iop(2);
+        let ops = vec![
+            op0,
+            Op::new(OpCode::Finish, &[iop(2)]),
+        ];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_ovf_followed_by_guard() {
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
+        op0.pos = iop(2);
+        let ops = vec![
+            op0,
+            Op::new(OpCode::GuardNoOverflow, &[]),
+            Op::new(OpCode::Finish, &[iop(2)]),
+        ];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_fail_args_const_invalid() {
+        // history.py:590: fail_args must not contain constants
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
+        guard.fail_args = Some(smallvec::smallvec![OpRef::const_int(0)]);
+        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        let ops = vec![guard, Op::new(OpCode::Finish, &[])];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_fail_args_undefined_invalid() {
+        // history.py:591: fail_args entries must be in seen
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
+        guard.fail_args = Some(smallvec::smallvec![iop(99)]);
+        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        let ops = vec![guard, Op::new(OpCode::Finish, &[])];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_label_resets_seen() {
+        // history.py:596-602: LABEL resets the seen set to its args
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        op0.pos = iop(1);
+        // LABEL introduces a fresh scope with iarg(0) only
+        let label = Op::new(OpCode::Label, &[iarg(0)]);
+        // iop(1) was defined before label, so it's no longer in seen
+        let ops = vec![
+            op0,
+            label,
+            Op::new(OpCode::Jump, &[iop(1)]),
+        ];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_label_valid() {
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        op0.pos = iop(1);
+        let label = Op::new(OpCode::Label, &[iop(1)]);
+        let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop(1)])];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(trace.check_consistency());
     }
 
     #[test]
