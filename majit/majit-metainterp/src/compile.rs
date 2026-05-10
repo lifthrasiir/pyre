@@ -31,6 +31,8 @@ use majit_ir::{
 
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
+use crate::recorder::TracePosition;
+use crate::trace_ctx::TraceCtx;
 use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary, ResumeValueSource,
@@ -4846,6 +4848,299 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 /// onto the descr-owned layer, mirroring RPython where
 /// `ResumeGuardDescr` (`compile.py:855`) is the single guard-owned
 /// resume container.
+
+// ── MergePoint + TraceCtx merge-point / inline-tracking methods ──────────
+//
+// Moved from `trace_ctx.rs` — these are the **compile role** of `TraceCtx`,
+// mirroring RPython's `compile.py compile_loop` / `compile_bridge`
+// merge-point bookkeeping and `pyjitpl.py` portal-frame / inline-trace
+// tracking (`current_merge_points`, `portal_trace_positions`).
+
+/// pyjitpl.py:2989 — a visited loop header with its trace position.
+///
+/// RPython stores `(original_boxes, start)` where `original_boxes` is the
+/// full list of green+red args at the first visit, and `start` is a 5-tuple
+/// trace position. majit stores the equivalent as OpRef vectors + TracePosition.
+#[derive(Clone, Debug)]
+pub struct MergePoint {
+    /// Green key of the loop header.
+    pub green_key: u64,
+    /// Trace position when this loop header was first visited.
+    pub position: TracePosition,
+    /// pyjitpl.py:2989: original_boxes — live variable OpRefs at the first
+    /// visit to this loop header. Used by compile_loop/compile_retrace as
+    /// the inputargs for trace cutting.
+    pub original_boxes: Vec<OpRef>,
+    /// Types of original_boxes. RPython Box carries type implicitly;
+    /// majit stores types alongside OpRefs for compile_retrace parity.
+    pub original_box_types: Vec<Type>,
+    /// Bytecode PC of this loop header. Used by cut_trace_from to update
+    /// meta when the trace closes at a different loop.
+    pub header_pc: usize,
+}
+
+impl TraceCtx {
+    /// pyjitpl.py:2991 — check if a loop header was already visited.
+    ///
+    /// PRE-EXISTING-ADAPTATION: clean Rust extraction of the inline scan
+    /// at `pyjitpl.py:2994-3036`. RPython has no method with this name
+    /// — the loop body iterates `current_merge_points` directly with
+    /// `same_greenkey` matching. The helper exists only because the
+    /// field is `pub(crate)`-private and the single caller in
+    /// pyre-jit-trace cannot reach it directly.
+    pub fn has_merge_point(&self, key: u64) -> bool {
+        self.current_merge_points
+            .iter()
+            .any(|mp| mp.green_key == key)
+    }
+
+    /// pyjitpl.py:2994-2997 reverse `same_greenkey` scan.
+    ///
+    /// Pyre's typed `green_key: u64` already collapses the
+    /// `same_greenkey` element-wise compare into hash equality (the
+    /// hash incorporates every greenarg via `JitCell.get_uhash`), so
+    /// the per-element loop in upstream is folded into a single
+    /// `mp.green_key == key` test here — the `same_greenkey` semantics
+    /// survive the collapse.
+    ///
+    /// **Known parity gap (intentional for now)**: upstream
+    /// `pyjitpl.py:2996 assert len(original_boxes) == len(live_arg_boxes)`
+    /// must fire on every visited merge point because all merge points
+    /// in `current_merge_points` come from the same jitdriver (fixed
+    /// red-bank shape).  Pyre's `current_merge_points` currently mixes
+    /// shapes across its inline-frame model (observed: 4 vs 14 on
+    /// `nested_loop`), so enforcing the assert prematurely panics
+    /// healthy traces.  The assert lands once jitdriver isolation
+    /// across `add_merge_point` callers is tightened — a separate
+    /// follow-up.  `live_args_len` is plumbed through so that
+    /// follow-up doesn't need to re-touch the call sites.
+    pub fn has_merge_point_with_shape_assert(&self, key: u64, _live_args_len: usize) -> bool {
+        // pyjitpl.py:2994-2997 reverse scan:
+        //   for j in range(len(self.current_merge_points) - 1, -1, -1):
+        //       original_boxes, start = self.current_merge_points[j]
+        //       assert len(original_boxes) == len(live_arg_boxes)
+        //       if greenkey == ...:
+        //           ...
+        //
+        // PRE-EXISTING-ADAPTATION (Priority 1 probe 2026-05-04): the
+        // upstream assert holds because PyPy's
+        // `initialize_virtualizable` (pyjitpl.py:3290-3307) appends
+        // `virtualizable_boxes` onto `original_boxes` BEFORE the seed
+        // at line 2878 (`current_merge_points = [(original_boxes,
+        // ...)]`).  So PyPy's seed shape equals the back-edge
+        // `live_arg_boxes` shape (greenkey + redkey + virtualizable
+        // expansion - 1).
+        //
+        // Pyre's seed sites (`trace.rs:65 add_merge_point`,
+        // `trace_ctx.rs::with_metainterp_sd / with_green_key`
+        // constructors) populate `current_merge_points[0]` from the
+        // bare `recorder.inputarg_types().len()` (typically
+        // `(frame, ec)` = 2 reds), while the back-edge
+        // `close_loop_args_at` returns `frame + ec + 6 vable static
+        // fields + nlocals + stack_only` (~14 for nested_loop).
+        // Empirical probe (`MAJIT_PROBE_MERGE_SHAPE=1`):
+        //   nested_loop key=4362041886086414 mp_len=2 live_args_len=14
+        //   nested_loop key=4362041886086447 mp_len=4 live_args_len=14
+        //
+        // The convergence path is to seed with the same shape as
+        // back-edge — i.e. run `capture_close_loop_args_at(start_pc)`
+        // at trace start so the seed matches PyPy's vable-expanded
+        // `original_boxes`.  That requires the MIFrame's symbolic
+        // state to be initialized enough for `close_loop_args_at` to
+        // run before any opcode has been recorded, plus extending the
+        // 2 trace_ctx.rs constructors.  Multi-session epic; until
+        // then `live_args_len` is plumbed but unused so the call
+        // surface stays stable.
+        self.current_merge_points
+            .iter()
+            .rev()
+            .any(|mp| mp.green_key == key)
+    }
+
+    /// pyjitpl.py:3029-3030 — record a loop header visit with position
+    /// and live variable snapshot.
+    ///
+    /// RPython allows multiple merge points with the same green key
+    /// (representing different loop iterations or inlining depths).
+    /// Always appends; has_merge_point checks if any match exists.
+    pub fn add_merge_point(
+        &mut self,
+        key: u64,
+        live_args: Vec<OpRef>,
+        live_arg_types: Vec<Type>,
+        header_pc: usize,
+    ) {
+        // Use the TraceCtx-level position so `snapshot_data_len` reflects
+        // the current Vec<Snapshot> side table length (Task #70 moved
+        // snapshots off `recorder::Trace`; a bare `recorder.get_position()`
+        // would report `snapshot_data_len: 0`, causing `cut_trace` to
+        // truncate valid snapshots when this merge point is restored).
+        let position = self.get_trace_position();
+        self.current_merge_points.push(MergePoint {
+            green_key: key,
+            position,
+            original_boxes: live_args,
+            original_box_types: live_arg_types,
+            header_pc,
+        });
+    }
+
+    /// pyjitpl.py:2908 — bridge traces start with empty merge points.
+    pub fn clear_merge_points(&mut self) {
+        self.current_merge_points.clear();
+    }
+
+    /// pyjitpl.py:2801 / 2803 / 2818 / 7985 — `current_merge_points[0]`
+    /// is the outermost loop header's greenkey.  Used by
+    /// `blackhole_if_trace_too_long` / `prepare_trace_segmenting` /
+    /// `aborted_tracing` to distinguish "tracing a loop body" from
+    /// "tracing a bridge" (empty merge-points list).
+    pub fn current_merge_points_first_greenkey(&self) -> Option<u64> {
+        self.current_merge_points.first().map(|mp| mp.green_key)
+    }
+
+    /// pyjitpl.py:2988: find merge point by key, searching in reverse
+    /// order (most recent first, matching RPython's range(len-1, -1, -1)).
+    pub fn get_merge_point(&self, key: u64) -> Option<&MergePoint> {
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| mp.green_key == key)
+    }
+
+    /// pyjitpl.py:2994 same_greenkey + header identity: check if a specific
+    /// loop header (key, header_pc) was already visited.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre disambiguates loop headers by
+    /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py:2994`)
+    /// matches by Python box identity over a structural greenkey tuple;
+    /// pyre's `make_green_key` collapses `(W_CodeObject*, pc)` into a
+    /// `u64`, losing the per-header identity, so the explicit `header_pc`
+    /// disambiguator restores it for re-entrant loop headers within one
+    /// code object.
+    pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
+        self.current_merge_points
+            .iter()
+            .any(|mp| mp.green_key == key && mp.header_pc == header_pc)
+    }
+
+    /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
+    /// searching in reverse order (most recent first).
+    pub fn get_merge_point_at(&self, key: u64, header_pc: usize) -> Option<&MergePoint> {
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| mp.green_key == key && mp.header_pc == header_pc)
+    }
+
+    /// Get the current inlining depth.
+    pub fn inline_depth(&self) -> usize {
+        self.inline_frames.len()
+    }
+
+    pub fn inline_trace_depth(&self) -> usize {
+        self.inline_trace_positions.len()
+    }
+
+    /// Update the green key for this trace.
+    ///
+    /// RPython pyjitpl.py reached_loop_header(): when func-entry tracing
+    /// hits a back-edge, the loop must be registered under the back-edge's
+    /// green key, not the function-entry key.
+    pub fn set_green_key(&mut self, key: u64, raw: (usize, usize)) {
+        self.green_key = key;
+        self.green_key_raw = raw;
+    }
+
+    /// Record the structured greenkey for the root trace. Called once
+    /// at trace start to seed `green_key_raw` and `root_green_key_raw`
+    /// from the tracer-side `(code_ptr, pc)`. Subsequent back-edge
+    /// retargeting flows through [`set_green_key`].
+    pub fn set_root_green_key_raw(&mut self, raw: (usize, usize)) {
+        self.green_key_raw = raw;
+        self.root_green_key_raw = raw;
+    }
+
+    /// pyjitpl.py:1396-1401 element-wise greenkey comparison against
+    /// the current trace's greenkey and each inline-frame greenkey.
+    pub fn is_tracing_key(&self, target: (usize, usize)) -> bool {
+        self.green_key_raw == target
+            || self.root_green_key_raw == target
+            || self.inline_frames.contains(&target)
+    }
+
+    /// pyjitpl.py:1390-1402 recursion counting only walks portal
+    /// frames already pushed on `framestack`; the root trace entry is
+    /// not counted unless it has become an actual inline frame.
+    pub fn has_inline_frame_for(&self, target: (usize, usize)) -> bool {
+        self.inline_frames.contains(&target)
+    }
+
+    /// pyjitpl.py:1389-1402 `_opimpl_recursive_call` element-wise walk:
+    ///
+    /// ```python
+    /// count = 0
+    /// for f in self.metainterp.framestack:
+    ///     if f.jitcode is not portal_code: continue
+    ///     gk = f.greenkey
+    ///     for i in range(len(gk)):
+    ///         if not gk[i].same_constant(greenboxes[i]): break
+    ///     else: count += 1
+    /// ```
+    ///
+    /// Pyre's greenkey is `(code_ptr, pc)` — a fixed-arity pair — so
+    /// tuple equality reproduces the element-wise `same_constant`
+    /// result without an intermediate hash that could falsely collide.
+    ///
+    /// Only inlined portal frames count here. The root frame is
+    /// created without a `greenkey` in upstream `initialize_state_from_start`
+    /// / `newframe(mainjitcode)`, so counting `root_green_key_raw` would
+    /// make self-recursion hit `max_unroll_recursion` one level early.
+    pub fn recursive_depth(&self, target: (usize, usize)) -> usize {
+        self.inline_frames.iter().filter(|&&k| k == target).count()
+    }
+
+    /// Push an inline frame (entering a callee).
+    /// Returns false if the max inline depth has been exceeded.
+    /// `callee_raw` is the structured `(code_ptr, pc)` greenkey, stored
+    /// in `inline_frames` so `recursive_depth` / `is_tracing_key` can
+    /// walk it element-wise (pyjitpl.py:1396-1401 parity).
+    pub(crate) fn push_inline_frame(&mut self, callee_raw: (usize, usize), max_depth: u32) -> bool {
+        if (self.inline_frames.len() as u32) >= max_depth {
+            return false;
+        }
+        self.inline_frames.push(callee_raw);
+        true
+    }
+
+    /// Pop an inline frame (returning from a callee).
+    pub(crate) fn pop_inline_frame(&mut self) {
+        self.inline_frames.pop();
+    }
+
+    pub fn push_inline_trace_position(&mut self, green_key: u64) {
+        self.inline_trace_positions
+            .push((green_key, self.recorder.num_ops()));
+    }
+
+    pub fn pop_inline_trace_position(&mut self) {
+        self.inline_trace_positions.pop();
+    }
+
+    pub fn truncate_inline_trace_positions(&mut self, depth: usize) {
+        self.inline_trace_positions.truncate(depth);
+    }
+
+    /// pyjitpl.py:3514 find_biggest_function
+    pub fn find_biggest_function(&self) -> Option<u64> {
+        let current_pos = self.recorder.num_ops();
+        self.inline_trace_positions
+            .iter()
+            .map(|&(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
+            .max_by_key(|&(_, size)| size)
+            .map(|(green_key, _)| green_key)
+    }
+}
 
 #[cfg(test)]
 mod fail_descr_tests {

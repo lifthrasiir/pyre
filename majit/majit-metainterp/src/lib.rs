@@ -91,7 +91,8 @@ pub use pyjitpl::{
     trace_jitcode_with_args,
 };
 pub use quasiimmut::QuasiImmut;
-pub use trace_ctx::{MergePoint, TraceCtx};
+pub use compile::MergePoint;
+pub use trace_ctx::TraceCtx;
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 /// Compute green key from code pointer and PC.
