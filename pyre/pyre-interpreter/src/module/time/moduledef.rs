@@ -2,31 +2,31 @@
 //!
 //! PyPy equivalent: pypy/module/time/moduledef.py
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function};
+use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
 
 use super::interp_time;
 
 pub fn init(ns: &mut DictStorage) {
-    dict_storage_store(ns, "time", make_builtin_function("time", interp_time::time));
+    dict_storage_store(ns, "time", make_builtin_function_with_arity("time", interp_time::time, 0));
     dict_storage_store(
         ns,
         "time_ns",
-        make_builtin_function("time_ns", interp_time::time_ns),
+        make_builtin_function_with_arity("time_ns", interp_time::time_ns, 0),
     );
     dict_storage_store(
         ns,
         "monotonic",
-        make_builtin_function("monotonic", interp_time::monotonic),
+        make_builtin_function_with_arity("monotonic", interp_time::monotonic, 0),
     );
     dict_storage_store(
         ns,
         "sleep",
-        make_builtin_function("sleep", interp_time::sleep),
+        make_builtin_function_with_arity("sleep", interp_time::sleep, 1),
     );
     dict_storage_store(
         ns,
         "perf_counter",
-        make_builtin_function("perf_counter", interp_time::perf_counter),
+        make_builtin_function_with_arity("perf_counter", interp_time::perf_counter, 0),
     );
     dict_storage_store(
         ns,
@@ -46,7 +46,7 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "mktime",
-        make_builtin_function("mktime", interp_time::mktime),
+        make_builtin_function_with_arity("mktime", interp_time::mktime, 1),
     );
     dict_storage_store(
         ns,

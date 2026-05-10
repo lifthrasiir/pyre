@@ -2244,7 +2244,7 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__set__",
-        make_builtin_function("__set__", |args| {
+        make_builtin_function_with_arity("__set__", |args| {
             let w_self = args[0];
             let w_obj = args[1];
             let w_value = args[2];
@@ -2272,7 +2272,7 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
                 ),
                 Err(e) => Err(e),
             }
-        }),
+        }, 3),
     );
     // typedef.py:388-400 GetSetProperty.descr_property_del
     //
@@ -2292,7 +2292,7 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__delete__",
-        make_builtin_function("__delete__", |args| {
+        make_builtin_function_with_arity("__delete__", |args| {
             let w_self = args[0];
             let w_obj = args[1];
             let fdel = read_fdel(w_self);
@@ -2322,7 +2322,7 @@ fn init_getset_descriptor_type(ns: &mut DictStorage) {
                 ),
                 Err(e) => Err(e),
             }
-        }),
+        }, 2),
     );
 }
 
@@ -2399,7 +2399,7 @@ fn init_type_type(ns: &mut DictStorage) {
     // GetSetProperty fget callbacks receive (descriptor_self, w_obj) so the
     // wrapped object is at args[1] (matches PyPy's typecheck wrapper that
     // passes (closure, space, w_obj)).
-    let annotations_getter = make_builtin_function("__annotations__", |args| {
+    let annotations_getter = make_builtin_function_with_arity("__annotations__", |args| {
         // GetSetProperty fget callbacks receive (descriptor_self, w_obj),
         // so the cls is at args[1].
         let cls = args[1];
@@ -2428,14 +2428,14 @@ fn init_type_type(ns: &mut DictStorage) {
             }
         }
         Ok(pyre_object::w_dict_new())
-    });
+    }, 2);
     dict_storage_store(
         ns,
         "__annotations__",
         make_getset_descriptor(annotations_getter),
     );
 
-    let mro_getter = make_builtin_function("__mro__", |args| {
+    let mro_getter = make_builtin_function_with_arity("__mro__", |args| {
         let cls = args[1];
         unsafe {
             let mro_ptr = pyre_object::w_type_get_mro(cls);
@@ -2444,10 +2444,10 @@ fn init_type_type(ns: &mut DictStorage) {
             }
             Ok(pyre_object::w_tuple_new((*mro_ptr).clone()))
         }
-    });
+    }, 2);
     dict_storage_store(ns, "__mro__", make_getset_descriptor(mro_getter));
 
-    let dict_getter = make_builtin_function("__dict__", |args| {
+    let dict_getter = make_builtin_function_with_arity("__dict__", |args| {
         let cls = args[1];
         unsafe {
             let ns_ptr = pyre_object::typeobject::w_type_get_dict_ptr(cls);
@@ -2462,22 +2462,22 @@ fn init_type_type(ns: &mut DictStorage) {
             let canonical = crate::baseobjspace::dict_storage_to_dict(ns_ptr as *const DictStorage);
             Ok(pyre_object::w_dict_proxy_new(canonical))
         }
-    });
+    }, 2);
     dict_storage_store(ns, "__dict__", make_getset_descriptor(dict_getter));
 
-    let name_getter = make_builtin_function("__name__", |args| unsafe {
+    let name_getter = make_builtin_function_with_arity("__name__", |args| unsafe {
         let name = pyre_object::w_type_get_name(args[1]);
         Ok(pyre_object::w_str_new(name))
-    });
+    }, 2);
     dict_storage_store(ns, "__name__", make_getset_descriptor(name_getter));
 
-    let bases_getter = make_builtin_function("__bases__", |args| unsafe {
+    let bases_getter = make_builtin_function_with_arity("__bases__", |args| unsafe {
         let bases = pyre_object::w_type_get_bases(args[1]);
         if bases.is_null() {
             return Ok(pyre_object::w_tuple_new(vec![]));
         }
         Ok(bases)
-    });
+    }, 2);
     dict_storage_store(ns, "__bases__", make_getset_descriptor(bases_getter));
 }
 
@@ -2573,7 +2573,7 @@ fn init_builtin_function_type(ns: &mut DictStorage) {
     // W_TypeObject is still under construction, so `cls` cannot be
     // resolved here; `patch_builtin_function_descriptors` runs after the
     // type cache is populated and writes the missing reqcls.
-    let self_getter = make_builtin_function("__self__", |_args| Ok(pyre_object::w_none()));
+    let self_getter = make_builtin_function_with_arity("__self__", |_args| Ok(pyre_object::w_none()), 2);
     dict_storage_store(ns, "__self__", make_getset_descriptor(self_getter));
 
     dict_storage_store(
@@ -3054,7 +3054,7 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "real",
         pyre_object::w_property_new(
-            make_builtin_function("real", |args| {
+            make_builtin_function_with_arity("real", |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::w_int_new(0));
                 unsafe {
                     if pyre_object::is_bool(obj) {
@@ -3064,7 +3064,7 @@ fn init_int_type(ns: &mut DictStorage) {
                     }
                 }
                 Ok(obj)
-            }),
+            }, 1),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         ),
@@ -3073,7 +3073,7 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "imag",
         pyre_object::w_property_new(
-            make_builtin_function("imag", |_| Ok(pyre_object::w_int_new(0))),
+            make_builtin_function_with_arity("imag", |_| Ok(pyre_object::w_int_new(0)), 1),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         ),
@@ -3082,9 +3082,9 @@ fn init_int_type(ns: &mut DictStorage) {
         ns,
         "numerator",
         pyre_object::w_property_new(
-            make_builtin_function("numerator", |args| {
+            make_builtin_function_with_arity("numerator", |args| {
                 Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
-            }),
+            }, 1),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         ),
@@ -3402,18 +3402,18 @@ fn init_object_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__format__",
-        make_builtin_function("__format__", |args| {
+        make_builtin_function_with_arity("__format__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new(""));
             }
             Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0]) }))
-        }),
+        }, 2),
     );
     // PyPy: objectobject.py descr___reduce_ex__
     dict_storage_store(
         ns,
         "__reduce_ex__",
-        make_builtin_function("__reduce_ex__", |_| Ok(pyre_object::w_none())),
+        make_builtin_function_with_arity("__reduce_ex__", |_| Ok(pyre_object::w_none()), 2),
     );
     dict_storage_store(
         ns,
@@ -4174,9 +4174,9 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     let addr = *CACHED.get_or_init(|| {
-        let fget = make_builtin_function("descr_get_dict", descr_get_dict);
-        let fset = make_builtin_function("descr_set_dict", descr_set_dict);
-        let fdel = make_builtin_function("descr_del_dict", descr_del_dict);
+        let fget = make_builtin_function_with_arity("descr_get_dict", descr_get_dict, 2);
+        let fset = make_builtin_function_with_arity("descr_set_dict", descr_set_dict, 3);
+        let fdel = make_builtin_function_with_arity("descr_del_dict", descr_del_dict, 2);
         let descr = make_getset_property(fget, fset, fdel);
         let _ = crate::baseobjspace::setattr(descr, "__name__", pyre_object::w_str_new("__dict__"));
         descr as usize
@@ -4195,7 +4195,7 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     let addr = *CACHED.get_or_init(|| {
-        let fget = make_builtin_function("descr_get_weakref", descr_get_weakref);
+        let fget = make_builtin_function_with_arity("descr_get_weakref", descr_get_weakref, 2);
         let descr = make_getset_property(fget, pyre_object::PY_NULL, pyre_object::PY_NULL);
         let _ =
             crate::baseobjspace::setattr(descr, "__name__", pyre_object::w_str_new("__weakref__"));

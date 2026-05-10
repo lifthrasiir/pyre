@@ -1365,10 +1365,10 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE)
             }
             CommonConstant::BuiltinAll => {
-                crate::make_module_builtin_function("all", crate::builtins::builtin_all_fn)
+                crate::make_module_builtin_function_with_arity("all", crate::builtins::builtin_all_fn, 1)
             }
             CommonConstant::BuiltinAny => {
-                crate::make_module_builtin_function("any", crate::builtins::builtin_any_fn)
+                crate::make_module_builtin_function_with_arity("any", crate::builtins::builtin_any_fn, 1)
             }
             CommonConstant::BuiltinList => {
                 crate::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE)

@@ -2,7 +2,7 @@
 //!
 //! PyPy equivalent: pypy/module/sys/
 
-use crate::{DictStorage, dict_storage_store};
+use crate::{DictStorage, dict_storage_store, make_builtin_function_with_arity};
 use pyre_object::*;
 use std::sync::OnceLock;
 
@@ -174,7 +174,7 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "exc_info",
-        crate::make_builtin_function("exc_info", |_| {
+        make_builtin_function_with_arity("exc_info", |_| {
             let exc = crate::eval::get_current_exception();
             unsafe {
                 if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
@@ -185,7 +185,7 @@ pub fn init(ns: &mut DictStorage) {
                     Ok(w_tuple_new(vec![exc_type, exc, w_none()]))
                 }
             }
-        }),
+        }, 0),
     );
     // sys.flags — pypy/module/sys/app.py:99-119 `class sysflags` with
     // `__metaclass__ = structseqtype`. PyPy exposes it as a structseq
@@ -233,7 +233,7 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "getdefaultencoding",
-        crate::make_builtin_function("getdefaultencoding", |_| Ok(w_str_new("utf-8"))),
+        make_builtin_function_with_arity("getdefaultencoding", |_| Ok(w_str_new("utf-8")), 0),
     );
     // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py:45.
     // The runtime stack budget lives in `crate::stack_check`; both
@@ -242,7 +242,7 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "getrecursionlimit",
-        crate::make_builtin_function("getrecursionlimit", |args| {
+        make_builtin_function_with_arity("getrecursionlimit", |args| {
             // pypy/module/sys/vm.py:72 — no arguments.
             if !args.is_empty() {
                 return Err(crate::PyError::type_error(
@@ -250,12 +250,12 @@ pub fn init(ns: &mut DictStorage) {
                 ));
             }
             Ok(w_int_new(crate::stack_check::get_recursion_limit() as i64))
-        }),
+        }, 0),
     );
     dict_storage_store(
         ns,
         "setrecursionlimit",
-        crate::make_builtin_function("setrecursionlimit", |args| {
+        make_builtin_function_with_arity("setrecursionlimit", |args| {
             // pypy/module/sys/vm.py:63 `@unwrap_spec(new_limit="c_int")`
             // — exactly one positional argument, coerced through
             // baseobjspace.c_int_w (gateway_int_w + 32-bit range
@@ -270,19 +270,19 @@ pub fn init(ns: &mut DictStorage) {
             let new_limit = crate::baseobjspace::c_int_w(args[0])?;
             crate::stack_check::set_recursion_limit(new_limit)?;
             Ok(w_none())
-        }),
+        }, 1),
     );
     // sys.intern
     dict_storage_store(
         ns,
         "intern",
-        crate::make_builtin_function("intern", |args| {
+        make_builtin_function_with_arity("intern", |args| {
             Ok(if args.is_empty() {
                 w_str_new("")
             } else {
                 args[0]
             })
-        }),
+        }, 1),
     );
     // sys.implementation — structseq-like namespace with name, version, ...
     {
@@ -361,12 +361,12 @@ pub fn init(ns: &mut DictStorage) {
         let _ = crate::baseobjspace::setattr(
             jit,
             "is_enabled",
-            crate::make_builtin_function("is_enabled", |_| Ok(w_bool_from(false))),
+            make_builtin_function_with_arity("is_enabled", |_| Ok(w_bool_from(false)), 0),
         );
         let _ = crate::baseobjspace::setattr(
             jit,
             "is_available",
-            crate::make_builtin_function("is_available", |_| Ok(w_bool_from(false))),
+            make_builtin_function_with_arity("is_available", |_| Ok(w_bool_from(false)), 0),
         );
         dict_storage_store(ns, "_jit", jit);
     }
@@ -478,48 +478,48 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "exception",
-        crate::make_builtin_function("exception", |_| Ok(w_none())),
+        make_builtin_function_with_arity("exception", |_| Ok(w_none()), 0),
     );
     // sys.exc_clear — no-op
     dict_storage_store(
         ns,
         "exc_clear",
-        crate::make_builtin_function("exc_clear", |_| Ok(w_none())),
+        make_builtin_function_with_arity("exc_clear", |_| Ok(w_none()), 0),
     );
     // sys.gettrace / settrace
     dict_storage_store(
         ns,
         "gettrace",
-        crate::make_builtin_function("gettrace", sys_gettrace_impl),
+        make_builtin_function_with_arity("gettrace", sys_gettrace_impl, 0),
     );
     dict_storage_store(
         ns,
         "settrace",
-        crate::make_builtin_function("settrace", sys_settrace_impl),
+        make_builtin_function_with_arity("settrace", sys_settrace_impl, 1),
     );
     // sys.getprofile / setprofile
     dict_storage_store(
         ns,
         "getprofile",
-        crate::make_builtin_function("getprofile", sys_getprofile_impl),
+        make_builtin_function_with_arity("getprofile", sys_getprofile_impl, 0),
     );
     dict_storage_store(
         ns,
         "setprofile",
-        crate::make_builtin_function("setprofile", sys_setprofile_impl),
+        make_builtin_function_with_arity("setprofile", sys_setprofile_impl, 1),
     );
     // sys.getfilesystemencoding
     dict_storage_store(
         ns,
         "getfilesystemencoding",
-        crate::make_builtin_function("getfilesystemencoding", |_| Ok(w_str_new("utf-8"))),
+        make_builtin_function_with_arity("getfilesystemencoding", |_| Ok(w_str_new("utf-8")), 0),
     );
     dict_storage_store(
         ns,
         "getfilesystemencodeerrors",
-        crate::make_builtin_function("getfilesystemencodeerrors", |_| {
+        make_builtin_function_with_arity("getfilesystemencodeerrors", |_| {
             Ok(w_str_new("surrogateescape"))
-        }),
+        }, 0),
     );
     // sys.audit — no-op
     dict_storage_store(
@@ -531,18 +531,18 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "is_finalizing",
-        crate::make_builtin_function("is_finalizing", |_| Ok(w_bool_from(false))),
+        make_builtin_function_with_arity("is_finalizing", |_| Ok(w_bool_from(false)), 0),
     );
     // sys.displayhook / excepthook
     dict_storage_store(
         ns,
         "displayhook",
-        crate::make_builtin_function("displayhook", |_| Ok(w_none())),
+        make_builtin_function_with_arity("displayhook", |_| Ok(w_none()), 1),
     );
     dict_storage_store(
         ns,
         "excepthook",
-        crate::make_builtin_function("excepthook", |_| Ok(w_none())),
+        make_builtin_function_with_arity("excepthook", |_| Ok(w_none()), 3),
     );
     // sys.path_hooks / path_importer_cache
     dict_storage_store(ns, "path_hooks", w_list_new(vec![]));
@@ -555,7 +555,7 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "addaudithook",
-        crate::make_builtin_function("addaudithook", |_| Ok(w_none())),
+        make_builtin_function_with_arity("addaudithook", |_| Ok(w_none()), 1),
     );
 }
 

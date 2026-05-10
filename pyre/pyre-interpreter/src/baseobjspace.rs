@@ -3301,16 +3301,20 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
     // Return W_Method(func, gen) so the generator is passed as args[0].
     unsafe {
         if pyre_object::generatorobject::is_generator(obj) {
-            let (sname, func): (&str, fn(&[PyObjectRef]) -> PyResult) = match name {
-                "send" => ("send", generator_send_method),
-                "throw" => ("throw", generator_throw_method),
-                "close" => ("close", generator_close_method),
-                "__next__" => ("__next__", generator_next_method),
+            let (sname, func, arity): (&str, fn(&[PyObjectRef]) -> PyResult, Option<u16>) = match name {
+                "send" => ("send", generator_send_method, Some(2)),
+                "throw" => ("throw", generator_throw_method, None),
+                "close" => ("close", generator_close_method, Some(1)),
+                "__next__" => ("__next__", generator_next_method, Some(1)),
                 "__iter__" => return Ok(obj),
-                _ => ("", generator_next_method), // sentinel — won't match
+                _ => ("", generator_next_method, None), // sentinel — won't match
             };
             if !sname.is_empty() {
-                let func_obj = crate::make_builtin_function(sname, func);
+                let func_obj = if let Some(a) = arity {
+                    crate::make_builtin_function_with_arity(sname, func, a)
+                } else {
+                    crate::make_builtin_function(sname, func)
+                };
                 return Ok(pyre_object::w_method_new(
                     func_obj,
                     obj,
@@ -3330,7 +3334,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
             match name {
                 "__iter__" => return Ok(obj),
                 "__next__" => {
-                    let func_obj = crate::make_builtin_function("__next__", iter_next_method);
+                    let func_obj = crate::make_builtin_function_with_arity("__next__", iter_next_method, 1);
                     return Ok(pyre_object::w_method_new(
                         func_obj,
                         obj,
@@ -3357,7 +3361,7 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 _ => None,
             };
             if let Some((sname, func)) = static_name {
-                let builtin = crate::make_builtin_function(sname, func);
+                let builtin = crate::make_builtin_function_with_arity(sname, func, 2);
                 return Ok(pyre_object::methodobject::w_method_new(
                     builtin,
                     obj,
