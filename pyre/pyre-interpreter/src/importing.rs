@@ -1461,7 +1461,7 @@ fn init_functools(ns: &mut DictStorage) {
             Ok(crate::make_builtin_function_with_arity("cmp_to_key.K", |args| {
                 Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
             }, 1))
-        }, 0),
+        }, 1),
     );
 }
 
@@ -2022,7 +2022,7 @@ fn init_posix(ns: &mut DictStorage) {
         crate::dict_storage_store(
             ns,
             name,
-            crate::make_builtin_function_with_arity(name, |_| Ok(pyre_object::w_none()), 0),
+            crate::make_builtin_function(name, |_| Ok(pyre_object::w_none())),
         );
     }
 
@@ -3625,22 +3625,22 @@ fn init_codecs(ns: &mut DictStorage) {
                     args[0]
                 })
             }, 1))
-        }, 0),
+        }, 1),
     );
     crate::dict_storage_store(
         ns,
         "register_error",
-        crate::make_builtin_function_with_arity("register_error", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("register_error", |_| Ok(pyre_object::w_none()), 2),
     );
     crate::dict_storage_store(
         ns,
         "register",
-        crate::make_builtin_function_with_arity("register", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("register", |_| Ok(pyre_object::w_none()), 1),
     );
     crate::dict_storage_store(
         ns,
         "lookup",
-        crate::make_builtin_function_with_arity("lookup", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("lookup", |_| Ok(pyre_object::w_none()), 1),
     );
     // encode/decode — return input unchanged. Matches PyPy _codecs.encode
     // when the codec is the identity.
@@ -3657,7 +3657,7 @@ fn init_codecs(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "charmap_build",
-        crate::make_builtin_function_with_arity("charmap_build", |_| Ok(pyre_object::w_dict_new()), 0),
+        crate::make_builtin_function_with_arity("charmap_build", |_| Ok(pyre_object::w_dict_new()), 1),
     );
 }
 
