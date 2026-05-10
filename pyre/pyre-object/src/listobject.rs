@@ -230,8 +230,9 @@ impl W_ListObject {
 ///
 /// Accepts exact W_IntObject (not bool, not int subclass) or W_LongObject
 /// whose value fits in a machine-word integer. Shared with
-/// `specialisedtupleobject.py:172-175 makespecialisedtuple2` and the JIT's
-/// `IntegerListStrategy` identity gate (state.rs:int_strategy_preserves_identity).
+/// `specialisedtupleobject.py:172-175 makespecialisedtuple2` and the
+/// `IntegerListStrategy.is_correct_type` strategy gate
+/// (`listobject.py:1957-1958`).
 #[inline]
 pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() {
@@ -258,13 +259,23 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
 
 /// listobject.py:2394-2398 `plain_int_w(space, w_obj)`. Unwraps a plain
 /// int value from W_IntObject or W_LongObject. Caller must ensure
-/// `is_plain_int1(item)` returned true.
+/// `is_plain_int1(item)` returned true (which for `W_LongObject`
+/// implies `_fits_int()`). RPython routes through `w_obj._int_w(space)`
+/// (`longobject.py:157`) which raises `OverflowError` on out-of-range
+/// values; pyre treats that path as unreachable and panics on
+/// precondition violation rather than silently returning 0.
 #[inline]
 pub(crate) unsafe fn plain_int_w(item: PyObjectRef) -> i64 {
     if is_int(item) {
         w_int_get_value(item)
     } else {
-        i64::try_from(w_long_get_value(item)).unwrap_or(0)
+        i64::try_from(w_long_get_value(item)).unwrap_or_else(|_| {
+            panic!(
+                "plain_int_w: W_LongObject out of i64 range — \
+                 is_plain_int1/_fits_int precondition violated \
+                 (listobject.py:2394 / longobject.py:157)"
+            )
+        })
     }
 }
 

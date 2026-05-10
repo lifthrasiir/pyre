@@ -643,8 +643,8 @@ pub enum ResumeVirtualLayoutSummary {
         /// resume.py:694: self.func
         func: i64,
         size: usize,
-        /// resume.py:695: self.offsets
-        offsets: Vec<usize>,
+        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
+        offsets: Vec<i64>,
         /// resume.py:697: self.descrs
         descrs: Vec<majit_ir::ArrayDescrInfo>,
         /// resume.py:693: fieldnums (decoded)
@@ -1428,8 +1428,9 @@ pub enum VirtualInfo {
         func: i64,
         /// Size of the buffer in bytes.
         size: usize,
-        /// resume.py:695: self.offsets — byte offsets for each stored value.
-        offsets: Vec<usize>,
+        /// resume.py:695: self.offsets — byte offsets for each stored
+        /// value. Signed to match rawbuffer.py:14.
+        offsets: Vec<i64>,
         /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
         descrs: Vec<majit_ir::ArrayDescrInfo>,
         /// resume.py:693: fieldnums — per-entry source (decoded from tagged fieldnums).
@@ -2211,7 +2212,7 @@ impl EncodedResumeData {
                 },
                 VirtualInfo::VRawSlice { offset, parent } => {
                     majit_ir::RdVirtualInfo::VRawSliceInfo {
-                        offset: *offset as usize,
+                        offset: *offset,
                         fieldnums: fieldnums(std::iter::once(parent.clone()), liveboxes, rd_consts),
                     }
                 }
@@ -2923,7 +2924,8 @@ pub enum MaterializedVirtual {
     RawBuffer {
         func: i64,
         size: usize,
-        offsets: Vec<usize>,
+        /// rawbuffer.py:14 stores offsets as RPython unbounded ints.
+        offsets: Vec<i64>,
         descrs: Vec<majit_ir::ArrayDescrInfo>,
         values: Vec<MaterializedValue>,
     },
@@ -3351,7 +3353,7 @@ impl ResumeDataVirtualAdder {
         &mut self,
         func: i64,
         size: usize,
-        offsets: Vec<usize>,
+        offsets: Vec<i64>,
         descrs: Vec<majit_ir::ArrayDescrInfo>,
         values: Vec<VirtualFieldSource>,
     ) -> usize {
@@ -5578,11 +5580,13 @@ pub trait BlackholeAllocator {
         let _ = (func, size);
         0
     }
-    /// resume.py:1543 setrawbuffer_item(buffer, fieldnum, offset, descr)
+    /// resume.py:1543 setrawbuffer_item(buffer, fieldnum, offset, descr).
+    /// `offset` mirrors `RawBuffer.offsets[i]` and is signed
+    /// (rawbuffer.py:14).
     fn setrawbuffer_item(
         &self,
         buffer: i64,
-        offset: usize,
+        offset: i64,
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {

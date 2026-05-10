@@ -2027,6 +2027,46 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
     )
 }
 
+/// Unbox a `W_LongObject` (whose BigInt fits in i64) into a raw i64 OpRef.
+///
+/// Lowering — mirrors `_int_w_unsafe()` (longobject.py:127) under the
+/// fits_int precondition (`is_plain_int1` accepts both W_IntObject and
+/// fits_int W_LongObject; listobject.py:1957-1958):
+///
+/// 1. `GUARD_CLASS(obj, LONG_TYPE)` — concrete type observed at trace.
+/// 2. `residual_call(jit_w_long_fits_int, obj) -> i64` — runtime
+///    fits_int probe. Subsequent trace executions may see a W_LongObject
+///    whose BigInt has grown out of i64 range; the residual call captures
+///    that observation per execution.
+/// 3. `GUARD_TRUE(fits_int_result)` — bridge if the runtime BigInt does
+///    not fit (alternatively: deopt back to the interpreter).
+/// 4. `residual_call(jit_w_long_toint, obj) -> i64` —
+///    `W_LongObject.toint()` (`longobject.py:138`) → `rbigint.toint()`
+///    (`rbigint.py:465`, elidable). OverflowError is statically
+///    unreachable post-fits-int GUARD_TRUE.
+pub(crate) fn trace_unbox_long_with_resume(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    long_type_addr: i64,
+) -> OpRef {
+    if !ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.const_int(long_type_addr);
+        frame.generate_guard(ctx, OpCode::GuardClass, &[obj, type_const]);
+        ctx.heap_cache_mut()
+            .class_now_known(obj, majit_ir::GcRef(long_type_addr as usize));
+    }
+    let fits_fn =
+        ctx.const_int(pyre_object::longobject::jit_w_long_fits_int as *const () as usize as i64);
+    let fits_descr = crate::descr::make_jit_w_long_fits_int_calldescr();
+    let fits_result = ctx.record_op_with_descr(OpCode::CallI, &[fits_fn, obj], fits_descr);
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[fits_result]);
+    let unbox_fn =
+        ctx.const_int(pyre_object::longobject::jit_w_long_toint as *const () as usize as i64);
+    let unbox_descr = crate::descr::make_jit_w_long_toint_calldescr();
+    ctx.record_op_with_descr(OpCode::CallI, &[unbox_fn, obj], unbox_descr)
+}
+
 /// Unbox float with proper GuardClass resume data via MIFrame::generate_guard.
 pub(crate) fn trace_unbox_float_with_resume(
     frame: &mut MIFrame,
@@ -5832,7 +5872,7 @@ unsafe fn write_field_bytes(raw: *mut u8, offset: usize, field_size: usize, valu
 fn materialize_virtual_raw_buffer(
     func: i64,
     size: usize,
-    offsets: &[usize],
+    offsets: &[i64],
     descrs: &[majit_ir::ArrayDescrInfo],
     values: &[majit_metainterp::resume::MaterializedValue],
     materialized_refs: &[Option<majit_ir::GcRef>],
@@ -5869,7 +5909,7 @@ fn materialize_virtual_raw_buffer(
             !bh_descr.is_array_of_pointers(),
             "raw buffer entry must not be pointer type"
         );
-        let offset = offsets[i] as i64;
+        let offset = offsets[i];
         if di.item_type == 2 {
             // resume.py:1545-1547: descr.is_array_of_floats() → bh_raw_store_f
             backend.bh_raw_store_f(buffer, offset, f64::from_bits(concrete as u64), &bh_descr);

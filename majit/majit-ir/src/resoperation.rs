@@ -133,12 +133,43 @@ impl OpRef {
         self.raw() & !Self::CONST_BIT
     }
 
-    /// resoperation.py: is_constant() — Const subclass check.
+    /// resoperation.py:47 `AbstractValue.is_constant()` returns False;
+    /// history.py:213 `Const.is_constant()` returns True. The
+    /// dispatch is class-based — typed body variants
+    /// (`IntOp/RefOp/FloatOp/VoidOp/InputArg*`) correspond to
+    /// `AbstractValue` subclasses and are NOT constants.
+    ///
+    /// A typed body variant with `CONST_BIT` in its payload is a
+    /// namespace invariant violation — the constant namespace
+    /// (`ConstInt/ConstFloat/ConstPtr`) and the body namespace must
+    /// stay disjoint at construction time. Fail loud at the consumer
+    /// rather than silently classifying as a constant.
     pub fn is_constant(self) -> bool {
         match self {
             Self::ConstInt(_) | Self::ConstFloat(_) | Self::ConstPtr(_) => true,
-            Self::Untyped(x) if x & Self::CONST_BIT != 0 && x < Self::SENTINEL_BASE => true,
-            _ => false,
+            Self::None => false,
+            // Untyped is being retired (Slice 5.D.9 / Task #160).
+            // While the variant exists, legacy producers still encode
+            // constants as `Untyped(idx | CONST_BIT)`; honour that
+            // until the variant is removed.
+            Self::Untyped(x) => Self::raw_is_constant(x),
+            Self::IntOp(x)
+            | Self::RefOp(x)
+            | Self::FloatOp(x)
+            | Self::VoidOp(x)
+            | Self::InputArgInt(x)
+            | Self::InputArgRef(x)
+            | Self::InputArgFloat(x) => {
+                debug_assert!(
+                    !Self::raw_is_constant(x),
+                    "typed body OpRef {:?} carries CONST_BIT payload {:#x}: \
+                     namespace invariant violation — body and const namespaces must \
+                     stay disjoint (history.py:213 vs resoperation.py:47)",
+                    self,
+                    x
+                );
+                false
+            }
         }
     }
 
@@ -555,7 +586,10 @@ pub enum RdVirtualInfo {
         func: i64,
         size: usize,
         /// resume.py:696: self.offsets — byte offsets of stored values.
-        offsets: Vec<usize>,
+        /// Signed because rawbuffer.py:14 stores offsets as RPython
+        /// unbounded ints; with `index < 0`, `basesize + itemsize*index`
+        /// is negative.
+        offsets: Vec<i64>,
         /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
         /// RPython carries live ArrayDescr objects; we carry serializable snapshots.
         descrs: Vec<ArrayDescrInfo>,
@@ -563,7 +597,9 @@ pub enum RdVirtualInfo {
     },
     /// resume.py:717: VRawSliceInfo
     VRawSliceInfo {
-        offset: usize,
+        /// info.py:460: signed slice base — `optimize_INT_ADD` folds the
+        /// addend as a signed `getint()`.
+        offset: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:763 `VStrPlainInfo` — virtual byte-string built from

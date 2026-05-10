@@ -2638,8 +2638,12 @@ pub struct VirtualArrayStructInfo {
 /// offset and forward to the parent buffer.
 #[derive(Clone, Debug)]
 pub struct VirtualRawSliceInfo {
-    /// Slice offset relative to the parent buffer's base.
-    pub offset: usize,
+    /// Slice offset relative to the parent buffer's base. Signed because
+    /// `info.py:460 RawSlicePtrInfo.__init__(offset, parent)` accepts an
+    /// unbounded RPython int — `optimize_INT_ADD` folds the addend as a
+    /// signed `getint()` and a negative addend is a valid (if rare)
+    /// slice base.
+    pub offset: i64,
     /// OpRef of the parent VirtualRawBuffer (or another VirtualRawSlice
     /// — `optimize_int_add` flattens chained slices when the underlying
     /// info is `VirtualRawBufferInfo`/`VirtualRawSliceInfo`).
@@ -2660,9 +2664,13 @@ pub struct VirtualRawBufferInfo {
     pub func: i64,
     /// Size of the buffer in bytes.
     pub size: usize,
-    /// rawbuffer.py:14: self.offsets
-    pub offsets: Vec<usize>,
-    /// rawbuffer.py:15: self.lengths
+    /// rawbuffer.py:14: self.offsets — signed because RPython's
+    /// unbounded int allows `basesize + itemsize*index` to be negative
+    /// when `index < 0`. `write_value` keeps the list sorted using
+    /// signed comparison (rawbuffer.py:104 `self.offsets[i] > offset`).
+    pub offsets: Vec<i64>,
+    /// rawbuffer.py:15: self.lengths — always non-negative (unsigned
+    /// upstream itemsize from `unpack_arraydescr_size`).
     pub lengths: Vec<usize>,
     /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
     pub descrs: Vec<DescrRef>,
@@ -2682,16 +2690,16 @@ pub struct VirtualRawBufferInfo {
 pub enum RawBufferError {
     /// A write overlaps with an existing write.
     OverlappingWrite {
-        new_offset: usize,
+        new_offset: i64,
         new_length: usize,
-        existing_offset: usize,
+        existing_offset: i64,
         existing_length: usize,
     },
     /// A read from an offset that was never written.
-    UninitializedRead { offset: usize, length: usize },
+    UninitializedRead { offset: i64, length: usize },
     /// A read whose length/offset doesn't match the write at that offset.
     IncompatibleRead {
-        offset: usize,
+        offset: i64,
         read_length: usize,
         write_length: usize,
     },
@@ -2715,11 +2723,26 @@ impl VirtualRawBufferInfo {
     /// replaces value (rawbuffer.py:102), never descr.
     pub fn write_value(
         &mut self,
-        offset: usize,
+        offset: i64,
         length: usize,
         descr: DescrRef,
         value: OpRef,
     ) -> Result<(), RawBufferError> {
+        // RPython rawbuffer.py uses unbounded-int `length`. The pyre
+        // length is `usize`; on 64-bit platforms `usize > i64::MAX`
+        // would wrap to a negative i64 and break the signed overlap
+        // checks. Realistically itemsize never approaches 2^63, but
+        // bail conservatively for spec-strict parity. Treat the
+        // failure as `InvalidRawWrite` (OverlappingWrite is the
+        // closest existing error variant).
+        let Ok(length_i) = i64::try_from(length) else {
+            return Err(RawBufferError::OverlappingWrite {
+                new_offset: offset,
+                new_length: length,
+                existing_offset: offset,
+                existing_length: length,
+            });
+        };
         let mut insert_pos = 0;
         for i in 0..self.offsets.len() {
             let wo = self.offsets[i];
@@ -2742,10 +2765,17 @@ impl VirtualRawBufferInfo {
             }
             insert_pos = i + 1;
         }
-        // rawbuffer.py:108: check overlap with next entry.
+        // rawbuffer.py:108: `if i < len(self.offsets) and offset+length
+        // > self.offsets[i]: _invalid_write("overlap with next bytes")`.
+        // RPython int is unbounded; in Rust an i64 overflow on
+        // `offset + length` (length is non-negative usize) means the
+        // write extends past i64::MAX, which by signed compare is
+        // greater than every legitimate next_off — i.e. an overlap.
+        // checked_add returns None on overflow → treat as overlap.
         if insert_pos < self.offsets.len() {
             let next_off = self.offsets[insert_pos];
-            if offset + length > next_off {
+            let end = offset.checked_add(length_i);
+            if end.map_or(true, |e| e > next_off) {
                 return Err(RawBufferError::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
@@ -2754,11 +2784,16 @@ impl VirtualRawBufferInfo {
                 });
             }
         }
-        // rawbuffer.py:111: check overlap with previous entry.
+        // rawbuffer.py:111: `if i > 0 and self.offsets[i-1]+self.lengths[i-1]
+        // > offset: _invalid_write("overlap with previous bytes")`.
+        // Same overflow argument: a saturated/overflowed `prev_off+prev_len`
+        // is unbounded-greater-than `offset` in RPython, so checked_add
+        // None → treat as overlap.
         if insert_pos > 0 {
             let prev_off = self.offsets[insert_pos - 1];
             let prev_len = self.lengths[insert_pos - 1];
-            if prev_off + prev_len > offset {
+            let prev_end = prev_off.checked_add(prev_len as i64);
+            if prev_end.map_or(true, |e| e > offset) {
                 return Err(RawBufferError::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
@@ -2778,7 +2813,7 @@ impl VirtualRawBufferInfo {
     /// rawbuffer.py:120: read_value(offset, length, descr).
     pub fn read_value(
         &self,
-        offset: usize,
+        offset: i64,
         length: usize,
         descr: &DescrRef,
     ) -> Result<OpRef, RawBufferError> {
@@ -2796,26 +2831,6 @@ impl VirtualRawBufferInfo {
             }
         }
         Err(RawBufferError::UninitializedRead { offset, length })
-    }
-
-    /// Check if a read at `(offset, size)` is fully covered by previous writes.
-    pub fn is_read_fully_covered(&self, offset: usize, size: usize) -> bool {
-        (0..size).all(|i| {
-            let byte = offset + i;
-            self.offsets
-                .iter()
-                .zip(self.lengths.iter())
-                .any(|(&wo, &wl)| byte >= wo && byte < wo + wl)
-        })
-    }
-
-    /// Find the index of an existing write that is completely overwritten
-    /// by a new write at `(offset, size)`.
-    pub fn find_overwritten_write(&self, offset: usize, size: usize) -> Option<usize> {
-        self.offsets
-            .iter()
-            .zip(self.lengths.iter())
-            .position(|(&wo, &wl)| offset <= wo && offset + size >= wo + wl)
     }
 }
 
@@ -2967,55 +2982,6 @@ mod tests {
                 write_length: 8,
             }
         );
-    }
-
-    #[test]
-    fn rawbuffer_read_fully_covered() {
-        let mut buf = make_buf(32);
-        let d = int_descr();
-        buf.write_value(0, 8, d.clone(), OpRef::int_op(10)).unwrap();
-        buf.write_value(8, 8, d.clone(), OpRef::int_op(20)).unwrap();
-
-        // [0, 16) is fully covered by [0,8) + [8,16)
-        assert!(buf.is_read_fully_covered(0, 16));
-        // [0, 8) covered
-        assert!(buf.is_read_fully_covered(0, 8));
-        // [4, 8) falls within [0, 8)
-        assert!(buf.is_read_fully_covered(4, 4));
-    }
-
-    #[test]
-    fn rawbuffer_read_partially_covered_fails() {
-        let mut buf = make_buf(32);
-        let d4 = int_descr_sz(4);
-        buf.write_value(0, 4, d4.clone(), OpRef::int_op(10))
-            .unwrap();
-        buf.write_value(8, 4, d4.clone(), OpRef::int_op(20))
-            .unwrap();
-
-        // Bytes 4..8 are not covered by any write
-        assert!(!buf.is_read_fully_covered(0, 8));
-        // Byte 16 was never written
-        assert!(!buf.is_read_fully_covered(16, 4));
-    }
-
-    #[test]
-    fn rawbuffer_overwritten_write_detected() {
-        let mut buf = make_buf(32);
-        let d4 = int_descr_sz(4);
-        buf.write_value(4, 4, d4.clone(), OpRef::int_op(10))
-            .unwrap();
-        buf.write_value(12, 4, d4.clone(), OpRef::int_op(20))
-            .unwrap();
-
-        // A write [4, 12) fully contains [4, 8)
-        assert_eq!(buf.find_overwritten_write(4, 8), Some(0));
-        // A write [0, 16) fully contains [4, 8)
-        assert_eq!(buf.find_overwritten_write(0, 16), Some(0));
-        // A write [12, 20) fully contains [12, 16)
-        assert_eq!(buf.find_overwritten_write(12, 8), Some(1));
-        // A write [0, 4) does not contain any existing entry
-        assert_eq!(buf.find_overwritten_write(0, 4), None);
     }
 
     #[test]

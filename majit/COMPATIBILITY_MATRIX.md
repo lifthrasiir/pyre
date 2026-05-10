@@ -172,7 +172,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Note: PreambleOp, HeapOp, PureOp, LoopInvariantOp, CompoundOp, ExtendedShortPreambleBuilder은 구현됨
 
 **virtualstate.rs** (90%)
-- Note: GenerateGuardState, lenbound, make_inputargs, force_boxes, VirtualStateConstructor, compute_renum 모두 구현됨
+- Note: lenbound, make_inputargs, force_boxes, VirtualStateConstructor 구현됨. GenerateGuardState/compute_renum 은 production guard generation 이 GuardRequirement::GuardValue + ctx.make_constant_* 경로로 흐르면서 dead code 화 되어 제거됨 (대응 unroll.py:649 path 포팅 시 재도입).
 
 **info.rs** (85%)
 - Missing: per-type `force_box()` (InstancePtrInfo, ArrayPtrInfo 등 타입별 forcing)

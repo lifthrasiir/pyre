@@ -544,7 +544,18 @@ impl ShortBoxes {
 
     pub fn note_known_constant(&mut self, opref: OpRef) {
         self.known_constants.insert(opref);
-        self.next_synthetic_pos = self.next_synthetic_pos.max(opref.raw().saturating_add(1));
+        // Constants live in the CONST_BIT namespace (raw payloads with the
+        // high bit set). Synthetic positions allocated below live in the
+        // body namespace (raw payloads without the high bit). Keep the two
+        // disjoint so a later `compound.res.with_raw(next_synthetic_pos)`
+        // cannot mint a typed `IntOp/RefOp/FloatOp(0x8...)` whose payload
+        // accidentally encodes a constant — the typed `is_constant()` arms
+        // do not match such payloads, so `replace_op` would treat the
+        // synthetic alias as a body OpRef and resize `forwarded` to its
+        // ~2 GB raw value.
+        if !opref.is_constant() {
+            self.next_synthetic_pos = self.next_synthetic_pos.max(opref.raw().saturating_add(1));
+        }
     }
 
     pub fn note_known_constants_from_ctx(&mut self, ctx: &crate::optimizeopt::OptContext) {
@@ -2726,11 +2737,29 @@ pub fn build_short_preamble_from_produced_boxes(
 ) -> ShortPreamble {
     let mut builder = ShortPreambleBuilder::new(label_args, produced, short_inputargs);
     // RPython parity: populate known_constants so produce_arg can resolve
-    // constant OpRefs (10000+ range) in short op args. Without this,
-    // add_op_to_short fails for ops like GetfieldGcPure(constant_ptr)
-    // because produce_arg(constant_ptr) returns None.
+    // constant OpRefs in short op args. Without this, add_op_to_short
+    // fails for ops like GetfieldGcPure(constant_ptr) because
+    // produce_arg(constant_ptr) returns None.
+    //
+    // `loop_constants` (mod.rs:2940-2962) is two-source:
+    //   - const_pool entries — key is `OpRef::const_*(idx).raw()`, i.e.
+    //     `idx | CONST_BIT`. Reconstruct the typed `Const*` OpRef.
+    //   - self.constants entries (mod.rs:2956-2962, body-namespace ops
+    //     promoted to constant via `make_constant`) — key is
+    //     `replaced.raw() as u32`, i.e. the body OpRef position with
+    //     no CONST_BIT. Reconstruct the typed body `*Op` OpRef so
+    //     downstream `produce_arg` lookups (which key on the
+    //     operation's typed variant — `IntOp/FloatOp/RefOp`) hit.
+    //     Wrapping these as `Const*` (via `const_typed`) would
+    //     OR `CONST_BIT` and break variant-aware identity.
     for &idx in loop_constants.keys() {
-        builder.note_known_constant(OpRef::from_raw(idx));
+        let tp = loop_constant_types[&idx];
+        let opref = if OpRef::raw_is_constant(idx) {
+            OpRef::const_typed(idx, tp)
+        } else {
+            OpRef::op_typed(idx, tp)
+        };
+        builder.note_known_constant(opref);
     }
     for (result, _) in produced {
         let _ = builder.add_op_to_short(*result);

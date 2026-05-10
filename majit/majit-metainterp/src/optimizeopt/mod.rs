@@ -1080,7 +1080,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         &mut self,
         func: i64,
         size: usize,
-        offsets: &[usize],
+        offsets: &[i64],
         descrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
         let descr_infos: Vec<majit_ir::ArrayDescrInfo> = descrs
@@ -1114,7 +1114,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     }
 
     // resume.py:338-339 visit_vrawslice → VRawSliceInfo
-    fn visit_vrawslice(&mut self, offset: usize) -> Self::VInfo {
+    fn visit_vrawslice(&mut self, offset: i64) -> Self::VInfo {
         Some(majit_ir::RdVirtualInfo::VRawSliceInfo {
             offset,
             fieldnums: Vec::new(),
@@ -5627,6 +5627,13 @@ impl OptContext {
         // `Info(Constant)` fixtures where the walker terminates at the source
         // InputArg/ResOp and `resolved.is_constant()` would be false.
         if self.resolved_is_constant_via_box(resolved) {
+            return;
+        }
+        // optimizer.py:441-443: `if op.type == 'i': return` — raw
+        // pointers (Int-typed array bases for `RAW_LOAD/STORE` and
+        // `GETARRAYITEM_RAW/SETARRAYITEM_RAW`) carry no nullability
+        // info, so skip rather than attaching a Ref-typed `NonNullPtrInfo`.
+        if matches!(resolved.ty(), Some(majit_ir::Type::Int)) {
             return;
         }
         // optimizer.py:446: if opinfo is not None: assert opinfo.is_nonnull(); return

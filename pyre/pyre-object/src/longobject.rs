@@ -89,6 +89,38 @@ pub unsafe fn w_long_get_value(obj: PyObjectRef) -> &'static BigInt {
     }
 }
 
+/// `rbigint.fits_int()` (`rpython/rlib/rbigint.py:490`) — JIT-callable
+/// wrapper. Returns 1 when the W_LongObject's BigInt fits in i64,
+/// 0 otherwise. Used as the runtime fits_int guard before
+/// `jit_w_long_toint`.
+///
+/// Unlike `rbigint.toint()`, upstream `fits_int()` is not marked
+/// `@jit.elidable`, so keep this call cannot-raise but non-elidable.
+pub extern "C" fn jit_w_long_fits_int(obj: i64) -> i64 {
+    let obj = obj as PyObjectRef;
+    unsafe { w_long_fits_int(obj) as i64 }
+}
+
+/// `W_LongObject.toint()` (`pypy/objspace/std/longobject.py:138`) →
+/// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`).
+/// Extract an i64 from a W_LongObject. RPython `toint` raises
+/// `OverflowError` when the BigInt does not fit; the elidable
+/// trace-time site emits a `fits_int` GUARD_TRUE first
+/// (`pypy/objspace/std/listobject.py:2390 is_plain_int1` parity), so
+/// the OverflowError path is unreachable in production. Pyre encodes
+/// that unreachability as a panic. There is no `_int_w_unsafe` upstream —
+/// this is the elidable `toint` after a `fits_int` guard.
+#[majit_macros::elidable]
+pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
+    let obj = obj as PyObjectRef;
+    unsafe {
+        let big = w_long_get_value(obj);
+        i64::try_from(big).unwrap_or_else(|_| {
+            panic!("jit_w_long_toint: BigInt out of i64 range — fits_int guard violated")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +163,35 @@ mod tests {
     fn test_long_type_name_is_int() {
         // Python users see "int" for both W_IntObject and W_LongObject
         assert_eq!(LONG_TYPE.name, "int");
+    }
+
+    #[test]
+    fn test_jit_w_long_fits_int_in_range() {
+        let obj = w_long_from_i64(123);
+        assert_eq!(jit_w_long_fits_int(obj as i64), 1);
+        let obj = w_long_from_i64(i64::MAX);
+        assert_eq!(jit_w_long_fits_int(obj as i64), 1);
+        let obj = w_long_from_i64(i64::MIN);
+        assert_eq!(jit_w_long_fits_int(obj as i64), 1);
+    }
+
+    #[test]
+    fn test_jit_w_long_fits_int_out_of_range() {
+        let big = BigInt::from(i64::MAX) + BigInt::from(1);
+        let obj = w_long_new(big);
+        assert_eq!(jit_w_long_fits_int(obj as i64), 0);
+        let big = BigInt::from(i64::MIN) - BigInt::from(1);
+        let obj = w_long_new(big);
+        assert_eq!(jit_w_long_fits_int(obj as i64), 0);
+    }
+
+    #[test]
+    fn test_jit_w_long_toint_extracts_i64() {
+        let obj = w_long_from_i64(42);
+        assert_eq!(jit_w_long_toint(obj as i64), 42);
+        let obj = w_long_from_i64(i64::MAX);
+        assert_eq!(jit_w_long_toint(obj as i64), i64::MAX);
+        let obj = w_long_from_i64(i64::MIN);
+        assert_eq!(jit_w_long_toint(obj as i64), i64::MIN);
     }
 }

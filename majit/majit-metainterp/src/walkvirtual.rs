@@ -68,12 +68,12 @@ pub trait VirtualVisitor {
         &mut self,
         func: i64,
         size: usize,
-        offsets: &[usize],
+        offsets: &[i64],
         descrs: &[DescrRef],
     ) -> Self::VInfo;
 
     /// walkvirtual.py:23; info.py:484-486
-    fn visit_vrawslice(&mut self, offset: usize) -> Self::VInfo;
+    fn visit_vrawslice(&mut self, offset: i64) -> Self::VInfo;
 
     /// walkvirtual.py:26; vstring.py:210-212
     fn visit_vstrplain(&mut self, is_unicode: bool) -> Self::VInfo;

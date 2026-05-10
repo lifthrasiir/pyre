@@ -321,7 +321,7 @@ impl OptVirtualize {
     /// equivalent walk happens at access time in `resolve_raw_slice`.
     fn make_virtual_raw_slice(
         &mut self,
-        offset: usize,
+        offset: i64,
         parent: OpRef,
         source_op: &Op,
         ctx: &mut OptContext,
@@ -364,12 +364,17 @@ impl OptVirtualize {
     /// Resolve a slice/buffer alias chain to the underlying parent OpRef and
     /// the cumulative byte offset. Returns `(parent, total_offset)` when the
     /// chain ends in a `VirtualRawBuffer`, or `None` otherwise.
-    fn resolve_raw_slice(opref: OpRef, ctx: &OptContext) -> Option<(OpRef, usize)> {
+    fn resolve_raw_slice(opref: OpRef, ctx: &OptContext) -> Option<(OpRef, i64)> {
         let mut current = ctx.get_box_replacement(opref);
-        let mut total_offset = 0usize;
+        let mut total_offset: i64 = 0;
         loop {
             match ctx.peek_ptr_info_via_box(current) {
                 Some(PtrInfo::VirtualRawSlice(slice)) => {
+                    // info.py:471 RawSlicePtrInfo.getitem_raw recurses
+                    // into `self.parent.getitem_raw(self.offset + offset,
+                    // ...)`; RPython int has no overflow so a chain of
+                    // signed addends is always representable. In Rust we
+                    // bail on i64 overflow rather than wrap.
                     total_offset = total_offset.checked_add(slice.offset)?;
                     current = ctx.get_box_replacement(slice.parent);
                 }
@@ -835,7 +840,7 @@ impl OptVirtualize {
         let info = ctx.peek_ptr_info_via_box(arg0);
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
-                self.make_virtual_raw_slice(offset as usize, arg0, op, ctx);
+                self.make_virtual_raw_slice(offset, arg0, op, ctx);
                 OptimizationResult::Remove
             }
             _ => OptimizationResult::PassOn,
@@ -861,7 +866,13 @@ impl OptVirtualize {
                 None => return OptimizationResult::PassOn,
             };
             if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.peek_ptr_info_via_box(parent) {
-                let lookup_offset = base_offset + offset as usize;
+                // virtualize.py:362-365: `getitem_raw(offset, ...)` —
+                // unbounded signed int arithmetic upstream; in Rust,
+                // bail on i64 overflow rather than wrap into a stale
+                // matching offset.
+                let Some(lookup_offset) = base_offset.checked_add(offset) else {
+                    return OptimizationResult::PassOn;
+                };
                 let Some(descr) = op.descr.as_ref() else {
                     return OptimizationResult::PassOn;
                 };
@@ -896,7 +907,12 @@ impl OptVirtualize {
                 }
                 None => return OptimizationResult::PassOn,
             };
-            let store_offset = base_offset + offset as usize;
+            // virtualize.py:378: `setitem_raw(offset, ...)` — unbounded
+            // signed int upstream; bail on i64 overflow rather than
+            // wrap into a colliding offset.
+            let Some(store_offset) = base_offset.checked_add(offset) else {
+                return OptimizationResult::PassOn;
+            };
             let Some(descr) = op.descr.clone() else {
                 return OptimizationResult::PassOn;
             };
@@ -923,6 +939,239 @@ impl OptVirtualize {
                 _ => {}
             }
         }
+        OptimizationResult::PassOn
+    }
+
+    /// `virtualize.py:318-334 optimize_GETARRAYITEM_RAW_I` (aliased to `_F`):
+    ///
+    /// ```python
+    /// def optimize_GETARRAYITEM_RAW_I(self, op):
+    ///     opinfo = getrawptrinfo(op.getarg(0))
+    ///     if opinfo and opinfo.is_virtual():
+    ///         indexbox = self.get_constant_box(op.getarg(1))
+    ///         if indexbox is not None:
+    ///             offset, itemsize, descr = self._unpack_arrayitem_raw_op(op, indexbox)
+    ///             try:
+    ///                 itemvalue = opinfo.getitem_raw(offset, itemsize, descr)
+    ///             except InvalidRawOperation:
+    ///                 pass
+    ///             else:
+    ///                 self.make_equal_to(op, itemvalue)
+    ///                 return
+    ///     self.make_nonnull(op.getarg(0))
+    ///     return self.emit(op)
+    /// ```
+    ///
+    /// `_unpack_arrayitem_raw_op` (`virtualize.py:310-316`) is inlined: it
+    /// just unpacks the array_descr to `(basesize + itemsize*index,
+    /// itemsize, descr)` so factoring it out wouldn't share with anything.
+    /// Slice walk via `resolve_raw_slice` is the pyre equivalent of
+    /// `RawSlicePtrInfo.getitem_raw` (`info.py`) recursing through
+    /// `self.parent.getitem_raw(self.offset + offset, ...)`.
+    fn optimize_getarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let array_ref = ctx.get_box_replacement(op.arg(0));
+        let index_ref = op.arg(1);
+
+        if let Some(index) = ctx.get_constant_int(index_ref) {
+            if let Some(descr) = op.descr.as_ref() {
+                if let Some(ad) = descr.as_array_descr() {
+                    // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
+                    // `assert not descr.is_array_of_pointers()` at
+                    // setrawbuffer_item. Upstream's `_I/_F`-only
+                    // surface guarantees this; pyre carries the
+                    // assertion through the materialisation path,
+                    // so a virtualisation handler that admits a
+                    // pointer descr would panic at resume time.
+                    // Reject pointer descrs at entry instead.
+                    if ad.is_array_of_pointers() {
+                        ctx.make_nonnull(array_ref);
+                        return OptimizationResult::PassOn;
+                    }
+                    // virtualize.py:310-316 _unpack_arrayitem_raw_op:
+                    // `offset = basesize + (itemsize*index)`. RPython
+                    // int is unbounded so this is always
+                    // representable; in Rust we emulate that by using
+                    // checked arithmetic and falling through (== "no
+                    // optimisation") on i64 overflow rather than
+                    // wrapping into a stale offset that could match a
+                    // sibling write. `itemsize`/`basesize` come from
+                    // `unpack_arraydescr_size` (RPython unbounded
+                    // int); `usize → i64` via `try_from` so a
+                    // pathological descr that exceeds `i64::MAX`
+                    // bails rather than wrapping into a negative.
+                    let itemsize_u = ad.item_size();
+                    let basesize_u = ad.base_size();
+                    let (Ok(basesize), Ok(itemsize)) =
+                        (i64::try_from(basesize_u), i64::try_from(itemsize_u))
+                    else {
+                        ctx.make_nonnull(array_ref);
+                        return OptimizationResult::PassOn;
+                    };
+                    let Some(item_offset) = itemsize
+                        .checked_mul(index)
+                        .and_then(|m| basesize.checked_add(m))
+                    else {
+                        ctx.make_nonnull(array_ref);
+                        return OptimizationResult::PassOn;
+                    };
+                    let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
+                        Some((p, o)) => Some((p, o)),
+                        None if matches!(
+                            ctx.peek_ptr_info_via_box(array_ref),
+                            Some(PtrInfo::VirtualRawBuffer(_))
+                        ) =>
+                        {
+                            Some((array_ref, 0))
+                        }
+                        None => None,
+                    };
+                    if let Some((parent, base_offset)) = resolved {
+                        if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
+                            ctx.peek_ptr_info_via_box(parent)
+                        {
+                            // rawbuffer.py:89/120 store offsets as
+                            // signed: `self.offsets[i] > offset` is a
+                            // signed compare. A negative
+                            // `lookup_offset` is a valid lookup key
+                            // and matches an entry written at the
+                            // same negative offset.
+                            let Some(lookup_offset) = base_offset.checked_add(item_offset) else {
+                                ctx.make_nonnull(array_ref);
+                                return OptimizationResult::PassOn;
+                            };
+                            // rawbuffer.py:120 read_value ↔ getitem_raw +
+                            // InvalidRawOperation: an `Err` here matches
+                            // the upstream `except InvalidRawOperation:
+                            // pass` arm — fall through to
+                            // make_nonnull + emit.
+                            if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, descr)
+                            {
+                                ctx.replace_op(op.pos, val_ref);
+                                return OptimizationResult::Remove;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // virtualize.py:332: self.make_nonnull(op.getarg(0)) — for raw
+        // arrays this is a no-op because the helper skips `op.type == 'i'`
+        // (raw pointer); kept literal so the upstream callsite stays
+        // 1:1 with the source.
+        ctx.make_nonnull(array_ref);
+        OptimizationResult::PassOn
+    }
+
+    /// `virtualize.py:336-349 optimize_SETARRAYITEM_RAW`:
+    ///
+    /// ```python
+    /// def optimize_SETARRAYITEM_RAW(self, op):
+    ///     opinfo = getrawptrinfo(op.getarg(0))
+    ///     if opinfo and opinfo.is_virtual():
+    ///         indexbox = self.get_constant_box(op.getarg(1))
+    ///         if indexbox is not None:
+    ///             offset, itemsize, descr = self._unpack_arrayitem_raw_op(op, indexbox)
+    ///             itemop = get_box_replacement(op.getarg(2))
+    ///             try:
+    ///                 opinfo.setitem_raw(offset, itemsize, descr, itemop)
+    ///                 return
+    ///             except InvalidRawOperation:
+    ///                 pass
+    ///     self.make_nonnull(op.getarg(0))
+    ///     return self.emit(op)
+    /// ```
+    fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let array_ref = ctx.get_box_replacement(op.arg(0));
+        let index_ref = op.arg(1);
+        let value_ref = ctx.get_box_replacement(op.arg(2));
+
+        if let Some(index) = ctx.get_constant_int(index_ref) {
+            if let Some(descr) = op.descr.clone() {
+                if let Some(ad) = descr.as_array_descr() {
+                    // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
+                    // `assert not descr.is_array_of_pointers()`. A
+                    // pointer descr stored into the virtual rawbuffer's
+                    // `descrs[]` would panic at resume materialisation,
+                    // so reject it at entry. Upstream's `_I/_F`-only
+                    // surface guarantees this never reaches the
+                    // optimiser.
+                    if ad.is_array_of_pointers() {
+                        ctx.make_nonnull(array_ref);
+                        return OptimizationResult::PassOn;
+                    }
+                    // virtualize.py:310-316 _unpack_arrayitem_raw_op:
+                    // `offset = basesize + (itemsize*index)`. RPython
+                    // int is unbounded so this is always
+                    // representable; bail on i64 overflow rather than
+                    // wrap into a colliding offset. `usize → i64` via
+                    // `try_from` for descr sizes that exceed
+                    // `i64::MAX` (no upstream analogue but defensive
+                    // against unbounded-int → i64 narrowing).
+                    let itemsize_u = ad.item_size();
+                    let basesize_u = ad.base_size();
+                    let (Ok(basesize), Ok(itemsize)) =
+                        (i64::try_from(basesize_u), i64::try_from(itemsize_u))
+                    else {
+                        ctx.make_nonnull(array_ref);
+                        return OptimizationResult::PassOn;
+                    };
+                    let Some(item_offset) = itemsize
+                        .checked_mul(index)
+                        .and_then(|m| basesize.checked_add(m))
+                    else {
+                        ctx.make_nonnull(array_ref);
+                        return OptimizationResult::PassOn;
+                    };
+                    let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
+                        Some((p, o)) => Some((p, o)),
+                        None if matches!(
+                            ctx.peek_ptr_info_via_box(array_ref),
+                            Some(PtrInfo::VirtualRawBuffer(_))
+                        ) =>
+                        {
+                            Some((array_ref, 0))
+                        }
+                        None => None,
+                    };
+                    if let Some((parent, base_offset)) = resolved {
+                        // rawbuffer.py:89 keeps `offsets` sorted by
+                        // signed compare; a negative store_offset is
+                        // a legitimate write key.
+                        let Some(store_offset) = base_offset.checked_add(item_offset) else {
+                            ctx.make_nonnull(array_ref);
+                            return OptimizationResult::PassOn;
+                        };
+                        let outcome = ctx.with_ptr_info_mut(parent, |info| {
+                            if let PtrInfo::VirtualRawBuffer(vinfo) = info {
+                                Some(
+                                    vinfo
+                                        .write_value(
+                                            store_offset,
+                                            itemsize_u,
+                                            descr.clone(),
+                                            value_ref,
+                                        )
+                                        .is_ok(),
+                                )
+                            } else {
+                                None
+                            }
+                        });
+                        // rawbuffer.py:89 write_value ↔ setitem_raw +
+                        // InvalidRawOperation: an `Err` here matches the
+                        // upstream `except InvalidRawOperation: pass` and
+                        // falls through to make_nonnull + emit.
+                        if let Some(Some(true)) = outcome {
+                            return OptimizationResult::Remove;
+                        }
+                    }
+                }
+            }
+        }
+        // virtualize.py:348: self.make_nonnull(op.getarg(0)) — no-op for
+        // raw pointers via the helper's `op.type == 'i'` skip; kept
+        // literal for callsite parity.
+        ctx.make_nonnull(array_ref);
         OptimizationResult::PassOn
     }
 
@@ -1185,10 +1434,14 @@ impl Optimization for OptVirtualize {
             | OpCode::GetfieldRawR
             | OpCode::GetfieldRawF => self.optimize_getfield_gc(op, ctx),
 
-            // Array access on potentially-virtual arrays
-            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                self.optimize_setarrayitem_gc(op, ctx)
-            }
+            // virtualize.py:298 optimize_SETARRAYITEM_GC vs
+            // virtualize.py:336 optimize_SETARRAYITEM_RAW — upstream
+            // splits these because the former calls
+            // `opinfo.setitem(...)` against `VirtualArray` while the
+            // latter calls `opinfo.setitem_raw(...)` against
+            // `VirtualRawBuffer/Slice` and catches `InvalidRawOperation`.
+            OpCode::SetarrayitemGc => self.optimize_setarrayitem_gc(op, ctx),
+            OpCode::SetarrayitemRaw => self.optimize_setarrayitem_raw(op, ctx),
             // virtualize.py:289-296 — GETARRAYITEM_GC_R/F + the PURE
             // variants alias `optimize_GETARRAYITEM_GC_I` (the upstream
             // comment notes the operations are not completely
@@ -1199,10 +1452,25 @@ impl Optimization for OptVirtualize {
             | OpCode::GetarrayitemGcF
             | OpCode::GetarrayitemGcPureI
             | OpCode::GetarrayitemGcPureR
-            | OpCode::GetarrayitemGcPureF
-            | OpCode::GetarrayitemRawI
-            | OpCode::GetarrayitemRawR
-            | OpCode::GetarrayitemRawF => self.optimize_getarrayitem_gc(op, ctx),
+            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem_gc(op, ctx),
+            // virtualize.py:318-334 optimize_GETARRAYITEM_RAW_I (aliased
+            // to _F at virtualize.py:334). Upstream's
+            // `GETARRAYITEM_RAW` family is `_I/_F` only — RPython
+            // resoperation has no `_R` variant.
+            //
+            // pyre's IR also has `OpCode::GetarrayitemRawR` (raw
+            // arrays of GC refs). It is NOT routed through this
+            // optimisation: a folded read against `VirtualRawBuffer`
+            // would let a pointer descr enter the buffer's
+            // `descrs[]`, which `setrawbuffer_item` (pyre/pyre-jit/
+            // src/eval.rs:5625) explicitly rejects with
+            // `assert !is_array_of_pointers()` at resume
+            // materialisation. `_R` therefore falls through the
+            // catchall arm to plain emit, mirroring upstream's
+            // "no fold for `_R`" surface.
+            OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawF => {
+                self.optimize_getarrayitem_raw(op, ctx)
+            }
 
             // Array length
             OpCode::ArraylenGc => self.optimize_arraylen_gc(op, ctx),
@@ -2508,54 +2776,6 @@ mod tests {
         set_item.descr = Some(array_descr(24));
         let result = pass.propagate_forward(&set_item, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
-    }
-
-    #[test]
-    fn test_standard_virtualizable_raw_setarrayitem_updates_vable_state_without_side_table() {
-        // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg;
-        // slot 50 (constant), 10 / 2 (free oprefs) sit above the inputarg range.
-        let mut ctx = OptContext::with_inputarg_types(3, &[Type::Ref]);
-        ctx.seed_constant(OpRef::from_raw(50), Value::Int(0));
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
-            static_field_offsets: vec![],
-            static_field_types: vec![],
-            static_field_descrs: vec![],
-            array_field_offsets: vec![24],
-            array_item_types: vec![Type::Int],
-            array_field_descrs: vec![],
-            array_lengths: vec![1],
-            vable_input_offset: 0,
-        });
-        pass.setup();
-
-        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
-        get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef::int_op(10);
-        assert!(matches!(
-            pass.propagate_forward(&get_field, &mut ctx),
-            OptimizationResult::PassOn
-        ));
-        ctx.emit(get_field);
-
-        let mut set_item = Op::new(
-            OpCode::SetarrayitemRaw,
-            &[OpRef::int_op(10), OpRef::from_raw(50), OpRef::from_raw(2)],
-        );
-        set_item.descr = Some(array_descr(24));
-        assert!(matches!(
-            pass.propagate_forward(&set_item, &mut ctx),
-            OptimizationResult::PassOn
-        ));
-
-        let Some(PtrInfo::Virtualizable(vstate)) =
-            ctx.peek_ptr_info_via_box(OpRef::input_arg_ref(0))
-        else {
-            panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
-        };
-        assert_eq!(
-            get_array_element(&vstate.arrays, 0, 0),
-            Some(OpRef::from_raw(2))
-        );
     }
 
     #[test]

@@ -5654,7 +5654,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn setrawbuffer_item(
         &self,
         buffer: i64,
-        offset: usize,
+        offset: i64,
         value: i64,
         descr: &majit_ir::ArrayDescrInfo,
     ) {
@@ -5670,17 +5670,12 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             // resume.py:1545-1547: descr.is_array_of_floats()
             //   newvalue = self.decode_float(fieldnum)
             //   self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_f(
-                buffer,
-                offset as i64,
-                f64::from_bits(value as u64),
-                &bh_descr,
-            );
+            backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
         } else {
             // resume.py:1548-1550: else (int)
             //   newvalue = self.decode_int(fieldnum)
             //   self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_i(buffer, offset as i64, value, &bh_descr);
+            backend.bh_raw_store_i(buffer, offset, value, &bh_descr);
         }
     }
 

@@ -2455,9 +2455,25 @@ impl Optimizer {
             let preview_virtual_state =
                 crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
             let vs_args = &post_force_args;
-            let (preview_label_args, preview_virtuals) = preview_virtual_state
-                .make_inputargs_and_virtuals(vs_args, self, &mut ctx, false)
-                .expect("preview make_inputargs_and_virtuals failed");
+            // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
+            // mismatch here raises `VirtualStatesCantMatch` and the outer
+            // `compile_loop_body` catches it as an `InvalidLoop` to skip
+            // jump-to-existing and either retrace or fall back to the
+            // interpretive path. Propagate via the `InvalidLoop` panic
+            // payload so the existing wrapper at unroll.rs:1146 catches
+            // and reroutes instead of crashing the worker thread.
+            let (preview_label_args, preview_virtuals) =
+                match preview_virtual_state.make_inputargs_and_virtuals(
+                    vs_args,
+                    self,
+                    &mut ctx,
+                    false,
+                ) {
+                    Ok(pair) => pair,
+                    Err(()) => std::panic::panic_any(crate::optimize::InvalidLoop(
+                        "preview virtual state mismatch (VirtualStatesCantMatch)",
+                    )),
+                };
             let mut preview_short_args = preview_label_args.clone();
             preview_short_args.extend(preview_virtuals);
             let mut short_boxes =

@@ -93,72 +93,6 @@ use crate::optimizeopt::OptContext;
 use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::intutils::IntBound;
 
-/// virtualstate.py: GenerateGuardState — context for guard generation
-/// during virtual state comparison.
-///
-/// Holds the optimizer reference, a collection of generated guards,
-/// a renumbering map (OpRef → position), and flags.
-pub struct GenerateGuardState<'a> {
-    /// Reference to optimizer context.
-    pub ctx: &'a OptContext,
-    /// Extra guards generated during state comparison.
-    pub extra_guards: Vec<majit_ir::Op>,
-    /// Renumbering map: OpRef → position in the state vector.
-    pub renum: HashMap<OpRef, usize>,
-    /// Entries that could not be matched (incompatible state).
-    pub bad: HashMap<usize, String>,
-    /// Whether to force virtual boxes during comparison.
-    pub force_boxes: bool,
-}
-
-impl<'a> GenerateGuardState<'a> {
-    pub fn new(ctx: &'a OptContext) -> Self {
-        GenerateGuardState {
-            ctx,
-            extra_guards: Vec::new(),
-            renum: HashMap::new(),
-            bad: HashMap::new(),
-            force_boxes: false,
-        }
-    }
-
-    /// virtualstate.py: get_runtime_field(box, descr)
-    ///
-    /// Read a field from a concrete object at runtime.
-    /// Returns the value as an i64 (for int fields) or pointer.
-    pub fn get_runtime_field(&self, obj_ptr: i64, offset: usize) -> i64 {
-        if obj_ptr == 0 {
-            return 0;
-        }
-        unsafe { *((obj_ptr as *const u8).add(offset) as *const i64) }
-    }
-
-    /// virtualstate.py: get_runtime_item(box, descr, i)
-    ///
-    /// Read an array item from a concrete object at runtime.
-    pub fn get_runtime_item(&self, array_ptr: i64, index: usize, item_size: usize) -> i64 {
-        if array_ptr == 0 {
-            return 0;
-        }
-        unsafe { *((array_ptr as *const u8).add(index * item_size) as *const i64) }
-    }
-
-    /// Add an extra guard to be emitted before the bridge entry.
-    pub fn add_guard(&mut self, guard: majit_ir::Op) {
-        self.extra_guards.push(guard);
-    }
-
-    /// Mark an entry as incompatible.
-    pub fn mark_bad(&mut self, index: usize, reason: &str) {
-        self.bad.insert(index, reason.to_string());
-    }
-
-    /// Whether the comparison succeeded (no bad entries).
-    pub fn is_ok(&self) -> bool {
-        self.bad.is_empty()
-    }
-}
-
 /// Abstract info for one value at the loop boundary.
 ///
 /// Mirrors the hierarchy in RPython's `AbstractVirtualStateInfo` and its subclasses:
@@ -220,8 +154,9 @@ pub enum VirtualStateInfo {
         /// info.py:389: self.func — the malloc function pointer.
         func: i64,
         size: usize,
-        /// rawbuffer.py:14-16: offsets, lengths, per-entry child state.
-        entries: Vec<(usize, usize, Rc<VirtualStateInfoNode>)>,
+        /// rawbuffer.py:14-16: offsets (signed, see RawBuffer.offsets),
+        /// lengths (unsigned), per-entry child state.
+        entries: Vec<(i64, usize, Rc<VirtualStateInfoNode>)>,
         /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
         descrs: Vec<DescrRef>,
     },
@@ -675,9 +610,6 @@ impl VirtualStateInfo {
 pub struct VirtualState {
     /// Abstract info for each loop-carried variable, in order matching Label/Jump args.
     pub state: Vec<Rc<VirtualStateInfoNode>>,
-    /// virtualstate.py: renum — maps virtual OpRef to numbering index.
-    /// Used to ensure consistent virtual identity across loop iterations.
-    pub renum: std::collections::HashMap<OpRef, usize>,
     /// virtualstate.py:631 `VirtualState.numnotvirtuals`. Maintained by
     /// [`Self::enum_top_level`].
     numnotvirtuals: usize,
@@ -702,7 +634,6 @@ impl VirtualState {
     pub fn from_shared_rcs(state: Vec<Rc<VirtualStateInfoNode>>) -> Self {
         let mut vs = VirtualState {
             state,
-            renum: std::collections::HashMap::new(),
             numnotvirtuals: 0,
             info_counter: -1,
         };
@@ -1608,23 +1539,6 @@ impl VirtualState {
         }
     }
 
-    /// virtualstate.py: compute_renum(oprefs)
-    /// Build the renum mapping from OpRef to numbering index.
-    /// This ensures consistent virtual identity across loop iterations.
-    pub fn compute_renum(&mut self, oprefs: &[OpRef]) {
-        self.renum.clear();
-        for (i, &opref) in oprefs.iter().enumerate() {
-            if !opref.is_none() {
-                self.renum.insert(opref, i);
-            }
-        }
-    }
-
-    /// Get the numbering index for an OpRef.
-    pub fn get_renum(&self, opref: OpRef) -> Option<usize> {
-        self.renum.get(&opref).copied()
-    }
-
     /// virtualstate.py: debug_print(hdr, bad, metainterp_sd)
     /// Format the virtual state for debugging.
     pub fn debug_print(&self) -> String {
@@ -1649,116 +1563,6 @@ impl VirtualState {
 }
 
 impl VirtualState {
-    /// virtualstate.py: generate_guards(other, boxes, runtime_boxes, optimizer)
-    ///
-    /// Full guard generation with GenerateGuardState context.
-    /// For each state entry, generate guards that make the runtime values
-    /// match the expected virtual state shape.
-    ///
-    /// `runtime_boxes`: live OpRefs at the jump point. Used by per-entry
-    /// guard generation to decide whether emitting a GUARD_VALUE is
-    /// profitable (e.g. runtime value already equals the expected constant).
-    pub fn generate_guards_with_state<'a>(
-        &self,
-        other: &VirtualState,
-        boxes: &[OpRef],
-        runtime_boxes: Option<&[OpRef]>,
-        ctx: &'a OptContext,
-    ) -> GenerateGuardState<'a> {
-        let mut state = GenerateGuardState::new(ctx);
-        let len = self.state.len().min(other.state.len()).min(boxes.len());
-        for i in 0..len {
-            let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
-            self.generate_guard_for_entry(
-                i,
-                &self.state[i],
-                &other.state[i],
-                boxes[i],
-                runtime_box,
-                &mut state,
-            );
-        }
-        state
-    }
-
-    /// Per-entry guard generation (virtualstate.py: AbstractVirtualStateInfo.generate_guards)
-    ///
-    /// `runtime_box`: the live OpRef for this entry at the jump point.
-    /// For LEVEL_CONSTANT targets, if the runtime_box is available we emit
-    /// GUARD_VALUE instead of marking the entry as bad — matching RPython's
-    /// `NotVirtualStateInfo._generate_guards` (line 400).
-    fn generate_guard_for_entry(
-        &self,
-        idx: usize,
-        expected: &VirtualStateInfo,
-        incoming: &VirtualStateInfo,
-        box_opref: OpRef,
-        runtime_box: Option<OpRef>,
-        state: &mut GenerateGuardState,
-    ) {
-        match (expected, incoming) {
-            // Constant vs same constant → no guard needed
-            (VirtualStateInfo::Constant(val), VirtualStateInfo::Constant(other_val)) => {
-                if val != other_val {
-                    state.mark_bad(idx, "constant mismatch");
-                }
-            }
-            // Constant vs non-constant: emit GUARD_VALUE if runtime_box available,
-            // otherwise mark as bad. (virtualstate.py line 400)
-            (VirtualStateInfo::Constant(_val), _) => {
-                if runtime_box.is_some() {
-                    // PRE-EXISTING-ADAPTATION (Slice 5.D.9 audit, last-mover):
-                    // synthesizes a fake "const-pool position" via raw u32
-                    // 10_000 + idx, ignoring `_val`'s actual value. Convergence
-                    // path: thread `_val` into the constant pool and emit the
-                    // matching `OpRef::const_int/const_float/const_ptr(idx)`
-                    // here. Until then keep the `OpRef::from_raw(_)` form so
-                    // the audit-flagged synthesis stays visible — no other
-                    // typed factory is semantically correct for this synthetic
-                    // position.
-                    let val_const = OpRef::from_raw(10_000 + idx as u32);
-                    let mut op = Op::new(OpCode::GuardValue, &[box_opref, val_const]);
-                    op.fail_args = Some(Default::default());
-                    state.add_guard(op);
-                } else {
-                    state.mark_bad(idx, "constant mismatch");
-                }
-            }
-            // KnownClass vs unknown → GUARD_CLASS
-            // virtualstate.py:601-602: with runtime_box, RPython emits
-            // GUARD_NONNULL_CLASS using cpu.cls_of_box(runtime_box).
-            // We rely on GuardRequirement::GuardClass from the caller.
-            (VirtualStateInfo::KnownClass { .. }, VirtualStateInfo::Unknown(_)) => {
-                // Guard will be generated by the caller from GuardRequirement
-            }
-            // NonNull vs unknown → GUARD_NONNULL
-            // virtualstate.py:579: runtime_box check is implicit — we always
-            // emit GuardNonnull via GuardRequirement.
-            (VirtualStateInfo::NonNull, VirtualStateInfo::Unknown(_)) => {}
-            // IntBounded vs unknown → bounds guards
-            // virtualstate.py:493-498: RPython checks runtime_box.getint()
-            // against self.intbound.contains() before emitting bounds guards.
-            // We lack runtime value access, so we emit bounds guards
-            // unconditionally via GuardRequirement::GuardBounds.
-            (VirtualStateInfo::IntBounded(_), VirtualStateInfo::Unknown(_)) => {}
-            // Virtual vs Virtual → check fields match
-            (
-                VirtualStateInfo::Virtual { descr: d1, .. },
-                VirtualStateInfo::Virtual { descr: d2, .. },
-            ) => {
-                if d1.index() != d2.index() {
-                    state.mark_bad(idx, "virtual descriptor mismatch");
-                }
-            }
-            // Virtual vs non-virtual → cannot match
-            (VirtualStateInfo::Virtual { .. }, _) => {
-                state.mark_bad(idx, "expected virtual, got non-virtual");
-            }
-            // Compatible or both unknown → ok
-            _ => {}
-        }
-    }
-
     /// virtualstate.py: force_boxes(optimizer) — force all virtual entries
     /// to be materialized. After calling this, all entries become non-virtual
     /// (Constant, KnownClass, NonNull, IntBounded, or Unknown).
@@ -2878,19 +2682,5 @@ mod tests {
         assert_eq!(inputargs.len(), 1);
         assert_eq!(inputargs[0], ctx.get_box_replacement(virtual_ref));
         assert!(virtuals.is_empty());
-    }
-
-    #[test]
-    fn test_compute_renum() {
-        let mut state = VirtualState::new(vec![
-            VirtualStateInfo::Unknown(Type::Int),
-            VirtualStateInfo::NonNull,
-            VirtualStateInfo::Unknown(Type::Int),
-        ]);
-        state.compute_renum(&[OpRef::int_op(10), OpRef::ref_op(20), OpRef::int_op(30)]);
-        assert_eq!(state.get_renum(OpRef::int_op(10)), Some(0));
-        assert_eq!(state.get_renum(OpRef::ref_op(20)), Some(1));
-        assert_eq!(state.get_renum(OpRef::int_op(30)), Some(2));
-        assert_eq!(state.get_renum(OpRef::int_op(99)), None);
     }
 }

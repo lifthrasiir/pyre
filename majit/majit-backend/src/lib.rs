@@ -150,15 +150,16 @@ pub enum ExitVirtualLayout {
     },
     /// resume.py:717 VRawSliceInfo — base_buffer + offset.
     RawSlice {
-        offset: usize,
+        /// info.py:460 signed slice base.
+        offset: i64,
         base: ExitValueSourceLayout,
     },
     RawBuffer {
         /// resume.py:694: self.func
         func: i64,
         size: usize,
-        /// resume.py:695: self.offsets
-        offsets: Vec<usize>,
+        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
+        offsets: Vec<i64>,
         /// resume.py:697: self.descrs
         descrs: Vec<majit_ir::ArrayDescrInfo>,
         /// resume.py:693: fieldnums (decoded)

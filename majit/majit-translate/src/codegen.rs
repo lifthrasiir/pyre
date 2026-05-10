@@ -1453,6 +1453,7 @@ pub fn generated_list_setitem_by_strategy(
     value: majit_ir::OpRef,
     concrete_key: i64,
     strategy_id: i64,
+    unbox_long: bool,
 ) {
     frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, obj, strategy_id);
@@ -1477,12 +1478,7 @@ pub fn generated_list_setitem_by_strategy(
                 obj,
                 crate::descr::list_int_items_ptr_descr(),
             );
-            let raw = if frame.value_type(value) == majit_ir::Type::Int {
-                value
-            } else {
-                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
-            };
+            let raw = unbox_int_or_long_for_int_strategy(frame, ctx, value, unbox_long);
             crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
         }
         2 => {
@@ -1500,6 +1496,29 @@ pub fn generated_list_setitem_by_strategy(
             crate::state::trace_raw_float_array_setitem_value(ctx, items_ptr, index, raw);
         }
         _ => unreachable!(),
+    }
+}
+
+/// Unbox a Python int into a raw i64 for the int-strategy list path.
+/// `unbox_long=true` selects `trace_unbox_long_with_resume(LONG_TYPE)` to
+/// accept fits_int W_LongObject (`listobject.py:1957-1958 IntegerListStrategy
+/// .is_correct_type` parity); `false` selects the default W_IntObject unbox.
+#[inline]
+fn unbox_int_or_long_for_int_strategy(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    value: majit_ir::OpRef,
+    unbox_long: bool,
+) -> majit_ir::OpRef {
+    if frame.value_type(value) == majit_ir::Type::Int {
+        return value;
+    }
+    if unbox_long {
+        let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
+        crate::state::trace_unbox_long_with_resume(frame, ctx, value, long_type_addr)
+    } else {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
     }
 }
 
@@ -1656,6 +1675,7 @@ pub fn generated_list_append_by_strategy(
     value: majit_ir::OpRef,
     strategy_id: i64,
     is_inline: bool,
+    unbox_long: bool,
 ) {
     use majit_ir::OpCode;
 
@@ -1678,12 +1698,7 @@ pub fn generated_list_append_by_strategy(
                 list,
                 crate::descr::list_int_items_ptr_descr(),
             );
-            let raw = if frame.value_type(value) == majit_ir::Type::Int {
-                value
-            } else {
-                let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                crate::state::trace_unbox_int_with_resume(frame, ctx, value, int_type_addr)
-            };
+            let raw = unbox_int_or_long_for_int_strategy(frame, ctx, value, unbox_long);
             crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, len, raw);
         }
         2 => {
@@ -2461,12 +2476,14 @@ pub fn generated_store_subscr_value(
         if pyre_object::pyobject::is_list(concrete_obj)
             && pyre_object::pyobject::is_int(concrete_key)
         {
-            if let Some(sid) = detect_list_setitem_strategy(concrete_obj, concrete_value) {
+            if let Some((sid, unbox_long)) =
+                detect_list_setitem_strategy(concrete_obj, concrete_value)
+            {
                 let index = pyre_object::w_int_get_value(concrete_key);
                 let concrete_len = pyre_object::w_list_len(concrete_obj);
                 if check_index_in_bounds(index, concrete_len) {
                     generated_list_setitem_by_strategy(
-                        frame, ctx, obj, key, value, index, sid,
+                        frame, ctx, obj, key, value, index, sid, unbox_long,
                     );
                     return true;
                 }
@@ -2508,22 +2525,27 @@ unsafe fn detect_list_getitem_strategy(
 
 /// Detect list strategy for setitem, checking value type compatibility.
 /// listobject.py: int strategy requires int value, float strategy requires float.
+///
+/// Returns `(strategy_id, unbox_long)` where `unbox_long=true` indicates
+/// the int-strategy path must use the W_LongObject fits_int unbox helper
+/// (`listobject.py:2390 is_plain_int1` accepts W_IntObject and fits_int
+/// W_LongObject; the lowering branches between them).
 #[inline]
 unsafe fn detect_list_setitem_strategy(
     concrete_obj: pyre_object::PyObjectRef,
     concrete_value: pyre_object::PyObjectRef,
-) -> Option<i64> {
+) -> Option<(i64, bool)> {
     if pyre_object::w_list_uses_object_storage(concrete_obj) {
-        Some(0)
+        Some((0, false))
     } else if pyre_object::w_list_uses_int_storage(concrete_obj)
-        && pyre_object::pyobject::is_int(concrete_value)
-        && crate::state::int_strategy_preserves_identity(concrete_value)
+        && pyre_object::is_plain_int1(concrete_value)
     {
-        Some(1)
+        let unbox_long = pyre_object::pyobject::is_long(concrete_value);
+        Some((1, unbox_long))
     } else if pyre_object::w_list_uses_float_storage(concrete_obj)
         && pyre_object::pyobject::is_float(concrete_value)
     {
-        Some(2)
+        Some((2, false))
     } else {
         None
     }

@@ -1735,6 +1735,36 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
     majit_ir::make_raw_malloc_calldescr()
 }
 
+/// CallDescr for `pyre_object::longobject::jit_w_long_fits_int(obj) -> i64`.
+/// `rbigint.fits_int()` is not annotated `@jit.elidable` upstream; it is only
+/// used as a cannot-raise runtime guard before the elidable `toint()` call.
+pub fn make_jit_w_long_fits_int_calldescr() -> DescrRef {
+    majit_ir::make_call_descr(
+        vec![Type::Ref],
+        Type::Int,
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    )
+}
+
+/// CallDescr for `pyre_object::longobject::jit_w_long_toint(obj) -> i64`.
+/// `W_LongObject.toint()` (longobject.py:138) → `rbigint.toint()`
+/// (rbigint.py:465) — `EF_ELIDABLE_CANNOT_RAISE` because the caller
+/// emits a fits_int GUARD_TRUE before invoking; OverflowError is
+/// statically unreachable post-guard.
+pub fn make_jit_w_long_toint_calldescr() -> DescrRef {
+    majit_ir::make_call_descr(
+        vec![Type::Ref],
+        Type::Int,
+        majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::ElidableCannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    )
+}
+
 /// descr.py:273 ArrayDescr for array-of-structs (FLAG_STRUCT).
 /// resume.py:749: allocate_array(self.size, self.arraydescr, clear=True).
 pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: usize) -> DescrRef {

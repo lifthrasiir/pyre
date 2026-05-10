@@ -4502,27 +4502,30 @@ impl MIFrame {
                 // listobject.rs:234: typed strategies (int/float) de-specialize
                 // to object strategy if the appended value doesn't match.
                 // Only enter typed fast path when concrete value type matches.
-                let strategy_id = if w_list_uses_object_storage(concrete_list) {
-                    Some(0i64)
+                //
+                // `IntegerListStrategy.is_correct_type`
+                // (`listobject.py:1957-1958`) accepts both `W_IntObject` and
+                // a fits_int `W_LongObject`. Pyre threads the choice through
+                // `unbox_long`: false → `trace_unbox_int_with_resume(INT_TYPE)`,
+                // true → `trace_unbox_long_with_resume(LONG_TYPE)` (which
+                // emits the fits_int residual GUARD_TRUE before extraction).
+                let strategy = if w_list_uses_object_storage(concrete_list) {
+                    Some((0i64, false))
                 } else if w_list_uses_int_storage(concrete_list)
-                    && !concrete_value.is_null()
-                    && is_int(concrete_value)
-                    && crate::state::int_strategy_preserves_identity(concrete_value)
+                    && pyre_object::is_plain_int1(concrete_value)
                 {
-                    Some(1i64)
-                } else if w_list_uses_float_storage(concrete_list)
-                    && !concrete_value.is_null()
-                    && is_float(concrete_value)
-                {
-                    Some(2i64)
+                    let unbox_long = pyre_object::pyobject::is_long(concrete_value);
+                    Some((1i64, unbox_long))
+                } else if w_list_uses_float_storage(concrete_list) && is_float(concrete_value) {
+                    Some((2i64, false))
                 } else {
                     None
                 };
-                if let Some(sid) = strategy_id {
+                if let Some((sid, unbox_long)) = strategy {
                     let is_inline = w_list_is_inline_storage(concrete_list);
                     return self.with_ctx(|this, ctx| {
                         crate::generated_list_append_by_strategy(
-                            this, ctx, list, value, sid, is_inline,
+                            this, ctx, list, value, sid, is_inline, unbox_long,
                         );
                         Ok(())
                     });
