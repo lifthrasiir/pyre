@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use majit_ir::descr::{EffectInfo, ExtraEffect, OopSpecIndex};
+use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
@@ -2820,6 +2820,7 @@ impl CallControl {
         oopspecindex: OopSpecIndex,
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
+        extradescrs: Option<Vec<DescrRef>>,
     ) -> CallDescriptor {
         // Extract the direct-call target (if any) and indirect-call family
         // (if any).  Exactly one is Some after the initial dispatch;
@@ -3076,6 +3077,7 @@ impl CallControl {
             oopspecindex,
             can_invalidate,
             can_collect,
+            extradescrs,
         );
 
         // RPython call.py:326-332 post-conditions on elidable / loopinvariant.
@@ -3253,6 +3255,7 @@ fn effectinfo_from_writeanalyze(
     oopspecindex: OopSpecIndex,
     can_invalidate: bool,
     can_collect: bool,
+    extradescrs: Option<Vec<DescrRef>>,
 ) -> EffectInfo {
     // effectinfo.py:285: if effects is top_set or extraeffect == EF_RANDOM_EFFECTS:
     if effects.is_top || extraeffect == ExtraEffect::RandomEffects {
@@ -3267,7 +3270,7 @@ fn effectinfo_from_writeanalyze(
             readonly_descrs_interiorfields: None,
             write_descrs_interiorfields: None,
             single_write_descr_array: None,
-            extradescrs: None,
+            extradescrs: extradescrs.clone(),
             can_invalidate,
             can_collect: true, // effectinfo.py:364-365: forces → can_collect = True
             call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
@@ -3330,7 +3333,7 @@ fn effectinfo_from_writeanalyze(
             &write_descrs_interiorfields,
         )),
         single_write_descr_array,
-        extradescrs: None,
+        extradescrs,
         can_invalidate,
         can_collect,
         call_release_gil_target: EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
@@ -4735,6 +4738,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(!descriptor.extra_info.can_invalidate);
@@ -4757,6 +4761,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
@@ -4779,6 +4784,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4804,6 +4810,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4829,6 +4836,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4858,6 +4866,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4882,6 +4891,7 @@ mod tests {
             OopSpecIndex::None,
             Some(ExtraEffect::ElidableCannotRaise),
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -4923,6 +4933,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
@@ -4943,6 +4954,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         // RandomEffects is false, QuasiImmut is false → can_invalidate is false.
@@ -4989,6 +5001,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         // Should have non-empty bitsets for field reads and writes.
         assert!(
@@ -5064,6 +5077,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -5167,6 +5181,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
         // Write is set, but readonly should NOT have the same bit set.
         // RPython: readonly = reads & ~writes
@@ -5630,6 +5645,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
         );
     }
 
@@ -5752,5 +5768,79 @@ mod tests {
              incompatible argument types; got {:?}",
             segs(&bare_family),
         );
+    }
+
+    #[test]
+    fn test_getcalldescr_extradescrs_propagated() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct StubDescr(u32);
+        impl majit_ir::Descr for StubDescr {
+            fn index(&self) -> u32 {
+                self.0
+            }
+        }
+
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pure_add"]);
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("pure_add"));
+        cc.find_all_graphs_for_tests();
+
+        let extra0: DescrRef = Arc::new(StubDescr(80));
+        let extra1: DescrRef = Arc::new(StubDescr(81));
+        let extras = Some(vec![extra0.clone(), extra1.clone()]);
+
+        let target = CallTarget::function_path(["pure_add"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::DictLookup,
+            None,
+            &mut cache,
+            extras,
+        );
+        let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].index(), 80);
+        assert_eq!(got[1].index(), 81);
+    }
+
+    #[test]
+    fn test_getcalldescr_extradescrs_survives_random_effects() {
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct StubDescr(u32);
+        impl majit_ir::Descr for StubDescr {
+            fn index(&self) -> u32 {
+                self.0
+            }
+        }
+
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["chaotic"]);
+        cc.register_function_graph(path.clone(), raising_graph("chaotic"));
+        cc.find_all_graphs_for_tests();
+
+        let extra0: DescrRef = Arc::new(StubDescr(90));
+        let extras = Some(vec![extra0.clone()]);
+
+        let target = CallTarget::function_path(["chaotic"]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::DictLookup,
+            Some(ExtraEffect::RandomEffects),
+            &mut cache,
+            extras,
+        );
+        let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].index(), 90);
     }
 }

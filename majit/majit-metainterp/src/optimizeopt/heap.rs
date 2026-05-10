@@ -713,18 +713,16 @@ pub struct OptHeap {
     /// all its dependencies are transitively escaped.
     heapc_deps: HashMap<OpRef, Vec<OpRef>>,
 
-    // heap.py:27 OptHeap inherits Optimization.last_emitted_operation,
-    // which is set to REMOVED by `_optimize_CALL_DICT_LOOKUP`
-    // (heap.py:527) when a folded CALL_PURE collapses into its cached
-    // result. `optimize_GUARD_NO_EXCEPTION` (heap.py:530-533) reads the
-    // flag and skips emitting the trailing guard.
-    //
-    // _optimize_CALL_DICT_LOOKUP is not yet ported — it depends on
-    // `extradescrs` on EffectInfo (rpython rordereddict descriptor
-    // pairing) which majit-ir does not carry. Until that lands the
-    // OptHeap REMOVED setter does not exist, so the corresponding
-    // reader is omitted in optimize_GUARD_NO_EXCEPTION rather than
-    // installed as dead code.
+    /// heap.py:27 Optimization.last_emitted_operation is REMOVED.
+    /// Set to true when `_optimize_CALL_DICT_LOOKUP` folds a lookup;
+    /// read by `optimize_GUARD_NO_EXCEPTION` to suppress the trailing guard.
+    last_emitted_removed: bool,
+    /// heap.py:337: cached_dict_reads — descr_identity(extradescrs[0]) → { [dict,key] → result_opref }.
+    /// Consecutive dict lookups on the same dict+key are deduplicated.
+    cached_dict_reads: HashMap<usize, HashMap<[OpRef; 2], OpRef>>,
+    /// heap.py:560: corresponding_array_descrs — maps extradescrs[1] bitstring index → extradescrs[0] identity.
+    /// Used in force_from_effectinfo to clear dict_reads when the entries array is written.
+    corresponding_array_descrs: HashMap<u32, usize>,
     /// Fields known to be quasi-immutable: (obj, field_idx) -> cached value OpRef.
     /// Populated by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*.
     /// Survives calls (guarded by GUARD_NOT_INVALIDATED).
@@ -744,6 +742,9 @@ impl OptHeap {
             unescaped: Vec::new(),
             known_nonnull: Vec::new(),
             heapc_deps: HashMap::new(),
+            last_emitted_removed: false,
+            cached_dict_reads: HashMap::new(),
+            corresponding_array_descrs: HashMap::new(),
             quasi_immut_cache: HashMap::new(),
         }
     }
@@ -1256,7 +1257,7 @@ impl OptHeap {
             }
         }
         // heap.py:390: self.cached_dict_reads.clear()
-        // (no dict_reads cache in majit)
+        self.cached_dict_reads.clear();
     }
 
     /// heapcache.py:363-369 invalidate_unescaped / clear_caches_varargs
@@ -1428,6 +1429,86 @@ impl OptHeap {
             .and_then(|d| d.as_call_descr())
             .map(|cd| cd.get_extra_info().oopspecindex)
             .unwrap_or(OopSpecIndex::None)
+    }
+
+    /// heap.py:480-528 _optimize_CALL_DICT_LOOKUP.
+    ///
+    /// Cache consecutive dict lookup calls on the same dict+key.
+    /// FLAG_LOOKUP (0): always cache and reuse.
+    /// FLAG_STORE  (1): don't cache new; reuse only if cached value ≥ 0.
+    /// FLAG_DELETE (2+): never cache, never reuse.
+    fn _optimize_call_dict_lookup(
+        &mut self,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> bool {
+        const FLAG_LOOKUP: i64 = 0;
+        const FLAG_STORE: i64 = 1;
+
+        // heap.py:497-500: flag_value = self.getintbound(op.getarg(4))
+        //   if not flag_value.is_constant(): return False
+        //   flag = flag_value.get_constant_int()
+        if op.args.len() < 5 {
+            return false;
+        }
+        let flag = match ctx.get_constant_int_or_bound(op.arg(4)) {
+            Some(v) => v,
+            None => return false,
+        };
+        if flag != FLAG_LOOKUP && flag != FLAG_STORE {
+            return false;
+        }
+
+        // heap.py:504: descrs = op.getdescr().get_extra_info().extradescrs
+        let extradescrs = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr())
+            .and_then(|cd| cd.get_extra_info().extradescrs.as_ref())
+            .cloned();
+        let descrs = match extradescrs {
+            Some(ref d) if d.len() >= 2 => d,
+            _ => return false,
+        };
+        let descr1_id = descr_identity(&descrs[0]);
+        let descr2_idx = descrs[1].index();
+
+        // heap.py:506-510: d = cached_dict_reads[descr1]; register corresponding_array_descrs
+        let d = self
+            .cached_dict_reads
+            .entry(descr1_id)
+            .or_default();
+        self.corresponding_array_descrs
+            .entry(descr2_idx)
+            .or_insert(descr1_id);
+
+        // heap.py:513-514: key = [get_box_replacement(arg1), get_box_replacement(arg2)]
+        let key = [
+            ctx.get_box_replacement(op.arg(1)),
+            ctx.get_box_replacement(op.arg(2)),
+        ];
+
+        if let Some(&res_v) = d.get(&key) {
+            // heap.py:523-525: flag != FLAG_LOOKUP → self.getintbound(res_v).known_ge_const(0)
+            if flag != FLAG_LOOKUP {
+                let resolved = ctx.get_box_replacement(res_v);
+                let bound = ctx.get_int_bound(resolved);
+                let known_ge_zero = bound.map_or(false, |b| b.known_ge_const(0));
+                if !known_ge_zero {
+                    return false;
+                }
+            }
+            // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
+            ctx.make_equal_to(op.pos, res_v);
+            self.last_emitted_removed = true;
+            return true;
+        }
+
+        // heap.py:517-518: no hit — cache if FLAG_LOOKUP
+        if flag == FLAG_LOOKUP {
+            d.insert(key, op.pos);
+        }
+        false
     }
 
     /// Mark call arguments as escaped.
@@ -1616,6 +1697,10 @@ impl OptHeap {
                         }
                     }
                 }
+                // heap.py:547-552: del self.cached_dict_reads[fielddescr]
+                if !descr.is_always_pure() {
+                    self.cached_dict_reads.remove(&descr_identity(&descr));
+                }
             }
         }
 
@@ -1718,6 +1803,22 @@ impl OptHeap {
                     submap.clear_varindex();
                 }
             }
+        }
+
+        // heap.py:560-563: invalidate cached_dict_reads via corresponding_array_descrs.
+        let array_ids_to_clear: Vec<usize> = self
+            .corresponding_array_descrs
+            .iter()
+            .filter_map(|(&arr_idx, &dict_id)| {
+                if ei.check_write_descr_array(arr_idx) {
+                    Some(dict_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for dict_id in array_ids_to_clear {
+            self.cached_dict_reads.remove(&dict_id);
         }
     }
 
@@ -2540,10 +2641,12 @@ impl OptHeap {
                 // heap.py: DICT_LOOKUP caching — consecutive dict lookups
                 // on the same dict with the same key can be deduplicated.
                 OopSpecIndex::DictLookup => {
+                    // heap.py:472-475: try caching first
+                    if self._optimize_call_dict_lookup(op, ctx) {
+                        return OptimizationResult::Remove;
+                    }
                     self.mark_escaped_varargs(op, ctx);
                     self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                    // Invalidate dict-related caches but keep field/array caches.
-                    // Dict operations don't affect struct fields.
                     return OptimizationResult::Emit(op.clone());
                 }
                 OopSpecIndex::Arraycopy | OopSpecIndex::Arraymove => {
@@ -2781,33 +2884,16 @@ impl OptHeap {
                 OptimizationResult::PassOn
             }
 
-            // heap.py:530-535 optimize_GUARD_NO_EXCEPTION
-            // (alias optimize_GUARD_EXCEPTION = optimize_GUARD_NO_EXCEPTION):
-            //
-            //     def optimize_GUARD_NO_EXCEPTION(self, op):
-            //         if self.last_emitted_operation is REMOVED:
-            //             return
-            //         return self.emit(op)
-            //     optimize_GUARD_EXCEPTION = optimize_GUARD_NO_EXCEPTION
-            //
-            // The REMOVED check is the only path the upstream guard arm
-            // shortcuts on. last_emitted_operation is set to REMOVED only
-            // by _optimize_CALL_DICT_LOOKUP (heap.py:527), which majit
-            // does not yet port (see the field comment near the top of
-            // OptHeap). Until that helper lands the REMOVED branch has no
-            // producer, so the unconditional emit is the structurally
-            // correct port.
-            //
-            // Returning Emit hands the guard back to the propagate_forward
-            // wrapper, which (1) flushes self.postponed_op via the standard
-            // emit() override and (2) routes the guard through
-            // emit_operation. emit_operation then invokes
-            // emitting_operation for OptHeap, whose guard branch
-            // (heap.py:432-435) calls force_lazy_sets_for_guard — preserving
-            // immutable cache entries and writing the lazy sets only into
-            // the guard's pendingfields, never as new ops in the trace.
+            // heap.py:530-535 optimize_GUARD_NO_EXCEPTION / optimize_GUARD_EXCEPTION.
+            // When _optimize_CALL_DICT_LOOKUP folds a lookup, it sets
+            // last_emitted_removed; the trailing GUARD_NO_EXCEPTION is dead.
             OpCode::GuardNoException | OpCode::GuardException => {
-                OptimizationResult::Emit(op.clone())
+                if self.last_emitted_removed {
+                    self.last_emitted_removed = false;
+                    OptimizationResult::Remove
+                } else {
+                    OptimizationResult::Emit(op.clone())
+                }
             }
 
             // ── GUARD_NOT_INVALIDATED deduplication ──
@@ -2897,6 +2983,14 @@ impl Default for OptHeap {
 
 impl Optimization for OptHeap {
     fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        // Reset last_emitted_removed before non-guard ops (mirrors RPython's
+        // natural overwrite of last_emitted_operation on every emit).
+        if !matches!(
+            op.opcode,
+            OpCode::GuardNoException | OpCode::GuardException
+        ) {
+            self.last_emitted_removed = false;
+        }
         let result = self.dispatch_propagate(op, ctx);
         // RPython heap.py:417-425 emit() override parity:
         // Before emitting any new op, flush the postponed op. Then
@@ -2926,6 +3020,9 @@ impl Optimization for OptHeap {
         self.seen_allocation.clear();
         self.unescaped.clear();
         self.known_nonnull.clear();
+        self.last_emitted_removed = false;
+        self.cached_dict_reads.clear();
+        self.corresponding_array_descrs.clear();
         self.quasi_immut_cache.clear();
     }
 
@@ -6170,5 +6267,149 @@ mod tests {
             super::ArrayCachedItem::_cannot_alias_via_content(op1, op2, &mut ctx),
             "arrays with different constant at index 1 cannot alias"
         );
+    }
+
+    fn dict_lookup_descr(idx: u32, extra0: DescrRef, extra1: DescrRef) -> DescrRef {
+        Arc::new(TestCallDescr {
+            idx,
+            effect: EffectInfo {
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: OopSpecIndex::DictLookup,
+                extradescrs: Some(vec![extra0, extra1]),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// heap.py:480-528 parity: FLAG_LOOKUP deduplicates consecutive dict lookups.
+    #[test]
+    fn test_dict_lookup_cache_flag_lookup() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        // Build args: [func_addr, dict, key, hash, flag=FLAG_LOOKUP(0)]
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag = ctx.make_constant_int(0); // FLAG_LOOKUP
+
+        // First lookup — not cached yet, should return false (emit).
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+
+        // Second lookup with same dict+key — should be cached.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+        assert!(heap.last_emitted_removed);
+    }
+
+    /// heap.py:495-499 parity: FLAG_STORE reuses only if cached value >= 0.
+    #[test]
+    fn test_dict_lookup_cache_flag_store_nonneg() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag_lookup = ctx.make_constant_int(0); // FLAG_LOOKUP
+        let flag_store = ctx.make_constant_int(1); // FLAG_STORE
+
+        // Seed cache with FLAG_LOOKUP, then try FLAG_STORE.
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_lookup]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        // Pretend the result is known >= 0.
+        ctx.setintbound(
+            pos1,
+            &crate::optimizeopt::intutils::IntBound::from_constant(5),
+        );
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+
+        // FLAG_STORE with known non-negative cached value → reuse.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_store]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
+        assert_eq!(ctx.get_box_replacement(pos2), pos1);
+    }
+
+    /// heap.py:390 parity: clean_caches clears cached_dict_reads.
+    #[test]
+    fn test_dict_lookup_cache_cleared_by_clean_caches() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag = ctx.make_constant_int(0);
+
+        // Seed cache.
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        heap._optimize_call_dict_lookup(&op1, &mut ctx);
+        assert!(!heap.cached_dict_reads.is_empty());
+
+        // clean_caches should clear it.
+        heap.clean_caches(&mut ctx);
+        assert!(heap.cached_dict_reads.is_empty());
+
+        // Second lookup after clean — should NOT be cached.
+        let pos2 = ctx.reserve_pos_typed(Type::Int);
+        let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
+        op2.descr = Some(descr.clone());
+        op2.pos = pos2;
+        assert!(!heap._optimize_call_dict_lookup(&op2, &mut ctx));
+    }
+
+    /// FLAG_DELETE (2+) should never cache or reuse.
+    #[test]
+    fn test_dict_lookup_cache_flag_delete_no_cache() {
+        let extra_field: DescrRef = Arc::new(TestDescr(80));
+        let extra_array: DescrRef = Arc::new(TestDescr(81));
+        let descr = dict_lookup_descr(90, extra_field, extra_array);
+
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::new(256);
+
+        let func_addr = ctx.make_constant_int(0xDEAD);
+        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let hash = ctx.make_constant_int(42);
+        let flag_delete = ctx.make_constant_int(2); // FLAG_DELETE
+
+        let pos1 = ctx.reserve_pos_typed(Type::Int);
+        let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_delete]);
+        op1.descr = Some(descr.clone());
+        op1.pos = pos1;
+        assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
+        assert!(heap.cached_dict_reads.is_empty());
     }
 }

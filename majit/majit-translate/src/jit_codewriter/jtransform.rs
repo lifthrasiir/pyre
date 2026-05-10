@@ -1503,6 +1503,7 @@ impl<'a> Transformer<'a> {
                         OopSpecIndex::None,
                         extraeffect,
                         &mut self.analysis_cache,
+                        None,
                     );
                     self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
                 }
@@ -1610,6 +1611,7 @@ impl<'a> Transformer<'a> {
                 oopspecindex,
                 extraeffect_override,
                 &mut self.analysis_cache,
+                None,
             )
         };
 
@@ -1902,6 +1904,7 @@ impl<'a> Transformer<'a> {
                 graph_name,
                 OopSpecIndex::JitForceVirtual,
                 Some(majit_ir::descr::ExtraEffect::ForcesVirtualOrVirtualizable),
+                None,
             ),
             // jtransform.py:1748-1755
             "jit.not_in_trace" => {
@@ -1917,6 +1920,7 @@ impl<'a> Transformer<'a> {
                     result_ty,
                     graph_name,
                     OopSpecIndex::NotInTrace,
+                    None,
                     None,
                 )
             }
@@ -1941,6 +1945,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         oopspecindex: OopSpecIndex,
         extraeffect: Option<majit_ir::descr::ExtraEffect>,
+        extradescrs: Option<Vec<majit_ir::DescrRef>>,
     ) -> RewriteResult {
         // jtransform.py:1990-1993
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
@@ -1954,6 +1959,7 @@ impl<'a> Transformer<'a> {
                 oopspecindex,
                 extraeffect,
                 &mut self.analysis_cache,
+                extradescrs,
             )
         };
         self.notes.push(GraphTransformNote {
@@ -2032,6 +2038,7 @@ impl<'a> Transformer<'a> {
                 OopSpecIndex::None,
                 None,
                 &mut self.analysis_cache,
+                None,
             )
         };
         // jtransform.py:1677: assert not forces_virtual_or_virtualizable
@@ -2286,6 +2293,7 @@ impl<'a> Transformer<'a> {
                 OopSpecIndex::None,
                 None,
                 &mut self.analysis_cache,
+                None,
             )
         };
         // jtransform.py:301: assert calldescr.get_extra_info().check_is_elidable()
@@ -2460,6 +2468,7 @@ impl<'a> Transformer<'a> {
             OopSpecIndex::None,
             None,
             &mut self.analysis_cache,
+            None,
         );
         match cc_mut.guess_call_kind(op) {
             crate::call::CallKind::Regular => {
@@ -3300,6 +3309,8 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // All jit.* oopspecs are intercepted by _handle_jit_call() before
         // reaching this function. Remaining oopspecs map to OS_* indices.
         "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
+        _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
     }
 }
@@ -5402,5 +5413,26 @@ mod tests {
             &[arg],
             &ValueType::Ref,
         ));
+    }
+
+    #[test]
+    fn map_user_oopspec_dict_lookup() {
+        use majit_ir::descr::OopSpecIndex;
+        assert_eq!(
+            super::map_user_oopspec_to_index("ordereddict.lookup(d, key, hash, flag)"),
+            OopSpecIndex::DictLookup
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("ordereddict.lookup"),
+            OopSpecIndex::DictLookup
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("dict.lookup"),
+            OopSpecIndex::DictLookup
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("dict.setitem"),
+            OopSpecIndex::None
+        );
     }
 }

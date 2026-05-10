@@ -42,7 +42,7 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 | descr.rs | effectinfo.py | 1,500 | 85% | bitstring optimization |
 | rewrite.rs | rewrite.py | 3,546 | 95% | ~~INT_PY_DIV~~ ~~oois_ooisnot~~ ~~replace_old_guard_with_guard_value~~ ~~CALL_N arraycopy~~ 추가됨. try_boolinvers 분리, serialize/deserialize 이름 parity. ~~optimize_float_abs~~ 메서드 추출 |
 | virtualize.rs | virtualize.py | 3,986 | 80% | ~~COND_CALL, JIT_FORCE_VIRTUAL~~ 추가됨 |
-| heap.rs | heap.py | 3,592 | 85% | ~~pendingfields, DICT_LOOKUP, serialization, variable-index, aliasing~~ 추가됨. clean_caches 정제 남음 |
+| heap.rs | heap.py | 3,592 | 90% | ~~pendingfields, DICT_LOOKUP, serialization, variable-index, aliasing~~ 추가됨. ~~_optimize_CALL_DICT_LOOKUP~~ 추가됨 (cached_dict_reads, corresponding_array_descrs, GUARD_NO_EXCEPTION REMOVED 연동). clean_caches 정제 남음 |
 | vstring.rs | vstring.py | 1,298 | 80% | ~~STR_CONCAT, copy_str_content~~ 추가됨. ~~메서드 이름 parity~~ (strgetitem, getstrlen, int_add/int_sub, force_box, handle_str_equal_level1, opt_call_stroruni_* 분리). handle_str_equal_level2, generate_modified_call 남음 |
 | bridgeopt.rs | bridgeopt.py | 829 | 95% | serialize/deserialize/tag_box/decode_box 모두 구현됨 |
 | guard.rs | guard.py | 931 | 85% | ~~implies~~ ~~transitive_imply~~ ~~eliminate_array_bound_checks~~ 추가됨. IndexVar 연동 |
@@ -124,13 +124,14 @@ Tracks equivalence between majit (Rust, 81k LOC) and the in-tree RPython JIT sou
 - Implemented: `optimize_float_abs()` 별도 메서드 추출 (rewrite.py:155-161)
 - Note: GUARD_SUBCLASS/IS_OBJECT/NONNULL/CLASS, COND_CALL, INT_PY_DIV는 propagate_forward match arm으로 구현됨
 
-**heap.rs** (85%)
-- Implemented: variable-index array caching (`cached_arrayitems_var` HashMap)
+**heap.rs** (90%)
+- Implemented: variable-index array caching (`ArrayCacheSubMap::cached_varindex_triples`)
 - Implemented: aliasing analysis (`cannot_alias_via_content`, `_cannot_alias_via_classes_or_lengths` inline)
 - Implemented: `export_cached_fields()` / `import_cached_fields()` (bridge 지식 직렬화)
 - Implemented: `force_lazy_sets_for_guard()` (가드 전용 선택적 lazy set forcing → pendingfields → rd_pendingfields)
+- Implemented: `_optimize_CALL_DICT_LOOKUP()` — FLAG_LOOKUP/FLAG_STORE 캐싱, cached_dict_reads, corresponding_array_descrs, GUARD_NO_EXCEPTION REMOVED 연동, clean_caches/force_from_effectinfo 무효화
 - Missing: `clean_caches()` 정제 (순수 필드만 보존하는 선택적 무효화 — 부분 구현)
-- Note: pendingfields, DICT_LOOKUP, postponed ops, GUARD_NO_EXCEPTION, arraycopy 무효화 모두 구현됨
+- Note: pendingfields, ~~DICT_LOOKUP~~, postponed ops, GUARD_NO_EXCEPTION, arraycopy 무효화 모두 구현됨
 
 **virtualize.rs** (80%)
 - Missing: `optimize_INT_ADD()` raw slice optimization
