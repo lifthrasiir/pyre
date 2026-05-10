@@ -55,13 +55,14 @@ pub enum BoxKind {
     /// is the result identity. `position` is a pyre-only field with no
     /// RPython counterpart on `AbstractResOpOrInputArg` (which carries
     /// only `_forwarded`); it stores the index where the box lands in the
-    /// pool so debug formatters and a small number of recorder-side
-    /// fast paths can recover the OpRef without walking. PyPy threads the
-    /// equivalent through `FrontendOp.position_and_flags`
-    /// (resoperation.py:233) instead. Set by `opencoder.py Trace.record()`
-    /// (and the recorder's `record_op_*` family in pyre) at construction.
-    /// The `Op` struct mapping is attached via an adapter in H-6.1.
-    ResOp { position: u32 },
+    /// pool so the chain walker can reconstruct an `OpRef::op_typed(pos,
+    /// type)` when advancing through `Forwarded::Box(target)`. Set by
+    /// `opencoder.py Trace.record()` (and the recorder's `record_op_*`
+    /// family in pyre) at construction; updated by `optimizer.rs:2783`
+    /// const-pool compaction via `BoxRef::set_position`. RPython has no
+    /// equivalent on `AbstractResOp` itself — it threads
+    /// `position_and_flags` through `FrontendOp` (resoperation.py:233).
+    ResOp { position: std::cell::Cell<u32> },
 
     /// `resoperation.py:699 AbstractInputArg`.
     /// `position` mirrors `AbstractInputArg.position`
@@ -70,14 +71,17 @@ pub enum BoxKind {
     InputArg { position: Option<u32> },
 
     /// `history.py:220 ConstInt` / `:261 ConstFloat` / `:307 ConstPtr`.
-    Const(Value),
-
-    /// pyre-only transition variant — no direct RPython counterpart.
-    /// Temporary representation until opencoder's byte-trace position
-    /// information is absorbed into the InputArg/ResOp fields themselves.
-    /// **Retired at H-7 prerequisite 8** — if it remains afterwards the
-    /// epic is incomplete.
-    FrontendOp { position_and_flags: u64 },
+    /// `const_index` is a pyre-only field carrying the
+    /// `OpRef::Const{Int,Float,Ptr}.const_index()` so the chain walker
+    /// can reconstruct a constant-namespace OpRef when advancing past
+    /// `Forwarded::Box(const_box)` written by `replace_op(_, const_target)`.
+    /// `None` for `BoxRef::new_const(value)` (no index in scope —
+    /// `make_constant` used to pick this path before slice 18 split it
+    /// off; remaining `None` callers are test fixtures).
+    Const {
+        value: Value,
+        const_index: Option<u32>,
+    },
 }
 
 /// Variant of the `_forwarded` slot.
@@ -112,15 +116,18 @@ pub struct BoxRef(Rc<Box>);
 impl BoxRef {
     /// New `AbstractResOp` Box.
     ///
-    /// `position` mirrors `resoperation.py:233 AbstractResOpOrInputArg._pos`
-    /// — the index this box occupies in the pool (== raw value of the
-    /// matching OpRef). Construction-time assignment matches PyPy's
+    /// `position` is a pyre-only field with no RPython counterpart on
+    /// `AbstractResOpOrInputArg` (which carries only `_forwarded`).
+    /// Stores the index this box occupies in the pool (== raw value of
+    /// the matching OpRef). Construction-time assignment matches PyPy's
     /// `Trace.record()`.
     pub fn new_resop(type_: Type, position: u32) -> Self {
         Self(Rc::new(Box {
             forwarded: RefCell::new(Forwarded::None),
             type_,
-            kind: BoxKind::ResOp { position },
+            kind: BoxKind::ResOp {
+                position: std::cell::Cell::new(position),
+            },
         }))
     }
 
@@ -134,22 +141,44 @@ impl BoxRef {
     }
 
     /// New `Const*` Box. `type_` is inferred from `value`.
+    /// No `const_index` — used by callers without a const-namespace
+    /// OpRef in scope (test fixtures, default constructors).
     pub fn new_const(value: Value) -> Self {
         let type_ = value.get_type();
         Self(Rc::new(Box {
             forwarded: RefCell::new(Forwarded::None),
             type_,
-            kind: BoxKind::Const(value),
+            kind: BoxKind::Const {
+                value,
+                const_index: None,
+            },
         }))
     }
 
-    /// pyre transition variant — used only until H-7.
-    pub fn new_frontend_op(type_: Type, position_and_flags: u64) -> Self {
+    /// New `Const*` Box carrying a `const_index`. Used by
+    /// `replace_op(_, const_target)` so the chain walker can reconstruct
+    /// `OpRef::Const{Int,Float,Ptr}(const_index)` when advancing past
+    /// `Forwarded::Box(const_box)`.
+    pub fn new_const_with_index(value: Value, const_index: u32) -> Self {
+        let type_ = value.get_type();
         Self(Rc::new(Box {
             forwarded: RefCell::new(Forwarded::None),
             type_,
-            kind: BoxKind::FrontendOp { position_and_flags },
+            kind: BoxKind::Const {
+                value,
+                const_index: Some(const_index),
+            },
         }))
+    }
+
+    /// Extract the `const_index` field for chain-walker reconstruction.
+    /// Returns `None` for non-Const boxes and for Consts created via
+    /// `new_const` (no index in scope).
+    pub fn const_index(&self) -> Option<u32> {
+        match &self.0.kind {
+            BoxKind::Const { const_index, .. } => *const_index,
+            _ => None,
+        }
     }
 
     pub fn type_(&self) -> Type {
@@ -158,7 +187,7 @@ impl BoxRef {
 
     /// `resoperation.py:47 is_constant`.
     pub fn is_constant(&self) -> bool {
-        matches!(self.0.kind, BoxKind::Const(_))
+        matches!(self.0.kind, BoxKind::Const { .. })
     }
 
     pub fn is_inputarg(&self) -> bool {
@@ -173,13 +202,26 @@ impl BoxRef {
     ///
     /// Returns the index where this box resides in the pool for
     /// `ResOp` / `InputArg` (which are the two PyPy classes that own
-    /// `_pos`). `Const` and the pyre-only `FrontendOp` transition variant
-    /// have no canonical position and return `None`.
+    /// `_pos`). `Const` has no canonical position and returns `None`.
     pub fn position(&self) -> Option<u32> {
         match &self.0.kind {
-            BoxKind::ResOp { position } => Some(*position),
+            BoxKind::ResOp { position } => Some(position.get()),
             BoxKind::InputArg { position } => *position,
-            BoxKind::Const(_) | BoxKind::FrontendOp { .. } => None,
+            BoxKind::Const { .. } => None,
+        }
+    }
+
+    /// Update the ResOp position field. Used by `optimizer.rs:2783`
+    /// const-pool compaction to keep `BoxKind::ResOp { position }` aligned
+    /// with the new dense op-position range so the chain walker's BoxRef
+    /// reconstruction (`OpRef::op_typed(target.position(), tp)`) returns
+    /// post-compact positions.
+    ///
+    /// No-op for `InputArg` / `Const` (their positions are not subject
+    /// to compaction).
+    pub fn set_position(&self, new_pos: u32) {
+        if let BoxKind::ResOp { position } = &self.0.kind {
+            position.set(new_pos);
         }
     }
 
@@ -187,7 +229,7 @@ impl BoxRef {
     /// and the equivalent accessors on the other Const subclasses.
     pub fn const_value(&self) -> Option<Value> {
         match self.0.kind {
-            BoxKind::Const(v) => Some(v),
+            BoxKind::Const { value, .. } => Some(value),
             _ => None,
         }
     }
@@ -216,7 +258,7 @@ impl BoxRef {
         // shape; this assertion preserves the invariant. PyPy raises
         // unconditionally, so the check is always-on (not `debug_assert!`).
         assert!(
-            !matches!(self.0.kind, BoxKind::Const(_)),
+            !matches!(self.0.kind, BoxKind::Const { .. }),
             "set_forwarded_box on Const violates RPython AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
@@ -229,7 +271,7 @@ impl BoxRef {
         // `Const`; mirror that with an always-on assert (not
         // `debug_assert!`) so release builds preserve the invariant.
         assert!(
-            !matches!(self.0.kind, BoxKind::Const(_)),
+            !matches!(self.0.kind, BoxKind::Const { .. }),
             "set_forwarded_info on Const violates RPython AbstractValue \
              invariant (Const has no _forwarded slot)"
         );
@@ -241,7 +283,7 @@ impl BoxRef {
         // Const has no _forwarded slot to reset; clearing is a no-op for
         // Const but should not be called on it. Allow clear (idempotent
         // None) for transitional safety while migration progresses.
-        if matches!(self.0.kind, BoxKind::Const(_)) {
+        if matches!(self.0.kind, BoxKind::Const { .. }) {
             return;
         }
         *self.0.forwarded.borrow_mut() = Forwarded::None;
@@ -376,8 +418,7 @@ impl std::fmt::Debug for BoxRef {
         let kind = match &self.0.kind {
             BoxKind::ResOp { .. } => "ResOp",
             BoxKind::InputArg { .. } => "InputArg",
-            BoxKind::Const(_) => "Const",
-            BoxKind::FrontendOp { .. } => "FrontendOp",
+            BoxKind::Const { .. } => "Const",
         };
         write!(
             f,
@@ -392,12 +433,10 @@ impl std::fmt::Debug for BoxRef {
 /// Encapsulated `BoxRef` storage for `OptContext` (Codex plan step 1).
 ///
 /// Wraps `Vec<BoxRef>` as a newtype so consumers index by `OpRef` raw
-/// position. Future slices (Codex plan step 2-7) will move the
-/// representation to `Vec<Option<BoxRef>>` for sparse indexing — a
-/// prerequisite for retiring the legacy `forwarded: Vec<Forwarded>`
-/// fallback storage. `Deref` / `DerefMut` to `Vec<BoxRef>` keeps the
-/// migration backward-compatible: existing call sites keep working
-/// through auto-deref while the wrapper is rolled out.
+/// position. `BoxRef._forwarded` is the authoritative PyPy-style storage;
+/// `BoxPool` only maps pyre's flat `OpRef` indices to those Box identities.
+/// `Deref` / `DerefMut` to `Vec<BoxRef>` keeps existing call sites working
+/// while the wrapper remains a thin container.
 #[derive(Clone, Debug, Default)]
 pub struct BoxPool {
     inner: Vec<BoxRef>,
@@ -580,24 +619,9 @@ mod tests {
     }
 
     #[test]
-    fn position_is_none_for_const_and_frontend_variants() {
+    fn position_is_none_for_const() {
         let c = BoxRef::new_const(Value::Int(5));
         assert_eq!(c.position(), None);
-        let fop = BoxRef::new_frontend_op(Type::Int, 0xdead);
-        assert_eq!(fop.position(), None);
-    }
-
-    #[test]
-    fn frontend_op_transition_variant() {
-        let op = BoxRef::new_frontend_op(Type::Int, 0xdeadbeef);
-        assert!(!op.is_resop());
-        assert!(!op.is_inputarg());
-        assert!(!op.is_constant());
-        if let BoxKind::FrontendOp { position_and_flags } = &op.0.kind {
-            assert_eq!(*position_and_flags, 0xdeadbeef);
-        } else {
-            panic!("expected FrontendOp kind");
-        }
     }
 
     #[test]

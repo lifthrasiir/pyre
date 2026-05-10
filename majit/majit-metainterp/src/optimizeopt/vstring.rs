@@ -1,20 +1,3 @@
-/// String virtualization optimization pass.
-///
-/// Translated from rpython/jit/metainterp/optimizeopt/vstring.py.
-///
-/// Virtualizes string operations so that short, fully-tracked strings never
-/// allocate at runtime:
-///
-/// - NEWSTR with constant length -> virtual string (characters tracked)
-/// - STRSETITEM on virtual string -> stores character in tracked array
-/// - STRGETITEM on virtual string -> returns tracked character
-/// - STRLEN on virtual string -> constant length
-/// - COPYSTRCONTENT -> updates tracked characters or emits forced copies
-///
-/// When a virtual string escapes (used in an unhandled context), it is
-/// "forced": NEWSTR + STRSETITEM ops are emitted to materialize it.
-use std::collections::HashMap;
-
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{

@@ -392,11 +392,11 @@ impl UnrollOptimizer {
             // fresh Box identity set so _forwarded mutations cannot alias
             // across phases.
             //
-            // Const BoxRefs are NOT cached: `mirror_forwarded_to_box` and
-            // `get_box_replacement_box` allocate `BoxRef::new_const(value)`
-            // per call from `const_pool` (`history.py:220` ConstInt(value)
-            // per-call-site parity). opt_p1's entry path seeds `const_pool`
-            // from the shared `constants` map (`optimizer.rs:1944`).
+            // Const BoxRefs are NOT cached: `get_box_replacement_box`
+            // allocates `BoxRef::new_const(value)` per call from `const_pool`
+            // (`history.py:220` ConstInt(value) per-call-site parity).
+            // opt_p1's entry path seeds `const_pool` from the shared
+            // `constants` map (`optimizer.rs:1944`).
             opt_p1.set_pending_box_pool(p1_iter.box_pool.clone());
             let p1_ops =
                 opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
@@ -745,25 +745,17 @@ impl UnrollOptimizer {
         // Const BoxRefs: see opt_p1 plumb above — fresh per-call from
         // `const_pool` via `BoxRef::new_const(value)`, no dedup.
         opt_p2.set_pending_box_pool(iter.box_pool.clone());
-        let mut p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
+        let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
             body_num_inputs,
             phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
             p2_high_water,
         );
-        // RPython parity: by the time Phase 2 reaches the assembly path,
-        // body op args have already been canonicalized through
-        // `get_box_replacement` (optimizer.rs:2932-2940).  The flat OpRef
-        // port keeps Phase 2 source slots in a disjoint namespace
-        // `[phase2_inputarg_base..)` during optimization; re-resolve the
-        // finalized body ops here so no raw Phase 2 inputarg slot leaks into
-        // `assemble_peeled_trace_with_jump_args`.
-        if let Some(final_ctx) = opt_p2.final_ctx.as_ref() {
-            for op in &mut p2_ops {
-                apply_box_replacements(op, final_ctx);
-            }
-        }
+        // RPython optimizer.py:614-625 freezes op arguments during
+        // `_emit_operation`; optimizer.py:598-612 may then install a Const
+        // forwarding on the result, but it never retroactively rewrites the
+        // already-emitted op. Keep Phase 2 output in that emit-time shape here.
         // Post-translate Phase 2 output back to the shared-inputarg
         // layout expected by `assemble_peeled_trace_with_jump_args`.
         //
@@ -1789,6 +1781,17 @@ impl ExportedState {
         // an end_arg / short_op source). Retrace must keep its Phase 2
         // namespace disjoint from every one of those.
         high = high.max(self.phase1_emit_high_water);
+        // `box_pool_snapshot.len()` covers every Phase 1 BoxRef the failed
+        // attempt allocated, including positions whose only carrier is the
+        // pool itself (no end_arg / short_op / phase1_emit_op trace). When
+        // retrace's Phase 2 `start_fresh` is below that ceiling, the
+        // `TraceIterator::new` `p1_prefix.len().min(start_fresh)` truncation
+        // would drop the tail of the snapshot and re-issue the same raw
+        // positions for Phase 2 input/result OpRefs — a numeric collision
+        // PyPy's object-identity Boxes structurally cannot have.
+        if let Some(snapshot) = &self.box_pool_snapshot {
+            high = high.max(snapshot.len() as u32);
+        }
 
         high
     }
@@ -2117,20 +2120,32 @@ impl ExportedState {
                         // `set_forwarded_box` enforces the AbstractValue
                         // invariant (Const has no _forwarded slot of its
                         // own) for the source, which is a non-Const ResOp
-                        // / InputArg here.
-                        let needs_swap = {
+                        // / InputArg here. Preserve the original Const's
+                        // `const_index` so the chain walker can keep
+                        // reconstructing `OpRef::const_ptr(idx)` after GC.
+                        let swap_idx: Option<Option<u32>> = {
                             let f = b.get_forwarded();
                             if let crate::r#box::Forwarded::Box(target) = &*f {
-                                target.is_constant()
+                                if target.is_constant()
                                     && matches!(target.const_value(), Some(Value::Ref(_)))
+                                {
+                                    Some(target.const_index())
+                                } else {
+                                    None
+                                }
                             } else {
-                                false
+                                None
                             }
                         };
-                        if needs_swap {
-                            b.set_forwarded_box(crate::r#box::BoxRef::new_const(Value::Ref(
-                                updated,
-                            )));
+                        if let Some(orig_idx) = swap_idx {
+                            let new_target = match orig_idx {
+                                Some(idx) => crate::r#box::BoxRef::new_const_with_index(
+                                    Value::Ref(updated),
+                                    idx,
+                                ),
+                                None => crate::r#box::BoxRef::new_const(Value::Ref(updated)),
+                            };
+                            b.set_forwarded_box(new_target);
                         }
                     }
                 }
@@ -3529,30 +3544,45 @@ impl OptUnroll {
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
         let resolved = ctx.get_box_replacement(opref);
-        // RPython export_state/_expand_info records properties on the Box
-        // objects that survive to the next iteration. In majit, a loop box may
-        // temporarily forward to a Const during the current iteration even
-        // though the next iteration still needs a box identity. Export only
-        // true Const objects here; forwarded-to-Const metadata would otherwise
-        // over-specialize the imported targetarg and leak one iteration's
-        // guard knowledge into the next.
-        if opref.is_constant() {
+        // unroll.py:432-443 `_expand_info` calls `self.optimizer.getinfo(arg)`
+        // which itself runs `get_box_replacement` first, so a non-constant
+        // OpRef forwarded to a Const surfaces the corresponding constant
+        // info class (ConstPtrInfo / FloatConstInfo / IntBound from_constant).
+        let synthesize_const_info = |value: Value| -> Option<OpInfo> {
+            match value {
+                // ConstPtrInfo parity: RPython stores Ref constants as
+                // ConstPtrInfo (a `PtrInfo` subclass). `setinfo_from_preamble`
+                // at unroll.py:65-68 dispatches through `is_constant()`.
+                Value::Ref(gcref) => Some(OpInfo::Ptr(PtrInfo::Constant(gcref))),
+                // FloatConstInfo parity: unroll.py:97-98 handles
+                // `isinstance(preamble_info, info.FloatConstInfo)` with
+                // `op.set_forwarded(preamble_info._const)`.
+                Value::Float(f) => Some(OpInfo::FloatConst(f)),
+                // Int constants: RPython uses IntBound with lower==upper.
+                Value::Int(v) => Some(OpInfo::IntBound(
+                    crate::optimizeopt::intutils::IntBound::from_constant(v),
+                )),
+                Value::Void => None,
+            }
+        };
+        if resolved.is_constant() {
             if let Some(value) = ctx.get_constant(resolved) {
-                return match value {
-                    // ConstPtrInfo parity: RPython stores Ref constants as
-                    // ConstPtrInfo (a `PtrInfo` subclass). `setinfo_from_preamble`
-                    // at unroll.py:65-68 dispatches through `is_constant()`.
-                    Value::Ref(gcref) => Some(OpInfo::Ptr(PtrInfo::Constant(gcref))),
-                    // FloatConstInfo parity: unroll.py:97-98 handles
-                    // `isinstance(preamble_info, info.FloatConstInfo)` with
-                    // `op.set_forwarded(preamble_info._const)`.
-                    Value::Float(f) => Some(OpInfo::FloatConst(f)),
-                    // Int constants: RPython uses IntBound with lower==upper.
-                    Value::Int(v) => Some(OpInfo::IntBound(
-                        crate::optimizeopt::intutils::IntBound::from_constant(v),
-                    )),
-                    Value::Void => None,
-                };
+                return synthesize_const_info(value);
+            }
+        }
+        // make_constant now mirrors optimizer.py:432 as
+        // `Forwarded::Box(constbox)`. Probe the BoxRef directly so RPython's
+        // ConstPtrInfo / FloatConstInfo / IntBound dispatch also fires for
+        // legacy Info(Constant) fixtures and guard_value-pinned boxes.
+        if let Some(b) = ctx.get_box_replacement_box(resolved) {
+            match &*b.get_forwarded() {
+                crate::r#box::Forwarded::Info(OpInfo::Constant(v)) => {
+                    return synthesize_const_info(*v);
+                }
+                crate::r#box::Forwarded::Info(OpInfo::FloatConst(f)) => {
+                    return Some(OpInfo::FloatConst(*f));
+                }
+                _ => {}
             }
         }
         // unroll.py:432-443 _expand_info uses self.optimizer.getinfo(arg) which
@@ -3562,13 +3592,7 @@ impl OptUnroll {
         // `opref_type(resolved) == Some(Int)`. We rely on that filter so the
         // lookup here cannot pull a bound for a ref/float box.
         if let Some(ptr_info) = ctx.peek_ptr_info_via_box(resolved) {
-            // Drop `PtrInfo::Constant` synthesized for non-constant OpRefs —
-            // the per-iteration constant-forwarding shouldn't leak into the
-            // next iteration's imported state (see `get_box_replacement` note).
-            let is_const_shadow = matches!(ptr_info, PtrInfo::Constant(_)) && !opref.is_constant();
-            if !is_const_shadow {
-                return Some(OpInfo::Ptr(ptr_info));
-            }
+            return Some(OpInfo::Ptr(ptr_info));
         }
         if let Some(bound) = exported_int_bounds.and_then(|bounds| bounds.get(&resolved).cloned()) {
             return Some(OpInfo::IntBound(bound));
@@ -3823,7 +3847,7 @@ fn assemble_peeled_trace_with_jump_args(
     constants: &std::collections::HashMap<u32, i64>,
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
-    p1_end_args: &[OpRef],
+    _p1_end_args: &[OpRef],
     ctx: &mut crate::optimizeopt::OptContext,
 ) -> Vec<Op> {
     let mut result =
@@ -4119,6 +4143,11 @@ fn assemble_peeled_trace_with_jump_args(
     // RPython's Box identity makes this implicit — the alias's Box is
     // the same Python object that body ops already hold. Pyre's flat
     // OpRef model needs an explicit forwarding registration here.
+    let mut assembly_alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    // Keep the assembly-only alias map separate from the general `_forwarded`
+    // walk. PyPy has object identity for these short-preamble boxes; pyre needs
+    // the explicit jump_source -> label_arg substitution, but must not follow
+    // later postprocess Const forwarding on unrelated emitted guard args.
     for (i, &source_slot) in filtered_extra_label_args.iter().enumerate() {
         if source_slot.is_none() {
             continue;
@@ -4134,6 +4163,7 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
             if !jump_source.is_none() && jump_source != source_slot {
                 ctx.replace_op(jump_source, extended_label_arg);
+                assembly_alias_remap.insert(jump_source, extended_label_arg);
             }
         }
     }
@@ -4162,17 +4192,20 @@ fn assemble_peeled_trace_with_jump_args(
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos) {
             new_op.pos = mapped_pos;
         }
-        // Body op args go through Phase 2 forwarding (set by both the
-        // optimizer's regular forwarding-resolve pass at end of Phase 2,
-        // optimizer.rs:2236-2262, AND the Case A/B SameAs alias
-        // registration above) followed by the shift-back from Phase 2
-        // inputarg_base to the body layout (body_result_remap, populated
-        // by the dedicated pass below).
+        // Body op args were already resolved at emit time by
+        // optimizer.py:614-625 / Optimizer::emit_operation. Do not walk
+        // forwarding chains again here: postprocess_GUARD_TRUE/FALSE may have
+        // installed Const forwarding after the guard was emitted, and PyPy keeps
+        // the guard's original runtime argument.
         let remap_body_arg = |arg: OpRef,
+                              assembly_alias_remap: &HashMap<OpRef, OpRef>,
                               body_result_remap: &HashMap<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
          -> OpRef {
+            if let Some(&mapped) = assembly_alias_remap.get(&arg) {
+                return mapped;
+            }
             if let Some(&mapped) = body_result_remap.get(&arg) {
                 if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
                     return mapped;
@@ -4181,9 +4214,9 @@ fn assemble_peeled_trace_with_jump_args(
             arg
         };
         for arg in &mut new_op.args {
-            *arg = ctx.get_box_replacement(*arg);
             *arg = remap_body_arg(
                 *arg,
+                &assembly_alias_remap,
                 &body_result_remap,
                 &seen_body_defs,
                 &visible_before_label,
@@ -4213,7 +4246,14 @@ fn assemble_peeled_trace_with_jump_args(
                     {
                         continue;
                     }
-                    let resolved_arg = ctx.get_box_replacement(arg);
+                    // optimizer.py:614-625 freezes op args at emit time;
+                    // walking ctx.get_box_replacement here would follow Const
+                    // forwarding that postprocess installed AFTER the body op
+                    // was emitted (corrupting already-emitted trace). The
+                    // short-preamble alias (jump_source -> extended_label_arg)
+                    // is the only assembly-time substitution we want; consult
+                    // the local map directly.
+                    let resolved_arg = assembly_alias_remap.get(&arg).copied().unwrap_or(arg);
                     let available_before_label = visible_before_label.contains(&arg)
                         || visible_before_label.contains(&resolved_arg)
                         || seen_body_defs.contains(&arg);
@@ -4236,9 +4276,17 @@ fn assemble_peeled_trace_with_jump_args(
             // so each source_arg appears at most once — which is the
             // RPython-parity behavior for Box-keyed live-in sets.
             for &source_arg in &extra_inner_sources {
-                let resolved = ctx.get_box_replacement(source_arg);
+                // optimizer.py:614-625 freeze: do not follow ctx forwarding
+                // chains here; postprocess Const forwarding on body ops would
+                // otherwise leak into the extended Label's arg list, turning
+                // a runtime inputarg slot into a Const reference.
+                let resolved = assembly_alias_remap
+                    .get(&source_arg)
+                    .copied()
+                    .unwrap_or(source_arg);
                 let mapped_arg = remap_body_arg(
                     resolved,
+                    &assembly_alias_remap,
                     &body_result_remap,
                     &seen_body_defs,
                     &visible_before_label,
@@ -4403,17 +4451,6 @@ fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[O
     }
     while jump_args.len() < preamble_args.len() {
         jump_args.push(preamble_args[jump_args.len()]);
-    }
-}
-
-fn apply_box_replacements(op: &mut Op, ctx: &crate::optimizeopt::OptContext) {
-    for arg in op.args.iter_mut() {
-        *arg = ctx.get_box_replacement(*arg);
-    }
-    if let Some(fail_args) = op.fail_args.as_mut() {
-        for arg in fail_args.iter_mut() {
-            *arg = ctx.get_box_replacement(*arg);
-        }
     }
 }
 
@@ -5756,11 +5793,16 @@ mod tests {
             &mut ctx,
             None,
         );
-        // Generous Ref-typed inputarg pool — the test only consumes slots 0..3
-        // as `targetargs` and walks `OpRef::int_op(K)` for various large K
-        // as opaque opref handles. Ref matches the producer shape.
-        let mut ctx2 =
-            crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Ref; 1024]);
+        // 3 Int-typed inputargs matching the producer's `OpRef::int_op`
+        // shape (the exported short box uses `int_op(12)/(13)/(14)/(30)`
+        // throughout, so the cross-type-forward guard requires Int
+        // targetargs too — `optimizer.py:432 set_forwarded` preserves
+        // Box.type per `history.py:220 BoxInt.type='i'`). Out-of-range
+        // raw OpRefs (raw 12/13/14, raw 30) are still valid handles via
+        // `value_types` / `peek_ptr_info_via_box` — `box_pool.get(idx)`
+        // returns `None` and the readers fall through to the empty-pool
+        // path used for opaque preamble OpRef handles.
+        let mut ctx2 = crate::optimizeopt::OptContext::with_inputarg_types(6, &vec![Type::Int; 3]);
         let targetargs = [OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)];
         let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);

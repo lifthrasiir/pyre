@@ -387,14 +387,13 @@ impl TreeLoop {
             })
             .collect();
 
-        // H-3.4 prep (Epic H slice 60): build a fresh `box_pool` mirroring
-        // the new namespace. Inputargs go first (fresh `BoxRef::new_inputarg`
-        // with type/position), followed by prefix re-emitted ops and
-        // post-cut ops (fresh `BoxRef::new_resop` with result type). Without
-        // this, retrace baselines reach the optimizer with empty box_pool
-        // and every BoxRef-routing reader fell back to the legacy Vec read
-        // even after H-3.0a/b plumbed production. Total length:
-        // `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
+        // Build a fresh `box_pool` mirroring the new namespace. Inputargs
+        // go first (fresh `BoxRef::new_inputarg` with type/position),
+        // followed by prefix re-emitted ops and post-cut ops (fresh
+        // `BoxRef::new_resop` with result type). The optimizer reads
+        // PtrInfo / IntBound / Const exclusively through these BoxRefs,
+        // so retrace baselines must arrive with the pool seeded. Total
+        // length: `new_ia_boxes.len() + op_escaped.len() + cut_ops.len()`.
         let mut box_pool: crate::r#box::BoxPool =
             Vec::with_capacity(new_ia_boxes.len() + op_escaped.len() + cut_ops.len()).into();
         for (i, &tp) in new_ia_types.iter().enumerate() {

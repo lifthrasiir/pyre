@@ -4632,7 +4632,7 @@ fn build_ref_root_slots(
     if let Some((jump_idx, jump)) = ops
         .iter()
         .enumerate()
-        .rfind(|(_, op)| op.opcode == OpCode::Jump)
+        .rfind(|(_, op)| op.opcode == OpCode::Jump && op.args.len() == inputargs.len())
     {
         let num_inputs = inputargs.len();
         for (i, &arg) in jump.args.iter().enumerate() {

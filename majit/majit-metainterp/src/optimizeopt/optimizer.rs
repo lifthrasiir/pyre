@@ -12,7 +12,7 @@ use crate::optimizeopt::{
     virtualize::{OptVirtualize, VirtualizableConfig},
     vstring::OptString,
 };
-use majit_ir::{Const, DescrRef, GcRef, Op, OpCode, OpRef, Type};
+use majit_ir::{DescrRef, GcRef, Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::info::PtrInfo;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
@@ -203,9 +203,9 @@ pub struct Optimizer {
     /// `optimize_with_constants_and_inputs_at`; the entry transfers
     /// ownership to `OptContext.box_pool`.
     ///
-    /// Empty for callers that never set the pool (tests, retrace
-    /// helpers without recorder); mirror writes installed in H-3.1
-    /// fall back to legacy `forwarded` Vec only.
+    /// Empty only for synthetic callers that never set the pool (tests,
+    /// retrace helpers without recorder). Production parity paths route
+    /// optimizer info through BoxRef `_forwarded`.
     pending_box_pool: crate::r#box::BoxPool,
 }
 
@@ -2634,38 +2634,22 @@ impl Optimizer {
             }
         }
 
-        // Resolve forwarding BEFORE remap (RPython get_box_replacement: follow
-        // chain, stop at ptr_info terminal). H-3.4 slice 72: route through
-        // canonical `ctx.get_box_replacement` instead of cloning `forwarded`
-        // and re-walking. Two-pass to satisfy the borrow checker — collect
-        // referenced OpRefs under `&ctx`, then mutate `&mut ctx.new_operations`.
-        {
-            let mut refs: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-            for op in &ctx.new_operations {
-                refs.extend(op.args.iter().copied());
-                if let Some(ref fa) = op.fail_args {
-                    refs.extend(fa.iter().copied());
-                }
-            }
-            let resolved: std::collections::HashMap<OpRef, OpRef> = refs
-                .into_iter()
-                .map(|r| (r, ctx.get_box_replacement(r)))
-                .collect();
-            for op in &mut ctx.new_operations {
-                for arg in &mut op.args {
-                    if let Some(&r) = resolved.get(arg) {
-                        *arg = r;
-                    }
-                }
-                if let Some(ref mut fa) = op.fail_args {
-                    for arg in fa.iter_mut() {
-                        if let Some(&r) = resolved.get(arg) {
-                            *arg = r;
-                        }
-                    }
-                }
-            }
-        }
+        // Path A — finalize cascade removed. PyPy walks args ONCE at op-emit
+        // time via `_emit_operation:614-625 force_box`; never re-walks. The
+        // cited `compile.py:emit_op:403-423` is a virtualizable-only patcher
+        // (5 callers all inside `patch_new_loop_to_load_virtualizable_fields`),
+        // not a general finalize pass. Pyre's emit-time arg walking happens
+        // in two PyPy-parity locations:
+        //   1. `propagate_from_pass_range:3336-3339` — incoming op args
+        //      resolved via `ctx.get_box_replacement` BEFORE pass dispatch.
+        //   2. `Optimizer::emit_operation:3524-3528` — `force_box` on every
+        //      arg unconditionally (PyPy `optimizer.py:623-625` parity).
+        // After emit, args are frozen on the op. Postprocess setting
+        // `box._forwarded = Const` (e.g., `make_constant` from
+        // `optimize_GUARD_FALSE`) must NOT retroactively rewrite already-
+        // emitted ops' args — doing so converts a runtime-typed GuardFalse
+        // into `GuardFalse Const(0)` whose machine code is always-success
+        // (cmp 0,0; jz), causing infinite loops in compiled traces.
 
         // RPython keeps constants as Const boxes, not SameAs placeholder ops in
         // the final trace. Drop constant-only SameAs placeholders before the
@@ -2676,38 +2660,12 @@ impl Optimizer {
 
         // Drain remaining extra ops.
         self.drain_extra_operations_from(0, &mut ctx);
-        // Extra operations can introduce new forwarding (for example Heap/Pure
-        // forwarding a recently-emitted boxed-field read to its raw payload).
-        // Resolve forwarding again with ptr_info stop. H-3.4 slice 72: same
-        // two-pass `ctx.get_box_replacement` migration as the pre-remap
-        // resolution above.
-        {
-            let mut refs: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
-            for op in &ctx.new_operations {
-                refs.extend(op.args.iter().copied());
-                if let Some(ref fa) = op.fail_args {
-                    refs.extend(fa.iter().copied());
-                }
-            }
-            let resolved: std::collections::HashMap<OpRef, OpRef> = refs
-                .into_iter()
-                .map(|r| (r, ctx.get_box_replacement(r)))
-                .collect();
-            for op in &mut ctx.new_operations {
-                for arg in &mut op.args {
-                    if let Some(&r) = resolved.get(arg) {
-                        *arg = r;
-                    }
-                }
-                if let Some(ref mut fa) = op.fail_args {
-                    for arg in fa.iter_mut() {
-                        if let Some(&r) = resolved.get(arg) {
-                            *arg = r;
-                        }
-                    }
-                }
-            }
-        }
+        // Path A — second finalize cascade also removed. Same rationale as
+        // above: each emit_extra-queued op runs through `propagate_from_pass_range`
+        // which resolves its incoming args at input time via
+        // `ctx.get_box_replacement`, and through `Optimizer::emit_operation`
+        // which `force_box`es every arg. No retroactive walking of pre-existing
+        // new_operations is needed.
         // RPython: no equivalent filter — Box identity guarantees all
         // references are valid. The retain filter was a majit safety net
         // but incorrectly dropped valid ops (e.g., IntAddOvf referencing
@@ -2779,14 +2737,91 @@ impl Optimizer {
                 next_const_pos += 1;
             }
 
-            // Apply remap to forwarding table too, so forwarding resolution
-            // after remap resolves to the correct remapped positions.
-            for entry in &mut ctx.forwarded {
-                if let crate::optimizeopt::info::Forwarded::Op(target) = entry {
-                    if let Some(&new_pos) = remap.get(&target.raw()) {
-                        *target = target.with_raw(new_pos);
+            // Walk box_pool and update each ResOp's position field in
+            // place so the chain walker's `target.position()`
+            // reconstruction (in `Forwarded::Box(target)` chain advance)
+            // returns post-compact positions. The `Rc<Box>` identity is
+            // preserved — sibling chains carrying the same Rc<Box> as a
+            // forwarding target observe the new position automatically.
+            for box_ref in ctx.box_pool.iter() {
+                if let Some(old_pos) = box_ref.position() {
+                    if let Some(&new_pos) = remap.get(&old_pos) {
+                        box_ref.set_position(new_pos);
                     }
                 }
+            }
+
+            // Physically reshuffle `box_pool` keyed by post-remap raw
+            // positions. PyPy's `_forwarded` is an object-identity slot
+            // (`resoperation.py:57-68 get_box_replacement` walks
+            // `op._forwarded` via Python `is`-identity), so upstream has
+            // no analogous index-alias hazard. Pyre indexes
+            // `box_pool[opref.raw()]` directly in `get_box_replacement`
+            // (mod.rs:3158) and `get_box_replacement_box`. Without this
+            // reshuffle, `box_pool[new_pos]` after the in-place
+            // `set_position` loop above is the original Rc<Box> allocated
+            // for `new_pos`'s old occupant, not the Rc<Box> whose
+            // internal position was just remapped to `new_pos`. Phase 2
+            // callers (`unroll.rs:899/910/917/995
+            // final_ctx.get_box_replacement`) consume the post-remap
+            // context, so the alias hazard is reachable.
+            //
+            // Build a fresh `Vec<BoxRef>` keyed by current
+            // `position()`. Inputarg slots `[0, num_inputs)` are not
+            // remapped and stay at their box_pool index. Remapped boxes
+            // land at `remap[old_idx]`. Stale unused slots (no remap
+            // entry, position() returns the old idx) are dropped — empty
+            // slots in the new pool are filled with Void placeholders
+            // matching `ensure_box_at` semantics so any reader still
+            // indexing those slots sees `Forwarded::None` instead of
+            // stale forwarding fragments.
+            {
+                let max_remapped = remap.values().copied().max().unwrap_or(0) as usize;
+                let new_size = std::cmp::max(max_remapped + 1, ctx.box_pool.len());
+                let mut new_pool: Vec<Option<crate::r#box::BoxRef>> = vec![None; new_size];
+
+                // Pass 1: place remapped boxes at their post-remap target.
+                for (old_idx, b) in ctx.box_pool.iter().enumerate() {
+                    let old_idx_u32 = old_idx as u32;
+                    if old_idx < num_inputs {
+                        continue;
+                    }
+                    if let Some(&new_pos) = remap.get(&old_idx_u32) {
+                        let target = new_pos as usize;
+                        if target < new_pool.len() {
+                            new_pool[target] = Some(b.clone());
+                        }
+                    }
+                }
+
+                // Pass 2: inputargs at original indices + non-remapped
+                // entries that don't collide with a remap target.
+                for (old_idx, b) in ctx.box_pool.iter().enumerate() {
+                    let old_idx_u32 = old_idx as u32;
+                    if old_idx < num_inputs {
+                        if old_idx < new_pool.len() {
+                            new_pool[old_idx] = Some(b.clone());
+                        }
+                        continue;
+                    }
+                    if remap.contains_key(&old_idx_u32) {
+                        continue;
+                    }
+                    if old_idx < new_pool.len() && new_pool[old_idx].is_none() {
+                        new_pool[old_idx] = Some(b.clone());
+                    }
+                }
+
+                let materialized: Vec<crate::r#box::BoxRef> = new_pool
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, opt)| {
+                        opt.unwrap_or_else(|| {
+                            crate::r#box::BoxRef::new_resop(majit_ir::Type::Void, idx as u32)
+                        })
+                    })
+                    .collect();
+                ctx.box_pool = crate::r#box::BoxPool::from(materialized);
             }
 
             // Apply remap to all args and fail_args
@@ -3306,15 +3341,21 @@ impl Optimizer {
             ctx.register_value_type(op.pos, op.result_type());
         }
 
-        // Resolve forwarded arguments
+        // Resolve forwarded arguments. PyPy `_emit_operation`
+        // (optimizer.py:614-625) walks args via force_box at the entry to
+        // emission; pyre's pre-pass walk via `ctx.get_box_replacement` is
+        // the structural analog (force_box is invoked separately at
+        // `Optimizer::emit_operation:3527` for the post-pass refresh).
+        // fail_args are NOT walked here — PyPy snapshots them once at
+        // `store_final_boxes_in_guard` time via the numbering layer (which
+        // encodes Const entries as TAGCONST in rd_numb, leaving fail_args
+        // as TAGBOX-only references). Re-walking fail_args at pass entry
+        // would be a pyre-only layer that could substitute Const refs
+        // post-`replace_op(_, const_target)` and de-sync from the
+        // numbering snapshot.
         let mut resolved_op = op.clone();
         for arg in &mut resolved_op.args {
             *arg = ctx.get_box_replacement(*arg);
-        }
-        if let Some(ref mut fa) = resolved_op.fail_args {
-            for arg in fa.iter_mut() {
-                *arg = ctx.get_box_replacement(*arg);
-            }
         }
 
         let mut current_op = resolved_op;
@@ -3904,10 +3945,20 @@ impl Optimizer {
         // RPython finish() handles virtuals without forcing.
         // _number_boxes tags virtual fail_args as TAGVIRTUAL,
         // _number_virtuals builds rd_virtuals from PtrInfo.
+        //
+        // PyPy parity: fail_args are canonicalized through
+        // `get_box_replacement(a, True)` in the compile/backend patching
+        // helpers. In RPython the second argument is `not_const=True`:
+        // the chain walk stops before stepping into a Const target, so
+        // the guard fail_arg keeps the runtime box identity here. Const
+        // entries are encoded by `resume.py:204 _number_boxes` as TAGCONST
+        // in rd_numb during numbering, and the liveboxes returned by
+        // `finish()` / `descr.store_final_boxes` remain TAGBOX-only for
+        // backend regalloc.
         if let Some(ref mut fail_args) = op.fail_args {
             for fa_idx in 0..fail_args.len() {
                 if !fail_args[fa_idx].is_none() {
-                    fail_args[fa_idx] = ctx.get_box_replacement(fail_args[fa_idx]);
+                    fail_args[fa_idx] = ctx.get_box_replacement_not_const(fail_args[fa_idx]);
                 }
             }
         }

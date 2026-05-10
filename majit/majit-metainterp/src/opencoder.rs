@@ -7,7 +7,6 @@ use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
 use crate::constant_pool::ConstantPool;
-use crate::history::TreeLoop;
 
 fn u16_to_opcode(v: u16) -> OpCode {
     assert!(

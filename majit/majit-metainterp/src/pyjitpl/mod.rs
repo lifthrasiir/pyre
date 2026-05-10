@@ -43,9 +43,9 @@ pub use crate::compile::{
 };
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
-use crate::optimizeopt::{
-    SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_get, snapshot_insert,
-};
+#[cfg(test)]
+use crate::optimizeopt::snapshot_get;
+use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
 use crate::resume::{
     MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
@@ -283,8 +283,6 @@ fn heap_value_for(ty: Type, bits: i64) -> Value {
         Type::Void => Value::Void,
     }
 }
-
-pub(crate) use crate::trace_ctx::value_to_raw_bits;
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
@@ -528,8 +526,8 @@ fn prepare_bridge_trace_for_optimizer(
 }
 
 fn normalize_root_loop_entry_contract(
-    mut inputargs: Vec<InputArg>,
-    mut optimized_ops: Vec<Op>,
+    inputargs: Vec<InputArg>,
+    optimized_ops: Vec<Op>,
 ) -> Result<(Vec<InputArg>, Vec<Op>), (usize, usize)> {
     let last_jump = optimized_ops
         .iter()
@@ -2084,7 +2082,7 @@ impl<M: Clone> MetaInterp<M> {
         // directly to `virtualizable_arg_index()` and `startindex` becomes
         // `num_reds`. The expanded static/array slots occupy
         // `live_values[num_reds .. num_reds + total_vable]`.
-        let vable_index = ctx
+        let _vable_index = ctx
             .driver_descriptor()
             .and_then(|driver| driver.virtualizable_arg_index())
             .unwrap_or(0);
@@ -4890,7 +4888,7 @@ impl<M: Clone> MetaInterp<M> {
         // gcreftracer.py parity: GC may have moved objects between Phase 1
         // and Phase 2. Refresh GcRef values from shadow stack before use.
         start_state.refresh_from_gc();
-        let bridge_trace = self.bridge_info();
+        let _bridge_trace = self.bridge_info();
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let retracing_from = self.retracing_from.take();
@@ -7864,7 +7862,7 @@ impl<M: Clone> MetaInterp<M> {
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
         constants: HashMap<u32, i64>,
-        mut constant_types: HashMap<u32, Type>,
+        constant_types: HashMap<u32, Type>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -7913,8 +7911,8 @@ impl<M: Clone> MetaInterp<M> {
         // Per-iter bridge `BoxRef` pool from `prepare_bridge_trace_for_optimizer`'s
         // `TraceIterator::new` (`opencoder.py:259-262` parity). The bridge
         // optimizer reads through `BoxRef::_forwarded` for `getptrinfo` /
-        // `getintbound` callsites; without this plumb, those readers fall back
-        // to the legacy Vec via `box_pool.is_empty()` sentinel.
+        // `getintbound` callsites; the pool must be plumbed through for
+        // those readers to hit non-empty BoxRefs.
         optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
@@ -8203,7 +8201,7 @@ impl<M: Clone> MetaInterp<M> {
         bridge_ops: &[majit_ir::Op],
         bridge_inputargs: &[majit_ir::InputArg],
         constants: HashMap<u32, i64>,
-        mut constant_types: HashMap<u32, Type>,
+        constant_types: HashMap<u32, Type>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -8407,7 +8405,7 @@ impl<M: Clone> MetaInterp<M> {
             eprintln!("inputargs: {:?}", bridge_inputargs);
             eprint!("{}", majit_ir::format_trace(bridge_ops, &constants));
         }
-        let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
+        let _compiled = self.compiled_loops.get_mut(&green_key).unwrap();
         // compile.py:1077-1078 parity: optimize_bridge may raise InvalidLoop
         // (e.g. rewrite.py:404-407 GUARD_CLASS proven to always fail).
         // RPython catches it via the abstract jitexc handler and discards
@@ -9218,6 +9216,28 @@ impl<M: Clone> MetaInterp<M> {
         let mut initial_values = HashMap::with_capacity(fail_args.len());
         for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {
             initial_values.insert(arg.raw(), value);
+        }
+
+        // PyPy parity: `_run_forever` interprets Python bytecode after guard
+        // failure, NOT the JIT trace's IR. pyre's `blackhole_execute_with_state_ca`
+        // IR-replay is a NEW-DEVIATION. When post-guard ops are only Label/Jump
+        // structural markers, the replay's `_run_forever` parity Jump-loop
+        // (blackhole.rs:283-291) loops back to label_index+1, potentially
+        // re-executing preamble+body indefinitely without making progress.
+        // Short-circuit: if no actual work follows the guard, return
+        // GuardFailed with the input fail_values directly — semantically
+        // equivalent to "the trace immediately re-fails the same guard".
+        let post_guard_has_work = trace.ops[guard_op_index + 1..]
+            .iter()
+            .any(|op| !matches!(op.opcode, OpCode::Label | OpCode::Jump));
+        if !post_guard_has_work {
+            return Some((
+                crate::blackhole::BlackholeResult::GuardFailed {
+                    guard_index: guard_op_index,
+                    fail_values: fail_values.to_vec(),
+                },
+                exception,
+            ));
         }
 
         Some(blackhole_execute_with_state_ca(

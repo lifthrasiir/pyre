@@ -1542,7 +1542,7 @@ impl<S: JitState> JitDriver<S> {
             TraceAction::CloseLoop => {
                 // pyjitpl.py:2979-3036 reached_loop_header parity.
                 // Path 1: bridge — only if has_compiled_targets (line 2982).
-                let has_partial_trace = self.meta.partial_trace().is_some();
+                let _has_partial_trace = self.meta.partial_trace().is_some();
                 if let Some(bridge) = self.meta.bridge_info() {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;
@@ -1676,7 +1676,7 @@ impl<S: JitState> JitDriver<S> {
                 loop_header_pc,
             } => {
                 // pyjitpl.py:2979-2990 reached_loop_header parity.
-                let has_partial_trace = self.meta.partial_trace().is_some();
+                let _has_partial_trace = self.meta.partial_trace().is_some();
                 if let Some(bridge) = self.meta.bridge_info() {
                     let bridge_key = bridge.green_key;
                     let bridge_trace_id = bridge.trace_id;

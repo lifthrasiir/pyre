@@ -104,7 +104,7 @@ type FieldKey = (OpRef, usize);
 /// - PyPy `cached_infos: [PtrInfo]` is replaced by `cached_structs:
 ///   Vec<OpRef>` because Rust's borrow checker forbids holding
 ///   parallel `&mut PtrInfo` references; the PtrInfo itself is read
-///   on-demand from `ctx.forwarded[opref]` / `ctx.const_infos[gcref]`.
+///   on-demand from `box._forwarded` / `ctx.const_infos[gcref]`.
 /// - PyPy `descr` parameters are carried as descriptor references for
 ///   field-cache identity, with a separate `field_idx` / `descr_idx`
 ///   (u32) only where the RPython source indexes `PtrInfo` slots or
@@ -161,7 +161,7 @@ impl CachedField {
     ///
     /// PyPy iterates `cached_infos` and writes
     /// `opinfo._fields[descr.get_index()] = None`. The Rust port walks
-    /// `cached_structs`, resolves each opref through `ctx.forwarded`
+    /// `cached_structs`, resolves each opref through `box._forwarded`
     /// OR `ctx.const_infos` (the latter mirrors `info.py:715-726
     /// ConstPtrInfo._get_info` which routes constant bases through
     /// `optheap.const_infos[gcref]`), and calls
@@ -477,7 +477,7 @@ impl ArrayCachedItem {
     ///
     /// PyPy iterates `cached_infos` and writes
     /// `opinfo._items[self.index] = None`. The Rust port walks
-    /// `cached_structs` and routes through `ctx.forwarded` /
+    /// `cached_structs` and routes through `box._forwarded` /
     /// `ctx.const_infos`. The `self.parent.clear_varindex()` half is
     /// performed by the caller (`ArrayCacheSubMap::invalidate_index`)
     /// because Rust forbids the back-pointer.

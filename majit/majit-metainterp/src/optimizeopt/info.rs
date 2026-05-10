@@ -10,39 +10,6 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
-/// resoperation.py: AbstractResOpOrInputArg._forwarded
-///
-/// RPython uses a single `_forwarded` field per Box that holds EITHER:
-/// - None (no forwarding, no info)
-/// - another Box (forwarding to that box)
-/// - a PtrInfo instance (terminal info)
-/// - a Const value (terminal — RPython: _forwarded = constbox)
-///
-/// `get_box_replacement` follows Box→Box links, stops at None/PtrInfo/Const.
-/// `getptrinfo` reads PtrInfo from the terminal Box.
-#[derive(Clone, Debug)]
-pub enum Forwarded {
-    /// No forwarding or info set.
-    None,
-    /// Forwarding to another OpRef (RPython: _forwarded = other_box).
-    Op(OpRef),
-    /// Terminal info (RPython: _forwarded = PtrInfo instance).
-    Info(PtrInfo),
-    /// Terminal constant (RPython: _forwarded = constbox).
-    /// optimizer.py:432: box.set_forwarded(constbox).
-    Const(majit_ir::Value),
-    /// Terminal IntBound (RPython: _forwarded = IntBound instance).
-    /// intutils.py:73: IntBound(AbstractInfo) — stored directly in
-    /// _forwarded, retrieved by optimizer.py:99 getintbound().
-    IntBound(crate::optimizeopt::intutils::IntBound),
-}
-
-impl Default for Forwarded {
-    fn default() -> Self {
-        Forwarded::None
-    }
-}
-
 /// shortpreamble.py:11-49: PreambleOp
 ///
 /// Wrapper stored in PtrInfo._fields during Phase 2 import.
@@ -341,11 +308,11 @@ pub type StringConstantAllocator = std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef 
 /// - **`Forwarded(&mut PtrInfo)`** — `arg0.get_forwarded()` returns either an
 ///   existing `AbstractVirtualPtrInfo` subclass (early-return path) or a
 ///   freshly-installed Instance/Struct/Array/Str etc. (`optimizer.py:475-498`).
-///   The mutable reference is backed by `OptContext::forwarded[idx]` so
-///   `info.setfield()` / `info.setitem()` mutate the canonical PtrInfo
-///   in-place — matching PyPy's `arg0.set_forwarded(opinfo)` followed by
-///   `opinfo.setfield(...)`.
-pub enum EnsuredPtrInfo<'a> {
+///   The mutable reference is backed by the `BoxRef`'s `_forwarded` slot at
+///   `box_pool[idx]`, so `info.setfield()` / `info.setitem()` mutate the
+///   canonical PtrInfo in-place — matching PyPy's
+///   `arg0.set_forwarded(opinfo)` followed by `opinfo.setfield(...)`.
+pub enum EnsuredPtrInfo {
     /// `info.ConstPtrInfo(arg0)` — synthesized from a constant Ref / raw-pointer
     /// Int OpRef. Read-only by construction.
     Constant {
@@ -353,46 +320,13 @@ pub enum EnsuredPtrInfo<'a> {
         /// Optional runtime hook for `getstrlen1(mode)` lookups.
         string_length_resolver: Option<StringLengthResolver>,
     },
-    /// `arg0.get_forwarded()` — direct mutable handle into the
-    /// `OptContext::forwarded` slot. Used by empty-pool fixtures.
-    Forwarded(&'a mut PtrInfo),
     /// `arg0.get_forwarded()` — BoxRef-routed mutable handle. Each
     /// `as_mut()` call re-borrows the inner `RefCell`. Produced when
     /// `OptContext::box_pool` is populated (Epic H Phase C).
     ForwardedBox(crate::r#box::BoxRef),
 }
 
-/// Wrapper handle that unifies the two backing storage layouts of
-/// [`EnsuredPtrInfo::as_mut`]. `Direct` returns a borrow into the
-/// `OptContext::forwarded` Vec slot (empty-pool fixtures); `Cell`
-/// returns a `RefMut` re-borrowed from a `BoxRef`'s inner `RefCell`
-/// (production / box_pool-seeded paths). `Deref` / `DerefMut` route
-/// method calls and pattern destructures uniformly across both.
-pub enum EnsuredMutHandle<'a> {
-    Direct(&'a mut PtrInfo),
-    Cell(std::cell::RefMut<'a, PtrInfo>),
-}
-
-impl std::ops::Deref for EnsuredMutHandle<'_> {
-    type Target = PtrInfo;
-    fn deref(&self) -> &PtrInfo {
-        match self {
-            EnsuredMutHandle::Direct(p) => &**p,
-            EnsuredMutHandle::Cell(c) => &**c,
-        }
-    }
-}
-
-impl std::ops::DerefMut for EnsuredMutHandle<'_> {
-    fn deref_mut(&mut self) -> &mut PtrInfo {
-        match self {
-            EnsuredMutHandle::Direct(p) => &mut **p,
-            EnsuredMutHandle::Cell(c) => &mut **c,
-        }
-    }
-}
-
-impl<'a> EnsuredPtrInfo<'a> {
+impl EnsuredPtrInfo {
     /// `info.py PtrInfo.getlenbound(mode)` — direct delegation to the underlying
     /// PtrInfo. For `Constant` the call routes through the optional
     /// `string_length_resolver` so an exact constant length can be returned
@@ -447,7 +381,6 @@ impl<'a> EnsuredPtrInfo<'a> {
                     Some(IntBound::from_constant(length))
                 }
             }
-            EnsuredPtrInfo::Forwarded(info) => info.getlenbound(mode),
             EnsuredPtrInfo::ForwardedBox(bx) => {
                 bx.ptr_info_mut().and_then(|mut p| p.getlenbound(mode))
             }
@@ -460,11 +393,10 @@ impl<'a> EnsuredPtrInfo<'a> {
     /// info slot (info.py:738-752). The `ForwardedBox` variant returns
     /// `None` if the BoxRef's `_forwarded` slot does not currently hold
     /// `Forwarded::Info(OpInfo::Ptr(_))`.
-    pub fn as_mut(&mut self) -> Option<EnsuredMutHandle<'_>> {
+    pub fn as_mut(&mut self) -> Option<std::cell::RefMut<'_, PtrInfo>> {
         match self {
             EnsuredPtrInfo::Constant { .. } => None,
-            EnsuredPtrInfo::Forwarded(info) => Some(EnsuredMutHandle::Direct(&mut **info)),
-            EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut().map(EnsuredMutHandle::Cell),
+            EnsuredPtrInfo::ForwardedBox(bx) => bx.ptr_info_mut(),
         }
     }
 

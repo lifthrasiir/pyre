@@ -870,6 +870,14 @@ pub struct VirtualFieldsInfo {
 pub trait BoxEnv {
     /// resume.py:202 — box.get_box_replacement()
     fn get_box_replacement(&self, opref: OpRef) -> OpRef;
+    /// resoperation.py:58 get_box_replacement(not_const=True) — walk
+    /// forwarding chains but stop before stepping into a Const target.
+    ///
+    /// Used after resume numbering has already classified Const boxes as
+    /// TAGCONST, so backend liveboxes keep their runtime Box identity.
+    fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
+        self.get_box_replacement(opref)
+    }
     /// resume.py:204 — isinstance(box, Const)
     fn is_const(&self, opref: OpRef) -> bool;
     /// Constant value + type. Only valid when is_const returns true.

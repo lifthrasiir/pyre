@@ -586,6 +586,52 @@ pub(crate) fn blackhole_execute_with_state_ca(
     drop(merged);
     let mut exc_state = initial_exception;
 
+    // Defensive trivial-loop short-circuit (mirrors
+    // pyjitpl/mod.rs:9188-9199): `_run_forever` parity here is a
+    // NEW-DEVIATION (PyPy interprets jitcode bytecodes, not IR ops). When
+    // ops[start_index..] contains a Jump but no real work, the Jump-loops-
+    // to-Label parity (line 644-653 below) re-enters the body indefinitely
+    // without making progress. Return GuardFailed early using the preceding
+    // guard op's fail_args layout so the caller's exit_layout decode keys
+    // against a stable position.
+    let mut trivial_has_jump = false;
+    let mut trivial_has_work = false;
+    for op in &ops[start_index..] {
+        match op.opcode {
+            OpCode::Label => {}
+            OpCode::Jump => trivial_has_jump = true,
+            _ => {
+                trivial_has_work = true;
+                break;
+            }
+        }
+    }
+    if trivial_has_jump && !trivial_has_work {
+        let guard_idx = start_index.saturating_sub(1);
+        let fail_values = ops
+            .get(guard_idx)
+            .and_then(|op| op.fail_args.as_ref())
+            .map(|args| {
+                args.iter()
+                    .map(|a| {
+                        initial_values
+                            .get(&a.raw())
+                            .or_else(|| constants.get(&a.raw()))
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (
+            BlackholeResult::GuardFailed {
+                guard_index: guard_idx,
+                fail_values,
+            },
+            exc_state,
+        );
+    }
+
     // RPython _run_forever parity: find the Label op (loop header) so
     // that Jump can loop back. The trace is [Label, ..., Jump(→Label)].
     let label_index = ops

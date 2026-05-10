@@ -35,7 +35,7 @@ use majit_trace::heapcache::HeapCache;
 use majit_backend::JitCellToken;
 
 use crate::call_descr::{
-    EffectInfoSlot, make_call_descr, make_call_descr_from_target_slot, make_call_may_force_descr,
+    EffectInfoSlot, make_call_descr_from_target_slot, make_call_may_force_descr,
 };
 use crate::constant_pool::ConstantPool;
 use crate::jitcode::JitArgKind;

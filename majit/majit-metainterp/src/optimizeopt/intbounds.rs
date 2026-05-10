@@ -47,11 +47,12 @@ fn replace_with(original: &Op, opcode: OpCode, args: &[OpRef]) -> OptimizationRe
 /// Keeps track of the bounds placed on integers by guards and removes
 /// redundant guards.
 ///
-/// RPython parity: `OptIntBounds(Optimization)` has NO own bounds storage —
+/// `OptIntBounds(Optimization)` has NO own bounds storage —
 /// all bound state lives on `box._forwarded` and is accessed via the base
 /// class `Optimization.getintbound`/`setintbound` (optimizer.py:99-125).
-/// In majit the equivalent is `OptContext::forwarded[Forwarded::IntBound]`
-/// accessed via `ctx.getintbound`/`ctx.setintbound`/`ctx.with_intbound_mut`.
+/// In majit the equivalent is the `BoxRef`'s `_forwarded` slot
+/// (`Forwarded::Info(OpInfo::IntBound(_))`) accessed via
+/// `ctx.getintbound`/`ctx.setintbound`/`ctx.with_intbound_mut`.
 pub struct OptIntBounds {
     /// intbounds.py: last_emitted_operation — opcode (for overflow guard handling).
     last_emitted_opcode: Option<OpCode>,
@@ -1691,9 +1692,8 @@ impl OptIntBounds {
         //     array = self.ensure_ptr_info_arg0(op)
         //     self.optimizer.setintbound(op, array.getlenbound(None))
         // `getlenbound` lazily fills `ArrayPtrInfo.lenbound` (`info.py:573`).
-        // Wrapper triggers `mirror_forwarded_to_box` so the BoxRef snapshot
-        // sees the populated lenbound — same rationale as STRLEN/UNICODELEN
-        // postprocessors below.
+        // `with_ensured_ptr_info_arg0` mutates the PtrInfo object stored in
+        // the BoxRef's authoritative `_forwarded` slot.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut array| array.getlenbound(None));
         if let Some(bound) = bound {
             ctx.setintbound(op.pos, &bound);
@@ -1715,8 +1715,7 @@ impl OptIntBounds {
         ctx.make_nonnull_str(op.arg(0), 0);
         // `getlenbound` is a lazy-fill mutator on `StrPtrInfo.lenbound`
         // (`vstring.py:62`). Route through `with_ensured_ptr_info_arg0`
-        // so `mirror_forwarded_to_box` re-syncs the BoxRef snapshot of
-        // the StrPtrInfo after the lenbound slot is populated.
+        // so the BoxRef-held StrPtrInfo is updated in place.
         let bound = ctx.with_ensured_ptr_info_arg0(op, |mut info| info.getlenbound(Some(0)));
         if let Some(bound) = bound {
             ctx.setintbound(op.pos, &bound);
@@ -2728,22 +2727,15 @@ impl Optimization for OptIntBounds {
             //   if op.getarg(0).type == 'i':
             //       self.propagate_bounds_backward(op.getarg(0))
             OpCode::GuardTrue | OpCode::GuardFalse | OpCode::GuardValue => {
-                let arg0 = ctx.get_box_replacement(op.arg(0));
-                let is_int = ctx
-                    .opref_type(arg0)
+                let arg0 = op.arg(0);
+                let is_int = arg0
+                    .ty()
+                    .or_else(|| ctx.opref_type(arg0))
                     .map_or(true, |t| t == majit_ir::Type::Int);
                 if !is_int {
                     return;
                 }
-                // intbounds.py:40-50 propagate_bounds_backward
-                let b = self.getintbound(arg0, ctx);
-                if b.is_constant() {
-                    self.make_constant_int_ref(arg0, b.get_constant_int(), ctx);
-                }
-                if let Some(producing_op) = self.find_producing_op(arg0, ctx) {
-                    let producing_op = producing_op.clone();
-                    self.propagate_bounds_backward_op(&producing_op, ctx);
-                }
+                self.propagate_bounds_backward(arg0, ctx);
             }
 
             // ── Arithmetic postprocess ──
@@ -2951,7 +2943,7 @@ mod tests {
         let mut pass = OptIntBounds::new();
         // Compute num_inputs as the highest OpRef referenced anywhere (as
         // arg, result pos, or initial bound key) plus one. With bounds now
-        // living on `ctx.forwarded`, reserve_pos must skip past every
+        // living on `box._forwarded`, reserve_pos must skip past every
         // pre-existing OpRef so freshly emitted ops (e.g. SameAsI from
         // rewrite's `x + x → x << 1`) cannot collide with an input arg.
         let max_arg = ops
@@ -3967,7 +3959,7 @@ mod tests {
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // Manually tighten the result and trigger backward prop. The
         // OptIntBounds pass is stateless except for `last_emitted_*`
-        // (everything else lives on `ctx.forwarded`), so we can spin up a
+        // (everything else lives on `box._forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
         let mut pass = OptIntBounds::new();
         ctx.setintbound(OpRef::int_op(1), &IntBound::bounded(-5, -1));

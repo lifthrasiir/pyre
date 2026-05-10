@@ -352,6 +352,17 @@ impl BoxEnv for SimpleBoxEnv {
             .copied()
             .unwrap_or(opref)
     }
+
+    fn get_box_replacement_not_const(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+        match self.replacements.get(&opref.raw()).copied() {
+            Some(target) if target.is_constant() || self.constants.contains_key(&target.raw()) => {
+                opref
+            }
+            Some(target) => target,
+            None => opref,
+        }
+    }
+
     fn is_const(&self, opref: majit_ir::OpRef) -> bool {
         self.constants.contains_key(&opref.raw())
     }
@@ -4425,11 +4436,49 @@ impl ResumeDataLoopMemo {
 
         // Resolve each livebox through the forwarding chain so the backend
         // sees the final concrete OpRef (not an optimizer-internal alias).
+        //
+        // `resume.py:finish` invariant: liveboxes contains ONLY non-Const
+        // boxes — Const values are encoded inline via TAGCONST at numbering
+        // time (`_number_boxes` classifies via `box.is_constant()` before
+        // adding to liveboxes). Backend regalloc enforces the same upstream
+        // contract (`pyre/regalloc.rs:453 !arg.is_constant()` mirrors
+        // `regalloc.py:1204 assert not isinstance(arg, Const)`).
+        //
+        // The numbering pass that produced this `liveboxes` list already
+        // satisfied that invariant. The re-walk below exists for boxes that
+        // were further forwarded between numbering and finish (e.g.
+        // `make_equal_to` writing `Forwarded::Box(next_box)`), so the
+        // backend sees the final concrete position. It uses
+        // get_box_replacement(not_const=True) parity and stops before a Const
+        // target; Consts are represented by rd_numb TAGCONST, not backend
+        // livebox slots.
+        //
+        // resume.py:412-417 + regalloc.py:1204: liveboxes contains ONLY
+        // non-Const boxes — `_number_boxes` (resume.rs:3755-3826) classifies
+        // Const via `is_const(opref)` → TAGCONST inline (lines 3773-3777)
+        // before the box ever reaches liveboxes. PyPy `resume.py:finish` has
+        // no post-numbering Const→hole step; the invariant is that liveboxes
+        // entries stay non-Const through finish(). Hard-assert that
+        // `get_box_replacement_not_const` does not produce a
+        // constant-namespace OpRef
+        // here — if the assert fires, a writer (e.g. a future
+        // `make_constant` flip without paired numbering) is racing the
+        // numbering snapshot, which would break rd_numb / liveboxes
+        // alignment downstream.
         let ordered_liveboxes: Vec<majit_ir::OpRef> = liveboxes
             .into_iter()
             .map(|opt| {
-                opt.map(|opref| env.get_box_replacement(opref))
-                    .unwrap_or(majit_ir::OpRef::NONE)
+                opt.map(|opref| {
+                    let walked = env.get_box_replacement_not_const(opref);
+                    debug_assert!(
+                        !walked.is_constant(),
+                        "resume.py:412-417 invariant: liveboxes entry walked to \
+                         constant-namespace OpRef post-numbering ({opref:?} → {walked:?}); \
+                         _number_boxes should have classified this as TAGCONST inline"
+                    );
+                    walked
+                })
+                .unwrap_or(majit_ir::OpRef::NONE)
             })
             .collect();
 

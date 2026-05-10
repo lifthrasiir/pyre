@@ -431,8 +431,8 @@ impl OptPure {
             }
             // history.py:204-205 Const.same_box → same_constant.
             // OptContext::get_constant covers both namespaces:
-            // CONST_BIT (constant pool) and Forwarded::Const /
-            // op-namespace make_constant. Identical constant values
+            // CONST_BIT (constant pool) and op-namespace make_constant.
+            // Identical constant values
             // count as same_box even when their OpRef slots differ.
             match (ctx.get_constant(query), ctx.get_constant(stored)) {
                 (Some(a), Some(b)) => a == b,
@@ -835,25 +835,30 @@ fn constant_ptr_value(arg: OpRef, ctx: &OptContext) -> Option<usize> {
     // guard_value establishes it. pyre's seed_constant pre-populates
     // trace-time Ref values that try_constant_fold_pure_getfield would
     // dereference — reading fields from objects that may differ at runtime.
-    // Only Forwarded::Const (from guard_value) is a genuine constant.
+    // Only explicit Const forwarding from guard_value is a genuine constant.
     let ia_base = ctx.inputarg_base as usize;
     let ia_end = ia_base + ctx.num_inputs();
     if (resolved.raw() as usize) >= ia_base && (resolved.raw() as usize) < ia_end {
         // BoxRef-routing reader (H-3.2c slice 58). `resolved` is already
         // the Vec chain terminal; BoxRef walk advances at most one step to
         // the make_constant-mirrored fresh `BoxRef::new_const(value)`.
-        // Empty box_pool (test/retrace baselines) falls back to legacy
-        // `Forwarded::Const` Vec read.
-        if let Some(b) = ctx.get_box_replacement_box(resolved) {
-            if let Some(Value::Ref(ptr)) = b.const_value() {
-                if !ptr.is_null() {
-                    return Some(ptr.as_usize());
-                }
+        let b = ctx.get_box_replacement_box(resolved)?;
+        // Forwarded::Box(constbox) — Const-namespace BoxRef terminal.
+        if let Some(Value::Ref(ptr)) = b.const_value() {
+            if !ptr.is_null() {
+                return Some(ptr.as_usize());
             }
             return None;
         }
-        use crate::optimizeopt::info::Forwarded;
-        if let Some(Forwarded::Const(Value::Ref(ptr))) = ctx.forwarded.get(resolved.raw() as usize)
+        // Forwarded::Info(OpInfo::Constant(Value::Ref(_))) — legacy
+        // snapshot replay shape (bridge import / fixture seeding). The
+        // production make_constant writer now emits Forwarded::Box(constbox)
+        // per optimizer.py:432, handled above; this arm survives only for
+        // the legacy fixture replay path so GUARD_VALUE-pinned Ref
+        // inputargs still fold GETFIELD_GC_PURE under that shape.
+        use crate::optimizeopt::info::OpInfo;
+        if let crate::r#box::Forwarded::Info(OpInfo::Constant(Value::Ref(ptr))) =
+            &*b.get_forwarded()
         {
             if !ptr.is_null() {
                 return Some(ptr.as_usize());

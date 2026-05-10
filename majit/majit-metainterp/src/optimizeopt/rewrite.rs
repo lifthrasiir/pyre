@@ -2813,8 +2813,9 @@ impl Optimization for OptRewrite {
                         if !self.loop_invariant_results.contains_key(&func_val) {
                             // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
                             // `produce_loop_invariant` installs
-                            // `replace_op(source, result_opref)`, so source's
-                            // slot now holds `Forwarded::Op(result_opref)`.
+                            // `replace_op(source, result_opref)`, so the source
+                            // box's `_forwarded` slot now holds
+                            // `Forwarded::Box(result_box)`.
                             // Build the synthetic SameAsI replay at
                             // `result_opref` (= get_box_replacement(source))
                             // so `take_preamble_forwarded_opinfo` reads the
@@ -4261,7 +4262,9 @@ mod tests {
         let mut pass = OptRewrite::new();
         let result = pass.propagate_forward(&ops[3], &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
-        assert_eq!(ctx.get_box_replacement(OpRef::int_op(3)), OpRef::int_op(0));
+        let resolved = ctx.get_box_replacement(OpRef::int_op(3));
+        assert!(resolved.is_constant());
+        assert_eq!(ctx.get_constant_int(resolved), Some(42));
     }
 
     #[test]
