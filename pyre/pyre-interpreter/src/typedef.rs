@@ -1733,11 +1733,29 @@ fn init_dict_type(ns: &mut DictStorage) {
         ns,
         "__or__",
         make_builtin_function_with_arity("__or__", |args| {
-            // dict | dict → merge
             if args.len() < 2 {
                 return Ok(args[0]);
             }
-            Ok(args[0]) // stub
+            let src = crate::type_methods::resolve_dict_backing(args[0]);
+            let other = crate::type_methods::resolve_dict_backing(args[1]);
+            let dst = pyre_object::w_dict_new();
+            if !src.is_null() {
+                unsafe {
+                    let d = &*(src as *const pyre_object::dictobject::W_DictObject);
+                    for &(k, v) in &*d.entries {
+                        pyre_object::w_dict_store(dst, k, v);
+                    }
+                }
+            }
+            if !other.is_null() {
+                unsafe {
+                    let d = &*(other as *const pyre_object::dictobject::W_DictObject);
+                    for &(k, v) in &*d.entries {
+                        pyre_object::w_dict_store(dst, k, v);
+                    }
+                }
+            }
+            Ok(dst)
         }, 2),
     );
     dict_storage_store(
@@ -1748,7 +1766,18 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "clear",
-        make_builtin_function_with_arity("clear", |_args| Ok(pyre_object::w_none()), 1),
+        make_builtin_function_with_arity("clear", |args| {
+            if !args.is_empty() {
+                let d = crate::type_methods::resolve_dict_backing(args[0]);
+                if !d.is_null() {
+                    unsafe {
+                        let dict = &mut *(d as *mut pyre_object::dictobject::W_DictObject);
+                        (*dict.entries).clear();
+                    }
+                }
+            }
+            Ok(pyre_object::w_none())
+        }, 1),
     );
     // dict.fromkeys(iterable, value=None) — classmethod
     dict_storage_store(
@@ -3405,6 +3434,14 @@ fn init_object_type(ns: &mut DictStorage) {
         make_builtin_function_with_arity("__format__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new(""));
+            }
+            if args.len() > 1 {
+                let spec = unsafe { crate::py_str(args[1]) };
+                if !spec.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "unsupported format string passed to object.__format__",
+                    ));
+                }
             }
             Ok(pyre_object::w_str_new(&unsafe { crate::py_str(args[0]) }))
         }, 2),

@@ -90,15 +90,6 @@ impl Drop for CallDepthGuardPublic {
     }
 }
 
-/// RAII guard that decrements CALL_DEPTH on drop.
-struct CallDepthGuard;
-impl Drop for CallDepthGuard {
-    #[inline(always)]
-    fn drop(&mut self) {
-        CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-    }
-}
-
 /// Register the JIT-aware eval function. Called by pyre-jit at startup.
 pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
@@ -323,8 +314,7 @@ pub fn call_user_function_resolved(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    CALL_DEPTH.with(|d| d.set(d.get() + 1));
-    let _depth_guard = CallDepthGuard;
+    let _depth_guard = increment_call_depth();
 
     let w_code = unsafe { crate::getcode(callable) };
     let globals = unsafe { function_get_globals(callable) };
@@ -350,12 +340,7 @@ pub fn call_user_function_resolved(
         return gen_frame.run();
     }
 
-    let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
-    let eval_fn = if plain_mode {
-        eval_frame_plain
-    } else {
-        EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain)
-    };
+    let eval_fn = get_eval_fn();
 
     let mut func_frame =
         PyFrame::new_for_call_with_closure(w_code, args, globals, frame.execution_context, closure);
@@ -449,15 +434,8 @@ pub fn call_user_function(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyResult {
-    // Direct TLS increment — no Box allocation. Replaces DEPTH_BUMP_OVERRIDE callback.
-    CALL_DEPTH.with(|d| d.set(d.get() + 1));
-    let _depth_guard = CallDepthGuard;
-    let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
-    let eval_fn = if plain_mode {
-        eval_frame_plain
-    } else {
-        EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain)
-    };
+    let _depth_guard = increment_call_depth();
+    let eval_fn = get_eval_fn();
     call_user_function_with_eval(frame, callable, args, eval_fn)
 }
 

@@ -547,6 +547,7 @@ pub fn builtin_code_new_with_arity(
     func: BuiltinCodeFn,
     arity: u16,
 ) -> PyObjectRef {
+    debug_assert!(arity <= 4, "builtin arity {arity} for {name} exceeds fast-path max 4");
     builtin_code_new_full(name, func, None, arity)
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Uses sre-engine crate (RustPython's SRE bytecode interpreter).
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity, make_module_builtin_function, make_module_builtin_function_with_arity};
+use crate::{DictStorage, dict_storage_store, make_builtin_function, make_module_builtin_function, make_module_builtin_function_with_arity};
 use pyre_object::*;
 use sre_engine::engine::{Request, State};
 use std::cell::RefCell;
@@ -88,7 +88,7 @@ pub fn init(ns: &mut DictStorage) {
             Ok(w_int_new(sre_engine::string::lower_unicode(
                 unsafe { w_int_get_value(args[0]) } as u32
             ) as i64))
-        }, 1),
+        }, 2),
     );
     // Create SRE_Pattern and SRE_Match types.
     // PyPy: interp_sre.py W_SRE_Pattern, W_SRE_Match
@@ -143,10 +143,10 @@ fn init_sre_match_type(ns: &mut DictStorage) {
     // protocol and binds `m` as the first positional argument. PyPy:
     // interp_sre.W_SRE_Match typedef — same layout.
     dict_storage_store(ns, "group", make_builtin_function("group", sre_match_group));
-    dict_storage_store(ns, "groups", make_builtin_function_with_arity("groups", sre_match_groups, 1));
-    dict_storage_store(ns, "start", make_builtin_function_with_arity("start", sre_match_start, 1));
-    dict_storage_store(ns, "end", make_builtin_function_with_arity("end", sre_match_end, 1));
-    dict_storage_store(ns, "span", make_builtin_function_with_arity("span", sre_match_span, 1));
+    dict_storage_store(ns, "groups", make_builtin_function("groups", sre_match_groups));
+    dict_storage_store(ns, "start", make_builtin_function("start", sre_match_start));
+    dict_storage_store(ns, "end", make_builtin_function("end", sre_match_end));
+    dict_storage_store(ns, "span", make_builtin_function("span", sre_match_span));
 }
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)

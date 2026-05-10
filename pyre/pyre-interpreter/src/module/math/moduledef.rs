@@ -142,7 +142,7 @@ pub fn init(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "nextafter",
-        make_builtin_function_with_arity("nextafter", interp_math::nextafter, 2),
+        make_builtin_function("nextafter", interp_math::nextafter),
     );
     dict_storage_store(ns, "ulp", make_builtin_function_with_arity("ulp", interp_math::ulp, 1));
     dict_storage_store(ns, "fma", make_builtin_function_with_arity("fma", interp_math::fma, 3));

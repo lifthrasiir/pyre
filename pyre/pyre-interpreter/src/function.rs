@@ -1180,6 +1180,10 @@ pub fn funccall_valuestack(
 
     // function.py:153-184 — nargs == fast_natural_arity: builtin fast path
     if nargs == fast_natural_arity && nargs <= 4 {
+        debug_assert!(
+            (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
+            "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
+        );
         let builtin_fn = unsafe { crate::builtin_code_get(code as PyObjectRef) };
         // function.py:154-184 — BuiltinCodeN.fastcall_N dispatch.
         // Pyre builtins share a single fn(&[PyObjectRef]) signature, so we
@@ -1236,23 +1240,24 @@ pub fn funccall_valuestack(
     if (fast_natural_arity & crate::FLATPYCALL as usize) != 0 {
         let natural_arity = fast_natural_arity & 0xff;
         if nargs < natural_arity {
-            let defs = unsafe { crate::function_get_defaults(func) };
-            let defs_len = if defs.is_null() {
+            let raw_defs = unsafe { crate::function_get_defaults(func) };
+            let defs = if raw_defs.is_null() {
+                std::ptr::null_mut()
+            } else {
+                crate::baseobjspace::unwrap_cell(raw_defs)
+            };
+            let defs_len = if defs.is_null() || !unsafe { pyre_object::is_tuple(defs) } {
                 0
             } else {
-                let defs = crate::baseobjspace::unwrap_cell(defs);
-                if unsafe { pyre_object::is_tuple(defs) } {
-                    unsafe { pyre_object::w_tuple_len(defs) }
-                } else {
-                    0
-                }
+                unsafe { pyre_object::w_tuple_len(defs) }
             };
-            if nargs >= natural_arity - defs_len {
+            if nargs >= natural_arity.saturating_sub(defs_len) {
                 return _flat_pycall_defaults(
                     func,
                     code,
                     nargs,
                     frame,
+                    defs,
                     natural_arity - nargs,
                     dropvalues,
                 );
@@ -1321,11 +1326,14 @@ fn _flat_pycall(
 ///
 /// Same as `_flat_pycall` but also fills missing positional args from
 /// `self.defs_w[ndefs - defs_to_load ..]`.
+/// `defs` is the pre-unwrapped defaults tuple (already null-checked and
+/// verified as a tuple by the caller in `funccall_valuestack`).
 fn _flat_pycall_defaults(
     func: PyObjectRef,
     code: *const (),
     nargs: usize,
     frame: &mut crate::pyframe::PyFrame,
+    defs: PyObjectRef,
     defs_to_load: usize,
     dropvalues: usize,
 ) -> PyObjectRef {
@@ -1347,9 +1355,7 @@ fn _flat_pycall_defaults(
     }
 
     // function.py:224-229 — fill remaining from defs_w
-    let defs = unsafe { crate::function_get_defaults(func) };
-    let defs = crate::baseobjspace::unwrap_cell(defs);
-    if !defs.is_null() && unsafe { pyre_object::is_tuple(defs) } {
+    if !defs.is_null() {
         let ndefs = unsafe { pyre_object::w_tuple_len(defs) };
         let start = ndefs - defs_to_load;
         let mut i = nargs;
@@ -1364,7 +1370,6 @@ fn _flat_pycall_defaults(
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
-    // Use the JIT-aware eval override (same as call_user_function in call.rs).
     let eval_fn = crate::call::get_eval_fn();
     match eval_fn(&mut new_frame) {
         Ok(v) => v,

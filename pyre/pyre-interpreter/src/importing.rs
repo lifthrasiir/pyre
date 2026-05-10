@@ -216,12 +216,12 @@ fn init_gc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "is_tracked",
-        crate::make_builtin_function_with_arity("is_tracked", |_| Ok(pyre_object::w_bool_from(false)), 0),
+        crate::make_builtin_function_with_arity("is_tracked", |_| Ok(pyre_object::w_bool_from(false)), 1),
     );
     crate::dict_storage_store(
         ns,
         "is_finalized",
-        crate::make_builtin_function_with_arity("is_finalized", |_| Ok(pyre_object::w_bool_from(false)), 0),
+        crate::make_builtin_function_with_arity("is_finalized", |_| Ok(pyre_object::w_bool_from(false)), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -255,7 +255,7 @@ fn init_unicodedata(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "category",
-        crate::make_builtin_function_with_arity("category", |_| Ok(pyre_object::w_str_new("Cn")), 0),
+        crate::make_builtin_function_with_arity("category", |_| Ok(pyre_object::w_str_new("Cn")), 1),
     );
     // unicodedata.name(chr, default=None) → str
     crate::dict_storage_store(
@@ -275,7 +275,7 @@ fn init_unicodedata(ns: &mut DictStorage) {
         "lookup",
         crate::make_builtin_function_with_arity("lookup", |_| {
             Err(crate::PyError::key_error("character not found"))
-        }, 0),
+        }, 1),
     );
     // unicodedata.decimal(chr, default=None) → int
     crate::dict_storage_store(
@@ -556,12 +556,12 @@ fn init_struct(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "unpack_from",
-        crate::make_builtin_function_with_arity("unpack_from", |_| Ok(pyre_object::w_tuple_new(vec![])), 0),
+        crate::make_builtin_function("unpack_from", |_| Ok(pyre_object::w_tuple_new(vec![]))),
     );
     crate::dict_storage_store(
         ns,
         "iter_unpack",
-        crate::make_builtin_function_with_arity("iter_unpack", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function_with_arity("iter_unpack", |_| Ok(pyre_object::w_list_new(vec![])), 2),
     );
     // Struct class — minimal constructor returning instance with format
     // attribute. Used by struct.Struct(fmt).pack/unpack.
@@ -788,12 +788,12 @@ fn init_locale(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "setlocale",
-        crate::make_builtin_function_with_arity("setlocale", |_| Ok(pyre_object::w_str_new("C")), 0),
+        crate::make_builtin_function("setlocale", |_| Ok(pyre_object::w_str_new("C"))),
     );
     crate::dict_storage_store(
         ns,
         "nl_langinfo",
-        crate::make_builtin_function_with_arity("nl_langinfo", |_| Ok(pyre_object::w_str_new("")), 0),
+        crate::make_builtin_function_with_arity("nl_langinfo", |_| Ok(pyre_object::w_str_new("")), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -987,7 +987,7 @@ fn init_atexit(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "unregister",
-        crate::make_builtin_function_with_arity("unregister", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("unregister", |_| Ok(pyre_object::w_none()), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -1020,17 +1020,17 @@ fn init_signal_stub(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "getsignal",
-        crate::make_builtin_function_with_arity("getsignal", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("getsignal", |_| Ok(pyre_object::w_none()), 1),
     );
     crate::dict_storage_store(
         ns,
         "default_int_handler",
-        crate::make_builtin_function_with_arity("default_int_handler", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("default_int_handler", |_| Ok(pyre_object::w_none()), 2),
     );
     crate::dict_storage_store(
         ns,
         "set_wakeup_fd",
-        crate::make_builtin_function_with_arity("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1)), 0),
+        crate::make_builtin_function_with_arity("set_wakeup_fd", |_| Ok(pyre_object::w_int_new(-1)), 1),
     );
     crate::dict_storage_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::dict_storage_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
@@ -1068,7 +1068,7 @@ fn init_itertools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "starmap",
-        crate::make_builtin_function_with_arity("starmap", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function_with_arity("starmap", |_| Ok(pyre_object::w_list_new(vec![])), 2),
     );
     // count(start=0, step=1) — PyPy: W_Count___new__
     //
@@ -1115,13 +1115,13 @@ fn init_itertools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "islice",
-        crate::make_builtin_function_with_arity("islice", |_| Ok(pyre_object::w_list_new(vec![])), 0),
+        crate::make_builtin_function("islice", |_| Ok(pyre_object::w_list_new(vec![]))),
     );
     // groupby
     crate::dict_storage_store(
         ns,
         "groupby",
-        crate::make_builtin_function_with_arity("groupby", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function("groupby", |_| Ok(pyre_object::w_none())),
     );
     // permutations(iterable, r=None) — PyPy: pypy/module/itertools/interp_itertools.py
     crate::dict_storage_store(
@@ -1337,7 +1337,7 @@ fn init_contextvars(ns: &mut DictStorage) {
             let _ = crate::baseobjspace::setattr(
                 obj,
                 "set",
-                crate::make_builtin_function_with_arity("set", |_| Ok(pyre_object::w_none()), 0),
+                crate::make_builtin_function_with_arity("set", |_| Ok(pyre_object::w_none()), 2),
             );
             Ok(obj)
         }),
@@ -1369,12 +1369,12 @@ fn init_abc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_abc_init",
-        crate::make_builtin_function_with_arity("_abc_init", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("_abc_init", |_| Ok(pyre_object::w_none()), 1),
     );
     crate::dict_storage_store(
         ns,
         "_abc_register",
-        crate::make_builtin_function_with_arity("_abc_register", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("_abc_register", |_| Ok(pyre_object::w_none()), 2),
     );
     // _abc_instancecheck(cls, instance) — CPython: Modules/_abc.c _abc__abc_instancecheck.
     //
@@ -1427,12 +1427,12 @@ fn init_abc(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "_get_dump",
-        crate::make_builtin_function_with_arity("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![])), 0),
+        crate::make_builtin_function_with_arity("_get_dump", |_| Ok(pyre_object::w_tuple_new(vec![])), 1),
     );
     crate::dict_storage_store(
         ns,
         "_reset_registry",
-        crate::make_builtin_function_with_arity("_reset_registry", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("_reset_registry", |_| Ok(pyre_object::w_none()), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -1446,9 +1446,9 @@ fn init_functools(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "reduce",
-        crate::make_builtin_function_with_arity("reduce", |_| {
+        crate::make_builtin_function("reduce", |_| {
             Err(crate::PyError::type_error("reduce not implemented"))
-        }, 0),
+        }),
     );
     // functools.cmp_to_key(cmp) — returns a callable that wraps a value in
     // an opaque key. For sorting str / int / tuple of those (the only paths
@@ -1610,12 +1610,12 @@ fn thread_handle_type() -> PyObjectRef {
                 crate::dict_storage_store(
                     ns,
                     "join",
-                    crate::make_builtin_function_with_arity("join", |_| Ok(pyre_object::w_none()), 1),
+                    crate::make_builtin_function("join", |_| Ok(pyre_object::w_none())),
                 );
                 crate::dict_storage_store(
                     ns,
                     "set_result",
-                    crate::make_builtin_function_with_arity("set_result", |_| Ok(pyre_object::w_none()), 1),
+                    crate::make_builtin_function_with_arity("set_result", |_| Ok(pyre_object::w_none()), 2),
                 );
                 crate::dict_storage_store(
                     ns,
@@ -1658,7 +1658,7 @@ fn init_thread(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "start_joinable_thread",
-        crate::make_builtin_function_with_arity("start_joinable_thread", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function("start_joinable_thread", |_| Ok(pyre_object::w_int_new(0))),
     );
     crate::dict_storage_store(
         ns,
@@ -1698,7 +1698,7 @@ fn init_thread(ns: &mut DictStorage) {
         "_make_thread_handle",
         crate::make_builtin_function_with_arity("_make_thread_handle", |_| {
             Ok(pyre_object::w_instance_new(thread_handle_type()))
-        }, 0),
+        }, 1),
     );
     // _get_main_thread_ident — threading.py:43
     crate::dict_storage_store(
@@ -1716,13 +1716,13 @@ fn init_thread(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "set_name",
-        crate::make_builtin_function_with_arity("set_name", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("set_name", |_| Ok(pyre_object::w_none()), 1),
     );
     // _excepthook — threading.py:1262
     crate::dict_storage_store(
         ns,
         "_excepthook",
-        crate::make_builtin_function_with_arity("_excepthook", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("_excepthook", |_| Ok(pyre_object::w_none()), 1),
     );
     // _local — PyPy: pypy/module/thread/os_local.py Local
     // Thread-local data. Single-threaded: equivalent to a plain object with dict.
@@ -3321,17 +3321,17 @@ fn init_imp(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "is_frozen",
-        crate::make_builtin_function_with_arity("is_frozen", |_| Ok(pyre_object::w_bool_from(false)), 0),
+        crate::make_builtin_function_with_arity("is_frozen", |_| Ok(pyre_object::w_bool_from(false)), 1),
     );
     crate::dict_storage_store(
         ns,
         "is_frozen_package",
-        crate::make_builtin_function_with_arity("is_frozen_package", |_| Ok(pyre_object::w_bool_from(false)), 0),
+        crate::make_builtin_function_with_arity("is_frozen_package", |_| Ok(pyre_object::w_bool_from(false)), 1),
     );
     crate::dict_storage_store(
         ns,
         "get_frozen_object",
-        crate::make_builtin_function_with_arity("get_frozen_object", |_| Ok(pyre_object::w_none()), 0),
+        crate::make_builtin_function_with_arity("get_frozen_object", |_| Ok(pyre_object::w_none()), 1),
     );
     crate::dict_storage_store(
         ns,
@@ -3346,12 +3346,12 @@ fn init_imp(ns: &mut DictStorage) {
     crate::dict_storage_store(
         ns,
         "exec_builtin",
-        crate::make_builtin_function_with_arity("exec_builtin", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity("exec_builtin", |_| Ok(pyre_object::w_int_new(0)), 1),
     );
     crate::dict_storage_store(
         ns,
         "exec_dynamic",
-        crate::make_builtin_function_with_arity("exec_dynamic", |_| Ok(pyre_object::w_int_new(0)), 0),
+        crate::make_builtin_function_with_arity("exec_dynamic", |_| Ok(pyre_object::w_int_new(0)), 1),
     );
     crate::dict_storage_store(
         ns,
