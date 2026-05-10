@@ -9,6 +9,7 @@ pub(crate) mod call_policy_byte;
 mod classify;
 mod codegen_state;
 mod codegen_trace;
+mod green_type_tag;
 pub(crate) mod jitcode_lower;
 
 use proc_macro2::TokenStream;
@@ -64,6 +65,26 @@ pub struct JitInterpConfig {
     pub auto_calls: bool,
     /// Optional structured green-key expressions for marker rewrite.
     pub greens: Vec<Expr>,
+    /// Slice (audit Issue #6) — explicit red declarations for the
+    /// dispatch JitCode `BC_JIT_MERGE_POINT` payload.  RPython
+    /// `jtransform.py:1700 make_three_lists(op.args[2+num_green_args:])`
+    /// derives reds from the marker call's tail args; pyre's marker is
+    /// stateless (no tail args), so consumers declare the reds via
+    /// this config slot instead.  Empty = use the default candidate
+    /// list `[program, pc(+ optional vable)]` with declared greens
+    /// filtered out (the pre-Issue-#6 pyre behavior).
+    pub reds: Vec<Expr>,
+    /// Slice 92.2 — per-green type tag from `greens = [name: tag]` syntax.
+    /// Lockstep with [`Self::greens`] (same length, same order).  `None`
+    /// at a given index means the green flows through the
+    /// `<_ as GreenAsI64>::__green_repr` trait dispatch unchanged;
+    /// `Some(tag)` overrides the dispatch with an explicit
+    /// `(value_bits, GreenType::<tag>)` pair so str / unicode greens route
+    /// through the hardcoded `default_str_eq` / `default_str_hash` /
+    /// `default_unicode_hash` in `majit-ir/src/value.rs`
+    /// (`warmstate.py:108-128 lltype.Ptr STR/UNICODE` parity, no
+    /// frontend override).
+    pub green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
     /// Virtualizable frame field declaration.
     ///
     /// RPython equivalent: jtransform.py's `is_virtualizable_getset()`.
@@ -358,6 +379,7 @@ impl Parse for JitInterpConfig {
         let mut calls: Vec<CallEntry> = Vec::new();
         let mut auto_calls = None;
         let mut greens = None;
+        let mut reds = None;
         let mut virtualizable_decl = None;
         let mut state_fields = None;
 
@@ -385,7 +407,14 @@ impl Parse for JitInterpConfig {
                     auto_calls = Some(input.parse::<LitBool>()?.value);
                 }
                 "greens" => {
-                    greens = Some(parse_expr_list(input)?);
+                    let specs = green_type_tag::parse_green_spec_list(input)?;
+                    greens = Some(specs);
+                }
+                "reds" => {
+                    if reds.is_some() {
+                        return Err(syn::Error::new(key.span(), "duplicate `reds`"));
+                    }
+                    reds = Some(parse_expr_list(input)?);
                 }
                 "virtualizable_fields" => {
                     virtualizable_decl = Some(parse_virtualizable_decl(input)?);
@@ -416,13 +445,22 @@ impl Parse for JitInterpConfig {
             ));
         }
 
+        let greens_specs = greens.unwrap_or_default();
+        let (green_exprs, green_type_tags): (Vec<Expr>, Vec<Option<green_type_tag::GreenTypeTag>>) =
+            greens_specs
+                .into_iter()
+                .map(|spec| (spec.expr, spec.type_tag))
+                .unzip();
+
         Ok(JitInterpConfig {
             state_type,
             env_type,
             io_shims: io_shims.unwrap_or_default(),
             calls,
             auto_calls: auto_calls.unwrap_or(false),
-            greens: greens.unwrap_or_default(),
+            greens: green_exprs,
+            reds: reds.unwrap_or_default(),
+            green_type_tags,
             virtualizable_decl,
             state_fields,
         })
@@ -776,12 +814,27 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             // recursive portal/residual callback re-enters this trace
             // path on the same driver thread.
             let __shared_asm = __driver.shared_asm();
-            __driver.merge_point(|__ctx, __sym| {
+            // Slice 2.2: clone the dispatch JitCode Arc before the mutable
+            // `merge_point` borrow so the closure can forward it to
+            // `#trace_fn_name` without holding a `JitDriver` reference.
+            let __dispatch_jitcode: Option<::std::sync::Arc<majit_metainterp::JitCode>> =
+                __driver.dispatch_jitcode().cloned();
+            __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
+                let __ctx = __meta
+                    .trace_ctx()
+                    .expect("merge_point invariant: tracing must be Some");
                 if __sym.trace_started && __pc == __sym.loop_header_pc() {
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
-                let __result = #trace_fn_name(&__shared_asm, __ctx, __sym, __env, __pc);
+                let __result = #trace_fn_name(
+                    &__shared_asm,
+                    __ctx,
+                    __sym,
+                    __env,
+                    __pc,
+                    __dispatch_jitcode.as_ref(),
+                );
                 __sym.trace_started = true;
                 // pyjitpl.py:2843 blackhole_if_trace_too_long — check
                 // AFTER executing the step (RPython _interpret loop order).
@@ -810,6 +863,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         &func.block,
         &merge_fn_name,
         &config.greens,
+        &config.green_type_tags,
         &config.calls,
         &config.io_shims,
     );
@@ -827,6 +881,7 @@ fn rewrite_body(
     block: &syn::Block,
     merge_fn_name: &Ident,
     default_greens: &[Expr],
+    default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
     call_policies: &[CallEntry],
     io_shims: &[(Path, Ident)],
 ) -> TokenStream {
@@ -915,12 +970,142 @@ fn rewrite_body(
         }
     }
 
-    fn green_key_expr(target: &Expr, greens: &[Expr]) -> Option<TokenStream> {
+    /// Slice 92.2 — emit a single `(i64, majit_ir::GreenType)` pair for one
+    /// green expression, dispatching on the optional per-green type tag.
+    /// Untagged (`None`) greens flow through the
+    /// `<_ as GreenAsI64>::__green_repr` trait — preserving the
+    /// pre-Slice-92 behavior. Tagged greens emit explicit casts so
+    /// `&str`-bearing greens carry `GreenType::Str` instead of being
+    /// silently routed through the blanket `impl<T: ?Sized>` Ref impl.
+    fn emit_green_repr(spec_expr: &Expr, tag: Option<green_type_tag::GreenTypeTag>) -> TokenStream {
+        use green_type_tag::GreenTypeTag;
+        match tag {
+            // Untagged greens go through the `GreenAsI64` trait —
+            // primitive types route to `GreenType::Int`, floats to
+            // `GreenType::Float`, references to `GreenType::Ref`.  An
+            // untagged `&str` lands on the blanket `impl<T: ?Sized>
+            // GreenAsI64 for &T` and carries `GreenType::Ref` (raw
+            // pointer identity).  Consumers wanting RPython STR /
+            // UNICODE content semantics MUST tag explicitly via
+            // `greens = [name: str]` / `greens = [name: unicode]`;
+            // `&str` is ambiguous between `rstr.STR` (UTF-8 byte
+            // string) and `rstr.UNICODE` (codepoint sequence) and the
+            // macro cannot pick one without an explicit declaration.
+            None => quote! {
+                <_ as majit_ir::GreenAsI64>::__green_repr(#spec_expr)
+            },
+            Some(GreenTypeTag::Int) => quote! {
+                ((#spec_expr) as i64, majit_ir::GreenType::Int)
+            },
+            Some(GreenTypeTag::Float) => quote! {
+                {
+                    let __green_f: f64 = (#spec_expr) as f64;
+                    (__green_f.to_bits() as i64, majit_ir::GreenType::Float)
+                }
+            },
+            Some(GreenTypeTag::Ref) => quote! {
+                ((#spec_expr) as *const _ as *const () as usize as i64,
+                 majit_ir::GreenType::Ref)
+            },
+            // ABI: the i64 is the address of a `'static` slot holding
+            // a `&'static str`.  `majit_ir::value::default_str_eq` /
+            // `default_str_hash` / `default_unicode_hash` dereference
+            // the i64 as `*const &'static str` and read the fat
+            // pointer (data + len) — RPython's `rstr.STR*` /
+            // `rstr.UNICODE*` carry their length internally; pyre
+            // mirrors that contract by storing the fat pointer at a
+            // stable address rather than the bare data pointer.
+            //
+            // PRE-EXISTING-ADAPTATION (allocation lifetime divergence
+            // from RPython, intentionally deferred):
+            //
+            //   * RPython: `rstr.STR*` is GC-allocated *once per
+            //     JitCell* and naturally stable for the JitCell's
+            //     lifetime.  `JitCell.greenargs[i]` holds the rstr
+            //     pointer; subsequent merge-point hits for the same
+            //     `(jitdriver, greenkey)` pass the existing pointer
+            //     into `equal_whatever` / `hash_whatever`.  No
+            //     re-allocation, GC frees the rstr when the cell
+            //     dies.
+            //
+            //   * pyre: `&str` has no stable backing-storage address
+            //     by default, so this macro emits a fresh slot via
+            //     `Box::leak` *every merge-point hit* — not once per
+            //     JitCell.  The GreenKey HashMap content-de-dupes via
+            //     `default_str_eq` / `default_str_hash`, so multiple
+            //     slots with the same content collapse to a single
+            //     cache entry, but the slot leaks themselves grow
+            //     unboundedly with merge-point hit count for
+            //     long-running programs.
+            //
+            // A structural fix (per-JitCell owned-string field
+            // instead of leaked slot, e.g. reshaping
+            // `GreenKey::values` from `Vec<i64>` to a typed enum
+            // carrying `Box<str>` for str/unicode greens, with the
+            // macro emitting a temporary the cache promotes on
+            // insertion) is a multi-session refactor and is
+            // intentionally deferred — a global intern side-table
+            // was rejected as non-orthodox (RPython does not
+            // maintain one).  Functional behavior matches RPython
+            // (content-keyed compare/hash); only the lifetime /
+            // allocation profile differs.
+            Some(GreenTypeTag::Str) => quote! {
+                (
+                    majit_ir::make_str_slot(#spec_expr),
+                    majit_ir::GreenType::Str,
+                )
+            },
+            Some(GreenTypeTag::Unicode) => quote! {
+                (
+                    majit_ir::make_str_slot(#spec_expr),
+                    majit_ir::GreenType::Unicode,
+                )
+            },
+        }
+    }
+
+    fn green_key_expr(
+        target: &Expr,
+        greens: &[Expr],
+        green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
+    ) -> Option<TokenStream> {
         if greens.is_empty() {
             None
         } else {
+            // Per-green dispatch through `majit_ir::GreenAsI64::__green_repr`
+            // so the `(i64-bits, GreenType)` pair travels together for each
+            // green expression. `with_types` builds the typed schema;
+            // `warmstate.py:575 _green_args_spec` keys per-type
+            // `equal_whatever`/`hash_whatever` off the green's lltype, so a
+            // Ref-typed green must compare by pointer identity, a Float by
+            // bit pattern, and an Int by raw value — collapsing all to
+            // `GreenType::Int` (the previous `GreenKey::new` shape) made
+            // Float / Ref greens equal under bit-equal Int values they
+            // should not be equal to.
+            //
+            // Slice 92.2 — `green_type_tags` is the lockstep
+            // `Vec<Option<GreenTypeTag>>` carried alongside `greens`
+            // (`JitInterpConfig.green_type_tags`).  Tagged greens
+            // bypass the trait dispatch with explicit casts so str /
+            // unicode greens carry `GreenType::Str` (warmstate.py:108-128
+            // ll_streq / ll_strhash routing).  Untagged greens
+            // (`None`) keep the trait path unchanged.
+            let green_reprs: Vec<TokenStream> = greens
+                .iter()
+                .enumerate()
+                .map(|(i, expr)| {
+                    let tag = green_type_tags.get(i).copied().flatten();
+                    emit_green_repr(expr, tag)
+                })
+                .collect();
             Some(quote! {
-                majit_ir::GreenKey::new(vec![(#target) as i64, #((#greens) as i64),*])
+                {
+                    let (__values, __types): (Vec<i64>, Vec<majit_ir::GreenType>) = vec![
+                        <_ as majit_ir::GreenAsI64>::__green_repr(#target),
+                        #(#green_reprs),*
+                    ].into_iter().unzip();
+                    majit_ir::GreenKey::with_types(__values, __types)
+                }
             })
         }
     }
@@ -1069,7 +1254,7 @@ fn rewrite_body(
                     let policy_path = jitcode_lower::helper_policy_path(func)?;
                     quote! {
                         {
-                            let (_, _, __majit_observer_trace, __majit_observer_concrete, _prebuild) = #policy_path();
+                            let (_, _, __majit_observer_trace, __majit_observer_concrete, _) = #policy_path();
                             if __majit_observer_trace.is_null()
                                 && __majit_observer_concrete.is_null()
                             {
@@ -1186,6 +1371,7 @@ fn rewrite_body(
     struct MarkerRewriter {
         merge_fn_name: Ident,
         default_greens: Vec<Expr>,
+        default_green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
         call_policies: Vec<(Vec<String>, Option<CallPolicyKind>)>,
         io_shims: Vec<(Vec<String>, Ident)>,
     }
@@ -1213,6 +1399,24 @@ fn rewrite_body(
                     let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
+                    // Slice 2.3: jit_merge_point!() in #[jit_interp] dispatch portals
+                    // expands to a single merge_wrapper invocation.  The wrapper
+                    // (generate_merge_wrapper) clones the dispatch JitCode Arc and calls
+                    // `driver.merge_point(...)` exactly once — there is no additional
+                    // outer merge-point hook.  The BC_JIT_MERGE_POINT(_C) IR op lives
+                    // inside the dispatch JitCode body (lower_dispatch_body, Slice 1.2),
+                    // not in the outer Rust source.
+                    //
+                    // RPython parity: source-level jit_merge_point() is a codewriter
+                    // marker; the runtime hook is the JitCode IR op
+                    // (interp_jit.py:88-90).
+                    //
+                    // The `is_tracing()` guard here is a hot-path short-circuit
+                    // (avoids the cold `__merge_*` call when not tracing).  It does NOT
+                    // add a second merge-point dispatch — `driver.merge_point` guards
+                    // again internally, but the closure runs only once.
+                    //
+                    // Slice 5 will simplify further once the legacy factory is deleted.
                     let new_tokens: TokenStream = quote! {
                         if #driver.is_tracing() {
                             #merge_fn(&mut #driver, #env, #pc);
@@ -1272,17 +1476,67 @@ fn rewrite_body(
                                 .as_ref()
                                 .cloned()
                                 .unwrap_or_else(|| syn::parse_quote!(stacksize));
-                            let greens = if args.greens.is_empty() {
-                                self.default_greens.clone()
+                            let (greens, green_type_tags) = if args.greens.is_empty() {
+                                (
+                                    self.default_greens.clone(),
+                                    self.default_green_type_tags.clone(),
+                                )
                             } else {
-                                args.greens.clone()
+                                // RPython `can_enter_jit` and
+                                // `jit_merge_point` reference the same
+                                // `JitDriver` greens spec — the marker op
+                                // args sit in fixed positional slots whose
+                                // lltype is fixed by declaration
+                                // (`warmstate.py:564 _green_args_spec`,
+                                // `support.py:126 decode_hp_hint_args`
+                                // asserts on count mismatch at translation
+                                // time).  Positional inheritance of
+                                // declaration tags therefore matches
+                                // RPython parity: a `str`-tagged green
+                                // stays Str-keyed through the override
+                                // path, routing through the canonical
+                                // slot ABI rather than silently falling
+                                // to the blanket `GreenAsI64 for &T`
+                                // (Ref / pointer identity) implementation.
+                                //
+                                // If a downstream override expression has
+                                // a different Rust type than the
+                                // declaration's tag indicates (e.g. tag
+                                // `Int` with `&str` override), the
+                                // emitted explicit cast (`(<expr>) as
+                                // i64`) fails at compile time — fail-loud
+                                // at the macro / type-check boundary
+                                // rather than at runtime with a
+                                // misshaped key.
+                                //
+                                // Marker arity is structurally fixed in
+                                // RPython, so a count mismatch is a
+                                // hard user error. pyre fails loud at
+                                // proc-macro expansion (compile-time)
+                                // with a clear message rather than
+                                // silently falling back to an untagged
+                                // trait path that would emit a misshaped
+                                // key schema.
+                                if args.greens.len() != self.default_green_type_tags.len() {
+                                    panic!(
+                                        "can_enter_jit! override green count {} does not match \
+                                         the JitDriver declaration's green count {} — RPython \
+                                         marker arity is fixed (rpython/jit/codewriter/support.py \
+                                         decode_hp_hint_args asserts on mismatch). Fix the \
+                                         override expression list to match the declaration's \
+                                         `greens=[...]` arity.",
+                                        args.greens.len(),
+                                        self.default_green_type_tags.len(),
+                                    );
+                                }
+                                (args.greens.clone(), self.default_green_type_tags.clone())
                             };
                             let stacksize_update: TokenStream = quote! { #stacksize_expr = 0i32; };
                             // compile.py:711 parity: back_edge returns
                             // Some(resume_pc) on guard failure (blackhole
                             // resume) or FINISH (loop header re-entry).
                             let back_edge: TokenStream = if let Some(green_key) =
-                                green_key_expr(target_expr, &greens)
+                                green_key_expr(target_expr, &greens, &green_type_tags)
                             {
                                 quote! {
                                     if let Some(__resume_pc) = #driver_expr.back_edge_structured(#green_key, #target_expr, #state_expr, #env_expr, #pre_run_expr) {
@@ -1322,6 +1576,7 @@ fn rewrite_body(
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
         default_greens: default_greens.to_vec(),
+        default_green_type_tags: default_green_type_tags.to_vec(),
         call_policies: call_policies
             .iter()
             .map(|entry| (path_segments(&entry.path), entry.policy))

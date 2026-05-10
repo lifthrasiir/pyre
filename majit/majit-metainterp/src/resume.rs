@@ -5172,9 +5172,8 @@ mod tests {
     #[test]
     fn blackhole_from_resumedata_accepts_runtime_jitcode_without_canonical_pair() {
         use crate::blackhole::BlackholeInterpBuilder;
-        use crate::jitcode::{
-            BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE, JitCodeBuilder,
-        };
+        use crate::jitcode::JitCodeBuilder;
+        use crate::jitcode::insns::{BC_ABORT, BC_CATCH_EXCEPTION, BC_LIVE, BC_RVMPROF_CODE};
 
         let mut writer = crate::resumecode::Writer::new(6);
         writer.append_int(0); // items_resume_section (patched below)

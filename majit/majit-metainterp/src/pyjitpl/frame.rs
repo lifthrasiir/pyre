@@ -921,9 +921,15 @@ impl MIFrame {
             Type::Int => &mut self.int_regs,
             Type::Ref => &mut self.ref_regs,
             Type::Float => &mut self.float_regs,
+            // pyjitpl.py:236-244 `else: assert 0, oldbox` — RPython rejects
+            // any box whose `type` attribute is not 'i' / 'r' / 'f'.
+            // Mirroring that assertion strength keeps the contract: the
+            // caller must resolve a typed Box; passing a Void-typed
+            // OpRef indicates the caller's type oracle returned a
+            // semantically impossible answer.
             Type::Void => panic!(
-                "replace_active_box_in_frame: void oldbox {:?} (pyjitpl.py:240 `assert 0, oldbox`)",
-                oldbox
+                "replace_active_box_in_frame: oldbox {oldbox:?} resolved to Type::Void; \
+                 RPython parity rejects unknown/void box types (pyjitpl.py:236)"
             ),
         };
         if registers.is_empty() {
@@ -1431,10 +1437,12 @@ mod tests {
     }
 
     /// Type::Void is not a valid box type (pyjitpl.py:246 `assert 0,
-    /// oldbox`).
+    /// oldbox`).  The Rust port mirrors RPython's strength — a Void-typed
+    /// oldbox indicates the caller's type oracle returned a semantically
+    /// impossible answer, so panic rather than silently swallow.
     #[test]
-    #[should_panic(expected = "replace_active_box_in_frame: void oldbox")]
-    fn replace_active_box_in_frame_void_type_panics_like_rpython() {
+    #[should_panic(expected = "Type::Void")]
+    fn replace_active_box_in_frame_void_type_panics() {
         let jitcode = make_jitcode_with_regs(1, 1, 1);
         let mut frame = MIFrame::new(jitcode, 0);
         frame.int_regs[0] = Some(OpRef::int_op(7));

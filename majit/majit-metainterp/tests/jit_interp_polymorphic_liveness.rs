@@ -18,14 +18,16 @@
 //!    entry into the shared `Assembler` (proving the macro pipeline is
 //!    actually running per-marker analysis, not collapsing every arm to the
 //!    canonical set).
-//! 2. `__jitcode_*` factory calls AFTER `install_canonical_liveness` must
-//!    not grow `asm.all_liveness()` — every per-marker triple must already
-//!    be registered by prebuild.  Mirrors the runtime assertion at
-//!    `codegen_trace.rs:178-185`.
-//! 3. At least two of the per-arm JitCodes must contain BC_LIVE markers
-//!    pointing at *distinct* offsets (the polymorphism check).
+//! 2. `__dispatch_jitcode_*` builder calls AFTER `install_canonical_liveness`
+//!    must not grow `asm.all_liveness()` — every per-marker triple (both
+//!    dispatch-body and per-arm sub-builder) must already be registered by
+//!    prebuild.  Mirrors the runtime assertion at `codegen_trace.rs:178-185`.
+//! 3. At least two of the per-arm JitCodes built via the legacy per-arm
+//!    factory must contain BC_LIVE markers pointing at *distinct* offsets
+//!    (the polymorphism check).
 
-use majit_metainterp::{Assembler, BC_LIVE, JitCode, JitDriver, JitState as _};
+use majit_metainterp::jitcode::insns::BC_LIVE;
+use majit_metainterp::{Assembler, JitCode, JitDriver, JitState as _};
 
 // ── Synthetic state ────────────────────────────────────────────────
 
@@ -46,8 +48,8 @@ pub type Bytecode = [u8];
 
 // `BytecodeExt::get_op` is consumed by the macro-emitted `__trace_*` fn
 // (codegen_trace.rs:61 `program.get_op(pc)`), but the integration tests
-// below drive only `__jitcode_*` / `__prebuild_*`, so the compiler flags
-// the trait as dead code in this binary's reachability graph.
+// below drive only `__dispatch_jitcode_*` / `__prebuild_*`, so the compiler
+// flags the trait as dead code in this binary's reachability graph.
 #[allow(dead_code)]
 trait BytecodeExt {
     fn get_op(&self, pc: usize) -> u8;
@@ -154,16 +156,6 @@ fn collect_bc_live_offsets(jitcode: &JitCode) -> Vec<u16> {
     offsets
 }
 
-/// Build the polymorphic factory's JitCode for a given (pc, op).
-///
-/// `__prebuild_jitcode_liveness_polymorphic_mainloop` must be called
-/// once before any factory invocation so per-marker triples land in
-/// `asm.all_liveness` ahead of the runtime `finalize_liveness` patch.
-fn build_jitcode_for_op(asm: &mut Assembler, program: &[u8], pc: usize, op: u8) -> JitCode {
-    __jitcode_polymorphic_mainloop(asm, program, pc, op)
-        .unwrap_or_else(|| panic!("factory returned None for op={op}"))
-}
-
 // ── Tests ──────────────────────────────────────────────────────────
 
 /// Mirror the production install ordering from
@@ -218,8 +210,9 @@ fn prebuild_registers_more_than_canonical_entry() {
 #[test]
 fn factory_does_not_grow_asm_after_prebuild() {
     // Mirror the runtime assertion at `codegen_trace.rs:178-185`: every
-    // per-marker triple emitted by the per-arm builder must already be in
-    // `asm.all_liveness` (prebuild hit), so `finalize_liveness` only
+    // per-marker triple emitted by the dispatch JitCode builder (and its
+    // per-arm sub-builders embedded via `BC_INLINE_CALL`) must already be
+    // in `asm.all_liveness` (prebuild hit), so `finalize_liveness` only
     // dedups against existing offsets.  A regression in the prebuild walker
     // (e.g., missing emit-site coverage) would surface as growth here.
     let mut asm = Assembler::new();
@@ -228,15 +221,13 @@ fn factory_does_not_grow_asm_after_prebuild() {
 
     let post_install_len = asm.all_liveness().len();
 
-    let program = [OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD, OP_END];
-    for &op in &[OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD] {
-        let _ = build_jitcode_for_op(&mut asm, &program, 1, op);
-    }
+    let _dispatch = __dispatch_jitcode_polymorphic_mainloop(&mut asm, 0i64)
+        .expect("dispatch lower must succeed for fixture");
 
     assert_eq!(
         asm.all_liveness().len(),
         post_install_len,
-        "factory finalize_liveness must not grow all_liveness post-install"
+        "dispatch JitCode build must not grow all_liveness past prebuild snapshot"
     );
 }
 
@@ -247,6 +238,21 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
     // macro pipeline regressed to "every arm uses canonical offset 0", all
     // collected offsets would collapse to {0} and this assertion would
     // fire.
+    //
+    // Note: this test still drives the per-arm factory
+    // (`__jitcode_polymorphic_mainloop`) rather than walking
+    // `dispatch.exec.descrs`.  The dispatch JitCode embeds each arm via
+    // `BC_INLINE_CALL` + `add_sub_jitcode`, but per the documented dispatch
+    // lowering path (`jitcode_lower.rs:5180-5202`), arms whose bodies
+    // reference outer-scope locals (`state.a`, `state.b`, ...) fall back to
+    // `__sub_builder.abort()` — those embedded arm jitcodes carry a single
+    // abort byte and zero BC_LIVE markers.  The per-arm prebuild emitted
+    // alongside `generate_jitcode_arm` (codegen_trace.rs) registers the
+    // distinct triples that the legacy per-arm factory's `finalize_liveness`
+    // patches into per-arm BC_LIVE slots, so this is where the polymorphism
+    // signal is observable.  Slice 5 deletes the legacy factory; at that
+    // point this test will need to switch to a per-arm prebuild walker that
+    // doesn't go through the embed/abort dispatch path.
     let mut asm = Assembler::new();
     let canonical: Vec<u8> = (0..4u8).collect();
     install_canonical_for_test(&mut asm, &canonical);
@@ -260,7 +266,8 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
     // remaining markers.
     let mut per_arm_offsets: Vec<Vec<u16>> = Vec::new();
     for &op in &[OP_GUARD_A, OP_SUM_AB, OP_SUM_ABC, OP_SUM_ABCD] {
-        let jitcode = build_jitcode_for_op(&mut asm, &program, 1, op);
+        let jitcode = __jitcode_polymorphic_mainloop(&mut asm, &program, 1, op)
+            .unwrap_or_else(|| panic!("factory returned None for op={op}"));
         let mut offs = collect_bc_live_offsets(&jitcode);
         // drop the leading canonical marker (body offset 0)
         if !offs.is_empty() {
@@ -296,5 +303,76 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
         "polymorphic per-pc liveness regressed: every per-pc BC_LIVE marker \
          points at the same offset — saw {all_offsets:?} across arms \
          OP_GUARD_A/OP_SUM_AB/OP_SUM_ABC/OP_SUM_ABCD"
+    );
+}
+
+#[test]
+fn install_canonical_liveness_registers_dispatch_jitcode_singleton() {
+    let mut driver: JitDriver<Polymorphic4State> = JitDriver::new(100);
+    let state = Polymorphic4State {
+        a: 1,
+        b: 1,
+        c: 1,
+        d: 1,
+    };
+    let program = [OP_GUARD_A, OP_END];
+    state
+        .build_meta(0, &program)
+        .install_canonical_liveness(&mut driver);
+    let stored = driver.dispatch_jitcode();
+    assert!(
+        stored.is_some(),
+        "install_canonical_liveness must register dispatch JitCode singleton"
+    );
+    let jc = stored.unwrap();
+    assert!(
+        !jc.code.is_empty(),
+        "registered dispatch JitCode body must be non-empty"
+    );
+    let live_offsets = collect_bc_live_offsets(jc);
+    assert!(
+        !live_offsets.is_empty(),
+        "registered dispatch JitCode must contain at least one BC_LIVE marker"
+    );
+}
+
+/// Slice 4.3 regression pin: `BC_INLINE_CALL` targets in the dispatch
+/// JitCode descr table must be `RuntimeBhDescr::JitCode` (frame-chain
+/// interpreter path), never fnaddr handlers (which target native call
+/// wrappers). Production runtime enforcement at
+/// `pyjitpl/dispatch.rs:1690-1692` panics if `descrs[sub_idx].as_jitcode()`
+/// is `None`; this build-time test pins the lowerer's emit invariant so
+/// accidental migration to a fnaddr emit path surfaces at compile + test
+/// time, not at first dispatch. RPython parity: `blackhole.py:150-157`
+/// argcode `j` resolves via `self.descrs[idx]` asserted to be a `JitCode`.
+#[test]
+fn dispatch_inline_call_descrs_have_jitcode_entries() {
+    let mut asm = Assembler::new();
+    let canonical: Vec<u8> = (0..4u8).collect();
+    install_canonical_for_test(&mut asm, &canonical);
+
+    let dispatch = __dispatch_jitcode_polymorphic_mainloop(&mut asm, 0i64)
+        .expect("dispatch lower must succeed for fixture");
+
+    let mut jitcode_count = 0;
+    for d in dispatch.exec.descrs.iter() {
+        if let majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc) = d {
+            jitcode_count += 1;
+            // Each sub-jitcode body is at least 1 byte. Cross-scope arms
+            // fall back to a single abort byte (`jitcode_lower.rs:5170-5202`),
+            // which is intentional — but a zero-byte body would mean the
+            // build pipeline silently dropped the sub-jitcode entirely.
+            assert!(
+                !jc.code.is_empty(),
+                "BC_INLINE_CALL target sub-jitcode body must be non-empty"
+            );
+        }
+    }
+    assert!(
+        jitcode_count >= 1,
+        "dispatch must emit at least one BC_INLINE_CALL JitCode descr; \
+         a fnaddr-only descr table would mean the lowerer wired native \
+         call targets instead of frame-chain sub-jitcodes, regressing \
+         the dispatch.rs:1690-1692 contract"
     );
 }

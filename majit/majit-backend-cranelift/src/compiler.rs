@@ -2904,6 +2904,13 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
     Ok(jf.fail_descr.as_ref())
 }
 
+/// Owned-Arc counterpart of [`get_latest_descr_from_deadframe`].
+///
+/// `cpu.get_latest_descr(deadframe)` (`history.py:125`) returns the
+/// descr object the metainterp stamped; pyre threads the same identity
+/// through `Arc<CraneliftFailDescr>` upcast to `Arc<dyn FailDescr>`
+/// so consumer-side bridge entry can route off descr Arc rather than
+/// `(trace_id, fail_index)` surrogates.
 pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
 ) -> Result<Arc<dyn FailDescr>, BackendError> {

@@ -1922,12 +1922,14 @@ mod tests {
     fn assemble_accumulates_canonical_last_exc_value_and_jit_merge_point_keys() {
         let mut assembler = Assembler::new();
 
-        let mut ssarepr = SSARepr::new("portal");
-        // jtransform.py:1704-1707 emits the canonical 7-arg shape
-        // `[Constant(jd.index), greens_i, greens_r, greens_f,
-        //   reds_i, reds_r, reds_f]`. A small ConstInt jd_index lowers
-        // to the `c` argcode (insn_key arg[0] match: -128..=127 → 'c').
-        ssarepr.insns.push(Insn::op(
+        // Portal A — small jdindex ConstInt(0) lowers to `c` argcode
+        // (insn_key arg[0] match: -128..=127 → 'c'). One
+        // `jit_merge_point` per portal jitcode mirrors
+        // `jtransform.py:1690-1712` (which emits exactly one
+        // `jit_merge_point` per portal); the assembler accumulates
+        // both shapes across separate `assemble` calls.
+        let mut portal_small = SSARepr::new("portal_small");
+        portal_small.insns.push(Insn::op(
             "jit_merge_point",
             vec![
                 Operand::ConstInt(0),
@@ -1954,7 +1956,25 @@ mod tests {
                 Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
             ],
         ));
-        ssarepr.insns.push(Insn::op(
+        portal_small.insns.push(Insn::op_with_result(
+            "last_exc_value",
+            Vec::new(),
+            Register::new(Kind::Ref, 3),
+        ));
+        assembler.assemble(
+            &mut portal_small,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 2,
+                ref_: 4,
+                ..NumRegs::default()
+            }),
+        );
+
+        // Portal B — large jdindex ConstInt(200) lowers to `i` argcode
+        // (out of -128..=127), exercising the const-patches path.
+        let mut portal_large = SSARepr::new("portal_large");
+        portal_large.insns.push(Insn::op(
             "jit_merge_point",
             vec![
                 Operand::ConstInt(200),
@@ -1966,20 +1986,7 @@ mod tests {
                 Operand::ListOfKind(ListOfKind::new(Kind::Float, Vec::new())),
             ],
         ));
-        ssarepr.insns.push(Insn::op_with_result(
-            "last_exc_value",
-            Vec::new(),
-            Register::new(Kind::Ref, 3),
-        ));
-        assembler.assemble(
-            &mut ssarepr,
-            JitCodeBuilder::default(),
-            Some(NumRegs {
-                int: 2,
-                ref_: 4,
-                ..NumRegs::default()
-            }),
-        );
+        assembler.assemble(&mut portal_large, JitCodeBuilder::default(), None);
 
         let insns = assembler.insns_snapshot();
         let wellknown = majit_metainterp::jitcode::wellknown_bh_insns();

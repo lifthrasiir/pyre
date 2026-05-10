@@ -155,11 +155,38 @@ pub struct TraceCtx {
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
     current_merge_points: Vec<MergePoint>,
-    /// pyjitpl.py:2979 reached_loop_header parity: callback to check
-    /// has_compiled_targets(ptoken) for a given green key. Bridge traces
-    /// skip loop headers without compiled targets. Live lookup (not snapshot)
-    /// matches RPython's get_procedure_token(greenboxes) + has_compiled_targets.
+    /// pyjitpl.py:2978-2986 reached_loop_header / pyjitpl.py:1551
+    /// opimpl_jit_merge_point auto-loop-header gate: callback to check
+    /// `has_compiled_targets(ptoken)` for a given green key.  Live
+    /// lookup (not snapshot) mirrors RPython's
+    /// `get_procedure_token(greenboxes)` + `has_compiled_targets`.
+    /// Installed unconditionally at trace start (both bridge and
+    /// primary entry paths) so the auto-stamp gate sees consistent
+    /// state regardless of resumekey.  See `is_bridge_trace` for the
+    /// orthogonal "this is a bridge close-skip" flag — earlier pyre
+    /// revisions overloaded fn-presence as the bridge marker, which
+    /// blocked installing this fn at primary entry.
     pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
+    /// pyjitpl.py:2978 `if not self.partial_trace:` parity at
+    /// `reached_loop_header` — explicit "this trace started from a
+    /// guard failure" flag.  RPython distinguishes via
+    /// `self.resumekey` typing (`ResumeGuardDescr` vs
+    /// `ResumeFromInterpDescr`); pyre sets this to `true` at
+    /// `start_bridge_tracing` and leaves the default `false` for
+    /// primary entries.  Consumers that need bridge-only behavior
+    /// (e.g. `pyre-jit-trace::metainterp::run_to_end`'s close-loop
+    /// skip when no compiled targets exist for the current
+    /// greenkey) gate on this flag instead of fn presence.
+    pub is_bridge_trace: bool,
+    /// pyjitpl.py:1551 `if self.metainterp.portal_call_depth: return` parity
+    /// — live read of `MetaInterp.portal_call_depth` at the
+    /// `BC_JIT_MERGE_POINT` first-iteration auto loop-header gate.  When
+    /// nested portal calls are active (`portal_call_depth != 0`), RPython
+    /// skips the auto-stamp and waits for an explicit `loop_header` op.
+    /// Pyre exposes this as a Fn pointer so the trace ctx (which owns
+    /// the cross-component flow at dispatch time) can sample the
+    /// metainterp's depth counter without holding a back-reference.
+    pub portal_call_depth_fn: Option<Box<dyn Fn() -> i32>>,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
     /// / `slice_unicode` (resume.py:1143-1188) which look up the
@@ -565,6 +592,8 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            is_bridge_trace: false,
+            portal_call_depth_fn: None,
             callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -622,6 +651,8 @@ impl TraceCtx {
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
+            is_bridge_trace: false,
+            portal_call_depth_fn: None,
             callinfocollection: None,
             call_pure_results: std::collections::HashMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,

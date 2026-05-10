@@ -21,6 +21,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let state_type = &config.state_type;
     let env_type = &config.env_type;
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", func.sig.ident);
+    let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", func.sig.ident);
+    let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", func.sig.ident);
     let sf = config.state_fields.as_ref().unwrap();
 
     let unsupported_fields: Vec<String> = sf
@@ -689,6 +691,33 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 &self,
                 driver: &mut majit_metainterp::JitDriver<#state_type>,
             ) {
+                // RPython `codewriter.py:23-24` calls `CallControl.__init__`
+                // (`call.py:46-47`) before `assemble()` produces the jitcodes
+                // that read `jitdriver_sd.index`. Pyre's analog: stamp the
+                // descriptor onto the driver before the dispatch JitCode
+                // build below reads jdindex via
+                // `driver.index().expect(...)`.
+                //
+                // `ensure_descriptor_registered` mirrors PyPy's `for
+                // index, jd in enumerate(jitdrivers_sd): jd.index = index`
+                // — when the consumer constructed the driver via
+                // `JitDriver::with_descriptor(threshold, jd)`, that jd
+                // (carrying `greens`/`reds`/`virtualizable`/result_type
+                // info) is registered in place; only when no descriptor
+                // was pre-built does an empty stub get registered as a
+                // pyre-only fail-soft.  Idempotent: re-entry is a no-op
+                // once `driver.index()` returns `Some(_)`.
+                //
+                // Slice (audit Issue #5) — populate the JitDriver's
+                // green / red schema BEFORE
+                // `ensure_descriptor_registered` runs, so the
+                // descriptor that gets registered carries the real
+                // `(name, IR Type)` pairs from the dispatch
+                // JitCode body's `BC_JIT_MERGE_POINT` rather than the
+                // empty stub.  `green_kind_counts` / `red_kind_counts`
+                // then reflect the actual payload partition.
+                #declare_schema_fn_name(driver);
+                driver.ensure_descriptor_registered();
                 // Phase 4 Epic B.3-B.4: register canonical entry +
                 // canonical opcode ids into the driver-shared
                 // `Assembler` (cf. `JitDriver::shared_asm`) so per-pc
@@ -729,30 +758,30 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // to dynamically resolve `op_live` /
                     // `op_catch_exception` / `op_*_return` instead of a
                     // parallel hardcoded `BC_*` seeding block.
-                    __asm.register_insn("live/", majit_metainterp::BC_LIVE);
+                    __asm.register_insn("live/", majit_metainterp::jitcode::insns::BC_LIVE);
                     __asm.register_insn(
                         "catch_exception/L",
-                        majit_metainterp::BC_CATCH_EXCEPTION,
+                        majit_metainterp::jitcode::insns::BC_CATCH_EXCEPTION,
                     );
                     __asm.register_insn(
                         "rvmprof_code/ii",
-                        majit_metainterp::BC_RVMPROF_CODE,
+                        majit_metainterp::jitcode::insns::BC_RVMPROF_CODE,
                     );
                     __asm.register_insn(
                         "int_return/i",
-                        majit_metainterp::BC_INT_RETURN,
+                        majit_metainterp::jitcode::insns::BC_INT_RETURN,
                     );
                     __asm.register_insn(
                         "ref_return/r",
-                        majit_metainterp::BC_REF_RETURN,
+                        majit_metainterp::jitcode::insns::BC_REF_RETURN,
                     );
                     __asm.register_insn(
                         "float_return/f",
-                        majit_metainterp::BC_FLOAT_RETURN,
+                        majit_metainterp::jitcode::insns::BC_FLOAT_RETURN,
                     );
                     __asm.register_insn(
                         "void_return/",
-                        majit_metainterp::BC_VOID_RETURN,
+                        majit_metainterp::jitcode::insns::BC_VOID_RETURN,
                     );
                     // RPython `pyjitpl.py:2255 finish_setup` builds every
                     // JitCode and stamps every per-marker `-live-` triple
@@ -767,6 +796,33 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // the table never grows past this point (asserted in
                     // `__trace_*`).
                     #prebuild_fn_name(&mut __asm);
+                    // Build the dispatch JitCode singleton against the
+                    // same shared assembler. `__prebuild_jitcode_liveness_*`
+                    // registers per-marker triples for both the dispatch
+                    // JitCode and every per-arm JitCode, so the
+                    // `finalize_liveness` calls inside this factory only
+                    // dedup — they do not grow `asm.all_liveness` past the
+                    // prebuild snapshot. Mirrors `pyjitpl.py:2264
+                    // finish_setup`, where `metainterp_sd.liveness_info`
+                    // is snapshotted only after every JitCode has been
+                    // built and every `-live-` triple stamped.
+                    // Single-phase jdindex resolution (jtransform.py:1704):
+                    // `register_descriptor` ran above (line 689 onwards),
+                    // unconditionally stamping the index on the driver
+                    // before this point. Read it through the now-`Some`
+                    // accessor and bake it into the dispatch JitCode body.
+                    //
+                    // Codex Pre-A.3 review BLOCKER (a) absorption: a fake
+                    // `0` index must never end up baked into a registered
+                    // JitCode body. With `register_descriptor` ordered
+                    // before this read, the `expect()` is a structural
+                    // invariant — it can fire only if a future change
+                    // accidentally moves the registration after this site.
+                    let __jdindex: i64 = driver.index().expect(
+                        "register_descriptor must run before install_canonical_liveness — \
+                         RPython call.py:46-47 / codewriter.py:23-24 lifecycle invariant"
+                    ) as i64;
+                    let __dispatch_jc_opt = #dispatch_jitcode_fn_name(&mut __asm, __jdindex);
                     // Safety net: ensure the canonical entry has a
                     // registered offset before the snapshot, even if no
                     // per-pc factory has run a `finalize_liveness` yet
@@ -775,6 +831,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // `canonical_liveness_offset`.
                     let _ = __asm.ensure_canonical_liveness_offset();
                     driver.install_canonical_liveness(&__asm);
+                    // PyPy `make_jitcodes()` / `pyjitpl.py:2255
+                    // finish_setup()` only install completed jitcodes —
+                    // there is no path where a body that the codewriter
+                    // failed to lower lands as a successfully-installed
+                    // singleton.  When `lower_dispatch_body` returned
+                    // `None` at proc-macro time, the dispatch builder
+                    // returns `None` here; skip
+                    // `register_dispatch_jitcode` to match that
+                    // lifecycle.  Successful builds (`Some(jc)`) install
+                    // unconditionally per PyPy
+                    // `pypy/module/pypyjit/interp_jit.py:82-94`.
+                    if let Some(__dispatch_jc) = __dispatch_jc_opt {
+                        driver.register_dispatch_jitcode(__dispatch_jc);
+                    }
                 }
             }
         }

@@ -13,7 +13,7 @@ pub use descr::{
     DescrRef, FailDescr, FieldDescr, GcCache, InteriorFieldDescr, JitCodeDescr, LLType,
     LoopTargetDescr, LoopTokenDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr,
     SwitchDescr, TargetArgLoc, UnpackAtExitInfo, VableExpansion, descr_identity, make_array_descr,
-    make_field_descr, make_loop_target_descr, make_malloc_array_calldescr,
+    make_array_descr_signed, make_field_descr, make_loop_target_descr, make_malloc_array_calldescr,
     make_malloc_array_nonstandard_calldescr, make_malloc_big_fixedsize_calldescr,
     make_malloc_str_calldescr, make_malloc_unicode_calldescr, make_memcpy_calldescr,
     make_raw_malloc_calldescr, make_size_descr_full, make_size_descr_with_vtable,
@@ -30,6 +30,7 @@ pub use resoperation::{
     Op, OpCode, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
-    Const, FAILARGS_LIMIT, GcRef, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn, StrHashFn,
-    Type, Value, VarKind, set_str_resolver, set_unicode_resolver,
+    Const, FAILARGS_LIMIT, GcRef, GreenAsI64, GreenKey, GreenType, InputArg, JitDriverVar, StrEqFn,
+    StrHashFn, Type, Value, VarKind, green_type_to_ir, make_str_slot, set_str_resolver,
+    set_unicode_resolver,
 };

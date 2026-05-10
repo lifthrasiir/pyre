@@ -193,7 +193,7 @@ impl<'a> OpTypeIndex<'a> {
         }
         if opref.is_constant() {
             // history.py:220/261/307: `Const*` boxes pin `box.type` at
-            // construction. Typed `OpRef::ConstInt/ConstFloat/ConstPtr`
+            // construction.  Typed `OpRef::ConstInt/ConstFloat/ConstPtr`
             // variants short-circuit at the `opref.ty()` arm above, so
             // this branch only fires for `Untyped(x | CONST_BIT)` —
             // legacy `OpRef::from_const` / `OpRef::from_raw` reconstructs

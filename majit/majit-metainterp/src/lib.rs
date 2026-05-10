@@ -67,8 +67,7 @@ pub use jit_state::{
     ResumeDataResult,
 };
 pub use jitcode::{
-    BC_CATCH_EXCEPTION, BC_FLOAT_RETURN, BC_INT_RETURN, BC_LIVE, BC_REF_RETURN, BC_RVMPROF_CODE,
-    BC_VOID_RETURN, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo,
+    BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo, insns,
     live_slots_for_state_field_jit,
 };
 pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
@@ -234,14 +233,33 @@ macro_rules! conditional_call_elidable {
     }};
 }
 
-/// Hash a green key from i64 slice values.
+/// Hash a green key from i64 slice values, all-Int convention.
 ///
 /// Uses the same algorithm as [`GreenKey::hash_u64`](majit_ir::GreenKey::hash_u64),
 /// so callers can compute a key hash without constructing a full `GreenKey`.
-/// warmstate.py:584-593 `JitCell.get_uhash` — all-Int path.
+/// warmstate.py:584-593 `JitCell.get_uhash` — Int-only path.
+///
+/// Callers that have non-Int greens (Float / Ref) must use
+/// [`green_key_hash_typed`] instead; the per-type
+/// `equal_whatever`/`hash_whatever` differs from the Int default and a
+/// bare-i64 hash would collide with an Int-typed key carrying the same bits.
 #[inline]
 pub fn green_key_hash(values: &[i64]) -> u64 {
     majit_ir::GreenKey::new(values.to_vec()).hash_u64()
+}
+
+/// Hash a green key from `(i64 bits, GreenType)` slices.
+///
+/// `warmstate.py:575 _green_args_spec` keys per-type
+/// `equal_whatever`/`hash_whatever` off the green's lltype, so a Float
+/// green hashes as `f64::from_bits(bits)`-aware and a Ref green hashes
+/// as identity over the pointer bits.  Mirrors the typed schema that
+/// `#[jit_interp]` macro-emitted code now produces via
+/// `GreenKey::with_types`.
+#[inline]
+pub fn green_key_hash_typed(values: &[i64], types: &[majit_ir::GreenType]) -> u64 {
+    debug_assert_eq!(values.len(), types.len());
+    majit_ir::GreenKey::with_types(values.to_vec(), types.to_vec()).hash_u64()
 }
 
 // ── we_are_jitted / JIT mode flag ──
@@ -369,6 +387,33 @@ mod tests {
     fn green_key_hash_matches_green_key() {
         let hash = green_key_hash(&[42, 7]);
         let gk = majit_ir::GreenKey::new(vec![42, 7]);
+        assert_eq!(hash, gk.hash_u64());
+    }
+
+    #[test]
+    fn green_key_hash_typed_diverges_from_all_int_for_float_greens() {
+        let bits = (3.14f64).to_bits() as i64;
+        let untyped = green_key_hash(&[bits]);
+        let typed = green_key_hash_typed(&[bits], &[majit_ir::GreenType::Float]);
+        // hash_whatever(Float, bits) vs hash_whatever(Int, bits) — distinct
+        // per `warmstate.py:566 _green_args_spec` per-type lookup.
+        assert_ne!(
+            untyped, typed,
+            "Float-typed hash must not collide with Int-typed hash on the same bits",
+        );
+    }
+
+    #[test]
+    fn green_key_hash_typed_matches_with_types() {
+        let bits = (3.14f64).to_bits() as i64;
+        let hash = green_key_hash_typed(
+            &[bits, 42],
+            &[majit_ir::GreenType::Float, majit_ir::GreenType::Int],
+        );
+        let gk = majit_ir::GreenKey::with_types(
+            vec![bits, 42],
+            vec![majit_ir::GreenType::Float, majit_ir::GreenType::Int],
+        );
         assert_eq!(hash, gk.hash_u64());
     }
 }

@@ -2,45 +2,20 @@ mod assembler;
 
 pub use assembler::{JitCodeBuilder, live_slots_for_state_field_jit};
 pub use majit_translate::jitcode::{
-    BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, JitCode as CanonicalJitCode,
+    BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, BhInteriorFieldSpec,
+    JitCode as CanonicalJitCode,
 };
 
-// `BC_*` constants and `MAX_HOST_CALL_ARITY` were moved to
-// `majit_translate::insns` in slice #86c (Task #86). They live with
-// the canonical RPython-parity types (`JitCode` / `BhDescr` /
-// `BhCallDescr` / `enumerate_vars`) per
-// `epic_e_task86_canonical_home_design_2026_05_04.md`. These
-// re-exports keep all in-crate and external consumers working
-// without an import-path sweep — that sweep is slice #86e.
-pub use majit_translate::insns::{
-    BC_ABORT, BC_ABORT_PERMANENT, BC_ARRAYLEN_VABLE, BC_CALL_ASSEMBLER_FLOAT,
-    BC_CALL_ASSEMBLER_INT, BC_CALL_ASSEMBLER_REF, BC_CALL_ASSEMBLER_VOID, BC_CATCH_EXCEPTION,
-    BC_COND_CALL_VALUE_INT, BC_COND_CALL_VALUE_REF, BC_COND_CALL_VOID, BC_FLOAT_ABS, BC_FLOAT_ADD,
-    BC_FLOAT_GUARD_VALUE, BC_FLOAT_MUL, BC_FLOAT_NEG, BC_FLOAT_POP, BC_FLOAT_PUSH, BC_FLOAT_RETURN,
-    BC_FLOAT_SUB, BC_FLOAT_TRUEDIV, BC_GETARRAYITEM_VABLE_F, BC_GETARRAYITEM_VABLE_I,
-    BC_GETARRAYITEM_VABLE_R, BC_GETFIELD_VABLE_F, BC_GETFIELD_VABLE_I, BC_GETFIELD_VABLE_R,
-    BC_GOTO_IF_EXCEPTION_MISMATCH, BC_GOTO_IF_NOT_FLOAT_EQ, BC_GOTO_IF_NOT_FLOAT_GE,
-    BC_GOTO_IF_NOT_FLOAT_GT, BC_GOTO_IF_NOT_FLOAT_LE, BC_GOTO_IF_NOT_FLOAT_LT,
-    BC_GOTO_IF_NOT_FLOAT_NE, BC_GOTO_IF_NOT_INT_EQ, BC_GOTO_IF_NOT_INT_GE, BC_GOTO_IF_NOT_INT_GT,
-    BC_GOTO_IF_NOT_INT_IS_TRUE, BC_GOTO_IF_NOT_INT_IS_ZERO, BC_GOTO_IF_NOT_INT_LE,
-    BC_GOTO_IF_NOT_INT_LT, BC_GOTO_IF_NOT_INT_NE, BC_GOTO_IF_NOT_PTR_EQ, BC_GOTO_IF_NOT_PTR_ISZERO,
-    BC_GOTO_IF_NOT_PTR_NE, BC_GOTO_IF_NOT_PTR_NONZERO, BC_HINT_FORCE_VIRTUALIZABLE, BC_INLINE_CALL,
-    BC_INSTANCE_PTR_EQ, BC_INSTANCE_PTR_NE, BC_INT_ADD, BC_INT_AND, BC_INT_EQ, BC_INT_GE,
-    BC_INT_GT, BC_INT_GUARD_VALUE, BC_INT_INVERT, BC_INT_LE, BC_INT_LSHIFT, BC_INT_LT, BC_INT_MUL,
-    BC_INT_NE, BC_INT_NEG, BC_INT_OR, BC_INT_POP, BC_INT_PUSH, BC_INT_RETURN, BC_INT_RSHIFT,
-    BC_INT_SUB, BC_INT_XOR, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_JUMP, BC_LAST_EXC_VALUE,
-    BC_LAST_EXCEPTION, BC_LIVE, BC_LOAD_STATE_ARRAY, BC_LOAD_STATE_FIELD, BC_LOAD_STATE_VARRAY,
-    BC_LOOP_HEADER, BC_MOVE_F, BC_MOVE_I, BC_MOVE_R, BC_PTR_EQ, BC_PTR_ISZERO, BC_PTR_NE,
-    BC_PTR_NONZERO, BC_RAISE, BC_RECORD_KNOWN_RESULT_INT, BC_RECORD_KNOWN_RESULT_REF,
-    BC_REF_GUARD_VALUE, BC_REF_POP, BC_REF_PUSH, BC_REF_RETURN, BC_RERAISE, BC_RESIDUAL_CALL_IR_I,
-    BC_RESIDUAL_CALL_IR_R, BC_RESIDUAL_CALL_IR_V, BC_RESIDUAL_CALL_IRF_F, BC_RESIDUAL_CALL_IRF_I,
-    BC_RESIDUAL_CALL_IRF_R, BC_RESIDUAL_CALL_IRF_V, BC_RESIDUAL_CALL_R_I, BC_RESIDUAL_CALL_R_R,
-    BC_RESIDUAL_CALL_R_V, BC_RVMPROF_CODE, BC_SETARRAYITEM_VABLE_F, BC_SETARRAYITEM_VABLE_I,
-    BC_SETARRAYITEM_VABLE_R, BC_SETFIELD_VABLE_F, BC_SETFIELD_VABLE_I, BC_SETFIELD_VABLE_R,
-    BC_STORE_STATE_ARRAY, BC_STORE_STATE_FIELD, BC_STORE_STATE_VARRAY, BC_UINT_GE, BC_UINT_GT,
-    BC_UINT_LE, BC_UINT_LT, BC_UINT_MUL_HIGH, BC_UINT_RSHIFT, BC_UNREACHABLE, BC_VOID_RETURN,
-    MAX_HOST_CALL_ARITY,
-};
+// `BC_*` constants and `MAX_HOST_CALL_ARITY` live in
+// `majit_translate::insns` (Task #86, slice #86c). The module is
+// re-exported here as the canonical access path; in-crate and external
+// consumers reach `BC_*` / `MAX_HOST_CALL_ARITY` via
+// `jitcode::insns::BC_*`.
+pub use majit_translate::insns;
+
+/// Alias for `BC_JUMP`; used in dispatch JitCode loop-close tests
+/// (Slice 1.7) and `jitcode_lower::lower_dispatch_body` jump emission.
+pub const BC_GOTO: u8 = insns::BC_JUMP;
 
 // `insn_byte` and `wellknown_bh_insns` were moved to
 // `majit_translate::insns` in slice #86d (Task #86). Re-exports keep
@@ -336,6 +311,22 @@ pub struct JitCodeExecState {
     /// would collapse distinct trace targets that share a concrete
     /// pointer.
     pub call_descr_to_call_target: std::collections::HashMap<u16, JitCallTarget>,
+    /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte for
+    /// the dispatch JitCode emitted by `lower_dispatch_body`.  `None`
+    /// for non-dispatch JitCodes (helpers, sub-arms) — exactly one
+    /// `jit_merge_point` op is allowed per dispatch JitCode and the
+    /// builder asserts that contract on the second call.
+    ///
+    /// Captured by `JitCodeBuilder::jit_merge_point` at the
+    /// `self.code.len()` immediately before the opcode byte is pushed,
+    /// so consumers reading `jit_merge_point_offset` land on the
+    /// opcode byte itself (decoded the same way as `frame.next_u8()`
+    /// would deliver it).  `register_dispatch_jitcode` reads this
+    /// field to validate the green/red list counts against the
+    /// declared `JitDriverDescriptor` schema without re-scanning the
+    /// bytecode — RPython `blackhole.py:107-156` argcode-based decode
+    /// parity, no payload-byte collision risk.
+    pub jit_merge_point_offset: Option<usize>,
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -402,6 +393,12 @@ impl JitCode {
             core: majit_translate::jitcode::JitCode::new(name),
             exec: JitCodeExecState::default(),
         }
+    }
+
+    /// `jitcode.py:14 JitCode.name` accessor — proxies to the canonical
+    /// source-only core for diagnostic / parity-validator messages.
+    pub fn name(&self) -> &str {
+        &self.core.name
     }
 
     /// Wrap a pre-built canonical `JitCode` (e.g. one produced by
@@ -517,16 +514,16 @@ impl JitCodeRuntimeExt for JitCode {
     fn trailing_return_info(&self) -> Option<(JitArgKind, u16)> {
         let body = self.try_body()?;
         let code = &body.code;
-        if code.last().copied() == Some(BC_VOID_RETURN) || code.len() < 3 {
+        if code.last().copied() == Some(insns::BC_VOID_RETURN) || code.len() < 3 {
             return None;
         }
         let opcode_pos = code.len() - 3;
         let opcode = code[opcode_pos];
         let src = u16::from_le_bytes([code[opcode_pos + 1], code[opcode_pos + 2]]);
         match opcode {
-            BC_INT_RETURN => Some((JitArgKind::Int, src)),
-            BC_REF_RETURN => Some((JitArgKind::Ref, src)),
-            BC_FLOAT_RETURN => Some((JitArgKind::Float, src)),
+            insns::BC_INT_RETURN => Some((JitArgKind::Int, src)),
+            insns::BC_REF_RETURN => Some((JitArgKind::Ref, src)),
+            insns::BC_FLOAT_RETURN => Some((JitArgKind::Float, src)),
             _ => None,
         }
     }
@@ -584,70 +581,73 @@ mod tests {
         );
         assert_eq!(
             insns.get("getfield_vable_i/rd>i"),
-            Some(&BC_GETFIELD_VABLE_I)
+            Some(&super::insns::BC_GETFIELD_VABLE_I)
         );
         assert_eq!(
             insns.get("getfield_vable_r/rd>r"),
-            Some(&BC_GETFIELD_VABLE_R)
+            Some(&super::insns::BC_GETFIELD_VABLE_R)
         );
         assert_eq!(
             insns.get("getfield_vable_f/rd>f"),
-            Some(&BC_GETFIELD_VABLE_F)
+            Some(&super::insns::BC_GETFIELD_VABLE_F)
         );
         assert_eq!(
             insns.get("setfield_vable_i/rid"),
-            Some(&BC_SETFIELD_VABLE_I)
+            Some(&super::insns::BC_SETFIELD_VABLE_I)
         );
         assert_eq!(
             insns.get("setfield_vable_r/rrd"),
-            Some(&BC_SETFIELD_VABLE_R)
+            Some(&super::insns::BC_SETFIELD_VABLE_R)
         );
         assert_eq!(
             insns.get("setfield_vable_f/rfd"),
-            Some(&BC_SETFIELD_VABLE_F)
+            Some(&super::insns::BC_SETFIELD_VABLE_F)
         );
         assert_eq!(
             insns.get("getarrayitem_vable_i/ridd>i"),
-            Some(&BC_GETARRAYITEM_VABLE_I)
+            Some(&super::insns::BC_GETARRAYITEM_VABLE_I)
         );
         assert_eq!(
             insns.get("getarrayitem_vable_r/ridd>r"),
-            Some(&BC_GETARRAYITEM_VABLE_R)
+            Some(&super::insns::BC_GETARRAYITEM_VABLE_R)
         );
         assert_eq!(
             insns.get("getarrayitem_vable_f/ridd>f"),
-            Some(&BC_GETARRAYITEM_VABLE_F)
+            Some(&super::insns::BC_GETARRAYITEM_VABLE_F)
         );
         assert_eq!(
             insns.get("setarrayitem_vable_i/riidd"),
-            Some(&BC_SETARRAYITEM_VABLE_I)
+            Some(&super::insns::BC_SETARRAYITEM_VABLE_I)
         );
         assert_eq!(
             insns.get("setarrayitem_vable_r/rirdd"),
-            Some(&BC_SETARRAYITEM_VABLE_R)
+            Some(&super::insns::BC_SETARRAYITEM_VABLE_R)
         );
         assert_eq!(
             insns.get("setarrayitem_vable_f/rifdd"),
-            Some(&BC_SETARRAYITEM_VABLE_F)
+            Some(&super::insns::BC_SETARRAYITEM_VABLE_F)
         );
-        assert_eq!(insns.get("arraylen_vable/rdd>i"), Some(&BC_ARRAYLEN_VABLE));
+        assert_eq!(
+            insns.get("arraylen_vable/rdd>i"),
+            Some(&super::insns::BC_ARRAYLEN_VABLE)
+        );
         assert_eq!(
             insns.get("hint_force_virtualizable/r"),
-            Some(&BC_HINT_FORCE_VIRTUALIZABLE)
+            Some(&super::insns::BC_HINT_FORCE_VIRTUALIZABLE)
         );
         // Slice 0 of `pyre-call-family-canonical-migration.md` — canonical
         // residual_call_*_v opcodes reserved for Slice 1 emit migration.
         assert_eq!(
             insns.get("residual_call_r_v/iRd"),
-            Some(&BC_RESIDUAL_CALL_R_V),
+            Some(&super::insns::BC_RESIDUAL_CALL_R_V),
         );
         assert_eq!(
             insns.get("residual_call_ir_v/iIRd"),
-            Some(&BC_RESIDUAL_CALL_IR_V),
+            Some(&super::insns::BC_RESIDUAL_CALL_IR_V),
         );
         assert_eq!(
             insns.get("residual_call_irf_v/iIRFd"),
-            Some(&BC_RESIDUAL_CALL_IRF_V),
+            Some(&super::insns::BC_RESIDUAL_CALL_IRF_V),
         );
     }
 
@@ -664,17 +664,17 @@ mod tests {
 
         let pairs = [
             // Borrow-checker abort signals.
-            ("abort/", BC_ABORT),
-            ("abort_permanent/", BC_ABORT_PERMANENT),
+            ("abort/", insns::BC_ABORT),
+            ("abort_permanent/", insns::BC_ABORT_PERMANENT),
             // Proc-macro JIT-machine state addressing.
-            ("load_state_field/di", BC_LOAD_STATE_FIELD),
-            ("store_state_field/di", BC_STORE_STATE_FIELD),
-            ("load_state_array/dii", BC_LOAD_STATE_ARRAY),
-            ("store_state_array/dii", BC_STORE_STATE_ARRAY),
-            ("load_state_varray/dii", BC_LOAD_STATE_VARRAY),
-            ("store_state_varray/dii", BC_STORE_STATE_VARRAY),
+            ("load_state_field/di", insns::BC_LOAD_STATE_FIELD),
+            ("store_state_field/di", insns::BC_STORE_STATE_FIELD),
+            ("load_state_array/dii", insns::BC_LOAD_STATE_ARRAY),
+            ("store_state_array/dii", insns::BC_STORE_STATE_ARRAY),
+            ("load_state_varray/dii", insns::BC_LOAD_STATE_VARRAY),
+            ("store_state_varray/dii", insns::BC_STORE_STATE_VARRAY),
             // pyre nested-bytecode inline_call (pyre-only `P` argcode).
-            ("inline_call_pyre_nested/P", BC_INLINE_CALL),
+            ("inline_call_pyre_nested/P", insns::BC_INLINE_CALL),
         ];
 
         for (key, expected_byte) in pairs {
@@ -714,7 +714,7 @@ mod tests {
         use crate::blackhole::BlackholeInterpBuilder;
 
         let body = BuildJitCodeBody {
-            code: vec![BC_LIVE, 0x00, 0x00], // live/ with 2-byte offset
+            code: vec![insns::BC_LIVE, 0x00, 0x00], // live/ with 2-byte offset
             c_num_regs_i: 4,
             c_num_regs_r: 2,
             c_num_regs_f: 1,

@@ -13,6 +13,8 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let trace_fn_name = format_ident!("__trace_{}", fn_name);
     let jitcode_fn_name = format_ident!("__jitcode_{}", fn_name);
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
+    let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", fn_name);
+    let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", fn_name);
 
     let match_expr = find_dispatch_match(&func.block);
     let Some(match_expr) = match_expr else {
@@ -46,6 +48,11 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         config.auto_calls,
         config.virtualizable_decl.as_ref(),
         config.state_fields.as_ref(),
+        &config.greens,
+        &config.green_type_tags,
+        &config.reds,
+        &config.state_type,
+        &config.env_type,
     );
 
     let classified = classify_arms(&match_expr.arms);
@@ -68,32 +75,68 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let jitcode_arms = generated_arms.iter().map(|(arm, _)| arm);
     let liveness_prebuilds = generated_arms.iter().map(|(_, prebuild)| prebuild);
 
-    let label_closure = quote! { |_unused_pc| 0usize };
-    let trace_jitcode_call = if config.virtualizable_decl.is_some() {
+    // Slice 1: dispatch JitCode singleton produced by lower_dispatch_body.
+    // Slice 2 wires `__trace_*` to invoke it; Slice 3 extends install pipeline
+    // to register it as the driver-shared singleton. Slice 3.2 splices the
+    // dispatch JitCode's per-marker liveness prebuild into
+    // `__prebuild_jitcode_liveness_*` alongside the per-arm prebuilds, so the
+    // driver-shared `Assembler` already holds every triple the dispatch
+    // factory will emit — preserving the no-growth invariant asserted in
+    // `__trace_*` below for the dispatch JitCode build path.
+    let dispatch_lowerer_config = lowerer_config.with_vable_input_ref_reg(1);
+    let (
+        dispatch_body,
+        dispatch_prebuild,
+        dispatch_lower_ok,
+        dispatch_green_schema,
+        dispatch_red_schema,
+    ) = match jitcode_lower::lower_dispatch_body(&dispatch_lowerer_config, &func.block, &classified)
+    {
+        Some(generated) => (
+            generated.body,
+            generated.liveness_prebuild,
+            true,
+            generated.green_schema,
+            generated.red_schema,
+        ),
+        None => (quote! {}, quote! {}, false, Vec::new(), Vec::new()),
+    };
+    // Slice (audit Issue #5) — split the (name, type) tuples into
+    // separate name + type token vectors so the macro splat below
+    // can interleave them as `(#name, #type)` without losing
+    // ordering.  Per-pair iteration via tuple destructuring inside
+    // the splat is not supported by `quote!`.
+    let dispatch_green_schema_names: Vec<&str> = dispatch_green_schema
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let dispatch_green_schema_types: Vec<&proc_macro2::TokenStream> =
+        dispatch_green_schema.iter().map(|(_, t)| t).collect();
+    let dispatch_red_schema_names: Vec<&str> = dispatch_red_schema
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    let dispatch_red_schema_types: Vec<&proc_macro2::TokenStream> =
+        dispatch_red_schema.iter().map(|(_, t)| t).collect();
+
+    // Slice 91.3 (post-audit) — identity closure so
+    // `runtime.label_at(pc)` returns the OUTER interpreter pc that
+    // `BC_JIT_MERGE_POINT` (`dispatch.rs`) feeds it (`self.portal_pc`,
+    // populated from `outer_program_pc`).  The legacy `|_unused_pc|
+    // 0usize` always returned 0, defeating the loop-header check at
+    // `runtime.label_at(pc) == sym.loop_header_pc()` for every consumer
+    // whose `loop_header_pc()` is non-zero.  Mirrors RPython's portal
+    // pc-as-label model where the merge point's identity is its pc.
+    let label_closure = quote! { |pc: usize| pc };
+    let push_virtualizable_argbox = if config.virtualizable_decl.is_some() {
         quote! {
             let Some(__vable_argbox) = __ctx.standard_virtualizable_jitcode_argbox() else {
                 return TraceAction::Abort;
             };
-            let __jitcode_args = [__vable_argbox];
-            let __result = majit_metainterp::trace_jitcode_observer_with_args(
-                __ctx,
-                __sym,
-                &__jitcode,
-                pc,
-                #label_closure,
-                &__jitcode_args,
-            );
+            __jitcode_args.push(__vable_argbox);
         }
     } else {
-        quote! {
-            let __result = majit_metainterp::trace_jitcode_observer(
-                __ctx,
-                __sym,
-                &__jitcode,
-                pc,
-                #label_closure,
-            );
-        }
+        quote! {}
     };
 
     let trace_fn_body = quote! {
@@ -104,54 +147,71 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             __sym: &mut __JitSym,
             program: &#env_type,
             pc: usize,
+            // Slice 2.2: dispatch JitCode singleton forwarded from __merge_*
+            // (cloned from JitDriver before mutable borrow). None when Slice 3
+            // install pipeline has not yet run; falls back to legacy factory.
+            __dispatch_jitcode_arg: Option<&::std::sync::Arc<majit_metainterp::JitCode>>,
         ) -> majit_metainterp::TraceAction {
             use majit_metainterp::TraceAction;
 
-            let __op = program.get_op(pc);
-            // The lowered JitCode must see the same local state as the
-            // interpreter's `match opcode { ... }` body: the opcode has
-            // already been fetched and `pc` has already advanced past it.
-            // RPython tracing observes the post-fetch bytecode index when
-            // recording immediate operands, so pass `pc + 1` here instead
-            // of the opcode's address.
-            let __jit_pc = pc + 1;
-            // Lock the driver-shared `Assembler` only across the
-            // `JitCode` build (which calls `finalize_liveness` to register
-            // per-marker triples into `all_liveness`).  RPython does not
-            // hold any assembler lock during tracing — `make_jitcodes()`
-            // finishes before the metainterp starts (`pyjitpl.py:2255
-            // finish_setup`).  Releasing before `trace_jitcode_observer`
-            // avoids a deadlock if a recursive portal/residual callback
-            // re-enters this trace path on the same driver thread.
-            let __jitcode_opt = {
-                let mut __asm_guard = __shared_asm
-                    .lock()
-                    .expect("shared_asm poisoned in __trace_* JitCode build");
-                // RPython `pyjitpl.py:2255-2264` builds all jitcodes before
-                // `finish_setup` snapshots `metainterp_sd.liveness_info`.
-                // Runtime trace-time factory calls may rebuild/dedup, but
-                // must not append new liveness entries past that snapshot.
-                let __liveness_len_before = __asm_guard.all_liveness().len();
-                let __jitcode_opt = #jitcode_fn_name(&mut *__asm_guard, program, __jit_pc, __op);
-                assert_eq!(
-                    __asm_guard.all_liveness().len(),
-                    __liveness_len_before,
-                    "__trace_* JitCode build grew shared_asm.all_liveness past \
-                     staticdata.liveness_info snapshot — pre-build every reachable \
-                     (pc, op) JitCode and call JitDriver::sync_liveness_info_from_shared_asm() \
-                     before tracing starts"
-                );
-                __jitcode_opt
-            };
-            let Some(__jitcode) = __jitcode_opt else {
-                if majit_metainterp::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] no jitcode for pc={} op={}",
-                        pc,
-                        __op
+            // Slice 2.2: prefer the dispatch JitCode singleton registered by
+            // `JitDriver::register_dispatch_jitcode` (RPython interp_jit.py:82-94
+            // dispatch() invokes the dispatch JitCode once per outer loop
+            // iteration). Fall back to the per-(pc, op) legacy factory during
+            // the Slice 2-4 transition; Slice 5 removes the fallback.
+            let __using_dispatch_jitcode = __dispatch_jitcode_arg.is_some();
+            let __jitcode: majit_metainterp::JitCode = if let Some(__dispatch_arc) = __dispatch_jitcode_arg {
+                (**__dispatch_arc).clone()
+            } else {
+                let __op = program.get_op(pc);
+                // The lowered JitCode must see the same local state as the
+                // interpreter's `match opcode { ... }` body: the opcode has
+                // already been fetched and `pc` has already advanced past it.
+                // RPython tracing observes the post-fetch bytecode index when
+                // recording immediate operands, so pass `pc + 1` here instead
+                // of the opcode's address.
+                let __jit_pc = pc + 1;
+                // Lock the driver-shared `Assembler` only across the
+                // `JitCode` build (which calls `finalize_liveness` to register
+                // per-marker triples into `all_liveness`).  RPython does not
+                // hold any assembler lock during tracing — `make_jitcodes()`
+                // finishes before the metainterp starts (`pyjitpl.py:2255
+                // finish_setup`).  Releasing before `trace_jitcode_observer`
+                // avoids a deadlock if a recursive portal/residual callback
+                // re-enters this trace path on the same driver thread.
+                let __jitcode_opt = {
+                    let mut __asm_guard = __shared_asm
+                        .lock()
+                        .expect("shared_asm poisoned in __trace_* JitCode build");
+                    // RPython `pyjitpl.py:2255-2264` builds all jitcodes before
+                    // `finish_setup` snapshots `metainterp_sd.liveness_info`.
+                    // Runtime trace-time factory calls may rebuild/dedup, but
+                    // must not append new liveness entries past that snapshot.
+                    let __liveness_len_before = __asm_guard.all_liveness().len();
+                    let __jitcode_opt = #jitcode_fn_name(&mut *__asm_guard, program, __jit_pc, __op);
+                    assert_eq!(
+                        __asm_guard.all_liveness().len(),
+                        __liveness_len_before,
+                        "__trace_* JitCode build grew shared_asm.all_liveness past \
+                         staticdata.liveness_info snapshot — pre-build every reachable \
+                         (pc, op) JitCode and call JitDriver::sync_liveness_info_from_shared_asm() \
+                         before tracing starts"
                     );
+                    __jitcode_opt
+                };
+                match __jitcode_opt {
+                    Some(jc) => jc,
+                    None => {
+                        if majit_metainterp::majit_log_enabled() {
+                            eprintln!(
+                                "[jit] no jitcode for pc={} op={}",
+                                pc,
+                                __op
+                            );
+                        }
+                        return TraceAction::AbortPermanent;
+                    }
                 }
-                return TraceAction::AbortPermanent;
             };
 
             // Observer mode: the outer Rust mainloop runs the same opcode
@@ -164,12 +224,50 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             // second time. The IR call op recorded above runs at compiled-
             // trace runtime; the outer/metainterp pair stays single-execution
             // per recording iter.
-            #trace_jitcode_call
+            let mut __jitcode_args: ::std::vec::Vec<(
+                majit_metainterp::JitArgKind,
+                majit_ir::OpRef,
+                i64,
+            )> = ::std::vec::Vec::new();
+            if __using_dispatch_jitcode {
+                let __program_bits = program as *const #env_type as *const () as usize as i64;
+                let __program_box = __ctx.const_ref(__program_bits);
+                __jitcode_args.push((
+                    majit_metainterp::JitArgKind::Ref,
+                    __program_box,
+                    __program_bits,
+                ));
+                let __pc_bits = pc as i64;
+                let __pc_box = __ctx.const_int(__pc_bits);
+                __jitcode_args.push((
+                    majit_metainterp::JitArgKind::Int,
+                    __pc_box,
+                    __pc_bits,
+                ));
+            }
+            #push_virtualizable_argbox
+            let __result = if __jitcode_args.is_empty() {
+                majit_metainterp::trace_jitcode_observer(
+                    __ctx,
+                    __sym,
+                    &__jitcode,
+                    pc,
+                    #label_closure,
+                )
+            } else {
+                majit_metainterp::trace_jitcode_observer_with_args(
+                    __ctx,
+                    __sym,
+                    &__jitcode,
+                    pc,
+                    #label_closure,
+                    &__jitcode_args,
+                )
+            };
             if majit_metainterp::majit_log_enabled() && !matches!(__result, TraceAction::Continue) {
                 eprintln!(
-                    "[jit] trace action at pc={} op={} -> {:?}",
+                    "[jit] trace action at pc={} -> {:?}",
                     pc,
-                    __op,
                     __result
                 );
             }
@@ -190,6 +288,43 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             }
         }
 
+        /// Slice 1: dispatch JitCode singleton builder.
+        ///
+        /// Builds the entire dispatch loop body (jit_merge_point + pre-dispatch
+        /// ops + opcode fetch + dispatch chain + per-arm INLINE_CALL + loop
+        /// close) as a single JitCode. Slice 2 wires this into `__trace_*`;
+        /// Slice 3 registers it via `JitDriver::register_dispatch_jitcode` at
+        /// install time.
+        ///
+        /// Returns `Option<JitCode>`: `Some(jc)` when `lower_dispatch_body`
+        /// succeeded at proc-macro time, `None` when the body shape was
+        /// rejected (e.g. unrecognised inner control flow).  PyPy's
+        /// `make_jitcodes()` / `pyjitpl.py:2255 finish_setup()` only
+        /// install completed jitcodes — there is no "empty body installed
+        /// as success" path.  The install pipeline at
+        /// `codegen_state.rs:840` `if let Some(jc) = ... { register }`
+        /// matches that lifecycle by skipping `register_dispatch_jitcode`
+        /// when this returns `None`.
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        #[doc(hidden)]
+        pub fn #dispatch_jitcode_fn_name(
+            __asm: &mut majit_metainterp::Assembler,
+            // jtransform.py:1704 portal_jd.index threaded as runtime param.
+            __jdindex: i64,
+        ) -> Option<majit_metainterp::JitCode> {
+            if !#dispatch_lower_ok {
+                // `lower_dispatch_body` rejected the body at proc-macro
+                // time; surface as None so the install pipeline skips
+                // `register_dispatch_jitcode` per PyPy parity.
+                return None;
+            }
+            let mut __builder = majit_metainterp::JitCodeBuilder::new();
+            let _live_offset_patch = __builder.live_placeholder();
+            #dispatch_body
+            __builder.finalize_liveness(__asm);
+            Some(__builder.finish())
+        }
+
         /// Pre-register every lowered arm's per-marker liveness triple
         /// into the driver-shared `Assembler`, mirroring RPython
         /// `pyjitpl.py:2255 finish_setup`'s "all `-live-` entries land
@@ -200,7 +335,33 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         /// `metainterp_sd.liveness_info`.
         #[allow(non_snake_case, unused_variables, unused_mut)]
         fn #prebuild_fn_name(__asm: &mut majit_metainterp::Assembler) {
+            #dispatch_prebuild
             #(#liveness_prebuilds)*
+        }
+
+        /// Slice (audit Issue #5) — declare the dispatch JitCode's
+        /// `(name, GreenType)` green schema and `(name, IR Type)` red
+        /// schema on the JitDriver so `JitDriverStaticData::
+        /// green_args_spec` reports STR/UNICODE subtypes and
+        /// `green_kind_counts` / `red_kind_counts` reflect the real
+        /// payload of `BC_JIT_MERGE_POINT`.  RPython
+        /// `warmspot.py:663-665` derives the same `_green_args_spec`
+        /// from the `JIT_ENTER_FUNCTYPE` signature; pyre derives it
+        /// from the `lowerer.bindings` BindingKind plus
+        /// `green_type_tags` (the `: str` / `: unicode` declarations)
+        /// at `lower_dispatch_body` time.  No-op when the dispatch
+        /// body failed to lower (the schema vectors are then empty).
+        #[allow(non_snake_case, unused_variables, unused_mut)]
+        fn #declare_schema_fn_name<S: majit_metainterp::JitState>(
+            __driver: &mut majit_metainterp::JitDriver<S>,
+        ) {
+            let __greens: ::std::vec::Vec<(&str, majit_ir::GreenType)> = vec![
+                #( (#dispatch_green_schema_names, #dispatch_green_schema_types) ),*
+            ];
+            let __reds: ::std::vec::Vec<(&str, majit_ir::Type)> = vec![
+                #( (#dispatch_red_schema_names, #dispatch_red_schema_types) ),*
+            ];
+            __driver.declare_schema_typed(__greens, __reds);
         }
 
         #trace_fn_body
@@ -299,7 +460,7 @@ fn generate_jitcode_arm(
     (quote! { #pat => { #build }, }, liveness_prebuild)
 }
 
-fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch> {
+pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch> {
     for stmt in &block.stmts {
         if let Some(m) = find_match_in_stmt(stmt) {
             return Some(m);
@@ -454,7 +615,7 @@ fn expr_inner_match_block<'e>(expr: &'e Expr, target_match: &ExprMatch) -> Optio
 }
 
 /// `true` iff `stmt`'s expression subtree contains `target_match`.
-fn stmt_contains_match(stmt: &Stmt, target_match: &ExprMatch) -> bool {
+pub(crate) fn stmt_contains_match(stmt: &Stmt, target_match: &ExprMatch) -> bool {
     match stmt {
         Stmt::Expr(expr, _) => expr_contains_match(expr, target_match),
         Stmt::Local(local) => local
@@ -466,7 +627,7 @@ fn stmt_contains_match(stmt: &Stmt, target_match: &ExprMatch) -> bool {
     }
 }
 
-fn block_contains_match(block: &Block, target_match: &ExprMatch) -> bool {
+pub(crate) fn block_contains_match(block: &Block, target_match: &ExprMatch) -> bool {
     block
         .stmts
         .iter()

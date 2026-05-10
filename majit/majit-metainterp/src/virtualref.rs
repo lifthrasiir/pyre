@@ -176,6 +176,14 @@ impl Default for VirtualRefInfo {
 }
 
 impl crate::resume::VRefInfo for VirtualRefInfo {
+    /// virtualref.py:122-129 continue_tracing(gcref, real_object)
+    ///
+    /// Mirrors RPython:
+    ///   if not self.is_virtual_ref(gcref): return
+    ///   assert real_object
+    ///   vref = ...; assert vref.virtual_token != TOKEN_TRACING_RESCALL
+    ///   vref.virtual_token = TOKEN_NONE
+    ///   vref.forced = real_object
     fn continue_tracing(&self, vref: i64, virtual_ref: i64) {
         // `virtualref.py:122-129 continue_tracing(gcref, real_object)`
         // — delegate to the inherent helper which carries the

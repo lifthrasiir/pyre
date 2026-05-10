@@ -55,7 +55,136 @@ use crate::virtualizable::VirtualizableInfo;
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
+use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind, green_type_to_ir};
+
+/// Bucket the variables of a given kind by IR `Type`, returning
+/// `(num_int, num_ref, num_float)`. `Type::Void` is skipped per
+/// upstream — `bhimpl_jit_merge_point` only encodes `i / R / F` slots.
+fn kind_counts(vars: &[JitDriverVar], kind: VarKind) -> (usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize);
+    for v in vars.iter().filter(|v| v.kind == kind) {
+        match v.tp {
+            Type::Int => counts.0 += 1,
+            Type::Ref => counts.1 += 1,
+            Type::Float => counts.2 += 1,
+            Type::Void => {}
+        }
+    }
+    counts
+}
+
+/// Slice (audit Issue #5) — production dispatch JitCode payload
+/// schema cross-check.  Called from `register_dispatch_jitcode` just
+/// before the JitCode is stashed as the driver's singleton.
+///
+/// Walks the body bytes from offset 0 looking for the first
+/// `BC_JIT_MERGE_POINT` / `BC_JIT_MERGE_POINT_C` byte; when found,
+/// reads the 1-byte jdindex + six [I, R, F, I, R, F] length bytes
+/// and compares them to `green_kind_counts` / `red_kind_counts`.
+///
+/// The walk is structural (peek for the merge-point byte) rather
+/// than a full bytecode iterator — false positives are tolerated
+/// because pyre's lowerer always emits the merge-point near the
+/// start of the dispatch body, and the count check would only
+/// false-pass when the body coincidentally starts with a
+/// well-formed-looking 7-byte sequence at the same offset.  The
+/// check fires in release builds — `warmspot.py:660-666
+/// make_args_specification` runs at translation time and asserts
+/// the marker op's args match the driver schema; the runtime
+/// version stays active in production for the same reason
+/// (codegen / `declare_schema` drift would otherwise silently
+/// install a misshaped dispatch JitCode).
+///
+/// Translation-time assertion surface — `pyjitpl.py:1530
+/// verify_green_args` + `warmspot.py:660-666 make_args_specification`
+/// fail loudly when the dispatch JitCode's `BC_JIT_MERGE_POINT`
+/// payload disagrees with the driver schema.  Pyre keeps the same
+/// fail-loud contract here: every malformed shape (no descriptor,
+/// missing merge offset, truncated payload) is a codegen /
+/// `declare_schema` lifecycle bug, not a runtime data condition.
+fn validate_dispatch_jitcode_payload<S>(driver: &JitDriver<S>, jc: &crate::jitcode::JitCode)
+where
+    S: crate::JitState,
+{
+    let descriptor = driver.descriptor.as_ref().unwrap_or_else(|| {
+        panic!(
+            "register_dispatch_jitcode: JitDriver has no descriptor — \
+             `declare_schema` / `declare_schema_typed` must run before \
+             registration (warmspot.py:660-666 make_args_specification \
+             parity)",
+        )
+    });
+    use majit_translate::jit_codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
+    let body = &jc.code;
+    // Read the opcode byte directly from the captured offset
+    // (`JitCodeBuilder::jit_merge_point` records `self.code.len()`
+    // immediately before pushing the opcode).  No byte-stream scan —
+    // mirrors RPython `blackhole.py:107-156` argcode-based decode
+    // (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
+    // cannot trigger a false-positive payload validation).  Pre-Merge-
+    // Point body-local lets and other lowerer-emitted prefix opcodes
+    // (`bind_pre_merge_point_stmts` at `jitcode_lower.rs:8987`) are
+    // therefore irrelevant to the validator's correctness.
+    let merge_offset = jc.exec.jit_merge_point_offset.unwrap_or_else(|| {
+        panic!(
+            "register_dispatch_jitcode: dispatch JitCode `{}` has no \
+             jit_merge_point_offset — `JitCodeBuilder::jit_merge_point` \
+             must have run during lowering (jitcode_lower.rs dispatch \
+             body emission invariant)",
+            jc.name(),
+        )
+    });
+    let opcode = body
+        .get(merge_offset)
+        .copied()
+        .expect("jit_merge_point_offset out of bounds — JitCodeBuilder invariant violated");
+    assert!(
+        opcode == BC_JIT_MERGE_POINT || opcode == BC_JIT_MERGE_POINT_C,
+        "jit_merge_point_offset {merge_offset} does not point at \
+         BC_JIT_MERGE_POINT(_C); JitCodeBuilder::jit_merge_point invariant",
+    );
+    let payload_start = merge_offset + 1;
+    let body_len = body.len();
+    assert!(
+        payload_start + 7 <= body_len,
+        "register_dispatch_jitcode: dispatch JitCode `{}` body has \
+         {body_len} bytes but BC_JIT_MERGE_POINT(_C) at offset \
+         {merge_offset} requires at least 8 (jdindex + 6 list-len bytes). \
+         pyjitpl.py:1530 verify_green_args parity surface — payload \
+         truncation indicates a codegen lifecycle bug.",
+        jc.name(),
+    );
+    let _jdindex = body[payload_start];
+    let mut q = payload_start + 1;
+    let (gi, gr, gf) = descriptor.green_kind_counts();
+    let (ri, rr, rf) = descriptor.red_kind_counts();
+    let expected = [gi, gr, gf, ri, rr, rf];
+    for (slot, expect) in expected.iter().enumerate() {
+        assert!(
+            q < body_len,
+            "register_dispatch_jitcode: dispatch JitCode `{}` body \
+             truncated at slot {slot} — header byte beyond body length \
+             {body_len} (codegen / declare_schema mismatch).",
+            jc.name(),
+        );
+        let count = body[q] as usize;
+        assert_eq!(
+            count, *expect,
+            "register_dispatch_jitcode: BC_JIT_MERGE_POINT payload \
+             slot {slot} count {count} disagrees with driver schema {expect} \
+             (greens=({gi}, {gr}, {gf}) reds=({ri}, {rr}, {rf})). \
+             Codegen / declare_schema mismatch.",
+        );
+        q += 1 + count;
+        assert!(
+            q <= body_len,
+            "register_dispatch_jitcode: dispatch JitCode `{}` body \
+             truncated reading slot {slot} register bytes — payload \
+             tail at offset {q} exceeds body length {body_len}.",
+            jc.name(),
+        );
+    }
+}
 
 /// Descriptor for a JitDriver's variable layout.
 ///
@@ -198,6 +327,33 @@ impl JitDriverStaticData {
         Self::with_virtualizable(greens, reds, None)
     }
 
+    /// Create a descriptor where greens carry a full [`GreenType`]
+    /// (preserving STR/UNICODE subtypes) instead of the IR-collapsed
+    /// `Type::Ref`.  Mirrors `warmspot.py:663 _green_args_spec`.
+    pub fn with_green_types(greens: Vec<(&str, GreenType)>, reds: Vec<(&str, Type)>) -> Self {
+        Self::with_green_types_and_virtualizable(greens, reds, None)
+    }
+
+    /// [`Self::with_green_types`] + optional virtualizable name.
+    pub fn with_green_types_and_virtualizable(
+        greens: Vec<(&str, GreenType)>,
+        reds: Vec<(&str, Type)>,
+        virtualizable: Option<&str>,
+    ) -> Self {
+        let mut vars = Vec::new();
+        for (name, gt) in greens {
+            vars.push(JitDriverVar::green_with_type(
+                name,
+                green_type_to_ir(gt),
+                gt,
+            ));
+        }
+        for (name, tp) in reds {
+            vars.push(JitDriverVar::red(name, tp));
+        }
+        Self::finish_with_vars(vars, virtualizable)
+    }
+
     /// Create a descriptor with optional virtualizable metadata.
     pub fn with_virtualizable(
         greens: Vec<(&str, Type)>,
@@ -211,6 +367,10 @@ impl JitDriverStaticData {
         for (name, tp) in reds {
             vars.push(JitDriverVar::red(name, tp));
         }
+        Self::finish_with_vars(vars, virtualizable)
+    }
+
+    fn finish_with_vars(vars: Vec<JitDriverVar>, virtualizable: Option<&str>) -> Self {
         // warmspot.py:664 — `red_args_types` carries one history-kind
         // char per red arg in declaration order. Built from the red-only
         // slice of `vars` so adding a green/red split helper later (S2)
@@ -312,6 +472,25 @@ impl JitDriverStaticData {
         self.vars.iter().filter(|v| v.kind == VarKind::Red).count()
     }
 
+    /// Per-kind counts of green variables, in `(Int, Ref, Float)` order.
+    ///
+    /// Mirrors the partition `bhimpl_jit_merge_point` payload encodes via
+    /// `@arguments("self", "i", "I", "R", "F", ...)` (`blackhole.py:1066`):
+    /// the greens are split by IR kind so the typed register lists in the
+    /// `BC_JIT_MERGE_POINT` body line up with the JitDriver schema. Slice
+    /// 91.5 uses these counts to validate the runtime payload shape.
+    pub fn green_kind_counts(&self) -> (usize, usize, usize) {
+        kind_counts(&self.vars, VarKind::Green)
+    }
+
+    /// Per-kind counts of red variables, in `(Int, Ref, Float)` order.
+    ///
+    /// Companion to [`green_kind_counts`]; together they reproduce the six
+    /// `[I, R, F, I, R, F]` length bytes of `BC_JIT_MERGE_POINT`.
+    pub fn red_kind_counts(&self) -> (usize, usize, usize) {
+        kind_counts(&self.vars, VarKind::Red)
+    }
+
     /// jitdriver.py:12 `self.num_green_args ... rpython.jit.metainterp.warmspot`.
     ///
     /// Upstream-canonical name; alias of [`Self::num_greens`]. Matches
@@ -339,19 +518,16 @@ impl JitDriverStaticData {
     /// `make_jitcell_subclass` (`warmstate.py:557-654`) to dispatch
     /// `equal_whatever` / `hash_whatever`.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `JitDriverVar.tp` carries only
-    /// the IR-level [`Type`] (i/r/f/v) without the upstream STR/UNICODE
-    /// distinction (`GreenType::Str`, `GreenType::Unicode`). The
-    /// resulting spec collapses string / unicode greens to plain
-    /// `GreenType::Ref` and falls back to pointer identity equality.
-    /// Drivers that need typed string greens must override via the
-    /// `EntryPoint::schema` registration path (`register_entry_point_typed`
-    /// at jitdriver.rs:2047) until the IR carries the subtype natively.
+    /// `JitDriverVar.green_type` carries the upstream lltype subtype
+    /// (`Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`) when the install path
+    /// supplies it via [`JitDriverStaticData::with_green_types`] /
+    /// [`JitDriver::declare_schema_typed`]; greens declared via the
+    /// canonical [`Type`]-only API fall back to `GreenType::from(tp)`.
     pub fn green_args_spec(&self) -> Vec<GreenType> {
         self.vars
             .iter()
             .filter(|v| v.kind == VarKind::Green)
-            .map(|v| GreenType::from(v.tp))
+            .map(|v| v.green_type.unwrap_or_else(|| GreenType::from(v.tp)))
             .collect()
     }
 
@@ -563,6 +739,15 @@ pub struct JitDriver<S: JitState> {
                 + Send,
         >,
     >,
+    /// Slice 2.1: dispatch JitCode singleton, registered at install time
+    /// by `__JitMeta::install_canonical_liveness` (Slice 3 wires this).
+    /// `__trace_<fn>` invokes this singleton instead of the per-(pc, op)
+    /// factory; the legacy factory stays available during the transition
+    /// (Slice 5 deletes it).
+    ///
+    /// RPython parity: metainterp_sd.jitcodes[driver_idx] global registry
+    /// slot, scoped to the per-#[jit_interp] driver.
+    dispatch_jitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -608,6 +793,7 @@ impl<S: JitState> JitDriver<S> {
             jitcode_factory: None,
             blackhole_allocator: None,
             portal_runner: None,
+            dispatch_jitcode: None,
             shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
                 majit_translate::jit_codewriter::assembler::Assembler::new(),
             )),
@@ -715,6 +901,33 @@ impl<S: JitState> JitDriver<S> {
         self.jitcode_factory = Some(Box::new(factory));
     }
 
+    /// Register the dispatch JitCode singleton. Called once at install time
+    /// by the macro-generated `__JitMeta::install_canonical_liveness` (Slice 3
+    /// wires the call site). After registration, `__trace_<fn>` can use this
+    /// singleton instead of the per-(pc, op) factory. The legacy factory
+    /// remains available during the transition; Slice 5 deletes it.
+    ///
+    /// RPython parity: metainterp_sd.jitcodes[driver_idx] global registry
+    /// slot assignment, scoped to the per-#[jit_interp] driver.
+    pub fn register_dispatch_jitcode(&mut self, jitcode: crate::jitcode::JitCode) {
+        // Slice (audit Issue #5) — cross-check the dispatch JitCode
+        // body's `BC_JIT_MERGE_POINT` payload partition against the
+        // declared driver schema (set via `declare_schema` at the
+        // macro-emitted install path).  The check fires only when a
+        // schema is non-empty AND the payload counts disagree, which
+        // indicates a codegen / `make_three_lists` regression.
+        // Production-active — `warmspot.py:660-666
+        // make_args_specification` translation-time assert parity.
+        validate_dispatch_jitcode_payload(self, &jitcode);
+        self.dispatch_jitcode = Some(std::sync::Arc::new(jitcode));
+    }
+
+    /// Access the registered dispatch JitCode. Returns `None` until
+    /// `register_dispatch_jitcode` has been called.
+    pub fn dispatch_jitcode(&self) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        self.dispatch_jitcode.as_ref()
+    }
+
     /// Register a BlackholeAllocator for virtual materialization during
     /// guard failure blackhole resume. Without this, virtual objects
     /// and raw buffers are allocated as null/zero.
@@ -725,20 +938,131 @@ impl<S: JitState> JitDriver<S> {
         self.blackhole_allocator = Some(Box::new(allocator));
     }
 
+    /// Pre-register the per-driver green / red schema with the embedded
+    /// `JitDriverStaticData::vars`.  The macro-emitted install path
+    /// (`#[jit_interp]` codegen) calls this before
+    /// `ensure_descriptor_registered` runs, so
+    /// `green_kind_counts` / `red_kind_counts` reflect the actual schema
+    /// the dispatch JitCode body's `BC_JIT_MERGE_POINT` carries —
+    /// matching `warmspot.py:663-665` `jd._green_args_spec` /
+    /// `red_args_types` derivation from the `JIT_ENTER_FUNCTYPE`.
+    ///
+    /// Idempotent: if `with_descriptor` already populated the
+    /// descriptor (e.g. consumer-side preconfiguration), this is a
+    /// no-op.  Otherwise it replaces the empty stub fallback that
+    /// `ensure_descriptor_registered` would install.
+    pub fn declare_schema(&mut self, greens: Vec<(&str, Type)>, reds: Vec<(&str, Type)>) {
+        if self.descriptor.is_some() {
+            return;
+        }
+        self.descriptor = Some(JitDriverStaticData::new(greens, reds));
+    }
+
+    /// [`Self::declare_schema`] variant whose green list carries the
+    /// upstream lltype subtype directly (`GreenType::Str` /
+    /// `GreenType::Unicode` / canonical `Int`/`Ref`/`Float`/`Void`),
+    /// mirroring `warmspot.py:663 jd._green_args_spec`.  Used by the
+    /// `#[jit_interp]` install path so `JitDriverStaticData::
+    /// green_args_spec` reports STR/UNICODE without falling back to
+    /// `Ref`.  Reds keep IR `Type` (no `equal_whatever` dispatch on
+    /// runtime args).
+    pub fn declare_schema_typed(
+        &mut self,
+        greens: Vec<(&str, GreenType)>,
+        reds: Vec<(&str, Type)>,
+    ) {
+        if self.descriptor.is_some() {
+            return;
+        }
+        self.descriptor = Some(JitDriverStaticData::with_green_types(greens, reds));
+    }
+
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
         let mut driver = Self::new(threshold);
         // warmstate.py:564 `_green_args_spec` carries lltype TYPE per
-        // green arg. `JitDriverVar.tp` is the IR `Type`; convert through
-        // `From<Type>` which maps `Ref` to `GreenType::Ref`. Callers that
-        // need the stricter `STR` / `UNICODE` distinction use
-        // `register_entry_point` with an explicit schema.
-        let greens: Vec<GreenType> = descriptor.greens().iter().map(|v| v.tp.into()).collect();
+        // green arg, including `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
+        // distinct from generic Ptr.  `JitDriverVar.green_type` is the
+        // STR/UNICODE-preserving slot populated by
+        // `JitDriverStaticData::with_green_types` (`warmspot.py:663`
+        // `_green_args_spec` parity).  When the descriptor was built
+        // through that constructor (e.g. `#[jit_interp]` install path
+        // via `declare_schema_typed`), use the per-var subtype directly;
+        // otherwise fall back to `GreenType::from(v.tp)` for the
+        // canonical Int/Ref/Float/Void mapping.
+        let greens: Vec<GreenType> = descriptor
+            .greens()
+            .iter()
+            .map(|v| v.green_type.unwrap_or_else(|| v.tp.into()))
+            .collect();
         driver.descriptor = Some(descriptor);
         driver.entry_points.push(EntryPoint {
             name: "primary".to_string(),
             schema: greens,
         });
         driver
+    }
+
+    /// Registered slot index of this driver's descriptor, populated by
+    /// [`MetaInterpStaticData::register_jitdriver_sd`].  Mirrors the RPython
+    /// attribute `jitdriver_sd.index` (`rpython/jit/codewriter/call.py:46-47`)
+    /// read by `jtransform.py:1704` and `compile_tmp_callback`.  Returns `None`
+    /// before registration runs.
+    pub fn index(&self) -> Option<usize> {
+        self.descriptor.as_ref().and_then(|d| d.index)
+    }
+
+    /// PyPy `call.py:46-47` `for index, jd in enumerate(jitdrivers_sd):
+    /// jd.index = index` parity.  If a consumer constructed this driver
+    /// via [`JitDriver::with_descriptor`] (the descriptor carries
+    /// `greens`/`reds`/`virtualizable` already), reuse THAT descriptor
+    /// when registering — `register_descriptor` was previously called
+    /// with a freshly-built empty `JitDriverStaticData::new(vec![],
+    /// vec![])`, which clobbered the consumer-provided descriptor's
+    /// fields and caused `jitdrivers_sd[idx].num_green_args() == 0` even
+    /// when the dispatch JitCode body's `BC_JIT_MERGE_POINT` carried a
+    /// real `greens` payload (`pyjitpl.py:1530 opimpl_jit_merge_point`
+    /// would then mis-validate the green count).
+    ///
+    /// Idempotent: returns immediately when [`JitDriver::index`] is
+    /// already `Some(_)`.  When the consumer did NOT pre-build a
+    /// descriptor (`self.descriptor` is `None`), falls back to an empty
+    /// stub — pyre-only fail-soft, since PyPy's `jitdrivers_sd` list
+    /// would never contain such an entry.
+    pub fn ensure_descriptor_registered(&mut self) {
+        if self.index().is_some() {
+            return;
+        }
+        let jd = self
+            .descriptor
+            .take()
+            .unwrap_or_else(|| JitDriverStaticData::new(vec![], vec![]));
+        let _ = self.register_descriptor(jd);
+    }
+
+    /// Register `jd` with the embedded `MetaInterpStaticData` and stamp the
+    /// returned index onto `self.descriptor`. Mirrors RPython's
+    /// `CallControl.__init__` (`call.py:46-47`) where `jd.index = idx` is
+    /// stamped right after `metainterp_sd.jitdrivers_sd.append(jd)`.
+    ///
+    /// The macro-emitted `__JitMeta::install_canonical_liveness` invokes
+    /// [`JitDriver::ensure_descriptor_registered`] once per consumer
+    /// startup, before the dispatch JitCode body is built (which bakes
+    /// `jd.index` into `BC_JIT_MERGE_POINT` / `BC_LOOP_HEADER` payloads —
+    /// see `jtransform.py:1704, :1716`).
+    pub fn register_descriptor(&mut self, jd: JitDriverStaticData) -> usize {
+        let crate::pyjitpl::MetaInterp {
+            staticdata,
+            backend,
+            ..
+        } = &mut self.meta;
+        let sd_mut = std::sync::Arc::get_mut(staticdata)
+            .expect("MetaInterpStaticData must be uniquely owned at register_descriptor time");
+        let idx = sd_mut.register_jitdriver_sd(jd, backend);
+        // Mirror onto self.descriptor so JitDriver::index() returns Some(idx)
+        // — A.3.1a's accessor reads through descriptor, not the
+        // staticdata Vec, so the stamped clone must live on the driver too.
+        self.descriptor = Some(sd_mut.jitdrivers_sd[idx].clone());
+        idx
     }
 
     /// Get compiled loop metadata for the given green key.
@@ -1037,8 +1361,9 @@ impl<S: JitState> JitDriver<S> {
 
     /// Tracing hook — call at the top of the dispatch loop.
     ///
-    /// If tracing is active, calls `trace_fn` with the active [`TraceCtx`]
-    /// and symbolic state, then handles the result automatically:
+    /// If tracing is active, calls `trace_fn` with the active [`MetaInterp`]
+    /// (via which the closure can obtain the active [`TraceCtx`]) and
+    /// symbolic state, then handles the result automatically:
     ///
     /// - `CloseLoop` → validates depths, collects jump args, compiles
     /// - `Finish` → compiles a terminal trace ending in `FINISH`
@@ -1049,14 +1374,15 @@ impl<S: JitState> JitDriver<S> {
     /// # Example
     ///
     /// ```ignore
-    /// driver.merge_point(|ctx, sym| {
+    /// driver.merge_point(|meta, sym| {
+    ///     let ctx = meta.trace_ctx().expect("merge_point invariant");
     ///     trace_instruction(ctx, sym, program, pc, &state)
     /// });
     /// ```
     #[inline]
     pub fn merge_point<F>(&mut self, trace_fn: F)
     where
-        F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
+        F: FnOnce(&mut MetaInterp<S::Meta>, &mut S::Sym) -> TraceAction,
     {
         if !self.meta.is_tracing() {
             return;
@@ -1071,16 +1397,9 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        // Phase 1: split-borrow self into meta (for ctx) and sym, run closure
+        // Phase 1: split-borrow self into meta and sym, run closure.
+        // self.meta and self.sym are disjoint fields → standard split-borrow.
         let mut action = {
-            let Some(ctx) = self.meta.trace_ctx() else {
-                if crate::majit_log_enabled() {
-                    eprintln!("[mp] abort:ctx_none");
-                }
-                self.sym = None;
-                self.meta.clear_trace_session();
-                return;
-            };
             let Some(sym) = self.sym.as_mut() else {
                 if crate::majit_log_enabled() {
                     eprintln!("[mp] abort:sym_none2");
@@ -1089,8 +1408,8 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.clear_trace_session();
                 return;
             };
-            trace_fn(ctx, sym)
-        }; // ctx and sym references dropped here
+            trace_fn(&mut self.meta, sym)
+        }; // borrows dropped here
 
         // pyjitpl.py:1618 force_finish_trace segmenting check.
         //
@@ -1680,7 +1999,7 @@ impl<S: JitState> JitDriver<S> {
         trace_fn: F,
     ) -> Option<DetailedDriverRunOutcome>
     where
-        F: FnOnce(&mut TraceCtx, &mut S::Sym) -> TraceAction,
+        F: FnOnce(&mut MetaInterp<S::Meta>, &mut S::Sym) -> TraceAction,
     {
         // RPython JC_TRACING parity: in RPython, MetaInterp._interpret()
         // runs all bytecodes within the same portal call. In pyre,
@@ -1814,12 +2133,12 @@ impl<S: JitState> JitDriver<S> {
             let trace_id = result.trace_id;
             let exit_layout = result.exit_layout.clone();
             let raw_values = result.values.clone();
-            let descr_addr = result.descr_addr;
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             drop(result);
 
             // must_compile tick for bridge threshold counting.
             if crate::majit_log_enabled() {
+                let descr_addr = std::sync::Arc::as_ptr(&descr_arc) as *const () as usize;
                 eprintln!(
                     "[jit] handle_fail: fail_index={} trace_id={} descr_addr={:#x} values={}",
                     fail_index,
@@ -2838,7 +3157,6 @@ impl<S: JitState> JitDriver<S> {
         let exit_layout = result.exit_layout.clone();
         let typed_values = result.typed_values.clone();
         let raw_values = result.values.clone();
-        let descr_addr = result.descr_addr;
         drop(result);
 
         // memmgr.py:58-61: keep_loop_alive(loop_token)
@@ -2883,7 +3201,6 @@ impl<S: JitState> JitDriver<S> {
             descr_arc,
             should_bridge,
             owning_key,
-            descr_addr,
             raw_values,
             exit_layout,
         }
@@ -3384,9 +3701,24 @@ impl<S: JitState> JitDriver<S> {
         let meta_ptr = &self.meta as *const _ as *const ();
         if let Some(ref mut ctx) = self.meta.tracing {
             ctx.header_pc = resume_pc;
+            // pyjitpl.py:2978 `if not self.partial_trace:` — bridge
+            // entry sets the explicit flag so close-loop consumers
+            // can apply bridge-only behavior without overloading
+            // `has_compiled_targets_fn` presence.
+            ctx.is_bridge_trace = true;
             ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
                 let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
                 meta.has_compiled_targets(gk)
+            }));
+            // pyjitpl.py:1551 first-iteration auto loop-header
+            // `if self.metainterp.portal_call_depth: return` parity —
+            // sample the live counter through the same self.meta
+            // pointer.  Same lifetime invariant as
+            // `has_compiled_targets_fn` (bridge tracing runs
+            // synchronously within `start_bridge_tracing`'s scope).
+            ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+                let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
+                meta.portal_call_depth
             }));
         }
         // resume.py:1042 parity: map frame locals to bridge InputArg OpRefs
@@ -3478,6 +3810,12 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// The caller provides:
     /// - `green_values`: green key as i64 slice (e.g., `[target_pc, selected]`)
+    /// - `green_types`: per-position [`GreenType`] schema for the same
+    ///   greens.  Required so the typed
+    ///   `equal_whatever`/`hash_whatever` machinery (`warmstate.py:575
+    ///   _green_args_spec`) is consistent with the
+    ///   `#[jit_interp]`-emitted call sites that build typed keys via
+    ///   `GreenKey::with_types`.
     /// - `target_pc`: the back-edge target PC
     /// - `pre_run`: callback to execute before compiled code (e.g., flush I/O)
     /// - `on_guard_failure`: callback to restore interpreter state from guard
@@ -3492,6 +3830,7 @@ impl<S: JitState> JitDriver<S> {
     pub fn run_back_edge_generic(
         &mut self,
         green_values: &[i64],
+        green_types: &[majit_ir::GreenType],
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -3507,7 +3846,7 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        let key_hash = crate::green_key_hash(green_values);
+        let key_hash = crate::green_key_hash_typed(green_values, green_types);
 
         if !self.has_compiled_loop(key_hash) {
             // warmstate.py:446,465: cold fast path — check would_fire without
@@ -3518,7 +3857,7 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.warm_state_mut().counter_tick(key_hash);
                 return None;
             }
-            let green_key = GreenKey::new(green_values.to_vec());
+            let green_key = GreenKey::with_types(green_values.to_vec(), green_types.to_vec());
             // Preserve resume_pc from back_edge_structured (guard
             // failure returns the guard's pc, not the loop header).
             return self.back_edge_structured(green_key, target_pc, state, env, pre_run);
@@ -3999,7 +4338,7 @@ mod tests {
                     &mut state,
                     &(),
                     || {},
-                    |_ctx, _sym| { TraceAction::Continue }
+                    |_meta, _sym| { TraceAction::Continue }
                 )
                 .is_none()
         );
@@ -4676,13 +5015,16 @@ mod tests {
         let mut asm = Assembler::new();
         let mut scratch = Vec::<u8>::new();
         asm._encode_liveness(&live_i, &live_r, &live_f, &mut scratch);
-        asm.register_insn("live/", crate::jitcode::BC_LIVE);
-        asm.register_insn("catch_exception/L", crate::jitcode::BC_CATCH_EXCEPTION);
-        asm.register_insn("rvmprof_code/ii", crate::jitcode::BC_RVMPROF_CODE);
-        asm.register_insn("int_return/i", crate::jitcode::BC_INT_RETURN);
-        asm.register_insn("ref_return/r", crate::jitcode::BC_REF_RETURN);
-        asm.register_insn("float_return/f", crate::jitcode::BC_FLOAT_RETURN);
-        asm.register_insn("void_return/", crate::jitcode::BC_VOID_RETURN);
+        asm.register_insn("live/", crate::jitcode::insns::BC_LIVE);
+        asm.register_insn(
+            "catch_exception/L",
+            crate::jitcode::insns::BC_CATCH_EXCEPTION,
+        );
+        asm.register_insn("rvmprof_code/ii", crate::jitcode::insns::BC_RVMPROF_CODE);
+        asm.register_insn("int_return/i", crate::jitcode::insns::BC_INT_RETURN);
+        asm.register_insn("ref_return/r", crate::jitcode::insns::BC_REF_RETURN);
+        asm.register_insn("float_return/f", crate::jitcode::insns::BC_FLOAT_RETURN);
+        asm.register_insn("void_return/", crate::jitcode::insns::BC_VOID_RETURN);
         let expected = asm.all_liveness().to_vec();
 
         let mut driver = JitDriver::<TypedRestoreState>::new(0);
@@ -4695,7 +5037,7 @@ mod tests {
         // populates `asm.insns` before `finish_setup(codewriter)`.
         assert_eq!(
             driver.meta.staticdata.op_live,
-            crate::jitcode::BC_LIVE as i32,
+            crate::jitcode::insns::BC_LIVE as i32,
         );
     }
 
@@ -4711,6 +5053,37 @@ mod tests {
         let spec = sd.green_args_spec();
         assert_eq!(spec.len(), sd.num_green_args());
         assert_eq!(spec, vec![GreenType::Int, GreenType::Ref]);
+    }
+
+    /// Slice 91.1 — per-kind partition of greens/reds aligning with
+    /// `bhimpl_jit_merge_point`'s `[I, R, F, I, R, F]` payload shape.
+    #[test]
+    fn green_red_kind_counts_partition_vars_by_ir_type() {
+        let sd = JitDriverStaticData::new(
+            vec![
+                ("g_int_a", Type::Int),
+                ("g_ref_a", Type::Ref),
+                ("g_int_b", Type::Int),
+            ],
+            vec![
+                ("r_float_a", Type::Float),
+                ("r_int_a", Type::Int),
+                ("r_float_b", Type::Float),
+                ("r_ref_a", Type::Ref),
+            ],
+        );
+        assert_eq!(sd.green_kind_counts(), (2, 1, 0));
+        assert_eq!(sd.red_kind_counts(), (1, 1, 2));
+    }
+
+    #[test]
+    fn green_red_kind_counts_skip_void_slots() {
+        let sd = JitDriverStaticData::new(
+            vec![("g_void", Type::Void), ("g_int", Type::Int)],
+            vec![("r_void", Type::Void), ("r_ref", Type::Ref)],
+        );
+        assert_eq!(sd.green_kind_counts(), (1, 0, 0));
+        assert_eq!(sd.red_kind_counts(), (0, 1, 0));
     }
 
     /// `warmstate.py:535-553` `make_unwrap_greenkey().unwrap_greenkey(greenkey)`
@@ -4777,5 +5150,23 @@ mod tests {
         cell.comparekey = Some(key_a);
         assert!(cell.comparekey_matches(&key_b));
         assert!(!cell.comparekey_matches(&key_c));
+    }
+
+    #[test]
+    fn jit_driver_index_returns_descriptor_index() {
+        // `JitDriver::index()` must forward `descriptor.index`; returns None
+        // before registration stamps it.
+        let mut sd = JitDriverStaticData::new(vec![], vec![]);
+        sd.index = Some(3);
+        let driver = JitDriver::<TypedRestoreState>::with_descriptor(1, sd);
+        assert_eq!(driver.index(), Some(3));
+    }
+
+    #[test]
+    fn jit_driver_index_returns_none_without_descriptor() {
+        // A driver constructed without a descriptor (threshold-only) must
+        // return None from index().
+        let driver = JitDriver::<TypedRestoreState>::new(1);
+        assert_eq!(driver.index(), None);
     }
 }

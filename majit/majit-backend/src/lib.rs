@@ -1072,27 +1072,45 @@ pub struct JitCellToken {
     /// covered by the existing `unsafe impl Sync for JitCellToken`
     /// at line 1130 — single-threaded JIT scheduler invariant.
     pub generation: Cell<i64>,
-    /// `history.py:435` `JitCellToken.retraced_count = 0`.
-    /// Incremented at `unroll.py` retrace boundaries (compile_retrace
-    /// path) when a previously compiled loop is re-traced.  RPython
-    /// packs `FORCE_BRIDGE_SEGMENTING` (history.py:431) into bit 0
-    /// of this field; the count itself is stored shifted left by one,
-    /// accessed via `get_retraced_count` / `set_retraced_count`
-    /// (history.py:464/467).  Interior mutability via `Cell<u32>`
-    /// mirrors the RPython attribute write through `&JitCellToken`;
-    /// same `unsafe impl Sync` covers it as `generation`.  Callers
-    /// must use the accessors (not `.get()` / `.set()` directly) to
-    /// keep the bit-packing invariant.
+    /// `history.py:431-435 JitCellToken.retraced_count` parity slot.
+    ///
+    /// RPython packs two pieces of state into this u-int:
+    ///   * bit 0 = `FORCE_BRIDGE_SEGMENTING` flag.
+    ///     `compile.py:728-730 _trace_and_compile_from_bridge` checks
+    ///     `loop_token.retraced_count & FORCE_BRIDGE_SEGMENTING` to
+    ///     decide whether the next bridge from this loop should
+    ///     segment trace at the guard.  Set at `pyjitpl.py:2833`.
+    ///   * bits 1+ = retrace count (`history.py:464-468
+    ///     get_retraced_count() = retraced_count >> 1` /
+    ///     `set_retraced_count(value) = (value << 1) | (current & 1)`),
+    ///     compared by `unroll.py:264-272` against `retrace_limit`
+    ///     to disable repeated retracing of the same loop.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre currently splits these across
+    /// two existing locations — `CompiledTrace.retraced_count` (the
+    /// retrace count) and `BaseJitCell.flags & FORCE_FINISH` (the
+    /// segmenting bit, keyed on green-key hash via
+    /// `WarmEnterState::{mark,take}_force_finish_tracing`).  This
+    /// field carries the canonical RPython packed-bit shape so that
+    /// future site-by-site convergence (Tasks #137 / #235 series)
+    /// can migrate one reader at a time onto the token-resident
+    /// surface without breaking the existing flow.  Interior
+    /// mutability via `Cell<u32>` mirrors RPython's attribute
+    /// writes through `&JitCellToken`; the same `unsafe impl Sync`
+    /// covers it as `generation`.  Callers must use the accessors
+    /// (not `.get()` / `.set()` directly) to keep the bit-packing
+    /// invariant.
     pub retraced_count: Cell<u32>,
 }
 
 impl JitCellToken {
-    /// `history.py:431` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed into
-    /// `retraced_count`.  Set at `pyjitpl.py:2833` (pyre:
-    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge trace
-    /// aborts without an inlinable function; read at `compile.py:729`
-    /// (pyre: `MetaInterp::start_retrace_from_guard`) to decide whether
-    /// the next bridge from this loop should `force_finish_trace`.
+    /// `history.py:431` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
+    /// into `retraced_count`.  Set at `pyjitpl.py:2833` (pyre:
+    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge
+    /// trace aborts without an inlinable function; read at
+    /// `compile.py:729` (pyre: `MetaInterp::start_retrace_from_guard`)
+    /// to decide whether the next bridge from this loop should
+    /// `force_finish_trace`.
     pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
 
     /// `history.py:464` `def get_retraced_count(self): return
@@ -1110,9 +1128,6 @@ impl JitCellToken {
         let flag = self.retraced_count.get() & Self::FORCE_BRIDGE_SEGMENTING;
         self.retraced_count.set((value << 1) | flag);
     }
-}
-
-impl JitCellToken {
     pub fn new(number: u64) -> Self {
         JitCellToken {
             number,
@@ -1133,7 +1148,7 @@ impl JitCellToken {
             _ll_function_addr: 0,
             // memmgr.py:38 default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
-            // history.py:435 `retraced_count = 0`.
+            // history.py:435 `retraced_count = 0` (class attribute default).
             retraced_count: Cell::new(0),
         }
     }
@@ -1987,14 +2002,61 @@ pub trait Backend: Send {
     }
 
     // ── model.py:209-215, 247-253 array operations ──
-    /// model.py:209 bh_getarrayitem_gc_i(array, index, arraydescr)
+    /// `llmodel.py:591 bh_getarrayitem_gc_i`: typed array load with sign
+    /// extension.
+    ///
+    /// `unpack_arraydescr_size(arraydescr)` returns `(ofs, size, sign)`;
+    /// the `BhDescr::Array` shape carries the equivalent triple as
+    /// `(base_size, itemsize, is_item_signed)`.  The default impl mirrors
+    /// `read_int_at_mem(gcref, ofs + index * size, size, sign)` (`llmodel.py:592`)
+    /// — itemsize 1/2/4/8 with explicit sign dispatch — so any backend that
+    /// receives a typed-array `BhDescr::Array` (cranelift, dynasm, wasm) gets
+    /// the correct signed/unsigned read without a per-backend override.
+    /// Backends that route GC-array reads through their own runtime (e.g.
+    /// llgraph's RPython-typed dictionary) override; pyre's raw-memory
+    /// backends share this default.
     fn bh_getarrayitem_gc_i(
         &self,
-        _array_ptr: i64,
-        _index: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        use majit_translate::jitcode::BhDescr;
+        let (base_size, itemsize, is_signed) = match arraydescr {
+            BhDescr::Array {
+                base_size,
+                itemsize,
+                is_item_signed,
+                ..
+            } => (*base_size, *itemsize, *is_item_signed),
+            other => panic!(
+                "bh_getarrayitem_gc_i: expected BhDescr::Array, got {:?}",
+                other,
+            ),
+        };
+        let item_addr = (array_ptr as usize)
+            .wrapping_add(base_size)
+            .wrapping_add((index as usize).wrapping_mul(itemsize));
+        // SAFETY: `array_ptr` is a GC-managed array pointer threaded through
+        // from the trace recorder; `index` is bounded by the outer
+        // interpreter's array-length precondition.  Mirrors `llmodel.py:592
+        // read_int_at_mem` raw pointer read with size + sign discrimination
+        // from the array descriptor.
+        unsafe {
+            match (itemsize, is_signed) {
+                (1, true) => *(item_addr as *const i8) as i64,
+                (1, false) => *(item_addr as *const u8) as i64,
+                (2, true) => *(item_addr as *const i16) as i64,
+                (2, false) => *(item_addr as *const u16) as i64,
+                (4, true) => *(item_addr as *const i32) as i64,
+                (4, false) => *(item_addr as *const u32) as i64,
+                (8, _) => *(item_addr as *const i64),
+                other => panic!(
+                    "bh_getarrayitem_gc_i: unsupported (itemsize, signed) = {:?}",
+                    other,
+                ),
+            }
+        }
     }
     /// model.py:210 bh_getarrayitem_gc_r(array, index, arraydescr)
     fn bh_getarrayitem_gc_r(

@@ -201,12 +201,15 @@ pub const BC_FLOAT_POP: u8 = 112;
 pub const BC_INT_ADD: u8 = 113;
 pub const BC_INT_SUB: u8 = 114;
 pub const BC_INT_MUL: u8 = 115;
-// 116 / 117 free — RPython `jtransform.py:575-577` rewrites
-// `int_floordiv` / `int_mod` to `direct_call(ll_int_py_*)` before
-// jitcode emission, so `blackhole.py` has no `bhimpl_int_floordiv`
-// / `bhimpl_int_mod` and no `int_(floordiv|mod)/ii>i` insns key.
-// Pyre's runtime trace path goes through the β' redirect at
-// `majit-translate/src/codegen.rs::generated_binary_int_value`.
+// 116, 117 — reserved (no opcode for `int_floordiv` / `int_mod`).
+// `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
+// `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
+// jitcode emission; the bytecode dispatch path therefore has no
+// `BC_INT_FLOORDIV` / `BC_INT_MOD` opcode.  Pyre's residual call at
+// `majit-translate/src/codegen.rs::generated_binary_int_value`
+// emits `CallI(ll_int_py_div, ...)` / `CallI(ll_int_py_mod, ...)`
+// for the same effect.  Slot numbers stay reserved so opcode
+// renumbering stays stable across this gap.
 pub const BC_INT_AND: u8 = 118;
 pub const BC_INT_OR: u8 = 119;
 pub const BC_INT_XOR: u8 = 120;
@@ -263,6 +266,10 @@ pub const BC_RESIDUAL_CALL_R_R: u8 = 165;
 pub const BC_RESIDUAL_CALL_IR_R: u8 = 166;
 pub const BC_RESIDUAL_CALL_IRF_R: u8 = 167;
 pub const BC_RESIDUAL_CALL_IRF_F: u8 = 168;
+/// `bhimpl_getarrayitem_gc_i/rid>i` — read int from a GC-managed array
+/// at runtime offset (`pyjitpl.py:2237 op_getarrayitem_gc_i`). Used by
+/// dispatch JitCode opcode-fetch lowering to load `program[pc]`.
+pub const BC_GETARRAYITEM_GC_I: u8 = 169;
 // Typed return opcodes — RPython `blackhole.py:841-862`
 // `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
 // pyre's portal return is REF (see BC_REF_RETURN) but the insns map
@@ -396,6 +403,7 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("setfield_vable_i/rid", BC_SETFIELD_VABLE_I);
     m.insert("setfield_vable_r/rrd", BC_SETFIELD_VABLE_R);
     m.insert("setfield_vable_f/rfd", BC_SETFIELD_VABLE_F);
+    m.insert("getarrayitem_gc_i/rid>i", BC_GETARRAYITEM_GC_I);
     m.insert("getarrayitem_vable_i/ridd>i", BC_GETARRAYITEM_VABLE_I);
     m.insert("getarrayitem_vable_r/ridd>r", BC_GETARRAYITEM_VABLE_R);
     m.insert("getarrayitem_vable_f/ridd>f", BC_GETARRAYITEM_VABLE_F);
@@ -504,9 +512,10 @@ pub fn wellknown_bh_insns() -> HashMap<&'static str, u8> {
     m.insert("int_add/ii>i", BC_INT_ADD);
     m.insert("int_sub/ii>i", BC_INT_SUB);
     m.insert("int_mul/ii>i", BC_INT_MUL);
-    // `int_floordiv/ii>i` and `int_mod/ii>i` intentionally absent:
-    // `jtransform.py:575-577` rewrites both to `direct_call(ll_int_py_*)`
-    // before jitcode emission so neither key reaches the assembler.
+    // `int_floordiv/ii>i` / `int_mod/ii>i` intentionally absent —
+    // `jtransform.py:576-577` rewrites via `_do_builtin_call`, so the
+    // SSA-name → bytecode table never matches these.  See the
+    // `BC_INT_AND` constants block above for the parity rationale.
     m.insert("int_and/ii>i", BC_INT_AND);
     m.insert("int_or/ii>i", BC_INT_OR);
     m.insert("int_xor/ii>i", BC_INT_XOR);

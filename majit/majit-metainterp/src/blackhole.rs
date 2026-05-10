@@ -1704,7 +1704,7 @@ impl BlackholeInterpreter {
     pub(crate) fn bhimpl_jit_merge_point(&mut self, opcode: u8) -> Result<(), DispatchError> {
         let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
         let jdindex_byte = self.next_u8();
-        let jdindex = if opcode == jitcode::BC_JIT_MERGE_POINT_C {
+        let jdindex = if opcode == jitcode::insns::BC_JIT_MERGE_POINT_C {
             (jdindex_byte as i8) as usize
         } else {
             self.registers_i[jdindex_byte as usize] as usize
@@ -4697,7 +4697,7 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 /// trace before this helper is invoked, matching RPython's
 /// `rint.py:429 ll_int_py_div_ovf_zer` shape.  Direct (non-traced)
 /// callers must respect the same precondition.
-pub fn bhimpl_int_floordiv(a: i64, b: i64) -> i64 {
+pub fn ll_int_py_div(a: i64, b: i64) -> i64 {
     let d = a.wrapping_div(b);
     if (a ^ b) < 0 && d.wrapping_mul(b) != a {
         d.wrapping_sub(1)
@@ -4707,14 +4707,14 @@ pub fn bhimpl_int_floordiv(a: i64, b: i64) -> i64 {
 }
 
 /// RPython `rint.py:496-500 ll_int_py_mod` (oopspec `int.py_mod`).
-/// See [`bhimpl_int_floordiv`] for the JIT-side runtime guard
+/// See [`ll_int_py_div`] for the JIT-side runtime guard
 /// rationale (`int_eq(rhs, 0)` + `(lhs == INT_MIN) & (rhs == -1)`).
 /// Uses `wrapping_rem` for the C-style remainder step, then applies
 /// RPython `ll_int_py_mod`'s sign correction only when the remainder
-/// and divisor have opposite signs.  As with `bhimpl_int_floordiv`,
+/// and divisor have opposite signs.  As with [`ll_int_py_div`],
 /// `wrapping_rem(0)` and `INT_MIN % -1` are unreachable from the
 /// trace path; non-traced callers must respect the same precondition.
-pub fn bhimpl_int_mod(a: i64, b: i64) -> i64 {
+pub fn ll_int_py_mod(a: i64, b: i64) -> i64 {
     let r = a.wrapping_rem(b);
     if r != 0 && (r ^ b) < 0 {
         r.wrapping_add(b)
@@ -4907,7 +4907,7 @@ fn handler_jit_merge_point_i(
     _code: &[u8],
     _position: usize,
 ) -> Result<usize, DispatchError> {
-    bh.bhimpl_jit_merge_point(jitcode::BC_JIT_MERGE_POINT)?;
+    bh.bhimpl_jit_merge_point(jitcode::insns::BC_JIT_MERGE_POINT)?;
     Ok(bh.position)
 }
 
@@ -4918,7 +4918,7 @@ fn handler_jit_merge_point_c(
     _code: &[u8],
     _position: usize,
 ) -> Result<usize, DispatchError> {
-    bh.bhimpl_jit_merge_point(jitcode::BC_JIT_MERGE_POINT_C)?;
+    bh.bhimpl_jit_merge_point(jitcode::insns::BC_JIT_MERGE_POINT_C)?;
     Ok(bh.position)
 }
 
@@ -4946,8 +4946,15 @@ fn handler_abort_result_marker_r(
     Ok(position + 1)
 }
 bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
-bhhandler_ii_i!(handler_int_floordiv, bhimpl_int_floordiv);
-bhhandler_ii_i!(handler_int_mod, bhimpl_int_mod);
+// `int_floordiv` / `int_mod` are NOT registered as bytecode handlers:
+// `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
+// `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
+// jitcode emission, so RPython's `blackhole.py` has no
+// `bhimpl_int_floordiv` / `bhimpl_int_mod`.  pyre keeps the helper
+// functions ([`ll_int_py_div`] / [`ll_int_py_mod`] above) for the
+// translate-side residual call (`codegen.rs:980-1027` emits them as
+// `CallI` with `INT_PY_DIV_EFFECT_INFO` / `INT_PY_MOD_EFFECT_INFO`)
+// but does not wire them into the bytecode dispatch table.
 bhhandler_ii_i!(handler_int_and, bhimpl_int_and);
 bhhandler_ii_i!(handler_int_or, bhimpl_int_or);
 bhhandler_ii_i!(handler_int_xor, bhimpl_int_xor);
@@ -6618,8 +6625,10 @@ macro_rules! bhhandler_ii_i_pyre_u16 {
 bhhandler_ii_i_pyre_u16!(handler_int_add_pyre_u16, bhimpl_int_add);
 bhhandler_ii_i_pyre_u16!(handler_int_sub_pyre_u16, bhimpl_int_sub);
 bhhandler_ii_i_pyre_u16!(handler_int_mul_pyre_u16, bhimpl_int_mul);
-bhhandler_ii_i_pyre_u16!(handler_int_floordiv_pyre_u16, bhimpl_int_floordiv);
-bhhandler_ii_i_pyre_u16!(handler_int_mod_pyre_u16, bhimpl_int_mod);
+// `int_floordiv` / `int_mod` have no `bhimpl_*` upstream:
+// `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
+// `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
+// jitcode emission, so neither opcode nor handler exists.
 bhhandler_ii_i_pyre_u16!(handler_int_and_pyre_u16, bhimpl_int_and);
 bhhandler_ii_i_pyre_u16!(handler_int_or_pyre_u16, bhimpl_int_or);
 bhhandler_ii_i_pyre_u16!(handler_int_xor_pyre_u16, bhimpl_int_xor);
@@ -7678,9 +7687,15 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("abort_permanent/", handler_abort_permanent);
 
     builder.wire_handler("int_mul/ii>i", handler_int_mul);
-    builder.wire_handler("int_div/ii>i", handler_int_floordiv);
-    builder.wire_handler("int_floordiv/ii>i", handler_int_floordiv);
-    builder.wire_handler("int_mod/ii>i", handler_int_mod);
+    // `int_div` / `int_floordiv` / `int_mod` are intentionally NOT
+    // wired: `jtransform.py:576-577 rewrite_op_int_floordiv =
+    // _do_builtin_call` rewrites these primitives to
+    // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)`
+    // before jitcode emission, so RPython's blackhole never sees the
+    // bare op.  Pyre's runtime path mirrors this via
+    // `codegen.rs:980-1027` emitting `CallI(ll_int_py_div, ...)`
+    // directly.  Wiring `handler_int_floordiv` here would silently
+    // re-introduce the upstream-absent bytecode dispatch path.
     builder.wire_handler("int_and/ii>i", handler_int_and);
     builder.wire_handler("int_or/ii>i", handler_int_or);
     builder.wire_handler("int_xor/ii>i", handler_int_xor);
@@ -8305,8 +8320,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_add_pyre_u16/ii>i", handler_int_add_pyre_u16);
     builder.wire_handler("int_sub_pyre_u16/ii>i", handler_int_sub_pyre_u16);
     builder.wire_handler("int_mul_pyre_u16/ii>i", handler_int_mul_pyre_u16);
-    builder.wire_handler("int_floordiv_pyre_u16/ii>i", handler_int_floordiv_pyre_u16);
-    builder.wire_handler("int_mod_pyre_u16/ii>i", handler_int_mod_pyre_u16);
+    // `int_floordiv` / `int_mod` have no `bhimpl_*` upstream:
+    // `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
+    // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
+    // jitcode emission, so neither key reaches `wire_handler`.
     builder.wire_handler("int_and_pyre_u16/ii>i", handler_int_and_pyre_u16);
     builder.wire_handler("int_or_pyre_u16/ii>i", handler_int_or_pyre_u16);
     builder.wire_handler("int_xor_pyre_u16/ii>i", handler_int_xor_pyre_u16);

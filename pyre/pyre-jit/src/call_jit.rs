@@ -1567,6 +1567,26 @@ fn materialize_str_call_for_cranelift(
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
+        // warmstate.py:108-128 ll_streq / ll_strhash registration —
+        // pyre's `#[jit_interp]` macro emits the canonical `*const
+        // &'static str` slot ABI for STR/UNICODE greens
+        // (`majit-macros::jit_interp::emit_green_repr`).  Each frontend
+        // owns its own `rstr.STR` / `rstr.UNICODE` decoder; pyre
+        // registers its `default_str_eq` / `default_str_hash` /
+        // `default_unicode_hash` here so `equal_whatever(GreenType::Str,
+        // ..)` / `hash_whatever(GreenType::Str, ..)` route to content-
+        // aware comparison/hashing for every `greens=[name: str]`
+        // JitCell.  Lives on the pyre side (not in metainterp's
+        // `JitDriver::new`) so non-pyre frontends supply their own slot
+        // ABI without inheriting pyre's via a process-global default.
+        majit_ir::value::set_str_resolver(
+            majit_ir::value::default_str_eq,
+            majit_ir::value::default_str_hash,
+        );
+        majit_ir::value::set_unicode_resolver(
+            majit_ir::value::default_str_eq,
+            majit_ir::value::default_unicode_hash,
+        );
         register_jit_function_caller(jit_call_user_function_from_frame);
         // compile.py:1090 `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
@@ -2432,8 +2452,8 @@ pub fn trace_and_compile_from_bridge(
             &mut jit_state,
             &env,
             || {},
-            |ctx, sym| {
-                let (action, _executed) = trace_bytecode(ctx, sym, code, resume_pc, trace_frame);
+            |meta, sym| {
+                let (action, _executed) = trace_bytecode(meta, sym, code, resume_pc, trace_frame);
                 action
             },
         )

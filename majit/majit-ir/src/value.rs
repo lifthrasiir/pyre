@@ -283,6 +283,14 @@ pub enum VarKind {
 ///
 /// Mirrors RPython's JitDriver parameter lists. Each variable has
 /// a name (for debugging), a type, and a kind (green/red).
+///
+/// `warmspot.py:663 jd._green_args_spec = [TYPE for ARG, TYPE in
+/// jd._JIT_ENTER_FUNCTYPE.ARGS[:jd.num_green_args]]` carries the full
+/// lltype TYPE per green — including `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`.
+/// The IR-level [`Type`] (i/r/f/v) collapses those to `Ref`, so greens
+/// also carry an optional [`GreenType`] preserving the STR/UNICODE
+/// subtype.  Reds keep `green_type = None` (no equivalent of
+/// `equal_whatever` for runtime args).
 #[derive(Clone, Debug, PartialEq)]
 pub struct JitDriverVar {
     /// Variable name (e.g., "pc", "stack", "sp").
@@ -291,14 +299,37 @@ pub struct JitDriverVar {
     pub tp: Type,
     /// Whether this is a green (constant) or red (runtime) variable.
     pub kind: VarKind,
+    /// Per-green lltype subtype (`STR` / `UNICODE` / canonical
+    /// `Int`/`Float`/`Ref`/`Void`).  `None` for reds and for greens
+    /// constructed via [`Self::green`] without an explicit subtype —
+    /// the canonical fall-back is `GreenType::from(self.tp)`.
+    pub green_type: Option<GreenType>,
 }
 
 impl JitDriverVar {
+    /// Construct a green var with the canonical [`GreenType`] derived
+    /// from `tp` (Int/Ref/Float/Void).  Use [`Self::green_with_type`]
+    /// when the upstream lltype is `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`
+    /// so `green_args_spec` reports the correct
+    /// `equal_whatever`/`hash_whatever` dispatch type.
     pub fn green(name: impl Into<String>, tp: Type) -> Self {
         JitDriverVar {
             name: name.into(),
             tp,
             kind: VarKind::Green,
+            green_type: None,
+        }
+    }
+
+    /// Construct a green var with an explicit [`GreenType`] subtype —
+    /// `warmspot.py:663` parity for STR/UNICODE Ptr greens that
+    /// `Type::Ref` cannot distinguish on its own.
+    pub fn green_with_type(name: impl Into<String>, tp: Type, green_type: GreenType) -> Self {
+        JitDriverVar {
+            name: name.into(),
+            tp,
+            kind: VarKind::Green,
+            green_type: Some(green_type),
         }
     }
 
@@ -307,6 +338,7 @@ impl JitDriverVar {
             name: name.into(),
             tp,
             kind: VarKind::Red,
+            green_type: None,
         }
     }
 }
@@ -343,10 +375,29 @@ impl From<Type> for GreenType {
     }
 }
 
-/// Resolver types for ll_streq / ll_strhash — pluggable because each
-/// frontend (pyre, RPython) has its own rstr.STR / UNICODE layout. The
-/// helper remains pure at the majit-ir layer; frontends register their
-/// resolvers at startup via [`set_str_resolver`] / [`set_unicode_resolver`].
+/// Project a [`GreenType`] back onto the IR-level [`Type`].  STR /
+/// UNICODE collapse to `Type::Ref` (their lltype is `lltype.Ptr` —
+/// `warmstate.py:109` `isinstance(TYPE, lltype.Ptr)` precondition).
+pub fn green_type_to_ir(g: GreenType) -> Type {
+    match g {
+        GreenType::Int => Type::Int,
+        GreenType::Float => Type::Float,
+        GreenType::Void => Type::Void,
+        GreenType::Ref | GreenType::Str | GreenType::Unicode => Type::Ref,
+    }
+}
+
+/// Resolver function pointer types for `GreenType::Str` /
+/// `GreenType::Unicode` content equality and hashing.
+///
+/// Pluggable because each frontend has its own `rstr.STR` / `rstr.UNICODE`
+/// layout — RPython holds gc-typed pointers, pyre holds `*const &'static str`
+/// cast through `usize` (per-occurrence `Box::leak`).  The IR layer keeps
+/// no assumption about that ABI; frontends register their decoders via
+/// [`set_str_resolver`] / [`set_unicode_resolver`] at startup, mirroring
+/// RPython's `warmstate.py:108-128` indirection through
+/// `rstr.LLHelpers.ll_streq` / `ll_strhash` (which is itself a function
+/// pointer the frontend produces for its own STR/UNICODE layout).
 pub type StrEqFn = fn(i64, i64) -> bool;
 pub type StrHashFn = fn(i64) -> u64;
 
@@ -355,14 +406,187 @@ static STR_HASH: std::sync::OnceLock<StrHashFn> = std::sync::OnceLock::new();
 static UNICODE_EQ: std::sync::OnceLock<StrEqFn> = std::sync::OnceLock::new();
 static UNICODE_HASH: std::sync::OnceLock<StrHashFn> = std::sync::OnceLock::new();
 
+/// Frontend-registered Str green resolver.  First call wins; subsequent
+/// calls are silently ignored to mirror `OnceLock::set`'s init-once
+/// contract.  Frontends register at JitDriver startup before any
+/// trace records a Str green.
 pub fn set_str_resolver(eq: StrEqFn, hash: StrHashFn) {
     let _ = STR_EQ.set(eq);
     let _ = STR_HASH.set(hash);
 }
 
+/// Frontend-registered Unicode green resolver.  Same init-once contract
+/// as [`set_str_resolver`].
 pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
     let _ = UNICODE_EQ.set(eq);
     let _ = UNICODE_HASH.set(hash);
+}
+
+/// Pyre canonical `ll_streq` analog for `GreenType::Str` / `GreenType::Unicode`.
+///
+/// Public so consumers can register it at startup via
+/// [`set_str_resolver`] / [`set_unicode_resolver`] — pyre's macro
+/// (`majit-macros::jit_interp::emit_green_repr`) emits the `*const
+/// &'static str` slot ABI (per-occurrence `Box::leak` of a `Box<&'static str>`,
+/// the pyre analog to RPython's GC-allocated `rstr.STR*`).  Decoding
+/// the slot to compare by content is the pyre half of the contract;
+/// RPython's half is in `rstr.py:604 ll_streq`.  Other frontends with
+/// different STR layouts register their own resolver pair.
+///
+/// Stable-slot helper for STR/UNICODE green emission.
+///
+/// Materialises a `*const &'static str` slot at a stable address by
+/// leaking a `Box<&'static str>` — pyre's per-occurrence analog of
+/// RPython's GC-allocated `rstr.STR*` (`rstr.py:25-30`).  Each call
+/// allocates a fresh slot; the GreenKey HashMap content-de-dupes via
+/// `default_str_eq` / `default_str_hash` so semantically every
+/// merge-point hit collapses to a single cache entry, but the leaked
+/// slots themselves grow unboundedly with hit count for long-running
+/// programs.
+///
+/// This shape is a Rust-side adaptation: `&str` literals don't have
+/// stable backing-storage addresses by default, and RPython's
+/// `rstr.STR*` keeps the data + len at a GC-allocated address that is
+/// stable for the JitCell's lifetime.  RPython does NOT maintain a
+/// global string-intern side table — `JitCell.greenargs[i]` holds the
+/// rstr pointer and the GC frees it when the cell dies.  An earlier
+/// pyre revision added a process-global `HashMap<Box<str>, usize>`
+/// here to bound the leak, but a global intern is non-orthodox: it
+/// has no RPython precedent and never frees, so the bound it provides
+/// only delays the unbounded growth (distinct STR/UNICODE contents
+/// still grow without bound over a process lifetime).  The structural
+/// fix — reshape `GreenKey::values` from `Vec<i64>` to a typed enum
+/// carrying `Box<str>` for str/unicode greens, with the macro
+/// emitting a temporary that the JitCell cache promotes on insertion
+/// — is a multi-session refactor and is intentionally deferred.
+/// Functional behavior matches RPython (content-keyed compare/hash);
+/// only the lifetime / allocation profile differs.
+pub fn make_str_slot(s: &str) -> i64 {
+    let owned: Box<str> = Box::from(s);
+    let owned_static: &'static str = Box::leak(owned);
+    let slot: &'static &'static str = Box::leak(Box::new(owned_static));
+    slot as *const &'static str as usize as i64
+}
+
+pub fn default_str_eq(a: i64, b: i64) -> bool {
+    if a == b {
+        // `if s1 == s2: return True` (`rstr.py:604`) — handles both
+        // pointer-equal and `(0, 0)` (both null).
+        return true;
+    }
+    if a == 0 || b == 0 {
+        // `if not s1 or not s2: return False` (`rstr.py:606`) — exactly
+        // one side is null; null vs non-null can never match.  Without
+        // this guard the deref below would dereference a null pointer.
+        return false;
+    }
+    // SAFETY: pyre canonical green ABI — both `i64`s are non-null
+    // `*const &'static str` pointing to leaked slots with `'static`
+    // lifetime per `emit_green_repr`'s `Box::leak` path.
+    let (sa, sb) = unsafe {
+        (
+            *(a as usize as *const &'static str),
+            *(b as usize as *const &'static str),
+        )
+    };
+    sa == sb
+}
+
+/// `rpython/rlib/objectmodel.py:596 _hash_string` parity over a byte
+/// stream — the modified Fowler-Noll-Vo (FNV) variant that
+/// CPython 2.7 (and RPython by inheritance) uses for string hashes:
+///
+/// ```text
+///     length = len(s)
+///     if length == 0: return -1
+///     x = ord(s[0]) << 7
+///     for i in 0..length: x = intmask((1000003 * x) ^ ord(s[i]))
+///     x ^= length
+///     return intmask(x)
+/// ```
+///
+/// `intmask` truncates to the machine word; on a 64-bit target this
+/// matches `i64::wrapping_mul` / `i64::wrapping_xor` exactly, so the
+/// value is bit-identical to a 64-bit RPython build.
+fn rpython_hash_bytes(bytes: &[u8]) -> i64 {
+    let length = bytes.len();
+    if length == 0 {
+        return -1;
+    }
+    let mut x: i64 = (bytes[0] as i64) << 7;
+    for &b in bytes {
+        x = 1000003i64.wrapping_mul(x) ^ (b as i64);
+    }
+    x ^= length as i64;
+    x
+}
+
+/// `rpython/rlib/objectmodel.py:596 _hash_string` parity over a
+/// codepoint stream — companion to [`rpython_hash_bytes`] for
+/// `rstr.UNICODE` (whose `chars` field is an array of codepoint
+/// values, not bytes).  Iterates the `&str` codepoint-by-codepoint
+/// so multi-byte UTF-8 sequences hash by their decoded value rather
+/// than the byte representation.
+fn rpython_hash_codepoints(s: &str) -> i64 {
+    let length = s.chars().count();
+    if length == 0 {
+        return -1;
+    }
+    let first = s.chars().next().unwrap() as i64;
+    let mut x: i64 = first << 7;
+    for c in s.chars() {
+        x = 1000003i64.wrapping_mul(x) ^ (c as i64);
+    }
+    x ^= length as i64;
+    x
+}
+
+/// `rpython/rtyper/lltypesystem/rstr.py:405 _ll_strhash` zero-substitute.
+///
+/// RPython treats `0` as the "hash not yet computed" sentinel for
+/// `rstr.STR.hash` / `rstr.UNICODE.hash` and substitutes a fixed
+/// non-zero replacement (`29872897`) when the FNV result is zero.
+/// pyre mirrors that contract for both `Str` and `Unicode` greens —
+/// stable bucket assignment requires a deterministic non-zero hash.
+fn rpython_zero_substitute(x: i64) -> i64 {
+    if x == 0 { 29872897 } else { x }
+}
+
+/// Pyre canonical `ll_strhash` analog for `GreenType::Str` (Py2 byte
+/// strings).  Public so consumers can register it via
+/// [`set_str_resolver`].  Decodes the slot ABI (same as
+/// [`default_str_eq`]) and hashes the underlying `&str` byte-by-byte
+/// through [`rpython_hash_bytes`] — `rstr.STR.chars` is a sequence of
+/// single-byte values, so byte iteration matches the upstream
+/// `ord(s[i])` loop bit-for-bit.
+pub fn default_str_hash(a: i64) -> u64 {
+    // `if not s: return 0` (`rstr.py:407`) — null slot hashes to 0,
+    // matching RPython's `_ll_strhash` precondition guard.  Without
+    // this the deref would dereference a null pointer for unset
+    // green slots.
+    if a == 0 {
+        return 0;
+    }
+    // SAFETY: non-null canonical slot ABI as [`default_str_eq`].
+    let s = unsafe { *(a as usize as *const &'static str) };
+    rpython_zero_substitute(rpython_hash_bytes(s.as_bytes())) as u64
+}
+
+/// Pyre canonical `ll_strhash` analog for `GreenType::Unicode`
+/// (Py2 unicode strings — codepoint-indexed).  Public so consumers
+/// can register it via [`set_unicode_resolver`].  Decodes the slot
+/// ABI and hashes codepoint-by-codepoint through
+/// [`rpython_hash_codepoints`] — `rstr.UNICODE.chars` is a sequence
+/// of decoded codepoint values, matching `&str.chars()` iteration.
+pub fn default_unicode_hash(a: i64) -> u64 {
+    // `if not s: return 0` (`rstr.py:407`) — null slot hashes to 0,
+    // matching `_ll_strhash`'s precondition guard.
+    if a == 0 {
+        return 0;
+    }
+    // SAFETY: non-null canonical slot ABI as [`default_str_eq`].
+    let s = unsafe { *(a as usize as *const &'static str) };
+    rpython_zero_substitute(rpython_hash_codepoints(s)) as u64
 }
 
 /// warmstate.py:108-112 equal_whatever(TYPE, x, y)
@@ -370,10 +594,35 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 /// Port of RPython's lltype dispatch:
 /// - Ptr to STR / UNICODE → rstr.LLHelpers.ll_streq
 /// - everything else → `x == y` (with Float using bitwise f64 equality)
+///
+/// STR / UNICODE indirect through frontend-registered resolvers
+/// ([`set_str_resolver`] / [`set_unicode_resolver`]).  Each frontend
+/// owns its own `rstr.STR` / `rstr.UNICODE` decoder; PyPy compiles a
+/// type-specialised `equal_whatever(STR, ..)` whose body is the
+/// frontend's `ll_streq` (`@specialize.arg(0)` at `warmstate.py:107`).
+/// Pyre's runtime equivalent: a registered resolver MUST exist before
+/// any STR/UNICODE green key is compared.  An unregistered call
+/// panics rather than silently falling back to bitwise equality —
+/// PyPy never returns `x == y` for an STR green, and a silent
+/// fallback masks frontend-init bugs (e.g., calling
+/// `equal_whatever(GreenType::Str, ..)` before
+/// `install_jit_call_bridge` runs).
 pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
     match tp {
-        GreenType::Str => STR_EQ.get().map(|f| f(x, y)).unwrap_or_else(|| x == y),
-        GreenType::Unicode => UNICODE_EQ.get().map(|f| f(x, y)).unwrap_or_else(|| x == y),
+        GreenType::Str => STR_EQ.get().expect(
+            "equal_whatever(GreenType::Str, ..): no Str resolver \
+                 registered — frontend must call \
+                 `set_str_resolver(eq, hash)` at startup before any \
+                 STR green key is compared (warmstate.py:108-111 \
+                 ll_streq parity)",
+        )(x, y),
+        GreenType::Unicode => UNICODE_EQ.get().expect(
+            "equal_whatever(GreenType::Unicode, ..): no Unicode \
+                 resolver registered — frontend must call \
+                 `set_unicode_resolver(eq, hash)` at startup before \
+                 any UNICODE green key is compared (warmstate.py:\
+                 108-111 ll_streq parity)",
+        )(x, y),
         GreenType::Float => {
             let a = f64::from_bits(x as u64);
             let b = f64::from_bits(y as u64);
@@ -389,16 +638,34 @@ pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
 /// - Ptr to STR / UNICODE → rstr.LLHelpers.ll_strhash
 /// - generic GC Ptr → identityhash (or 0 for null)
 /// - primitive → rffi.cast(Signed, x)
+///
+/// STR / UNICODE indirect through frontend-registered resolvers
+/// ([`set_str_resolver`] / [`set_unicode_resolver`]).  PyPy compiles
+/// a type-specialised `hash_whatever(STR, ..)` whose body is the
+/// frontend's `ll_strhash` (`@specialize.arg(0)` at `warmstate.py:114`).
+/// Pyre's runtime equivalent: a registered resolver MUST exist before
+/// any STR/UNICODE green key is hashed.  An unregistered call panics
+/// rather than silently returning the slot-bits-as-u64 — PyPy never
+/// hashes an STR green by raw pointer bits, and a silent fallback
+/// masks frontend-init bugs (e.g., calling
+/// `hash_whatever(GreenType::Str, ..)` before
+/// `install_jit_call_bridge` runs).
 pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
     match tp {
-        GreenType::Str => STR_HASH
-            .get()
-            .map(|f| f(value))
-            .unwrap_or_else(|| value as u64),
-        GreenType::Unicode => UNICODE_HASH
-            .get()
-            .map(|f| f(value))
-            .unwrap_or_else(|| value as u64),
+        GreenType::Str => STR_HASH.get().expect(
+            "hash_whatever(GreenType::Str, ..): no Str resolver \
+                 registered — frontend must call \
+                 `set_str_resolver(eq, hash)` at startup before any \
+                 STR green key is hashed (warmstate.py:115-121 \
+                 ll_strhash parity)",
+        )(value),
+        GreenType::Unicode => UNICODE_HASH.get().expect(
+            "hash_whatever(GreenType::Unicode, ..): no Unicode \
+                 resolver registered — frontend must call \
+                 `set_unicode_resolver(eq, hash)` at startup before \
+                 any UNICODE green key is hashed (warmstate.py:\
+                 115-121 ll_strhash parity)",
+        )(value),
         GreenType::Ref => {
             // identityhash(x) or 0
             if value != 0 { value as u64 } else { 0 }
@@ -517,6 +784,77 @@ impl GreenKey {
     }
 }
 
+/// Macro-emitted bridge used by `#[jit_interp]` to build a typed
+/// `GreenKey` from heterogeneous green expressions.
+///
+/// Returns the `(i64 bit-representation, GreenType)` pair so the caller
+/// emits both vectors in lockstep with a single move of the green value.
+/// Integer / bool greens widen as Int (`warmstate.py:566 hash_whatever`
+/// equal_int / hash_int);  float greens carry their bit-pattern under
+/// Float (equal_float / hash_float);  reference greens widen via raw
+/// pointer bits under Ref (Ptr identity — `equal_ptr` compares the bit
+/// pattern that `hash_ptr` keyed on).
+pub trait GreenAsI64 {
+    fn __green_repr(self) -> (i64, GreenType);
+}
+
+macro_rules! impl_green_as_i64_int {
+    ($($ty:ty),*) => {
+        $(
+            impl GreenAsI64 for $ty {
+                #[inline(always)]
+                fn __green_repr(self) -> (i64, GreenType) {
+                    (self as i64, GreenType::Int)
+                }
+            }
+        )*
+    };
+}
+
+impl_green_as_i64_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, bool);
+
+impl GreenAsI64 for f32 {
+    #[inline(always)]
+    fn __green_repr(self) -> (i64, GreenType) {
+        // Promote f32 → f64 before extracting the i64 bit pattern.
+        // [`equal_whatever`] / [`hash_whatever`] interpret the stored
+        // bits as an `f64` (`value.rs:378 f64::from_bits(x as u64)`);
+        // storing the bare `f32::to_bits()` (a u32 in the low 32 bits
+        // of an i64) would round-trip to a subnormal f64 instead of
+        // the float value the caller intended.  PyPy / RPython's
+        // Float type is always f64 (`lltype.Float`); promoting f32
+        // matches that single-width contract.
+        ((self as f64).to_bits() as i64, GreenType::Float)
+    }
+}
+
+impl GreenAsI64 for f64 {
+    #[inline(always)]
+    fn __green_repr(self) -> (i64, GreenType) {
+        (self.to_bits() as i64, GreenType::Float)
+    }
+}
+
+impl<T: ?Sized> GreenAsI64 for &T {
+    #[inline(always)]
+    fn __green_repr(self) -> (i64, GreenType) {
+        (
+            self as *const T as *const () as usize as i64,
+            GreenType::Ref,
+        )
+    }
+}
+
+impl<T: ?Sized> GreenAsI64 for &mut T {
+    #[inline(always)]
+    fn __green_repr(self) -> (i64, GreenType) {
+        (
+            self as *const T as *const () as usize as i64,
+            GreenType::Ref,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +902,40 @@ mod tests {
     }
 
     #[test]
+    fn green_repr_returns_per_type_green_type() {
+        assert_eq!(7i64.__green_repr(), (7i64, GreenType::Int));
+        assert_eq!(7u32.__green_repr(), (7i64, GreenType::Int));
+        assert_eq!(true.__green_repr(), (1i64, GreenType::Int));
+
+        let (fv, ft) = 3.14f64.__green_repr();
+        assert_eq!(fv, 3.14f64.to_bits() as i64);
+        assert_eq!(ft, GreenType::Float);
+
+        let s: &'static str = "abc";
+        let (rv, rt) = s.__green_repr();
+        assert_eq!(rv, s as *const str as *const () as usize as i64);
+        assert_eq!(rt, GreenType::Ref);
+    }
+
+    #[test]
+    fn green_repr_f32_promotes_to_f64_for_consistent_hash() {
+        // `equal_whatever(Float, x, y)` interprets bits as `f64`
+        // (`value.rs:378`).  An f32 green that stored only its 32-bit
+        // pattern would round-trip to a subnormal f64; promoting to
+        // f64 first keeps the i64 representation consistent with the
+        // f64 green carrying the same numeric value.
+        let f32_val: f32 = 1.5;
+        let f64_val: f64 = 1.5;
+        let (f32_bits, _) = f32_val.__green_repr();
+        let (f64_bits, _) = f64_val.__green_repr();
+        assert_eq!(f32_bits, f64_bits);
+
+        // Round-trip via `equal_whatever(Float, _, _)` confirms both
+        // evaluate to the same f64 value (1.5 == 1.5).
+        assert!(equal_whatever(GreenType::Float, f32_bits, f64_bits));
+    }
+
+    #[test]
     fn test_green_key_multi() {
         let k1 = GreenKey::new(vec![10, 20, 30]);
         let k2 = GreenKey::new(vec![10, 20, 30]);
@@ -572,17 +944,6 @@ mod tests {
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
         assert_eq!(k1.hash_u64(), k2.hash_u64());
-    }
-
-    /// warmstate.py:108-112 — STR/UNICODE greens use ll_streq, not
-    /// identity. With a resolver wired, equal_whatever should treat two
-    /// distinct pointers with identical content as equal.
-    #[test]
-    fn test_green_type_str_dispatch_without_resolver() {
-        // Without a resolver the helpers fall back to pointer identity.
-        assert!(equal_whatever(GreenType::Str, 0x1000, 0x1000));
-        assert!(!equal_whatever(GreenType::Str, 0x1000, 0x1001));
-        assert_eq!(hash_whatever(GreenType::Str, 0x1000), 0x1000u64);
     }
 
     #[test]

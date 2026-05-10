@@ -2688,6 +2688,23 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|i| i as i32)
                     .unwrap_or(-1);
                 self.tracing = Some(ctx);
+                // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
+                // `setup_tracing` for rationale.  Bridge-trace
+                // distinction now flows through
+                // `TraceCtx::is_bridge_trace` rather than
+                // `has_compiled_targets_fn` presence, so the parallel
+                // entry installs both fns unconditionally.
+                let self_ptr = self as *const Self as *const ();
+                if let Some(ref mut ctx) = self.tracing {
+                    ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+                        let meta = unsafe { &*(self_ptr as *const Self) };
+                        meta.has_compiled_targets(gk)
+                    }));
+                    ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+                        let meta = unsafe { &*(self_ptr as *const Self) };
+                        meta.portal_call_depth
+                    }));
+                }
                 let pending_num = self.warm_state.alloc_token_number();
                 self.pending_token = Some((green_key, pending_num));
                 // RPython compile_tmp_callback parity: register a placeholder
@@ -2878,6 +2895,26 @@ impl<M: Clone> MetaInterp<M> {
             .map(|i| i as i32)
             .unwrap_or(-1);
         self.tracing = Some(ctx);
+        // pyjitpl.py:1547-1556 `opimpl_jit_merge_point` auto-stamp
+        // gate inputs.  Both `portal_call_depth` and
+        // `has_compiled_targets(ptoken)` feed the primary-trace gate;
+        // mirror `start_bridge_tracing`'s install (jitdriver.rs:3714-
+        // 3717) at the primary path so the gate sees consistent state
+        // regardless of which entry started this trace.  The
+        // `has_compiled_targets_fn` presence is no longer overloaded
+        // as a bridge marker — `TraceCtx::is_bridge_trace` carries
+        // that distinction explicitly.
+        let self_ptr = self as *const Self as *const ();
+        if let Some(ref mut ctx) = self.tracing {
+            ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.has_compiled_targets(gk)
+            }));
+            ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.portal_call_depth
+            }));
+        }
         let pending_num = self.warm_state.alloc_token_number();
         self.pending_token = Some((green_key, pending_num));
         self.backend.register_pending_target(
@@ -6230,7 +6267,6 @@ impl<M: Clone> MetaInterp<M> {
             savedata: result.savedata,
             exception,
             status: result.status,
-            descr_addr: result.descr_addr,
         })
     }
 
@@ -6265,7 +6301,6 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
-        let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         // compile.py:186 `descr.rd_loop_token` — owning loop's clt,
         // stamped at compile time.  Walk the chain
         // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
@@ -6389,7 +6424,6 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             exception,
             status,
-            descr_addr,
         })
     }
 
@@ -6420,7 +6454,6 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
-        let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key);
         Self::finish_compiled_run_io();
@@ -6535,7 +6568,6 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             exception,
             status,
-            descr_addr,
         })
     }
 
@@ -10606,19 +10638,22 @@ impl<M: Clone> MetaInterp<M> {
 
                 if position < code.len() {
                     let mut opcode = code[position];
-                    if opcode == crate::jitcode::BC_LIVE {
+                    if opcode == crate::jitcode::insns::BC_LIVE {
                         position += SIZE_LIVE_OP;
                         if position < code.len() {
                             opcode = code[position];
                         }
                     }
-                    if opcode == crate::jitcode::BC_CATCH_EXCEPTION && position + 2 < code.len() {
+                    if opcode == crate::jitcode::insns::BC_CATCH_EXCEPTION
+                        && position + 2 < code.len()
+                    {
                         let target =
                             u16::from_le_bytes([code[position + 1], code[position + 2]]) as usize;
                         frame.pc = target;
                         frame.code_cursor = target;
                         handled = true;
-                    } else if opcode == crate::jitcode::BC_RVMPROF_CODE && position + 2 < code.len()
+                    } else if opcode == crate::jitcode::insns::BC_RVMPROF_CODE
+                        && position + 2 < code.len()
                     {
                         let leaving_idx = code[position + 1] as usize;
                         let unique_id_idx = code[position + 2] as usize;
@@ -11760,8 +11795,30 @@ impl<M: Clone> MetaInterp<M> {
             "pyjitpl.py:3596 already verified args.len() == num_red_args; \
              red_arg_types_as_ir_types must agree with that count",
         );
+        // PyPy `warmstate.py:575 _green_args_spec` keys per-type
+        // `equal_whatever`/`hash_whatever` off each green's lltype, so a
+        // Float / Ref green hashes differently than an Int green
+        // carrying the same i64 bits, and a Ptr(rstr.STR) green uses
+        // content-hash/equality rather than pointer identity.  Pull the
+        // typed spec from the registered driver
+        // (`target_sd.green_args_spec()`, mirroring upstream
+        // `warmrunnerstate.get_assembler_token(greenargs)` reading
+        // `_green_args_spec`) so STR / UNICODE greens land on the same
+        // cell that the macro-emitted typed-key path uses.  Earlier
+        // pyre revisions reconstructed the GreenType from runtime
+        // `JitArgKind` (which collapses STR/UNICODE to `Ref`); the
+        // collapse caused direct-assembler lookups for STR/UNICODE
+        // greens to compute pointer-identity hashes instead of the
+        // content hashes the install-time path stored under.
         let green_values: Vec<i64> = greenargs.iter().map(|(_, _, value)| *value).collect();
-        let green_key = crate::green_key_hash(&green_values);
+        let green_types: Vec<majit_ir::GreenType> = target_sd.green_args_spec();
+        debug_assert_eq!(
+            green_types.len(),
+            greenargs.len(),
+            "warmspot.py:663 _green_args_spec must agree with the \
+             jitcode arg layout greenargs prefix",
+        );
+        let green_key = crate::green_key_hash_typed(&green_values, &green_types);
         // `compile.py:187` parity: `op.getdescr()` IS a `JitCellToken`.  Carry
         // the *same* Arc that `compiled_loops` / warm cell own through to the
         // descr so `record_loop_or_bridge` can downcast and push it directly,
@@ -12771,9 +12828,6 @@ pub enum DetailedDriverRunOutcome {
         should_bridge: bool,
         /// compile.py: rd_loop_token — owning compiled loop key.
         owning_key: u64,
-        /// compile.py:780: current_object_addr_as_int(self) — the exact
-        /// descriptor that failed. Used for start/done_compiling.
-        descr_addr: usize,
         /// Raw register values from compiled code exit.
         raw_values: Vec<i64>,
         /// Guard exit layout (rd_numb, fail_arg_types, etc.).
@@ -13083,6 +13137,30 @@ impl std::error::Error for ChangeFrame {}
 /// uses to promote a const-funcptr residual call into an inlined one.
 ///
 /// PRE-EXISTING-ADAPTATION: pyre's `MetaInterp<M>` still owns several
+/// `descr.py:348-360 get_array_descr` lltype-shape cache key for
+/// `dispatch_array_descr_cache`.  RPython keys
+/// `gccache._cache_array[ARRAY_OR_STRUCT]` on the lltype itself, which
+/// transitively encodes `type_id`, `is_array_of_pointers`,
+/// `is_array_of_structs`, item layout, and interior field positions.
+/// Pyre lowered the IR to `BhDescr::Array` before this site, so the
+/// equivalent key threads through every variant field that
+/// distinguishes two `BhDescr::Array` entries — `(type_id, base_size,
+/// itemsize, item_type, is_array_of_pointers, is_array_of_structs,
+/// is_item_signed, interior_fields)`.  Two arrays of distinct lltypes
+/// with identical `(base_size, itemsize)` geometry land on distinct
+/// cache slots, matching upstream's per-lltype cache identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DispatchArrayDescrKey {
+    pub type_id: u32,
+    pub base_size: usize,
+    pub itemsize: usize,
+    pub item_type: majit_ir::Type,
+    pub is_array_of_pointers: bool,
+    pub is_array_of_structs: bool,
+    pub is_item_signed: bool,
+    pub interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
+}
+
 /// runtime-state fields that RPython places on `MetaInterpStaticData`
 /// (e.g. profiler, `warmrunnerdesc`, `cpu`).  `staticdata` itself
 /// already holds the per-process tables (`opcode_*`, `opcode_descrs`,
@@ -13208,6 +13286,56 @@ pub struct MetaInterpStaticData {
     /// Mutex lock. RPython's Python dicts are shared mutable references
     /// by default; Rust needs interior mutability for the same behavior.
     pub all_descrs: std::sync::Mutex<Vec<DescrRef>>,
+    /// `descr.py:20 GcCache._cache_array` parity for the dispatch JitCode
+    /// trace-side `BC_GETARRAYITEM_GC_I` recorder.
+    ///
+    /// `JitCodeMachine::dispatch_array_descr_ref` materialises an
+    /// `Arc<SimpleArrayDescr>` from the canonical pool's
+    /// `BhDescr::Array` entry the first time a given lltype shape is
+    /// resolved.  The cache must outlive a single trace so cross-trace
+    /// / cross-bridge recorders receive the same `Arc<dyn Descr>`
+    /// identity for the same lltype ARRAY — `descr_identity`
+    /// (`descr.rs:494`) is Arc-address-based, so without the
+    /// translation-wide table, two traces compiled for the same loop
+    /// would surface distinct array descrs from `Arc::ptr_eq`'s
+    /// perspective and break optimizer/backend descr-keyed caches.
+    /// PyPy keeps the equivalent cache on `gccache._cache_array`
+    /// (`descr.py:348`).
+    ///
+    /// Keyed on [`DispatchArrayDescrKey`], which captures the full
+    /// lltype-discriminant shape carried on `BhDescr::Array`
+    /// (`type_id`, `base_size`, `itemsize`, `item_type`,
+    /// `is_array_of_pointers`, `is_array_of_structs`, `is_item_signed`,
+    /// `interior_fields`).  Mirrors upstream
+    /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py:348-360`)
+    /// where the key is the lltype itself.  Pyre cannot use the lltype
+    /// directly because the codewriter has already lowered the IR to
+    /// `BhDescr::Array`; the struct above carries every lltype
+    /// discriminant the BhDescr exposes so two distinct lltypes that
+    /// happen to share `(base_size, itemsize, item_type,
+    /// is_item_signed)` (e.g. one is an array-of-pointers, one is an
+    /// array-of-structs with interior fields) get distinct cache slots.
+    /// `make_array_descr_signed` (`descr.rs:3712`) is the constructor
+    /// pyre's dispatch path uses; it currently leaves `type_id=0`,
+    /// `lendescr=None`, and the struct/interior-field flags empty,
+    /// matching what pyre's bytecode-array dispatch (`program: &[u8]`)
+    /// needs but lagging upstream `descr.py:get_array_descr` which
+    /// preserves `lendescr`, `flag`, `is_pure`, and per-field interior
+    /// descrs.  Closing that gap is tracked separately; the cache key
+    /// is already keyed by the full discriminator so the value side
+    /// can be enriched without changing the key shape.  Earlier
+    /// revisions keyed on `descr_idx` (per-JitCode-builder pool slot),
+    /// which happens to work when only one JitCode body emits arrays
+    /// but breaks structurally when distinct JitCodes use the same
+    /// slot index for different array shapes — pyre's per-loop-body
+    /// JitCode design (each `#[jit_interp]` site has an independent
+    /// pool) makes that scenario reachable.
+    ///
+    /// Mutex-wrapped because `Arc<MetaInterpStaticData>` is shared
+    /// across the metainterp / trace / bridge pipelines (mirroring
+    /// `all_descrs` above).
+    pub dispatch_array_descr_cache:
+        std::sync::Mutex<std::collections::HashMap<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -13665,10 +13793,11 @@ impl MetaInterpStaticData {
     /// caller does not need to set them.
     pub fn register_jitdriver_sd(
         &mut self,
-        jd: crate::jitdriver::JitDriverStaticData,
+        mut jd: crate::jitdriver::JitDriverStaticData,
         cpu: &mut dyn majit_backend::Backend,
     ) -> usize {
         let idx = self.jitdrivers_sd.len();
+        jd.index = Some(idx); // call.py:46-47 `jd.index = idx`
         self.jitdrivers_sd.push(jd);
         // `pyjitpl.py:2273-2281` — reattach the finish/exc descrs whenever
         // the jitdriver list changes so new drivers pick up the same
@@ -15716,8 +15845,8 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         {
             let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
-            sd.op_live = crate::jitcode::BC_LIVE as i32;
-            sd.op_catch_exception = crate::jitcode::BC_CATCH_EXCEPTION as i32;
+            sd.op_live = crate::jitcode::insns::BC_LIVE as i32;
+            sd.op_catch_exception = crate::jitcode::insns::BC_CATCH_EXCEPTION as i32;
             sd.op_rvmprof_code = -1;
         }
 
@@ -15741,8 +15870,8 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         {
             let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
-            sd.op_live = crate::jitcode::BC_LIVE as i32;
-            sd.op_catch_exception = crate::jitcode::BC_CATCH_EXCEPTION as i32;
+            sd.op_live = crate::jitcode::insns::BC_LIVE as i32;
+            sd.op_catch_exception = crate::jitcode::insns::BC_CATCH_EXCEPTION as i32;
             sd.op_rvmprof_code = -1;
         }
 
@@ -15765,7 +15894,7 @@ mod metainterp_static_data_tests {
     fn finishframe_exception_jumps_to_catch_handler() {
         let mut meta = MetaInterp::<()>::new(0);
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        jitcode.body_mut().code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 3, 0];
+        jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 3, 0];
         let jitcode = std::sync::Arc::new(jitcode);
 
         meta.framestack
@@ -15785,10 +15914,10 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
         jitcode.body_mut().code = vec![
-            crate::jitcode::BC_LIVE,
+            crate::jitcode::insns::BC_LIVE,
             0,
             0,
-            crate::jitcode::BC_CATCH_EXCEPTION,
+            crate::jitcode::insns::BC_CATCH_EXCEPTION,
             6,
             0,
         ];
@@ -15836,7 +15965,7 @@ mod metainterp_static_data_tests {
         // Expected: popframe() drops the callee, then BC_CATCH_EXCEPTION
         // in the caller routes control to the handler target.
         let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        caller_jitcode.body_mut().code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 5, 0];
+        caller_jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 5, 0];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);
 
         // Callee: non-CATCH opcode at pc 0. Use BC_LIVE (skip prefix)
@@ -15881,7 +16010,7 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
 
         let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        caller_jitcode.body_mut().code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 9, 0];
+        caller_jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 9, 0];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);
         let mut callee_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
         callee_jitcode.body_mut().code = vec![0xff, 0, 0];
@@ -16458,13 +16587,16 @@ mod metainterp_static_data_tests {
         // `asm.insns` so `setup_insns(asm.insns())` resolves the
         // pyre-static `BC_*` opnums dynamically (RPython parity:
         // `assembler.py:222 self.insns[key] = opnum`).
-        asm.register_insn("live/", crate::jitcode::BC_LIVE);
-        asm.register_insn("catch_exception/L", crate::jitcode::BC_CATCH_EXCEPTION);
-        asm.register_insn("rvmprof_code/ii", crate::jitcode::BC_RVMPROF_CODE);
-        asm.register_insn("int_return/i", crate::jitcode::BC_INT_RETURN);
-        asm.register_insn("ref_return/r", crate::jitcode::BC_REF_RETURN);
-        asm.register_insn("float_return/f", crate::jitcode::BC_FLOAT_RETURN);
-        asm.register_insn("void_return/", crate::jitcode::BC_VOID_RETURN);
+        asm.register_insn("live/", crate::jitcode::insns::BC_LIVE);
+        asm.register_insn(
+            "catch_exception/L",
+            crate::jitcode::insns::BC_CATCH_EXCEPTION,
+        );
+        asm.register_insn("rvmprof_code/ii", crate::jitcode::insns::BC_RVMPROF_CODE);
+        asm.register_insn("int_return/i", crate::jitcode::insns::BC_INT_RETURN);
+        asm.register_insn("ref_return/r", crate::jitcode::insns::BC_REF_RETURN);
+        asm.register_insn("float_return/f", crate::jitcode::insns::BC_FLOAT_RETURN);
+        asm.register_insn("void_return/", crate::jitcode::insns::BC_VOID_RETURN);
         let expected = asm.all_liveness().to_vec();
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -16473,32 +16605,32 @@ mod metainterp_static_data_tests {
         assert_eq!(meta.staticdata.liveness_info, expected);
         assert_eq!(
             meta.staticdata.op_live,
-            crate::jitcode::BC_LIVE as i32,
+            crate::jitcode::insns::BC_LIVE as i32,
             "install_canonical_liveness must seed op_live to pyre-static BC_LIVE",
         );
         assert_eq!(
             meta.staticdata.op_catch_exception,
-            crate::jitcode::BC_CATCH_EXCEPTION as i32,
+            crate::jitcode::insns::BC_CATCH_EXCEPTION as i32,
         );
         assert_eq!(
             meta.staticdata.op_rvmprof_code,
-            crate::jitcode::BC_RVMPROF_CODE as i32,
+            crate::jitcode::insns::BC_RVMPROF_CODE as i32,
         );
         assert_eq!(
             meta.staticdata.op_int_return,
-            crate::jitcode::BC_INT_RETURN as i32,
+            crate::jitcode::insns::BC_INT_RETURN as i32,
         );
         assert_eq!(
             meta.staticdata.op_ref_return,
-            crate::jitcode::BC_REF_RETURN as i32,
+            crate::jitcode::insns::BC_REF_RETURN as i32,
         );
         assert_eq!(
             meta.staticdata.op_float_return,
-            crate::jitcode::BC_FLOAT_RETURN as i32,
+            crate::jitcode::insns::BC_FLOAT_RETURN as i32,
         );
         assert_eq!(
             meta.staticdata.op_void_return,
-            crate::jitcode::BC_VOID_RETURN as i32,
+            crate::jitcode::insns::BC_VOID_RETURN as i32,
         );
     }
 
@@ -16513,6 +16645,26 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         let _share: std::sync::Arc<MetaInterpStaticData> = meta.staticdata.clone();
         meta.install_canonical_liveness(&Assembler::new());
+    }
+
+    #[test]
+    fn register_jitdriver_sd_stamps_index_back() {
+        // call.py:46-47 `jd.index = idx` — index written back into the
+        // descriptor at registration time, not left None.
+        let mut meta = MetaInterp::<()>::new(0);
+        let jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        let idx = {
+            let MetaInterp {
+                staticdata,
+                backend,
+                ..
+            } = &mut meta;
+            std::sync::Arc::get_mut(staticdata)
+                .unwrap()
+                .register_jitdriver_sd(jd, backend)
+        };
+        let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
+        assert_eq!(sd.jitdrivers_sd[idx].index, Some(idx));
     }
 }
 

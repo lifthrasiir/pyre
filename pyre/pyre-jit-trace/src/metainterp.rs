@@ -222,24 +222,35 @@ impl PyreMetaInterp {
                 // code, continuing until they reach a COMPILED loop's header.
                 // Without this, nested loop bridges close at the outer loop's
                 // header instead of the inner loop's.
-                if let Some(ref has_compiled) = ctx.has_compiled_targets_fn {
-                    // pyjitpl.py:2979: ptoken = self.get_procedure_token(greenboxes)
-                    // greenboxes = (code, pc) for the CURRENT frame's loop header.
-                    let w_code = self.framestack.last().unwrap().jitcode;
-                    let target_pc = match &action {
-                        TraceAction::CloseLoopWithArgs {
-                            loop_header_pc: Some(tp),
-                            ..
-                        } => *tp,
-                        _ => pc,
-                    };
-                    let gk = crate::driver::make_green_key(w_code, target_pc);
-                    if !has_compiled(gk) {
-                        // No compiled targets for this loop — continue tracing.
-                        // RPython: reached_loop_header returns without closing.
-                        let top = self.framestack.last_mut().unwrap();
-                        top.pc = pc;
-                        return LoopAction::Continue;
+                // pyjitpl.py:2978 `if not self.partial_trace:` — only
+                // bridge traces apply the close-loop skip when no
+                // compiled target exists for the current greenkey.
+                // Primary traces always close their first complete
+                // iteration regardless of has_compiled_targets, so
+                // gate on the explicit `is_bridge_trace` flag rather
+                // than `has_compiled_targets_fn` presence (which is
+                // installed at primary entry too as the auto-stamp
+                // gate input).
+                if ctx.is_bridge_trace {
+                    if let Some(ref has_compiled) = ctx.has_compiled_targets_fn {
+                        // pyjitpl.py:2979: ptoken = self.get_procedure_token(greenboxes)
+                        // greenboxes = (code, pc) for the CURRENT frame's loop header.
+                        let w_code = self.framestack.last().unwrap().jitcode;
+                        let target_pc = match &action {
+                            TraceAction::CloseLoopWithArgs {
+                                loop_header_pc: Some(tp),
+                                ..
+                            } => *tp,
+                            _ => pc,
+                        };
+                        let gk = crate::driver::make_green_key(w_code, target_pc);
+                        if !has_compiled(gk) {
+                            // No compiled targets for this loop — continue tracing.
+                            // RPython: reached_loop_header returns without closing.
+                            let top = self.framestack.last_mut().unwrap();
+                            top.pc = pc;
+                            return LoopAction::Continue;
+                        }
                     }
                 }
                 self.handle_close_loop(ctx, &action, pc);

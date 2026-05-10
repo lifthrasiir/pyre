@@ -90,7 +90,12 @@ where
         );
     }
     assert!(driver.is_tracing());
-    driver.merge_point(|ctx, sym| close_loop_with_increment_guard_failure!(ctx, sym));
+    driver.merge_point(|meta, sym| {
+        let ctx = meta
+            .trace_ctx()
+            .expect("merge_point invariant: tracing must be Some");
+        close_loop_with_increment_guard_failure!(ctx, sym)
+    });
 }
 
 fn assert_guard_failure_blackhole_outcome<S>(driver: &mut JitDriver<S>, key: u64, state: &mut S)

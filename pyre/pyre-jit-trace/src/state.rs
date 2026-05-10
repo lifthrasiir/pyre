@@ -6577,7 +6577,10 @@ mod tests {
         let live_patch = builder.live_placeholder();
         builder.patch_live_offset(live_patch, 0);
         let mut insns = std::collections::HashMap::new();
-        insns.insert("live/".to_string(), majit_metainterp::jitcode::BC_LIVE);
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
         crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
         let mut pyjit = crate::PyJitCode::skeleton(raw_code, code_ref, None);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());

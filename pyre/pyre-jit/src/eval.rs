@@ -2529,9 +2529,8 @@ fn jit_merge_point_hook(
         &mut jit_state,
         env,
         || {},
-        |ctx, sym| {
-            let (driver, _) = driver_pair();
-            driver.meta_interp_mut().tracing_call_depth = Some(current_depth);
+        |meta, sym| {
+            meta.tracing_call_depth = Some(current_depth);
             // RPython parity: codewriter.make_jitcodes() runs before tracing
             // starts, populating all_liveness. In pyre, JitCode compilation is
             // lazy — ensure the code's JitCode (with liveness) exists before
@@ -2539,7 +2538,7 @@ fn jit_merge_point_hook(
             crate::jit::codewriter::register_portal_jitdriver(code, frame.pycode, Some(pc));
             let snapshot = frame.snapshot_for_tracing();
             let _ = concrete_frame;
-            let (action, _executed_frame) = trace_bytecode(ctx, sym, code, pc, snapshot);
+            let (action, _executed_frame) = trace_bytecode(meta, sym, code, pc, snapshot);
             action
         },
     ) {
@@ -2665,11 +2664,15 @@ fn handle_fail(
     descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
     should_bridge: bool,
     owning_key: u64,
-    descr_addr: usize,
     exit_layout: &CompiledExitLayout,
     raw_values: &[i64],
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
+    // compile.py:780 `current_object_addr_as_int(self)` — descriptor
+    // identity used by `start_compiling` / `done_compiling` to flip
+    // `ResumeGuardDescr.status`'s ST_BUSY_FLAG.  Recover from the Arc
+    // each call rather than threading it through outer signatures.
+    let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
     // compile.py:702-703: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         let is_tracing = {
@@ -2920,7 +2923,6 @@ fn execute_assembler(
             ref descr_arc,
             should_bridge,
             owning_key,
-            descr_addr,
             ref raw_values,
             ref exit_layout,
         } => {
@@ -2932,7 +2934,6 @@ fn execute_assembler(
                 descr_arc,
                 should_bridge,
                 owning_key,
-                descr_addr,
                 exit_layout,
                 raw_values,
                 info,
@@ -3096,7 +3097,7 @@ fn bound_reached(
                 &mut jit_state,
                 env,
                 || {},
-                |ctx, sym| {
+                |meta, sym| {
                     use pyre_jit_trace::trace::trace_bytecode;
                     crate::jit::codewriter::register_portal_jitdriver(
                         code,
@@ -3105,7 +3106,7 @@ fn bound_reached(
                     );
                     let concrete_frame = frame.snapshot_for_tracing();
                     let (action, _) =
-                        trace_bytecode(ctx, sym, code, loop_header_pc, concrete_frame);
+                        trace_bytecode(meta, sym, code, loop_header_pc, concrete_frame);
                     action
                 },
             );
@@ -3163,7 +3164,6 @@ fn bound_reached(
             ref descr_arc,
             should_bridge,
             owning_key,
-            descr_addr,
             ref raw_values,
             ref exit_layout,
         } = outcome
@@ -3176,7 +3176,6 @@ fn bound_reached(
                 descr_arc,
                 should_bridge,
                 owning_key,
-                descr_addr,
                 exit_layout,
                 raw_values,
                 info,
@@ -3333,7 +3332,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref descr_arc,
             should_bridge,
             owning_key,
-            descr_addr,
             ref raw_values,
             ref exit_layout,
         } = outcome
@@ -3346,7 +3344,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 descr_arc,
                 should_bridge,
                 owning_key,
-                descr_addr,
                 exit_layout,
                 raw_values,
                 info,

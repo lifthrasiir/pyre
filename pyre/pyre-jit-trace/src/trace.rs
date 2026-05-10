@@ -5,11 +5,11 @@
 //! calls MIFrame::trace_code_step() for each bytecode, combining
 //! concrete execution and symbolic IR recording.
 
-use majit_metainterp::{TraceAction, TraceCtx};
+use majit_metainterp::{MetaInterp, TraceAction};
 use pyre_interpreter::CodeObject;
 
 use crate::metainterp::{MetaInterpFrame, PyreMetaInterp};
-use crate::state::PyreSym;
+use crate::state::{PyreMeta, PyreSym};
 
 /// Trace an entire loop body starting at `start_pc`.
 ///
@@ -18,12 +18,15 @@ use crate::state::PyreSym;
 /// loop calls MIFrame::trace_code_step() for each bytecode, combining
 /// concrete execution and symbolic IR recording.
 pub fn trace_bytecode(
-    ctx: &mut TraceCtx,
+    meta: &mut MetaInterp<PyreMeta>,
     sym: &mut PyreSym,
     _code: &CodeObject,
     start_pc: usize,
     mut concrete_frame: Box<pyre_interpreter::pyframe::PyFrame>,
 ) -> (TraceAction, Box<pyre_interpreter::pyframe::PyFrame>) {
+    let ctx = meta
+        .trace_ctx()
+        .expect("trace_bytecode invariant: meta.tracing must be Some during merge_point closure");
     // RPython MetaInterp._interpret() parity: root frame owns a concrete
     // PyFrame snapshot. MetaInterp drives both symbolic tracing AND
     // concrete execution — the interpreter does not run during tracing.

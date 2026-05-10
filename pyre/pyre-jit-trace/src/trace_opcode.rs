@@ -7277,13 +7277,16 @@ mod tests {
         all_liveness.extend(encode_liveness(&[1]));
         all_liveness.extend(encode_liveness(&[3]));
         let mut insns = HashMap::new();
-        insns.insert("live/".to_string(), majit_metainterp::jitcode::BC_LIVE);
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
         crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
 
         let runtime_jc = {
             let inner = majit_metainterp::jitcode::JitCode::new("get_list_of_active_boxes_test");
             inner.set_body(majit_translate::jitcode::JitCodeBody {
-                code: vec![majit_metainterp::jitcode::BC_LIVE, 0, 0],
+                code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
                 c_num_regs_i: 4,
                 c_num_regs_r: 4,
                 c_num_regs_f: 4,

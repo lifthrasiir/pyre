@@ -95,6 +95,14 @@ pub struct JitCodeBuilder {
     /// next instruction starts or `finish()` seals the code.
     pending_resulttype: Option<char>,
     has_abort: bool,
+    /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte —
+    /// captured by `jit_merge_point()` immediately before
+    /// `write_insn` pushes the opcode.  Propagated to
+    /// `JitCodeExecState::jit_merge_point_offset` at `finish()`.
+    /// `None` until `jit_merge_point()` is called; second call asserts
+    /// to mirror RPython's "exactly one jit_merge_point per portal
+    /// jitcode" invariant (`jtransform.py:1690-1712`).
+    jit_merge_point_offset: Option<usize>,
     /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`. RPython hands
     /// `fnaddr` to `JitCode.__init__` *before* the assembler fills the
     /// body; pyre stages it here through `set_fnaddr` so `finish()` can
@@ -738,6 +746,59 @@ impl JitCodeBuilder {
         self.push_u8(src as u8);
     }
 
+    /// Load an integer element from a GC-managed array.
+    ///
+    /// blackhole.py `bhimpl_getarrayitem_gc_i @arguments("r","i","d",returns="i")`:
+    /// reads `registers_r[array_reg]` as the array pointer,
+    /// `registers_i[index_reg]` as the element index, and `descrs[descr_idx]`
+    /// as the array descriptor; writes the result into `registers_i[dst]`.
+    ///
+    /// Encoding: `[BC_GETARRAYITEM_GC_I][array_reg u8][index_reg u8]
+    ///             [descr_idx lo u8][descr_idx hi u8][dst u8]`.
+    ///
+    /// Used by the dispatch JitCode body to encode `let opcode = program[pc]`
+    /// (pyopcode.py:171 `ord(co_code[next_instr])`).
+    pub fn getarrayitem_gc_i(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
+        self.touch_ref_reg(array_reg);
+        self.touch_reg(index_reg);
+        self.touch_reg(dst);
+        self.write_insn("getarrayitem_gc_i/rid>i");
+        self.push_reg_u8(array_reg, "getarrayitem_gc_i array");
+        self.push_reg_u8(index_reg, "getarrayitem_gc_i index");
+        self.push_u16(descr_idx);
+        self.push_reg_u8(dst, "getarrayitem_gc_i dst");
+    }
+
+    /// Add a GC-array descriptor for a byte-element array to the descrs pool.
+    ///
+    /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
+    /// The descriptor models a `u8`-element GC array — the `program: &[u8]`
+    /// bytecode slice used by the dispatch JitCode body.
+    ///
+    /// Deduped: multiple calls with the same shape return the same index.
+    ///
+    /// `itemsize=1` mirrors RPython `pypy/interpreter/pyopcode.py:171`
+    /// `ord(co_code[next_instr])` byte-load semantics. `is_item_signed=false`
+    /// because `ord()` yields a non-negative `0..=255` integer (zero-extend
+    /// to `i64`, never sign-extend); the `u8` SUB-INTERVAL property must
+    /// not be widened to a signed `i64` at the descr boundary or the
+    /// backend would emit `movsx` on byte loads ≥ `0x80` and corrupt
+    /// opcode dispatch.  `base_size=0` because Rust `&[u8]` data pointers
+    /// (codegen_trace.rs:193 `*const #env_type as *const ()`) point
+    /// directly at the first element without any GC header.
+    pub fn add_gc_byte_array_descr(&mut self) -> u16 {
+        self.add_bh_descr(CanonicalBhDescr::Array {
+            base_size: 0,
+            itemsize: 1,
+            type_id: 0,
+            item_type: majit_ir::value::Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            interior_fields: Vec::new(),
+        })
+    }
+
     /// RPython `blackhole.py:459-521` `bhimpl_int_*` per-opname handlers:
     /// each primitive has its own insn_id in `BlackholeInterpBuilder.insns`
     /// (`blackhole.py:52-81 setup_insns`). Emits via `write_insn` with
@@ -1274,6 +1335,19 @@ impl JitCodeBuilder {
         reds_r: &[u8],
         reds_f: &[u8],
     ) {
+        // Capture the bytecode offset of the OPCODE byte (before
+        // `write_insn` pushes it).  jtransform.py:1690-1712 emits exactly
+        // one `jit_merge_point` per portal jitcode; assert the second
+        // call so a double-emit lowerer bug fails loud rather than
+        // overwriting the offset and leaving the validator on the wrong
+        // payload.
+        assert!(
+            self.jit_merge_point_offset.is_none(),
+            "JitCodeBuilder::jit_merge_point called twice; \
+             jtransform.py:1690-1712 emits exactly one merge point per \
+             portal jitcode",
+        );
+        self.jit_merge_point_offset = Some(self.code.len());
         if (-128..=127).contains(&jdindex) {
             self.write_insn("jit_merge_point/cIRFIRF");
             self.push_u8((jdindex & 0xFF) as u8);
@@ -1553,7 +1627,7 @@ impl JitCodeBuilder {
         if let Some(caller_dst) = return_f {
             self.touch_float_reg(caller_dst);
         }
-        self.start_instr(jitcode::BC_INLINE_CALL);
+        self.start_instr(jitcode::insns::BC_INLINE_CALL);
         self.push_u16(sub_jitcode_idx);
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
@@ -1631,9 +1705,9 @@ impl JitCodeBuilder {
     ) {
         self.emit_canonical_call_void_via_target(
             (
-                jitcode::BC_RESIDUAL_CALL_R_V,
-                jitcode::BC_RESIDUAL_CALL_IR_V,
-                jitcode::BC_RESIDUAL_CALL_IRF_V,
+                jitcode::insns::BC_RESIDUAL_CALL_R_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
             ),
             fn_ptr_idx,
             arg_regs,
@@ -1656,9 +1730,9 @@ impl JitCodeBuilder {
     ) {
         let calldescr_idx = self.emit_canonical_call_void(
             (
-                jitcode::BC_RESIDUAL_CALL_R_V,
-                jitcode::BC_RESIDUAL_CALL_IR_V,
-                jitcode::BC_RESIDUAL_CALL_IRF_V,
+                jitcode::insns::BC_RESIDUAL_CALL_R_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
             ),
             funcptr,
             args,
@@ -1782,9 +1856,9 @@ impl JitCodeBuilder {
     ) {
         self.emit_canonical_call_void_via_target(
             (
-                jitcode::BC_RESIDUAL_CALL_R_V,
-                jitcode::BC_RESIDUAL_CALL_IR_V,
-                jitcode::BC_RESIDUAL_CALL_IRF_V,
+                jitcode::insns::BC_RESIDUAL_CALL_R_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
             ),
             fn_ptr_idx,
             arg_regs,
@@ -1811,9 +1885,9 @@ impl JitCodeBuilder {
     ) {
         self.emit_canonical_call_void_via_target(
             (
-                jitcode::BC_RESIDUAL_CALL_R_V,
-                jitcode::BC_RESIDUAL_CALL_IR_V,
-                jitcode::BC_RESIDUAL_CALL_IRF_V,
+                jitcode::insns::BC_RESIDUAL_CALL_R_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
             ),
             fn_ptr_idx,
             arg_regs,
@@ -1863,9 +1937,9 @@ impl JitCodeBuilder {
         );
         self.emit_canonical_call_void_via_target(
             (
-                jitcode::BC_RESIDUAL_CALL_R_V,
-                jitcode::BC_RESIDUAL_CALL_IR_V,
-                jitcode::BC_RESIDUAL_CALL_IRF_V,
+                jitcode::insns::BC_RESIDUAL_CALL_R_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
             ),
             fn_ptr_idx,
             arg_regs,
@@ -2046,9 +2120,9 @@ impl JitCodeBuilder {
     ) {
         self.emit_canonical_call_typed_via_target(
             (
-                jitcode::BC_RESIDUAL_CALL_R_I,
-                jitcode::BC_RESIDUAL_CALL_IR_I,
-                jitcode::BC_RESIDUAL_CALL_IRF_I,
+                jitcode::insns::BC_RESIDUAL_CALL_R_I,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_I,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_I,
             ),
             fn_ptr_idx,
             arg_regs,
@@ -2087,9 +2161,9 @@ impl JitCodeBuilder {
     ) {
         self.emit_canonical_call_typed_via_target(
             (
-                jitcode::BC_RESIDUAL_CALL_R_R,
-                jitcode::BC_RESIDUAL_CALL_IR_R,
-                jitcode::BC_RESIDUAL_CALL_IRF_R,
+                jitcode::insns::BC_RESIDUAL_CALL_R_R,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_R,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_R,
             ),
             fn_ptr_idx,
             arg_regs,
@@ -2132,7 +2206,7 @@ impl JitCodeBuilder {
         let funcptr_const_idx = self.add_const_i(funcptr);
         let calldescr_idx = self.add_call_descr(calldescr);
 
-        self.start_instr(jitcode::BC_RESIDUAL_CALL_IRF_F);
+        self.start_instr(jitcode::insns::BC_RESIDUAL_CALL_IRF_F);
         let funcptr_offset = self.code.len();
         self.push_u8(0);
         self.const_patches_u8
@@ -2426,9 +2500,9 @@ impl JitCodeBuilder {
     ) {
         let calldescr_idx = self.emit_canonical_call_typed(
             (
-                jitcode::BC_RESIDUAL_CALL_R_I,
-                jitcode::BC_RESIDUAL_CALL_IR_I,
-                jitcode::BC_RESIDUAL_CALL_IRF_I,
+                jitcode::insns::BC_RESIDUAL_CALL_R_I,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_I,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_I,
             ),
             funcptr,
             args,
@@ -2451,9 +2525,9 @@ impl JitCodeBuilder {
     ) {
         let calldescr_idx = self.emit_canonical_call_typed(
             (
-                jitcode::BC_RESIDUAL_CALL_R_R,
-                jitcode::BC_RESIDUAL_CALL_IR_R,
-                jitcode::BC_RESIDUAL_CALL_IRF_R,
+                jitcode::insns::BC_RESIDUAL_CALL_R_R,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_R,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_R,
             ),
             funcptr,
             args,
@@ -2486,7 +2560,7 @@ impl JitCodeBuilder {
     }
 
     pub fn call_assembler_void_typed_args(&mut self, target_idx: u16, arg_regs: &[JitCallArg]) {
-        self.call_assembler_void_like(jitcode::BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
+        self.call_assembler_void_like(jitcode::insns::BC_CALL_ASSEMBLER_VOID, target_idx, arg_regs);
     }
 
     pub fn call_assembler_int(&mut self, target_idx: u16, arg_regs: &[u16], dst: u16) {
@@ -2495,7 +2569,12 @@ impl JitCodeBuilder {
     }
 
     pub fn call_assembler_int_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_assembler_int_like(jitcode::BC_CALL_ASSEMBLER_INT, target_idx, arg_regs, dst);
+        self.call_assembler_int_like(
+            jitcode::insns::BC_CALL_ASSEMBLER_INT,
+            target_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     /// Parity #14 Slice C.4: Pure sibling of
@@ -2579,7 +2658,12 @@ impl JitCodeBuilder {
         typed_args: &[JitCallArg],
     ) {
         self.touch_reg(cond_reg);
-        self.call_cond_like(jitcode::BC_COND_CALL_VOID, fn_ptr_idx, cond_reg, typed_args);
+        self.call_cond_like(
+            jitcode::insns::BC_COND_CALL_VOID,
+            fn_ptr_idx,
+            cond_reg,
+            typed_args,
+        );
     }
 
     /// RPython: `conditional_call_value_ir_i(value, funcptr, calldescr, [i], [r])`
@@ -2593,7 +2677,7 @@ impl JitCodeBuilder {
         self.touch_reg(value_reg);
         self.touch_reg(dst);
         self.call_cond_value_like(
-            jitcode::BC_COND_CALL_VALUE_INT,
+            jitcode::insns::BC_COND_CALL_VALUE_INT,
             fn_ptr_idx,
             value_reg,
             typed_args,
@@ -2613,7 +2697,7 @@ impl JitCodeBuilder {
         self.touch_ref_reg(value_reg);
         self.touch_ref_reg(dst);
         self.call_cond_value_like(
-            jitcode::BC_COND_CALL_VALUE_REF,
+            jitcode::insns::BC_COND_CALL_VALUE_REF,
             fn_ptr_idx,
             value_reg,
             typed_args,
@@ -2631,7 +2715,7 @@ impl JitCodeBuilder {
     ) {
         self.touch_reg(result_reg);
         self.call_cond_like(
-            jitcode::BC_RECORD_KNOWN_RESULT_INT,
+            jitcode::insns::BC_RECORD_KNOWN_RESULT_INT,
             fn_ptr_idx,
             result_reg,
             typed_args,
@@ -2647,7 +2731,7 @@ impl JitCodeBuilder {
     ) {
         self.touch_ref_reg(result_reg);
         self.call_cond_like(
-            jitcode::BC_RECORD_KNOWN_RESULT_REF,
+            jitcode::insns::BC_RECORD_KNOWN_RESULT_REF,
             fn_ptr_idx,
             result_reg,
             typed_args,
@@ -2853,7 +2937,12 @@ impl JitCodeBuilder {
     }
 
     pub fn call_assembler_ref_typed(&mut self, target_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.call_assembler_ref_like(jitcode::BC_CALL_ASSEMBLER_REF, target_idx, arg_regs, dst);
+        self.call_assembler_ref_like(
+            jitcode::insns::BC_CALL_ASSEMBLER_REF,
+            target_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     // ── Float-typed builder methods ───────────────────────────
@@ -2961,7 +3050,12 @@ impl JitCodeBuilder {
         arg_regs: &[JitCallArg],
         dst: u16,
     ) {
-        self.call_assembler_float_like(jitcode::BC_CALL_ASSEMBLER_FLOAT, target_idx, arg_regs, dst);
+        self.call_assembler_float_like(
+            jitcode::insns::BC_CALL_ASSEMBLER_FLOAT,
+            target_idx,
+            arg_regs,
+            dst,
+        );
     }
 
     /// RPython `blackhole.py:696-719` `bhimpl_float_{add,sub,mul,truediv}`
@@ -3290,6 +3384,11 @@ impl JitCodeBuilder {
         jc.exec = super::JitCodeExecState {
             descrs: self.descrs,
             call_descr_to_call_target: self.call_descr_to_call_target,
+            // Propagate the captured `BC_JIT_MERGE_POINT(_C)` opcode
+            // offset so `register_dispatch_jitcode` validates the payload
+            // by direct seek instead of byte-stream scan
+            // (blackhole.py:107-156 argcode-based decode parity).
+            jit_merge_point_offset: self.jit_merge_point_offset,
         };
         // codewriter.py:68 `jitcode.index = index` — back-stamped by
         // `state::jitcode_for` at registration time. JitCode::new
@@ -3870,7 +3969,7 @@ mod tests {
         // Opcode byte (start_instr) + funcptr_reg(1) + countI(1)+regI(1)
         // + countR(1)+regR(1) + countF(1)+regF(1) + descr(2) = 10 bytes.
         let bytes = &jitcode.code[start..start + 10];
-        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IRF_V);
+        assert_eq!(bytes[0], jitcode::insns::BC_RESIDUAL_CALL_IRF_V);
         // funcptr_reg patched to num_regs_i + funcptr_const_idx (=0).
         assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
         assert_eq!(bytes[2], 1); // countI
@@ -3905,7 +4004,7 @@ mod tests {
         );
         let jitcode = builder.finish();
         let bytes = &jitcode.code[start..start + 6];
-        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_R_V);
+        assert_eq!(bytes[0], jitcode::insns::BC_RESIDUAL_CALL_R_V);
         // funcptr_reg post-regs slot.
         assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
         assert_eq!(bytes[2], 1); // countR
@@ -3934,7 +4033,7 @@ mod tests {
         );
         let jitcode = builder.finish();
         let bytes = &jitcode.code[start..start + 8];
-        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IR_V);
+        assert_eq!(bytes[0], jitcode::insns::BC_RESIDUAL_CALL_IR_V);
         assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
         assert_eq!(bytes[2], 1); // countI
         assert_eq!(bytes[3], 2); // regI
@@ -3979,7 +4078,7 @@ mod tests {
         // Opcode + funcptr_reg + countI + regI + countR + regR + countF
         // + regF + descr×2 + dst = 11 bytes.
         let bytes = &jitcode.code[start..start + 11];
-        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IRF_I);
+        assert_eq!(bytes[0], jitcode::insns::BC_RESIDUAL_CALL_IRF_I);
         assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
         assert_eq!(bytes[2], 1); // countI
         assert_eq!(bytes[3], 2); // regI
@@ -4024,7 +4123,7 @@ mod tests {
         // + countF(1) + descr(2) + dst(1) = 9 bytes for an int-only
         // float-returning call.
         let bytes = &jitcode.code[start..start + 9];
-        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IRF_F);
+        assert_eq!(bytes[0], jitcode::insns::BC_RESIDUAL_CALL_IRF_F);
         assert_eq!(bytes[1], jitcode.num_regs_i() as u8);
         assert_eq!(bytes[2], 1); // countI
         assert_eq!(bytes[3], 2); // regI
@@ -4052,7 +4151,7 @@ mod tests {
 
         let jitcode = builder.finish();
         let bytes = &jitcode.code[start..start + 8];
-        assert_eq!(bytes[0], jitcode::BC_RESIDUAL_CALL_IR_V);
+        assert_eq!(bytes[0], jitcode::insns::BC_RESIDUAL_CALL_IR_V);
         assert_eq!(bytes[2], 1); // countI
         assert_eq!(bytes[3], 2); // regI: grouped before refs
         assert_eq!(bytes[4], 1); // countR

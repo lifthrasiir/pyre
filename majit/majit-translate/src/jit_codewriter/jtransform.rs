@@ -914,6 +914,76 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
+            // RPython `jtransform.py:576-577`:
+            //   rewrite_op_int_floordiv = _do_builtin_call
+            //   rewrite_op_int_mod = _do_builtin_call
+            // `_do_builtin_call` replaces the `int_floordiv` / `int_mod`
+            // SpaceOperation with `direct_call(ll_int_py_div, ...)` /
+            // `direct_call(ll_int_py_mod, ...)` BEFORE jitcode emission,
+            // so RPython's `pipeline.insns` never carries the bare
+            // `int_floordiv/ii>i` / `int_mod/ii>i` opname and
+            // `blackhole.py` has no `bhimpl_int_floordiv` /
+            // `bhimpl_int_mod` to match.  pyre's front-end emits
+            // `BinOp { op: "mod" }` (and "floordiv" is reserved for the
+            // explicit floor-division shape) over `i64` operands from
+            // Rust's `%` / floor-div helpers; without this rewrite the
+            // assembler encoder
+            // (`jit_codewriter/assembler.rs:2778-2789`
+            // `format!("int_{op}")`) would emit the bare opname.
+            // Model after the `float_mod` → `ll_math_fmod` arm above:
+            // synthesize a `CallResidual` op routed to the helper with
+            // the matching `OopSpecIndex::IntPyMod` /
+            // `OopSpecIndex::IntPyDiv` and `ExtraEffect::ElidableCanRaise`
+            // (because integer `%` / `//` may raise `ZeroDivisionError`
+            // and `OverflowError` for `INT_MIN % -1` / `INT_MIN // -1`),
+            // matching `call.rs::INT_MOD_TARGETS` /
+            // `INT_FLOORDIV_TARGETS` registry entries.  The helpers
+            // (`majit_metainterp::blackhole::ll_int_py_mod` /
+            // `ll_int_py_div`) implement Python-floor semantics on top
+            // of Rust's truncating `wrapping_rem` / `wrapping_div`, so
+            // the rewrite preserves Python `%` / `//` behaviour at the
+            // residual-call level.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "mod" | "floordiv")
+                && self.get_value_kind(*lhs) == 'i'
+                && self.get_value_kind(*rhs) == 'i'
+                && *result_ty == ValueType::Int =>
+            {
+                let (helper_name, oopspec) = if binop_name == "mod" {
+                    ("int_mod", OopSpecIndex::IntPyMod)
+                } else {
+                    ("int_floordiv", OopSpecIndex::IntPyDiv)
+                };
+                let target = CallTarget::function_path([helper_name]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                let mut ops = Vec::with_capacity(3);
+                ops.push(funcptr_op);
+                ops.push(SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
+                            majit_ir::value::Type::Int,
+                            EffectInfo::new(ExtraEffect::ElidableCanRaise, oopspec),
+                        ),
+                        args_i: vec![*lhs, *rhs],
+                        args_r: vec![],
+                        args_f: vec![],
+                        result_kind: 'i',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
             // pyre front-end uses Rust's syn::BinOp / syn::UnOp identifiers
             // (`add_assign`, `deref`) which have no RPython counterpart —
             // RPython's flow-space never sees Python-level `+=` or `*x` as

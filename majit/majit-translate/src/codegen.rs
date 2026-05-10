@@ -941,7 +941,7 @@ pub fn generated_binary_int_value(
     // With `EF_ELIDABLE_CANNOT_RAISE` the trace has no
     // `GUARD_NO_EXCEPTION` for this call, so these guards are the
     // only barrier between a re-used trace and an unsafe
-    // `bhimpl_int_floordiv` / `bhimpl_int_mod` invocation: the
+    // `ll_int_py_div` / `ll_int_py_mod` invocation: the
     // helpers are now `wrapping_div` / `wrapping_rem` precondition
     // wrappers (`blackhole.rs:5785/5802`), so a zero divisor is
     // undefined behaviour in release and panics in debug, and
@@ -982,12 +982,12 @@ pub fn generated_binary_int_value(
             let (lhs_val, rhs_val) =
                 concrete.expect("IntFloorDiv concrete check passed above");
             let func_ptr =
-                majit_metainterp::blackhole::bhimpl_int_floordiv as *const ();
+                majit_metainterp::blackhole::ll_int_py_div as *const ();
             // The runtime guards above ensure `rhs != 0` and
             // `not (lhs == INT_MIN && rhs == -1)` for the recorded
             // trace; safe to invoke the helper concretely here.
             let concrete_result =
-                majit_metainterp::blackhole::bhimpl_int_floordiv(lhs_val, rhs_val);
+                majit_metainterp::blackhole::ll_int_py_div(lhs_val, rhs_val);
             ctx.call_typed_with_effect_pure(
                 OpCode::CallI,
                 func_ptr,
@@ -1006,9 +1006,9 @@ pub fn generated_binary_int_value(
         OpCode::IntMod => {
             let (lhs_val, rhs_val) =
                 concrete.expect("IntMod concrete check passed above");
-            let func_ptr = majit_metainterp::blackhole::bhimpl_int_mod as *const ();
+            let func_ptr = majit_metainterp::blackhole::ll_int_py_mod as *const ();
             let concrete_result =
-                majit_metainterp::blackhole::bhimpl_int_mod(lhs_val, rhs_val);
+                majit_metainterp::blackhole::ll_int_py_mod(lhs_val, rhs_val);
             ctx.call_typed_with_effect_pure(
                 OpCode::CallI,
                 func_ptr,
