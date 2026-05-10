@@ -73,6 +73,23 @@ pub fn call_depth() -> u32 {
     CALL_DEPTH.with(|d| d.get())
 }
 
+/// Increment call depth and return an RAII guard that decrements on drop.
+/// Used by _flat_pycall to match call_user_function's depth tracking.
+#[inline(always)]
+pub fn increment_call_depth() -> CallDepthGuardPublic {
+    CALL_DEPTH.with(|d| d.set(d.get() + 1));
+    CallDepthGuardPublic
+}
+
+/// RAII guard that decrements CALL_DEPTH on drop.
+pub struct CallDepthGuardPublic;
+impl Drop for CallDepthGuardPublic {
+    #[inline(always)]
+    fn drop(&mut self) {
+        CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// RAII guard that decrements CALL_DEPTH on drop.
 struct CallDepthGuard;
 impl Drop for CallDepthGuard {
@@ -85,6 +102,18 @@ impl Drop for CallDepthGuard {
 /// Register the JIT-aware eval function. Called by pyre-jit at startup.
 pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
+}
+
+/// Get the current eval function (JIT-aware if registered, plain otherwise).
+/// Respects the force-plain-eval mode.
+#[inline]
+pub fn get_eval_fn() -> fn(&mut PyFrame) -> PyResult {
+    let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
+    if plain_mode {
+        eval_frame_plain
+    } else {
+        EVAL_OVERRIDE.get().copied().unwrap_or(eval_frame_plain)
+    }
 }
 
 // ── JIT parameter injection ──────────────────────────────────────
