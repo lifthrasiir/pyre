@@ -4,14 +4,16 @@
 /// When tracing is active, every interpreter operation is fed to the
 /// recorder, which builds a linear sequence of IR operations (a trace).
 ///
-/// Upstream counterpart: `rpython/jit/metainterp/history.py:714 class History`
-/// (`record_nospec` / `record_same_as` / `record_aborted` etc.).  Pyre
-/// callers reach the recorder via `MetaInterp.history.record*` mirroring
+/// Upstream counterpart: `rpython/jit/metainterp/opencoder.py class Trace`
+/// (raw op storage, `record_op`, `cut_point`, `cut_at`, `set_inputargs`).
+/// The higher-level `History` wrapper (history.py:714) that creates
+/// FrontendOps and provides `record_nospec` / `record_same_as` lives in
+/// `history.rs` as `impl TraceCtx`.  Pyre callers reach the recorder via
+/// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::r#box::BoxRef;
-use crate::history::TreeLoop;
 
 /// opencoder.py:567-568 `cut_point()` — RPython 5-tuple
 /// `(_pos, _count, _index, len(_snapshot_data), len(_snapshot_array_data))`.
@@ -377,18 +379,24 @@ impl Trace {
         }
     }
 
-    /// Return the completed trace.
-    /// The recorder is consumed; no further operations can be recorded.
+    /// Consume the recorder and return its parts: (inputargs, ops, box_pool).
     ///
-    /// Snapshots (pyre-only Vec<Snapshot> side table) live on `TraceCtx`;
-    /// callers that need them assemble via `TreeLoop::with_snapshots`
-    /// directly — see `TraceCtx::into_tree_loop`.
-    pub fn get_trace(self) -> TreeLoop {
-        // H-3.0a: hand the BoxRef pool over so the optimizer sees the
-        // same `Rc<Box>` allocations that were created during recording.
-        // RPython parity: `AbstractResOp` / `AbstractInputArg` objects
-        // live unchanged from the tracer through optimization.
-        TreeLoop::with_box_pool(self.inputargs, self.ops, Vec::new(), self.box_pool)
+    /// history.py parity: the recording phase ends and the trace is handed
+    /// to the optimizer as a `TreeLoop`. Callers use
+    /// `TreeLoop::from(recorder)` (history.rs `From<Trace>`) to produce the
+    /// completed loop — see `TraceCtx::into_tree_loop` for the snapshot-
+    /// bearing path.
+    pub fn into_parts(self) -> (Vec<InputArg>, Vec<Op>, crate::r#box::BoxPool) {
+        (self.inputargs, self.ops, self.box_pool)
+    }
+
+    /// Convenience: consume the recorder and produce a `TreeLoop`.
+    ///
+    /// Delegates to `TreeLoop::from(self)` (history.rs `From<Trace>` impl).
+    /// Snapshots are NOT included — callers that need them should use
+    /// `TraceCtx::into_tree_loop` instead.
+    pub fn get_trace(self) -> crate::history::TreeLoop {
+        crate::history::TreeLoop::from(self)
     }
 
     /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
@@ -1103,110 +1111,6 @@ mod tests {
         rec.record_input_arg(Type::Int);
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // History / TreeLoop parity tests
-    // Ported from rpython/jit/metainterp/test/test_history.py
-    // ══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_trace_has_inputargs_ops_structure() {
-        // Parity: TreeLoop has inputargs and operations.
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let i1 = rec.record_input_arg(Type::Int);
-
-        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
-
-        rec.close_loop(&[sub, i1]);
-        let trace = rec.get_trace();
-
-        // inputargs
-        assert_eq!(trace.num_inputargs(), 2);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Int);
-
-        // ops: IntAdd, IntSub, Jump
-        assert_eq!(trace.num_ops(), 3);
-        assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
-        assert_eq!(trace.ops[2].opcode, OpCode::Jump);
-    }
-
-    #[test]
-    fn test_trace_guards_have_fail_args() {
-        // Parity: guards in a trace carry fail_args.
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let i1 = rec.record_input_arg(Type::Int);
-
-        let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
-        let descr = make_fail_descr(0);
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
-
-        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        rec.close_loop(&[add, i1]);
-
-        let trace = rec.get_trace();
-        let guards: Vec<_> = trace.iter_guards().collect();
-        assert_eq!(guards.len(), 1);
-
-        let fail_args = guards[0].fail_args.as_ref().unwrap();
-        assert_eq!(fail_args.len(), 2);
-        assert_eq!(fail_args[0], i0);
-        assert_eq!(fail_args[1], i1);
-    }
-
-    #[test]
-    fn test_trace_iter_ops() {
-        // Parity: can iterate over all ops.
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        rec.record_op(OpCode::IntSub, &[iop(1), i0]);
-        rec.close_loop(&[iop(2)]);
-
-        let trace = rec.get_trace();
-        let opcodes: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
-        assert_eq!(opcodes, vec![OpCode::IntAdd, OpCode::IntSub, OpCode::Jump]);
-    }
-
-    #[test]
-    fn test_trace_mixed_types() {
-        // Parity: traces can have mixed-type inputargs (int, ref, float).
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let r0 = rec.record_input_arg(Type::Ref);
-        let f0 = rec.record_input_arg(Type::Float);
-
-        let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        rec.close_loop(&[i1, r0, f0]);
-
-        let trace = rec.get_trace();
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
-        assert!(trace.is_loop());
-    }
-
-    #[test]
-    fn test_trace_pos_matches_opref() {
-        // Parity: each op's .pos matches the OpRef returned by record_op.
-        let mut rec = Trace::new();
-        let i0 = rec.record_input_arg(Type::Int);
-        let i1 = rec.record_input_arg(Type::Int);
-
-        let ref0 = rec.record_op(OpCode::IntAdd, &[i0, i1]);
-        let ref1 = rec.record_op(OpCode::IntMul, &[ref0, i1]);
-        let ref2 = rec.record_op(OpCode::IntSub, &[ref1, ref0]);
-
-        rec.close_loop(&[ref2, i1]);
-        let trace = rec.get_trace();
-
-        assert_eq!(trace.ops[0].pos, ref0);
-        assert_eq!(trace.ops[1].pos, ref1);
-        assert_eq!(trace.ops[2].pos, ref2);
-    }
 
     // ══════════════════════════════════════════════════════════════════
     // Opencoder breadth tests — deeper parity with test_opencoder.py

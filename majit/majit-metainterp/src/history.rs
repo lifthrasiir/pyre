@@ -9,12 +9,21 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
 
-/// RPython `History` parity alias for `TreeLoop`.
+/// history.py:714 `class History` → `TreeLoop` conversion.
 ///
-/// The Rust implementation keeps the historical `TreeLoop` name for naming
-/// consistency with `rpython/jit/metainterp/pyjitpl.py` internals, while
-/// `History` is retained for direct RPython call-site parity.
-pub type History = TreeLoop;
+/// RPython's `History` wraps an `opencoder.Trace` during recording; when
+/// the recording phase ends, downstream code accesses the trace as a
+/// `TreeLoop` (via `history.trace.get_iter()`).  In Pyre the recorder
+/// (`recorder::Trace`) is consumed into a `TreeLoop` through this `From`
+/// impl, mirroring that transition.  Snapshots are NOT carried by the
+/// recorder — callers that need them use `TreeLoop::with_box_pool`
+/// directly (see `TraceCtx::into_tree_loop`).
+impl From<crate::recorder::Trace> for TreeLoop {
+    fn from(trace: crate::recorder::Trace) -> Self {
+        let (inputargs, ops, box_pool) = trace.into_parts();
+        TreeLoop::with_box_pool(inputargs, ops, Vec::new(), box_pool)
+    }
+}
 
 /// Cut position for a materialized `TreeLoop`.
 ///
@@ -1331,6 +1340,139 @@ mod tests {
         // Verify remapping chain: v2's arg should reference re-emitted v1
         assert_eq!(cut.ops[1].args[0], iop(1)); // v1 → prefix idx 0 → BoxInt at position 1
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // History / TreeLoop parity tests
+    // Ported from rpython/jit/metainterp/test/test_history.py
+    // (moved from recorder.rs — these test history.py TreeLoop behaviour)
+    // ══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_trace_has_inputargs_ops_structure() {
+        use crate::recorder::Trace;
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
+
+        rec.close_loop(&[sub, i1]);
+        let trace = rec.get_trace();
+
+        assert_eq!(trace.num_inputargs(), 2);
+        assert_eq!(trace.inputargs[0].tp, Type::Int);
+        assert_eq!(trace.inputargs[1].tp, Type::Int);
+
+        assert_eq!(trace.num_ops(), 3);
+        assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
+        assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
+        assert_eq!(trace.ops[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn test_trace_guards_have_fail_args() {
+        use crate::recorder::Trace;
+        use majit_ir::{DescrRef, FailDescr};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct TestFailDescr(u32);
+        impl majit_ir::Descr for TestFailDescr {
+            fn index(&self) -> u32 { self.0 }
+            fn as_fail_descr(&self) -> Option<&dyn FailDescr> { Some(self) }
+        }
+        impl FailDescr for TestFailDescr {
+            fn fail_index(&self) -> u32 { self.0 }
+            fn fail_arg_types(&self) -> &[Type] { &[] }
+        }
+
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
+        let descr: DescrRef = Arc::new(TestFailDescr(0));
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
+
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        rec.close_loop(&[add, i1]);
+
+        let trace = rec.get_trace();
+        let guards: Vec<_> = trace.iter_guards().collect();
+        assert_eq!(guards.len(), 1);
+
+        let fail_args = guards[0].fail_args.as_ref().unwrap();
+        assert_eq!(fail_args.len(), 2);
+        assert_eq!(fail_args[0], i0);
+        assert_eq!(fail_args[1], i1);
+    }
+
+    #[test]
+    fn test_trace_iter_ops() {
+        use crate::recorder::Trace;
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        rec.record_op(OpCode::IntSub, &[iop(1), i0]);
+        rec.close_loop(&[iop(2)]);
+
+        let trace = rec.get_trace();
+        let opcodes: Vec<_> = trace.iter_ops().map(|op| op.opcode).collect();
+        assert_eq!(opcodes, vec![OpCode::IntAdd, OpCode::IntSub, OpCode::Jump]);
+    }
+
+    #[test]
+    fn test_trace_mixed_types() {
+        use crate::recorder::Trace;
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let r0 = rec.record_input_arg(Type::Ref);
+        let f0 = rec.record_input_arg(Type::Float);
+
+        let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
+        rec.close_loop(&[i1, r0, f0]);
+
+        let trace = rec.get_trace();
+        assert_eq!(trace.inputargs[0].tp, Type::Int);
+        assert_eq!(trace.inputargs[1].tp, Type::Ref);
+        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert!(trace.is_loop());
+    }
+
+    #[test]
+    fn test_trace_pos_matches_opref() {
+        use crate::recorder::Trace;
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+
+        let ref0 = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        let ref1 = rec.record_op(OpCode::IntMul, &[ref0, i1]);
+        let ref2 = rec.record_op(OpCode::IntSub, &[ref1, ref0]);
+
+        rec.close_loop(&[ref2, i1]);
+        let trace = rec.get_trace();
+
+        assert_eq!(trace.ops[0].pos, ref0);
+        assert_eq!(trace.ops[1].pos, ref1);
+        assert_eq!(trace.ops[2].pos, ref2);
+    }
+
+    #[test]
+    fn test_from_trace_for_tree_loop() {
+        use crate::recorder::Trace;
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        let i1 = rec.record_input_arg(Type::Int);
+        let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
+        rec.close_loop(&[add, i1]);
+
+        let trace: TreeLoop = rec.into();
+        assert_eq!(trace.num_inputargs(), 2);
+        assert_eq!(trace.num_ops(), 2);
+        assert!(trace.is_loop());
+    }
 }
 
 // ── TraceCtx recording API (History role) ───────────────────────────────
@@ -1705,15 +1847,15 @@ impl TraceCtx {
     /// come from the TraceCtx-owned side table (Task #70 moved them off
     /// `recorder::Trace`); the recorder contributes only inputargs + ops.
     pub fn into_tree_loop(self) -> crate::history::TreeLoop {
-        let recorder_trace = self.recorder.get_trace();
         // H-3.0a: forward the recorder's BoxRef pool so the optimizer
         // sees the same `Rc<Box>` allocations created during tracing —
         // RPython parity for `AbstractValue` object identity.
+        let (inputargs, ops, box_pool) = self.recorder.into_parts();
         crate::history::TreeLoop::with_box_pool(
-            recorder_trace.inputargs,
-            recorder_trace.ops,
+            inputargs,
+            ops,
             self.snapshots,
-            recorder_trace.box_pool,
+            box_pool,
         )
     }
 
