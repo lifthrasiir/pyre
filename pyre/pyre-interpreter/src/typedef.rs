@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use pyre_object::pyobject::*;
 use pyre_object::*;
 
-use crate::{DictStorage, dict_storage_store, make_builtin_function};
+use crate::{DictStorage, dict_storage_store, make_builtin_function, make_builtin_function_with_arity};
 
 /// Compatibility stand-ins for PyPy `typedef.py` API (type descriptor helpers).
 #[derive(Debug, Default)]
@@ -757,12 +757,12 @@ fn init_ellipsis_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__repr__",
-        make_builtin_function("__repr__", |_args| Ok(w_str_new("Ellipsis"))),
+        make_builtin_function_with_arity("__repr__", |_args| Ok(w_str_new("Ellipsis")), 1),
     );
     dict_storage_store(
         ns,
         "__reduce__",
-        make_builtin_function("__reduce__", |_args| Ok(w_str_new("Ellipsis"))),
+        make_builtin_function_with_arity("__reduce__", |_args| Ok(w_str_new("Ellipsis")), 1),
     );
 }
 
@@ -781,21 +781,21 @@ fn init_notimplemented_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__repr__",
-        make_builtin_function("__repr__", |_args| Ok(w_str_new("NotImplemented"))),
+        make_builtin_function_with_arity("__repr__", |_args| Ok(w_str_new("NotImplemented")), 1),
     );
     dict_storage_store(
         ns,
         "__reduce__",
-        make_builtin_function("__reduce__", |_args| Ok(w_str_new("NotImplemented"))),
+        make_builtin_function_with_arity("__reduce__", |_args| Ok(w_str_new("NotImplemented")), 1),
     );
     // special.py:28-33 descr_bool
     dict_storage_store(
         ns,
         "__bool__",
-        make_builtin_function("__bool__", |_args| {
+        make_builtin_function_with_arity("__bool__", |_args| {
             crate::warn::warn_deprecation("NotImplemented should not be used in a boolean context");
             Ok(pyre_object::boolobject::w_bool_from(true))
-        }),
+        }, 1),
     );
 }
 
@@ -1117,22 +1117,22 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "append",
-        make_builtin_function("append", crate::type_methods::list_method_append),
+        make_builtin_function_with_arity("append", crate::type_methods::list_method_append, 2),
     );
     dict_storage_store(
         ns,
         "extend",
-        make_builtin_function("extend", crate::type_methods::list_method_extend),
+        make_builtin_function_with_arity("extend", crate::type_methods::list_method_extend, 2),
     );
     dict_storage_store(
         ns,
         "copy",
-        make_builtin_function("copy", crate::type_methods::list_method_copy),
+        make_builtin_function_with_arity("copy", crate::type_methods::list_method_copy, 1),
     );
     dict_storage_store(
         ns,
         "insert",
-        make_builtin_function("insert", crate::type_methods::list_method_insert),
+        make_builtin_function_with_arity("insert", crate::type_methods::list_method_insert, 3),
     );
     dict_storage_store(
         ns,
@@ -1142,12 +1142,12 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "clear",
-        make_builtin_function("clear", crate::type_methods::list_method_clear),
+        make_builtin_function_with_arity("clear", crate::type_methods::list_method_clear, 1),
     );
     dict_storage_store(
         ns,
         "reverse",
-        make_builtin_function("reverse", crate::type_methods::list_method_reverse),
+        make_builtin_function_with_arity("reverse", crate::type_methods::list_method_reverse, 1),
     );
     dict_storage_store(
         ns,
@@ -1162,12 +1162,12 @@ fn init_list_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "count",
-        make_builtin_function("count", crate::type_methods::list_method_count),
+        make_builtin_function_with_arity("count", crate::type_methods::list_method_count, 2),
     );
     dict_storage_store(
         ns,
         "remove",
-        make_builtin_function("remove", crate::type_methods::list_method_remove),
+        make_builtin_function_with_arity("remove", crate::type_methods::list_method_remove, 2),
     );
 }
 
@@ -1179,7 +1179,7 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "join",
-        make_builtin_function("join", crate::type_methods::str_method_join),
+        make_builtin_function_with_arity("join", crate::type_methods::str_method_join, 2),
     );
     dict_storage_store(
         ns,
@@ -1229,12 +1229,12 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "upper",
-        make_builtin_function("upper", crate::type_methods::str_method_upper),
+        make_builtin_function_with_arity("upper", crate::type_methods::str_method_upper, 1),
     );
     dict_storage_store(
         ns,
         "lower",
-        make_builtin_function("lower", crate::type_methods::str_method_lower),
+        make_builtin_function_with_arity("lower", crate::type_methods::str_method_lower, 1),
     );
     dict_storage_store(
         ns,
@@ -1249,37 +1249,37 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "isdigit",
-        make_builtin_function("isdigit", crate::type_methods::str_method_isdigit),
+        make_builtin_function_with_arity("isdigit", crate::type_methods::str_method_isdigit, 1),
     );
     dict_storage_store(
         ns,
         "isdecimal",
-        make_builtin_function("isdecimal", crate::type_methods::str_method_isdecimal),
+        make_builtin_function_with_arity("isdecimal", crate::type_methods::str_method_isdecimal, 1),
     );
     dict_storage_store(
         ns,
         "isnumeric",
-        make_builtin_function("isnumeric", crate::type_methods::str_method_isnumeric),
+        make_builtin_function_with_arity("isnumeric", crate::type_methods::str_method_isnumeric, 1),
     );
     dict_storage_store(
         ns,
         "istitle",
-        make_builtin_function("istitle", crate::type_methods::str_method_istitle),
+        make_builtin_function_with_arity("istitle", crate::type_methods::str_method_istitle, 1),
     );
     dict_storage_store(
         ns,
         "isalpha",
-        make_builtin_function("isalpha", crate::type_methods::str_method_isalpha),
+        make_builtin_function_with_arity("isalpha", crate::type_methods::str_method_isalpha, 1),
     );
     dict_storage_store(
         ns,
         "isidentifier",
-        make_builtin_function("isidentifier", crate::type_methods::str_method_isidentifier),
+        make_builtin_function_with_arity("isidentifier", crate::type_methods::str_method_isidentifier, 1),
     );
     dict_storage_store(
         ns,
         "zfill",
-        make_builtin_function("zfill", crate::type_methods::str_method_zfill),
+        make_builtin_function_with_arity("zfill", crate::type_methods::str_method_zfill, 2),
     );
     dict_storage_store(
         ns,
@@ -1294,17 +1294,17 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "title",
-        make_builtin_function("title", crate::type_methods::str_method_title),
+        make_builtin_function_with_arity("title", crate::type_methods::str_method_title, 1),
     );
     dict_storage_store(
         ns,
         "capitalize",
-        make_builtin_function("capitalize", crate::type_methods::str_method_capitalize),
+        make_builtin_function_with_arity("capitalize", crate::type_methods::str_method_capitalize, 1),
     );
     dict_storage_store(
         ns,
         "swapcase",
-        make_builtin_function("swapcase", crate::type_methods::str_method_swapcase),
+        make_builtin_function_with_arity("swapcase", crate::type_methods::str_method_swapcase, 1),
     );
     dict_storage_store(
         ns,
@@ -1324,37 +1324,37 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "isspace",
-        make_builtin_function("isspace", crate::type_methods::str_method_isspace),
+        make_builtin_function_with_arity("isspace", crate::type_methods::str_method_isspace, 1),
     );
     dict_storage_store(
         ns,
         "isupper",
-        make_builtin_function("isupper", crate::type_methods::str_method_isupper),
+        make_builtin_function_with_arity("isupper", crate::type_methods::str_method_isupper, 1),
     );
     dict_storage_store(
         ns,
         "islower",
-        make_builtin_function("islower", crate::type_methods::str_method_islower),
+        make_builtin_function_with_arity("islower", crate::type_methods::str_method_islower, 1),
     );
     dict_storage_store(
         ns,
         "isalnum",
-        make_builtin_function("isalnum", crate::type_methods::str_method_isalnum),
+        make_builtin_function_with_arity("isalnum", crate::type_methods::str_method_isalnum, 1),
     );
     dict_storage_store(
         ns,
         "isascii",
-        make_builtin_function("isascii", crate::type_methods::str_method_isascii),
+        make_builtin_function_with_arity("isascii", crate::type_methods::str_method_isascii, 1),
     );
     dict_storage_store(
         ns,
         "partition",
-        make_builtin_function("partition", crate::type_methods::str_method_partition),
+        make_builtin_function_with_arity("partition", crate::type_methods::str_method_partition, 2),
     );
     dict_storage_store(
         ns,
         "rpartition",
-        make_builtin_function("rpartition", crate::type_methods::str_method_rpartition),
+        make_builtin_function_with_arity("rpartition", crate::type_methods::str_method_rpartition, 2),
     );
     dict_storage_store(
         ns,
@@ -1364,12 +1364,12 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "removeprefix",
-        make_builtin_function("removeprefix", crate::type_methods::str_method_removeprefix),
+        make_builtin_function_with_arity("removeprefix", crate::type_methods::str_method_removeprefix, 2),
     );
     dict_storage_store(
         ns,
         "removesuffix",
-        make_builtin_function("removesuffix", crate::type_methods::str_method_removesuffix),
+        make_builtin_function_with_arity("removesuffix", crate::type_methods::str_method_removesuffix, 2),
     );
     dict_storage_store(
         ns,
@@ -1379,80 +1379,80 @@ fn init_str_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "translate",
-        make_builtin_function("translate", crate::type_methods::str_method_translate),
+        make_builtin_function_with_arity("translate", crate::type_methods::str_method_translate, 2),
     );
     // str dunder methods
     dict_storage_store(
         ns,
         "__contains__",
-        make_builtin_function("__contains__", |args| {
+        make_builtin_function_with_arity("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
             Ok(pyre_object::w_bool_from(
                 crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
             ))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__len__",
-        make_builtin_function("__len__", |args| {
+        make_builtin_function_with_arity("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
             crate::baseobjspace::len(args[0])
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__getitem__",
-        make_builtin_function("__getitem__", |args| {
+        make_builtin_function_with_arity("__getitem__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__getitem__"));
             }
             crate::baseobjspace::getitem(args[0], args[1])
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function("__iter__", |args| {
+        make_builtin_function_with_arity("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
             crate::baseobjspace::iter(args[0])
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__add__",
-        make_builtin_function("__add__", |args| {
+        make_builtin_function_with_arity("__add__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__add__"));
             }
             crate::baseobjspace::add(args[0], args[1])
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__mul__",
-        make_builtin_function("__mul__", |args| {
+        make_builtin_function_with_arity("__mul__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mul__"));
             }
             crate::baseobjspace::mul(args[0], args[1])
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__mod__",
-        make_builtin_function("__mod__", |args| {
+        make_builtin_function_with_arity("__mod__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__mod__"));
             }
             crate::baseobjspace::mod_(args[0], args[1])
-        }),
+        }, 2),
     );
     // maketrans — PyPy: unicodeobject.py descr_maketrans
     dict_storage_store(
@@ -1586,17 +1586,17 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "keys",
-        make_builtin_function("keys", crate::type_methods::dict_method_keys),
+        make_builtin_function_with_arity("keys", crate::type_methods::dict_method_keys, 1),
     );
     dict_storage_store(
         ns,
         "values",
-        make_builtin_function("values", crate::type_methods::dict_method_values),
+        make_builtin_function_with_arity("values", crate::type_methods::dict_method_values, 1),
     );
     dict_storage_store(
         ns,
         "items",
-        make_builtin_function("items", crate::type_methods::dict_method_items),
+        make_builtin_function_with_arity("items", crate::type_methods::dict_method_items, 1),
     );
     dict_storage_store(
         ns,
@@ -1616,7 +1616,7 @@ fn init_dict_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__setitem__",
-        make_builtin_function("__setitem__", |args| {
+        make_builtin_function_with_arity("__setitem__", |args| {
             if args.len() < 3 {
                 return Err(crate::PyError::type_error("__setitem__ requires 3 args"));
             }
@@ -1634,12 +1634,12 @@ fn init_dict_type(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_none())
-        }),
+        }, 3),
     );
     dict_storage_store(
         ns,
         "__getitem__",
-        make_builtin_function("__getitem__", |args| {
+        make_builtin_function_with_arity("__getitem__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__getitem__ requires 2 args"));
             }
@@ -1656,12 +1656,12 @@ fn init_dict_type(ns: &mut DictStorage) {
                 }
             }
             crate::baseobjspace::getitem(args[0], args[1])
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__contains__",
-        make_builtin_function("__contains__", |args| {
+        make_builtin_function_with_arity("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -1675,12 +1675,12 @@ fn init_dict_type(ns: &mut DictStorage) {
             Ok(pyre_object::w_bool_from(
                 crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
             ))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__len__",
-        make_builtin_function("__len__", |args| {
+        make_builtin_function_with_arity("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
@@ -1691,12 +1691,12 @@ fn init_dict_type(ns: &mut DictStorage) {
                 ));
             }
             crate::baseobjspace::len(args[0])
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function("__iter__", |args| {
+        make_builtin_function_with_arity("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
@@ -1706,49 +1706,49 @@ fn init_dict_type(ns: &mut DictStorage) {
                 return crate::baseobjspace::iter(dict);
             }
             crate::baseobjspace::iter(args[0])
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__delitem__",
-        make_builtin_function("__delitem__", |args| {
+        make_builtin_function_with_arity("__delitem__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__delitem__ requires 2 args"));
             }
             crate::baseobjspace::delitem(args[0], args[1])?;
             Ok(pyre_object::w_none())
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__eq__",
-        make_builtin_function("__eq__", |args| {
+        make_builtin_function_with_arity("__eq__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
             crate::baseobjspace::compare(args[0], args[1], crate::baseobjspace::CompareOp::Eq)
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__or__",
-        make_builtin_function("__or__", |args| {
+        make_builtin_function_with_arity("__or__", |args| {
             // dict | dict → merge
             if args.len() < 2 {
                 return Ok(args[0]);
             }
             Ok(args[0]) // stub
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "copy",
-        make_builtin_function("copy", crate::type_methods::dict_method_copy),
+        make_builtin_function_with_arity("copy", crate::type_methods::dict_method_copy, 1),
     );
     dict_storage_store(
         ns,
         "clear",
-        make_builtin_function("clear", |_args| Ok(pyre_object::w_none())),
+        make_builtin_function_with_arity("clear", |_args| Ok(pyre_object::w_none()), 1),
     );
     // dict.fromkeys(iterable, value=None) — classmethod
     dict_storage_store(
@@ -2021,41 +2021,41 @@ fn init_tuple_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "count",
-        make_builtin_function("count", crate::type_methods::tuple_method_count),
+        make_builtin_function_with_arity("count", crate::type_methods::tuple_method_count, 2),
     );
     dict_storage_store(
         ns,
         "__contains__",
-        make_builtin_function("__contains__", |args| {
+        make_builtin_function_with_arity("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
             Ok(pyre_object::w_bool_from(
                 crate::baseobjspace::contains(args[0], args[1]).unwrap_or(false),
             ))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__len__",
-        make_builtin_function("__len__", |args| {
+        make_builtin_function_with_arity("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
             Ok(pyre_object::w_int_new(
                 unsafe { pyre_object::w_tuple_len(args[0]) } as i64,
             ))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function("__iter__", |args| {
+        make_builtin_function_with_arity("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
             crate::baseobjspace::iter(args[0])
-        }),
+        }, 1),
     );
 }
 
@@ -2070,36 +2070,36 @@ fn init_union_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__args__",
-        make_builtin_function("__args__", |args| {
+        make_builtin_function_with_arity("__args__", |args| {
             let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             if unsafe { pyre_object::is_union(self_) } {
                 Ok(unsafe { pyre_object::w_union_get_args(self_) })
             } else {
                 Ok(pyre_object::PY_NULL)
             }
-        }),
+        }, 1),
     );
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     dict_storage_store(
         ns,
         "__or__",
-        make_builtin_function("__or__", |args| {
+        make_builtin_function_with_arity("__or__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__or__ requires 2 arguments"));
             }
             Ok(pyre_object::w_union_new(args[0], args[1]))
-        }),
+        }, 2),
     );
     // UnionType.__ror__
     dict_storage_store(
         ns,
         "__ror__",
-        make_builtin_function("__ror__", |args| {
+        make_builtin_function_with_arity("__ror__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("__ror__ requires 2 arguments"));
             }
             Ok(pyre_object::w_union_new(args[1], args[0]))
-        }),
+        }, 2),
     );
 }
 
@@ -2579,7 +2579,7 @@ fn init_builtin_function_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__repr__",
-        make_builtin_function("__repr__", |args| {
+        make_builtin_function_with_arity("__repr__", |args| {
             let func = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             let name = if func.is_null() {
                 "<unknown>"
@@ -2589,7 +2589,7 @@ fn init_builtin_function_type(ns: &mut DictStorage) {
             Ok(pyre_object::w_str_new(&format!(
                 "<built-in function {name}>"
             )))
-        }),
+        }, 1),
     );
 
     // function.py:395 getset_func_doc = GetSetProperty(fget_func_doc,
@@ -2658,14 +2658,14 @@ fn init_builtin_code_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "co_name",
-        make_builtin_function("co_name", |args| {
+        make_builtin_function_with_arity("co_name", |args| {
             let code = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             if code.is_null() {
                 return Ok(pyre_object::w_none());
             }
             let name = unsafe { crate::builtin_code_name(code) };
             Ok(pyre_object::w_str_new(name))
-        }),
+        }, 1),
     );
 }
 
@@ -2673,22 +2673,22 @@ fn init_method_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__func__",
-        make_builtin_function("__func__", |args| {
+        make_builtin_function_with_arity("__func__", |args| {
             Ok(args
                 .first()
                 .map(|&method| unsafe { pyre_object::w_method_get_func(method) })
                 .unwrap_or(pyre_object::w_none()))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__self__",
-        make_builtin_function("__self__", |args| {
+        make_builtin_function_with_arity("__self__", |args| {
             Ok(args
                 .first()
                 .map(|&method| unsafe { pyre_object::w_method_get_self(method) })
                 .unwrap_or(pyre_object::w_none()))
-        }),
+        }, 1),
     );
 }
 
@@ -2842,7 +2842,7 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__name__",
-        make_builtin_function("__name__", |args| {
+        make_builtin_function_with_arity("__name__", |args| {
             let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
                 return Ok(pyre_object::w_none());
@@ -2850,19 +2850,19 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
             Ok(pyre_object::w_str_new(unsafe {
                 pyre_object::w_member_get_name(member)
             }))
-        }),
+        }, 1),
     );
     // typedef.py:498 __objclass__ = interp_attrproperty_w('w_cls', ...)
     dict_storage_store(
         ns,
         "__objclass__",
-        make_builtin_function("__objclass__", |args| {
+        make_builtin_function_with_arity("__objclass__", |args| {
             let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
                 return Ok(pyre_object::w_none());
             }
             Ok(unsafe { pyre_object::w_member_get_cls(member) })
-        }),
+        }, 1),
     );
 }
 
@@ -2920,7 +2920,7 @@ fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "bit_length",
-        make_builtin_function("bit_length", |args| {
+        make_builtin_function_with_arity("bit_length", |args| {
             let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
                 unsafe { pyre_object::w_int_get_value(args[0]) }
             } else {
@@ -2932,7 +2932,7 @@ fn init_int_type(ns: &mut DictStorage) {
                 64 - val.unsigned_abs().leading_zeros()
             };
             Ok(pyre_object::w_int_new(bits as i64))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
@@ -2942,14 +2942,14 @@ fn init_int_type(ns: &mut DictStorage) {
         // `pyre_object::int_bit_count` (`@jit.elidable` parity port of
         // `_bit_count`) so the call graph matches upstream
         // `descr_bit_count -> _bit_count` 1:1.
-        make_builtin_function("bit_count", |args| {
+        make_builtin_function_with_arity("bit_count", |args| {
             let val = if !args.is_empty() && unsafe { pyre_object::is_int(args[0]) } {
                 unsafe { pyre_object::w_int_get_value(args[0]) }
             } else {
                 0
             };
             Ok(pyre_object::w_int_new(pyre_object::int_bit_count(val)))
-        }),
+        }, 1),
     );
     // int.to_bytes(length=1, byteorder='big', *, signed=False)
     // PyPy: longobject.py descr_to_bytes
@@ -3035,18 +3035,18 @@ fn init_int_type(ns: &mut DictStorage) {
         dict_storage_store(
             ns,
             method,
-            make_builtin_function(method, |args| {
+            make_builtin_function_with_arity(method, |args| {
                 Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
-            }),
+            }, 1),
         );
     }
     // int.conjugate — identity
     dict_storage_store(
         ns,
         "conjugate",
-        make_builtin_function("conjugate", |args| {
+        make_builtin_function_with_arity("conjugate", |args| {
             Ok(args.first().copied().unwrap_or(pyre_object::w_int_new(0)))
-        }),
+        }, 1),
     );
     // int.real / int.imag / int.numerator — properties
     // True.real → 1 (int, not bool), False.real → 0
@@ -3092,7 +3092,7 @@ fn init_int_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "denominator",
-        make_builtin_function("denominator", |_| Ok(pyre_object::w_int_new(1))),
+        make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 1),
     );
 }
 fn init_float_type(ns: &mut DictStorage) {
@@ -3132,7 +3132,7 @@ fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "hex",
-        make_builtin_function("hex", |args| {
+        make_builtin_function_with_arity("hex", |args| {
             // float.hex() — PyPy: descr_hex. Format the float as a hex
             // literal compatible with float.fromhex.
             if args.is_empty() {
@@ -3146,7 +3146,7 @@ fn init_float_type(ns: &mut DictStorage) {
                 return Ok(pyre_object::w_str_new(if v > 0.0 { "inf" } else { "-inf" }));
             }
             Ok(pyre_object::w_str_new(&format!("{v:e}")))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
@@ -3225,18 +3225,18 @@ fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "is_integer",
-        make_builtin_function("is_integer", |args| {
+        make_builtin_function_with_arity("is_integer", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_bool_from(false));
             }
             let v = unsafe { pyre_object::w_float_get_value(args[0]) };
             Ok(pyre_object::w_bool_from(v.is_finite() && v == v.trunc()))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "as_integer_ratio",
-        make_builtin_function("as_integer_ratio", |args| {
+        make_builtin_function_with_arity("as_integer_ratio", |args| {
             if args.is_empty() {
                 return Err(crate::PyError::type_error(
                     "as_integer_ratio() requires self",
@@ -3266,20 +3266,20 @@ fn init_float_type(ns: &mut DictStorage) {
                     pyre_object::w_int_new(denom),
                 ]))
             }
-        }),
+        }, 1),
     );
     // floatobject.py:713: __int__ = interp2app(W_FloatObject.descr_trunc)
     for method in ["__trunc__", "__int__"] {
         dict_storage_store(
             ns,
             method,
-            make_builtin_function(method, |args| {
+            make_builtin_function_with_arity(method, |args| {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("__trunc__() requires self"));
                 }
                 let v = unsafe { pyre_object::w_float_get_value(args[0]) };
                 Ok(pyre_object::w_int_new(v.trunc() as i64))
-            }),
+            }, 1),
         );
     }
 }
@@ -3338,37 +3338,37 @@ fn init_object_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__eq__",
-        make_builtin_function("__eq__", |args| {
+        make_builtin_function_with_arity("__eq__", |args| {
             Ok(pyre_object::w_bool_from(
                 args.len() >= 2 && std::ptr::eq(args[0], args[1]),
             ))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__ne__",
-        make_builtin_function("__ne__", |args| {
+        make_builtin_function_with_arity("__ne__", |args| {
             Ok(pyre_object::w_bool_from(
                 args.len() >= 2 && !std::ptr::eq(args[0], args[1]),
             ))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__hash__",
-        make_builtin_function("__hash__", |args| {
+        make_builtin_function_with_arity("__hash__", |args| {
             Ok(pyre_object::w_int_new(if args.is_empty() {
                 0
             } else {
                 args[0] as i64
             }))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__repr__",
         // PyPy: objectobject.py descr___repr__ — base __repr__ for all objects
-        make_builtin_function("__repr__", |args| {
+        make_builtin_function_with_arity("__repr__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new("<object>"));
             }
@@ -3384,19 +3384,19 @@ fn init_object_type(ns: &mut DictStorage) {
             }
             // For non-instances, delegate to display
             Ok(pyre_object::w_str_new(&format!("<object at {:?}>", obj)))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__str__",
-        make_builtin_function("__str__", |args| {
+        make_builtin_function_with_arity("__str__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_str_new("<object>"));
             }
             // Delegate to __repr__ to avoid infinite recursion
             // PyPy: objectobject.py descr___str__ → space.repr(w_self)
             Ok(pyre_object::w_str_new(&unsafe { crate::py_repr(args[0]) }))
-        }),
+        }, 1),
     );
     // PyPy: objectobject.py descr___format__
     dict_storage_store(
@@ -3430,7 +3430,7 @@ fn init_object_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__setattr__",
-        make_builtin_function("__setattr__", |args| {
+        make_builtin_function_with_arity("__setattr__", |args| {
             if args.len() < 3 {
                 return Err(crate::PyError::type_error(
                     "__setattr__ requires 3 arguments",
@@ -3438,13 +3438,13 @@ fn init_object_type(ns: &mut DictStorage) {
             }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
             crate::baseobjspace::setattr(args[0], name, args[2])
-        }),
+        }, 3),
     );
     // PyPy: objectobject.py descr___delattr__
     dict_storage_store(
         ns,
         "__delattr__",
-        make_builtin_function("__delattr__", |args| {
+        make_builtin_function_with_arity("__delattr__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error(
                     "__delattr__ requires 2 arguments",
@@ -3452,13 +3452,13 @@ fn init_object_type(ns: &mut DictStorage) {
             }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
             crate::baseobjspace::delattr(args[0], name)
-        }),
+        }, 2),
     );
     // PyPy: objectobject.py descr___getattribute__
     dict_storage_store(
         ns,
         "__getattribute__",
-        make_builtin_function("__getattribute__", |args| {
+        make_builtin_function_with_arity("__getattribute__", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error(
                     "__getattribute__ requires 2 arguments",
@@ -3466,7 +3466,7 @@ fn init_object_type(ns: &mut DictStorage) {
             }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
             crate::baseobjspace::getattr(args[0], name)
-        }),
+        }, 2),
     );
 }
 
@@ -3523,12 +3523,12 @@ fn init_bytes_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__repr__",
-        make_builtin_function("__repr__", bytes_method_repr),
+        make_builtin_function_with_arity("__repr__", bytes_method_repr, 1),
     );
     dict_storage_store(
         ns,
         "__str__",
-        make_builtin_function("__str__", bytes_method_repr),
+        make_builtin_function_with_arity("__str__", bytes_method_repr, 1),
     );
     // bytes methods are mostly shared with bytearray — add as needed.
 }
@@ -3657,7 +3657,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__add__",
-        make_builtin_function("__add__", |args| {
+        make_builtin_function_with_arity("__add__", |args| {
             assert!(args.len() >= 2, "__add__ requires 2 arguments");
             let a = args[0];
             let b = args[1];
@@ -3674,12 +3674,12 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                     &result,
                 ))
             }
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__iadd__",
-        make_builtin_function("__iadd__", |args| {
+        make_builtin_function_with_arity("__iadd__", |args| {
             assert!(args.len() >= 2);
             let ba = args[0];
             let other = args[1];
@@ -3690,12 +3690,12 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                 }
             }
             Ok(ba)
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "translate",
-        make_builtin_function("translate", |args| {
+        make_builtin_function_with_arity("translate", |args| {
             assert!(args.len() >= 2);
             let ba = args[0];
             let table = args[1];
@@ -3722,7 +3722,7 @@ fn init_bytearray_type(ns: &mut DictStorage) {
                     &result,
                 ))
             }
-        }),
+        }, 2),
     );
 }
 
@@ -3735,7 +3735,7 @@ fn init_setlike_common(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "__contains__",
-        make_builtin_function("__contains__", |args| {
+        make_builtin_function_with_arity("__contains__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -3747,12 +3747,12 @@ fn init_setlike_common(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_bool_from(false))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__len__",
-        make_builtin_function("__len__", |args| {
+        make_builtin_function_with_arity("__len__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_int_new(0));
             }
@@ -3764,22 +3764,22 @@ fn init_setlike_common(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_int_new(0))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__iter__",
-        make_builtin_function("__iter__", |args| {
+        make_builtin_function_with_arity("__iter__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_none());
             }
             crate::baseobjspace::iter(args[0])
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__bool__",
-        make_builtin_function("__bool__", |args| {
+        make_builtin_function_with_arity("__bool__", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_bool_from(false));
             }
@@ -3791,54 +3791,54 @@ fn init_setlike_common(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_bool_from(true))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "__or__",
-        make_builtin_function("__or__", set_method_union),
+        make_builtin_function_with_arity("__or__", set_method_union, 2),
     );
     dict_storage_store(
         ns,
         "__and__",
-        make_builtin_function("__and__", set_method_intersection),
+        make_builtin_function_with_arity("__and__", set_method_intersection, 2),
     );
     dict_storage_store(
         ns,
         "__sub__",
-        make_builtin_function("__sub__", set_method_difference),
+        make_builtin_function_with_arity("__sub__", set_method_difference, 2),
     );
     dict_storage_store(
         ns,
         "__xor__",
-        make_builtin_function("__xor__", set_method_symmetric_difference),
+        make_builtin_function_with_arity("__xor__", set_method_symmetric_difference, 2),
     );
-    dict_storage_store(ns, "__eq__", make_builtin_function("__eq__", set_method_eq));
-    dict_storage_store(ns, "__le__", make_builtin_function("__le__", set_method_le));
-    dict_storage_store(ns, "__ge__", make_builtin_function("__ge__", set_method_ge));
+    dict_storage_store(ns, "__eq__", make_builtin_function_with_arity("__eq__", set_method_eq, 2));
+    dict_storage_store(ns, "__le__", make_builtin_function_with_arity("__le__", set_method_le, 2));
+    dict_storage_store(ns, "__ge__", make_builtin_function_with_arity("__ge__", set_method_ge, 2));
     dict_storage_store(
         ns,
         "__lt__",
-        make_builtin_function("__lt__", |args| {
+        make_builtin_function_with_arity("__lt__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
             let le = unsafe { pyre_object::w_bool_get_value(set_method_le(args)?) };
             let eq = unsafe { pyre_object::w_bool_get_value(set_method_eq(args)?) };
             Ok(pyre_object::w_bool_from(le && !eq))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "__gt__",
-        make_builtin_function("__gt__", |args| {
+        make_builtin_function_with_arity("__gt__", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(false));
             }
             let ge = unsafe { pyre_object::w_bool_get_value(set_method_ge(args)?) };
             let eq = unsafe { pyre_object::w_bool_get_value(set_method_eq(args)?) };
             Ok(pyre_object::w_bool_from(ge && !eq))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
@@ -3858,22 +3858,22 @@ fn init_setlike_common(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "symmetric_difference",
-        make_builtin_function("symmetric_difference", set_method_symmetric_difference),
+        make_builtin_function_with_arity("symmetric_difference", set_method_symmetric_difference, 2),
     );
     dict_storage_store(
         ns,
         "issubset",
-        make_builtin_function("issubset", set_method_le),
+        make_builtin_function_with_arity("issubset", set_method_le, 2),
     );
     dict_storage_store(
         ns,
         "issuperset",
-        make_builtin_function("issuperset", set_method_ge),
+        make_builtin_function_with_arity("issuperset", set_method_ge, 2),
     );
     dict_storage_store(
         ns,
         "isdisjoint",
-        make_builtin_function("isdisjoint", |args| {
+        make_builtin_function_with_arity("isdisjoint", |args| {
             if args.len() < 2 {
                 return Ok(pyre_object::w_bool_from(true));
             }
@@ -3886,12 +3886,12 @@ fn init_setlike_common(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_bool_from(true))
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "copy",
-        make_builtin_function("copy", |args| {
+        make_builtin_function_with_arity("copy", |args| {
             if args.is_empty() {
                 return Ok(pyre_object::w_set_new());
             }
@@ -3902,7 +3902,7 @@ fn init_setlike_common(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_set_from_items(&items))
-        }),
+        }, 1),
     );
 }
 
@@ -4070,27 +4070,27 @@ fn init_set_type(ns: &mut DictStorage) {
     dict_storage_store(
         ns,
         "add",
-        make_builtin_function("add", |args| {
+        make_builtin_function_with_arity("add", |args| {
             if args.len() >= 2 {
                 unsafe { pyre_object::w_set_add(args[0], args[1]) };
             }
             Ok(pyre_object::w_none())
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "discard",
-        make_builtin_function("discard", |args| {
+        make_builtin_function_with_arity("discard", |args| {
             if args.len() >= 2 {
                 unsafe { pyre_object::w_set_discard(args[0], args[1]) };
             }
             Ok(pyre_object::w_none())
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "remove",
-        make_builtin_function("remove", |args| {
+        make_builtin_function_with_arity("remove", |args| {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("remove() requires an argument"));
             }
@@ -4102,12 +4102,12 @@ fn init_set_type(ns: &mut DictStorage) {
                 ));
             }
             Ok(pyre_object::w_none())
-        }),
+        }, 2),
     );
     dict_storage_store(
         ns,
         "pop",
-        make_builtin_function("pop", |args| {
+        make_builtin_function_with_arity("pop", |args| {
             if args.is_empty() {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::KeyError,
@@ -4123,12 +4123,12 @@ fn init_set_type(ns: &mut DictStorage) {
                 crate::PyErrorKind::KeyError,
                 "pop from an empty set",
             ))
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,
         "clear",
-        make_builtin_function("clear", |args| {
+        make_builtin_function_with_arity("clear", |args| {
             if !args.is_empty() {
                 let items = unsafe { pyre_object::w_set_items(args[0]) };
                 for item in items {
@@ -4136,7 +4136,7 @@ fn init_set_type(ns: &mut DictStorage) {
                 }
             }
             Ok(pyre_object::w_none())
-        }),
+        }, 1),
     );
     dict_storage_store(
         ns,

@@ -2,7 +2,7 @@ use malachite_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::executioncontext::DictStorage;
-use crate::{PyDisplay, make_builtin_function, make_module_builtin_function};
+use crate::{PyDisplay, make_builtin_function, make_module_builtin_function, make_module_builtin_function_with_arity};
 use pyre_object::*;
 
 /// Install the default builtins into a namespace.
@@ -13,17 +13,17 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("range", || {
         make_module_builtin_function("range", builtin_range)
     });
-    namespace.get_or_insert_with("len", || make_module_builtin_function("len", builtin_len));
-    namespace.get_or_insert_with("abs", || make_module_builtin_function("abs", builtin_abs));
+    namespace.get_or_insert_with("len", || make_module_builtin_function_with_arity("len", builtin_len, 1));
+    namespace.get_or_insert_with("abs", || make_module_builtin_function_with_arity("abs", builtin_abs, 1));
     namespace.get_or_insert_with("min", || make_module_builtin_function("min", builtin_min));
     namespace.get_or_insert_with("max", || make_module_builtin_function("max", builtin_max));
     namespace.get_or_insert_with("type", || crate::typedef::w_type());
     namespace.get_or_insert_with("isinstance", || {
-        make_module_builtin_function("isinstance", builtin_isinstance)
+        make_module_builtin_function_with_arity("isinstance", builtin_isinstance, 2)
     });
     namespace.get_or_insert_with("str", || crate::typedef::gettypeobject(&STR_TYPE));
     namespace.get_or_insert_with("repr", || {
-        make_module_builtin_function("repr", builtin_repr)
+        make_module_builtin_function_with_arity("repr", builtin_repr, 1)
     });
     namespace.get_or_insert_with("int", || crate::typedef::gettypeobject(&INT_TYPE));
     namespace.get_or_insert_with("float", || crate::typedef::gettypeobject(&FLOAT_TYPE));
@@ -33,16 +33,16 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("None", || w_none());
     namespace.get_or_insert_with("NotImplemented", || w_not_implemented());
     namespace.get_or_insert_with("hasattr", || {
-        make_module_builtin_function("hasattr", builtin_hasattr)
+        make_module_builtin_function_with_arity("hasattr", builtin_hasattr, 2)
     });
     namespace.get_or_insert_with("getattr", || {
         make_module_builtin_function("getattr", builtin_getattr)
     });
     namespace.get_or_insert_with("setattr", || {
-        make_module_builtin_function("setattr", builtin_setattr)
+        make_module_builtin_function_with_arity("setattr", builtin_setattr, 3)
     });
     namespace.get_or_insert_with("delattr", || {
-        make_module_builtin_function("delattr", builtin_delattr)
+        make_module_builtin_function_with_arity("delattr", builtin_delattr, 2)
     });
     namespace.get_or_insert_with("tuple", || crate::typedef::gettypeobject(&TUPLE_TYPE));
     namespace.get_or_insert_with("list", || crate::typedef::gettypeobject(&LIST_TYPE));
@@ -55,19 +55,19 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
     namespace.get_or_insert_with("super", || {
         make_module_builtin_function("super", builtin_super)
     });
-    namespace.get_or_insert_with("id", || make_module_builtin_function("id", builtin_id));
+    namespace.get_or_insert_with("id", || make_module_builtin_function_with_arity("id", builtin_id, 1));
     namespace.get_or_insert_with("hash", || {
-        make_module_builtin_function("hash", builtin_hash)
+        make_module_builtin_function_with_arity("hash", builtin_hash, 1)
     });
-    namespace.get_or_insert_with("ord", || make_module_builtin_function("ord", builtin_ord));
-    namespace.get_or_insert_with("chr", || make_module_builtin_function("chr", builtin_chr));
+    namespace.get_or_insert_with("ord", || make_module_builtin_function_with_arity("ord", builtin_ord, 1));
+    namespace.get_or_insert_with("chr", || make_module_builtin_function_with_arity("chr", builtin_chr, 1));
     namespace.get_or_insert_with("map", || make_module_builtin_function("map", builtin_map));
     namespace.get_or_insert_with("zip", || make_module_builtin_function("zip", builtin_zip));
     namespace.get_or_insert_with("enumerate", || {
         make_module_builtin_function("enumerate", builtin_enumerate)
     });
     namespace.get_or_insert_with("reversed", || {
-        make_module_builtin_function("reversed", builtin_reversed)
+        make_module_builtin_function_with_arity("reversed", builtin_reversed, 1)
     });
     namespace.get_or_insert_with("sorted", || {
         make_module_builtin_function("sorted", builtin_sorted)
@@ -79,7 +79,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("next", builtin_next)
     });
     namespace.get_or_insert_with("callable", || {
-        make_module_builtin_function("callable", builtin_callable)
+        make_module_builtin_function_with_arity("callable", builtin_callable, 1)
     });
     namespace.get_or_insert_with("vars", || {
         make_module_builtin_function("vars", builtin_vars)
@@ -230,10 +230,10 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         tp
     });
     namespace.get_or_insert_with("globals", || {
-        make_module_builtin_function("globals", builtin_globals)
+        make_module_builtin_function_with_arity("globals", builtin_globals, 0)
     });
     namespace.get_or_insert_with("locals", || {
-        make_module_builtin_function("locals", builtin_locals)
+        make_module_builtin_function_with_arity("locals", builtin_locals, 0)
     });
     namespace.get_or_insert_with("exec", || {
         make_module_builtin_function("exec", builtin_exec)
@@ -577,8 +577,8 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
             runtime_error,
         ),
     );
-    namespace.get_or_insert_with("any", || make_module_builtin_function("any", builtin_any));
-    namespace.get_or_insert_with("all", || make_module_builtin_function("all", builtin_all));
+    namespace.get_or_insert_with("any", || make_module_builtin_function_with_arity("any", builtin_any, 1));
+    namespace.get_or_insert_with("all", || make_module_builtin_function_with_arity("all", builtin_all, 1));
     namespace.get_or_insert_with("sum", || make_module_builtin_function("sum", builtin_sum));
     namespace.get_or_insert_with("round", || {
         make_module_builtin_function("round", builtin_round)
@@ -594,7 +594,7 @@ pub fn install_default_builtins(namespace: &mut DictStorage) {
         make_module_builtin_function("format", builtin_format)
     });
     namespace.get_or_insert_with("issubclass", || {
-        make_module_builtin_function("issubclass", builtin_issubclass)
+        make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
     });
     namespace.get_or_insert_with("__import__", || {
         make_module_builtin_function("__import__", builtin_import_stub)
