@@ -1738,6 +1738,9 @@ fn init_dict_type(ns: &mut DictStorage) {
             }
             let src = crate::type_methods::resolve_dict_backing(args[0]);
             let other = crate::type_methods::resolve_dict_backing(args[1]);
+            if other.is_null() {
+                return Ok(pyre_object::w_not_implemented());
+            }
             let dst = pyre_object::w_dict_new();
             if !src.is_null() {
                 unsafe {
@@ -1747,7 +1750,7 @@ fn init_dict_type(ns: &mut DictStorage) {
                     }
                 }
             }
-            if !other.is_null() {
+            {
                 unsafe {
                     let d = &*(other as *const pyre_object::dictobject::W_DictObject);
                     for &(k, v) in &*d.entries {
@@ -2096,18 +2099,15 @@ fn init_tuple_type(ns: &mut DictStorage) {
 /// types.UnionType — PyPy: _pypy_generic_alias.py UnionType
 fn init_union_type(ns: &mut DictStorage) {
     // UnionType.__args__ — returns the tuple of union member types
-    dict_storage_store(
-        ns,
-        "__args__",
-        make_builtin_function_with_arity("__args__", |args| {
-            let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if unsafe { pyre_object::is_union(self_) } {
-                Ok(unsafe { pyre_object::w_union_get_args(self_) })
-            } else {
-                Ok(pyre_object::PY_NULL)
-            }
-        }, 1),
-    );
+    let args_getter = make_builtin_function_with_arity("__args__", |args| {
+        let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+        if unsafe { pyre_object::is_union(self_) } {
+            Ok(unsafe { pyre_object::w_union_get_args(self_) })
+        } else {
+            Ok(pyre_object::PY_NULL)
+        }
+    }, 1);
+    dict_storage_store(ns, "__args__", make_getset_descriptor(args_getter));
     // UnionType.__or__ — PyPy: UnionType.__or__ → _create_union
     dict_storage_store(
         ns,
@@ -2684,41 +2684,32 @@ fn patch_builtin_function_descriptors() {
 /// PyPy exposes co_name, co_varnames, co_argcount, co_flags, co_consts.
 /// No __get__ — BuiltinCode is a code object, not a descriptor.
 fn init_builtin_code_type(ns: &mut DictStorage) {
-    dict_storage_store(
-        ns,
-        "co_name",
-        make_builtin_function_with_arity("co_name", |args| {
-            let code = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if code.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let name = unsafe { crate::builtin_code_name(code) };
-            Ok(pyre_object::w_str_new(name))
-        }, 1),
-    );
+    let co_name_getter = make_builtin_function_with_arity("co_name", |args| {
+        let code = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+        if code.is_null() {
+            return Ok(pyre_object::w_none());
+        }
+        let name = unsafe { crate::builtin_code_name(code) };
+        Ok(pyre_object::w_str_new(name))
+    }, 1);
+    dict_storage_store(ns, "co_name", make_getset_descriptor(co_name_getter));
 }
 
 fn init_method_type(ns: &mut DictStorage) {
-    dict_storage_store(
-        ns,
-        "__func__",
-        make_builtin_function_with_arity("__func__", |args| {
-            Ok(args
-                .first()
-                .map(|&method| unsafe { pyre_object::w_method_get_func(method) })
-                .unwrap_or(pyre_object::w_none()))
-        }, 1),
-    );
-    dict_storage_store(
-        ns,
-        "__self__",
-        make_builtin_function_with_arity("__self__", |args| {
-            Ok(args
-                .first()
-                .map(|&method| unsafe { pyre_object::w_method_get_self(method) })
-                .unwrap_or(pyre_object::w_none()))
-        }, 1),
-    );
+    let func_getter = make_builtin_function_with_arity("__func__", |args| {
+        Ok(args
+            .first()
+            .map(|&method| unsafe { pyre_object::w_method_get_func(method) })
+            .unwrap_or(pyre_object::w_none()))
+    }, 1);
+    dict_storage_store(ns, "__func__", make_getset_descriptor(func_getter));
+    let self_getter = make_builtin_function_with_arity("__self__", |args| {
+        Ok(args
+            .first()
+            .map(|&method| unsafe { pyre_object::w_method_get_self(method) })
+            .unwrap_or(pyre_object::w_none()))
+    }, 1);
+    dict_storage_store(ns, "__self__", make_getset_descriptor(self_getter));
 }
 
 fn init_code_type(ns: &mut DictStorage) {
@@ -2868,31 +2859,25 @@ fn init_member_descriptor_type(ns: &mut DictStorage) {
         }),
     );
     // typedef.py:497 __name__ = interp_attrproperty('name', ...)
-    dict_storage_store(
-        ns,
-        "__name__",
-        make_builtin_function_with_arity("__name__", |args| {
-            let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(pyre_object::w_str_new(unsafe {
-                pyre_object::w_member_get_name(member)
-            }))
-        }, 1),
-    );
+    let name_getter = make_builtin_function_with_arity("__name__", |args| {
+        let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+        if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(pyre_object::w_str_new(unsafe {
+            pyre_object::w_member_get_name(member)
+        }))
+    }, 1);
+    dict_storage_store(ns, "__name__", make_getset_descriptor(name_getter));
     // typedef.py:498 __objclass__ = interp_attrproperty_w('w_cls', ...)
-    dict_storage_store(
-        ns,
-        "__objclass__",
-        make_builtin_function_with_arity("__objclass__", |args| {
-            let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
-                return Ok(pyre_object::w_none());
-            }
-            Ok(unsafe { pyre_object::w_member_get_cls(member) })
-        }, 1),
-    );
+    let objclass_getter = make_builtin_function_with_arity("__objclass__", |args| {
+        let member = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+        if member.is_null() || !unsafe { pyre_object::memberobject::is_member(member) } {
+            return Ok(pyre_object::w_none());
+        }
+        Ok(unsafe { pyre_object::w_member_get_cls(member) })
+    }, 1);
+    dict_storage_store(ns, "__objclass__", make_getset_descriptor(objclass_getter));
 }
 
 /// `staticmethod.__new__(cls, func)` — PyPy: function.py StaticMethod.descr__new__
@@ -3118,11 +3103,8 @@ fn init_int_type(ns: &mut DictStorage) {
             pyre_object::PY_NULL,
         ),
     );
-    dict_storage_store(
-        ns,
-        "denominator",
-        make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 1),
-    );
+    let denom_getter = make_builtin_function_with_arity("denominator", |_| Ok(pyre_object::w_int_new(1)), 1);
+    dict_storage_store(ns, "denominator", make_getset_descriptor(denom_getter));
 }
 fn init_float_type(ns: &mut DictStorage) {
     dict_storage_store(ns, "__new__", make_new_descr(float_descr_new));
@@ -3473,6 +3455,11 @@ fn init_object_type(ns: &mut DictStorage) {
                     "__setattr__ requires 3 arguments",
                 ));
             }
+            if !unsafe { pyre_object::is_str(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "attribute name must be string",
+                ));
+            }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
             crate::baseobjspace::setattr(args[0], name, args[2])
         }, 3),
@@ -3487,6 +3474,11 @@ fn init_object_type(ns: &mut DictStorage) {
                     "__delattr__ requires 2 arguments",
                 ));
             }
+            if !unsafe { pyre_object::is_str(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "attribute name must be string",
+                ));
+            }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
             crate::baseobjspace::delattr(args[0], name)
         }, 2),
@@ -3499,6 +3491,11 @@ fn init_object_type(ns: &mut DictStorage) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error(
                     "__getattribute__ requires 2 arguments",
+                ));
+            }
+            if !unsafe { pyre_object::is_str(args[1]) } {
+                return Err(crate::PyError::type_error(
+                    "attribute name must be string",
                 ));
             }
             let name = unsafe { pyre_object::w_str_get_value(args[1]) };
