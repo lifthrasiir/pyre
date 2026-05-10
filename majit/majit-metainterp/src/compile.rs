@@ -4957,6 +4957,14 @@ impl TraceCtx {
         live_arg_types: Vec<Type>,
         header_pc: usize,
     ) {
+        debug_assert_eq!(
+            live_args.len(),
+            live_arg_types.len(),
+            "add_merge_point: live_args/live_arg_types length mismatch \
+             (key={key:#x}, header_pc={header_pc}, args={}, types={})",
+            live_args.len(),
+            live_arg_types.len(),
+        );
         // Use the TraceCtx-level position so `snapshot_data_len` reflects
         // the current Vec<Snapshot> side table length (Task #70 moved
         // snapshots off `recorder::Trace`; a bare `recorder.get_position()`
