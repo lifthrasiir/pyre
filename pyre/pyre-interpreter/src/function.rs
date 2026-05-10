@@ -1179,7 +1179,8 @@ pub fn funccall_valuestack(
         unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
 
     // function.py:153-184 — nargs == fast_natural_arity: builtin fast path
-    if nargs == fast_natural_arity && nargs <= 4 {
+    // baseobjspace.py:1243 — skip when profiling (c_call/c_return events)
+    if nargs == fast_natural_arity && nargs <= 4 && !frame.get_is_being_profiled() {
         debug_assert!(
             (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
             "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
