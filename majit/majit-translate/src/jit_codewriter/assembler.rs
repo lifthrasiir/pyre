@@ -1690,6 +1690,11 @@ impl Assembler {
             return existing;
         }
         if let Some(num) = crate::insns::insn_byte_opt(key) {
+            debug_assert!(
+                crate::insns::is_reserved_opcode_byte(num),
+                "insn_byte_opt({key:?}) returned {num} which is not reserved — \
+                 wellknown/extension tables out of sync with is_reserved_opcode_byte",
+            );
             self.insns.insert(key.to_string(), num);
             return num;
         }
