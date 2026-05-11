@@ -519,7 +519,10 @@ mod assign_caller_local_layout_tests {
 /// Returns `Some(())` if at least one pre-dispatch stmt was found; `None` if
 /// no while body or dispatch match could be located (caller continues anyway
 /// since later tasks fill the dispatch chain).
-pub(super) fn lower_pre_dispatch_stmts(lowerer: &mut Lowerer, func_block: &syn::Block) -> Option<()> {
+pub(super) fn lower_pre_dispatch_stmts(
+    lowerer: &mut Lowerer,
+    func_block: &syn::Block,
+) -> Option<()> {
     // Find the dispatch match expression anywhere in the function block.
     let dispatch_match = find_dispatch_match(func_block)?;
 
@@ -1591,7 +1594,9 @@ pub(super) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
 /// variant — dispatch arms never produce an inline_call return value
 /// (the arm body's return path is always the loop back-edge to
 /// `jit_merge_point` or the default exit, never a value).
-pub(super) fn dispatch_arm_inline_call_tokens(layout: &[CallerLocalLayout]) -> proc_macro2::TokenStream {
+pub(super) fn dispatch_arm_inline_call_tokens(
+    layout: &[CallerLocalLayout],
+) -> proc_macro2::TokenStream {
     use quote::quote;
     let has_int = layout.iter().any(|l| matches!(l.kind, BindingKind::Int));
     let has_float = layout.iter().any(|l| matches!(l.kind, BindingKind::Float));
@@ -2050,7 +2055,10 @@ pub(super) fn emit_promote_greens(lowerer: &mut Lowerer, config: &LowererConfig)
 ///
 /// Returns `(greens_i, greens_r, greens_f)` matching the
 /// `jit_merge_point(..., greens_i, greens_r, greens_f, ...)` bucket order.
-pub(super) fn resolve_greens(lowerer: &Lowerer, config: &LowererConfig) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub(super) fn resolve_greens(
+    lowerer: &Lowerer,
+    config: &LowererConfig,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut greens_i: Vec<u8> = Vec::new();
     let mut greens_r: Vec<u8> = Vec::new();
     let mut greens_f: Vec<u8> = Vec::new();
@@ -2140,7 +2148,10 @@ pub(super) fn resolve_greens(lowerer: &Lowerer, config: &LowererConfig) -> (Vec<
 ///
 /// Returns `(reds_i, reds_r, reds_f)` matching the
 /// `jit_merge_point(..., reds_i, reds_r, reds_f)` bucket order.
-pub(super) fn resolve_reds(lowerer: &Lowerer, config: &LowererConfig) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub(super) fn resolve_reds(
+    lowerer: &Lowerer,
+    config: &LowererConfig,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut reds_i: Vec<u8> = Vec::new();
     let mut reds_r: Vec<u8> = Vec::new();
     let mut reds_f: Vec<u8> = Vec::new();
@@ -2257,7 +2268,10 @@ pub(super) fn resolve_reds(lowerer: &Lowerer, config: &LowererConfig) -> (Vec<u8
 /// return the schema unchanged.  The bytecode payload encoder
 /// (`resolve_greens`) still emits the RPython `make_three_lists` bucket
 /// shape independently.
-pub(super) fn green_schema(lowerer: &Lowerer, config: &LowererConfig) -> Vec<(String, TokenStream)> {
+pub(super) fn green_schema(
+    lowerer: &Lowerer,
+    config: &LowererConfig,
+) -> Vec<(String, TokenStream)> {
     use crate::jit_interp::green_type_tag::GreenTypeTag;
     let mut out: Vec<(u8, String, TokenStream)> = Vec::new();
     for (i, green) in config.greens.iter().enumerate() {

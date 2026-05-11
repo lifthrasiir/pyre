@@ -398,7 +398,10 @@ fn try_generate_jitcode_body_inner(
 /// shapes are skipped silently here (the existing `lower_pre_dispatch_stmts`
 /// post-merge-point walker / dispatch-body emit is responsible for
 /// diagnostics on its own pass).
-pub(super) fn bind_pre_merge_point_stmts(lowerer: &mut Lowerer, func_block: &syn::Block) -> Option<()> {
+pub(super) fn bind_pre_merge_point_stmts(
+    lowerer: &mut Lowerer,
+    func_block: &syn::Block,
+) -> Option<()> {
     let dispatch_match = find_dispatch_match(func_block)?;
     let loop_body = find_dispatch_loop_body(func_block, dispatch_match)?;
     for stmt in &loop_body.stmts {

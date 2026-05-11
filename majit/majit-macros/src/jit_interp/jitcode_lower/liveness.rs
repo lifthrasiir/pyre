@@ -282,7 +282,10 @@ pub(super) fn liveness_prebuild_tokens(
 /// `op_metadata` and `statements` must stay index-aligned; both vectors
 /// are mutated in lockstep.
 #[allow(dead_code)]
-pub(super) fn remove_repeated_live(op_metadata: &mut Vec<OpMeta>, statements: &mut Vec<TokenStream>) {
+pub(super) fn remove_repeated_live(
+    op_metadata: &mut Vec<OpMeta>,
+    statements: &mut Vec<TokenStream>,
+) {
     debug_assert_eq!(op_metadata.len(), statements.len());
     let mut new_meta: Vec<OpMeta> = Vec::with_capacity(op_metadata.len());
     let mut new_stmts: Vec<TokenStream> = Vec::with_capacity(statements.len());

@@ -171,7 +171,10 @@ pub(super) fn inline_float_arg_tokens(bindings: &[Binding]) -> TokenStream {
 /// `BC_INLINE_CALL` and the trailing `BC_LIVE` marker as two distinct
 /// `OpMeta` entries (RPython `jtransform.py:480-481` emits inline_call
 /// followed by `-live-`).
-pub(super) fn inline_call_tokens(bindings: &[Binding], result_reg: u16) -> (TokenStream, TokenStream) {
+pub(super) fn inline_call_tokens(
+    bindings: &[Binding],
+    result_reg: u16,
+) -> (TokenStream, TokenStream) {
     let args_i = inline_int_arg_tokens(bindings);
     let args_r = inline_ref_arg_tokens(bindings);
     let args_f = inline_float_arg_tokens(bindings);
@@ -378,7 +381,9 @@ pub(super) fn inline_prebuild_path(expr: &Expr) -> Option<Path> {
     Some(path)
 }
 
-pub(super) fn binding_kind_for_inline_policy(kind: crate::jit_interp::CallPolicyKind) -> Option<BindingKind> {
+pub(super) fn binding_kind_for_inline_policy(
+    kind: crate::jit_interp::CallPolicyKind,
+) -> Option<BindingKind> {
     match kind {
         crate::jit_interp::CallPolicyKind::InlineInt => Some(BindingKind::Int),
         crate::jit_interp::CallPolicyKind::InlineRef => Some(BindingKind::Ref),
@@ -436,4 +441,3 @@ pub(super) fn opcode_for_assign_binop(op: &BinOp) -> Option<Ident> {
     };
     Some(Ident::new(name, proc_macro2::Span::call_site()))
 }
-

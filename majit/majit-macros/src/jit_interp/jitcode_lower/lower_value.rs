@@ -1061,7 +1061,10 @@ impl<'c> Lowerer<'c> {
         Some(LoweredSequence::new(nested.statements, nested.op_metadata))
     }
 
-    pub(super) fn lower_branch_value_expr(&mut self, expr: &Expr) -> Option<(LoweredSequence, Binding)> {
+    pub(super) fn lower_branch_value_expr(
+        &mut self,
+        expr: &Expr,
+    ) -> Option<(LoweredSequence, Binding)> {
         let mut nested = Lowerer {
             bindings: self.bindings.clone(),
             statements: Vec::new(),

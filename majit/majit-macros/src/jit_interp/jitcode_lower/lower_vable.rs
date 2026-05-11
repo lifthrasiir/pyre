@@ -590,6 +590,4 @@ impl<'c> Lowerer<'c> {
             depends_on_stack: false,
         })
     }
-
-
 }

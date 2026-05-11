@@ -1437,5 +1437,4 @@ impl<'c> Lowerer<'c> {
 
         None
     }
-
 }

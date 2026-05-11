@@ -285,6 +285,4 @@ impl<'c> Lowerer<'c> {
     }
 
     // ── Core lowering (unchanged logic) ──────────────────────────────
-
-
 }
