@@ -25,6 +25,7 @@ pub(super) fn expr_has_loop_control(expr: &Expr) -> bool {
                     .is_some_and(|(_, e)| expr_has_loop_control(e))
         }
         Expr::Block(block) => block_has_loop_control(&block.block),
+        Expr::Match(m) => m.arms.iter().any(|arm| expr_has_loop_control(&arm.body)),
         // Don't recurse into nested loops — they have their own break/continue scope
         Expr::Loop(_) | Expr::While(_) | Expr::ForLoop(_) => false,
         _ => false,
