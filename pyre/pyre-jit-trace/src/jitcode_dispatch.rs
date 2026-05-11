@@ -8322,41 +8322,335 @@ mod tests {
 
     #[test]
     fn inline_call_with_void_subreturn_surfaces_unexpected_void_error() {
-        // Slice 2i: `_r_r` variant requires the callee to surface a Ref
-        // result. `SubReturn { result: None }` reaching the `_r_r`
-        // caller means the codewriter emitted a shape mismatch (callee
-        // body terminates with `void_return/` analogue instead of
-        // `ref_return/r`). Manufacture the mismatch directly by
-        // injecting a callee that surfaces `SubReturn { result: None }`
-        // through a synthetic outcome — but since the walker shape only
-        // emits `SubReturn { Some(_) }` from `ref_return/r`, this test
-        // currently exercises the error path via a hand-built sub-walk
-        // that bypasses the standard handlers. The simplest reliable
-        // way is to dispatch the inline_call with a callee body whose
-        // first byte is unsupported (so the sub-walk fails) — but that
-        // surfaces a *different* error. Instead we exercise the void
-        // branch indirectly: the only way `SubReturn{None}` can reach
-        // the caller is if a future handler emits it. Lock in the
-        // error path now with an explicit test that asserts the variant
-        // shape so the contract is captured (the regression that this
-        // test guards against is silently dropping a void return into
-        // a `_r_r` slot, which any future handler could reintroduce).
-        //
-        // Since current handlers never emit `SubReturn{None}`, this
-        // test simply verifies the typed-error variant exists and is
-        // constructible — once a future handler can synthesize the
-        // condition, the assertion will become the real regression
-        // guard. RPython parity: the `_r_r`/`_r_v` shape split is in
-        // `assembler.py:gen_inline_call` and is enforced statically by
-        // the codewriter; the walker's job is to surface the violation
-        // rather than mask it.
         let err = DispatchError::UnexpectedVoidSubReturn { pc: 42 };
         assert_eq!(
             err,
             DispatchError::UnexpectedVoidSubReturn { pc: 42 },
-            "UnexpectedVoidSubReturn must remain a distinct DispatchError variant — \
-             do not collapse with InlineCallArityMismatch or RegisterOutOfRange",
         );
+    }
+
+    // ── inline_call_*_v regression tests ──────────────────────────────
+    //
+    // Exercise the void-return contract for all three dispatch variants:
+    //   dispatch_inline_call_dr_kind  (inline_call_r_v/dR)
+    //   dispatch_inline_call_dir_kind (inline_call_ir_v/dIR)
+    //   dispatch_inline_call_dirf_kind(inline_call_irf_v/dIRF)
+
+    #[test]
+    fn inline_call_r_v_accepts_void_returning_callee() {
+        // Callee body: `void_return/` — surfaces SubReturn { None }.
+        // Caller: `inline_call_r_v/dR  descr=7 R=[r0]` then `void_return/`.
+        let void_ret = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_v/dR")
+            .expect("`inline_call_r_v/dR` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([void_ret]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+        };
+        // dR layout: 2B descr(7) + 1B R-len(1) + 1B R-arg(r0)  — no >X dst
+        let caller_code = [
+            inline_byte,
+            0x07, 0x00, // descr index 7
+            0x01, 0x00, // R: len=1, arg=r0
+            void_ret,   // caller terminates
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, _) = walk(&caller_code, 0, &mut wc)
+            .expect("inline_call_r_v with void callee must succeed");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+    }
+
+    #[test]
+    fn inline_call_r_v_rejects_non_void_returning_callee() {
+        // Callee body: `ref_return r0` — surfaces SubReturn { Some(_) }.
+        // inline_call_r_v must reject with UnexpectedNonVoidSubReturn.
+        let ref_ret = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_v/dR")
+            .expect("`inline_call_r_v/dR` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([ref_ret, 0x00]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+        };
+        let caller_code = [
+            inline_byte,
+            0x07, 0x00, // descr index 7
+            0x01, 0x00, // R: len=1, arg=r0
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let err = walk(&caller_code, 0, &mut wc)
+            .expect_err("inline_call_r_v with non-void callee must reject");
+        assert_eq!(err, DispatchError::UnexpectedNonVoidSubReturn { pc: 0 });
+    }
+
+    #[test]
+    fn inline_call_ir_v_accepts_void_returning_callee() {
+        let void_ret = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_ir_v/dIR")
+            .expect("`inline_call_ir_v/dIR` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([void_ret]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 1,
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+        };
+        // dIR layout: 2B descr(7) + I-list(len=1, i0) + R-list(len=1, r0) — no dst
+        let caller_code = [
+            inline_byte,
+            0x07, 0x00, // descr index 7
+            0x01, 0x00, // I: len=1, arg=i0
+            0x01, 0x00, // R: len=1, arg=r0
+            void_ret,   // caller terminates
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let mut regs_i = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, _) = walk(&caller_code, 0, &mut wc)
+            .expect("inline_call_ir_v with void callee must succeed");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+    }
+
+    #[test]
+    fn inline_call_ir_v_rejects_non_void_returning_callee() {
+        let int_ret = *insns_opname_to_byte()
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_ir_v/dIR")
+            .expect("`inline_call_ir_v/dIR` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([int_ret, 0x00]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 1,
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+        };
+        let caller_code = [
+            inline_byte,
+            0x07, 0x00,
+            0x01, 0x00, // I: len=1, arg=i0
+            0x01, 0x00, // R: len=1, arg=r0
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let mut regs_i = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let err = walk(&caller_code, 0, &mut wc)
+            .expect_err("inline_call_ir_v with non-void callee must reject");
+        assert_eq!(err, DispatchError::UnexpectedNonVoidSubReturn { pc: 0 });
+    }
+
+    #[test]
+    fn inline_call_irf_v_accepts_void_returning_callee() {
+        let void_ret = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let Some(&inline_byte) = insns_opname_to_byte().get("inline_call_irf_v/dIRF") else {
+            // irf_v opcode not yet emitted by the pipeline build — skip.
+            return;
+        };
+        let callee_code: &'static [u8] = Box::leak(Box::new([void_ret]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 1,
+            num_regs_f: 1,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+        };
+        // dIRF layout: 2B descr + I-list + R-list + F-list — no dst
+        let caller_code = [
+            inline_byte,
+            0x07, 0x00, // descr index 7
+            0x01, 0x00, // I: len=1, arg=i0
+            0x01, 0x00, // R: len=1, arg=r0
+            0x01, 0x00, // F: len=1, arg=f0
+            void_ret,   // caller terminates
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let mut regs_i = distinct_const_refs(&mut tc, 4);
+        let mut regs_f = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, _) = walk(&caller_code, 0, &mut wc)
+            .expect("inline_call_irf_v with void callee must succeed");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+    }
+
+    #[test]
+    fn inline_call_irf_v_rejects_non_void_returning_callee() {
+        let ref_ret = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let Some(&inline_byte) = insns_opname_to_byte().get("inline_call_irf_v/dIRF") else {
+            return;
+        };
+        let callee_code: &'static [u8] = Box::leak(Box::new([ref_ret, 0x00]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 1,
+            num_regs_f: 1,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+        };
+        let caller_code = [
+            inline_byte,
+            0x07, 0x00,
+            0x01, 0x00, // I
+            0x01, 0x00, // R
+            0x01, 0x00, // F
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let mut regs_i = distinct_const_refs(&mut tc, 4);
+        let mut regs_f = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let err = walk(&caller_code, 0, &mut wc)
+            .expect_err("inline_call_irf_v with non-void callee must reject");
+        assert_eq!(err, DispatchError::UnexpectedNonVoidSubReturn { pc: 0 });
     }
 
     /// Build a `SimpleFieldDescr` with a stable index so the
