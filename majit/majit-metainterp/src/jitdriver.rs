@@ -3135,13 +3135,9 @@ impl<S: JitState> JitDriver<S> {
         self.meta.invalidate_loop(green_key);
     }
 
-    /// Record a blackhole resume failure and optionally invalidate.
-    ///
-    /// Increments the abort counter for the green key. Below the limit
-    /// the loop is invalidated (allowing retrace); at the limit the
-    /// loop is left as-is and the key is marked DONT_TRACE_HERE so the
-    /// compile → guard-fail → bh-fail → invalidate cycle stops.
-    pub fn record_blackhole_failure_and_maybe_invalidate(&mut self, green_key: u64) -> bool {
+    /// Record a blackhole resume failure, invalidate the compiled loop,
+    /// and at the abort limit also set DONT_TRACE_HERE to stop retracing.
+    pub fn record_blackhole_failure_and_maybe_invalidate(&mut self, green_key: u64) {
         self.meta.record_blackhole_failure_and_maybe_invalidate(green_key)
     }
 

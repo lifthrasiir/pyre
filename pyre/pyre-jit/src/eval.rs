@@ -3553,11 +3553,11 @@ fn execute_assembler(
                             // decoder work should eliminate the remaining
                             // triggers.
                             //
-                            // Increment abort_count so that the compile /
-                            // guard-fail / bh-fail / invalidate / retrace
-                            // cycle is bounded. Once the limit is reached
-                            // the loop is not invalidated again and the key
-                            // is marked DONT_TRACE_HERE.
+                            // Increment abort_count and invalidate the
+                            // compiled loop. Once the limit is reached the
+                            // key is also marked DONT_TRACE_HERE so the
+                            // compile / guard-fail / bh-fail / invalidate /
+                            // retrace cycle stops.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} trace={} guard={} — recording failure",
@@ -3955,8 +3955,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // 3b-2/3b-3 should eliminate the triggers by
                             // reading/writing registers_r at post-regalloc
                             // color instead of semantic slot index.
-                            // Increment abort_count to bound the retrace
-                            // cycle (see execute_assembler's handler).
+                            // Increment abort_count, invalidate compiled
+                            // loop, and at limit mark DONT_TRACE_HERE.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — recording failure",
