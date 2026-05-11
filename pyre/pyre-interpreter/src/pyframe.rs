@@ -2219,6 +2219,12 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
         ConstantData::Str { value } => pyre_object::w_str_new(value.as_str().unwrap_or("")),
         ConstantData::None => pyre_object::w_none(),
         ConstantData::Ellipsis => pyre_object::noneobject::w_ellipsis(),
+        ConstantData::Slice { elements } if elements.len() == 3 => {
+            let start = pyobject_from_constant(&elements[0]);
+            let stop = pyobject_from_constant(&elements[1]);
+            let step = pyobject_from_constant(&elements[2]);
+            pyre_object::w_slice_new(start, stop, step)
+        }
         _ => pyre_object::w_none(),
     }
 }
