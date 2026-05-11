@@ -24,6 +24,11 @@ impl<'c> Lowerer<'c> {
         let src = binding.reg;
         // vable_reg is always Ref (the virtualizable input register); src bank
         // follows `field_type` per `assembler.py:217` argcode mapping.
+        // jtransform.py:926 — `-live-` precedes `setfield_vable_*`.
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
         let vable_r = Register::ref_(vable_reg);
         match field_type {
             ValueKind::Ref => self.emit_op(
@@ -77,6 +82,11 @@ impl<'c> Lowerer<'c> {
         let val_reg = val_binding.reg;
 
         // vable_reg: Ref. idx_reg: Int (array index). val_reg: bank by item_type.
+        // jtransform.py:798 — `-live-` precedes `setarrayitem_vable_*`.
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
         let vable_r = Register::ref_(vable_reg);
         let idx_r = Register::int(idx_reg);
         match item_type {
@@ -303,11 +313,10 @@ impl<'c> Lowerer<'c> {
 
     // ── conditional_call / record_known_result JIT op emission ──────
 
-    /// RPython jtransform.py:1685 — `rewrite_op_jit_conditional_call`.
+    /// RPython jtransform.py:832 `getfield_vable_*`.
     ///
-    /// Recognizes `conditional_call!(condition, func, args...)` and emits
-    /// `__builder.conditional_call_ir_v_typed_args`, matching
-    /// `jtransform.py`'s canonical opname.
+    /// Recognizes `frame.field` where `frame` is the virtualizable variable
+    /// and `field` is a declared virtualizable scalar field.
     pub(super) fn lower_vable_field_read(&mut self, expr: &Expr) -> Option<Binding> {
         let config = self.config?;
         let vable_var = config.vable_var.as_ref()?;
@@ -323,6 +332,11 @@ impl<'c> Lowerer<'c> {
                 let reg = self.alloc_reg();
                 let fi = field_index as u16;
                 // vable_reg is Ref; result `reg` bank follows field_type.
+                // jtransform.py:845 — `-live-` precedes `getfield_vable_*`.
+                self.emit_op(
+                    OpMeta::live_marker(),
+                    quote! { let _ = __builder.live_placeholder(); },
+                );
                 let vable_r = Register::ref_(vable_reg);
                 let kind = match field_type {
                     ValueKind::Ref => {
@@ -400,6 +414,11 @@ impl<'c> Lowerer<'c> {
         let reg = self.alloc_reg();
         let ai = array_index as u16;
         // vable_reg: Ref. idx_reg: Int. result `reg` bank by item_type.
+        // jtransform.py:764 — `-live-` precedes `getarrayitem_vable_*`.
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
         let vable_r = Register::ref_(vable_reg);
         let idx_r = Register::int(idx_reg);
         let kind = match item_type {
@@ -469,6 +488,11 @@ impl<'c> Lowerer<'c> {
         let vable_reg = self.vable_base_reg()?;
         let reg = self.alloc_reg();
         let ai = array_index as u16;
+        // jtransform.py:814 — `-live-` precedes `arraylen_vable`.
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
         // vable_arraylen reads vable_reg (Ref) and writes the length to an int reg.
         self.emit_op(
             OpMeta::linear(
