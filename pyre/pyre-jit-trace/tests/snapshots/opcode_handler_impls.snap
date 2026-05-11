@@ -341,13 +341,17 @@ impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
         step: Self::Value,
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let concrete = crate::state::ConcreteValue::Ref(
-            pyre_object::w_slice_new(
-                start.concrete.to_pyobj(),
-                stop.concrete.to_pyobj(),
-                step.concrete.to_pyobj(),
-            ),
-        );
+        let concrete = if start.concrete.is_null() || stop.concrete.is_null() || step.concrete.is_null() {
+            crate::state::ConcreteValue::Null
+        } else {
+            crate::state::ConcreteValue::Ref(
+                pyre_object::w_slice_new(
+                    start.concrete.to_pyobj(),
+                    stop.concrete.to_pyobj(),
+                    step.concrete.to_pyobj(),
+                ),
+            )
+        };
         let opref = self.trace_slice_constant(
             start.opref, stop.opref, step.opref,
             concrete.to_pyobj(),
