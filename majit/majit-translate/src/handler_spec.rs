@@ -404,6 +404,7 @@ mod tests {
             "fn code_constant",
             "fn none_constant",
             "fn ellipsis_constant",
+            "fn slice_constant",
         ] {
             assert!(
                 out.contains(method),
