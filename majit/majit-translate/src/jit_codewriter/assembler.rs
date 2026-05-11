@@ -2124,8 +2124,10 @@ fn kind_char_to_name(c: char) -> &'static str {
         'i' => "int",
         'r' => "ref",
         'f' => "float",
-        'v' => "void",
-        _ => panic!("kind_char_to_name: unrecognised kind char {c:?}"),
+        _ => panic!(
+            "kind_char_to_name: invalid kind char {c:?} — only 'i'/'r'/'f' \
+             are valid for typed opname prefixes (void is not an operand kind)"
+        ),
     }
 }
 
