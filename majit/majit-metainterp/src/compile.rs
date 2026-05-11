@@ -4882,7 +4882,7 @@ impl TraceCtx {
     /// across `add_merge_point` callers is tightened — a separate
     /// follow-up.  `live_args_len` is plumbed through so that
     /// follow-up doesn't need to re-touch the call sites.
-    pub fn has_merge_point_with_shape_assert(&self, key: u64, _live_args_len: usize) -> bool {
+    pub fn has_merge_point_with_shape_assert(&self, key: u64, live_args_len: usize) -> bool {
         // pyjitpl.py:2994-2997 reverse scan:
         //   for j in range(len(self.current_merge_points) - 1, -1, -1):
         //       original_boxes, start = self.current_merge_points[j]
@@ -4890,39 +4890,20 @@ impl TraceCtx {
         //       if greenkey == ...:
         //           ...
         //
-        // PRE-EXISTING-ADAPTATION (Priority 1 probe 2026-05-04): the
-        // upstream assert holds because PyPy's
-        // `initialize_virtualizable` (pyjitpl.py:3290-3307) appends
-        // `virtualizable_boxes` onto `original_boxes` BEFORE the seed
-        // at line 2878 (`current_merge_points = [(original_boxes,
-        // ...)]`).  So PyPy's seed shape equals the back-edge
-        // `live_arg_boxes` shape (greenkey + redkey + virtualizable
-        // expansion - 1).
-        //
-        // Pyre's seed sites (`trace.rs:65 add_merge_point`,
-        // `trace_ctx.rs::with_metainterp_sd / with_green_key`
-        // constructors) populate `current_merge_points[0]` from the
-        // bare `recorder.inputarg_types().len()` (typically
-        // `(frame, ec)` = 2 reds), while the back-edge
-        // `close_loop_args_at` returns `frame + ec + 6 vable static
-        // fields + nlocals + stack_only` (~14 for nested_loop).
-        // Empirical probe (`MAJIT_PROBE_MERGE_SHAPE=1`):
-        //   nested_loop key=4362041886086414 mp_len=2 live_args_len=14
-        //   nested_loop key=4362041886086447 mp_len=4 live_args_len=14
-        //
-        // The convergence path is to seed with the same shape as
-        // back-edge — i.e. run `capture_close_loop_args_at(start_pc)`
-        // at trace start so the seed matches PyPy's vable-expanded
-        // `original_boxes`.  That requires the MIFrame's symbolic
-        // state to be initialized enough for `close_loop_args_at` to
-        // run before any opcode has been recorded, plus extending the
-        // 2 trace_ctx.rs constructors.  Multi-session epic; until
-        // then `live_args_len` is plumbed but unused so the call
-        // surface stays stable.
+        // RPython asserts `len(original_boxes) == len(live_arg_boxes)` on
+        // every visited merge point because all merge points in
+        // `current_merge_points` come from the same jitdriver (fixed
+        // red-bank shape).  Pyre's seed sites don't yet guarantee the
+        // same shape as back-edge (seed=2 reds vs back-edge=14 with
+        // virtualizable expansion); until the seed path runs
+        // `capture_close_loop_args_at(start_pc)` at trace start, filter
+        // by shape length instead of asserting — a shape mismatch means
+        // the merge point was seeded under a different frame layout and
+        // should not match.
         self.current_merge_points
             .iter()
             .rev()
-            .any(|mp| mp.green_key == key)
+            .any(|mp| mp.green_key == key && mp.original_boxes.len() == live_args_len)
     }
 
     /// pyjitpl.py:3029-3030 — record a loop header visit with position
