@@ -9,21 +9,13 @@ use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
 
-/// history.py:714 `class History` → `TreeLoop` conversion.
+/// RPython `History` parity name.
 ///
-/// RPython's `History` wraps an `opencoder.Trace` during recording; when
-/// the recording phase ends, downstream code accesses the trace as a
-/// `TreeLoop` (via `history.trace.get_iter()`).  In Pyre the recorder
-/// (`recorder::Trace`) is consumed into a `TreeLoop` through this `From`
-/// impl, mirroring that transition.  Snapshots are NOT carried by the
-/// recorder — callers that need them use `TreeLoop::with_box_pool`
-/// directly (see `TraceCtx::into_tree_loop`).
-impl From<crate::recorder::Trace> for TreeLoop {
-    fn from(trace: crate::recorder::Trace) -> Self {
-        let (inputargs, ops, box_pool) = trace.into_parts();
-        TreeLoop::with_box_pool(inputargs, ops, Vec::new(), box_pool)
-    }
-}
+/// The current Rust port still fuses RPython's `History` recording role into
+/// `TraceCtx`; keep the `History` item so line-by-line ports can refer to the
+/// RPython role explicitly while the eventual `MetaInterp.history` field split
+/// is still pending.
+pub type History = crate::trace_ctx::TraceCtx;
 
 /// Cut position for a materialized `TreeLoop`.
 ///
@@ -217,8 +209,9 @@ impl TreeLoop {
         if self.ops.is_empty() {
             return true;
         }
-        // history.py:564-565: inputargs must not contain constants
         let mut seen = std::collections::HashSet::new();
+        let mut op_positions = std::collections::HashSet::new();
+        // history.py:564-565: inputargs must not contain constants
         for ia in &self.inputargs {
             let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp);
             if ia_ref.is_constant() {
@@ -232,6 +225,12 @@ impl TreeLoop {
 
         // history.py:573-603: walk operations
         for (num, op) in self.ops.iter().enumerate() {
+            // PyPy's operation objects are unique by allocation. Rust traces
+            // carry that identity in OpRef positions, so duplicate positions
+            // are structurally invalid before considering dataflow.
+            if !op.pos.is_none() && !op_positions.insert(op.pos) {
+                return false;
+            }
             // history.py:576-578: ovf ops must be followed by guard_overflow
             if op.opcode.is_ovf() {
                 if let Some(next_op) = self.ops.get(num + 1) {
@@ -245,7 +244,7 @@ impl TreeLoop {
             // history.py:579-581: each arg must be Const or in seen
             for arg in &op.args {
                 if arg.is_none() {
-                    continue;
+                    return false;
                 }
                 if !arg.is_constant() && !seen.contains(arg) {
                     return false;
@@ -253,7 +252,7 @@ impl TreeLoop {
             }
             // history.py:582-593: guard checks
             if op.opcode.is_guard() {
-                if check_descr && op.descr.is_none() && !op.opcode.is_guard_overflow() {
+                if check_descr && op.descr.is_none() {
                     return false;
                 }
                 // history.py:588-591: fail_args validation
@@ -279,14 +278,16 @@ impl TreeLoop {
             // history.py:594-595: if op produces a value, add to seen
             if op.opcode.result_type() != Type::Void {
                 if !op.pos.is_none() {
-                    seen.insert(op.pos);
+                    if !seen.insert(op.pos) {
+                        return false;
+                    }
                 }
             }
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
                 seen.clear();
                 for arg in &op.args {
-                    if arg.is_constant() {
+                    if arg.is_none() || arg.is_constant() {
                         return false;
                     }
                     if !seen.insert(*arg) {
@@ -296,10 +297,17 @@ impl TreeLoop {
             }
         }
 
-        // history.py:605-608: if last op is JUMP, verify target exists
         let last = self.ops.last().unwrap();
         if !last.opcode.is_final() {
             return false;
+        }
+        // history.py:605-608: if a JUMP has a target, it must be TargetToken.
+        if last.opcode == OpCode::Jump {
+            if let Some(descr) = last.descr.as_ref() {
+                if descr.as_loop_target_descr().is_none() {
+                    return false;
+                }
+            }
         }
 
         true
@@ -702,7 +710,7 @@ mod tests {
 
     // ══════════════════════════════════════════════════════════════════
     // History / TreeLoop parity tests
-    // Ported from rpython/jit/metainterp/test/test_history.py
+    // Local parity coverage for history.py TreeLoop structure.
     // ══════════════════════════════════════════════════════════════════
 
     #[test]
@@ -1193,6 +1201,19 @@ mod tests {
     }
 
     #[test]
+    fn test_check_consistency_none_arg_invalid() {
+        // history.py:579-582: regular op args must be Const or known boxes;
+        // None is only accepted in fail_args.
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            Op::new(OpCode::IntAdd, &[iarg(0), OpRef::NONE]),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
     fn test_check_consistency_const_arg_ok() {
         // history.py:580: constants are always valid args
         let inputargs = vec![InputArg::new_int(0)];
@@ -1210,10 +1231,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
         op0.pos = iop(2);
-        let ops = vec![
-            op0,
-            Op::new(OpCode::Finish, &[iop(2)]),
-        ];
+        let ops = vec![op0, Op::new(OpCode::Finish, &[iop(2)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
     }
@@ -1223,13 +1241,27 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
         op0.pos = iop(2);
+        let mut guard = Op::new(OpCode::GuardNoOverflow, &[]);
+        guard.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        let ops = vec![op0, guard, Op::new(OpCode::Finish, &[iop(2)])];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_guard_without_descr_invalid() {
+        // history.py:583-584: every guard needs a descr when check_descr=True,
+        // including overflow guards.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg(0), iarg(1)]);
+        op0.pos = iop(2);
         let ops = vec![
             op0,
             Op::new(OpCode::GuardNoOverflow, &[]),
             Op::new(OpCode::Finish, &[iop(2)]),
         ];
         let trace = TreeLoop::new(inputargs, ops);
-        assert!(trace.check_consistency());
+        assert!(!trace.check_consistency());
     }
 
     #[test]
@@ -1265,11 +1297,7 @@ mod tests {
         // LABEL introduces a fresh scope with iarg(0) only
         let label = Op::new(OpCode::Label, &[iarg(0)]);
         // iop(1) was defined before label, so it's no longer in seen
-        let ops = vec![
-            op0,
-            label,
-            Op::new(OpCode::Jump, &[iop(1)]),
-        ];
+        let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(!trace.check_consistency());
     }
@@ -1283,6 +1311,27 @@ mod tests {
         let ops = vec![op0, label, Op::new(OpCode::Jump, &[iop(1)])];
         let trace = TreeLoop::new(inputargs, ops);
         assert!(trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_duplicate_op_position_invalid() {
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut op0 = Op::new(OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        op0.pos = iop(1);
+        let mut op1 = Op::new(OpCode::IntSub, &[iop(1), iarg(0)]);
+        op1.pos = iop(1);
+        let ops = vec![op0, op1, Op::new(OpCode::Finish, &[iop(1)])];
+        let trace = TreeLoop::new(inputargs, ops);
+        assert!(!trace.check_consistency());
+    }
+
+    #[test]
+    fn test_check_consistency_jump_descr_must_be_target_token() {
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut jump = Op::new(OpCode::Jump, &[iarg(0)]);
+        jump.descr = Some(std::sync::Arc::new(DummyGuardDescr));
+        let trace = TreeLoop::new(inputargs, vec![jump]);
+        assert!(!trace.check_consistency());
     }
 
     #[test]
@@ -1537,8 +1586,7 @@ mod tests {
 
     // ══════════════════════════════════════════════════════════════════
     // History / TreeLoop parity tests
-    // Ported from rpython/jit/metainterp/test/test_history.py
-    // (moved from recorder.rs — these test history.py TreeLoop behaviour)
+    // Local parity coverage for history.py/opencoder.py trace materialization.
     // ══════════════════════════════════════════════════════════════════
 
     #[test]
@@ -1573,12 +1621,20 @@ mod tests {
         #[derive(Debug)]
         struct TestFailDescr(u32);
         impl majit_ir::Descr for TestFailDescr {
-            fn index(&self) -> u32 { self.0 }
-            fn as_fail_descr(&self) -> Option<&dyn FailDescr> { Some(self) }
+            fn index(&self) -> u32 {
+                self.0
+            }
+            fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+                Some(self)
+            }
         }
         impl FailDescr for TestFailDescr {
-            fn fail_index(&self) -> u32 { self.0 }
-            fn fail_arg_types(&self) -> &[Type] { &[] }
+            fn fail_index(&self) -> u32 {
+                self.0
+            }
+            fn fail_arg_types(&self) -> &[Type] {
+                &[]
+            }
         }
 
         let mut rec = Trace::new();
@@ -1654,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_trace_for_tree_loop() {
+    fn test_recorder_get_trace_for_tree_loop() {
         use crate::recorder::Trace;
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
@@ -1662,7 +1718,7 @@ mod tests {
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
 
-        let trace: TreeLoop = rec.into();
+        let trace = rec.get_trace();
         assert_eq!(trace.num_inputargs(), 2);
         assert_eq!(trace.num_ops(), 2);
         assert!(trace.is_loop());
@@ -1978,7 +2034,11 @@ impl TraceCtx {
         recorder.record_guard(opcode, args, descr)
     }
 
-    pub(crate) fn do_close_loop(recorder: &mut Trace, _constants: &ConstantPool, jump_args: &[OpRef]) {
+    pub(crate) fn do_close_loop(
+        recorder: &mut Trace,
+        _constants: &ConstantPool,
+        jump_args: &[OpRef],
+    ) {
         recorder.close_loop(jump_args);
     }
 
@@ -2045,12 +2105,7 @@ impl TraceCtx {
         // sees the same `Rc<Box>` allocations created during tracing —
         // RPython parity for `AbstractValue` object identity.
         let (inputargs, ops, box_pool) = self.recorder.into_parts();
-        crate::history::TreeLoop::with_box_pool(
-            inputargs,
-            ops,
-            self.snapshots,
-            box_pool,
-        )
+        crate::history::TreeLoop::with_box_pool(inputargs, ops, self.snapshots, box_pool)
     }
 
     /// Snapshot slice accessor — Pyre-level parity with

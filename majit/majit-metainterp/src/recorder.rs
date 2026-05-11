@@ -382,21 +382,18 @@ impl Trace {
     /// Consume the recorder and return its parts: (inputargs, ops, box_pool).
     ///
     /// history.py parity: the recording phase ends and the trace is handed
-    /// to the optimizer as a `TreeLoop`. Callers use
-    /// `TreeLoop::from(recorder)` (history.rs `From<Trace>`) to produce the
-    /// completed loop — see `TraceCtx::into_tree_loop` for the snapshot-
-    /// bearing path.
+    /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
+    /// the snapshot-bearing path.
     pub fn into_parts(self) -> (Vec<InputArg>, Vec<Op>, crate::r#box::BoxPool) {
         (self.inputargs, self.ops, self.box_pool)
     }
 
     /// Convenience: consume the recorder and produce a `TreeLoop`.
     ///
-    /// Delegates to `TreeLoop::from(self)` (history.rs `From<Trace>` impl).
     /// Snapshots are NOT included — callers that need them should use
     /// `TraceCtx::into_tree_loop` instead.
     pub fn get_trace(self) -> crate::history::TreeLoop {
-        crate::history::TreeLoop::from(self)
+        crate::history::TreeLoop::with_box_pool(self.inputargs, self.ops, Vec::new(), self.box_pool)
     }
 
     /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
@@ -1110,7 +1107,6 @@ mod tests {
         // This should panic.
         rec.record_input_arg(Type::Int);
     }
-
 
     // ══════════════════════════════════════════════════════════════════
     // Opencoder breadth tests — deeper parity with test_opencoder.py
