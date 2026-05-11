@@ -768,6 +768,29 @@ impl WarmEnterState {
         }
     }
 
+    /// Record a blackhole resume failure for a green key.
+    ///
+    /// Unlike `abort_tracing` (which handles trace-compilation failures),
+    /// this handles the case where compiled code ran successfully but the
+    /// blackhole resume after a guard failure failed.  Each failure
+    /// increments `abort_count` so that `force_start_tracing` will
+    /// eventually refuse to retrace, breaking the
+    /// compile → guard-fail → bh-fail → invalidate → retrace cycle.
+    ///
+    /// Returns `true` if the abort limit has been reached and the caller
+    /// should NOT invalidate (further retracing is pointless).
+    pub fn record_blackhole_failure(&mut self, green_key_hash: u64) -> bool {
+        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+            cell.abort_count += 1;
+            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.state = BaseJitCellState::DontTraceHere;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Install a compiled loop token for a green key.
     ///
     /// The cell transitions to Compiled state and takes ownership of
