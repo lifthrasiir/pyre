@@ -8941,9 +8941,22 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
-    /// pyjitpl.py:3132 prepare_resume_from_failure parity:
+    /// pyjitpl.py:3132 prepare_resume_from_failure parity.
+    ///
     /// Emit SAVE_EXC_CLASS + SAVE_EXCEPTION + RESTORE_EXCEPTION at
-    /// the bridge trace start for exception guard bridges.
+    /// the bridge trace start for exception guard bridges, then emit
+    /// GUARD_EXCEPTION (pyjitpl.py:3140-3147
+    /// `handle_possible_exception`).
+    ///
+    /// When the three SAVE/RESTORE ops are consecutive (no resume-data
+    /// virtual-reconstruction ops between them — the current pyre
+    /// state), `rewrite.rs::remove_bridge_exception` strips them,
+    /// leaving only the GUARD_EXCEPTION.  When pyre gains
+    /// resume-data replay (emitting NEW_WITH_VTABLE etc. between
+    /// SAVE and RESTORE), this method must be split into two phases
+    /// matching RPython's `_prepare_exception_resumption` (phase 1,
+    /// trace start) and `prepare_resume_from_failure` (phase 2,
+    /// after resume ops).
     pub fn emit_exception_bridge_prologue(&mut self, exc_class: i64, exc_value: i64) {
         let Some(ref mut ctx) = self.tracing else {
             return;
@@ -8953,6 +8966,17 @@ impl<M: Clone> MetaInterp<M> {
         let class_op = ctx.record_op(OpCode::SaveExcClass, &[class_const]);
         let value_op = ctx.record_op(OpCode::SaveException, &[value_const]);
         ctx.record_op(OpCode::RestoreException, &[class_op, value_op]);
+        // pyjitpl.py:3140-3147: after RESTORE_EXCEPTION, RPython calls
+        // execute_ll_raised(exception_obj) which sets last_exc_value,
+        // then handle_possible_exception() which emits GUARD_EXCEPTION.
+        // The guard tells the optimizer "this bridge starts with a known
+        // exception of class exc_class" — without it, the optimizer may
+        // incorrectly remove a later GUARD_NO_EXCEPTION.
+        if exc_class != 0 {
+            ctx.guard_exception(class_const, 0);
+        } else {
+            ctx.guard_no_exception(0);
+        }
     }
 
     // ── Guard Failure Recovery ─────────────────────────────────
