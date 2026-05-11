@@ -32,7 +32,7 @@ use majit_ir::{
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
 use crate::recorder::TracePosition;
-use crate::trace_ctx::TraceCtx;
+use crate::trace_ctx::{MergePoint, TraceCtx};
 use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary, ResumeValueSource,
@@ -4849,35 +4849,16 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 /// `ResumeGuardDescr` (`compile.py:855`) is the single guard-owned
 /// resume container.
 
-// ── MergePoint + TraceCtx merge-point / inline-tracking methods ──────────
+// ── TraceCtx merge-point / inline-tracking methods ──────────────────────
 //
-// Moved from `trace_ctx.rs` — these are the **compile role** of `TraceCtx`,
-// mirroring RPython's `compile.py compile_loop` / `compile_bridge`
-// merge-point bookkeeping and `pyjitpl.py` portal-frame / inline-trace
-// tracking (`current_merge_points`, `portal_trace_positions`).
-
-/// pyjitpl.py:2989 — a visited loop header with its trace position.
-///
-/// RPython stores `(original_boxes, start)` where `original_boxes` is the
-/// full list of green+red args at the first visit, and `start` is a 5-tuple
-/// trace position. majit stores the equivalent as OpRef vectors + TracePosition.
-#[derive(Clone, Debug)]
-pub struct MergePoint {
-    /// Green key of the loop header.
-    pub green_key: u64,
-    /// Trace position when this loop header was first visited.
-    pub position: TracePosition,
-    /// pyjitpl.py:2989: original_boxes — live variable OpRefs at the first
-    /// visit to this loop header. Used by compile_loop/compile_retrace as
-    /// the inputargs for trace cutting.
-    pub original_boxes: Vec<OpRef>,
-    /// Types of original_boxes. RPython Box carries type implicitly;
-    /// majit stores types alongside OpRefs for compile_retrace parity.
-    pub original_box_types: Vec<Type>,
-    /// Bytecode PC of this loop header. Used by cut_trace_from to update
-    /// meta when the trace closes at a different loop.
-    pub header_pc: usize,
-}
+// These are the **compile role** of `TraceCtx`, mirroring RPython's
+// `pyjitpl.py` merge-point bookkeeping (`current_merge_points`,
+// `portal_trace_positions`) and `compile.py compile_loop` /
+// `compile_bridge` consumption of merge-point state.
+//
+// `MergePoint` itself lives in `trace_ctx.rs` alongside the
+// `current_merge_points` field that owns it — matching RPython where
+// `MetaInterp` (pyjitpl.py) owns both the struct and the list.
 
 impl TraceCtx {
 

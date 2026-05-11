@@ -9,8 +9,11 @@
 //!   `into_tree_loop`, all `call_*` / `guard_*` recording wrappers.
 //!
 //! * **Compile role** → `compile.rs` `impl TraceCtx`:
-//!   `MergePoint`, `add/clear/get/has_merge_point*`,
+//!   `add/clear/get/has_merge_point*`,
 //!   inline-trace tracking (`push/pop_inline_*`, `recursive_depth`).
+//!
+//! `MergePoint` is defined here alongside `current_merge_points`,
+//! matching RPython where `MetaInterp` (pyjitpl.py) owns both.
 //!
 //! Remaining convergence: reshape `MetaInterp` fields from
 //! `meta.trace_ctx` to `meta.history` + `meta.trace` (upstream
@@ -23,7 +26,6 @@ use majit_trace::heapcache::HeapCache;
 
 use majit_backend::JitCellToken;
 
-use crate::compile::MergePoint;
 use crate::constant_pool::ConstantPool;
 use crate::jitcode::JitArgKind;
 // `make_resume_guard_descr*` is no longer needed at the tracer side —
@@ -58,6 +60,29 @@ fn concrete_ptrs_eq(a: &Value, b: &Value) -> bool {
         (Value::Ref(ra), Value::Ref(rb)) => ra == rb,
         _ => false,
     }
+}
+
+/// pyjitpl.py:2989 — a visited loop header with its trace position.
+///
+/// RPython stores `(original_boxes, start)` where `original_boxes` is the
+/// full list of green+red args at the first visit, and `start` is a 5-tuple
+/// trace position. majit stores the equivalent as OpRef vectors + TracePosition.
+#[derive(Clone, Debug)]
+pub struct MergePoint {
+    /// Green key of the loop header.
+    pub green_key: u64,
+    /// Trace position when this loop header was first visited.
+    pub position: crate::recorder::TracePosition,
+    /// pyjitpl.py:2989: original_boxes — live variable OpRefs at the first
+    /// visit to this loop header. Used by compile_loop/compile_retrace as
+    /// the inputargs for trace cutting.
+    pub original_boxes: Vec<OpRef>,
+    /// Types of original_boxes. RPython Box carries type implicitly;
+    /// majit stores types alongside OpRefs for compile_retrace parity.
+    pub original_box_types: Vec<Type>,
+    /// Bytecode PC of this loop header. Used by cut_trace_from to update
+    /// meta when the trace closes at a different loop.
+    pub header_pc: usize,
 }
 
 /// Tracing context: wraps Trace + ConstantPool with convenience API.

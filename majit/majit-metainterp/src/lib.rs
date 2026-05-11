@@ -91,7 +91,7 @@ pub use pyjitpl::{
     trace_jitcode_with_args,
 };
 pub use quasiimmut::QuasiImmut;
-pub use compile::MergePoint;
+pub use trace_ctx::MergePoint;
 pub use trace_ctx::TraceCtx;
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
