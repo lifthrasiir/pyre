@@ -1173,7 +1173,7 @@ pub(super) struct LoweredSequence {
 
 impl LoweredSequence {
     pub(super) fn new(statements: Vec<TokenStream>, op_metadata: Vec<OpMeta>) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             statements.len(),
             op_metadata.len(),
             "RPython ssarepr.insns parity requires statement/op_metadata streams to stay paired"
