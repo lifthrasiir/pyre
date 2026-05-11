@@ -145,8 +145,7 @@ pub struct PyJitCodeMetadata {
     /// `(nlocals..nlocals + max_stackdepth)` so `enforce_input_args`
     /// pins the tail too (parity with `flatten.py:88-100`).
     pub stack_slot_color_map: Vec<u16>,
-    /// Task #110 slice 3a (parent #185 epic, plan
-    /// `task110_ssa_authoritative_live_r_epic_plan.md`):
+    /// SSA-authoritative live_r epic slice 3a:
     /// post-regalloc color of each Python-semantic local slot.
     /// `pyre_color_for_semantic_local[i]` = `apply_rename(Kind::Ref, i)`
     /// for `i in 0..code.varnames.len()`. Populated in `finalize_jitcode`
@@ -159,13 +158,10 @@ pub struct PyJitCodeMetadata {
     ///
     /// Today `enforce_input_args` (`flatten.py:88-100` parity)
     /// pins each local-i inputarg color to identity (`color = i`),
-    /// so this map is `[0, 1, ..., nlocals-1]` for every populated jitcode.
-    /// The map exists as a side channel so the encoder
-    /// (`get_list_of_active_boxes` / `setup_kind_register_banks`) can
-    /// stop assuming `local_idx == post-regalloc-color` before slice 3b
-    /// rewrites the encoder to read `registers_r[color]` directly per
-    /// `pyjitpl.py:218-234`. No production reader consumes this map
-    /// today; slice 3b will pick it up site-by-site.
+    /// so this map is `[0, 1, ..., nlocals-1]` for every populated
+    /// jitcode. Slice 3b-2 (`get_list_of_active_boxes`) derives the
+    /// semantic index from the color via this map for locals and
+    /// `stack_slot_color_map` for stack slots.
     pub pyre_color_for_semantic_local: Vec<u16>,
 }
 

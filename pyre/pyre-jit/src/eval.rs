@@ -3057,9 +3057,9 @@ fn execute_assembler(
                             // `ExitFrameWithExceptionRef` for uncaught
                             // exceptions, never returns a failure code).
                             // Pyre's `BlackholeResult::Failed` is a layered
-                            // adaptation that should be removed once the
-                            // upstream SSA-authoritative live_r work lands
-                            // (Task #110 / Option α step 6).  Until then
+                            // adaptation; SSA-authoritative live_r slices
+                            // 3b-2/3b-3 (color-indexed registers_r) should
+                            // eliminate the remaining triggers. Until then
                             // the bare `invalidate_loop` keeps the cell
                             // retraceable; the failure surfaces in
                             // check.sh rather than being masked.
@@ -3445,11 +3445,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // (`blackhole.py:1679` raises
                             // `ExitFrameWithExceptionRef` instead).  The
                             // `BlackholeResult::Failed` variant is a pyre
-                            // layering on top of an upstream SSA liveness
-                            // gap (Task #110 / Option α step 6); when it
-                            // hits, surface the failure to check.sh by
-                            // invalidating the loop without forcing a
-                            // permanent dont-trace.
+                            // layering; SSA-authoritative live_r slices
+                            // 3b-2/3b-3 should eliminate the triggers by
+                            // reading/writing registers_r at post-regalloc
+                            // color instead of semantic slot index.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — invalidating",
@@ -6381,29 +6380,22 @@ mod tests {
             fail_args.iter().all(|arg| !arg.is_none()),
             "materialized fail args should not contain OpRef::NONE holes"
         );
-        // `registers_r` is keyed by semantic slot index (locals 0..nlocals,
-        // stack nlocals..nlocals+stack_only) — `load_local_value` writes
-        // there.  Phase 2.1c only changed the post-rename color landscape,
-        // not the semantic indexing.
-        assert!(
-            state.symbolic_registers_r()[2..4]
-                .iter()
-                .all(|opref| !opref.is_none()),
-            "live stack slots should be materialized into the symbolic register file"
-        );
+        // SSA-authoritative live_r slice 3b-3: registers_r is now
+        // color-indexed. Stack values are at their post-regalloc colors
+        // (from stack_slot_color_map), which may overlap with local
+        // indices when chordal coloring coalesces slots. The encoder
+        // reads registers_r[color] directly.
         for (depth, &color) in stack_colors.iter().enumerate() {
             let color = color as usize;
-            if color < 2 {
-                let stack_value = [stack0, stack1][depth];
-                assert_ne!(
-                    state.symbolic_registers_r()[color],
-                    stack_value,
-                    "Ref-bank color {} for stack depth {} must not overwrite semantic local slot {}",
-                    color,
-                    depth,
-                    color
-                );
-            }
+            let stack_value = [stack0, stack1][depth];
+            assert_eq!(
+                state.symbolic_registers_r()[color],
+                stack_value,
+                "stack depth {} at color {} must be in registers_r[{}]",
+                depth,
+                color,
+                color,
+            );
         }
     }
 

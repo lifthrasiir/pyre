@@ -1056,10 +1056,16 @@ pub fn seed_compiled_trace_jitcode_test_state(
 
     let nlocals = sym.nlocals;
     for &(depth, opref) in stack_slots {
-        let semantic_idx = nlocals + depth;
-        if semantic_idx < sym.registers_r.len() {
-            sym.registers_r[semantic_idx] = opref;
+        // SSA-authoritative live_r slice 3b-3: write at the
+        // post-regalloc color for this stack slot so the encoder
+        // (`get_list_of_active_boxes`) reads the correct value via
+        // `registers_r[color]`. Falls back to semantic index when no
+        // color map is available (skeleton/null jitcode).
+        let reg_idx = crate::trace_opcode::stack_slot_reg_idx(sym, depth);
+        if reg_idx >= sym.registers_r.len() {
+            sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
         }
+        sym.registers_r[reg_idx] = opref;
     }
 
     let banks = frame_liveness_reg_indices_by_bank_at(jitcode_index, live_pc);
