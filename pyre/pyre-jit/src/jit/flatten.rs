@@ -591,7 +591,9 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
         // `call.py:301 getcalldescr` — `EF_CAN_RAISE`.
         CallFlavor::Plain => EffectInfoSlot::CanRaise,
         // `call.py:303 getcalldescr` — `EF_CANNOT_RAISE` (`else` branch).
-        CallFlavor::PlainCannotRaise => EffectInfoSlot::CannotRaise,
+        CallFlavor::PlainCannotRaise | CallFlavor::PlainCannotRaiseNoHeap => {
+            EffectInfoSlot::CannotRaise
+        }
         // `call.py:291 getcalldescr` — `EF_LOOPINVARIANT`.
         CallFlavor::LoopInvariant => EffectInfoSlot::LoopInvariant,
         // `call.py:292-299 getcalldescr` 3-way elidable pick.
@@ -643,6 +645,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // touch no heap opt into `CANNOT_RAISE_NO_HEAP_EFFECT_INFO`
         // (the analyzer-output empty-set shape) instead.
         CallFlavor::PlainCannotRaise => majit_metainterp::cannot_raise_effect_info(),
+        CallFlavor::PlainCannotRaiseNoHeap => majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `call.py:288-289`
         // selects this extraeffect when `virtualizable_analyzer.
         // analyze(op)` is true.  `MOST_GENERAL` (`EF_RANDOM_EFFECTS
@@ -793,6 +796,12 @@ pub enum CallFlavor {
     /// this flavor today only when the callee is statically known not
     /// to raise.
     PlainCannotRaise,
+    /// `EF_CANNOT_RAISE` with analyzer-confirmed no-heap semantics.
+    /// `effectinfo_from_writeanalyze` (`call.py:320-324`) would compute
+    /// empty `readonly_descrs_*` / `write_descrs_*` bitsets and
+    /// `can_collect = False` for such helpers.  Maps to
+    /// `CANNOT_RAISE_NO_HEAP_EFFECT_INFO`.
+    PlainCannotRaiseNoHeap,
     /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`. The builder emits
     /// `call_may_force_*` so the metainterp forces virtualizable state
     /// before the call. Maps to `JitCodeBuilder::call_may_force_*_typed`.
@@ -2888,12 +2897,12 @@ pub fn build_call_fn_residual_call_r_r_insn(
 /// dual-write at codewriter.rs:6141-6152 stays in place.
 ///
 /// `get_current_exception_fn` has signature `() → Ref` with
-/// `CallFlavor::PlainCannotRaise` (per codewriter.rs:2246-2252 —
-/// TLS read of `CURRENT_EXCEPTION`; `EF_CANNOT_RAISE`).  Zero-arg
-/// (`ref_operands` empty) produces a `residual_call_r_r(ConstInt(
-/// fn_idx), ListR([]), Descr) → Reg(Ref, dst)` Insn — same opname
-/// as CALL family but with empty `ListR` and PlainCannotRaise
-/// flavor.
+/// `CallFlavor::PlainCannotRaiseNoHeap` (per codewriter.rs:2246-2252 —
+/// TLS read of `CURRENT_EXCEPTION`; `EF_CANNOT_RAISE`, no heap access,
+/// no GC).  Zero-arg (`ref_operands` empty) produces a
+/// `residual_call_r_r(ConstInt(fn_idx), ListR([]), Descr) → Reg(Ref,
+/// dst)` Insn — same opname as CALL family but with empty `ListR` and
+/// PlainCannotRaiseNoHeap flavor.
 pub fn build_get_current_exception_fn_residual_call_r_r_insn(
     get_current_exception_fn_idx: u16,
     dst_reg: u16,
@@ -2901,7 +2910,7 @@ pub fn build_get_current_exception_fn_residual_call_r_r_insn(
     build_residual_call_r_r_insn_from_operands(
         get_current_exception_fn_idx,
         Vec::new(),
-        CallFlavor::PlainCannotRaise,
+        CallFlavor::PlainCannotRaiseNoHeap,
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -3419,10 +3428,11 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
 /// dual-writes stay in place.
 ///
 /// `set_current_exception_fn` has signature `(exc: Ref) → Void` with
-/// `CallFlavor::PlainCannotRaise` (per codewriter.rs:2253-2258 — TLS
-/// write to `CURRENT_EXCEPTION`; `EF_CANNOT_RAISE`).  Same opname
-/// `residual_call_r_v` as SETITEM but fixed-arity 1 vs SETITEM's 3,
-/// plus PlainCannotRaise flavor vs SETITEM's MayForce.
+/// `CallFlavor::PlainCannotRaiseNoHeap` (per codewriter.rs:2253-2258 —
+/// TLS write to `CURRENT_EXCEPTION`; `EF_CANNOT_RAISE`, no heap access,
+/// no GC).  Same opname `residual_call_r_v` as SETITEM but fixed-arity
+/// 1 vs SETITEM's 3, plus PlainCannotRaiseNoHeap flavor vs SETITEM's
+/// MayForce.
 pub fn build_set_current_exception_fn_residual_call_r_v_insn(
     set_current_exception_fn_idx: u16,
     exc_reg: u16,
@@ -3430,7 +3440,7 @@ pub fn build_set_current_exception_fn_residual_call_r_v_insn(
     build_residual_call_r_v_insn_from_operands(
         set_current_exception_fn_idx,
         vec![Operand::Register(Register::new(Kind::Ref, exc_reg))],
-        CallFlavor::PlainCannotRaise,
+        CallFlavor::PlainCannotRaiseNoHeap,
     )
 }
 
@@ -3567,6 +3577,11 @@ mod tests {
         // instead; the unresolved-target shape exercised by
         // `unresolved_release_gil_effect_info_routes_to_release_gil_dispatch`
         // covers the via-target seed half of the round trip.
+        // PlainCannotRaiseNoHeap is excluded — it shares
+        // ExtraEffect::CannotRaise with PlainCannotRaise; the heap
+        // distinction lives in the bitstrings, not the extraeffect
+        // discriminant, so the round-trip correctly collapses to
+        // PlainCannotRaise.
         for flavor in [
             CallFlavor::Plain,
             CallFlavor::PlainCannotRaise,
@@ -6301,9 +6316,9 @@ mod tests {
 
     #[test]
     fn build_get_current_exception_fn_residual_call_r_r_insn_emits_zero_arg_call() {
-        // Task #48 micro-slice 15: 0-arg `() → Ref` PlainCannotRaise.
+        // Task #48 micro-slice 15: 0-arg `() → Ref` PlainCannotRaiseNoHeap.
         // Insn shape: `[ConstInt(fn_idx), ListR([]), Descr]
-        // → Reg(Ref, dst)`.  arg_kinds is empty; flavor is PlainCannotRaise.
+        // → Reg(Ref, dst)`.  arg_kinds is empty; flavor is PlainCannotRaiseNoHeap.
         let insn = build_get_current_exception_fn_residual_call_r_r_insn(
             /* fn_idx */ 30, /* dst_reg */ 5,
         );
@@ -6332,7 +6347,7 @@ mod tests {
                         assert_eq!(stub.arg_kinds, Vec::<Kind>::new());
                         assert_eq!(
                             stub.effect_info,
-                            effect_info_for_call_flavor(CallFlavor::PlainCannotRaise),
+                            effect_info_for_call_flavor(CallFlavor::PlainCannotRaiseNoHeap),
                         );
                     } else {
                         panic!("expected CallDescrStub");
@@ -6347,7 +6362,7 @@ mod tests {
 
     #[test]
     fn build_set_current_exception_fn_residual_call_r_v_insn_emits_void_call() {
-        // 1-arg `(exc:Ref) → Void` PlainCannotRaise.  Insn shape:
+        // 1-arg `(exc:Ref) → Void` PlainCannotRaiseNoHeap.  Insn shape:
         // `[ConstInt(fn_idx), ListR([Reg(exc)]), Descr]` (no result).
         let insn = build_set_current_exception_fn_residual_call_r_v_insn(
             /* fn_idx */ 31, /* exc_reg */ 7,
@@ -6383,7 +6398,7 @@ mod tests {
                         assert_eq!(stub.arg_kinds, vec![Kind::Ref]);
                         assert_eq!(
                             stub.effect_info,
-                            effect_info_for_call_flavor(CallFlavor::PlainCannotRaise),
+                            effect_info_for_call_flavor(CallFlavor::PlainCannotRaiseNoHeap),
                         );
                     } else {
                         panic!("expected CallDescrStub");
