@@ -314,12 +314,12 @@ pub(super) fn remove_repeated_live(op_metadata: &mut Vec<OpMeta>, statements: &m
             }
         }
         if markers.len() == 1 {
+            new_meta.push(op_metadata[first_marker_idx].clone());
+            new_stmts.push(statements[first_marker_idx].clone());
             for li in &interleaved_labels {
                 new_meta.push(op_metadata[*li].clone());
                 new_stmts.push(statements[*li].clone());
             }
-            new_meta.push(op_metadata[first_marker_idx].clone());
-            new_stmts.push(statements[first_marker_idx].clone());
             continue;
         }
         // PRE-EXISTING-ADAPTATION: `liveness.py:82-116 remove_repeated_live`
