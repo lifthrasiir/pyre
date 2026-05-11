@@ -8545,14 +8545,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "inline_call_irf_v/dIRF not yet emitted by the pipeline build"]
     fn inline_call_irf_v_accepts_void_returning_callee() {
         let void_ret = *insns_opname_to_byte()
             .get("void_return/")
             .expect("`void_return/` must be in insns table");
-        let Some(&inline_byte) = insns_opname_to_byte().get("inline_call_irf_v/dIRF") else {
-            // irf_v opcode not yet emitted by the pipeline build — skip.
-            return;
-        };
+        let &inline_byte = insns_opname_to_byte()
+            .get("inline_call_irf_v/dIRF")
+            .expect("`inline_call_irf_v/dIRF` must be in insns table");
         let callee_code: &'static [u8] = Box::leak(Box::new([void_ret]));
         let sub_body = SubJitCodeBody {
             code: callee_code,
@@ -8601,13 +8601,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "inline_call_irf_v/dIRF not yet emitted by the pipeline build"]
     fn inline_call_irf_v_rejects_non_void_returning_callee() {
         let ref_ret = *insns_opname_to_byte()
             .get("ref_return/r")
             .expect("`ref_return/r` must be in insns table");
-        let Some(&inline_byte) = insns_opname_to_byte().get("inline_call_irf_v/dIRF") else {
-            return;
-        };
+        let &inline_byte = insns_opname_to_byte()
+            .get("inline_call_irf_v/dIRF")
+            .expect("`inline_call_irf_v/dIRF` must be in insns table");
         let callee_code: &'static [u8] = Box::leak(Box::new([ref_ret, 0x00]));
         let sub_body = SubJitCodeBody {
             code: callee_code,
