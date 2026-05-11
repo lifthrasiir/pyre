@@ -1339,10 +1339,17 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
         )),
         ConstantData::None => ConcreteValue::Ref(pyre_object::w_none()),
         ConstantData::Slice { elements } if elements.len() == 3 => {
-            let start = load_const_concrete(&elements[0]).to_pyobj();
-            let stop = load_const_concrete(&elements[1]).to_pyobj();
-            let step = load_const_concrete(&elements[2]).to_pyobj();
-            ConcreteValue::Ref(pyre_object::w_slice_new(start, stop, step))
+            let start = load_const_concrete(&elements[0]);
+            let stop = load_const_concrete(&elements[1]);
+            let step = load_const_concrete(&elements[2]);
+            if start.is_null() || stop.is_null() || step.is_null() {
+                return ConcreteValue::Null;
+            }
+            ConcreteValue::Ref(pyre_object::w_slice_new(
+                start.to_pyobj(),
+                stop.to_pyobj(),
+                step.to_pyobj(),
+            ))
         }
         _ => ConcreteValue::Null,
     }
