@@ -313,48 +313,6 @@ impl TreeLoop {
         true
     }
 
-    /// Get all OpRefs used as arguments but not defined by any op.
-    /// These are the "free variables" — inputs from outside the trace.
-    pub fn free_vars(&self) -> Vec<OpRef> {
-        let defined: std::collections::HashSet<OpRef> = self
-            .ops
-            .iter()
-            .filter(|op| !op.pos.is_none())
-            .map(|op| op.pos)
-            .collect();
-        let mut free = std::collections::HashSet::new();
-        for op in &self.ops {
-            for arg in &op.args {
-                if !arg.is_none() && !defined.contains(arg) {
-                    free.insert(*arg);
-                }
-            }
-        }
-        let mut result: Vec<OpRef> = free.into_iter().collect();
-        result.sort_by_key(|r| r.raw());
-        result
-    }
-
-    /// Count operations by opcode category.
-    pub fn count_by_category(&self) -> (usize, usize, usize, usize) {
-        let mut guards = 0;
-        let mut pure = 0;
-        let mut calls = 0;
-        let mut other = 0;
-        for op in &self.ops {
-            if op.opcode.is_guard() {
-                guards += 1;
-            } else if op.opcode.is_always_pure() {
-                pure += 1;
-            } else if op.opcode.is_call() {
-                calls += 1;
-            } else {
-                other += 1;
-            }
-        }
-        (guards, pure, calls, other)
-    }
-
     /// opencoder.py CutTrace parity — create a new trace by cutting at the
     /// given position. `original_boxes` become the new inputargs; any OpRef
     /// referenced after the cut but defined before it (and not in
@@ -1332,39 +1290,6 @@ mod tests {
         jump.descr = Some(std::sync::Arc::new(DummyGuardDescr));
         let trace = TreeLoop::new(inputargs, vec![jump]);
         assert!(!trace.check_consistency());
-    }
-
-    #[test]
-    fn test_free_vars() {
-        let mut ops = vec![
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
-            Op::new(OpCode::Finish, &[OpRef::int_op(0)]),
-        ];
-        ops[0].pos = OpRef::int_op(0);
-        ops[1].pos = OpRef::int_op(1);
-        let trace = TreeLoop::new(vec![], ops);
-        let free = trace.free_vars();
-        // OpRef::int_op(100) and OpRef::int_op(101) are free (not defined)
-        assert!(free.contains(&OpRef::int_op(100)));
-        assert!(free.contains(&OpRef::int_op(101)));
-        assert!(!free.contains(&OpRef::int_op(0))); // defined by op[0]
-    }
-
-    #[test]
-    fn test_count_by_category() {
-        let ops = vec![
-            Op::new(OpCode::GuardTrue, &[OpRef::int_op(0)]),
-            Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::IntMul, &[OpRef::int_op(0), OpRef::int_op(1)]),
-            Op::new(OpCode::CallI, &[OpRef::int_op(0)]),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let trace = TreeLoop::new(vec![], ops);
-        let (guards, pure, calls, other) = trace.count_by_category();
-        assert_eq!(guards, 1);
-        assert_eq!(pure, 2);
-        assert_eq!(calls, 1);
-        assert_eq!(other, 1); // Finish
     }
 
     #[test]
