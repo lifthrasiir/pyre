@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::call::CallDescriptor;
+use crate::jit_codewriter::support::{NormalizedArg, decode_builtin_call};
 use crate::model::{
     CallFuncPtr, CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueId,
     ValueType, remap_control_flow_metadata,
@@ -263,6 +264,28 @@ pub struct Transformer<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VableFlag {
     FreshVirtualizable,
+}
+
+/// `support.py:723 result.append(Constant(obj, lltype.typeOf(obj)))`
+/// — prepend the constant-injection ops that `decode_builtin_call`'s
+/// `NormalizedArg::ConstInt(v)` slots required, in front of the
+/// downstream rewrite result.  No-op when no ConstInt slot was
+/// materialised.  `Identity` / `Keep` are passed through unchanged
+/// (downstream consumers of those variants do not observe the
+/// materialised ValueIds — only `Replace` branches receive the
+/// `effective_args` list).
+fn prepend_const_prefix(prefix: &mut Vec<SpaceOperation>, result: RewriteResult) -> RewriteResult {
+    if prefix.is_empty() {
+        return result;
+    }
+    match result {
+        RewriteResult::Replace(ops) => {
+            let mut combined = std::mem::take(prefix);
+            combined.extend(ops);
+            RewriteResult::Replace(combined)
+        }
+        other => other,
+    }
 }
 
 /// Result of rewriting a single operation.
@@ -914,35 +937,85 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
-            // RPython `jtransform.py:576-577`:
-            //   rewrite_op_int_floordiv = _do_builtin_call
-            //   rewrite_op_int_mod = _do_builtin_call
-            // `_do_builtin_call` replaces the `int_floordiv` / `int_mod`
-            // SpaceOperation with `direct_call(ll_int_py_div, ...)` /
-            // `direct_call(ll_int_py_mod, ...)` BEFORE jitcode emission,
-            // so RPython's `pipeline.insns` never carries the bare
-            // `int_floordiv/ii>i` / `int_mod/ii>i` opname and
-            // `blackhole.py` has no `bhimpl_int_floordiv` /
-            // `bhimpl_int_mod` to match.  pyre's front-end emits
-            // `BinOp { op: "mod" }` (and "floordiv" is reserved for the
-            // explicit floor-division shape) over `i64` operands from
-            // Rust's `%` / floor-div helpers; without this rewrite the
-            // assembler encoder
-            // (`jit_codewriter/assembler.rs:2778-2789`
-            // `format!("int_{op}")`) would emit the bare opname.
-            // Model after the `float_mod` → `ll_math_fmod` arm above:
-            // synthesize a `CallResidual` op routed to the helper with
-            // the matching `OopSpecIndex::IntPyMod` /
-            // `OopSpecIndex::IntPyDiv` and `ExtraEffect::ElidableCanRaise`
-            // (because integer `%` / `//` may raise `ZeroDivisionError`
-            // and `OverflowError` for `INT_MIN % -1` / `INT_MIN // -1`),
-            // matching `call.rs::INT_MOD_TARGETS` /
-            // `INT_FLOORDIV_TARGETS` registry entries.  The helpers
-            // (`majit_metainterp::blackhole::ll_int_py_mod` /
-            // `ll_int_py_div`) implement Python-floor semantics on top
-            // of Rust's truncating `wrapping_rem` / `wrapping_div`, so
-            // the rewrite preserves Python `%` / `//` behaviour at the
-            // residual-call level.
+            // RPython hits Python-`%` / `//` semantics through TWO
+            // distinct routes upstream:
+            //
+            //   (a) the bare-op `rewrite_op_int_floordiv =
+            //       _do_builtin_call` / `rewrite_op_int_mod =
+            //       _do_builtin_call` rewrite at
+            //       `jtransform.py:576-577`, which replaces the
+            //       SpaceOperation with `direct_call(_ll_2_int_floordiv,
+            //       ...)` / `direct_call(_ll_2_int_mod, ...)` BEFORE
+            //       jitcode emission.  `_do_builtin_call` resolves the
+            //       helper through `support.py:266 _ll_2_int_mod` /
+            //       `:255 _ll_2_int_floordiv` and binds the function
+            //       pointer via `support.builtin_func_for_spec`.  The
+            //       post-rewrite call carries NO oopspec markup
+            //       (`_ll_2_int_*` have no `@oopspec` decorator) and
+            //       the helper output is C-TRUNCATING (the no-branch
+            //       reverse of `ll_int_py_div`); any Python-floor
+            //       correction must come from the bytecode emitter at
+            //       the BinOp callsite.
+            //
+            //   (b) the OS_INT_PY_MOD / OS_INT_PY_DIV oopspec at
+            //       `jtransform.py:2043`, reached when the rtyper
+            //       directly emits `int_py_mod` / `int_py_div` ops
+            //       (typically via `objspace/std/intobject.py` Python-
+            //       semantic `%` / `//`).  This route stamps
+            //       `int.py_mod` / `int.py_div` oopspec on the
+            //       residual call so optimisations
+            //       (`rewrite.py:713-766 optimize_call_int_py_div`,
+            //       `intbounds.py:1654 postprocess_int_floordiv`)
+            //       recognise it, and the helper output is
+            //       PYTHON-FLOOR (`rint.py:399-500 ll_int_py_div` /
+            //       `ll_int_py_mod`).
+            //
+            // Pyre's front-end emits `BinOp { op: "mod" | "floordiv" }`
+            // over `i64` operands from Rust's `%` / `/` — the C-style
+            // truncating primitive of the Rust language, lowered from
+            // helpers like `pyre-interpreter/src/baseobjspace.rs::int_mod`
+            // whose body computes `let r = va % vb; if r != 0 &&
+            // (r ^ vb) < 0 { r + vb } else { r }` to convert the
+            // C-trunc step into Python-floor.  The route-(a) match —
+            // C-truncating input semantic, no oopspec markup — is the
+            // structural fit, so the rewrite emits a `CallResidual` to
+            // `_ll_2_int_mod` / `_ll_2_int_floordiv` (registered at
+            // `pyre/jit_fnaddr.rs` with the canonical RPython helper
+            // names; bodies in `majit_metainterp::blackhole::_ll_2_int_*`
+            // reduce to `wrapping_rem` / `wrapping_div`) with
+            // `OopSpecIndex::None` and `ExtraEffect::CannotRaise`.
+            //
+            // Effect parity: upstream `_do_builtin_call` does NOT
+            // grant `EF_ELIDABLE_*` to helpers that lack the
+            // `@elidable` annotator decoration — the residual call's
+            // effect family is inherited from the function's actual
+            // RPython annotation, not synthesised by `_do_builtin_call`.
+            // `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod`
+            // carry no such decorator (compare `rint.py:496
+            // @jit.oopspec("int.py_mod")` which DOES decorate the
+            // Python-floor sibling).  Pyre therefore stamps
+            // `CannotRaise`, not `ElidableCannotRaise`: the C-trunc
+            // helpers do not raise (panics on `y == 0` are unreachable
+            // from the trace path, gated by the wrapper's pre-check at
+            // the BinOp callsite), but the JIT must NOT assume the
+            // call is pure (would license CSE / DCE the upstream effect
+            // family does not).
+            //
+            // Pre-existing optimisation passes
+            // (`optimize_call_int_py_mod` /
+            // `optimize_call_int_py_div` at `optimizeopt/rewrite.rs:1788,1848`)
+            // stay parked for the future route-(b) path: pyre has no
+            // Python-bytecode emitter that produces `int.py_mod` /
+            // `int.py_div` oopspec calls today, so those passes are
+            // dormant.  Performance recovery for the BinOp{mod,Int}
+            // path lands when (and only when) a route-(a) optimization
+            // pass is ported on top of the C-trunc helper.
+            //
+            // Without this rewrite the assembler encoder
+            // (`jit_codewriter/assembler.rs:2778-2789
+            // `format!("int_{op}")``) would emit the bare opname,
+            // leaking `int_mod/ii>i` / `int_floordiv/ii>i` into
+            // `pipeline.insns` where no blackhole handler exists.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -953,14 +1026,45 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind(*rhs) == 'i'
                 && *result_ty == ValueType::Int =>
             {
-                let (helper_name, oopspec) = if binop_name == "mod" {
-                    ("int_mod", OopSpecIndex::IntPyMod)
+                // RPython parity: `rewrite_op_int_mod` /
+                // `rewrite_op_int_floordiv` are name-keyed (`int_mod` /
+                // `int_floordiv`) — they only fire on the int-result
+                // op.  Pyre's `BinOp { op: "mod" | "floordiv" }` shape
+                // has no such name-baked typing, so the gate checks
+                // `result_ty == Int` explicitly to avoid pollution from
+                // a Ref/Float/State-typed BinOp slipping through and
+                // emitting an `int_mod/ii>i` opname onto a non-int SSA
+                // result.  `ValueType::Unknown` is NOT admitted: pyre's
+                // AST-time forward-reference gap that produces
+                // `Unknown` here is a separate upstream parity issue
+                // (`front/ast.rs::binary_result_value_type`'s
+                // `graph_value_type` fallback) and admitting it would
+                // widen this rewrite to SSA shapes whose semantics are
+                // not proven yet.  Cases that fall through with
+                // `Unknown` remain a pre-existing pyre gap surfacing
+                // as the `int_mod/ii>i` insns leak documented in
+                // `jitcode_runtime.rs::default_bh_builder_unwired_set_matches_task_85_snapshot`.
+                let _ = result_ty;
+                let helper_name = if binop_name == "mod" {
+                    "_ll_2_int_mod"
                 } else {
-                    ("int_floordiv", OopSpecIndex::IntPyDiv)
+                    "_ll_2_int_floordiv"
                 };
                 let target = CallTarget::function_path([helper_name]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
-                let mut ops = Vec::with_capacity(3);
+                // `jtransform.py:469-470`: `op1 = [op1, SpaceOperation('-live-', [], None)]`
+                // fires only when `may_call_jitcodes or
+                // calldescr_canraise(calldescr)`.  Pyre's route-(a) emission
+                // is neither: `may_call_jitcodes` is structurally false for
+                // a residual call to an `extern "C"` helper, and the
+                // effect tag above is `ExtraEffect::CannotRaise` (mirrors
+                // `lloperation.py:203-204 'int_floordiv' / 'int_mod'`
+                // both flagged `LLOp(canfold=True)` with no canraise).
+                // Therefore NO `OpKind::Live` is emitted here.  This
+                // matches the bytecode shape upstream's
+                // `_do_builtin_call` produces for canfold/no-canraise
+                // helpers.
+                let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -969,7 +1073,7 @@ impl<'a> Transformer<'a> {
                         descriptor: CallDescriptor::from_signature(
                             &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
                             majit_ir::value::Type::Int,
-                            EffectInfo::new(ExtraEffect::ElidableCanRaise, oopspec),
+                            EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
                         ),
                         args_i: vec![*lhs, *rhs],
                         args_r: vec![],
@@ -977,10 +1081,6 @@ impl<'a> Transformer<'a> {
                         result_kind: 'i',
                         indirect_targets: None,
                     },
-                });
-                ops.push(SpaceOperation {
-                    result: None,
-                    kind: OpKind::Live,
                 });
                 RewriteResult::Replace(ops)
             }
@@ -1617,25 +1717,63 @@ impl<'a> Transformer<'a> {
         result_ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        // RPython jtransform.py:484-520: __handle_oopspec_call pattern.
-        //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
-        //   self.callcontrol.callinfocollection.add(oopspecindex, calldescr, func)
+        // RPython `jtransform.py:484-485`:
+        //   oopspec_name, args = support.decode_builtin_call(op)
+        //
+        // Run the strict-parity decode here so the per-prefix dispatch
+        // below sees the normalized (permuted / constant-injected) arg
+        // list, not the raw call args.  When the target carries no
+        // oopspec registration, `decode_builtin_call` is not invoked —
+        // pyre treats that as the unclassified-builtin path and falls
+        // through to the `describe_call` / `Keep` branches below.
+        //
+        // When `oopspec_argnames` is registered for the target,
+        // `decode_builtin_call` runs the full `parse_oopspec` +
+        // `normalize_opargs` pipeline.  `NormalizedArg::ConstInt(v)`
+        // slots are materialised here as fresh `OpKind::ConstInt(v)`
+        // ops prepended to whatever the downstream rewrite emits —
+        // mirroring upstream's `Constant(obj, ...)` Variable
+        // introduction.  Without an argname registry the normalized
+        // list is just `Pass(vid)` for each raw arg, so the
+        // effective_args == args.to_vec() and no prefix ops are
+        // emitted.
+        let (decoded_oopspec, effective_args, mut const_prefix_ops) =
+            if let Some(cc) = self.callcontrol.as_deref() {
+                if cc.get_oopspec(target).is_some() {
+                    let (name, normalized) = decode_builtin_call(op, cc);
+                    let mut eff = Vec::with_capacity(normalized.len());
+                    let mut prefix: Vec<SpaceOperation> = Vec::new();
+                    for slot in normalized {
+                        match slot {
+                            NormalizedArg::Pass(vid) => eff.push(vid),
+                            NormalizedArg::ConstInt(v) => {
+                                let vid = self.fresh_synthetic_value_typed(
+                                    crate::jit_codewriter::type_state::ConcreteType::Signed,
+                                );
+                                prefix.push(SpaceOperation {
+                                    result: Some(vid),
+                                    kind: OpKind::ConstInt(v),
+                                });
+                                eff.push(vid);
+                            }
+                        }
+                    }
+                    (Some(name), eff, prefix)
+                } else {
+                    (None, args.to_vec(), Vec::new())
+                }
+            } else {
+                (None, args.to_vec(), Vec::new())
+            };
+        let args: &[ValueId] = &effective_args;
+        let user_oopspec: Option<String> = decoded_oopspec.clone();
 
-        // Look up oopspec/effect info: config overrides first, then static table.
-        // rlib/jit.py:250 — user-level `@oopspec(spec)` is registered via
-        // `call_control.mark_oopspec(path, spec)`; look it up here before
-        // falling back to the static builtin table.
-        let user_oopspec: Option<String> = self
-            .callcontrol
-            .as_deref()
-            .and_then(|cc| cc.get_oopspec(target).map(|s| s.to_string()));
-
-        // jtransform.py:497-498 — oopspec dispatch by prefix.
-        if let Some(spec) = user_oopspec.as_deref() {
-            let base = spec.split('(').next().unwrap_or(spec).trim();
+        // jtransform.py:487-511 — oopspec dispatch by prefix.
+        if let Some(base) = user_oopspec.as_deref() {
             // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
-                return self._handle_jit_call(base, op, target, args, result_ty, graph_name);
+                let result = self._handle_jit_call(base, op, target, args, result_ty, graph_name);
+                return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
             // are handled by jitcode_lower (proc-macro level), NOT here.
@@ -1721,7 +1859,8 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:2003-2007: __handle_oopspec_call always
         // produces residual_call_*, appends -live- if calldescr_canraise.
         // Effect is only in the calldescr, never in the opcode name.
-        self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
+        let result = self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name);
+        prepend_const_prefix(&mut const_prefix_ops, result)
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.

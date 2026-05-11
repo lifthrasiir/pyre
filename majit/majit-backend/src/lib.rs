@@ -1087,20 +1087,34 @@ pub struct JitCellToken {
     ///     compared by `unroll.py:264-272` against `retrace_limit`
     ///     to disable repeated retracing of the same loop.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre currently splits these across
-    /// two existing locations — `CompiledTrace.retraced_count` (the
-    /// retrace count) and `BaseJitCell.flags & FORCE_FINISH` (the
-    /// segmenting bit, keyed on green-key hash via
-    /// `WarmEnterState::{mark,take}_force_finish_tracing`).  This
-    /// field carries the canonical RPython packed-bit shape so that
-    /// future site-by-site convergence (Tasks #137 / #235 series)
-    /// can migrate one reader at a time onto the token-resident
-    /// surface without breaking the existing flow.  Interior
-    /// mutability via `Cell<u32>` mirrors RPython's attribute
-    /// writes through `&JitCellToken`; the same `unsafe impl Sync`
-    /// covers it as `generation`.  Callers must use the accessors
-    /// (not `.get()` / `.set()` directly) to keep the bit-packing
-    /// invariant.
+    /// Pyre's flow is RPython-orthodox: the retrace count rides on
+    /// `JitCellToken.retraced_count` (read via `get_retraced_count`,
+    /// updated via `set_retraced_count` at unroll-pass boundaries —
+    /// `pyjitpl/mod.rs:7978` etc.); `FORCE_BRIDGE_SEGMENTING` is set
+    /// in `MetaInterp::blackhole_trace_too_long_slow` and read by
+    /// `MetaInterp::start_retrace_from_guard` (`pyjitpl/mod.rs:8772-
+    /// 8784`), mirroring `pyjitpl.py:2833` / `compile.py:729`.
+    ///
+    /// The complementary `BaseJitCell.flags & FORCE_FINISH` flag in
+    /// `warmstate.rs` is NOT a duplicate of this bit — it mirrors
+    /// upstream `warmstate.py:135 JC_FORCE_FINISH`, a green-key-keyed
+    /// signal read at `warmstate.py:439` (cell-side
+    /// `force_finish_trace`).  Upstream itself carries both signals
+    /// independently because the green-key cell and the loop token
+    /// have distinct lifetimes (a token may outlive its cell after
+    /// invalidation; a cell may exist before any token is bound).
+    /// Pyre mirrors the upstream split exactly.
+    ///
+    /// `UnrollOptimizer.retraced_count` is a transient pass-local
+    /// copy (`unroll.rs:59`) that the unroll pipeline writes back to
+    /// `set_retraced_count` once the pass finishes, matching
+    /// `unroll.py:216-217` (read at start, mutate, write back).
+    ///
+    /// Interior mutability via `Cell<u32>` mirrors RPython's
+    /// attribute writes through `&JitCellToken`; the same
+    /// `unsafe impl Sync` covers it as `generation`.  Callers must
+    /// use the accessors (not `.get()` / `.set()` directly) to keep
+    /// the bit-packing invariant.
     pub retraced_count: Cell<u32>,
 }
 

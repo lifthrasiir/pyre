@@ -4644,6 +4644,43 @@ mod tests {
             }
         }
     }
+
+    // ── `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod`
+    //    C-truncating helper parity tests ─────────────────────────────
+
+    #[test]
+    fn _ll_2_int_floordiv_truncates_toward_zero_for_mixed_signs() {
+        // `(-7).wrapping_div(3) == -2` (C truncation toward zero), whereas
+        // Python-floor `ll_int_py_div(-7, 3) == -3`.
+        assert_eq!(super::_ll_2_int_floordiv(-7, 3), -2);
+        assert_eq!(super::_ll_2_int_floordiv(7, -3), -2);
+        assert_eq!(super::_ll_2_int_floordiv(-7, -3), 2);
+        assert_eq!(super::ll_int_py_div(-7, 3), -3);
+    }
+
+    #[test]
+    fn _ll_2_int_floordiv_matches_division_for_aligned_signs() {
+        assert_eq!(super::_ll_2_int_floordiv(7, 3), 2);
+        assert_eq!(super::_ll_2_int_floordiv(9, 3), 3);
+        assert_eq!(super::_ll_2_int_floordiv(-9, -3), 3);
+    }
+
+    #[test]
+    fn _ll_2_int_mod_truncates_toward_zero_for_mixed_signs() {
+        // `(-7).wrapping_rem(3) == -1` (C truncation toward zero),
+        // whereas Python-floor `ll_int_py_mod(-7, 3) == 2`.
+        assert_eq!(super::_ll_2_int_mod(-7, 3), -1);
+        assert_eq!(super::_ll_2_int_mod(7, -3), 1);
+        assert_eq!(super::_ll_2_int_mod(-7, -3), -1);
+        assert_eq!(super::ll_int_py_mod(-7, 3), 2);
+    }
+
+    #[test]
+    fn _ll_2_int_mod_matches_remainder_for_aligned_signs() {
+        assert_eq!(super::_ll_2_int_mod(7, 3), 1);
+        assert_eq!(super::_ll_2_int_mod(9, 3), 0);
+        assert_eq!(super::_ll_2_int_mod(-9, -3), 0);
+    }
 }
 
 // ── bhimpl_* methods (RPython blackhole.py:452+) ────────────────────
@@ -4743,7 +4780,16 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 /// trace before this helper is invoked, matching RPython's
 /// `rint.py:429 ll_int_py_div_ovf_zer` shape.  Direct (non-traced)
 /// callers must respect the same precondition.
-pub fn ll_int_py_div(a: i64, b: i64) -> i64 {
+///
+/// `extern "C"`: the residual-call path
+/// (`majit-backend/src/call_stub.rs` invokes the helper through an
+/// `extern "C" fn(...)` pointer; matching ABI keeps the function
+/// pointer correctly callable from both the Rust-side
+/// `codegen.rs::generated_binary_int_value` (which folds the
+/// concrete result during trace recording) and the native call
+/// stub.  RPython's `getfunctionptr(graph)` similarly hands the
+/// codewriter a real C ABI pointer to the translated helper.
+pub extern "C" fn ll_int_py_div(a: i64, b: i64) -> i64 {
     let d = a.wrapping_div(b);
     if (a ^ b) < 0 && d.wrapping_mul(b) != a {
         d.wrapping_sub(1)
@@ -4760,13 +4806,49 @@ pub fn ll_int_py_div(a: i64, b: i64) -> i64 {
 /// and divisor have opposite signs.  As with [`ll_int_py_div`],
 /// `wrapping_rem(0)` and `INT_MIN % -1` are unreachable from the
 /// trace path; non-traced callers must respect the same precondition.
-pub fn ll_int_py_mod(a: i64, b: i64) -> i64 {
+///
+/// `extern "C"`: the residual-call path goes through
+/// `majit-backend/src/call_stub.rs` which invokes the helper through
+/// an `extern "C" fn(...)` pointer; see [`ll_int_py_div`] for the
+/// ABI parity rationale.
+pub extern "C" fn ll_int_py_mod(a: i64, b: i64) -> i64 {
     let r = a.wrapping_rem(b);
     if r != 0 && (r ^ b) < 0 {
         r.wrapping_add(b)
     } else {
         r
     }
+}
+
+/// RPython `support.py:255-264 _ll_2_int_floordiv`: C-truncating
+/// floor-division helper.  The upstream comment calls it "the reverse
+/// of `rpython.rtyper.rint.ll_int_py_div()`" — i.e. given an input
+/// pair `(x, y)` it returns the C-style truncated quotient
+/// (rounds toward zero), which is the no-branch reverse of
+/// [`ll_int_py_div`]'s Python-floor output.  The RPython body achieves
+/// this by starting from Python-floor `x // y` (the source-level `//`
+/// is floor in Python 2 / RPython) and adding `((x ^ y) >> 63 &
+/// (r * y != x))` to flip negative-with-remainder cases back to
+/// truncation.  In Rust, `i64.wrapping_div` is natively C-truncating,
+/// so the helper reduces to a direct call.
+///
+/// The single-segment oopspec name registered with this helper is
+/// `int_floordiv` (no `int.py_div` oopspec stamping — that route goes
+/// through [`ll_int_py_div`] which carries `@jit.oopspec("int.py_div")`
+/// upstream).  Pyre's `jtransform.rs` BinOp{floordiv, Int} arm
+/// rewrites to a `CallResidual` to this helper without an
+/// `OS_INT_PY_DIV` markup, matching `jtransform.py:576 rewrite_op_int_floordiv = _do_builtin_call` route (a).
+///
+/// `extern "C"`: residual-call ABI parity — see [`ll_int_py_div`].
+pub extern "C" fn _ll_2_int_floordiv(x: i64, y: i64) -> i64 {
+    x.wrapping_div(y)
+}
+
+/// RPython `support.py:266-271 _ll_2_int_mod`: C-truncating remainder
+/// helper.  See [`_ll_2_int_floordiv`] for the no-branch-reverse
+/// rationale.  In Rust, `i64.wrapping_rem` is natively C-truncating.
+pub extern "C" fn _ll_2_int_mod(x: i64, y: i64) -> i64 {
+    x.wrapping_rem(y)
 }
 
 /// blackhole.py:499-501 `bhimpl_int_and(a, b): return a & b`.

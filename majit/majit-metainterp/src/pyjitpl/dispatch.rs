@@ -907,28 +907,33 @@ where
         if let Some(cached) = guard.get(&cache_key) {
             return Some(cached.clone());
         }
-        // `make_array_descr_from_lltype_shape` threads every
-        // `BhDescr::Array` discriminator into the resulting
+        // `make_array_descr_from_lltype_shape` threads
+        // `BhDescr::Array` discriminators into the resulting
         // `SimpleArrayDescr`: `type_id` (so cross-trace descr identity
         // stays distinct between two lltypes with the same primitive
-        // shape), the pointer/struct flag selection (so
-        // `descr.flag` matches RPython `descr.py:241-254 get_type_flag`
-        // precedence), and the primitive sign carried on
-        // `is_item_signed`.  `interior_field_descrs` is empty here
-        // because pyre's bytecode-array dispatch (`program: &[u8]`)
-        // does not have inline-struct items; if a future BhDescr emits
-        // non-empty `interior_fields`, the caller would need to build
-        // the full per-field SimpleInteriorFieldDescrs first (matching
-        // upstream `descr.py:388 InteriorFieldDescr.__init__`) and
-        // pass them through.  Today's BhDescr::Array carrying
-        // `interior_fields = []` is the only shape this path mints.
+        // shape), the pointer/struct flag selection (so `descr.flag`
+        // matches RPython `descr.py:241-254 get_type_flag` precedence),
+        // the primitive sign carried on `is_item_signed`, and
+        // `lendescr` / `is_pure` (both `None` / `false` for the
+        // bytecode-array dispatch path — pyre's `program: &[u8]` is a
+        // fixed-size mutable buffer).
+        //
+        // `arraydescr.all_interiorfielddescrs` (`descr.py:372-375`)
+        // requires the per-field `SimpleInteriorFieldDescr` to share
+        // the parent `Arc<SimpleArrayDescr>` identity, so it can only
+        // be published AFTER the helper returns; pyre's dispatch path
+        // does not reach that case (this `debug_assert` pins it),
+        // matching the helper's documented construction-order
+        // contract.
         debug_assert!(
             cache_key.interior_fields.is_empty(),
             "dispatch_array_descr_ref: BhDescr::Array carries non-empty \
              interior_fields {:?} but the descr-mint path here only \
              handles primitive-item arrays (program: &[u8] opcode \
-             fetch).  Build per-field SimpleInteriorFieldDescrs and \
-             extend this caller before relying on the new shape.",
+             fetch).  Build per-field SimpleInteriorFieldDescrs from \
+             the returned parent Arc and call \
+             SimpleArrayDescr::set_all_interiorfielddescrs before \
+             relying on the new shape.",
             cache_key.interior_fields,
         );
         let descr_arc = majit_ir::descr::make_array_descr_from_lltype_shape(
@@ -939,7 +944,8 @@ where
             is_array_of_pointers,
             is_array_of_structs,
             is_item_signed,
-            Vec::new(),
+            None,  // lendescr — `program: &[u8]` is fixed-size
+            false, // is_pure — bytecode array is mutable from the JIT's POV
         );
         let descr: majit_ir::DescrRef = descr_arc;
         guard.insert(cache_key, descr.clone());

@@ -437,6 +437,56 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::jit_range_iter_new as *const (),
     );
 
+    // RPython convention (cross-reference `support.py:255-271` for
+    // the C-trunc helpers, `rint.py:398/495` for the Python-floor
+    // ones) is to keep the two semantic flavours under DISTINCT
+    // canonical names:
+    //
+    //   - bare `int_mod` / `int_floordiv` — the lltype-level
+    //     truncating primitive (canonical names of the
+    //     `_ll_2_int_mod` / `_ll_2_int_floordiv` no-branch reverse).
+    //     C-truncating output.
+    //   - `int.py_mod` / `int.py_div` — the Python-semantic
+    //     `@jit.oopspec("int.py_mod")` / `@jit.oopspec("int.py_div")`
+    //     names that decorate `ll_int_py_mod` / `ll_int_py_div`.
+    //     Python-floor output.
+    //
+    // Pyre's `jtransform.rs` BinOp{mod,floordiv,Int} arm emits a
+    // `CallTarget::function_path(["_ll_2_int_mod"])` /
+    // `CallTarget::function_path(["_ll_2_int_floordiv"])` per
+    // `jtransform.py:576-577 rewrite_op_int_floordiv =
+    // _do_builtin_call` (which resolves the helper through
+    // `support.py:266` `_ll_2_int_mod` / `:255` `_ll_2_int_floordiv`).
+    // The C-trunc residual call below is what the trace path sees;
+    // the Python-floor `ll_int_py_*` helpers stay available for the
+    // future route-(b) emitter (Python-bytecode `int.py_mod` /
+    // `int.py_div` direct calls) under the dotted-name keys.
+    //
+    // `register_macro_helper_trace_fnaddr` strips the leading segment
+    // from `full_path`; for a single-segment path (no `::`) the entire
+    // string survives as the canonical CallPath, matching the segment
+    // shape jtransform produces.
+    //
+    // The Rust-source graphs for either helper family are NOT
+    // registered in `CallControl::function_graphs` (pyre has no
+    // `MixLevelHelperAnnotator` to materialise a graph from a `pub
+    // extern "C"` function pointer), so `call.rs:1620-1670`
+    // `find_all_graphs_bfs` finds the function pointer via
+    // `function_fnaddrs` lookup but cannot seed the BFS through the
+    // helper's body — the helpers stay opaque to the inliner,
+    // matching upstream behaviour for any `@dont_look_inside`
+    // oopspec helper.
+    push_fnaddr(
+        &mut entries,
+        "_ll_2_int_mod",
+        majit_metainterp::blackhole::_ll_2_int_mod as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "_ll_2_int_floordiv",
+        majit_metainterp::blackhole::_ll_2_int_floordiv as *const (),
+    );
+
     entries
 }
 

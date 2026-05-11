@@ -438,6 +438,60 @@ pub struct CallControl {
     /// the stable symbolic address shim.
     function_fnaddrs: HashMap<CallPath, i64>,
 
+    /// RPython `rtyper._builtin_func_for_spec_cache` (`support.py:805-807`).
+    ///
+    /// Memoises the `(c_func, LIST_OR_DICT)` pair upstream computes
+    /// from `(oopspec_name, ll_args, ll_res, extrakey)`.  Pyre stores
+    /// the full [`crate::jit_codewriter::support::BuiltinFuncSpec`]
+    /// (the c_func analog + LIST_OR_DICT) keyed on the same tuple
+    /// shape via [`crate::jit_codewriter::support::BuiltinFuncSpecCacheKey`].
+    /// Wrapped in `RefCell` so `builtin_func_for_spec` can take a
+    /// shared `&CallControl` reference matching upstream's `rtyper`
+    /// parameter shape while still recording cache hits.
+    builtin_func_for_spec_cache: std::cell::RefCell<
+        HashMap<
+            crate::jit_codewriter::support::BuiltinFuncSpecCacheKey,
+            crate::jit_codewriter::support::BuiltinFuncSpec,
+        >,
+    >,
+
+    /// `support.py:782-794 need_result_type` side-channel.
+    ///
+    /// RPython attaches the flag directly on the wrapper function
+    /// (e.g. `LLtypeHelpers._ll_1_dict_keys.need_result_type = True`).
+    /// Pyre cannot read attributes off a function pointer, so the
+    /// flag is co-registered alongside the canonical name through
+    /// [`Self::register_need_result_type`].  `setup_extra_builtin`
+    /// reads from this map; missing canonical names default to
+    /// [`crate::jit_codewriter::support::NeedResultType::No`],
+    /// matching upstream's `getattr(..., 'need_result_type', False)`
+    /// missing-attribute fallback.  Wrapped in `RefCell` so
+    /// registration can use `&CallControl` consistently with the
+    /// fnaddr / cache registries.
+    need_result_type_registry:
+        std::cell::RefCell<HashMap<String, crate::jit_codewriter::support::NeedResultType>>,
+
+    /// `support.py:691-692 wrapper = wrapper(*extra)` factory registry.
+    ///
+    /// RPython's `_do_builtin_call` flow for `extra is not None`
+    /// (`jtransform.py:480-484` for dict / array build helpers like
+    /// `_ll_2_build_dict` / `_ll_2_build_list`) calls the wrapper
+    /// function with the `extra` tuple to obtain a SPECIALIZED wrapper
+    /// instance — `extra` carries the concrete lltype the build helper
+    /// is being specialised for (e.g. `Ptr(STR)` for the str-keyed
+    /// dict builder).  Pyre cannot synthesise specialized helpers at
+    /// runtime without RPython's annotator, so hosts pre-build every
+    /// `(canonical_name, extrakey)` specialisation and register the
+    /// resulting fnaddr here.  `setup_extra_builtin` consults this
+    /// map when `extra.is_some()`, falling back to `lookup_function_fnaddr`
+    /// only when no factory specialization is registered — matching
+    /// upstream's `wrapper = wrapper(*extra)` factory-call semantics
+    /// while keeping the call site host-driven.  Empty registry today;
+    /// no `INLINE_CALLS_TO` entry uses `extra`, but the surface lets
+    /// dict-build / array-build helpers land without a structural
+    /// adapter at the call site.
+    builtin_factory_registry: std::cell::RefCell<HashMap<(String, String), i64>>,
+
     /// RPython `all_jitcodes` materialized incrementally by
     /// `CodeWriter.make_jitcodes()`. Entries are appended only after a
     /// jitcode has been fully assembled.
@@ -520,6 +574,16 @@ pub struct CallControl {
     /// Maps call target → oopspec string (e.g. "jit.isconstant(value)").
     /// codewriter/jtransform reads this to route calls through OopSpecIndex.
     pub oopspec_targets: HashMap<CallPath, String>,
+    /// `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]` —
+    /// per-target positional parameter names, used by `parse_oopspec`
+    /// to resolve identifier slots in the spec's `(...)` pattern to
+    /// `Index(n)` placeholders.  Pyre cannot introspect a function
+    /// pointer for argnames; populated by the walker through
+    /// `mark_oopspec_argnames` whenever `#[oopspec(...)]` is paired
+    /// with a function signature (`front::ast::collect_jit_hints`
+    /// emits a companion `"oopspec_argnames:..."` hint that
+    /// `lib.rs:600` consumes alongside `"oopspec:..."`).
+    pub oopspec_argnames: HashMap<CallPath, Vec<String>>,
 
     /// RPython: `_immutable_fields_` per class. Maps struct_name →
     /// `(field_name, rank)` pairs declared immutable / quasi-immutable.
@@ -786,6 +850,9 @@ impl CallControl {
             builtin_targets: HashSet::new(),
             jitcodes: HashMap::new(),
             function_fnaddrs: HashMap::new(),
+            builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
+            need_result_type_registry: std::cell::RefCell::new(HashMap::new()),
+            builtin_factory_registry: std::cell::RefCell::new(HashMap::new()),
             finished_jitcodes: Vec::new(),
             unfinished_graphs: Vec::new(),
             callinfocollection: majit_ir::CallInfoCollection::new(),
@@ -807,6 +874,7 @@ impl CallControl {
             external_gc_effects: HashSet::new(),
             aroundstate_targets: HashSet::new(),
             oopspec_targets: HashMap::new(),
+            oopspec_argnames: HashMap::new(),
             immutable_fields_by_struct: HashMap::new(),
         }
     }
@@ -1543,19 +1611,87 @@ impl CallControl {
         //         todo.append(c_func.value._obj.graph)
         // ```
         //
-        // PRE-EXISTING-ADAPTATION: pyre has no `MixLevelHelperAnnotator`
-        // so `builtin_func_for_spec` returns a descriptor only, not a
-        // function-pointer-with-graph.  Where the oopspec name matches a
-        // graph registered via `register_function_graph`, seed that
-        // graph; otherwise the entry is structural-only and contributes
-        // nothing, matching upstream behavior when the helper is later
-        // inlined as a Rust intrinsic.
+        // PRE-EXISTING-ADAPTATION: pyre's BFS seed is a partial port
+        // of `call.py:59-64`, not a strict line-by-line mirror.
+        // Upstream seeds all four `inline_calls_to` entries (`int_abs`,
+        // `int_floordiv`, `int_mod`, `ll_math.ll_math_sqrt`) into
+        // `todo`, materialising the helper graph each time via
+        // `c_func.value._obj.graph` — the rtyper-bound translation
+        // synthesises a Rust-source-equivalent graph from the Python
+        // helper body, which `MixLevelHelperAnnotator` always
+        // produces.  Pyre cannot perform that synthesis: a host-bound
+        // `extern "C"` function pointer carries no body the walker can
+        // read, and pyre has no `MixLevelHelperAnnotator` to fabricate
+        // one.  The seed loop therefore:
+        //   (a) skips entries whose canonical name has no
+        //       `function_fnaddrs` registration (`int_abs`,
+        //       `ll_math.ll_math_sqrt` — not bound by pyre's host);
+        //   (b) registers the function pointer for bound entries
+        //       (`_ll_2_int_mod` / `_ll_2_int_floordiv` at
+        //       `pyre/jit_fnaddr.rs`) so downstream `direct_funcptr_value`
+        //       lookups succeed, but does not push the impl path onto
+        //       `todo` because `function_graphs.contains_key` fails
+        //       (no graph registered for an `extern "C"` helper).
+        // Both behaviours mirror upstream `@dont_look_inside` for the
+        // SAME helper — the trace cannot inline through it — but the
+        // pyre case is structurally broader: even helpers upstream
+        // WOULD inline through stay opaque here.  Convergence path:
+        // port `_ll_2_int_mod` / `_ll_2_int_floordiv` (and the other
+        // INLINE_CALLS_TO entries) as Rust-source bodies the walker
+        // can lower into a graph, register the graph via
+        // `register_function_graph(canonical_name)`, then the BFS seed
+        // arm below will push the impl path naturally.  Multi-session
+        // port: requires walker reach into majit-metainterp + a Rust
+        // analogue of `MixLevelHelperAnnotator.constfunc`.
         for (oopspec_name, ll_args, ll_res) in crate::support::INLINE_CALLS_TO {
-            let _spec = crate::support::builtin_func_for_spec(oopspec_name, ll_args, *ll_res);
-            let path = CallPath::from_segments([*oopspec_name]);
-            if self.function_graphs.contains_key(&path) && !self.candidate_graphs.contains(&path) {
-                self.candidate_graphs.insert(path.clone());
-                todo.push(path);
+            // `call.py:60-64`:
+            //   c_func, _ = support.builtin_func_for_spec(self.rtyper,
+            //                                             oopspec_name,
+            //                                             ll_args, ll_res)
+            //   todo.append(c_func.value._obj.graph)
+            //
+            // `extra` / `extrakey` are both None — the inline_calls_to
+            // entries are simple helpers without the build-helper /
+            // dict-iter side tables.  Upstream `c_func.value._obj.graph`
+            // is the wrapper's helper graph (e.g. the graph for
+            // `_ll_2_int_mod`), so the seed lookup must key on the
+            // canonical impl name produced by
+            // `setup_extra_builtin`, NOT on the oopspec name.
+            //
+            // Pre-check via `lookup_function_fnaddr` keeps the strict
+            // panic inside `setup_extra_builtin` (mirroring
+            // `support.py:687-690` raise-on-miss) from firing for
+            // entries pyre's host has not bound — pyre's helpers
+            // (e.g. `int_abs`, `ll_math.ll_math_sqrt`) are not all
+            // registered as concrete C ABI intrinsics, so the seed
+            // loop honestly skips entries with no host binding rather
+            // than crashing.  Entries that ARE bound flow through
+            // `builtin_func_for_spec`, populating the rtyper-equivalent
+            // cache, and contribute their canonical-impl graph to the
+            // BFS seed when (and only when) a Rust-source graph has
+            // been registered under that canonical name.
+            let canonical_path = CallPath::from_segments([format!(
+                "_ll_{}_{}",
+                ll_args.len(),
+                oopspec_name.replace('.', "_"),
+            )]);
+            if self.lookup_function_fnaddr(&canonical_path).is_none() {
+                continue;
+            }
+            let spec = crate::support::builtin_func_for_spec(
+                Some(self),
+                oopspec_name,
+                ll_args,
+                *ll_res,
+                None,
+                None,
+            );
+            let impl_path = CallPath::from_segments([spec.impl_name.as_str()]);
+            if self.function_graphs.contains_key(&impl_path)
+                && !self.candidate_graphs.contains(&impl_path)
+            {
+                self.candidate_graphs.insert(impl_path.clone());
+                todo.push(impl_path);
             }
         }
 
@@ -2031,6 +2167,132 @@ impl CallControl {
         symbolic_fnaddr_for_target(target)
     }
 
+    /// Strict lookup variant of [`fnaddr_for_target`].
+    ///
+    /// Returns `Some(fnaddr)` only when the host has bound a real
+    /// trace-call address through `register_function_fnaddr` (or one
+    /// of its macro-fed entry points); `None` when the resolved
+    /// `CallPath` has no registered entry, instead of synthesising a
+    /// symbolic placeholder.
+    ///
+    /// Used by [`crate::jit_codewriter::support::builtin_func_for_spec`]
+    /// to mirror RPython's `support.py:767-808` `(c_func, LIST_OR_DICT)`
+    /// shape — upstream materialises the helper through
+    /// `MixLevelHelperAnnotator.constfunc(impl, ...)`, pyre consults
+    /// the persistent fnaddr cache populated from
+    /// `pyre-interpreter::jit_trace_fnaddrs()` and surfaces a
+    /// well-typed `None` when the helper has not been registered
+    /// (callers can then either skip or fall back to the symbolic
+    /// placeholder explicitly).
+    pub fn lookup_function_fnaddr(&self, path: &CallPath) -> Option<i64> {
+        self.function_fnaddrs.get(path).copied()
+    }
+
+    /// `support.py:771-774` cache read.
+    ///
+    /// ```python
+    /// try:
+    ///     return rtyper._builtin_func_for_spec_cache[key]
+    /// except (KeyError, AttributeError):
+    ///     pass
+    /// ```
+    ///
+    /// Returns `Some(spec)` on a hit, `None` on a miss.  Pyre's cache
+    /// is unconditionally initialised at `CallControl::new`, so the
+    /// `AttributeError` branch upstream (cache field absent on the
+    /// rtyper) collapses to a `None` return.
+    pub fn lookup_builtin_func_for_spec_cache(
+        &self,
+        key: &crate::jit_codewriter::support::BuiltinFuncSpecCacheKey,
+    ) -> Option<crate::jit_codewriter::support::BuiltinFuncSpec> {
+        self.builtin_func_for_spec_cache.borrow().get(key).cloned()
+    }
+
+    /// `support.py:805-807` cache write.
+    ///
+    /// ```python
+    /// if not hasattr(rtyper, '_builtin_func_for_spec_cache'):
+    ///     rtyper._builtin_func_for_spec_cache = {}
+    /// rtyper._builtin_func_for_spec_cache[key] = (c_func, LIST_OR_DICT)
+    /// ```
+    ///
+    /// Pyre takes a `&self` reference because the cache lives behind a
+    /// `RefCell` — matching upstream's read-only `rtyper` parameter
+    /// shape lets `builtin_func_for_spec` retain a shared borrow
+    /// throughout the call.
+    pub fn cache_builtin_func_for_spec(
+        &self,
+        key: crate::jit_codewriter::support::BuiltinFuncSpecCacheKey,
+        spec: crate::jit_codewriter::support::BuiltinFuncSpec,
+    ) {
+        self.builtin_func_for_spec_cache
+            .borrow_mut()
+            .insert(key, spec);
+    }
+
+    /// `support.py:466-468` `_ll_1_dict_keys.need_result_type = True`
+    /// (and friends): host-side registration of the `need_result_type`
+    /// attribute against a canonical helper name.  Pyre cannot reach
+    /// into a function pointer; this registry is the structural
+    /// equivalent.  Call this alongside `register_function_fnaddr` for
+    /// any helper that upstream marks `need_result_type = True` /
+    /// `'exact'`.
+    pub fn register_need_result_type(
+        &self,
+        canonical_name: &str,
+        ty: crate::jit_codewriter::support::NeedResultType,
+    ) {
+        self.need_result_type_registry
+            .borrow_mut()
+            .insert(canonical_name.to_string(), ty);
+    }
+
+    /// `support.py:782` `getattr(impl, 'need_result_type', False)`.
+    ///
+    /// Returns `Some(ty)` when the host registered the flag for the
+    /// canonical name; `None` when it didn't (callers default to
+    /// `NeedResultType::No`, mirroring the missing-attribute
+    /// behaviour of upstream's `getattr(..., default=False)`).
+    pub fn lookup_need_result_type(
+        &self,
+        canonical_name: &str,
+    ) -> Option<crate::jit_codewriter::support::NeedResultType> {
+        self.need_result_type_registry
+            .borrow()
+            .get(canonical_name)
+            .copied()
+    }
+
+    /// `support.py:691-692 wrapper = wrapper(*extra)` factory registration.
+    ///
+    /// Hosts that expose a dict / array build helper register one
+    /// fnaddr per `(canonical_name, extrakey)` pair before the
+    /// codewriter pipeline starts.  `canonical_name` is the
+    /// `build_ll_<n>_<oopspec>` form `setup_extra_builtin` renders;
+    /// `extrakey` is the same string `builtin_func_for_spec`'s
+    /// caller passes for cache discrimination.  Mirrors upstream's
+    /// `LLtypeHelpers.build_ll_<n>_<oopspec>(*extra)` factory call
+    /// semantics, with the host doing the specialisation ahead of
+    /// time instead of at codewriter time.
+    pub fn register_builtin_factory(&self, canonical_name: &str, extrakey: &str, fnaddr: i64) {
+        self.builtin_factory_registry
+            .borrow_mut()
+            .insert((canonical_name.to_string(), extrakey.to_string()), fnaddr);
+    }
+
+    /// `support.py:691-692` factory lookup.
+    ///
+    /// `setup_extra_builtin` consults this when `extra.is_some()`;
+    /// `None` falls back to the plain canonical-name fnaddr lookup
+    /// (matching the "register the specialized fnaddr under the
+    /// build-prefixed canonical name" pre-factory-registry workaround).
+    pub fn lookup_builtin_factory(&self, canonical_name: &str, extrakey: &str) -> Option<i64> {
+        self.builtin_factory_registry
+            .borrow()
+            .get(&(canonical_name.to_string(), extrakey.to_string()))
+            .copied()
+    }
+
     /// Resolve a method call to a concrete impl graph.
     ///
     /// RPython: method resolution happens at the type system level; the
@@ -2264,6 +2526,31 @@ impl CallControl {
     pub fn get_oopspec(&self, target: &CallTarget) -> Option<&str> {
         self.target_to_path(target)
             .and_then(|p| self.oopspec_targets.get(&p).map(|s| s.as_str()))
+    }
+
+    /// `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]` —
+    /// register the positional parameter names of an oopspec target so
+    /// `parse_oopspec` can resolve identifier slots in the spec's
+    /// `(...)` pattern to `Index(n)` placeholders.  The list must
+    /// match the function's actual parameter declaration order.
+    ///
+    /// Populated by the walker (`lib.rs:600`) whenever
+    /// `front::ast::collect_jit_hints` emits the
+    /// `"oopspec_argnames:..."` companion hint — i.e. when a function
+    /// carries `#[oopspec(...)]` AND its signature is available at
+    /// hint-collection time.  Programmatic `mark_oopspec` callers
+    /// (`lib.rs:707-741` jit.* bindings) leave this unset because
+    /// their bare-name specs have no `(...)` pattern to resolve.
+    pub fn mark_oopspec_argnames(&mut self, path: CallPath, argnames: Vec<String>) {
+        self.oopspec_argnames.insert(path, argnames);
+    }
+
+    /// Per-target argname lookup paired with `get_oopspec`.  Returns
+    /// `None` when the target has no registered argname list
+    /// (the dominant case today).
+    pub fn get_oopspec_argnames(&self, target: &CallTarget) -> Option<&[String]> {
+        self.target_to_path(target)
+            .and_then(|p| self.oopspec_argnames.get(&p).map(|v| v.as_slice()))
     }
 
     // ── Graph-based analyzers (call.py:282-303) ─────────────────────

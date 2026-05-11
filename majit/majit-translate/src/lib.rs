@@ -599,6 +599,24 @@ fn analyze_pipeline_from_parsed(
                     call_control.mark_oopspec(p.clone(), spec.to_string());
                     continue;
                 }
+                // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
+                // — companion hint emitted by `front::ast::collect_jit_hints`
+                // when `#[oopspec(...)]` is paired with a function signature.
+                // Threads the declaration-order parameter names into
+                // `CallControl::oopspec_argnames` so `parse_oopspec`
+                // (`support.py:701-715` port) can resolve identifier
+                // slots in the spec's `(...)` pattern.
+                if let Some(names) = hint.strip_prefix("oopspec_argnames:") {
+                    let argnames: Vec<String> = names
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !argnames.is_empty() {
+                        call_control.mark_oopspec_argnames(p.clone(), argnames);
+                    }
+                    continue;
+                }
                 match hint.as_str() {
                     "elidable" => call_control.mark_elidable(p.clone()),
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),

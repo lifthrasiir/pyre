@@ -13359,15 +13359,24 @@ pub struct MetaInterpStaticData {
     /// happen to share `(base_size, itemsize, item_type,
     /// is_item_signed)` (e.g. one is an array-of-pointers, one is an
     /// array-of-structs with interior fields) get distinct cache slots.
-    /// `make_array_descr_signed` (`descr.rs:3712`) is the constructor
-    /// pyre's dispatch path uses; it currently leaves `type_id=0`,
-    /// `lendescr=None`, and the struct/interior-field flags empty,
-    /// matching what pyre's bytecode-array dispatch (`program: &[u8]`)
-    /// needs but lagging upstream `descr.py:get_array_descr` which
-    /// preserves `lendescr`, `flag`, `is_pure`, and per-field interior
-    /// descrs.  Closing that gap is tracked separately; the cache key
-    /// is already keyed by the full discriminator so the value side
-    /// can be enriched without changing the key shape.  Earlier
+    /// `make_array_descr_from_lltype_shape` (`descr.rs:3761`) is the
+    /// constructor pyre's dispatch path uses.  It threads the
+    /// `BhDescr::Array` discriminants `type_id`, the pointer/struct
+    /// `flag` selection, `lendescr`, and `is_pure` so the materialised
+    /// `SimpleArrayDescr` carries the same discriminator surface as
+    /// RPython `descr.py:240-289 ArrayDescr.__init__`.
+    /// `arraydescr.all_interiorfielddescrs` (`descr.py:372-375`) is
+    /// NOT a constructor argument: every per-field
+    /// `SimpleInteriorFieldDescr` must share the parent
+    /// `Arc<SimpleArrayDescr>` identity, but the helper mints that Arc
+    /// internally; callers that need interior fields publish the list
+    /// AFTER the Arc returns, via
+    /// `SimpleArrayDescr::set_all_interiorfielddescrs` over the same
+    /// Arc.  Pyre's bytecode-array dispatch path (`program: &[u8]`)
+    /// supplies `lendescr=None` and `is_pure=false`, and the
+    /// `debug_assert!` at `dispatch.rs::dispatch_array_descr_ref`
+    /// pins that BhDescr::Array carries no interior fields for this
+    /// path — `&[u8]` items have no inline-struct layout.  Earlier
     /// revisions keyed on `descr_idx` (per-JitCode-builder pool slot),
     /// which happens to work when only one JitCode body emits arrays
     /// but breaks structurally when distinct JitCodes use the same

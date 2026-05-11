@@ -1260,14 +1260,16 @@ mod tests {
         assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
     }
 
-    // Task #85 closure check: the strict builder covered every opname
-    // in the generated insns table at the time the snapshot was set.
-    // Earlier revisions kept this ignored while kind-flow bugs emitted
-    // pyre-only mixed signatures such as `int_ge/ir>i`; the
-    // codewriter/rtyper/jtransform parity fixes made those opnames
-    // disappear at the source.  This variant now uses the report
-    // builder (not the strict-panic builder) so the symmetry assertion
-    // tolerates the known unwired set documented in
+    // Task #85 closure check: the strict builder covers nearly every
+    // opname in the generated insns table.  Earlier revisions kept this
+    // ignored while kind-flow bugs emitted pyre-only mixed signatures
+    // such as `int_ge/ir>i`; the codewriter/rtyper/jtransform parity
+    // fixes made those opnames disappear at the source.  One opname
+    // (`int_mod/ii>i`) still leaks through because pyre's AST-time
+    // `front/ast.rs::binary_result_value_type` falls back to
+    // `ValueType::Unknown` for forward-referenced operands, and the
+    // strict jtransform `rewrite_op_int_mod` arm only matches
+    // `result_ty == Int`.  Documented in
     // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
     #[test]
     fn build_default_bh_builder_matches_insns_table() {
@@ -1276,7 +1278,10 @@ mod tests {
         // it must carry the same byte<->opname mapping as the build-time
         // insns bincode, and it must resolve the three well-known
         // opcodes (`live/`, `catch_exception/L`, `rvmprof_code/ii`) when
-        // they appear in the table.
+        // they appear in the table.  Uses the report builder so the
+        // documented `int_mod/ii>i` leak does not panic the strict
+        // builder — the leak is tracked by
+        // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
         let (builder, _unwired) = build_default_bh_builder_with_unwired_report();
         let expected_live = insns_opname_to_byte().get("live/").copied();
         assert_eq!(Some(builder.op_live), expected_live);
@@ -1292,37 +1297,32 @@ mod tests {
 
     #[test]
     fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
-        // Task #85 lock-in: every generated opname must either be wired
-        // by `wire_bhimpl_handlers`, or be on this known-gap list that
-        // documents a pending upstream rewrite.  A new entry outside
-        // that list means codewriter/regalloc emitted a kind shape that
-        // no RPython blackhole handler has — fix the upstream emission,
-        // do NOT add a `*_r>i`/`*_ir>i` bhhandler alias (pyre-only
-        // mixed signatures masked over real type-inference gaps and
-        // were rolled back in `jtransform: drop Ref-operand
-        // auto-coercion arms`).
+        // Task #85 lock-in: every generated opname must be wired by
+        // `wire_bhimpl_handlers`, OR be on this known-gap list with a
+        // cited upstream parity issue.  A new entry outside the list
+        // means codewriter / regalloc emitted a kind shape that no
+        // RPython blackhole handler has — fix at upstream emission, do
+        // NOT add a `*_r>i` / `*_ir>i` alias.
         //
-        // Currently expected unwired entries (TODO: close each one by
-        // implementing the named upstream rewrite, not by wiring an
-        // alias):
+        // Current expected entries:
         //
         // - `int_mod/ii>i` — RPython `jtransform.py:576-577
-        //   rewrite_op_int_mod` is wired to `_do_builtin_call`, which
-        //   replaces the SpaceOperation with `direct_call(ll_int_py_mod,
-        //   ...)` BEFORE the assembler encoder runs, so upstream's
-        //   `pipeline.insns` never carries the bare `int_mod` opname.
-        //   pyre's `jit_codewriter/assembler.rs:2778-2789` emits the
-        //   opname directly from `syn::BinOp::Rem` on `i64` operands
-        //   without an intervening rewrite, so the key leaks into
-        //   `pipeline.insns`.  Closing this requires porting
-        //   `_do_builtin_call` (or equivalent) into pyre's IR-rewrite
-        //   phase so the SSA op converts to a `Call` targeting
-        //   `ll_int_py_mod` before encode.  `int_floordiv/ii>i` has
-        //   the same parity gap in principle but does not currently
-        //   appear because no analyzed source emits it (Rust's `i64 /
-        //   i64` truncates toward zero, distinct from Python's
-        //   floor-division semantics, so the front-end may translate
-        //   it differently — leave it off this list until it surfaces).
+        //   rewrite_op_int_mod = _do_builtin_call` replaces the bare
+        //   op with `direct_call(_ll_2_int_mod, ...)` BEFORE jitcode
+        //   emission, so upstream's `pipeline.insns` never carries
+        //   the bare opname.  Pyre's `jit_codewriter/jtransform.rs`
+        //   `BinOp { op: "mod" | "floordiv" }` arm rewrites only when
+        //   `result_ty == Int`; pyre's AST-time
+        //   `front/ast.rs::binary_result_value_type` falls back to
+        //   `Unknown` when either operand's `graph_value_type` returns
+        //   `None` (a forward-reference gap that the rtyper-equivalent
+        //   type_state pass resolves later), so `Unknown`-typed mods
+        //   slip through and leak into `pipeline.insns`.  Closing
+        //   this requires fixing the AST-time type inference so
+        //   `result_ty` is reliably `Int` for `i64 % i64`; it is NOT
+        //   closed by widening the rewrite gate to admit `Unknown`
+        //   (a previously-attempted shortcut that mixed two upstream
+        //   routes — see jtransform.rs comment).
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
         let expected: Vec<String> = vec!["int_mod/ii>i".to_string()];
@@ -1338,20 +1338,17 @@ mod tests {
     #[test]
     fn default_bh_builder_handler_coverage_report() {
         // Diagnostic: surface the opnames in the real insns table that
-        // `wire_bhimpl_handlers` did NOT override. These fall back to
+        // `wire_bhimpl_handlers` did NOT override.  These fall back to
         // the `setup_insns` placeholder and would panic on dispatch.
         //
         // `BlackholeInterpBuilder::unwired_opnames()` is the accessor
-        // that returns the gap. Each unwired opname is a concrete
-        // bhimpl port that Phase D-2 must land before flipping the
-        // production dispatch path to insns-table-driven.
+        // that returns the gap.  The current expected unwired set is
+        // documented in
+        // `default_bh_builder_unwired_set_matches_task_85_snapshot`.
         //
         // The test does NOT fail on unwired opnames — it just reports
-        // them. Gating turns on later once the table path is the sole
-        // production dispatch route.  Use the report builder rather
-        // than the strict-panic variant so the diagnostic survives
-        // documented unwired entries (see
-        // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
+        // them.  Gating turns on later once the documented unwired
+        // entries are closed at upstream emission.
         let (builder, _) = build_default_bh_builder_with_unwired_report();
         let total = insns_opname_to_byte().len();
         let mut unwired: Vec<&str> = builder.unwired_opnames();

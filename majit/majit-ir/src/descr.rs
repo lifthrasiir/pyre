@@ -3738,26 +3738,57 @@ pub fn make_array_descr_full(
     ))
 }
 
-/// Build an [`ArrayDescr`] preserving the full lltype-discriminant set
-/// the codewriter records on `BhDescr::Array`.  Mirrors RPython
-/// `descr.py:348 get_array_descr` more closely than
-/// [`make_array_descr_signed`] by threading `type_id`, the
+/// Build an [`ArrayDescr`] preserving the lltype-discriminant set the
+/// codewriter records on `BhDescr::Array`.  Threads `type_id`, the
 /// pointer/struct discriminator (which selects the right
-/// [`ArrayFlag`]), and is_pure / lendescr / interior-field placeholders
-/// — so two distinct lltypes that share `(base_size, item_size,
-/// item_type, is_signed)` but differ on `is_array_of_pointers` /
-/// `is_array_of_structs` / `type_id` map to distinct
-/// `Arc<SimpleArrayDescr>`s.
+/// [`ArrayFlag`]), `lendescr`, and `is_pure` onto the resulting
+/// `SimpleArrayDescr`.
 ///
-/// `lendescr` is left `None` and `is_pure` is left `false`; pyre's
-/// dispatch path for opcode-fetch (`program: &[u8]`) never reads
-/// either, and arrays minted by other paths reach the fuller
-/// constructors directly.
+/// Caller-side caching contract: the resulting Arc identity is
+/// stable per-call (each invocation mints a fresh Arc), so any
+/// caller that wants `Arc::ptr_eq`-stable identity for repeated
+/// calls with the same `BhDescr::Array` shape must memoise on its
+/// own.  RPython's `descr.py:348 get_array_descr` keys the cache on
+/// the lltype object itself, which encodes ALL of `type_id`,
+/// `is_array_of_pointers`, `is_array_of_structs`, `lendescr`,
+/// `is_pure`, `interior_fields`, etc; pyre callers MUST use a key
+/// that distinguishes every pair of inputs that could resolve to a
+/// different `SimpleArrayDescr` shape, otherwise two distinct
+/// lltypes will collapse to a single cached Arc and break optimizer
+/// invariants that read those fields.  Pyre's only current caller
+/// (`pyjitpl::dispatch::dispatch_array_descr_ref`) uses
+/// `DispatchArrayDescrKey` which captures the eight `BhDescr::Array`
+/// discriminants and pins `lendescr=None` / `is_pure=false` /
+/// empty `interior_fields` for the bytecode-array
+/// (`program: &[u8]`) opcode-fetch path; future general-purpose
+/// callers must extend their cache key to cover whichever inputs
+/// they vary.
 ///
-/// `interior_field_descrs` is the caller-side list (already built per
-/// upstream `descr.py:388 InteriorFieldDescr.__init__`).  Pass an
-/// empty Vec for arrays whose item type is a primitive (no inline
-/// struct).
+/// Field provenance (RPython `descr.py:240-289 ArrayDescr.__init__`):
+/// - `lendescr`: `descr.py:286-287 self.lendescr = lendescr` — points
+///   at the array length field's `FieldDescr` for arrays whose
+///   `ARRAY._hints.get('nolength')` is false.  `None` for fixed-size
+///   buffers (pyre's `program: &[u8]` opcode-fetch path).
+/// - `is_pure`: `descr.py:288 self._is_pure = ARRAY._hints.get(
+///   'immutable', False)` — set on `Ptr(rstr.STR)` /
+///   `Ptr(rstr.UNICODE)` and any `lltype.Array(... hints={'immutable':
+///   True})`.  Drives the optimizer's pure-array fold.
+///
+/// LIMITATION (matches the `descr.py:388 InteriorFieldDescr.__init__`
+/// invariant): this helper does NOT mint
+/// `arraydescr.all_interiorfielddescrs`.  RPython requires every
+/// `InteriorFieldDescr` to carry the SAME `arraydescr` object identity
+/// the array descr it indexes into uses; pyre's
+/// [`SimpleInteriorFieldDescr::new`] takes that parent as
+/// `Arc<SimpleArrayDescr>` at construction time, so a caller cannot
+/// pre-build the interior descrs for an Arc that does not yet exist
+/// (which is exactly the situation here — the parent Arc is freshly
+/// minted inside this helper).  Use [`SimpleArrayDescr::
+/// set_all_interiorfielddescrs`] from the caller AFTER this helper
+/// returns: build the per-field `SimpleInteriorFieldDescr` Arcs with
+/// the returned parent Arc as their `array_descr`, then publish the
+/// list onto the parent through that `OnceLock` writer.  No interior
+/// argument here keeps the API honest about that ordering constraint.
 pub fn make_array_descr_from_lltype_shape(
     type_id: u32,
     base_size: usize,
@@ -3766,7 +3797,8 @@ pub fn make_array_descr_from_lltype_shape(
     is_array_of_pointers: bool,
     is_array_of_structs: bool,
     is_item_signed: bool,
-    interior_field_descrs: Vec<DescrRef>,
+    lendescr: Option<DescrRef>,
+    is_pure: bool,
 ) -> Arc<SimpleArrayDescr> {
     // RPython `descr.py:241-254 get_type_flag` precedence: pointer >
     // struct > primitive.  `is_array_of_pointers` selects FLAG_POINTER,
@@ -3794,21 +3826,9 @@ pub fn make_array_descr_from_lltype_shape(
         }
     };
     let mut descr = SimpleArrayDescr::with_flag(0, base_size, item_size, type_id, item_type, flag);
-    descr.lendescr = None;
-    descr.is_pure = false;
-    let arc = Arc::new(descr);
-    if !interior_field_descrs.is_empty() {
-        // RPython `descr.py:372-375` populates
-        // `arraydescr.all_interiorfielddescrs` after the array descr is
-        // minted, using the same arraydescr Arc inside each
-        // InteriorFieldDescr (`descr.py:388 InteriorFieldDescr.__init__`).
-        // The caller must therefore have built the `interior_field_descrs`
-        // with `arc` as their parent — pyre's
-        // `SimpleArrayDescr::set_all_interiorfielddescrs` writes through
-        // `OnceLock`, leaving the parent Arc identity stable.
-        arc.set_all_interiorfielddescrs(interior_field_descrs);
-    }
-    arc
+    descr.lendescr = lendescr;
+    descr.is_pure = is_pure;
+    Arc::new(descr)
 }
 
 /// Create a call descriptor.

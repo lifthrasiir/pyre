@@ -867,7 +867,20 @@ pub fn build_function_graph_with_self_ty_pub(
 /// Expose `collect_jit_hints` so `parse.rs` can hoist trait-method
 /// hints from AST attributes when the strict graph build returns Err.
 pub fn collect_jit_hints_pub(attrs: &[syn::Attribute]) -> Vec<String> {
-    collect_jit_hints(attrs)
+    collect_jit_hints(attrs, None)
+}
+
+/// `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
+/// — companion to `collect_jit_hints` that exposes the function's
+/// positional parameter names when `#[oopspec(...)]` is present.
+///
+/// Used by the walker to populate `CallControl::oopspec_argnames`
+/// (`lib.rs:598-600` consumes the `"oopspec_argnames:..."` hint
+/// alongside the `"oopspec:..."` hint).  Pyre's `parse_oopspec`
+/// (`support.py:701-715` port) needs argnames to resolve identifier
+/// slots in the spec's `(...)` pattern to `Index(n)` placeholders.
+pub fn collect_jit_hints_with_sig(attrs: &[syn::Attribute], sig: &syn::Signature) -> Vec<String> {
+    collect_jit_hints(attrs, Some(sig))
 }
 
 #[derive(Debug, Clone)]
@@ -2109,7 +2122,7 @@ fn build_function_graph(
     // RPython: function-level hints from decorators / GC transformer.
     // Scan #[jit_*] attributes to detect elidable, loopinvariant,
     // close_stack, cannot_collect, gc_effects.
-    let hints = collect_jit_hints(&func.attrs);
+    let hints = collect_jit_hints(&func.attrs, Some(&func.sig));
 
     // Direct port of `simplify.transform_dead_op_vars_in_blocks`
     // (`rpython/translator/simplify.py:422`) — the dead-op subset of
@@ -2157,8 +2170,9 @@ fn build_function_graph(
 ///
 /// For `#[oopspec("spec")]`, returns `"oopspec:spec_string"` so the hint
 /// consumer can extract the spec via `hint.strip_prefix("oopspec:")`.
-fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
+fn collect_jit_hints(attrs: &[syn::Attribute], sig: Option<&syn::Signature>) -> Vec<String> {
     let mut hints = Vec::new();
+    let mut saw_oopspec = false;
     for attr in attrs {
         if let Some(segment) = attr.path().segments.last() {
             let name = segment.ident.to_string();
@@ -2202,12 +2216,45 @@ fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
                     } else {
                         hints.push("oopspec".into());
                     }
+                    saw_oopspec = true;
                 }
                 // majit-specific
                 "jit_close_stack" => hints.push("close_stack".into()),
                 "jit_cannot_collect" => hints.push("cannot_collect".into()),
                 "jit_gc_effects" => hints.push("gc_effects".into()),
                 _ => {}
+            }
+        }
+    }
+    // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
+    // — when `#[oopspec(...)]` is present and the function signature
+    // is available, emit a paired `"oopspec_argnames:arg1,arg2,..."`
+    // hint so `lib.rs:598-600` can populate
+    // `CallControl::mark_oopspec_argnames` alongside `mark_oopspec`.
+    // `support.py:713 argname2index = dict(zip(argnames, [Index(n) for n in range(nb_args)]))`
+    // requires the declaration-order names; `self` is skipped because
+    // upstream `co_varnames` for a method's lifted free function would
+    // not include it (RPython doesn't have `self`-as-receiver in
+    // oopspec helpers, and pyre's `#[oopspec(...)]` macro is only
+    // applied to free fns / static methods per
+    // `majit-macros/src/lib.rs:1316`).
+    if saw_oopspec {
+        if let Some(sig) = sig {
+            let argnames: Vec<String> = sig
+                .inputs
+                .iter()
+                .filter_map(|arg| match arg {
+                    syn::FnArg::Typed(pat_type) => match &*pat_type.pat {
+                        syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+                        _ => None,
+                    },
+                    // `&self` / `self` receivers carry no positional
+                    // argname for the oopspec parser to bind against.
+                    syn::FnArg::Receiver(_) => None,
+                })
+                .collect();
+            if !argnames.is_empty() {
+                hints.push(format!("oopspec_argnames:{}", argnames.join(",")));
             }
         }
     }
