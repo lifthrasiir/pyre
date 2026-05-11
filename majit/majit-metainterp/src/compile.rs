@@ -5098,12 +5098,17 @@ impl TraceCtx {
         self.inline_trace_positions.truncate(depth);
     }
 
-    /// pyjitpl.py:3514 find_biggest_function
+    /// pyjitpl.py:3514-3546 find_biggest_function
+    ///
+    /// Considers both inlined callee segments and the root trace segment
+    /// (start_stack[0] in RPython, i.e. the outermost portal whose entry
+    /// position is 0).
     pub fn find_biggest_function(&self) -> Option<u64> {
         let current_pos = self.recorder.num_ops();
-        self.inline_trace_positions
-            .iter()
-            .map(|&(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
+        let root_entry = std::iter::once((self.green_key, 0usize));
+        root_entry
+            .chain(self.inline_trace_positions.iter().copied())
+            .map(|(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
             .max_by_key(|&(_, size)| size)
             .map(|(green_key, _)| green_key)
     }
