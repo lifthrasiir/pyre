@@ -1338,6 +1338,12 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
             value.as_str().expect("non-UTF-8 string constant"),
         )),
         ConstantData::None => ConcreteValue::Ref(pyre_object::w_none()),
+        ConstantData::Slice { elements } if elements.len() == 3 => {
+            let start = load_const_concrete(&elements[0]).to_pyobj();
+            let stop = load_const_concrete(&elements[1]).to_pyobj();
+            let step = load_const_concrete(&elements[2]).to_pyobj();
+            ConcreteValue::Ref(pyre_object::w_slice_new(start, stop, step))
+        }
         _ => ConcreteValue::Null,
     }
 }

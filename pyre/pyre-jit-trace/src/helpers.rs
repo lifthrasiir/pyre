@@ -515,6 +515,16 @@ pub trait TraceHelperAccess {
     fn trace_ellipsis_constant(&mut self) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(pyre_object::noneobject::w_ellipsis() as i64)))
     }
+
+    fn trace_slice_constant(
+        &mut self,
+        _start: OpRef,
+        _stop: OpRef,
+        _step: OpRef,
+        concrete_slice: pyre_object::PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(concrete_slice as i64)))
+    }
 }
 
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).

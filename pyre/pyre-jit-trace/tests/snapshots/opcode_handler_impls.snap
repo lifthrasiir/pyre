@@ -333,6 +333,27 @@ impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
         let opref = self.trace_ellipsis_constant()?;
         Ok(crate::state::FrontendOp::new(opref, concrete))
     }
+
+    fn slice_constant(
+        &mut self,
+        start: Self::Value,
+        stop: Self::Value,
+        step: Self::Value,
+    ) -> Result<Self::Value, pyre_interpreter::PyError> {
+        use crate::helpers::TraceHelperAccess;
+        let concrete = crate::state::ConcreteValue::Ref(
+            pyre_object::w_slice_new(
+                start.concrete.to_pyobj(),
+                stop.concrete.to_pyobj(),
+                step.concrete.to_pyobj(),
+            ),
+        );
+        let opref = self.trace_slice_constant(
+            start.opref, stop.opref, step.opref,
+            concrete.to_pyobj(),
+        )?;
+        Ok(crate::state::FrontendOp::new(opref, concrete))
+    }
 }
 
 impl pyre_interpreter::StackOpcodeHandler for crate::state::MIFrame {
