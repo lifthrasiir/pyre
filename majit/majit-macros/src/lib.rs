@@ -1198,7 +1198,10 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
             .ok_or_else(|| syn::Error::new_spanned(&pair.path, "expected `save_err = N`"))?;
         if key == "save_err" {
             if save_err.is_some() {
-                return Err(syn::Error::new_spanned(key, "duplicate `save_err` argument"));
+                return Err(syn::Error::new_spanned(
+                    key,
+                    "duplicate `save_err` argument",
+                ));
             }
             let syn::Expr::Lit(syn::ExprLit {
                 lit: Lit::Int(int_lit),

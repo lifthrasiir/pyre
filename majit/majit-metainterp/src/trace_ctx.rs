@@ -261,7 +261,6 @@ pub struct TraceCtx {
 /// override) matches the RPython baseline.
 pub const DEFAULT_TRACE_LIMIT: usize = 6000;
 
-
 impl TraceCtx {
     /// opencoder.py:472 `self.metainterp_sd` — shared static data the
     /// recorder was constructed with. Read-only handle for callers that
@@ -272,8 +271,6 @@ impl TraceCtx {
     pub fn metainterp_sd(&self) -> &std::sync::Arc<crate::MetaInterpStaticData> {
         &self.metainterp_sd
     }
-
-
 
     /// pyjitpl.py:2398: access the tracing-time heap cache.
     pub fn heap_cache(&self) -> &HeapCache {
@@ -471,9 +468,6 @@ impl TraceCtx {
         }
     }
 
-
-
-
     /// Get or create a constant OpRef for a given i64 value.
     pub fn const_int(&mut self, value: i64) -> OpRef {
         self.constants.get_or_insert(value)
@@ -601,7 +595,6 @@ impl TraceCtx {
         }
     }
 
-
     /// RPython `original_boxes[index]` lookup for the currently active trace.
     ///
     /// `MetaInterp.setup_tracing` snapshots each trace-entry concrete value in
@@ -696,7 +689,6 @@ impl TraceCtx {
     pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
         self.driver_descriptor = Some(descriptor);
     }
-
 
     /// Initialize standard virtualizable boxes from input args.
     /// Called at trace start when a virtualizable is registered.
@@ -2278,7 +2270,6 @@ mod tests {
             }
         }
     }
-
 
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {
         let mut recorder = ctx.recorder;

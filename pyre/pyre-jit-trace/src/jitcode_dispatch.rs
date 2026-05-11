@@ -8323,10 +8323,7 @@ mod tests {
     #[test]
     fn inline_call_with_void_subreturn_surfaces_unexpected_void_error() {
         let err = DispatchError::UnexpectedVoidSubReturn { pc: 42 };
-        assert_eq!(
-            err,
-            DispatchError::UnexpectedVoidSubReturn { pc: 42 },
-        );
+        assert_eq!(err, DispatchError::UnexpectedVoidSubReturn { pc: 42 },);
     }
 
     // ── inline_call_*_v regression tests ──────────────────────────────
@@ -8355,14 +8352,22 @@ mod tests {
         };
         let lookup = {
             let sub_body = sub_body.clone();
-            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
         };
         // dR layout: 2B descr(7) + 1B R-len(1) + 1B R-arg(r0)  — no >X dst
         let caller_code = [
             inline_byte,
-            0x07, 0x00, // descr index 7
-            0x01, 0x00, // R: len=1, arg=r0
-            void_ret,   // caller terminates
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x00,     // R: len=1, arg=r0
+            void_ret, // caller terminates
         ];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);
@@ -8384,8 +8389,8 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
         };
-        let (outcome, _) = walk(&caller_code, 0, &mut wc)
-            .expect("inline_call_r_v with void callee must succeed");
+        let (outcome, _) =
+            walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
         assert_eq!(outcome, DispatchOutcome::Terminate);
     }
 
@@ -8408,12 +8413,20 @@ mod tests {
         };
         let lookup = {
             let sub_body = sub_body.clone();
-            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
         };
         let caller_code = [
             inline_byte,
-            0x07, 0x00, // descr index 7
-            0x01, 0x00, // R: len=1, arg=r0
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x00, // R: len=1, arg=r0
         ];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);
@@ -8457,15 +8470,24 @@ mod tests {
         };
         let lookup = {
             let sub_body = sub_body.clone();
-            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
         };
         // dIR layout: 2B descr(7) + I-list(len=1, i0) + R-list(len=1, r0) — no dst
         let caller_code = [
             inline_byte,
-            0x07, 0x00, // descr index 7
-            0x01, 0x00, // I: len=1, arg=i0
-            0x01, 0x00, // R: len=1, arg=r0
-            void_ret,   // caller terminates
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x00, // I: len=1, arg=i0
+            0x01,
+            0x00,     // R: len=1, arg=r0
+            void_ret, // caller terminates
         ];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);
@@ -8488,8 +8510,8 @@ mod tests {
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
         };
-        let (outcome, _) = walk(&caller_code, 0, &mut wc)
-            .expect("inline_call_ir_v with void callee must succeed");
+        let (outcome, _) =
+            walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
         assert_eq!(outcome, DispatchOutcome::Terminate);
     }
 
@@ -8510,13 +8532,22 @@ mod tests {
         };
         let lookup = {
             let sub_body = sub_body.clone();
-            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
         };
         let caller_code = [
             inline_byte,
-            0x07, 0x00,
-            0x01, 0x00, // I: len=1, arg=i0
-            0x01, 0x00, // R: len=1, arg=r0
+            0x07,
+            0x00,
+            0x01,
+            0x00, // I: len=1, arg=i0
+            0x01,
+            0x00, // R: len=1, arg=r0
         ];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);
@@ -8562,16 +8593,26 @@ mod tests {
         };
         let lookup = {
             let sub_body = sub_body.clone();
-            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
         };
         // dIRF layout: 2B descr + I-list + R-list + F-list — no dst
         let caller_code = [
             inline_byte,
-            0x07, 0x00, // descr index 7
-            0x01, 0x00, // I: len=1, arg=i0
-            0x01, 0x00, // R: len=1, arg=r0
-            0x01, 0x00, // F: len=1, arg=f0
-            void_ret,   // caller terminates
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x00, // I: len=1, arg=i0
+            0x01,
+            0x00, // R: len=1, arg=r0
+            0x01,
+            0x00,     // F: len=1, arg=f0
+            void_ret, // caller terminates
         ];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);
@@ -8618,14 +8659,24 @@ mod tests {
         };
         let lookup = {
             let sub_body = sub_body.clone();
-            move |idx: usize| if idx == 7 { Some(sub_body.clone()) } else { None }
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
         };
         let caller_code = [
             inline_byte,
-            0x07, 0x00,
-            0x01, 0x00, // I
-            0x01, 0x00, // R
-            0x01, 0x00, // F
+            0x07,
+            0x00,
+            0x01,
+            0x00, // I
+            0x01,
+            0x00, // R
+            0x01,
+            0x00, // F
         ];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 4);

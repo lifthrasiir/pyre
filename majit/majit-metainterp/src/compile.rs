@@ -31,12 +31,11 @@ use majit_ir::{
 
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
-use crate::recorder::TracePosition;
-use crate::trace_ctx::{MergePoint, TraceCtx};
 use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
     ResumeLayoutSummary, ResumeValueSource,
 };
+use crate::trace_ctx::{MergePoint, TraceCtx};
 
 /// `compile.py:166-169` `make_jitcell_token(jitdriver_sd)`.
 ///
@@ -4861,7 +4860,6 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 // `MetaInterp` (pyjitpl.py) owns both the struct and the list.
 
 impl TraceCtx {
-
     /// pyjitpl.py:2994-2997 reverse `same_greenkey` scan.
     ///
     /// Pyre's typed `green_key: u64` already collapses the
@@ -5079,16 +5077,18 @@ impl TraceCtx {
         self.inline_trace_positions.truncate(depth);
     }
 
-    /// pyjitpl.py:3514-3546 find_biggest_function
+    /// pyjitpl.py:3538-3570 find_biggest_function
     ///
-    /// Considers both inlined callee segments and the root trace segment
-    /// (start_stack[0] in RPython, i.e. the outermost portal whose entry
-    /// position is 0).
+    /// RPython only considers portal frames recorded in
+    /// `portal_trace_positions`.  The root frame created by
+    /// `initialize_state_from_start()` has no greenkey and is not added to
+    /// that stack, so a non-inlined root trace returns `None` and the caller
+    /// falls back to `prepare_trace_segmenting()`.
     pub fn find_biggest_function(&self) -> Option<u64> {
         let current_pos = self.recorder.num_ops();
-        let root_entry = std::iter::once((self.green_key, 0usize));
-        root_entry
-            .chain(self.inline_trace_positions.iter().copied())
+        self.inline_trace_positions
+            .iter()
+            .copied()
             .map(|(green_key, start_pos)| (green_key, current_pos.saturating_sub(start_pos)))
             .max_by_key(|&(_, size)| size)
             .map(|(green_key, _)| green_key)
