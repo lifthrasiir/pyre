@@ -76,7 +76,12 @@ impl<'c> Lowerer<'c> {
                 self.expr_references_unknown_local(expr)
                     || self.expr_references_unknown_local(index)
             }
-            Expr::Match(m) => self.expr_references_unknown_local(&m.expr),
+            Expr::Match(m) => {
+                self.expr_references_unknown_local(&m.expr)
+                    || m.arms
+                        .iter()
+                        .any(|arm| self.expr_references_unknown_local(&arm.body))
+            }
             Expr::If(ExprIf {
                 cond,
                 then_branch,
@@ -142,12 +147,17 @@ impl<'c> Lowerer<'c> {
             | Expr::Paren(ExprParen { expr, .. })
             | Expr::Reference(ExprReference { expr, .. })
             | Expr::Unary(ExprUnary { expr, .. }) => self.expr_modifies_jit_state(expr),
+            Expr::Match(m) => {
+                self.expr_modifies_jit_state(&m.expr)
+                    || m.arms
+                        .iter()
+                        .any(|arm| self.expr_modifies_jit_state(&arm.body))
+            }
             Expr::Field(_)
             | Expr::Index(_)
             | Expr::Path(_)
             | Expr::Lit(_)
             | Expr::Try(_)
-            | Expr::Match(_)
             | Expr::Loop(_)
             | Expr::While(_)
             | Expr::ForLoop(_)
@@ -220,6 +230,12 @@ impl<'c> Lowerer<'c> {
                 self.expr_has_jit_state_reference(expr) || self.expr_has_jit_state_reference(index)
             }
             Expr::Field(syn::ExprField { base, .. }) => self.expr_has_jit_state_reference(base),
+            Expr::Match(m) => {
+                self.expr_has_jit_state_reference(&m.expr)
+                    || m.arms
+                        .iter()
+                        .any(|arm| self.expr_has_jit_state_reference(&arm.body))
+            }
             _ => false,
         }
     }
