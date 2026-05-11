@@ -1525,10 +1525,12 @@ mod tests {
             crate::r#box::BoxPool::new(),
         );
 
-        // GUARD_VALUE should be replaced with GUARD_TRUE
+        // GUARD_VALUE(v, 1) folds to GUARD_TRUE(v). postprocess_GUARD_VALUE
+        // then calls make_constant(v, 1), after which the emit-time trivial
+        // guard check eliminates the now-constant GUARD_TRUE(1).
         assert!(
-            result.iter().any(|o| o.opcode == OpCode::GuardTrue),
-            "GUARD_VALUE(v, 1) should become GUARD_TRUE(v)"
+            !result.iter().any(|o| o.opcode == OpCode::GuardTrue),
+            "GUARD_TRUE(1) should be eliminated as trivially true"
         );
         assert!(
             !result.iter().any(|o| o.opcode == OpCode::GuardValue),

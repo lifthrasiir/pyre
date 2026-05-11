@@ -2085,9 +2085,12 @@ impl OptRewrite {
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
+        // rewrite.py:165-168: box.type=='i' checks intbound.is_constant(),
+        // which catches values narrowed to a single point by bounds analysis,
+        // not just the constant pool.
         if let Some(val) = ctx
             .get_box_replacement_box(arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
+            .and_then(|b| ctx.get_constant_int_or_bound_box(&b))
         {
             if val != 0 {
                 return OptimizationResult::Remove;
@@ -2102,9 +2105,10 @@ impl OptRewrite {
     fn optimize_guard_false(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
+        // rewrite.py:165-168: box.type=='i' checks intbound.is_constant().
         if let Some(val) = ctx
             .get_box_replacement_box(arg0)
-            .and_then(|b| ctx.get_constant_int_box(&b))
+            .and_then(|b| ctx.get_constant_int_or_bound_box(&b))
         {
             if val == 0 {
                 return OptimizationResult::Remove;
@@ -2130,11 +2134,27 @@ impl OptRewrite {
 
         // rewrite.py:163-184 optimize_guard(op, constbox) — base contradiction
         // check called from optimize_GUARD_VALUE at line 301. `arg1` is the
-        // asserted Const; `arg0` may also be proven by IntBound, matching the
-        // integer arm in rewrite.py:165-173. For 'f', rewrite.py:295-298
-        // returns silently when arg0 is constant without checking equality, so
-        // we mirror that by removing on equality but never raising on mismatch.
-        if let (Some(actual), Some(expected)) = (
+        // asserted Const. For box.type=='i' (rewrite.py:165-168) the check is
+        // intbound.is_constant()/get_constant_int(), catching values narrowed
+        // by bounds analysis, not just the constant pool. For 'r'
+        // (rewrite.py:174-182) it is get_box_replacement(box).is_constant()/
+        // same_constant. For 'f', rewrite.py:295-298 returns silently when
+        // arg0 is constant without checking equality, so we mirror that by
+        // removing on equality but never raising on mismatch.
+        if let Some(expected_int) = ctx
+            .get_box_replacement_box(arg1)
+            .and_then(|b| ctx.get_constant_int_box(&b))
+        {
+            if let Some(actual_int) = ctx
+                .get_box_replacement_box(arg0)
+                .and_then(|b| ctx.get_constant_int_or_bound_box(&b))
+            {
+                if actual_int == expected_int {
+                    return OptimizationResult::Remove;
+                }
+                raise_invalid_loop("GUARD_VALUE proven to always fail");
+            }
+        } else if let (Some(actual), Some(expected)) = (
             ctx.get_box_replacement_box(arg0)
                 .and_then(|b| ctx.get_constant_box(&b)),
             ctx.get_box_replacement_box(arg1)
@@ -2148,8 +2168,6 @@ impl OptRewrite {
                     raise_invalid_loop("GUARD_VALUE proven to always fail");
                 }
                 Value::Float(_) => {
-                    // rewrite.py:295-298 'f' prelude: return silently on
-                    // constant arg0; no contradiction check.
                     return OptimizationResult::Remove;
                 }
                 Value::Void => {}
@@ -5206,9 +5224,12 @@ mod tests {
             crate::r#box::BoxPool::new(),
         );
 
+        // GUARD_VALUE(v, 0) folds to GUARD_FALSE(v). postprocess_GUARD_VALUE
+        // then calls make_constant(v, 0), after which the emit-time trivial
+        // guard check eliminates the now-constant GuardFalse(0).
         assert!(
-            result.iter().any(|o| o.opcode == OpCode::GuardFalse),
-            "GUARD_VALUE(v, 0) should become GUARD_FALSE(v)"
+            !result.iter().any(|o| o.opcode == OpCode::GuardFalse),
+            "GUARD_FALSE(0) should be eliminated as trivially true"
         );
     }
 
