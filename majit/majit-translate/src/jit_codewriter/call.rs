@@ -764,13 +764,15 @@ impl StructLayout {
 /// `cpu.fielddescrof(T, fieldname).get_ei_index()` /
 /// `cpu.arraydescrof(ARRAY).get_ei_index()`.
 ///
-/// RPython: each descriptor gets a globally unique index via
-/// `effectinfo.py:465-538 compute_bitstrings()`.  Indices are monotonic
-/// `u32` (no upper bound from the bitstring representation; the final
-/// `make_bitstring` (`bitstring.py:3-13`) sizes the byte vector to
-/// `(max_index + 7) / 8`).  Pyre keeps the same monotonic shape:
-/// `(owner_root, field_name)` keys always map to the same index, and
-/// distinct keys never alias.
+/// RPython: each descriptor gets an index unique within its namespace
+/// (fields, arrays, interiorfields) via `effectinfo.py:465-538
+/// compute_bitstrings()` — the outer `for key in descrs:` loop resets
+/// `mapping = {}` per namespace, so indices can collide across
+/// namespaces.  Indices are monotonic `u32` (no upper bound from the
+/// bitstring representation; `make_bitstring` (`bitstring.py:3-13`)
+/// sizes the byte vector to `(max_index + 7) / 8`).  Pyre mirrors this
+/// with three independent counters (`next_field_index`,
+/// `next_array_index`, `next_interiorfield_index`).
 ///
 /// Array descriptors are keyed by `(item_ty, array_type_id)` per
 /// RPython's `cpu.arraydescrof(ARRAY)`, which distinguishes by ARRAY
