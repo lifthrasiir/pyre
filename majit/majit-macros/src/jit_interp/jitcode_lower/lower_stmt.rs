@@ -1057,6 +1057,7 @@ impl<'c> Lowerer<'c> {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let __slot_tokens = CondCallEffectSlot::for_wrapped_kind(kind);
                     // `call.py:301-303 getcalldescr`: descr's `EffectInfo`
                     // differs by the analyzer's `_canraise` result, but the
                     // residual_call dispatch family is the same.
@@ -1094,7 +1095,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target_with_save_err(
                                 __trace_target,
                                 __concrete_target,
-                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                #__slot_tokens,
                                 __save_err,
                             );
                             #call_stmt
@@ -1108,6 +1109,7 @@ impl<'c> Lowerer<'c> {
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let __slot_tokens = CondCallEffectSlot::for_wrapped_kind(kind);
                     let call_stmt = match kind {
                         crate::jit_interp::CallPolicyKind::MayForceVoidWrapped => {
                             quote! { __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args); }
@@ -1140,7 +1142,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target_with_save_err(
                                 __trace_target,
                                 __concrete_target,
-                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                #__slot_tokens,
                                 __save_err,
                             );
                             #call_stmt
@@ -1303,6 +1305,7 @@ impl<'c> Lowerer<'c> {
                     };
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let __slot_tokens = CondCallEffectSlot::for_wrapped_kind(kind);
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::Call,
@@ -1327,7 +1330,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target_with_save_err(
                                 __trace_target,
                                 __concrete_target,
-                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                #__slot_tokens,
                                 __save_err,
                             );
                             #call_stmt
@@ -1341,6 +1344,7 @@ impl<'c> Lowerer<'c> {
                 let typed_args = typed_call_arg_tokens(&arg_bindings);
                 let __arg_regs: Vec<Register> =
                     arg_bindings.iter().map(Register::from_binding).collect();
+                let __slot_tokens = CondCallEffectSlot::slot_from_policy_tokens();
                 self.emit_op(
                     OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                     quote! {
@@ -1358,7 +1362,7 @@ impl<'c> Lowerer<'c> {
                         let __fn_idx = __builder.add_call_target_with_save_err(
                             __trace_target,
                             __concrete_target,
-                            majit_metainterp::EffectInfoSlot::CanRaise,
+                            #__slot_tokens,
                             __save_err,
                         );
                         match __policy {

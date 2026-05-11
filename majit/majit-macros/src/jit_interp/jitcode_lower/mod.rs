@@ -261,6 +261,56 @@ impl CondCallEffectSlot {
             Self::ElidableCanRaise | Self::ElidableCannotRaise | Self::ElidableOrMemerror
         )
     }
+
+    /// Emit the `EffectInfoSlot` token for a statically-known wrapped
+    /// `CallPolicyKind`.  Used by the `*Wrapped` lowering arms so the
+    /// registered call-target descr carries the real effect classification
+    /// (`call.py:282-303 getcalldescr`) rather than a blanket `CanRaise`.
+    /// Falls back to `CanRaise` for `MayForce` / `ReleaseGil` / `Inline*`
+    /// kinds whose conditional-call slot is `None` in
+    /// `call_policy_effect_slot`; the actual call surface dispatches them
+    /// through dedicated `call_may_force_*` / `call_release_gil_*` /
+    /// inline-helper paths that ignore the registered slot.
+    pub(super) fn for_wrapped_kind(kind: crate::jit_interp::CallPolicyKind) -> TokenStream {
+        call_policy_effect_slot(kind)
+            .map(|slot| slot.token())
+            .unwrap_or_else(|| quote! { majit_metainterp::EffectInfoSlot::CanRaise })
+    }
+
+    /// Emit a runtime `match __policy { ... }` expression that resolves the
+    /// `EffectInfoSlot` from the helper's `_jit_helper_policy` byte.  Used
+    /// by the `Infer` lowering paths where the policy kind is only known at
+    /// runtime (`call.py:282-303 getcalldescr` analyzer chain executed on
+    /// the live byte).
+    pub(super) fn slot_from_policy_tokens() -> TokenStream {
+        quote! {
+            match __policy {
+                #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #REF_DONT_LOOK_INSIDE
+                | #VOID_MAY_FORCE | #INT_MAY_FORCE | #REF_MAY_FORCE
+                | #VOID_RELEASE_GIL | #INT_RELEASE_GIL => {
+                    majit_metainterp::EffectInfoSlot::CanRaise
+                }
+                #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE
+                | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
+                | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE => {
+                    majit_metainterp::EffectInfoSlot::CannotRaise
+                }
+                #INT_ELIDABLE | #REF_ELIDABLE => {
+                    majit_metainterp::EffectInfoSlot::ElidableCanRaise
+                }
+                #VOID_LOOP_INVARIANT | #INT_LOOP_INVARIANT | #REF_LOOP_INVARIANT => {
+                    majit_metainterp::EffectInfoSlot::LoopInvariant
+                }
+                #INT_ELIDABLE_CANNOT_RAISE | #REF_ELIDABLE_CANNOT_RAISE => {
+                    majit_metainterp::EffectInfoSlot::ElidableCannotRaise
+                }
+                #INT_ELIDABLE_OR_MEMERROR | #REF_ELIDABLE_OR_MEMERROR => {
+                    majit_metainterp::EffectInfoSlot::ElidableOrMemerror
+                }
+                _ => majit_metainterp::EffectInfoSlot::CanRaise,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

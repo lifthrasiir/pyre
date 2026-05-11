@@ -1190,13 +1190,16 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
     use syn::{Lit, MetaNameValue, Token};
     let parser = syn::punctuated::Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
     let pairs = syn::parse::Parser::parse2(parser, attr)?;
-    let mut save_err: i32 = 0;
+    let mut save_err: Option<i32> = None;
     for pair in pairs {
         let key = pair
             .path
             .get_ident()
             .ok_or_else(|| syn::Error::new_spanned(&pair.path, "expected `save_err = N`"))?;
         if key == "save_err" {
+            if save_err.is_some() {
+                return Err(syn::Error::new_spanned(key, "duplicate `save_err` argument"));
+            }
             let syn::Expr::Lit(syn::ExprLit {
                 lit: Lit::Int(int_lit),
                 ..
@@ -1207,7 +1210,7 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
                     "save_err must be an integer literal (`rffi.py:62-71` flag bits)",
                 ));
             };
-            save_err = int_lit.base10_parse::<i32>()?;
+            save_err = Some(int_lit.base10_parse::<i32>()?);
         } else {
             return Err(syn::Error::new_spanned(
                 key,
@@ -1215,7 +1218,7 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
             ));
         }
     }
-    Ok(save_err)
+    Ok(save_err.unwrap_or(0))
 }
 
 /// Mark struct fields whose value never mutates after construction.

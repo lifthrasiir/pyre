@@ -444,6 +444,7 @@ impl<'c> Lowerer<'c> {
                     };
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    let __slot_tokens = CondCallEffectSlot::for_wrapped_kind(kind);
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::Call,
@@ -468,7 +469,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target_with_save_err(
                                 __trace_target,
                                 __concrete_target,
-                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                #__slot_tokens,
                                 __save_err,
                             );
                             #call_stmt
@@ -555,6 +556,7 @@ impl<'c> Lowerer<'c> {
                 }
                 let __arg_regs: Vec<Register> =
                     arg_bindings.iter().map(Register::from_binding).collect();
+                let __slot_tokens = CondCallEffectSlot::slot_from_policy_tokens();
                 if let Some(_arg_regs) = int_arg_regs {
                     // Inferred path: result is Int (the explicit-Inline case is
                     // handled at line 4u8 of the runtime match below, but the
@@ -582,7 +584,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target_with_save_err(
                                 __trace_target,
                                 __concrete_target,
-                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                #__slot_tokens,
                                 __save_err,
                             );
                             match __policy {
@@ -680,7 +682,7 @@ impl<'c> Lowerer<'c> {
                             let __fn_idx = __builder.add_call_target_with_save_err(
                                 __trace_target,
                                 __concrete_target,
-                                majit_metainterp::EffectInfoSlot::CanRaise,
+                                #__slot_tokens,
                                 __save_err,
                             );
                             match __policy {
