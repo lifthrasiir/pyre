@@ -970,9 +970,9 @@ impl MIFrame {
             // `load_local_value` whose vable-shadow read (line 1218)
             // works for any flat slot in `vb[NUM_VABLE_SCALARS..
             // NUM_VABLE_SCALARS + nlocals + ncells + stackdepth]`.
-            // The semantic_ref_slot_for_reg_color in-loop special-
-            // case below provides identity mapping for portal-bridge
-            // since no regalloc happens (color == slot index).
+            // Portal-bridge has no regalloc so colors == slot indices
+            // (identity); the `is_portal_bridge` guard in the Ref-bank
+            // materialization loop below provides the same bypass.
             if jc.payload.metadata.pc_map.is_empty() {
                 if jc.payload.is_portal_bridge() {
                     let stack_base = jc.payload.metadata.stack_base;
@@ -1736,13 +1736,15 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            // Step 2.2 prerequisite: do NOT write registers_r[idx] = op.
-            // After Step 2.2 routes stack pushes to color-indexed slots
-            // (which may be coalesced with a local color), this sync
-            // line OVERWRITES a freshly-pushed stack value. Path C
-            // readers (Slices 1-6) all consult vable shadow first for
-            // active vable owner traces, so the registers_r mirror is
-            // no longer required for downstream consumers.
+            // Do NOT write registers_r[idx] = op.  Slice 3b-3 routes
+            // stack pushes to color-indexed slots (stack_slot_reg_idx),
+            // so a stack slot's color may coincide with a local's
+            // identity color after chordal coalescing.  Writing
+            // registers_r[local_color] here would overwrite the stack
+            // value the writer just placed.  All downstream readers
+            // (the encoder, close_loop_args_at) consult the vable
+            // shadow first for active vable owner traces, so the
+            // registers_r mirror is not required.
             return Ok(op);
         }
         let s = self.sym_mut();

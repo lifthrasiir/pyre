@@ -1112,6 +1112,13 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
 /// Map a post-regalloc Ref-bank color back to the semantic
 /// `locals_cells_stack_w` slot it denotes at the current PC.
 ///
+/// **Decoder-only after slice 3b-2**: the encoder
+/// (`get_list_of_active_boxes`) now reads `registers_r[color]`
+/// directly and derives `semantic_idx` inline.  This function is
+/// still used by `restore_guard_failure_values` (the decoder) which
+/// needs the semantic slot index to call `set_local_at` /
+/// `set_stack_at` on the concrete PyFrame.
+///
 /// After stack-slot pinning removal, stack slots are no longer forced to
 /// occupy colors `nlocals + d`; the reverse lookup must consult
 /// `metadata.stack_slot_color_map` first, bounded to the LIVE stack
@@ -1534,26 +1541,17 @@ pub struct PyreSym {
     // initialised to `CONST_NULL`, `[num_regs_X, ...)` are the constant
     // pool entries copied from `jitcode.constants_X`.
     //
-    // Slice 2 / slice 3b-1 of the SSA-authoritative live_r epic
-    // (Task #185) size `registers_i` / `registers_r` / `registers_f`
-    // via `setup_kind_register_banks` when the owning JitCode is
-    // bound — the leading slots stay `OpRef::NONE` placeholders.
-    // Slice 3b-2 rewrites `get_list_of_active_boxes::snapshot` to
-    // dispatch reads per kind (`registers_i` / `registers_r` /
-    // `registers_f`) directly by post-regalloc-color, and slice 3b-3
-    // populates the trailing constant slots from
-    // `jitcode.constants_X` per `pyjitpl.py:97-119 copy_constants`.
-    //
-    // `registers_r` retains the existing pyre adaptation in the
-    // *prefix* range: index `[0, nlocals)` holds local slots and
-    // `[nlocals, nlocals+stack_only)` holds the operand-stack tail
-    // (Stage 3.4 Phase A/B/C collapsed the legacy `symbolic_stack`
-    // side-Vec into the tail). Slice 3b-1 widens the buffer to
-    // `num_regs_and_consts_r` so the trailing post-regalloc-color
-    // slots exist as `OpRef::NONE` placeholders ahead of the slice
-    // 3b-2/3b-3 reader/writer flips; today no production reader
-    // touches the trailing range, so the growth is byte-for-byte
-    // runtime no-op.
+    // SSA-authoritative live_r epic layout:
+    //   - `setup_kind_register_banks` sizes all three banks to
+    //     `num_regs_and_consts_X` when the owning JitCode is bound.
+    //   - `registers_i` / `registers_f` are indexed by post-regalloc
+    //     color. The encoder (`get_list_of_active_boxes`) reads them
+    //     directly via the bank clone.
+    //   - `registers_r` is color-indexed after the slice 3b-3 writer
+    //     flip: `write_stack_slot` / `read_stack_slot` use
+    //     `stack_slot_reg_idx` to map stack depth → post-regalloc
+    //     color. Locals stay at identity colors (enforce_input_args).
+    //     The encoder reads `registers_r[color]` directly (slice 3b-2).
     pub(crate) registers_i: Vec<OpRef>,
     #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,
@@ -2688,24 +2686,15 @@ impl PyreSym {
     /// `num_regs_and_consts_r` already in use for `registers_i` /
     /// `registers_f`.
     ///
-    /// This helper now ports the full upstream
-    /// `pyjitpl.py:74-90 MIFrame.setup` body (resize + `copy_constants`).
-    /// Slice 3b-2 (encoder per-bank read flip) and slice 3b-3 (tracer
-    /// write redirect) of the Task #185 epic remain the consumers that
-    /// will start reading from `registers_X[num_regs_X + i]`; until then
-    /// no production reader visits the trailing range, so the constant
-    /// fill is observable only to slices that opt in.
-    ///
-    /// Today no reader of `registers_r` touches the trailing slots
-    /// `[len_before_setup, num_regs_and_consts_r)`: encoder snapshot
-    /// (`get_list_of_active_boxes`) bounds its slice to
-    /// `nlocals + valid_stack_only`, dedup (`value_type`)
-    /// short-circuits before `iter().position` whenever the search
-    /// value is `OpRef::NONE`, and per-Python-PC writes
-    /// (LOAD_FAST/STORE_FAST/push/pop) operate on the locals + stack
-    /// tail prefix only. The growth is therefore byte-for-byte runtime
-    /// no-op until slice 3b-2 / 3b-3 wire readers/writers to the
-    /// trailing post-regalloc-color slots.
+    /// This helper ports the full upstream `pyjitpl.py:74-90
+    /// MIFrame.setup` body (resize + `copy_constants`).  After the
+    /// slice 3b-2/3b-3 flip, writers (`write_stack_slot` via
+    /// `stack_slot_reg_idx`) populate `registers_r` at post-regalloc
+    /// colors, and the encoder (`get_list_of_active_boxes`) reads
+    /// `registers_r[color]` directly.  The trailing constant slots
+    /// `[num_regs_X, num_regs_and_consts_X)` are filled by this
+    /// helper; no production reader consumes them yet (pending the
+    /// encoder's constant-bank read path).
     ///
     /// Safe to call when `self.jitcode` points at the thread-local
     /// `null_jitcode()` placeholder — the skeleton's

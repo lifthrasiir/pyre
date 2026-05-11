@@ -2424,15 +2424,14 @@ fn filter_liveness_in_place(
         }
         // PRE-EXISTING-ADAPTATION: LV∩SSA retain narrows the Ref bank
         // to the post-rename colors that correspond to LV-live Python
-        // locals or live stack slots at this PC. The encoder
-        // (`get_list_of_active_boxes`) populates only those colors via
-        // `semantic_ref_slot_for_reg_color`; scratches are not yet
-        // tracked in `PyreSym.registers_r`, so leaving them in the
-        // encoded `-live-` section would surface as `OpRef::NONE` in
-        // guard fail_args and BH dispatch reads of stale registers.
-        // Removing this retain requires extending the
-        // encoder/symbolic-state pair to the full post-color bank,
-        // mirroring `pyjitpl.py:218-225` line by line.
+        // locals or live stack slots at this PC.  After the slice
+        // 3b-2/3b-3 flip the encoder reads `registers_r[color]`
+        // directly, but scratch registers (temporaries that are SSA-
+        // live but have no Python-frame slot) remain `OpRef::NONE` in
+        // `registers_r` because no trace-time writer populates them.
+        // Removing this retain requires either (a) populating scratch
+        // colors during tracing (Task #158 graph regalloc) or (b) the
+        // encoder tolerating NONE for non-frame live registers.
         //
         // `MAJIT_PHASE06_DROP_LV=1` skips the retain, exposing the
         // RPython-orthodox SSA-only `live_r` so probe-A logs in
@@ -7828,20 +7827,17 @@ impl CodeWriter {
                 .unwrap_or(pre);
             stack_slot_color_map.push(post);
         }
-        // Task #110 slice 3a (parent #185 epic, plan
-        // `task110_ssa_authoritative_live_r_epic_plan.md`): record each
-        // Python-semantic local slot's post-regalloc color so the encoder
-        // (`pyre-jit-trace::trace_opcode::get_list_of_active_boxes`) can
-        // stop assuming `local_idx == post-regalloc-color` before slice
-        // 3b rewrites it to read from `registers_r[color]` directly per
-        // `pyjitpl.py:218-234`.
+        // SSA-authoritative live_r slice 3a: record each Python-semantic
+        // local slot's post-regalloc color.  The encoder
+        // (`get_list_of_active_boxes`) derives `semantic_idx` from
+        // `color_idx < nlocals → identity` after the slice 3b-2 flip.
         //
         // Today `enforce_input_args` (regalloc.rs:524-563, flatten.py:88
         // -100 parity) pins each local-i inputarg color to identity
         // (`color = i`), so this map is `[0, 1, ..., nlocals-1]` for
-        // every populated jitcode. The map exists as a side channel —
-        // no production reader consumes it yet; slice 3b will pick it
-        // up site-by-site.
+        // every populated jitcode.  When `enforce_input_args` pinning
+        // is relaxed (Task #158), the encoder will read this map to
+        // derive the semantic local index from a non-identity color.
         let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
         for i in 0..nlocals as u16 {
             let post = alloc_result
