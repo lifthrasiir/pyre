@@ -382,25 +382,17 @@ fn mirror_vable_static_to_boxes(
     }
 }
 
-/// Resolve the register-file index for a stack slot.
+/// Resolve the mutable frame-mirror index for a stack slot.
 ///
 /// RPython `pyjitpl.py` keeps each kind-specific register bank indexed by
-/// the post-regalloc register number. Pyre's Python frame array remains
-/// semantic-indexed, so stack writes translate through the per-jitcode
-/// `stack_slot_color_map` before touching `registers_r`.
+/// post-regalloc register number. Pyre still uses `registers_r` as a
+/// semantic mirror for `locals_cells_stack_w`, so stack writers must not use
+/// post-regalloc colors here: stack colors can legally coalesce with dead
+/// local colors and would overwrite the local mirror before loop-close and
+/// guard snapshots consume it. The encoder builds the color-indexed Ref bank
+/// separately from liveness and the virtualizable shadow.
 pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
-    let semantic_idx = sym.nlocals + stack_idx;
-    if sym.jitcode.is_null() {
-        return semantic_idx;
-    }
-    let jc = unsafe { &*sym.jitcode };
-    jc.payload
-        .metadata
-        .stack_slot_color_map
-        .get(stack_idx)
-        .copied()
-        .map(|color| color as usize)
-        .unwrap_or(semantic_idx)
+    sym.nlocals + stack_idx
 }
 
 /// Write a Ref-boxed value to the symbolic operand stack at depth
@@ -409,8 +401,8 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
 /// inline-call setup all duplicated:
 ///
-/// - `registers_r[reg_idx]` — the post-regalloc Ref bank slot
-///   (`reg_idx == stack_slot_color_map[stack_idx]` when available).
+/// - `registers_r[reg_idx]` — the semantic frame mirror slot
+///   (`reg_idx == nlocals + stack_idx`).
 /// - `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` —
 ///   `locals_cells_stack_w` heap mirror, ALWAYS semantic-indexed
 ///   (`pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable`).
@@ -473,10 +465,10 @@ pub(crate) fn write_stack_slot(
 /// heap-fill from `locals_cells_stack_w` when the slot is empty.
 /// Symmetric counterpart of `write_stack_slot`.
 ///
-/// Reads the color-indexed Ref bank via `stack_slot_reg_idx`.  On
+/// Reads the semantic frame mirror via `stack_slot_reg_idx`.  On
 /// NONE-fill, the IR `getarrayitem` op still uses the SEMANTIC array
 /// index (`locals_cells_stack_w[nlocals + stack_idx]`) — the heap layout
-/// the array descr describes — and stores the result in the Ref bank slot
+/// the array descr describes — and stores the result in the mirror slot
 /// subsequent stack reads consult.
 ///
 /// `init_symbolic` (state.rs:2785) leaves
@@ -519,7 +511,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// into the sentinel fallback, hence the `virtualizable_entry_at`
 /// pair-read+pair-write.
 ///
-/// `reg_top` / `reg_other` are post-regalloc Ref-bank indices.
+/// `reg_top` / `reg_other` are semantic frame-mirror indices.
 pub(crate) fn swap_stack_slots(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -829,8 +821,7 @@ impl MIFrame {
         // `push_typed_value` / `store_local_value` for every trace that
         // satisfies `owns_virtualizable_shadow()` (loop portal +
         // bridges with seeded `bridge_local_oprefs`). Non-owner traces
-        // snapshot the whole color-indexed Ref bank so stack colors
-        // outside the old semantic prefix remain visible to guards.
+        // keep the semantic `registers_r` mirror snapshot.
         //
         // Prefix length: when reading from the shadow, use the full
         // `valuestackdepth` — the shadow covers the entire `nlocals +
@@ -1164,9 +1155,9 @@ impl MIFrame {
             };
             // pre_opcode_registers_r indexing: for vable-owner traces the
             // snapshot is semantic-indexed (built from vable shadow), so
-            // read by semantic_idx.  For non-owner traces, the snapshot
-            // mirrors registers_r which is now color-indexed after the
-            // 3b-3 writer flip, so read by color_idx.
+            // read by semantic_idx. For non-owner traces, the snapshot is
+            // the temporary color-indexed bank materialized for guard
+            // capture, so read by color_idx.
             let pre_op_idx = if self.sym().owns_virtualizable_shadow() {
                 semantic_idx
             } else {
@@ -1746,15 +1737,13 @@ impl MIFrame {
             if idx >= s.registers_r.len() {
                 return Err(PyError::type_error("local index out of range in trace"));
             }
-            // Do NOT write registers_r[idx] = op.  Slice 3b-3 routes
-            // stack pushes to color-indexed slots (stack_slot_reg_idx),
-            // so a stack slot's color may coincide with a local's
-            // identity color after chordal coalescing.  Writing
-            // registers_r[local_color] here would overwrite the stack
-            // value the writer just placed.  All downstream readers
-            // (the encoder, close_loop_args_at) consult the vable
-            // shadow first for active vable owner traces, so the
-            // registers_r mirror is not required.
+            // Do NOT write registers_r[idx] = op here.  For active
+            // virtualizable-owner traces, the vable shadow is the
+            // authoritative source for locals, and stack colors can still
+            // coalesce with local colors in the encoder's temporary bank.
+            // Reintroducing a local mirror write here can overwrite the
+            // value that guard capture is about to materialize for a stack
+            // slot sharing the same color.
             return Ok(op);
         }
         let s = self.sym_mut();
@@ -7369,10 +7358,9 @@ mod tests {
         let float_box = OpRef::float_op(30);
         let mut sym = PyreSym::new_uninit(OpRef::NONE);
         sym.jitcode = inner_jc_ptr;
-        // SSA-authoritative live_r slice 3b-2: registers_r is now
-        // color-indexed (writers write at post-regalloc color via
-        // stack_slot_reg_idx). Set nlocals=2 so the Ref liveness
-        // color 1 reads registers_r[1] directly (identity for locals).
+        // SSA-authoritative live_r slice 3b-2: the encoder reads the
+        // color-indexed Ref bank. Set nlocals=2 so the Ref liveness
+        // color 1 reads the temporary bank at index 1 (identity for locals).
         // Int and Float banks stay kind-specific (no unification),
         // so their bank-indexed setup is unchanged.
         sym.nlocals = 2;

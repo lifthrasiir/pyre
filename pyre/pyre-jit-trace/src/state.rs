@@ -1031,11 +1031,10 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
 /// This helper mirrors what production code does:
 ///   1. `setup_kind_register_banks` to size the three banks +
 ///      copy-constants per `pyjitpl.py:97-119`.
-///   2. Place each `(stack_depth, opref)` at that slot's post-regalloc
-///      Ref-bank color (`stack_slot_color_map[depth]`, falling back to
-///      `nlocals + depth` for skeleton jitcodes). This matches
-///      `pyjitpl.py:218-225`, where `get_list_of_active_boxes` reads
-///      `registers_r[index]` directly.
+///   2. Place each `(stack_depth, opref)` at the semantic frame-mirror
+///      slot `registers_r[nlocals + depth]`. Production guard capture
+///      then materializes the color-indexed Ref bank from the same
+///      semantic/vable source before reading liveness.
 ///   3. Fill any still-`OpRef::NONE` Int/Float bank slot listed in
 ///      `live_pc`'s bank-split liveness with a typed dummy constant.
 ///      Ref slots are provided by the caller-provided stack slot map above.
@@ -1053,11 +1052,9 @@ pub fn seed_compiled_trace_jitcode_test_state(
 
     let nlocals = sym.nlocals;
     for &(depth, opref) in stack_slots {
-        // SSA-authoritative live_r slice 3b-3: write at the
-        // post-regalloc color for this stack slot so the encoder
-        // (`get_list_of_active_boxes`) reads the correct value via
-        // `registers_r[color]`. Falls back to semantic index when no
-        // color map is available (skeleton/null jitcode).
+        // Match production stack writes: keep `registers_r` as a
+        // semantic frame mirror. The encoder builds the color-indexed
+        // bank from this mirror/vable view at snapshot time.
         let reg_idx = crate::trace_opcode::stack_slot_reg_idx(sym, depth);
         if reg_idx >= sym.registers_r.len() {
             sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -1552,11 +1549,10 @@ pub struct PyreSym {
     //   - `registers_i` / `registers_f` are indexed by post-regalloc
     //     color. The encoder (`get_list_of_active_boxes`) reads them
     //     directly via the bank clone.
-    //   - `registers_r` is color-indexed after the slice 3b-3 writer
-    //     flip: `write_stack_slot` / `read_stack_slot` use
-    //     `stack_slot_reg_idx` to map stack depth → post-regalloc
-    //     color. Locals stay at identity colors (enforce_input_args).
-    //     The encoder reads `registers_r[color]` directly (slice 3b-2).
+    //   - `registers_r` remains pyre's semantic frame mirror for
+    //     `locals_cells_stack_w` because stack colors may coalesce with
+    //     local colors. The encoder materializes a temporary
+    //     color-indexed Ref-bank snapshot before reading liveness.
     pub(crate) registers_i: Vec<OpRef>,
     #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,
@@ -1605,8 +1601,7 @@ pub struct MIFrame {
     /// guard/resumedata capture for this one opcode. When `None`, guard
     /// capture reads the live register file directly. Shadow-owner snapshots
     /// are semantic frame prefixes sourced from `virtualizable_boxes`;
-    /// non-owner snapshots clone the full color-indexed `registers_r` bank so
-    /// guard capture can read stack colors outside the old semantic prefix.
+    /// non-owner snapshots clone the semantic `registers_r` mirror.
     pub(crate) pre_opcode_registers_r: Option<Vec<OpRef>>,
     /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
     /// Each entry points at one parent frame plus the resumepc that
@@ -2692,12 +2687,11 @@ impl PyreSym {
     /// `registers_f`.
     ///
     /// This helper ports the full upstream `pyjitpl.py:74-90
-    /// MIFrame.setup` body (resize + `copy_constants`).  After the
-    /// slice 3b-2/3b-3 flip, writers (`write_stack_slot` via
-    /// `stack_slot_reg_idx`) populate `registers_r` at post-regalloc
-    /// colors, and the encoder (`get_list_of_active_boxes`) reads
-    /// `registers_r[color]` directly.  The trailing constant slots
-    /// `[num_regs_X, num_regs_and_consts_X)` are filled by this
+    /// MIFrame.setup` body (resize + `copy_constants`).  Pyre still keeps
+    /// `registers_r` as the semantic frame mirror for stack/local writes;
+    /// guard capture materializes the post-regalloc-color Ref bank from
+    /// that mirror or the virtualizable shadow.  The trailing constant
+    /// slots `[num_regs_X, num_regs_and_consts_X)` are filled by this
     /// helper; no production reader consumes them yet (pending the
     /// encoder's constant-bank read path).
     ///

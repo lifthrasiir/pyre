@@ -3058,9 +3058,9 @@ fn execute_assembler(
                             // `ExitFrameWithExceptionRef` for uncaught
                             // exceptions, never returns a failure code).
                             // Pyre's `BlackholeResult::Failed` is a layered
-                            // adaptation; SSA-authoritative live_r slices
-                            // 3b-2/3b-3 (color-indexed registers_r) should
-                            // eliminate the remaining triggers. Until then
+                            // adaptation; SSA-authoritative live_r encoder /
+                            // decoder work should eliminate the remaining
+                            // triggers. Until then
                             // the bare `invalidate_loop` keeps the cell
                             // retraceable; the failure surfaces in
                             // check.sh rather than being masked.
@@ -6381,21 +6381,18 @@ mod tests {
             fail_args.iter().all(|arg| !arg.is_none()),
             "materialized fail args should not contain OpRef::NONE holes"
         );
-        // SSA-authoritative live_r slice 3b-3: registers_r is now
-        // color-indexed. Stack values are at their post-regalloc colors
-        // (from stack_slot_color_map), which may overlap with local
-        // indices when chordal coloring coalesces slots. The encoder
-        // reads registers_r[color] directly.
-        for (depth, &color) in stack_colors.iter().enumerate() {
-            let color = color as usize;
+        // `registers_r` remains the semantic frame mirror: stack values
+        // stay at `nlocals + depth`. Guard capture materializes the
+        // color-indexed bank separately from this mirror/vable state.
+        for depth in 0..stack_colors.len() {
             let stack_value = [stack0, stack1][depth];
+            let semantic_idx = 2 + depth;
             assert_eq!(
-                state.symbolic_registers_r()[color],
+                state.symbolic_registers_r()[semantic_idx],
                 stack_value,
-                "stack depth {} at color {} must be in registers_r[{}]",
+                "stack depth {} must be in semantic registers_r[{}]",
                 depth,
-                color,
-                color,
+                semantic_idx,
             );
         }
     }
