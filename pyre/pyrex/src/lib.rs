@@ -6,11 +6,12 @@ use std::rc::Rc;
 use lexopt::Arg::*;
 use lexopt::ValueExt;
 
-use pyre_interpreter::call;
+use pyre_interpreter::call::{
+    register_build_class, set_build_class_exec_ctx, set_last_exec_ctx,
+};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::*;
-use pyre_interpreter::{PyDisplay, PyExecutionContext};
+use pyre_interpreter::{Mode, PyDisplay, PyErrorKind, PyExecutionContext, compile_source};
 use pyre_jit::eval::eval_with_jit;
 
 mod repl;
@@ -177,18 +178,18 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
     };
 
     // Register __build_class__ callback (PyPy: setup_builtin_modules)
-    call::register_build_class();
+    register_build_class();
 
     let execution_context = Rc::new(PyExecutionContext::default());
     // Set execution context for __build_class__ to use
-    call::set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
+    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
     // Eagerly seed the LAST_EXEC_CTX TLS slot so that
     // `space.getexecutioncontext()` (sys.settrace/setprofile/getframe)
     // returns the live ExecutionContext from the very first user
     // statement, not only after the first `eval_frame_plain` entry
     // updates the slot.  Mirrors PyPy's `space.threadlocals` always
     // holding the active EC for the current thread.
-    call::set_last_exec_ctx(Rc::as_ptr(&execution_context));
+    set_last_exec_ctx(Rc::as_ptr(&execution_context));
     let mut frame = match PyFrame::new_with_context(code, execution_context) {
         Ok(frame) => frame,
         Err(e) => {
@@ -222,7 +223,7 @@ fn run_source(source: &str, mode: Mode, filename: &str) {
             }
         }
         Err(e) => {
-            if e.kind == pyre_interpreter::PyErrorKind::SystemExit {
+            if e.kind == PyErrorKind::SystemExit {
                 let code: i32 = e.message.parse().unwrap_or(0);
                 std::process::exit(code);
             }

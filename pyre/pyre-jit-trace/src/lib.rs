@@ -1,3 +1,5 @@
+#![allow(dead_code, unsafe_op_in_unsafe_fn, unused_doc_comments, unused_variables)]
+
 //! pyre-jit-trace: Trace-time JIT for pyre.
 //!
 //! This crate contains MIFrame (the meta-interpreter frame) and all

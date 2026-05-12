@@ -24,7 +24,6 @@
 use crate::call::CallControl;
 use crate::flatten;
 use crate::front::SemanticFunction;
-use crate::jtransform::rewrite_graph_with_callcontrol;
 use crate::pipeline::{PipelineConfig, PipelineResult, ProgramPipelineResult};
 use crate::translator::rtyper::legacy_annotator::annotate;
 use crate::translator::rtyper::legacy_resolve::resolve_types;

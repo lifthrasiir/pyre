@@ -897,8 +897,8 @@ impl RegAllocator {
     /// `unionfind.union` — weighted union, matching
     /// `rpython/tool/algo/unionfind.py:67-91`.
     fn union(&mut self, v0: u16, w0: u16) -> u16 {
-        let mut r1 = self.find_rep(v0);
-        let mut r2 = self.find_rep(w0);
+        let r1 = self.find_rep(v0);
+        let r2 = self.find_rep(w0);
         if r1 == r2 {
             return r1;
         }

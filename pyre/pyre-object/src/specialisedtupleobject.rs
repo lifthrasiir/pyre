@@ -238,38 +238,38 @@ pub unsafe fn is_specialised_tuple(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid `W_SpecialisedTupleObject_ii`.
 #[inline]
-pub unsafe fn w_specialised_tuple_ii_getvalue(obj: PyObjectRef, index: usize) -> i64 {
+pub unsafe fn w_specialised_tuple_ii_getvalue(obj: PyObjectRef, index: usize) -> i64 { unsafe {
     let t = &*(obj as *const W_SpecialisedTupleObject_ii);
     match index {
         0 => t.value0,
         1 => t.value1,
         _ => panic!("specialised tuple ii index out of range"),
     }
-}
+}}
 
 /// # Safety
 /// `obj` must point to a valid `W_SpecialisedTupleObject_ff`.
 #[inline]
-pub unsafe fn w_specialised_tuple_ff_getvalue(obj: PyObjectRef, index: usize) -> f64 {
+pub unsafe fn w_specialised_tuple_ff_getvalue(obj: PyObjectRef, index: usize) -> f64 { unsafe {
     let t = &*(obj as *const W_SpecialisedTupleObject_ff);
     match index {
         0 => t.value0,
         1 => t.value1,
         _ => panic!("specialised tuple ff index out of range"),
     }
-}
+}}
 
 /// # Safety
 /// `obj` must point to a valid `W_SpecialisedTupleObject_oo`.
 #[inline]
-pub unsafe fn w_specialised_tuple_oo_getvalue(obj: PyObjectRef, index: usize) -> PyObjectRef {
+pub unsafe fn w_specialised_tuple_oo_getvalue(obj: PyObjectRef, index: usize) -> PyObjectRef { unsafe {
     let t = &*(obj as *const W_SpecialisedTupleObject_oo);
     match index {
         0 => t.value0,
         1 => t.value1,
         _ => panic!("specialised tuple oo index out of range"),
     }
-}
+}}
 
 #[cfg(test)]
 mod tests {

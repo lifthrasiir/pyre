@@ -26,7 +26,7 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState}
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, DescrOperand, GraphFlattener, Insn, Kind, ListOfKind, Operand,
+    CallDescrStub, CallFlavor, GraphFlattener, Insn, Kind, Operand,
     Register, ResKind, SSARepr, TLabel, slot_for_call_flavor,
 };
 
@@ -2112,7 +2112,7 @@ fn register_helper_fn_pointers(
     // `make_call_descr_from_target_slot` (`call_descr.rs:390`) so the
     // recorded trace descr's `EffectInfo` matches the producer's
     // hand-classified flavor.
-    let mut bind = |assembler: &mut SSAReprEmitter, ptr: *const (), flavor: CallFlavor| {
+    let bind = |assembler: &mut SSAReprEmitter, ptr: *const (), flavor: CallFlavor| {
         // `MayForce` / `ReleaseGil` are dispatched via the
         // `call_may_force_*` / `call_release_gil_*` paths whose EI is
         // resolved inline by the const factory at
@@ -2848,102 +2848,102 @@ impl CodeWriter {
             call_fn:
                 HelperHandle {
                     idx: call_fn_idx,
-                    flavor: call_fn_flavor,
+                    flavor: _call_fn_flavor,
                 },
             load_global_fn:
                 HelperHandle {
                     idx: load_global_fn_idx,
-                    flavor: load_global_fn_flavor,
+                    flavor: _load_global_fn_flavor,
                 },
             compare_fn:
                 HelperHandle {
                     idx: compare_fn_idx,
-                    flavor: compare_fn_flavor,
+                    flavor: _compare_fn_flavor,
                 },
             binary_op_fn:
                 HelperHandle {
                     idx: binary_op_fn_idx,
-                    flavor: binary_op_fn_flavor,
+                    flavor: _binary_op_fn_flavor,
                 },
             box_int_fn:
                 HelperHandle {
                     idx: box_int_fn_idx,
-                    flavor: box_int_fn_flavor,
+                    flavor: _box_int_fn_flavor,
                 },
             truth_fn:
                 HelperHandle {
                     idx: truth_fn_idx,
-                    flavor: truth_fn_flavor,
+                    flavor: _truth_fn_flavor,
                 },
             load_const_fn:
                 HelperHandle {
                     idx: load_const_fn_idx,
-                    flavor: load_const_fn_flavor,
+                    flavor: _load_const_fn_flavor,
                 },
             store_subscr_fn:
                 HelperHandle {
                     idx: store_subscr_fn_idx,
-                    flavor: store_subscr_fn_flavor,
+                    flavor: _store_subscr_fn_flavor,
                 },
             build_list_fn:
                 HelperHandle {
                     idx: build_list_fn_idx,
-                    flavor: build_list_fn_flavor,
+                    flavor: _build_list_fn_flavor,
                 },
             normalize_raise_varargs_fn:
                 HelperHandle {
                     idx: normalize_raise_varargs_fn_idx,
-                    flavor: normalize_raise_varargs_fn_flavor,
+                    flavor: _normalize_raise_varargs_fn_flavor,
                 },
             call_fn_0:
                 HelperHandle {
                     idx: call_fn_0_idx,
-                    flavor: call_fn_0_flavor,
+                    flavor: _call_fn_0_flavor,
                 },
             call_fn_2:
                 HelperHandle {
                     idx: call_fn_2_idx,
-                    flavor: call_fn_2_flavor,
+                    flavor: _call_fn_2_flavor,
                 },
             call_fn_3:
                 HelperHandle {
                     idx: call_fn_3_idx,
-                    flavor: call_fn_3_flavor,
+                    flavor: _call_fn_3_flavor,
                 },
             call_fn_4:
                 HelperHandle {
                     idx: call_fn_4_idx,
-                    flavor: call_fn_4_flavor,
+                    flavor: _call_fn_4_flavor,
                 },
             call_fn_5:
                 HelperHandle {
                     idx: call_fn_5_idx,
-                    flavor: call_fn_5_flavor,
+                    flavor: _call_fn_5_flavor,
                 },
             call_fn_6:
                 HelperHandle {
                     idx: call_fn_6_idx,
-                    flavor: call_fn_6_flavor,
+                    flavor: _call_fn_6_flavor,
                 },
             call_fn_7:
                 HelperHandle {
                     idx: call_fn_7_idx,
-                    flavor: call_fn_7_flavor,
+                    flavor: _call_fn_7_flavor,
                 },
             call_fn_8:
                 HelperHandle {
                     idx: call_fn_8_idx,
-                    flavor: call_fn_8_flavor,
+                    flavor: _call_fn_8_flavor,
                 },
             get_current_exception_fn:
                 HelperHandle {
                     idx: get_current_exception_fn_idx,
-                    flavor: get_current_exception_fn_flavor,
+                    flavor: _get_current_exception_fn_flavor,
                 },
             set_current_exception_fn:
                 HelperHandle {
                     idx: set_current_exception_fn_idx,
-                    flavor: set_current_exception_fn_flavor,
+                    flavor: _set_current_exception_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -6380,7 +6380,7 @@ impl CodeWriter {
         // drift into "assembler overflow" or "abort_permanent present"
         // — both of which the assembler/blackhole already handle without
         // a front-end gate.
-        let mut has_abort = assembler.has_abort_flag();
+        let has_abort = assembler.has_abort_flag();
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
@@ -7970,7 +7970,7 @@ impl CodeWriter {
         // parity: borrow the CodeWriter's single Assembler so
         // `all_liveness` / `num_liveness_ops` continue to accumulate
         // across every jitcode compiled on this thread.
-        let (mut jitcode, pc_map_bytes) = {
+        let (jitcode, pc_map_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &pc_map, num_regs)
         };

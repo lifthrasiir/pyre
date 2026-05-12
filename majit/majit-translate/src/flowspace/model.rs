@@ -3017,7 +3017,7 @@ impl Block {
     /// result).
     pub fn getvariables(&self) -> Vec<Variable> {
         let mut result: Vec<Variable> = Vec::new();
-        let mut push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
+        let push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
             if let Hlvalue::Variable(v) = w {
                 if !result.iter().any(|x| x == v) {
                     result.push(v.clone());
@@ -3040,7 +3040,7 @@ impl Block {
     /// in this block (inputargs + every op's args).
     pub fn getconstants(&self) -> Vec<Constant> {
         let mut result: Vec<Constant> = Vec::new();
-        let mut push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
+        let push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
             if let Hlvalue::Constant(c) = w {
                 if !result.iter().any(|x| x == c) {
                     result.push(c.clone());

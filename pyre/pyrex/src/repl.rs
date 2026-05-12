@@ -6,9 +6,8 @@ use rustpython_compiler::{
     parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErrorType},
 };
 
-use pyre_interpreter::call;
+use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx};
 use pyre_interpreter::importing;
-use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{DictStorage, PyDisplay, PyError, PyExecutionContext, dict_storage_store};
 use pyre_jit::eval::eval_with_jit;
 
@@ -48,8 +47,8 @@ pub fn run_repl(quiet: bool) {
     }
 
     let execution_context = Rc::new(PyExecutionContext::default());
-    call::register_build_class();
-    call::set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
+    register_build_class();
+    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
 
     let mut namespace = Box::new(execution_context.fresh_dict_storage());
     namespace.fix_ptr();

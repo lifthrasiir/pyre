@@ -3701,7 +3701,7 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     use crate::translator::rtyper::lltypesystem::lltype::{
         self as lltype, ArrayType, LowLevelValue, MallocFlavor,
     };
-    use crate::translator::rtyper::rtyper::GenopResult;
+    
 
     let r_from_set = (r_from as &dyn std::any::Any)
         .downcast_ref::<SmallFunctionSetPBCRepr>()

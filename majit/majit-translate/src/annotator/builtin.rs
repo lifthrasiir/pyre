@@ -61,7 +61,7 @@ use std::sync::OnceLock;
 
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::{ClassDef, ClassDesc};
-use super::description::{DescEntry, FrozenDesc};
+use super::description::DescEntry;
 use super::model::{
     AnnotatorError, SomeBool, SomeByteArray, SomeChar, SomeDict, SomeFloat, SomeInstance,
     SomeInteger, SomeIterator, SomeObjectTrait, SomeString, SomeTuple, SomeUnicodeCodePoint,

@@ -355,22 +355,22 @@ impl DictStorage {
     /// Reallocate `values` to fit at least `min_cap` entries, copying
     /// the live prefix. Upstream `_ll_list_resize_really`
     /// (rlist.py:262-267) parity.
-    unsafe fn grow(&mut self, min_cap: usize) {
+    unsafe fn grow(&mut self, min_cap: usize) { unsafe {
         let current_cap = items_block_capacity(self.values);
         let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
         self.values = grow_list_items_block(self.values, target_cap, self.length);
-    }
+    }}
 
-    unsafe fn push(&mut self, value: PyObjectRef) {
+    unsafe fn push(&mut self, value: PyObjectRef) { unsafe {
         if self.length == items_block_capacity(self.values) {
             self.grow(self.length + 1);
         }
         let base = items_block_items_base(self.values);
         *base.add(self.length) = value;
         self.length += 1;
-    }
+    }}
 
-    unsafe fn remove_at(&mut self, idx: usize) -> PyObjectRef {
+    unsafe fn remove_at(&mut self, idx: usize) -> PyObjectRef { unsafe {
         assert!(idx < self.length);
         let base = items_block_items_base(self.values);
         let value = *base.add(idx);
@@ -378,25 +378,25 @@ impl DictStorage {
         std::ptr::copy(p.add(1), p, self.length - idx - 1);
         self.length -= 1;
         value
-    }
+    }}
 
-    unsafe fn values_slice(&self) -> &[PyObjectRef] {
+    unsafe fn values_slice(&self) -> &[PyObjectRef] { unsafe {
         let base = items_block_items_base(self.values);
         std::slice::from_raw_parts(base, self.length)
-    }
+    }}
 
-    unsafe fn values_slice_mut(&mut self) -> &mut [PyObjectRef] {
+    unsafe fn values_slice_mut(&mut self) -> &mut [PyObjectRef] { unsafe {
         let base = items_block_items_base(self.values);
         std::slice::from_raw_parts_mut(base, self.length)
-    }
+    }}
 
     /// Replace the entire values backing with a freshly allocated
     /// empty block. Used by `clear()`.
-    unsafe fn reset_values(&mut self) {
+    unsafe fn reset_values(&mut self) { unsafe {
         dealloc_list_items_block(self.values);
         self.values = alloc_list_items_block(&[]);
         self.length = 0;
-    }
+    }}
 
     #[inline]
     pub fn fix_ptr(&mut self) {

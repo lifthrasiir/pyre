@@ -16,7 +16,7 @@
 //! `---` and generic `Op` instructions) plus `Operand` for everything
 //! that appears inside a tuple.
 
-use std::{collections::HashMap, rc::Rc, sync::Arc};
+use std::{collections::HashMap, rc::Rc};
 
 use majit_ir::Descr;
 use majit_translate::jit_codewriter::flatten::reorder_renaming_list;

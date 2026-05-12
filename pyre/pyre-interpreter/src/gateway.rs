@@ -1,4 +1,5 @@
 //! Built-in function objects.
+#![allow(non_camel_case_types)]
 //!
 //! A `BuiltinCode` wraps a Rust function pointer that implements
 //! a Python builtin like `print`, `len`, etc.

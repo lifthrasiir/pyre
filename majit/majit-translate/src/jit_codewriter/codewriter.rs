@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::assembler::Assembler;
 use crate::call::CallControl;
-use crate::flatten::{RegKind, SSARepr, flatten_with_types};
+use crate::flatten::{RegKind, flatten_with_types};
 use crate::jit_codewriter::type_state::TypeResolutionState;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;

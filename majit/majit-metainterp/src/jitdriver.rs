@@ -50,7 +50,6 @@ use crate::pyjitpl::{
     JitStats, MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
-use crate::trace_ctx::TraceCtx;
 use crate::virtualizable::VirtualizableInfo;
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;

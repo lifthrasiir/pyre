@@ -6451,7 +6451,7 @@ impl MIFrame {
 unsafe fn trace_check_exc_match_against(
     exc_value: pyre_object::PyObjectRef,
     exc_type: pyre_object::PyObjectRef,
-) -> bool {
+) -> bool { unsafe {
     if !pyre_object::is_exception(exc_value) {
         return true;
     }
@@ -6508,7 +6508,7 @@ unsafe fn trace_check_exc_match_against(
     // ported yet; report a structural mismatch loudly so the caller
     // surfaces a tracer regression rather than silently emitting True.
     false
-}
+}}
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     match cv {

@@ -1,4 +1,5 @@
 //! PyFrame — execution frame for Python bytecode.
+#![allow(non_snake_case)]
 //!
 //! Each function call creates a new frame with its own value stack,
 //! local variables, and instruction pointer. The JIT virtualizes

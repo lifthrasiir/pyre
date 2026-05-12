@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 /// rpython/jit/backend/ parity:
 /// Direct machine code generation via dynasm-rs with in-place patching.
 ///
@@ -222,11 +224,11 @@ pub extern "C" fn dynasm_unregister_libc_jitframe(addr: i64) {
 }
 
 pub fn register_libc_jitframe_helper_addr() -> usize {
-    dynasm_register_libc_jitframe as usize
+    dynasm_register_libc_jitframe as *const () as usize
 }
 
 pub fn unregister_libc_jitframe_helper_addr() -> usize {
-    dynasm_unregister_libc_jitframe as usize
+    dynasm_unregister_libc_jitframe as *const () as usize
 }
 
 /// Register blackhole resume handler (same API as Cranelift).

@@ -49,7 +49,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::super::flowspace::model::{
-    BlockKey, BlockRef, ConstValue, Constant, HostObject, Variable,
+    BlockKey, BlockRef, Constant, HostObject, Variable,
 };
 use super::bookkeeper::Bookkeeper;
 use super::classdesc::ClassDef;

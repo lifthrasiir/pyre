@@ -1,4 +1,5 @@
 //! Graph-based jtransform: semantic rewrite pass.
+#![allow(non_snake_case)]
 //!
 //! RPython equivalent: jtransform.py Transformer.optimize_block()
 //!

@@ -10,13 +10,12 @@
 use std::collections::HashMap;
 
 use crate::flowspace::model::{
-    BlockKey, BlockRef, ConcretetypePlaceholder, ConstValue, Constant, FunctionGraph, Hlvalue,
-    LinkArg, LinkRef, SpaceOperation, Variable, mkentrymap,
+    BlockKey, BlockRef, ConcretetypePlaceholder, ConstValue, Constant, FunctionGraph, Hlvalue, LinkRef, SpaceOperation, Variable, mkentrymap,
 };
 use crate::translator::backendopt::removenoops;
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, LowLevelType, LowLevelValue, Ptr, PtrTarget, cast_pointer,
+    LowLevelType, LowLevelValue, PtrTarget, cast_pointer,
 };
 use crate::translator::simplify;
 

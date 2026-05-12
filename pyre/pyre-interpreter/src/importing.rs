@@ -13,10 +13,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::{CodeObject, Mode, compile_source_with_filename};
-use crate::{DictStorage, PyExecutionContext, dict_storage_load, dict_storage_store};
+use crate::{DictStorage, PyExecutionContext, dict_storage_store};
 use pyre_object::*;
 
-use crate::pyframe::PyFrame;
 
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names

@@ -1,3 +1,5 @@
+#![allow(non_upper_case_globals)]
+
 use majit_ir::{EffectInfo, OopSpecIndex, Op, OpCode, OpRef, Value};
 
 use crate::optimizeopt::info::{

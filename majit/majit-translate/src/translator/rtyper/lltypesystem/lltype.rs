@@ -1,4 +1,5 @@
 //! RPython `rpython/rtyper/lltypesystem/lltype.py`.
+#![allow(non_camel_case_types, non_snake_case)]
 //!
 //! Currently ports two surfaces:
 //! * Function-pointer surface consumed by `translator/simplify.py:get_graph`:

@@ -89,7 +89,7 @@ pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
             crate::flowspace::model::ConstValue::Bool(true),
         )],
     );
-    let mut fwd = ForwardReference::gc();
+    let fwd = ForwardReference::gc();
     fwd.r#become(LowLevelType::Struct(Box::new(body)))
         .expect("STR.become should succeed");
     LowLevelType::ForwardReference(Box::new(fwd))
@@ -133,7 +133,7 @@ pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
             crate::flowspace::model::ConstValue::Bool(true),
         )],
     );
-    let mut fwd = ForwardReference::gc();
+    let fwd = ForwardReference::gc();
     fwd.r#become(LowLevelType::Struct(Box::new(body)))
         .expect("UNICODE.become should succeed");
     LowLevelType::ForwardReference(Box::new(fwd))

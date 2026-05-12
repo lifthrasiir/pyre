@@ -1444,7 +1444,7 @@ where
         }
     }
 
-    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+    pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
         if self.frames.is_empty() {
             return TraceAction::Continue;
         }

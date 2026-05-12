@@ -24,7 +24,6 @@ use std::rc::Rc;
 use super::super::flowspace::model::ConstValue;
 use super::super::flowspace::model::Constant;
 use super::super::flowspace::model::Hlvalue;
-use super::super::flowspace::model::Variable;
 use super::super::flowspace::operation::{
     BuiltinException, CanOnlyThrow, HLOperation, OpKind, Specialization, Transformation,
     register_single,

@@ -1,4 +1,5 @@
 //! Function object.
+#![allow(non_snake_case)]
 //!
 //! Wraps a code object pointer, a function name, a pointer to the
 //! defining module's globals namespace, and an optional closure tuple.

@@ -1478,7 +1478,7 @@ impl<'t> BaseInliner<'t> {
     /// per upstream `:172-173`. Returns the number of successful
     /// inlines.
     pub fn inline_all(&mut self) -> Result<usize, CannotInline> {
-        use crate::flowspace::model::BlockKey;
+        
         let mut count = 0usize;
         let mut non_recursive: std::collections::HashMap<usize, ()> =
             std::collections::HashMap::new();
@@ -1704,7 +1704,7 @@ impl<'t> BaseInliner<'t> {
     /// post-call block's inputargs, and rewires the callee's
     /// returnblock / exceptblock back into the host graph.
     fn do_inline(&mut self, block: &crate::flowspace::model::BlockRef, index_operation: usize) {
-        use crate::flowspace::model::{BlockKey, BlockRefExt};
+        use crate::flowspace::model::BlockKey;
         // Upstream `:393 splitlink = split_block(block, index_operation)`.
         let splitlink = crate::translator::unsimplify::split_block(block, index_operation, None);
         let afterblock = splitlink

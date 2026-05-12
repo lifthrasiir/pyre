@@ -16,8 +16,8 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
-use pyre_object::pyobject::{FLOAT_TYPE, INT_TYPE, LIST_TYPE, is_bool, is_float, is_int};
-use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new, w_list_new};
+use pyre_object::pyobject::{is_bool, is_float, is_int};
+use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 use std::collections::HashMap;
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
@@ -1337,7 +1337,7 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
     }
 }
 
-use pyre_interpreter::{DictStorage, decode_instruction_at};
+use pyre_interpreter::DictStorage;
 
 use crate::descr::{
     GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
@@ -4766,7 +4766,7 @@ impl JitState for PyreJitState {
         };
 
         let nlocals = sym.nlocals;
-        let mut bridge_valuestackdepth = sym.valuestackdepth.max(nlocals);
+        let bridge_valuestackdepth = sym.valuestackdepth.max(nlocals);
         // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
         // items are declared Ref (W_Root array). Bridge resume slots stay
         // Ref at the virtualizable contract; any Int/Float unboxing must

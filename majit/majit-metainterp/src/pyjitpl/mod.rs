@@ -10,7 +10,6 @@ pub use dispatch::{
 };
 pub(crate) use dispatch::{
     call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
-    eval_unary_f, eval_unary_i,
 };
 pub use frame::{MIFrame, MIFrameStack};
 
@@ -32,7 +31,7 @@ compile_error!("majit-metainterp requires a backend: enable feature \"cranelift\
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
-use majit_ir::{Const, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{Const, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
 
 use crate::blackhole::{BlackholeResult, ExceptionState, blackhole_execute_with_state_ca};
 use crate::compile;

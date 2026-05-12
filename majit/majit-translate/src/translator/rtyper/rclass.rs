@@ -48,7 +48,7 @@ use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    self, _ptr, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO,
+    self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO,
     StructType,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;

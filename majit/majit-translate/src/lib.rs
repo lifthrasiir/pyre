@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_patterns, unused_doc_comments)]
+
 //! majit-translate: RPython translation pipeline.
 //!
 //! Upstream counterparts:

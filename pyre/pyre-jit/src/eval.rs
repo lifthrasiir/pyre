@@ -1,4 +1,5 @@
 //! JIT-enabled evaluation — the sole entry point for JIT execution.
+#![allow(non_camel_case_types, non_upper_case_globals)]
 //!
 //! This module owns the JitDriver, tracing hooks, and compiled-code
 //! execution. pyre-interpreter provides the pure interpreter (eval_frame_plain)
@@ -2739,11 +2740,11 @@ enum HandleFailOutcome {
 fn handle_fail(
     frame: &mut PyFrame,
     _green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
+    _trace_id: u64,
+    _fail_index: u32,
     descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
     should_bridge: bool,
-    owning_key: u64,
+    _owning_key: u64,
     exit_layout: &CompiledExitLayout,
     raw_values: &[i64],
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,

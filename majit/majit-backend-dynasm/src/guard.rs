@@ -8,7 +8,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use majit_backend::ExitRecoveryLayout;
-use majit_ir::{Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
+use majit_ir::{Descr, DescrRef, FailDescr, Type};
 
 /// Re-export the shared per-cpu descr attachment types so existing
 /// `crate::guard::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle}`

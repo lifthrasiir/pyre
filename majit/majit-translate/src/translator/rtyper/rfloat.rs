@@ -37,7 +37,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
+    ConvertedTo, GenopResult, HighLevelOp, constant_with_lltype,
     helper_pygraph_from_graph, variable_with_lltype,
 };
 

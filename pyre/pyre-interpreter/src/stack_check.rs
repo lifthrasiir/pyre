@@ -35,7 +35,7 @@
 //! `rpython/jit/backend/x86/assembler.py:1080
 //! _call_header_with_stack_check`).
 
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 
 use pyre_object::excobject::{ExcKind, w_exception_new};
 

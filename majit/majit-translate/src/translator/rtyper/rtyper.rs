@@ -2963,7 +2963,7 @@ fn lowlevel_helper_graph(
 }
 
 pub(crate) fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable {
-    let mut var = Variable::named(name);
+    let var = Variable::named(name);
     var.set_concretetype(Some(lltype.clone()));
     var.annotation
         .replace(Some(Rc::new(lltype_to_annotation(lltype))));
@@ -4824,7 +4824,7 @@ impl LowLevelOpList {
                 }
             }
         }
-        let mut vresult = Variable::new();
+        let vresult = Variable::new();
         match resulttype {
             GenopResult::Void => {
                 vresult.set_concretetype(Some(LowLevelType::Void));

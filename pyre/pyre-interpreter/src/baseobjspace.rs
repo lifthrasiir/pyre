@@ -1,4 +1,5 @@
 //! ObjSpace — Python object operation dispatch.
+#![allow(non_camel_case_types, non_snake_case)]
 //!
 //! The ObjSpace mediates all operations on Python objects. This is the layer
 //! where type-specific fast paths live, and where the JIT inserts `GuardClass`

@@ -2443,7 +2443,7 @@ fn exec_or_eval(
         /// reusing an existing proxy.  Call exactly once, AFTER all
         /// fallible setup, so a `?` early-return cannot leave the
         /// user dict pointing at a Box we're about to drop.
-        unsafe fn attach_forward_proxy(&mut self) {
+        unsafe fn attach_forward_proxy(&mut self) { unsafe {
             if self.proxy_attached
                 || self.owned.is_none()
                 || self.backing.is_null()
@@ -2454,13 +2454,13 @@ fn exec_or_eval(
             self.saved_proxy = pyre_object::w_dict_get_dict_storage_proxy(self.backing);
             pyre_object::w_dict_set_dict_storage_proxy(self.backing, self.storage_ptr as *mut u8);
             self.proxy_attached = true;
-        }
+        }}
 
         /// Restore the user dict's pre-exec proxy and clear the temp
         /// storage's `mirror_target`.  Idempotent.  Called via `Drop`
         /// on every exit path including `?` early-returns and
         /// panic-unwinds.
-        unsafe fn detach(&mut self) {
+        unsafe fn detach(&mut self) { unsafe {
             if self.proxy_attached {
                 pyre_object::w_dict_set_dict_storage_proxy(self.backing, self.saved_proxy);
                 self.proxy_attached = false;
@@ -2469,7 +2469,7 @@ fn exec_or_eval(
             if let Some(storage) = self.owned.as_deref_mut() {
                 storage.set_mirror_target(pyre_object::PY_NULL);
             }
-        }
+        }}
 
         fn storage_ptr(&self) -> *mut crate::DictStorage {
             self.storage_ptr
@@ -4143,7 +4143,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                     }
                 }
             }
-            Err(e) if writing => String::new(),
+            Err(_e) if writing => String::new(),
             Err(e) => {
                 return Err(crate::PyError::os_error_with_errno(
                     e.raw_os_error().unwrap_or(2),

@@ -6,6 +6,7 @@
 //! The JIT's current raw-array fast path only handles object storage.
 
 #![allow(unsafe_op_in_unsafe_fn)]
+#![allow(dead_code)]
 
 use crate::object_array::{
     ItemsBlock, alloc_list_items_block, dealloc_list_items_block, grow_list_items_block,

@@ -1188,7 +1188,7 @@ impl RPythonAnnotator {
                     // `setbinding` mutates the variable; reach through
                     // the graph's startblock to find the mutable slot.
                     let sv = s_impossible_value();
-                    let mut graph_mut = graph.borrow_mut();
+                    let graph_mut = graph.borrow_mut();
                     let mut rb = graph_mut.returnblock.borrow_mut();
                     if let Hlvalue::Variable(vm) = &mut rb.inputargs[0] {
                         self.setbinding(vm, sv);

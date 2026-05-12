@@ -9,12 +9,12 @@
 //! [`super::collectanalyze`] so the surface lines up the day a
 //! consumer needs it.
 
-use crate::flowspace::model::{ConstValue, GraphRef, Hlvalue, SpaceOperation};
+use crate::flowspace::model::{GraphRef, Hlvalue, SpaceOperation};
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{
     Dependency, DependencyTracker, GraphAnalyzer, framework_analyze_direct_call,
 };
-use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelType};
+use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::translator::TranslationContext;
 
 /// Upstream `class FinalizerError(Exception)` at `finalizer.py:8-17`.

@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_assignments, unused_doc_comments, unused_macros)]
+
 //! pyre-jit: Auto-generated JIT for pyre.
 //!
 //! This crate is the Rust equivalent of RPython's `rpython/jit/` —

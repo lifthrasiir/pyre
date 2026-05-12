@@ -840,7 +840,6 @@ use crate::jitcode::{self, JitArgKind, JitCode, JitCodeRuntimeExt};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
     call_int_function, call_ref_function, call_void_function, eval_binop_f, eval_binop_i,
-    eval_unary_f, eval_unary_i,
 };
 
 // ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────

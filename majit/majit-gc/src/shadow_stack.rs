@@ -135,10 +135,10 @@ pub fn register_libc_jitframe_tracer(tracer: LibcJitframeTracer) {
     let _ = LIBC_JF_TRACER.set(tracer);
 }
 
-/// Track which pointers refer to libc-allocated jitframes so the GC
-/// visitor can safely dispatch to the registered tracer. Without this
-/// set the visitor cannot tell a libc-alloc'd jitframe from an
-/// unrelated foreign pointer that happens to sit on the shadow stack.
+// Track which pointers refer to libc-allocated jitframes so the GC
+// visitor can safely dispatch to the registered tracer. Without this
+// set the visitor cannot tell a libc-alloc'd jitframe from an
+// unrelated foreign pointer that happens to sit on the shadow stack.
 thread_local! {
     static LIBC_JF_REGISTRY: RefCell<std::collections::HashSet<usize>> =
         RefCell::new(std::collections::HashSet::new());

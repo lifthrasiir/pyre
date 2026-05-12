@@ -1,3 +1,5 @@
+#![allow(dead_code, deprecated)]
+
 //! `majit-meta`: Meta-tracing automation layer for the majit JIT framework.
 //!
 //! Provides [`MetaInterp`] — a high-level JIT engine that handles the full

@@ -1,3 +1,5 @@
+#![allow(ambiguous_glob_reexports, dead_code, unused_assignments, unused_unsafe)]
+
 //! pyre-interpreter — the Python interpreter.
 //!
 //! PyPy equivalent: pypy/interpreter/
@@ -49,7 +51,6 @@ pub use builtins::*;
 pub use display::*;
 pub use error::*;
 pub use executioncontext::*;
-pub use frame_array::*;
 pub use function::*;
 pub use gateway::{
     BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFn, FLATPYCALL, HOPELESS, PASSTHROUGHARGS1,

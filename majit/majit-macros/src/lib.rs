@@ -1,3 +1,5 @@
+#![allow(dead_code, private_interfaces)]
+
 /// Proc macros for the majit JIT framework.
 ///
 /// rpython/rlib/jit.py decorator equivalents:
@@ -375,7 +377,7 @@ fn helper_policy_tokens_for_fn(
     attr_name: &str,
     trace_target_name: Option<&Ident>,
     concrete_target_name: Option<&Ident>,
-    save_err: i32,
+    _save_err: i32,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let unsupported_byte = jit_interp::call_policy_byte::UNSUPPORTED;
     let unsupported = quote! {
