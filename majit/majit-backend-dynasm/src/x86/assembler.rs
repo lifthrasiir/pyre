@@ -5527,9 +5527,11 @@ impl<'a> Assembler386<'a> {
                     let page_shift = wb.jit_wb_card_page_shift as i8;
                     let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
                     dynasm!(self.mc ; .arch x64
+                        ; push r10
                         ; push rcx
                         ; push rdx
                         ; mov r11, Rq(loc_index.value as u8)
+                        ; mov r10, Rq(loc_base.value as u8)
                         ; shr r11, byte_shift
                         ; not r11
                         ; sub r11, majit_gc::header::GcHeader::SIZE as i32
@@ -5538,9 +5540,10 @@ impl<'a> Assembler386<'a> {
                         ; and rcx, 7
                         ; mov dl, 1
                         ; shl dl, cl
-                        ; or BYTE [Rq(loc_base.value as u8) + r11], dl
+                        ; or BYTE [r10 + r11], dl
                         ; pop rdx
                         ; pop rcx
+                        ; pop r10
                     );
                 }
                 Some(Loc::Frame(loc_index)) => {
@@ -5548,9 +5551,11 @@ impl<'a> Assembler386<'a> {
                     let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
                     let index_offset = loc_index.ebp_loc.value;
                     dynasm!(self.mc ; .arch x64
+                        ; push r10
                         ; push rcx
                         ; push rdx
                         ; mov r11, [rbp + index_offset]
+                        ; mov r10, Rq(loc_base.value as u8)
                         ; shr r11, byte_shift
                         ; not r11
                         ; sub r11, majit_gc::header::GcHeader::SIZE as i32
@@ -5559,9 +5564,10 @@ impl<'a> Assembler386<'a> {
                         ; and rcx, 7
                         ; mov dl, 1
                         ; shl dl, cl
-                        ; or BYTE [Rq(loc_base.value as u8) + r11], dl
+                        ; or BYTE [r10 + r11], dl
                         ; pop rdx
                         ; pop rcx
+                        ; pop r10
                     );
                 }
                 Some(Loc::Immed(loc_index)) => {
