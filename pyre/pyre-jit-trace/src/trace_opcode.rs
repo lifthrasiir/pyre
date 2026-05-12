@@ -619,6 +619,7 @@ impl MIFrame {
             concrete_frame_addr: concrete_frame,
             orgpc,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
@@ -831,12 +832,8 @@ impl MIFrame {
         // occupancy, and capping at `registers_r.len()` would silently
         // drop live shadow slots once `registers_r` lags behind the
         // operand stack.
-        let prefix_len = if owns_shadow {
-            portal_vsd.unwrap_or(s.valuestackdepth)
-        } else {
-            s.valuestackdepth.min(s.registers_r.len())
-        };
-        if owns_shadow && prefix_len >= nlocals {
+        let prefix_len = portal_vsd.unwrap_or(s.valuestackdepth);
+        let snapshot = if owns_shadow && prefix_len >= nlocals {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let mut snapshot = Vec::with_capacity(prefix_len);
             for i in 0..nlocals {
@@ -851,15 +848,23 @@ impl MIFrame {
                         .expect("capture_pre_opcode_state: missing virtualizable stack box"),
                 );
             }
-            self.pre_opcode_registers_r = Some(snapshot);
+            snapshot
         } else {
-            self.pre_opcode_registers_r = Some(s.registers_r.clone());
-        }
+            s.registers_r.clone()
+        };
+        self.pre_opcode_semantic_depth = Some(prefix_len);
+        self.pre_opcode_registers_r = Some(snapshot);
     }
 
     #[inline]
     fn clear_pre_opcode_state(&mut self) {
         self.pre_opcode_registers_r = None;
+        self.pre_opcode_semantic_depth = None;
+    }
+
+    #[inline]
+    fn pre_opcode_depth_or(&self, fallback: usize) -> usize {
+        self.pre_opcode_semantic_depth.unwrap_or(fallback)
     }
 
     fn materialize_fail_arg_slot(
@@ -2130,7 +2135,7 @@ impl MIFrame {
     /// (both populated by `install_portal_for` G.3h + G.4.2).  Returns
     /// `None` for non-portal-bridge or null-jitcode states so the caller
     /// can fall back to the stale `sym.valuestackdepth` /
-    /// `pre_opcode_registers_r.len()` heuristic that the per-CodeObject
+    /// `pre_opcode_semantic_depth` heuristic that the per-CodeObject
     /// path relies on.
     ///
     /// Why this is needed: portal-bridge tracing records each user opcode
@@ -2180,10 +2185,7 @@ impl MIFrame {
         let resume_pc = self.orgpc;
         let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
             let s = self.sym();
-            self.pre_opcode_registers_r
-                .as_ref()
-                .map(|pre_r| pre_r.len())
-                .unwrap_or(s.valuestackdepth) as i64
+            self.pre_opcode_depth_or(s.valuestackdepth) as i64
         });
         // pyjitpl.py:2586-2602 `capture_resumedata` parity: RPython reads
         // `metainterp.virtualizable_boxes` without mutating it. The two
@@ -3644,7 +3646,7 @@ impl MIFrame {
         //
         // The slot-2 inline override re-derives the pre-opcode
         // valuestackdepth via `portal_bridge_vable_vsd(resume_pc)
-        // .unwrap_or(pre_opcode_registers_r.len() / s.valuestackdepth)`
+        // .unwrap_or(pre_opcode_semantic_depth / s.valuestackdepth)`
         // — same source `flush_to_frame_for_guard` uses to set
         // `s.vable_valuestackdepth`.
         //
@@ -3672,10 +3674,7 @@ impl MIFrame {
             let resume_pc = self.orgpc;
             Some(self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
                 let s = self.sym();
-                self.pre_opcode_registers_r
-                    .as_ref()
-                    .map(|pre_r| pre_r.len())
-                    .unwrap_or(s.valuestackdepth) as i64
+                self.pre_opcode_depth_or(s.valuestackdepth) as i64
             }))
         } else {
             None
@@ -3715,8 +3714,9 @@ impl MIFrame {
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
         let _ = stack_only;
-        let symbolic_stack_len = if let Some(ref pre_r) = self.pre_opcode_registers_r {
-            pre_r.len().saturating_sub(sym.nlocals)
+        let symbolic_stack_len = if self.pre_opcode_registers_r.is_some() {
+            self.pre_opcode_depth_or(sym.valuestackdepth)
+                .saturating_sub(sym.nlocals)
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
@@ -3740,10 +3740,7 @@ impl MIFrame {
             .map(|f| f.locals_w().len())
             .unwrap_or_else(|| {
                 let current_vsd = self
-                    .pre_opcode_registers_r
-                    .as_ref()
-                    .map(|pre_r| pre_r.len())
-                    .unwrap_or(sym.valuestackdepth);
+                    .pre_opcode_depth_or(sym.valuestackdepth);
                 let stack_depth = current_vsd
                     .saturating_sub(sym.nlocals)
                     .min(symbolic_stack_len);
@@ -7402,6 +7399,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
@@ -7476,6 +7474,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
+            pre_opcode_semantic_depth: Some(3),
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);

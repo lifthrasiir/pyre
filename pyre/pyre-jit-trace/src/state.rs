@@ -1606,6 +1606,11 @@ pub struct MIFrame {
     /// are semantic frame prefixes sourced from `virtualizable_boxes`;
     /// non-owner snapshots clone the semantic `registers_r` mirror.
     pub(crate) pre_opcode_registers_r: Option<Vec<OpRef>>,
+    /// Semantic frame prefix length at opcode start. This is distinct from
+    /// `pre_opcode_registers_r.len()` for non-owner traces because the Ref
+    /// bank may include post-regalloc color slots above the semantic
+    /// locals+stack prefix.
+    pub(crate) pre_opcode_semantic_depth: Option<usize>,
     /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
     /// Each entry points at one parent frame plus the resumepc that
     /// should be used when that parent is snapshotted. This stays much
@@ -6384,6 +6389,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state).expect_err("reraise should raise");
@@ -6411,6 +6417,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let err =
@@ -6437,6 +6444,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6471,6 +6479,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6515,6 +6524,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6559,6 +6569,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6595,6 +6606,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6637,6 +6649,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6736,6 +6749,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         <MIFrame as SharedOpcodeHandler>::push_value(
@@ -6780,6 +6794,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         frame.push(caught_exc);
@@ -7051,6 +7066,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         state.with_ctx(|this, ctx| {
@@ -7089,6 +7105,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
@@ -7135,6 +7152,7 @@ mod tests {
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
             };
             trace_unbox_int_with_resume(
                 &mut state,
@@ -7190,6 +7208,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: (&mut *frame) as *mut pyre_interpreter::PyFrame as usize,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let instance_ref = ctx.const_ref(instance as i64);
@@ -7567,6 +7586,7 @@ mod tests {
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
             };
 
             let loaded =
@@ -7618,6 +7638,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         state
@@ -7652,6 +7673,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let _ = <MIFrame as TraceHelperAccess>::trace_binary_value(
@@ -7693,6 +7715,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let _ = state
@@ -7759,6 +7782,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -7847,6 +7871,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let concrete_lhs = w_int_new(10);
@@ -7941,6 +7966,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         assert!(
@@ -8295,6 +8321,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
@@ -8372,6 +8399,7 @@ mod tests {
             orgpc: 0,
             concrete_frame_addr: frame_ptr,
             pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
         };
 
         let jump_args = state.with_ctx(|this, ctx| this.close_loop_args(ctx));
