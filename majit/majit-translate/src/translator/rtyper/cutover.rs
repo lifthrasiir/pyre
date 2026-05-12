@@ -544,6 +544,18 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         || msg.contains("complete_pending_blocks failed")
         || msg.contains("Cannot find attribute ")
         || msg.contains("AnnotatorError:")
+        // `dyn Trait` dispatch still enters the real-rtyper flowspace
+        // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
+        // some registry-prefill paths.  The production codewriter's
+        // jtransform path already runs `rpbc::lower_indirect_calls`
+        // before consuming these graphs; the real-rtyper cutover path
+        // cannot yet express the matching rclass/rpbc rewrite before
+        // adapter input without leaking post-rtyper `VtableMethodPtr` /
+        // `IndirectCall` ops into flowspace.  Treat this as a
+        // known-unported real-path gap so the dual gate falls back to
+        // the legacy type walker instead of panicking during registry
+        // population.
+        || (msg.contains("Call with CallTarget::Indirect") && msg.contains("rclass"))
         // (Retired 2026-05-06.) `AnnotatorError: immutablevalue(HostObject`
         // was Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
         // None) — the adapter wrapped the ctor name as
@@ -1390,6 +1402,17 @@ mod tests {
                 "{ll:?} must project to Signed"
             );
         }
+    }
+
+    #[test]
+    fn known_unported_classifies_indirect_call_adapter_invariant() {
+        let msg = "translate_op: Call with CallTarget::Indirect at result=Some(ValueId(4)) \
+                   must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
+                   reaching the flowspace adapter";
+        assert!(
+            is_known_unported(msg),
+            "registry population must skip/fallback on the current indirect-call cutover gap"
+        );
     }
 
     #[test]
