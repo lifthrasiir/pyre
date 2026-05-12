@@ -5525,6 +5525,27 @@ impl<'a> Assembler386<'a> {
                         ; pop rcx
                     );
                 }
+                Some(Loc::Frame(loc_index)) => {
+                    let page_shift = wb.jit_wb_card_page_shift as i8;
+                    let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
+                    let index_offset = loc_index.ebp_loc.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; push rcx
+                        ; push rdx
+                        ; mov r11, [rbp + index_offset]
+                        ; shr r11, byte_shift
+                        ; not r11
+                        ; sub r11, majit_gc::header::GcHeader::SIZE as i32
+                        ; mov rcx, [rbp + index_offset]
+                        ; shr rcx, page_shift
+                        ; and rcx, 7
+                        ; mov dl, 1
+                        ; shl dl, cl
+                        ; or BYTE [Rq(loc_base.value as u8) + r11], dl
+                        ; pop rdx
+                        ; pop rcx
+                    );
+                }
                 Some(Loc::Immed(loc_index)) => {
                     let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
                     let byte_ofs =
