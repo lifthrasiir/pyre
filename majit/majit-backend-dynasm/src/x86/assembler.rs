@@ -1052,9 +1052,15 @@ impl<'a> Assembler386<'a> {
                     ; cmp rax, [Rq(scratch)]
                     ; jbe =>continue_label
                     // Slow path: call pyre_stack_too_big_slowpath(rsp).
-                    ; mov rdi, rsp
+                );
+                self.emit_abi_arg_from_reg(0, 4); // rsp
+                dynasm!(self.mc
+                    ; .arch x64
                     ; mov Rq(scratch), QWORD addrs.slowpath_addr as i64
-                    ; call Rq(scratch)
+                );
+                self.emit_abi_call_reg(scratch);
+                dynasm!(self.mc
+                    ; .arch x64
                     ; test al, al
                     ; jz =>continue_label
                     // x86/assembler.py:347-390 `_build_stack_check_slowpath`:
@@ -1081,6 +1087,117 @@ impl<'a> Assembler386<'a> {
         // When addresses are not registered (tests / early startup), no
         // stack check is emitted — assembler.py:1082-1083 parity.
         self.setup_input_state(inputargs);
+    }
+
+    fn emit_abi_arg_from_reg(&mut self, idx: usize, src: u8) {
+        #[cfg(target_os = "windows")]
+        match idx {
+            0 => dynasm!(self.mc ; .arch x64 ; mov rcx, Rq(src)),
+            1 => dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(src)),
+            2 => dynasm!(self.mc ; .arch x64 ; mov r8, Rq(src)),
+            3 => dynasm!(self.mc ; .arch x64 ; mov r9, Rq(src)),
+            _ => {}
+        }
+        #[cfg(not(target_os = "windows"))]
+        match idx {
+            0 => dynasm!(self.mc ; .arch x64 ; mov rdi, Rq(src)),
+            1 => dynasm!(self.mc ; .arch x64 ; mov rsi, Rq(src)),
+            2 => dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(src)),
+            3 => dynasm!(self.mc ; .arch x64 ; mov rcx, Rq(src)),
+            4 => dynasm!(self.mc ; .arch x64 ; mov r8, Rq(src)),
+            5 => dynasm!(self.mc ; .arch x64 ; mov r9, Rq(src)),
+            _ => {}
+        }
+    }
+
+    fn emit_abi_arg_from_mem(&mut self, idx: usize, offset: i32) {
+        #[cfg(target_os = "windows")]
+        match idx {
+            0 => dynasm!(self.mc ; .arch x64 ; mov rcx, [rbp + offset]),
+            1 => dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + offset]),
+            2 => dynasm!(self.mc ; .arch x64 ; mov r8, [rbp + offset]),
+            3 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
+            _ => {}
+        }
+        #[cfg(not(target_os = "windows"))]
+        match idx {
+            0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
+            1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
+            2 => dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + offset]),
+            3 => dynasm!(self.mc ; .arch x64 ; mov rcx, [rbp + offset]),
+            4 => dynasm!(self.mc ; .arch x64 ; mov r8, [rbp + offset]),
+            5 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
+            _ => {}
+        }
+    }
+
+    fn emit_abi_arg_from_imm(&mut self, idx: usize, val: i64) {
+        #[cfg(target_os = "windows")]
+        match idx {
+            0 => dynasm!(self.mc ; .arch x64 ; mov rcx, QWORD val),
+            1 => dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD val),
+            2 => dynasm!(self.mc ; .arch x64 ; mov r8, QWORD val),
+            3 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val),
+            _ => {}
+        }
+        #[cfg(not(target_os = "windows"))]
+        match idx {
+            0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val),
+            1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val),
+            2 => dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD val),
+            3 => dynasm!(self.mc ; .arch x64 ; mov rcx, QWORD val),
+            4 => dynasm!(self.mc ; .arch x64 ; mov r8, QWORD val),
+            5 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val),
+            _ => {}
+        }
+    }
+
+    fn emit_abi_call_rax(&mut self) {
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 40
+            ; call rax
+            ; add rsp, 40
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc ; .arch x64 ; call rax);
+    }
+
+    fn emit_abi_call_rax_aligned(&mut self) {
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 40
+            ; call rax
+            ; add rsp, 40
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 8
+            ; call rax
+            ; add rsp, 8
+        );
+    }
+
+    fn emit_abi_call_rax_after_one_push(&mut self) {
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 32
+            ; call rax
+            ; add rsp, 32
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc ; .arch x64 ; call rax);
+    }
+
+    fn emit_abi_call_reg(&mut self, reg: u8) {
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc ; .arch x64
+            ; sub rsp, 40
+            ; call Rq(reg)
+            ; add rsp, 40
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc ; .arch x64 ; call Rq(reg));
     }
 
     // ----------------------------------------------------------------
@@ -2163,10 +2280,18 @@ impl<'a> Assembler386<'a> {
                                 &Loc::Reg(crate::regloc::RegLoc::new(value_reg, false)),
                             );
                             match item_size {
-                                1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(value_reg)),
-                                2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(value_reg)),
-                                4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(value_reg)),
-                                _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(value_reg)),
+                                1 => {
+                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(value_reg))
+                                }
+                                2 => {
+                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(value_reg))
+                                }
+                                4 => {
+                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(value_reg))
+                                }
+                                _ => {
+                                    dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(value_reg))
+                                }
                             }
                         }
                     }
@@ -2411,14 +2536,14 @@ impl<'a> Assembler386<'a> {
             }
             OpCode::CallMallocNurseryVarsizeFrame => {
                 if let Some(Loc::Reg(sizeloc)) = arglocs.first() {
-                    dynasm!(self.mc ; .arch x64 ; mov rdi, Rq(sizeloc.value as u8));
+                    self.emit_abi_arg_from_reg(0, sizeloc.value as u8);
                 }
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath as *const () as i64
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 self.reload_frame_if_necessary();
                 if !op.pos.is_none() {
@@ -2438,26 +2563,25 @@ impl<'a> Assembler386<'a> {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
                 };
-                // rdi = base_size, rsi = item_size, rdx = length
-                dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD base_size);
-                dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD itemsize);
+                self.emit_abi_arg_from_imm(0, base_size);
+                self.emit_abi_arg_from_imm(1, itemsize);
                 match arglocs.first() {
                     Some(Loc::Reg(len_r)) => {
-                        dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value as u8));
+                        self.emit_abi_arg_from_reg(2, len_r.value as u8);
                     }
                     Some(Loc::Immed(len_i)) => {
-                        dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD len_i.value);
+                        self.emit_abi_arg_from_imm(2, len_i.value);
                     }
                     _ => {
-                        dynasm!(self.mc ; .arch x64 ; xor edx, edx);
+                        self.emit_abi_arg_from_imm(2, 0);
                     }
                 }
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
@@ -4504,24 +4628,8 @@ impl<'a> Assembler386<'a> {
             let arg = op.arg(i);
             let abi_idx = i - func_arg - 1;
             match self.resolve_opref(arg) {
-                ResolvedArg::Slot(offset) => match abi_idx {
-                    0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
-                    1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
-                    2 => dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + offset]),
-                    3 => dynasm!(self.mc ; .arch x64 ; mov rcx, [rbp + offset]),
-                    4 => dynasm!(self.mc ; .arch x64 ; mov r8, [rbp + offset]),
-                    5 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
-                    _ => {}
-                },
-                ResolvedArg::Const(val) => match abi_idx {
-                    0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val as i64),
-                    1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val as i64),
-                    2 => dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD val as i64),
-                    3 => dynasm!(self.mc ; .arch x64 ; mov rcx, QWORD val as i64),
-                    4 => dynasm!(self.mc ; .arch x64 ; mov r8, QWORD val as i64),
-                    5 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val as i64),
-                    _ => {}
-                },
+                ResolvedArg::Slot(offset) => self.emit_abi_arg_from_mem(abi_idx, offset),
+                ResolvedArg::Const(val) => self.emit_abi_arg_from_imm(abi_idx, val as i64),
             }
         }
 
@@ -4529,14 +4637,14 @@ impl<'a> Assembler386<'a> {
             ResolvedArg::Slot(offset) => {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
             }
             ResolvedArg::Const(val) => {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val as i64
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
             }
         }
 
@@ -4557,36 +4665,12 @@ impl<'a> Assembler386<'a> {
             match arg {
                 Loc::Frame(f) => {
                     let offset = f.ebp_loc.value;
-                    match abi_idx {
-                        0 => dynasm!(self.mc ; .arch x64 ; mov rdi, [rbp + offset]),
-                        1 => dynasm!(self.mc ; .arch x64 ; mov rsi, [rbp + offset]),
-                        2 => dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + offset]),
-                        3 => dynasm!(self.mc ; .arch x64 ; mov rcx, [rbp + offset]),
-                        4 => dynasm!(self.mc ; .arch x64 ; mov r8, [rbp + offset]),
-                        5 => dynasm!(self.mc ; .arch x64 ; mov r9, [rbp + offset]),
-                        _ => {}
-                    }
+                    self.emit_abi_arg_from_mem(abi_idx, offset);
                 }
-                Loc::Reg(r) => match abi_idx {
-                    0 => dynasm!(self.mc ; .arch x64 ; mov rdi, Rq(r.value)),
-                    1 => dynasm!(self.mc ; .arch x64 ; mov rsi, Rq(r.value)),
-                    2 => dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(r.value)),
-                    3 => dynasm!(self.mc ; .arch x64 ; mov rcx, Rq(r.value)),
-                    4 => dynasm!(self.mc ; .arch x64 ; mov r8, Rq(r.value)),
-                    5 => dynasm!(self.mc ; .arch x64 ; mov r9, Rq(r.value)),
-                    _ => {}
-                },
+                Loc::Reg(r) => self.emit_abi_arg_from_reg(abi_idx, r.value),
                 Loc::Immed(i) => {
                     let val = i.value;
-                    match abi_idx {
-                        0 => dynasm!(self.mc ; .arch x64 ; mov rdi, QWORD val),
-                        1 => dynasm!(self.mc ; .arch x64 ; mov rsi, QWORD val),
-                        2 => dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD val),
-                        3 => dynasm!(self.mc ; .arch x64 ; mov rcx, QWORD val),
-                        4 => dynasm!(self.mc ; .arch x64 ; mov r8, QWORD val),
-                        5 => dynasm!(self.mc ; .arch x64 ; mov r9, QWORD val),
-                        _ => {}
-                    }
+                    self.emit_abi_arg_from_imm(abi_idx, val);
                 }
                 _ => {}
             }
@@ -4597,21 +4681,21 @@ impl<'a> Assembler386<'a> {
                 let offset = f.ebp_loc.value;
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
             }
             Some(Loc::Reg(r)) => {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, Rq(r.value)
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
             }
             Some(Loc::Immed(i)) => {
                 let val = i.value;
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val
-                    ; call rax
                 );
+                self.emit_abi_call_rax();
             }
             _ => {}
         }
@@ -4735,21 +4819,16 @@ impl<'a> Assembler386<'a> {
                 if force_addr != 0 {
                     if let Some(vloc) = vable_loc {
                         self.emit_load_to_rax(vloc);
-                        dynasm!(self.mc ; .arch x64
-                            ; mov rdi, rax
-                        );
+                        self.emit_abi_arg_from_reg(0, 0);
                     } else {
                         dynasm!(self.mc ; .arch x64
-                            ; mov rdi, [rdx + FIRST_ITEM_OFFSET as i32]
+                            ; mov rax, [rdx + FIRST_ITEM_OFFSET as i32]
                         );
+                        self.emit_abi_arg_from_reg(0, 0);
                     }
                     let pushed_gcmap = self.push_pending_call_gcmap();
-                    dynasm!(self.mc ; .arch x64
-                        ; sub rsp, 8
-                        ; mov rax, QWORD force_addr
-                        ; call rax
-                        ; add rsp, 8
-                    );
+                    dynasm!(self.mc ; .arch x64 ; mov rax, QWORD force_addr);
+                    self.emit_abi_call_rax_aligned();
                     self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
                 } else {
                     dynasm!(self.mc ; .arch x64
@@ -4764,28 +4843,23 @@ impl<'a> Assembler386<'a> {
 
             let trampoline_addr = crate::call_assembler_execute_addr() as i64;
             let pushed_gcmap = self.push_pending_call_gcmap();
-            dynasm!(self.mc ; .arch x64
-                ; mov rdi, rdx
-                ; sub rsp, 8
-            );
+            self.emit_abi_arg_from_reg(0, 2);
             if let Some(addr) = target_addr {
                 let addr = addr as i64;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rsi, QWORD addr
-                    ; mov rax, QWORD trampoline_addr
-                    ; call rax
-                );
+                self.emit_abi_arg_from_imm(1, addr);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
+                self.emit_abi_call_rax_aligned();
             } else if self.self_entry_label.is_some() {
                 let addr_ptr = self.self_entry_addr_ptr as i64;
                 dynasm!(self.mc ; .arch x64
-                    ; mov rsi, QWORD addr_ptr
-                    ; mov rsi, [rsi]
-                    ; mov rax, QWORD trampoline_addr
-                    ; call rax
+                    ; mov rax, QWORD addr_ptr
+                    ; mov rax, [rax]
                 );
+                self.emit_abi_arg_from_reg(1, 0);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
+                self.emit_abi_call_rax_aligned();
             }
             dynasm!(self.mc ; .arch x64
-                ; add rsp, 8
                 ; mov rbp, r12
             );
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
@@ -4807,18 +4881,12 @@ impl<'a> Assembler386<'a> {
             // `done_with_this_frame_descr_*` /
             // `exit_frame_with_exception_descr_ref` identities.
             let cpu_ptr = self.cpu_handle_ptr();
-            dynasm!(self.mc ; .arch x64
-                ; mov rdi, QWORD cpu_ptr            // arg0 = cpu_handle
-                ; mov rsi, rdx                      // arg1 = callee_jf_ptr
-                ; mov rdx, QWORD green_key as i64   // arg2 = green_key
-                ; sub rsp, 8
-                ; mov rax, QWORD helper_addr
-            );
+            self.emit_abi_arg_from_imm(0, cpu_ptr);
+            self.emit_abi_arg_from_reg(1, 2);
+            self.emit_abi_arg_from_imm(2, green_key);
+            dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
             let pushed_gcmap = self.push_pending_call_gcmap();
-            dynasm!(self.mc ; .arch x64
-                ; call rax
-                ; add rsp, 8
-            );
+            self.emit_abi_call_rax_aligned();
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
             dynasm!(self.mc ; .arch x64
                 ; jmp =>merge
@@ -4866,14 +4934,10 @@ impl<'a> Assembler386<'a> {
         // Allocate callee jitframe on heap via calloc.
         // Stack alignment: after prologue (push rbp + push r12) + return
         // addr, rsp ≡ -8 (mod 16). sub 8 aligns to 16 for ABI call.
-        dynasm!(self.mc ; .arch x64
-            ; sub rsp, 8                        // align to 16
-            ; mov rdi, 1                        // calloc nmemb
-            ; mov rsi, QWORD jf_alloc_bytes     // calloc size
-            ; mov rax, QWORD calloc_ptr
-            ; call rax                          // rax = heap jf_ptr
-            ; add rsp, 8                        // unalign
-        );
+        self.emit_abi_arg_from_imm(0, 1);
+        self.emit_abi_arg_from_imm(1, jf_alloc_bytes);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD calloc_ptr);
+        self.emit_abi_call_rax_aligned();
 
         // rdx/x20 = heap jf_ptr (held across arg stores).
         // load_arg_to_rax reads from [rbp+offset], rbp still = caller's jf.
@@ -4971,10 +5035,7 @@ impl<'a> Assembler386<'a> {
 
         // _call_assembler_emit_call (assembler.py:2267-2269):
         // rdi/x0 = callee jf_ptr.
-        dynasm!(self.mc ; .arch x64
-            ; mov rdi, rdx            // rdi = heap jf ptr
-            ; sub rsp, 8              // align stack for call
-        );
+        self.emit_abi_arg_from_reg(0, 2);
 
         // assembler.py:320 _call_assembler_emit_call(descr._ll_function_addr, ...)
         // Resolve target address from descr.call_target_token() or self_entry_label.
@@ -5007,27 +5068,21 @@ impl<'a> Assembler386<'a> {
             if force_addr != 0 {
                 dynasm!(self.mc ; .arch x64
                     ; mov r13, [rdx + Self::slot_offset(JITFRAME_FIXED_SIZE) as i32]
-                    ; mov rdi, rdx                   // free(heap_jf)
-                    ; sub rsp, 8
-                    ; mov rax, QWORD free_ptr
-                    ; call rax
-                    ; add rsp, 8
-                    ; mov rbp, r12                   // restore caller jf_ptr
-                    ; mov rdi, r13                   // arg0 = PyFrame ptr
-                    ; sub rsp, 8
-                    ; mov rax, QWORD force_addr
-                    ; call rax                       // rax = force_fn(frame_ptr) = result
-                    ; add rsp, 8
                 );
+                self.emit_abi_arg_from_reg(0, 2);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
+                self.emit_abi_call_rax_aligned();
+                dynasm!(self.mc ; .arch x64 ; mov rbp, r12); // restore caller jf_ptr
+                self.emit_abi_arg_from_reg(0, 13);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD force_addr);
+                self.emit_abi_call_rax_aligned();
                 self.reload_frame_if_necessary();
             } else {
                 // No force_fn registered — free and return 0.
+                self.emit_abi_arg_from_reg(0, 2);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
+                self.emit_abi_call_rax_aligned();
                 dynasm!(self.mc ; .arch x64
-                    ; mov rdi, rdx                   // free(heap_jf)
-                    ; sub rsp, 8
-                    ; mov rax, QWORD free_ptr
-                    ; call rax
-                    ; add rsp, 8
                     ; mov rbp, r12                   // restore caller jf_ptr
                     ; xor eax, eax                   // result = 0
                 );
@@ -5038,28 +5093,23 @@ impl<'a> Assembler386<'a> {
             let trampoline_addr = crate::call_assembler_execute_addr() as i64;
             if let Some(addr) = target_addr {
                 let addr = addr as i64;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rsi, QWORD addr             // arg1 = callee entry addr
-                    ; mov rax, QWORD trampoline_addr
-                    ; call rax
-                );
+                self.emit_abi_arg_from_imm(1, addr);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
+                self.emit_abi_call_rax_aligned();
             } else if self.self_entry_label.is_some() {
                 // Self-entry: load entry addr from self_entry_addr_ptr
                 // (written after finalization).
                 let addr_ptr = self.self_entry_addr_ptr as i64;
                 dynasm!(self.mc ; .arch x64
-                    ; mov rsi, QWORD addr_ptr         // rsi = &entry_addr
-                    ; mov rsi, [rsi]                   // rsi = entry_addr
-                    ; mov rax, QWORD trampoline_addr
-                    ; call rax
+                    ; mov rax, QWORD addr_ptr
+                    ; mov rax, [rax]
                 );
+                self.emit_abi_arg_from_reg(1, 0);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
+                self.emit_abi_call_rax_aligned();
             }
 
             // rax/x0 = callee's returned jf_ptr (= heap jf_ptr we passed).
-            dynasm!(self.mc ; .arch x64
-                ; add rsp, 8              // undo alignment
-            );
-
             // Restore caller's jf_ptr.
             dynasm!(self.mc ; .arch x64
                 ; mov rbp, r12            // restore caller's jf_ptr
@@ -5090,15 +5140,11 @@ impl<'a> Assembler386<'a> {
             // `exit_frame_with_exception_descr_ref` through the owning
             // backend instance rather than a per-thread fallback.
             let cpu_ptr = self.cpu_handle_ptr();
-            dynasm!(self.mc ; .arch x64
-                ; mov rdi, QWORD cpu_ptr            // arg0 = cpu_handle
-                ; mov rsi, rdx                      // arg1 = callee_jf_ptr
-                ; mov rdx, QWORD green_key as i64   // arg2 = green_key
-                ; sub rsp, 8
-                ; mov rax, QWORD helper_addr
-                ; call rax                          // rax = helper result
-                ; add rsp, 8
-            );
+            self.emit_abi_arg_from_imm(0, cpu_ptr);
+            self.emit_abi_arg_from_reg(1, 2);
+            self.emit_abi_arg_from_imm(2, green_key);
+            dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
+            self.emit_abi_call_rax_aligned();
             self.reload_frame_if_necessary();
             dynasm!(self.mc ; .arch x64 ; jmp =>merge);
 
@@ -5110,22 +5156,22 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64
                     ; movsd xmm0, [rdx + FIRST_ITEM_OFFSET as i32]
                     ; movq r12, xmm0               // preserve bits across free
-                    ; mov rdi, rdx                  // free(callee_jf)
-                    ; sub rsp, 8
-                    ; mov rax, QWORD free_ptr
-                    ; call rax
-                    ; add rsp, 8
+                );
+                self.emit_abi_arg_from_reg(0, 2);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
+                self.emit_abi_call_rax_aligned();
+                dynasm!(self.mc ; .arch x64
                     ; mov rax, r12                  // float bits in rax
                     ; =>merge
                 );
             } else {
                 dynasm!(self.mc ; .arch x64
                     ; mov r12, [rdx + FIRST_ITEM_OFFSET as i32]
-                    ; mov rdi, rdx                  // free(callee_jf)
-                    ; sub rsp, 8
-                    ; mov rax, QWORD free_ptr
-                    ; call rax
-                    ; add rsp, 8
+                );
+                self.emit_abi_arg_from_reg(0, 2);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD free_ptr);
+                self.emit_abi_call_rax_aligned();
+                dynasm!(self.mc ; .arch x64
                     ; mov rax, r12                  // rax = result
                     ; =>merge
                 );
@@ -5257,11 +5303,11 @@ impl<'a> Assembler386<'a> {
             ; movaps [rsp + 224], xmm14
             ; movaps [rsp + 240], xmm15
         );
+        self.emit_abi_arg_from_reg(0, loc_base.value as u8);
         dynasm!(self.mc ; .arch x64
-            ; mov rdi, Rq(loc_base.value as u8)
             ; mov rax, QWORD helper
-            ; call rax
         );
+        self.emit_abi_call_rax();
         // Restore XMM
         dynasm!(self.mc ; .arch x64
             ; movaps xmm0, [rsp]
@@ -5340,11 +5386,9 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
         }
         let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
-        dynasm!(self.mc ; .arch x64
-            ; mov rdi, QWORD total_size
-            ; mov rax, QWORD slowpath_fn
-            ; call rax
-        );
+        self.emit_abi_arg_from_imm(0, total_size);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD slowpath_fn);
+        self.emit_abi_call_rax();
         // pop_gcmap
         dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
 
@@ -5373,22 +5417,20 @@ impl<'a> Assembler386<'a> {
             .unwrap_or(16) as i64;
         let malloc_ptr = libc::malloc as *const () as i64;
         // Call malloc(obj_size)
-        dynasm!(self.mc ; .arch x64
-            ; mov rdi, QWORD obj_size
-            ; mov rax, QWORD malloc_ptr
-            ; call rax
-        );
+        self.emit_abi_arg_from_imm(0, obj_size);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
+        self.emit_abi_call_rax();
         // rax/x0 = pointer to allocated memory
         // Zero-initialize
+        self.emit_abi_arg_from_reg(0, 0);
+        self.emit_abi_arg_from_imm(1, 0);
+        self.emit_abi_arg_from_imm(2, obj_size);
         dynasm!(self.mc ; .arch x64
             ; push rax           // save ptr
-            ; mov rdi, rax       // dest = ptr
-            ; xor esi, esi       // val = 0
-            ; mov rdx, QWORD obj_size // size
             ; mov rax, QWORD (libc::memset as *const () as i64)
-            ; call rax
-            ; pop rax            // restore ptr
         );
+        self.emit_abi_call_rax_after_one_push();
+        dynasm!(self.mc ; .arch x64 ; pop rax); // restore ptr
         if !op.pos.is_none() {
             self.store_rax_to_result(op.pos);
         }
@@ -5410,18 +5452,18 @@ impl<'a> Assembler386<'a> {
             .map(|sd| sd.vtable())
             .unwrap_or(0) as i64;
         let malloc_ptr = libc::malloc as *const () as i64;
+        self.emit_abi_arg_from_imm(0, obj_size);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
+        self.emit_abi_call_rax();
+        self.emit_abi_arg_from_reg(0, 0);
+        self.emit_abi_arg_from_imm(1, 0);
+        self.emit_abi_arg_from_imm(2, obj_size);
         dynasm!(self.mc ; .arch x64
-            ; mov rdi, QWORD obj_size
-            ; mov rax, QWORD malloc_ptr
-            ; call rax
             ; push rax
-            ; mov rdi, rax
-            ; xor esi, esi
-            ; mov rdx, QWORD obj_size
             ; mov rax, QWORD (libc::memset as *const () as i64)
-            ; call rax
-            ; pop rax
         );
+        self.emit_abi_call_rax_after_one_push();
+        dynasm!(self.mc ; .arch x64 ; pop rax);
         // Write vtable at offset 0
         if vtable != 0 {
             dynasm!(self.mc ; .arch x64
@@ -6031,14 +6073,16 @@ impl<'a> Assembler386<'a> {
         // memmove(dst_addr, src_addr, byte_count)
         let memmove_ptr = libc::memmove as *const () as i64;
         dynasm!(self.mc ; .arch x64
-            ; mov rdi, rax   // dst
             ; pop rsi        // src
             ; pop rdx        // count
             ; push rbp
-            ; mov rax, QWORD memmove_ptr
-            ; call rax
-            ; pop rbp
         );
+        self.emit_abi_arg_from_reg(2, 2); // count
+        self.emit_abi_arg_from_reg(1, 6); // src
+        self.emit_abi_arg_from_reg(0, 0); // dst
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD memmove_ptr);
+        self.emit_abi_call_rax_after_one_push();
+        dynasm!(self.mc ; .arch x64 ; pop rbp);
     }
 
     /// NEWSTR: allocate a byte string of given length.
@@ -6083,18 +6127,21 @@ impl<'a> Assembler386<'a> {
             ; push rax                           // save length
             ; imul rax, rax, item_size as i32
             ; add rax, base_size as i32
-            ; mov rdi, rax                       // malloc arg
             ; push rax                           // save total_size
-            ; mov rax, QWORD malloc_ptr
-            ; call rax
+        );
+        self.emit_abi_arg_from_reg(0, 0);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD malloc_ptr);
+        self.emit_abi_call_rax();
+        dynasm!(self.mc ; .arch x64
             ; pop rcx                            // rcx = total_size
             ; push rax                           // save ptr
-            // memset(ptr, 0, total_size)
-            ; mov rdi, rax
-            ; xor esi, esi
-            ; mov rdx, rcx
-            ; mov rax, QWORD memset_ptr
-            ; call rax
+        );
+        self.emit_abi_arg_from_reg(2, 1);
+        self.emit_abi_arg_from_imm(1, 0);
+        self.emit_abi_arg_from_reg(0, 0);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD memset_ptr);
+        self.emit_abi_call_rax();
+        dynasm!(self.mc ; .arch x64
             ; pop rax                            // rax = ptr
             ; pop rcx                            // rcx = length
             // Store length at offset 8 (RPython string header)
@@ -6140,13 +6187,15 @@ impl<'a> Assembler386<'a> {
         // memset(dest, 0, byte_length)
         dynasm!(self.mc ; .arch x64
             ; mov rdx, rax                       // byte_length
-            ; pop rdi                            // dest
-            ; xor esi, esi                       // val = 0
+            ; pop rax                            // dest
             ; push rbp
-            ; mov rax, QWORD memset_ptr
-            ; call rax
-            ; pop rbp
         );
+        self.emit_abi_arg_from_reg(2, 2);
+        self.emit_abi_arg_from_imm(1, 0);
+        self.emit_abi_arg_from_reg(0, 0);
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD memset_ptr);
+        self.emit_abi_call_rax_after_one_push();
+        dynasm!(self.mc ; .arch x64 ; pop rbp);
     }
 
     // ================================================================
