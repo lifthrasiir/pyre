@@ -3386,6 +3386,7 @@ pub fn typeof_vars(args_v: &[Rc<Variable>]) -> SomeValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowspace::model::ConstValue;
     use crate::flowspace::model::GraphFunc;
     use std::rc::Rc;
 

@@ -3348,6 +3348,7 @@ pub type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
 
     #[test]
     fn object_vtable_resolves_to_struct_with_subclassrange_fields() {
