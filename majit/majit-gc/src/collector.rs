@@ -2758,18 +2758,25 @@ mod tests {
             "CARDS_SET should be set before collection"
         );
 
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
         // Minor collection clears card bytes.
         gc.do_collect_nursery();
 
-        let hdr = unsafe { header_of(obj.0) };
+        let hdr = unsafe { header_of(root.0) };
         assert!(
             unsafe { !(*hdr).has_flag(flags::CARDS_SET) },
             "CARDS_SET flag should be cleared after collection"
         );
         assert!(
-            !gc.is_card_dirty(obj, 0),
+            !gc.is_card_dirty(root, 0),
             "card 0 should be cleared after collection"
         );
+
+        gc.roots.clear();
     }
 
     #[test]

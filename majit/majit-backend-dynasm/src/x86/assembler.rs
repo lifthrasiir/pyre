@@ -5136,36 +5136,23 @@ impl<'a> Assembler386<'a> {
             // Inline card bit set (x86/assembler.py:2398 WriteBarrierSlowPath parity)
             dynasm!(self.mc ; .arch x64 ; =>card_mark);
             if let Some(Loc::Reg(loc_index)) = arglocs.get(1) {
-                let shift = (3 + wb.jit_wb_card_page_shift) as i8;
-                // byte_index = ~(index >> (3+page_shift))
-                dynasm!(self.mc ; .arch x64
-                    ; mov rcx, Rq(loc_index.value as u8)
-                    ; shr rcx, shift
-                    ; not rcx
-                );
-                // bit_index = (index >> page_shift) & 7 → set bit
                 let page_shift = wb.jit_wb_card_page_shift as i8;
+                let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
                 dynasm!(self.mc ; .arch x64
-                    ; mov rax, Rq(loc_index.value as u8)
-                    ; shr rax, page_shift
-                    ; and rax, 7
-                    ; mov rdx, 1
-                    ; shl rdx, cl  // cl = bit_index? no, need rax
-                );
-                // Actually simpler: use BTS instruction
-                // card_byte_ofs = rcx, bit = (index >> page_shift) & 7
-                // Just OR the byte directly
-                dynasm!(self.mc ; .arch x64
-                    ; mov rdx, 1
-                    ; mov r8, Rq(loc_index.value as u8)
-                    ; shr r8, page_shift
-                    ; and r8, 7
-                );
-                // set bit: load byte, or, store
-                dynasm!(self.mc ; .arch x64
-                    ; mov cl, r8b
+                    ; push rcx
+                    ; push rdx
+                    ; mov r11, Rq(loc_index.value as u8)
+                    ; shr r11, byte_shift
+                    ; not r11
+                    ; sub r11, majit_gc::header::GcHeader::SIZE as i32
+                    ; mov rcx, Rq(loc_index.value as u8)
+                    ; shr rcx, page_shift
+                    ; and rcx, 7
+                    ; mov dl, 1
                     ; shl dl, cl
-                    ; or BYTE [Rq(loc_base.value as u8) + rcx], dl
+                    ; or BYTE [Rq(loc_base.value as u8) + r11], dl
+                    ; pop rdx
+                    ; pop rcx
                 );
             }
         } else {

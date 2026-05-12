@@ -5439,6 +5439,7 @@ impl<'a> AssemblerARM64<'a> {
                     ; and x17, x16, 7
                     ; mov x16, 1
                     ; lsl x17, x16, x17
+                    ; sub x30, x30, majit_gc::header::GcHeader::SIZE as u32
                     ; ldrb w16, [X(loc_base.value), x30]
                     ; orr w16, w16, w17
                     ; strb w16, [X(loc_base.value), x30]

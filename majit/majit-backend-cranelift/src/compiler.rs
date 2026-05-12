@@ -10585,7 +10585,9 @@ impl CraneliftBackend {
                         let bit_idx = builder.ins().band(bit_idx, seven);
                         let one = builder.ins().iconst(cl_types::I64, 1);
                         let bit_mask = builder.ins().ishl(one, bit_idx);
-                        let card_addr = builder.ins().iadd(obj, byteofs_val);
+                        let card_header_base =
+                            builder.ins().iadd_imm(obj, -(majit_gc::header::GcHeader::SIZE as i64));
+                        let card_addr = builder.ins().iadd(card_header_base, byteofs_val);
                         let card_byte =
                             builder
                                 .ins()
