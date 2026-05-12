@@ -1032,18 +1032,34 @@ impl MIFrame {
             jitcode_ptr,
             local_color_map,
             stack_slot_color_map,
+            live_local_indices,
             is_portal_bridge,
         ) = {
             let s = self.sym();
-            let (local_color_map, stack_slot_color_map, is_portal_bridge, metadata_stack_depth) =
+            let (
+                local_color_map,
+                stack_slot_color_map,
+                live_local_indices,
+                is_portal_bridge,
+                metadata_stack_depth,
+            ) =
                 if s.jitcode.is_null() {
-                    (Vec::new(), Vec::new(), false, None)
+                    (Vec::new(), Vec::new(), Vec::new(), false, None)
                 } else {
                     unsafe {
                         let jc = &*s.jitcode;
+                        let live_local_indices = if jc.payload.code_ptr.is_null() {
+                            Vec::new()
+                        } else {
+                            let live_vars = crate::liveness::liveness_for(jc.payload.code_ptr);
+                            (0..s.nlocals)
+                                .filter(|&idx| live_vars.is_local_live(live_pc, idx))
+                                .collect()
+                        };
                         (
                             jc.payload.metadata.pyre_color_for_semantic_local.clone(),
                             jc.payload.metadata.stack_slot_color_map.clone(),
+                            live_local_indices,
                             jc.payload.is_portal_bridge(),
                             jc.payload
                                 .metadata
@@ -1069,6 +1085,7 @@ impl MIFrame {
                 s.jitcode,
                 local_color_map,
                 stack_slot_color_map,
+                live_local_indices,
                 is_portal_bridge,
             )
         };
@@ -1100,6 +1117,7 @@ impl MIFrame {
                     valid_stack_only,
                     &local_color_map,
                     &stack_slot_color_map,
+                    &live_local_indices,
                     color_idx,
                 )
             }) else {

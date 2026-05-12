@@ -1123,6 +1123,7 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     stack_only: usize,
     local_color_map: &[u16],
     stack_color_map: &[u16],
+    live_local_indices: &[usize],
     reg: usize,
 ) -> Option<usize> {
     let live_len = stack_color_map.len().min(stack_only);
@@ -1132,12 +1133,14 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     {
         return Some(nlocals + stack_idx);
     }
-    if let Some(local_idx) = local_color_map
-        .iter()
-        .take(nlocals)
-        .position(|&color| color as usize == reg)
-    {
-        return Some(local_idx);
+    for &local_idx in live_local_indices {
+        if local_idx < nlocals
+            && local_color_map
+                .get(local_idx)
+                .is_some_and(|&color| color as usize == reg)
+        {
+            return Some(local_idx);
+        }
     }
     if local_color_map.is_empty() && reg < nlocals {
         return Some(reg);
@@ -5451,6 +5454,21 @@ impl JitState for PyreJitState {
             // writeback needs.
             let local_color_map: &[u16] = &payload.metadata.pyre_color_for_semantic_local;
             let stack_color_map: &[u16] = &payload.metadata.stack_slot_color_map;
+            let live_local_indices: Vec<usize> = {
+                let code_ptr = if !payload.code_ptr.is_null() {
+                    payload.code_ptr
+                } else {
+                    raw_code_ptr
+                };
+                if code_ptr.is_null() {
+                    Vec::new()
+                } else {
+                    let live_vars = crate::liveness::liveness_for(code_ptr);
+                    (0..nlocals)
+                        .filter(|&local_idx| live_vars.is_local_live(live_pc, local_idx))
+                        .collect()
+                }
+            };
             for (is_ref_bank, length) in [(false, length_i), (true, length_r), (false, length_f)] {
                 if length == 0 {
                     continue;
@@ -5466,6 +5484,7 @@ impl JitState for PyreJitState {
                                 stack_only,
                                 local_color_map,
                                 stack_color_map,
+                                &live_local_indices,
                                 reg,
                             ) {
                                 if slot_idx < nlocals {
@@ -6073,7 +6092,7 @@ mod tests {
     #[test]
     fn semantic_ref_slot_prefers_live_stack_color_reuse() {
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[0, 1], &[0], 0),
+            semantic_ref_slot_for_reg_color(2, 1, &[0, 1], &[0], &[0, 1], 0),
             Some(2),
         );
     }
@@ -6081,8 +6100,16 @@ mod tests {
     #[test]
     fn semantic_ref_slot_falls_back_to_local_color_map() {
         assert_eq!(
-            semantic_ref_slot_for_reg_color(2, 1, &[4, 1], &[3], 1),
+            semantic_ref_slot_for_reg_color(2, 1, &[4, 1], &[3], &[1], 1),
             Some(1),
+        );
+    }
+
+    #[test]
+    fn semantic_ref_slot_ignores_dead_local_color_reuse() {
+        assert_eq!(
+            semantic_ref_slot_for_reg_color(2, 0, &[0, 1], &[], &[1], 0),
+            None,
         );
     }
 
