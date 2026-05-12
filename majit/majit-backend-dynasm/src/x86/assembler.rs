@@ -2118,6 +2118,60 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
+            // Structural adaptation: PyPy's llsupport/rewrite.py:132-154
+            // normally lowers SETARRAYITEM_* to GC_STORE(_INDEXED), but
+            // pyre's CI also exercises direct backend emission paths before
+            // that rewrite has run.
+            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
+                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
+                {
+                    let (base_size, item_size) = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_array_descr())
+                        .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+                        .unwrap_or((0, 8));
+                    let index_reg = crate::regloc::X86_64_SCRATCH_REG.value;
+                    let value_reg = crate::regloc::X86_64_SCRATCH_REG_2.value;
+
+                    self.regalloc_mov(
+                        index_loc,
+                        &Loc::Reg(crate::regloc::RegLoc::new(index_reg, false)),
+                    );
+                    if item_size != 1 {
+                        dynasm!(self.mc ; .arch x64 ; imul Rq(index_reg), Rq(index_reg), item_size);
+                    }
+                    if base_size != 0 {
+                        dynasm!(self.mc ; .arch x64 ; add Rq(index_reg), base_size);
+                    }
+                    dynasm!(self.mc ; .arch x64 ; add Rq(index_reg), Rq(base.value));
+
+                    match value_loc {
+                        Loc::Reg(val) if val.is_xmm => {
+                            dynasm!(self.mc ; .arch x64 ; movsd [Rq(index_reg)], Rx(val.value));
+                        }
+                        Loc::Reg(val) => match item_size {
+                            1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(val.value)),
+                            2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(val.value)),
+                            4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(val.value)),
+                            _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(val.value)),
+                        },
+                        _ => {
+                            self.regalloc_mov(
+                                value_loc,
+                                &Loc::Reg(crate::regloc::RegLoc::new(value_reg, false)),
+                            );
+                            match item_size {
+                                1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rb(value_reg)),
+                                2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rw(value_reg)),
+                                4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rd(value_reg)),
+                                _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(value_reg)),
+                            }
+                        }
+                    }
+                }
+            }
             // ── Control flow ──
             OpCode::Jump => {
                 let jump_descr = loop_target_descr(op);
