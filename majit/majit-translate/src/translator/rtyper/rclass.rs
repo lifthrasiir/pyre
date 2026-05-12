@@ -2006,6 +2006,7 @@ pub struct InstanceRepr {
     /// classdef=None, overwritten by `_check_for_immutable_hints` for
     /// classdef!=None (rclass.py:576). R2-C keeps it as an empty set —
     /// the immutable-hint derivation lands in R2-D.
+    #[allow(dead_code)]
     immutable_field_set: RefCell<HashSet<String>>,
     /// RPython `self._reusable_prebuilt_instance` (rclass.py:807).
     /// Lazy-initialised by [`Self::get_reusable_prebuilt_instance`] —

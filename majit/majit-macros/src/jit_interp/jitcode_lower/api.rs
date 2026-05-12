@@ -21,6 +21,7 @@ pub struct GeneratedJitCodeBody {
     pub red_schema: Vec<(String, TokenStream)>,
 }
 
+#[allow(dead_code)]
 pub fn try_generate_jitcode_body(body: &Expr) -> Option<TokenStream> {
     try_generate_jitcode_body_inner(body, None).map(|p| p.body)
 }
@@ -32,6 +33,7 @@ pub fn try_generate_jitcode_body_parts(
     try_generate_jitcode_body_inner(body, _config)
 }
 
+#[allow(dead_code)]
 pub fn try_generate_jitcode_body_with_config(
     config: &LowererConfig,
     body: &Expr,
@@ -56,6 +58,7 @@ pub fn try_generate_jitcode_body_with_config_parts(
 ///   pre-bind pass),
 /// - the bank (Int / Ref / Float) so the (parent, callee) pair lands in
 ///   the matching `args_<kind>` vector.
+#[allow(private_interfaces)]
 #[derive(Clone, Debug)]
 pub(crate) struct CallerLocalLayout {
     #[allow(dead_code)]
@@ -93,6 +96,7 @@ pub(crate) struct CallerLocalLayout {
 /// lowers cleanly.  Returns the layout descriptors plus the
 /// worst-case `next_reg` advance that the caller must apply so
 /// subsequent `alloc_reg()` cannot collide.
+#[allow(private_interfaces)]
 pub(crate) fn assign_caller_local_layout(
     caller_locals: &[(String, Binding)],
 ) -> (Vec<CallerLocalLayout>, u16) {
@@ -129,6 +133,7 @@ pub(crate) fn assign_caller_local_layout(
     (layout, max_pre_bound)
 }
 
+#[allow(private_interfaces)]
 pub(crate) fn try_generate_jitcode_body_parts_with_caller_bindings(
     body: &Expr,
     config: Option<&LowererConfig>,

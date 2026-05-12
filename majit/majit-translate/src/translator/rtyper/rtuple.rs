@@ -221,6 +221,7 @@ fn helper_identity_suffix(
 /// lltype (e.g. tuple constructor / `getitem` / `len` helpers, where
 /// no per-Repr override exists). The cross-Repr sites that vary by
 /// helper identity (eq/hash) use [`helper_identity_suffix`] instead.
+#[allow(dead_code)]
 fn lltype_shape_suffix(lltypes: &[LowLevelType]) -> String {
     lltypes
         .iter()

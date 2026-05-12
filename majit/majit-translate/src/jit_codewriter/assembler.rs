@@ -2051,6 +2051,7 @@ impl Assembler {
     }
 
     /// Look up just the kind for a ValueId.
+    #[allow(dead_code)]
     fn lookup_kind(&self, v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> RegKind {
         self.lookup_coloring(v, regallocs).1
     }

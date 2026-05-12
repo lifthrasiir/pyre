@@ -229,6 +229,7 @@ pub enum StateFieldKind {
     /// (e.g. polymorphic `Storage`). Pair with `opaque(Type)` raw-pointer
     /// handles passed via additional `int` scalars when the JIT needs to
     /// touch the underlying memory through `jit_promote!` + raw-load IR.
+    #[allow(dead_code)]
     Opaque(syn::Path),
 }
 

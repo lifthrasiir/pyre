@@ -1,3 +1,9 @@
+// The remaining lint hits are spread across the generated-JIT integration
+// layer (`call_jit`, `eval`, and `jit/*`) and come from in-progress RPython
+// parity scaffolding plus macro-expanded control flow. Keep this crate-level
+// suppression until those ports are collapsed into generated modules or deleted.
+// TODO(pyre-jit-cleanup): move these to generated modules/items as each
+// scaffolding block graduates.
 #![allow(dead_code, unused_assignments, unused_doc_comments, unused_macros)]
 
 //! pyre-jit: Auto-generated JIT for pyre.

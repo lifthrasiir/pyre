@@ -1145,11 +1145,11 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     None
 }
 
-/// Sentinel null JitCode for uninitialized PyreSym.
-///
-/// Cannot be `static` because `Arc::new` is not const; use a thread_local
-/// LazyCell so the initialiser runs once per thread and the resulting
-/// reference stays valid for the thread's lifetime.
+// Sentinel null JitCode for uninitialized PyreSym.
+//
+// Cannot be `static` because `Arc::new` is not const; use a thread_local
+// LazyCell so the initialiser runs once per thread and the resulting
+// reference stays valid for the thread's lifetime.
 thread_local! {
     static NULL_JITCODE_CELL: std::cell::OnceCell<JitCode> = const { std::cell::OnceCell::new() };
 }
@@ -2440,6 +2440,7 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
 /// depth. Used as the fallback shape when no `compiled_meta` exists yet
 /// (e.g. tmp_callback target where `compile_tmp_callback` produced a
 /// JCT but no compiled-loop metadata).
+#[allow(dead_code)]
 pub(crate) fn callee_layout_for_call_assembler(
     code: &pyre_interpreter::CodeObject,
 ) -> (usize, usize) {
@@ -2613,6 +2614,7 @@ pub(crate) fn one_arg_callee_frame_helper(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
     let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
     crate::virtualizable_gen::virt_live_value_types(len.saturating_sub(n))
@@ -2826,6 +2828,7 @@ impl PyreSym {
         self.execution_context = execution_context;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn shift_virtualizable_input_indices(&mut self, extra_reds: u32) {
         if extra_reds == 0 {
             return;

@@ -1013,6 +1013,7 @@ pub fn translate_op(
 /// convention of identifying ops by their opname stem so Slice 4
 /// dual-gate failures are immediately greppable.
 fn opkind_variant_name(kind: &OpKind) -> &'static str {
+    #[allow(unreachable_patterns)]
     match kind {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",

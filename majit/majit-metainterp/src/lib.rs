@@ -1,4 +1,4 @@
-#![allow(dead_code, deprecated)]
+#![allow(dead_code)]
 
 //! `majit-meta`: Meta-tracing automation layer for the majit JIT framework.
 //!

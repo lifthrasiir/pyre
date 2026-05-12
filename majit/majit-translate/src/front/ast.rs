@@ -2426,9 +2426,9 @@ fn value_id_defined_in_block(
     block.operations.iter().any(|op| op.result == Some(vid))
 }
 
-/// Build a SemanticFunction from a Rust function AST.  Mirrors
-/// RPython `flowspace/objspace.py:38` `build_flow()` — `FlowingError`
-/// propagates to the caller rather than producing a partial graph.
+// Build a SemanticFunction from a Rust function AST. Mirrors RPython
+// `flowspace/objspace.py:38` `build_flow()` — `FlowingError` propagates to
+// the caller rather than producing a partial graph.
 thread_local! {
     /// MAJIT_UNKNOWN_DUMP diagnostic context: name of the function
     /// currently being lowered. Set on `build_function_graph` entry

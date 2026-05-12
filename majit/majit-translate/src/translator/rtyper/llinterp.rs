@@ -226,11 +226,11 @@ pub struct LLInterpreter {
     pub traceback_frames: RefCell<Vec<Rc<RefCell<LLFrame>>>>,
 }
 
-/// Upstream module-level `LLInterpreter.current_interpreter = None`
-/// (`llinterp.py:70`) plus its mutation in `eval_graph` (`:99`):
-/// `LLInterpreter.current_interpreter = self`. Carried as a thread-local
-/// `Weak` pointer so the LLFrame can `current_interpreter()` without
-/// receiver plumbing, matching upstream's class-attribute lookup.
+// Upstream module-level `LLInterpreter.current_interpreter = None`
+// (`llinterp.py:70`) plus its mutation in `eval_graph` (`:99`):
+// `LLInterpreter.current_interpreter = self`. Carried as a thread-local
+// `Weak` pointer so the LLFrame can `current_interpreter()` without
+// receiver plumbing, matching upstream's class-attribute lookup.
 thread_local! {
     static CURRENT_INTERPRETER: std::cell::RefCell<std::rc::Weak<LLInterpreter>>
         = const { std::cell::RefCell::new(std::rc::Weak::new()) };

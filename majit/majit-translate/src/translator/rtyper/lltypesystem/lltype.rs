@@ -1002,6 +1002,7 @@ impl _array {
     }
 }
 
+#[allow(dead_code)]
 fn ptr_from_parent_type(parent_type: &LowLevelType) -> Ptr {
     match parent_type {
         LowLevelType::Struct(t) => Ptr {

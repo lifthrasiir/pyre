@@ -1502,6 +1502,7 @@ fn build_host_class_from_struct(item_struct: &ItemStruct) -> HostObject {
 /// `module_globals_lookup` under a `pub(crate)` name so cross-
 /// module tests can read the registry without exposing the
 /// `pub(super)` API surface.
+#[allow(dead_code)]
 pub(crate) fn module_globals_for_test(module_id: ModuleId, name: &str) -> Option<ConstValue> {
     module_globals_lookup(module_id, name)
 }

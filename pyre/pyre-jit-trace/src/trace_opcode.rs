@@ -551,6 +551,7 @@ pub(crate) fn swap_stack_slots(
 }
 
 impl MIFrame {
+    #[allow(dead_code)]
     fn active_execution_context(&self) -> *const pyre_interpreter::PyExecutionContext {
         let exec_ctx = self.sym().concrete_execution_context;
         if !exec_ctx.is_null() {
@@ -566,6 +567,7 @@ impl MIFrame {
     }
 
     /// Get the concrete return value from the frame's stack top.
+    #[allow(dead_code)]
     fn concrete_stack_value_at_return(&self) -> Option<PyObjectRef> {
         // MIFrame Box tracking: read from concrete_stack
         let s = self.sym();
@@ -922,6 +924,7 @@ impl MIFrame {
             Float,
         }
         impl LiveBank {
+            #[allow(dead_code)]
             fn ty(self) -> Type {
                 match self {
                     LiveBank::Int => Type::Int,
@@ -3806,6 +3809,7 @@ impl MIFrame {
     }
 
     /// RPython pyjitpl.py:177 get_list_of_active_boxes parity:
+    #[allow(dead_code)]
     fn fail_args_to_snapshot_boxes(
         fail_args: &[OpRef],
         ctx: &majit_metainterp::TraceCtx,
@@ -4160,12 +4164,14 @@ impl MIFrame {
         None
     }
 
+    #[allow(dead_code)]
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
         let actual_value = opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr());
         self.implement_guard_value(ctx, actual_value, expected);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn guard_int_like_value(&mut self, ctx: &mut TraceCtx, value: OpRef, expected: i64) {
         if self.value_type(value) == Type::Int {
             self.implement_guard_value(ctx, value, expected);
@@ -4229,6 +4235,7 @@ impl MIFrame {
         self.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn guard_len_eq(&mut self, ctx: &mut TraceCtx, len: OpRef, expected: usize) {
         self.implement_guard_value(ctx, len, expected as i64);
     }
@@ -5803,6 +5810,7 @@ impl MIFrame {
         Ok(objspace_truth_value(concrete_val))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn concrete_branch_truth(&mut self) -> Result<bool, PyError> {
         self.concrete_branch_truth_for_value(OpRef::NONE, PY_NULL)
     }

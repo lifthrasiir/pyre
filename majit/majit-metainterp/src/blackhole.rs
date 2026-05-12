@@ -184,6 +184,7 @@ pub enum BlackholeResult {
 /// This function will be removed once pyre generates jitcode and
 /// `pyjitpl.rs` guard failure recovery switches to jitcode-based blackhole.
 #[deprecated(note = "use BlackholeInterpreter for RPython-parity jitcode execution")]
+#[allow(deprecated)]
 pub fn blackhole_execute(
     ops: &[Op],
     constants: &HashMap<u32, i64>,
@@ -792,6 +793,7 @@ fn blackhole_with_recovery_layout(
     resume_data: Option<&ResumeData>,
     resume_layout: Option<&ResumeLayoutSummary>,
 ) -> BlackholeResult {
+    #[allow(deprecated)]
     let result = blackhole_execute(ops, constants, initial_values, start_index);
 
     // If guard failed and we have resume data with virtuals, materialize them

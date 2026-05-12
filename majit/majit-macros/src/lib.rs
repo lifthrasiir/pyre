@@ -1,5 +1,3 @@
-#![allow(dead_code, private_interfaces)]
-
 /// Proc macros for the majit JIT framework.
 ///
 /// rpython/rlib/jit.py decorator equivalents:
