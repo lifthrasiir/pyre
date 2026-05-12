@@ -19,12 +19,12 @@ cranelift-native = "0.130"
 target-lexicon = "0.13"
 
 [features]
-# No-op feature — declared so workspace-wide `cargo test --all
-# --features dynasm` does not error on a crate that has no dynasm
-# code path. The cranelift backend has no dynasm-specific code; this
-# crate stays unaffected when the workspace selects the dynasm feature.
-dynasm = []
+# Workspace-wide `cargo test --all --features dynasm` also selects this
+# crate's tests. The cranelift backend itself has no dynasm code path, but
+# its integration tests depend on `majit-metainterp::recorder::Trace`, and
+# `majit-metainterp` requires one backend feature to compile.
+dynasm = ["majit-metainterp/dynasm"]
 
 [dev-dependencies]
-majit-metainterp = { workspace = true, features = ["cranelift"] }
+majit-metainterp = { workspace = true }
 smallvec = "1"

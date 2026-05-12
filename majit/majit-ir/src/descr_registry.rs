@@ -144,17 +144,27 @@ mod tests {
         Arc::new(SimpleFieldDescr::new(idx, 0, 8, Type::Int, false))
     }
 
+    fn count_arc(haystack: &[DescrRef], needle: &DescrRef) -> usize {
+        haystack
+            .iter()
+            .filter(|descr| Arc::ptr_eq(descr, needle))
+            .count()
+    }
+
     /// Same `Arc` clone re-registered via the facade collapses to a
     /// single `_cache_field_order` entry — `Arc::ptr_eq` dedup at the
     /// `gc_cache.register_external_*` level.
     #[test]
     fn dedup_by_arc_identity_within_category() {
         let f = fresh_field(42);
-        let before = gc_cache().lock().unwrap().snapshot_fields().len();
         register_field(f.clone());
-        register_field(f);
-        let after = gc_cache().lock().unwrap().snapshot_fields().len();
-        assert_eq!(after - before, 1, "same Arc should collapse to one entry");
+        register_field(f.clone());
+        let fields = gc_cache().lock().unwrap().snapshot_fields();
+        assert_eq!(
+            count_arc(&fields, &f),
+            1,
+            "same Arc should collapse to one entry"
+        );
     }
 
     /// Distinct Arcs that share `descr.index() == 0` (e.g. two
@@ -164,10 +174,19 @@ mod tests {
     /// `(STRUCT, fieldname)` keyed dict.
     #[test]
     fn distinct_arcs_share_index_stay_separate() {
-        let before = gc_cache().lock().unwrap().snapshot_fields().len();
-        register_field(fresh_field(0));
-        register_field(fresh_field(0));
-        let after = gc_cache().lock().unwrap().snapshot_fields().len();
-        assert_eq!(after - before, 2);
+        let f_a = fresh_field(0);
+        let f_b = fresh_field(0);
+        register_field(f_a.clone());
+        register_field(f_b.clone());
+        let fields = gc_cache().lock().unwrap().snapshot_fields();
+        assert_eq!(count_arc(&fields, &f_a), 1);
+        assert_eq!(count_arc(&fields, &f_b), 1);
+        assert!(
+            fields
+                .iter()
+                .filter(|descr| Arc::ptr_eq(descr, &f_a) || Arc::ptr_eq(descr, &f_b))
+                .count()
+                == 2
+        );
     }
 }
