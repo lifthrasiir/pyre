@@ -382,28 +382,17 @@ fn mirror_vable_static_to_boxes(
     }
 }
 
-/// Resolve the post-regalloc register-file index for a stack slot.
+/// Resolve the register-file index for a stack slot.
 ///
-/// When the owning jitcode has a `stack_slot_color_map` (i.e. the
-/// jitcode has gone through regalloc), return the post-regalloc color
-/// for `stack_idx`.  Otherwise fall back to the semantic index
-/// `nlocals + stack_idx`.
-///
-/// SSA-authoritative live_r epic (Task #185) slice 3b-3: this helper
-/// centralises the index derivation so the writer/reader/swap helpers
-/// all share one atomic flip point.
+/// Keep the mutable `registers_r` stack mirror semantic-indexed.  The
+/// packed-liveness encoder maps live Ref colors back to semantic frame
+/// slots and then materializes a color-indexed snapshot locally; flipping
+/// these writers to colors lets coalesced stack colors overwrite local
+/// mirrors before loop-close and guard snapshots have consumed the
+/// semantic virtualizable view.
 pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
     let semantic_idx = sym.nlocals + stack_idx;
-    if sym.jitcode.is_null() {
-        return semantic_idx;
-    }
-    let jc = unsafe { &*sym.jitcode };
-    jc.payload
-        .metadata
-        .stack_slot_color_map
-        .get(stack_idx)
-        .map(|&c| c as usize)
-        .unwrap_or(semantic_idx)
+    semantic_idx
 }
 
 /// Write a Ref-boxed value to the symbolic operand stack at depth
@@ -412,9 +401,8 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
 /// inline-call setup all duplicated:
 ///
-/// - `registers_r[reg_idx]` — the unified register file, now
-///   color-indexed via `stack_slot_reg_idx` (post-regalloc color from
-///   `metadata.stack_slot_color_map[stack_idx]`).
+/// - `registers_r[reg_idx]` — the semantic stack mirror
+///   (`reg_idx == nlocals + stack_idx`).
 /// - `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` —
 ///   `locals_cells_stack_w` heap mirror, ALWAYS semantic-indexed
 ///   (`pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable`).
@@ -440,10 +428,9 @@ pub(crate) fn write_stack_slot(
     concrete: ConcreteValue,
 ) {
     let semantic_idx = sym.nlocals + stack_idx;
-    // SSA-authoritative live_r slice 3b-3: `reg_idx` is the
-    // post-regalloc color from `stack_slot_color_map[stack_idx]`.
-    // Writers populate `registers_r[color]` so the encoder
-    // (`get_list_of_active_boxes`) can read by color directly.
+    // Keep the write-side mirror semantic-indexed.  The encoder
+    // materializes the color-indexed Ref bank from the virtualizable
+    // shadow at snapshot time.
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -481,12 +468,11 @@ pub(crate) fn write_stack_slot(
 /// heap-fill from `locals_cells_stack_w` when the slot is empty.
 /// Symmetric counterpart of `write_stack_slot`.
 ///
-/// SSA-authoritative live_r slice 3b-3: `reg_idx` is the post-regalloc
-/// color via `stack_slot_reg_idx`.  On NONE-fill, the IR `getarrayitem`
-/// op uses the SEMANTIC array index (`locals_cells_stack_w[nlocals +
-/// stack_idx]`) — the heap layout the array descr describes — while
-/// the destination slot `reg_idx` is the JIT register-file slot
-/// subsequent reads consult.
+/// Reads the semantic stack mirror via `stack_slot_reg_idx`.  On
+/// NONE-fill, the IR `getarrayitem` op uses the same SEMANTIC array
+/// index (`locals_cells_stack_w[nlocals + stack_idx]`) — the heap layout
+/// the array descr describes — and stores the result in the semantic
+/// mirror slot subsequent stack reads consult.
 ///
 /// `init_symbolic` (state.rs:2785) leaves
 /// `locals_cells_stack_array_ref = OpRef::NONE` for active-owner
@@ -528,8 +514,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// into the sentinel fallback, hence the `virtualizable_entry_at`
 /// pair-read+pair-write.
 ///
-/// SSA-authoritative live_r slice 3b-3: `reg_top` / `reg_other` are
-/// the post-regalloc colors via `stack_slot_reg_idx`.
+/// `reg_top` / `reg_other` are semantic stack mirror indices.
 pub(crate) fn swap_stack_slots(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -1085,17 +1070,22 @@ impl MIFrame {
             }
             let color_idx = idx;
             // Derive semantic index for vable shadow / concrete_at.
-            // Locals: identity. Stack: reverse color map (full, not
-            // bounded by stack_only — chordal coloring guarantees a
-            // unique hit within the simultaneously-live subset).
-            let semantic_idx = if is_portal_bridge || color_idx < nlocals {
-                color_idx
+            // A stack slot color may be coalesced with a local identity
+            // color when the local is not live.  Mirror the decoder's
+            // `semantic_ref_slot_for_reg_color`: consult the live stack
+            // prefix first, and only fall back to local identity if no
+            // live stack slot owns this color.
+            let Some(semantic_idx) = (if is_portal_bridge {
+                Some(color_idx)
             } else {
-                stack_slot_color_map
-                    .iter()
-                    .position(|&c| c as usize == color_idx)
-                    .map(|si| nlocals + si)
-                    .unwrap_or(color_idx)
+                crate::state::semantic_ref_slot_for_reg_color(
+                    nlocals,
+                    valid_stack_only,
+                    &stack_slot_color_map,
+                    color_idx,
+                )
+            }) else {
+                continue;
             };
             {
                 let s = self.sym_mut();
@@ -1103,30 +1093,26 @@ impl MIFrame {
                     s.registers_r.resize(color_idx + 1, OpRef::NONE);
                 }
             }
-            // pyjitpl.py:218-234 parity: read registers_r[color]
-            // directly. For vable-owner locals the vable shadow is
-            // authoritative (load_local_value returns from shadow
-            // without writing registers_r — Step 2.2 prerequisite).
+            // pyjitpl.py:218-234 parity for the snapshot: produce the
+            // color-indexed Ref bank, but source active virtualizable
+            // frame slots from the semantic shadow first.  A stack color
+            // may be coalesced with a local color; reading
+            // `registers_r[color]` before the shadow would pick up a
+            // stale local mirror for a live stack slot.
             let live_max = nlocals + valid_stack_only;
             let read_live = |this: &MIFrame, ctx: &TraceCtx| -> OpRef {
                 let s = this.sym();
-                if s.owns_virtualizable_shadow() && semantic_idx < nlocals {
+                if s.owns_virtualizable_shadow() && semantic_idx < live_max {
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                     return ctx
                         .virtualizable_box_at(nvs + semantic_idx)
-                        .expect("get_list_of_active_boxes: missing vable local box");
+                        .expect("get_list_of_active_boxes: missing vable frame box");
                 }
                 let val = s.registers_r.get(color_idx).copied().unwrap_or(OpRef::NONE);
                 if val != OpRef::NONE {
                     return val;
                 }
-                if s.owns_virtualizable_shadow() && semantic_idx < live_max {
-                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                    ctx.virtualizable_box_at(nvs + semantic_idx)
-                        .unwrap_or(OpRef::NONE)
-                } else {
-                    OpRef::NONE
-                }
+                OpRef::NONE
             };
             let live_value_pre = read_live(self, ctx);
             if live_value_pre == OpRef::NONE {

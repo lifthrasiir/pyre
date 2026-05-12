@@ -1047,12 +1047,18 @@ pub unsafe fn w_list_setslice(
                     } else {
                         &[]
                     };
-                    let mut v = list.int_items.to_vec();
-                    let s = start.min(v.len());
-                    let e = end.min(v.len());
-                    v.splice(s..e, new_items.iter().copied());
-                    list.int_items = IntArray::from_vec(v);
-                    list.int_items.fix_ptr();
+                    let s = start.min(list.int_items.len());
+                    let e = end.min(list.int_items.len());
+                    if obj == w_other {
+                        let mut v = list.int_items.to_vec();
+                        v.splice(s..e, new_items.iter().copied());
+                        list.int_items = IntArray::from_vec(v);
+                        list.int_items.fix_ptr();
+                    } else {
+                        // RPython AbstractUnwrappedStrategy.setslice mutates
+                        // the unerased typed storage directly.
+                        list.int_items.splice(s, e - s, new_items);
+                    }
                     return Ok(());
                 }
                 ListStrategy::Float => {
@@ -1061,12 +1067,18 @@ pub unsafe fn w_list_setslice(
                     } else {
                         &[]
                     };
-                    let mut v = list.float_items.to_vec();
-                    let s = start.min(v.len());
-                    let e = end.min(v.len());
-                    v.splice(s..e, new_items.iter().copied());
-                    list.float_items = FloatArray::from_vec(v);
-                    list.float_items.fix_ptr();
+                    let s = start.min(list.float_items.len());
+                    let e = end.min(list.float_items.len());
+                    if obj == w_other {
+                        let mut v = list.float_items.to_vec();
+                        v.splice(s..e, new_items.iter().copied());
+                        list.float_items = FloatArray::from_vec(v);
+                        list.float_items.fix_ptr();
+                    } else {
+                        // RPython AbstractUnwrappedStrategy.setslice mutates
+                        // the unerased typed storage directly.
+                        list.float_items.splice(s, e - s, new_items);
+                    }
                     return Ok(());
                 }
                 ListStrategy::Object => {}
