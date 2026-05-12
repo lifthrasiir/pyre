@@ -2352,6 +2352,7 @@ fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
     depth_at_pc: &[u16],
+    local_color_map: &[u16],
     stack_slot_color_map: &[u16],
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
@@ -2444,7 +2445,12 @@ fn filter_liveness_in_place(
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                .map(|idx| idx as u16)
+                .map(|idx| {
+                    local_color_map
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(idx as u16)
+                })
                 .collect();
             s.extend(live_stack_colors.iter().copied());
             s
@@ -7861,7 +7867,13 @@ impl CodeWriter {
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
         // them into live_i/live_r/live_f per assembler.py:150-152.
-        filter_liveness_in_place(&mut ssarepr, code, &depth_at_pc, &stack_slot_color_map);
+        filter_liveness_in_place(
+            &mut ssarepr,
+            code,
+            &depth_at_pc,
+            &pyre_color_for_semantic_local,
+            &stack_slot_color_map,
+        );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -9311,8 +9323,15 @@ mod tests {
         }
 
         let depth_at_pc: Vec<u16> = vec![0; code.instructions.len()];
+        let local_color_map: Vec<u16> = (0..code.varnames.len() as u16).collect();
         let stack_slot_color_map: Vec<u16> = Vec::new();
-        filter_liveness_in_place(&mut ssarepr, &code, &depth_at_pc, &stack_slot_color_map);
+        filter_liveness_in_place(
+            &mut ssarepr,
+            &code,
+            &depth_at_pc,
+            &local_color_map,
+            &stack_slot_color_map,
+        );
 
         let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];
         let live_args = ssarepr.insns[live_idx]

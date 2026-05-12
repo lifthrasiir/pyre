@@ -1120,10 +1120,11 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
 /// occupy colors `nlocals + d`; the reverse lookup must consult
 /// `metadata.stack_slot_color_map` first, bounded to the LIVE stack
 /// prefix at the current PC. Only if no live stack slot owns the color
-/// can the color fall back to a local inputarg slot in `0..nlocals`.
+/// can the color fall back through the local slot -> color map.
 pub(crate) fn semantic_ref_slot_for_reg_color(
     nlocals: usize,
     stack_only: usize,
+    local_color_map: &[u16],
     stack_color_map: &[u16],
     reg: usize,
 ) -> Option<usize> {
@@ -1134,7 +1135,14 @@ pub(crate) fn semantic_ref_slot_for_reg_color(
     {
         return Some(nlocals + stack_idx);
     }
-    if reg < nlocals {
+    if let Some(local_idx) = local_color_map
+        .iter()
+        .take(nlocals)
+        .position(|&color| color as usize == reg)
+    {
+        return Some(local_idx);
+    }
+    if local_color_map.is_empty() && reg < nlocals {
         return Some(reg);
     }
     None
@@ -5444,6 +5452,7 @@ impl JitState for PyreJitState {
             // the map is the single source of truth for the
             // `color → stack-slot-index` reverse lookup the heap
             // writeback needs.
+            let local_color_map: &[u16] = &payload.metadata.pyre_color_for_semantic_local;
             let stack_color_map: &[u16] = &payload.metadata.stack_slot_color_map;
             for length in [length_i, length_r, length_f] {
                 if length == 0 {
@@ -5457,6 +5466,7 @@ impl JitState for PyreJitState {
                         if let Some(slot_idx) = semantic_ref_slot_for_reg_color(
                             nlocals,
                             stack_only,
+                            local_color_map,
                             stack_color_map,
                             reg,
                         ) {
@@ -6063,12 +6073,18 @@ mod tests {
 
     #[test]
     fn semantic_ref_slot_prefers_live_stack_color_reuse() {
-        assert_eq!(semantic_ref_slot_for_reg_color(2, 1, &[0], 0), Some(2),);
+        assert_eq!(
+            semantic_ref_slot_for_reg_color(2, 1, &[0, 1], &[0], 0),
+            Some(2),
+        );
     }
 
     #[test]
-    fn semantic_ref_slot_falls_back_to_local_prefix() {
-        assert_eq!(semantic_ref_slot_for_reg_color(2, 1, &[3], 1), Some(1),);
+    fn semantic_ref_slot_falls_back_to_local_color_map() {
+        assert_eq!(
+            semantic_ref_slot_for_reg_color(2, 1, &[4, 1], &[3], 1),
+            Some(1),
+        );
     }
 
     fn empty_meta() -> PyreMeta {

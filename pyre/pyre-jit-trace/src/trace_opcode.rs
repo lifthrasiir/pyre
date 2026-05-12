@@ -1032,15 +1032,23 @@ impl MIFrame {
         // pyjitpl.py:194-198 — pre_opcode_registers_r is captured at orgpc
         // and would mis-size live_max for the fallthrough_pc resume.
         let portal_live_vsd = self.portal_bridge_vable_vsd(live_pc).map(|d| d as usize);
-        let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map, is_portal_bridge) = {
+        let (
+            nlocals,
+            valid_stack_only,
+            jitcode_ptr,
+            local_color_map,
+            stack_slot_color_map,
+            is_portal_bridge,
+        ) = {
             let s = self.sym();
-            let (stack_slot_color_map, is_portal_bridge, metadata_stack_depth) =
+            let (local_color_map, stack_slot_color_map, is_portal_bridge, metadata_stack_depth) =
                 if s.jitcode.is_null() {
-                    (Vec::new(), false, None)
+                    (Vec::new(), Vec::new(), false, None)
                 } else {
                     unsafe {
                         let jc = &*s.jitcode;
                         (
+                            jc.payload.metadata.pyre_color_for_semantic_local.clone(),
                             jc.payload.metadata.stack_slot_color_map.clone(),
                             jc.payload.is_portal_bridge(),
                             jc.payload
@@ -1065,6 +1073,7 @@ impl MIFrame {
                 s.nlocals,
                 valid_stack_only,
                 s.jitcode,
+                local_color_map,
                 stack_slot_color_map,
                 is_portal_bridge,
             )
@@ -1087,14 +1096,15 @@ impl MIFrame {
             // A stack slot color may be coalesced with a local identity
             // color when the local is not live.  Mirror the decoder's
             // `semantic_ref_slot_for_reg_color`: consult the live stack
-            // prefix first, and only fall back to local identity if no
-            // live stack slot owns this color.
+            // prefix first, and only fall back through the local color
+            // map if no live stack slot owns this color.
             let Some(semantic_idx) = (if is_portal_bridge {
                 Some(color_idx)
             } else {
                 crate::state::semantic_ref_slot_for_reg_color(
                     nlocals,
                     valid_stack_only,
+                    &local_color_map,
                     &stack_slot_color_map,
                     color_idx,
                 )
