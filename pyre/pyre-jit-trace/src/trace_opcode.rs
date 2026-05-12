@@ -384,15 +384,23 @@ fn mirror_vable_static_to_boxes(
 
 /// Resolve the register-file index for a stack slot.
 ///
-/// Keep the mutable `registers_r` stack mirror semantic-indexed.  The
-/// packed-liveness encoder maps live Ref colors back to semantic frame
-/// slots and then materializes a color-indexed snapshot locally; flipping
-/// these writers to colors lets coalesced stack colors overwrite local
-/// mirrors before loop-close and guard snapshots have consumed the
-/// semantic virtualizable view.
+/// RPython `pyjitpl.py` keeps each kind-specific register bank indexed by
+/// the post-regalloc register number. Pyre's Python frame array remains
+/// semantic-indexed, so stack writes translate through the per-jitcode
+/// `stack_slot_color_map` before touching `registers_r`.
 pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
     let semantic_idx = sym.nlocals + stack_idx;
-    semantic_idx
+    if sym.jitcode.is_null() {
+        return semantic_idx;
+    }
+    let jc = unsafe { &*sym.jitcode };
+    jc.payload
+        .metadata
+        .stack_slot_color_map
+        .get(stack_idx)
+        .copied()
+        .map(|color| color as usize)
+        .unwrap_or(semantic_idx)
 }
 
 /// Write a Ref-boxed value to the symbolic operand stack at depth
@@ -401,8 +409,8 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// the `caller_result_stack_idx` writeback (metainterp.rs:475+) and
 /// inline-call setup all duplicated:
 ///
-/// - `registers_r[reg_idx]` — the semantic stack mirror
-///   (`reg_idx == nlocals + stack_idx`).
+/// - `registers_r[reg_idx]` — the post-regalloc Ref bank slot
+///   (`reg_idx == stack_slot_color_map[stack_idx]` when available).
 /// - `virtualizable_boxes[NUM_VABLE_SCALARS + semantic_idx]` —
 ///   `locals_cells_stack_w` heap mirror, ALWAYS semantic-indexed
 ///   (`pyjitpl.py:1242-1247 _opimpl_setarrayitem_vable`).
@@ -428,9 +436,6 @@ pub(crate) fn write_stack_slot(
     concrete: ConcreteValue,
 ) {
     let semantic_idx = sym.nlocals + stack_idx;
-    // Keep the write-side mirror semantic-indexed.  The encoder
-    // materializes the color-indexed Ref bank from the virtualizable
-    // shadow at snapshot time.
     let reg_idx = stack_slot_reg_idx(sym, stack_idx);
     if reg_idx >= sym.registers_r.len() {
         sym.registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -468,11 +473,11 @@ pub(crate) fn write_stack_slot(
 /// heap-fill from `locals_cells_stack_w` when the slot is empty.
 /// Symmetric counterpart of `write_stack_slot`.
 ///
-/// Reads the semantic stack mirror via `stack_slot_reg_idx`.  On
-/// NONE-fill, the IR `getarrayitem` op uses the same SEMANTIC array
+/// Reads the color-indexed Ref bank via `stack_slot_reg_idx`.  On
+/// NONE-fill, the IR `getarrayitem` op still uses the SEMANTIC array
 /// index (`locals_cells_stack_w[nlocals + stack_idx]`) — the heap layout
-/// the array descr describes — and stores the result in the semantic
-/// mirror slot subsequent stack reads consult.
+/// the array descr describes — and stores the result in the Ref bank slot
+/// subsequent stack reads consult.
 ///
 /// `init_symbolic` (state.rs:2785) leaves
 /// `locals_cells_stack_array_ref = OpRef::NONE` for active-owner
@@ -514,7 +519,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// into the sentinel fallback, hence the `virtualizable_entry_at`
 /// pair-read+pair-write.
 ///
-/// `reg_top` / `reg_other` are semantic stack mirror indices.
+/// `reg_top` / `reg_other` are post-regalloc Ref-bank indices.
 pub(crate) fn swap_stack_slots(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -824,15 +829,15 @@ impl MIFrame {
         // `push_typed_value` / `store_local_value` for every trace that
         // satisfies `owns_virtualizable_shadow()` (loop portal +
         // bridges with seeded `bridge_local_oprefs`). Non-owner traces
-        // keep the legacy semantic registers_r snapshot.
+        // snapshot the whole color-indexed Ref bank so stack colors
+        // outside the old semantic prefix remain visible to guards.
         //
         // Prefix length: when reading from the shadow, use the full
         // `valuestackdepth` — the shadow covers the entire `nlocals +
         // co_stacksize` frame array regardless of `registers_r`
         // occupancy, and capping at `registers_r.len()` would silently
         // drop live shadow slots once `registers_r` lags behind the
-        // operand stack.  The `registers_r` fallback path keeps the
-        // length cap because reading past `registers_r.len()` panics.
+        // operand stack.
         let prefix_len = if owns_shadow {
             portal_vsd.unwrap_or(s.valuestackdepth)
         } else {
@@ -855,7 +860,7 @@ impl MIFrame {
             }
             self.pre_opcode_registers_r = Some(snapshot);
         } else {
-            self.pre_opcode_registers_r = Some(s.registers_r[..prefix_len].to_vec());
+            self.pre_opcode_registers_r = Some(s.registers_r.clone());
         }
     }
 
@@ -1029,23 +1034,32 @@ impl MIFrame {
         let portal_live_vsd = self.portal_bridge_vable_vsd(live_pc).map(|d| d as usize);
         let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map, is_portal_bridge) = {
             let s = self.sym();
+            let (stack_slot_color_map, is_portal_bridge, metadata_stack_depth) =
+                if s.jitcode.is_null() {
+                    (Vec::new(), false, None)
+                } else {
+                    unsafe {
+                        let jc = &*s.jitcode;
+                        (
+                            jc.payload.metadata.stack_slot_color_map.clone(),
+                            jc.payload.is_portal_bridge(),
+                            jc.payload
+                                .metadata
+                                .depth_at_py_pc
+                                .get(live_pc)
+                                .copied()
+                                .map(|d| d as usize),
+                        )
+                    }
+                };
             let valid_stack_only = if let Some(vsd) = portal_live_vsd {
                 vsd.saturating_sub(s.nlocals)
-            } else if let Some(ref pre_r) = self.pre_opcode_registers_r {
-                pre_r.len().saturating_sub(s.nlocals)
+            } else if self.pre_opcode_registers_r.is_some() {
+                metadata_stack_depth.unwrap_or_else(|| {
+                    s.valuestackdepth.saturating_sub(s.nlocals)
+                })
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
-            };
-            let (stack_slot_color_map, is_portal_bridge) = if s.jitcode.is_null() {
-                (Vec::new(), false)
-            } else {
-                unsafe {
-                    let jc = &*s.jitcode;
-                    (
-                        jc.payload.metadata.stack_slot_color_map.clone(),
-                        jc.payload.is_portal_bridge(),
-                    )
-                }
             };
             (
                 s.nlocals,

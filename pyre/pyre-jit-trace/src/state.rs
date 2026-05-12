@@ -1031,17 +1031,14 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
 /// This helper mirrors what production code does:
 ///   1. `setup_kind_register_banks` to size the three banks +
 ///      copy-constants per `pyjitpl.py:97-119`.
-///   2. Place each `(stack_depth, opref)` at the semantic prefix slot
-///      `registers_r[nlocals + depth]`. The post-regalloc Ref-bank
-///      color from `stack_slot_color_map[depth]` is intentionally not
-///      written into `registers_r`: Pyre stores the semantic
-///      locals_cells_stack_w view there, and `get_list_of_active_boxes`
-///      rebuilds the transient color-indexed bank from liveness.
+///   2. Place each `(stack_depth, opref)` at that slot's post-regalloc
+///      Ref-bank color (`stack_slot_color_map[depth]`, falling back to
+///      `nlocals + depth` for skeleton jitcodes). This matches
+///      `pyjitpl.py:218-225`, where `get_list_of_active_boxes` reads
+///      `registers_r[index]` directly.
 ///   3. Fill any still-`OpRef::NONE` Int/Float bank slot listed in
 ///      `live_pc`'s bank-split liveness with a typed dummy constant.
-///      Ref slots are deliberately not filled by color here: the tracer
-///      materializes them from the semantic locals_cells_stack_w slot at
-///      snapshot time, matching the production path.
+///      Ref slots are provided by the caller-provided stack slot map above.
 #[cfg(any(test, feature = "test-support"))]
 pub fn seed_compiled_trace_jitcode_test_state(
     sym: &mut PyreSym,
@@ -1598,10 +1595,10 @@ pub struct MIFrame {
     /// RPython `capture_resumedata(resumepc=orgpc)`
     /// Opcode-start snapshot of the unified `registers_r` file used by
     /// guard/resumedata capture for this one opcode. When `None`, guard
-    /// capture reads the live register file directly. The snapshot stores
-    /// exactly `registers_r[..valuestackdepth]`, so its length is the
-    /// pre-opcode valuestack depth and no separate `pre_opcode_vsd` slot is
-    /// needed.
+    /// capture reads the live register file directly. Shadow-owner snapshots
+    /// are semantic frame prefixes sourced from `virtualizable_boxes`;
+    /// non-owner snapshots clone the full color-indexed `registers_r` bank so
+    /// guard capture can read stack colors outside the old semantic prefix.
     pub(crate) pre_opcode_registers_r: Option<Vec<OpRef>>,
     /// PyPy capture_resumedata: parent frame chain for multi-frame guards.
     /// Each entry points at one parent frame plus the resumepc that
