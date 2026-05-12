@@ -1111,12 +1111,12 @@ impl MIFrame {
                     s.registers_r.resize(color_idx + 1, OpRef::NONE);
                 }
             }
-            // pyjitpl.py:218-234 parity for the snapshot: produce the
-            // color-indexed Ref bank, but source active virtualizable
-            // frame slots from the semantic shadow first.  A stack color
-            // may be coalesced with a local color; reading
-            // `registers_r[color]` before the shadow would pick up a
-            // stale local mirror for a live stack slot.
+            // pyjitpl.py:218-234 parity for the snapshot/fallback:
+            // produce the color-indexed Ref bank, but source active
+            // virtualizable frame slots from the semantic shadow. A
+            // stack color may be coalesced with a dead local color;
+            // reading `registers_r[color]` for the fallback would pick
+            // up the stale local mirror for a live stack slot.
             let live_max = nlocals + valid_stack_only;
             let read_live = |this: &MIFrame, ctx: &TraceCtx| -> OpRef {
                 let s = this.sym();
@@ -1126,7 +1126,11 @@ impl MIFrame {
                         .virtualizable_box_at(nvs + semantic_idx)
                         .expect("get_list_of_active_boxes: missing vable frame box");
                 }
-                let val = s.registers_r.get(color_idx).copied().unwrap_or(OpRef::NONE);
+                let val = s
+                    .registers_r
+                    .get(semantic_idx)
+                    .copied()
+                    .unwrap_or(OpRef::NONE);
                 if val != OpRef::NONE {
                     return val;
                 }
@@ -1138,7 +1142,8 @@ impl MIFrame {
                     let _ = MIFrame::load_local_value(self, ctx, semantic_idx);
                 } else {
                     // Stack lazy-fill: heap read at semantic index,
-                    // store at color index in registers_r.
+                    // store in both the semantic mirror (read_live) and
+                    // the color bank (Ref-bank fail args).
                     let s = self.sym_mut();
                     if s.locals_cells_stack_array_ref == OpRef::NONE {
                         let frame_ref = s.frame;
@@ -1147,8 +1152,12 @@ impl MIFrame {
                     }
                     let idx_const = ctx.const_int(semantic_idx as i64);
                     let arr = s.locals_cells_stack_array_ref;
-                    s.registers_r[color_idx] =
-                        trace_array_getitem_value(ctx, arr, idx_const);
+                    let value = trace_array_getitem_value(ctx, arr, idx_const);
+                    if semantic_idx >= s.registers_r.len() {
+                        s.registers_r.resize(semantic_idx + 1, OpRef::NONE);
+                    }
+                    s.registers_r[semantic_idx] = value;
+                    s.registers_r[color_idx] = value;
                 }
             }
             let live_value = if live_value_pre == OpRef::NONE {
