@@ -1024,6 +1024,15 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; push rbp
             ; push r12               // save r12 (used by genop_call_assembler)
+        );
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc
+            ; .arch x64
+            ; mov rbp, rcx
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc
+            ; .arch x64
             ; mov rbp, rdi
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
