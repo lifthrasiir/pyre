@@ -5451,26 +5451,28 @@ impl JitState for PyreJitState {
             // writeback needs.
             let local_color_map: &[u16] = &payload.metadata.pyre_color_for_semantic_local;
             let stack_color_map: &[u16] = &payload.metadata.stack_slot_color_map;
-            for length in [length_i, length_r, length_f] {
+            for (is_ref_bank, length) in [(false, length_i), (true, length_r), (false, length_f)] {
                 if length == 0 {
                     continue;
                 }
                 let mut it = LivenessIterator::new(cursor, length, &all_liveness);
                 while let Some(reg_idx) = it.next() {
                     let reg = reg_idx as usize;
-                    if let Some(value) = values.get(idx) {
-                        let boxed = virtualizable_box_value(value);
-                        if let Some(slot_idx) = semantic_ref_slot_for_reg_color(
-                            nlocals,
-                            stack_only,
-                            local_color_map,
-                            stack_color_map,
-                            reg,
-                        ) {
-                            if slot_idx < nlocals {
-                                let _ = self.set_local_at(slot_idx, boxed);
-                            } else {
-                                let _ = self.set_stack_at(slot_idx - nlocals, boxed);
+                    if is_ref_bank {
+                        if let Some(value) = values.get(idx) {
+                            let boxed = virtualizable_box_value(value);
+                            if let Some(slot_idx) = semantic_ref_slot_for_reg_color(
+                                nlocals,
+                                stack_only,
+                                local_color_map,
+                                stack_color_map,
+                                reg,
+                            ) {
+                                if slot_idx < nlocals {
+                                    let _ = self.set_local_at(slot_idx, boxed);
+                                } else {
+                                    let _ = self.set_stack_at(slot_idx - nlocals, boxed);
+                                }
                             }
                         }
                     }
