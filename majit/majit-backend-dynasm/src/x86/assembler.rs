@@ -1324,7 +1324,16 @@ impl<'a> Assembler386<'a> {
             );
         }
         #[cfg(not(target_os = "windows"))]
-        dynasm!(self.mc ; .arch x64 ; call rax);
+        {
+            let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
+            if adjust != 0 {
+                dynasm!(self.mc ; .arch x64 ; sub rsp, adjust);
+            }
+            dynasm!(self.mc ; .arch x64 ; call rax);
+            if adjust != 0 {
+                dynasm!(self.mc ; .arch x64 ; add rsp, adjust);
+            }
+        }
     }
 
     fn emit_abi_call_rax(&mut self) {
@@ -1358,7 +1367,16 @@ impl<'a> Assembler386<'a> {
             );
         }
         #[cfg(not(target_os = "windows"))]
-        dynasm!(self.mc ; .arch x64 ; call Rq(reg));
+        {
+            let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
+            if adjust != 0 {
+                dynasm!(self.mc ; .arch x64 ; sub rsp, adjust);
+            }
+            dynasm!(self.mc ; .arch x64 ; call Rq(reg));
+            if adjust != 0 {
+                dynasm!(self.mc ; .arch x64 ; add rsp, adjust);
+            }
+        }
     }
 
     fn emit_abi_call_reg(&mut self, reg: u8) {
