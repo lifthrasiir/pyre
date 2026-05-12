@@ -2716,14 +2716,11 @@ impl MIFrame {
             let mut stack_types_vec =
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec();
             stack_types_vec.resize(target_stack_capacity, Type::Ref);
-            let (local_color_map, stack_color_map) = if s.jitcode.is_null() {
-                (Vec::new(), Vec::new())
+            let local_color_map = if s.jitcode.is_null() {
+                Vec::new()
             } else {
                 let jc = unsafe { &*s.jitcode };
-                (
-                    jc.payload.metadata.pyre_color_for_semantic_local.clone(),
-                    jc.payload.metadata.stack_slot_color_map.clone(),
-                )
+                jc.payload.metadata.pyre_color_for_semantic_local.clone()
             };
             // pyjitpl.py:2954-2965 `reached_loop_header` parity: read
             // both locals and stack values from the virtualizable shadow
@@ -2780,14 +2777,7 @@ impl MIFrame {
                     .collect();
                 let live_stack_len = stack_only.min(target_stack_capacity);
                 let stack_vec: Vec<OpRef> = (0..live_stack_len)
-                    .map(|d| {
-                        let color = stack_color_map
-                            .get(d)
-                            .copied()
-                            .map(|c| c as usize)
-                            .unwrap_or(nlocals + d);
-                        read_color(color)
-                    })
+                    .map(|d| read_color(nlocals + d))
                     .collect();
                 (locals_vec, stack_vec)
             };
