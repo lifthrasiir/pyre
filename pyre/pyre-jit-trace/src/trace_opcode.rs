@@ -1153,20 +1153,14 @@ impl MIFrame {
             } else {
                 live_value_pre
             };
-            // pre_opcode_registers_r indexing: for vable-owner traces the
-            // snapshot is semantic-indexed (built from vable shadow), so
-            // read by semantic_idx. For non-owner traces, the snapshot is
-            // the temporary color-indexed bank materialized for guard
-            // capture, so read by color_idx.
-            let pre_op_idx = if self.sym().owns_virtualizable_shadow() {
-                semantic_idx
-            } else {
-                color_idx
-            };
             let semantic_value = self
                 .pre_opcode_registers_r
                 .as_ref()
-                .and_then(|pre_r| pre_r.get(pre_op_idx).copied())
+                // `capture_pre_opcode_state` stores a semantic frame
+                // snapshot for both vable-owner and non-owner traces. A
+                // live stack color may reuse a dead local color, so reading
+                // the snapshot by color would capture the wrong local value.
+                .and_then(|pre_r| pre_r.get(semantic_idx).copied())
                 .filter(|value| !value.is_none())
                 .unwrap_or(live_value);
             let bank_value =
@@ -7385,6 +7379,80 @@ mod tests {
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
         assert_eq!(active, vec![int_box, ref_box, float_box]);
+
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
+    }
+
+    #[test]
+    fn pre_opcode_snapshot_reads_coalesced_stack_color_by_semantic_slot() {
+        use majit_translate::liveness::encode_liveness;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut all_liveness = vec![0, 1, 0];
+        all_liveness.extend(encode_liveness(&[0]));
+        let mut insns = HashMap::new();
+        insns.insert(
+            "live/".to_string(),
+            majit_metainterp::jitcode::insns::BC_LIVE,
+        );
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new(
+                "pre_opcode_snapshot_coalesced_stack_color_test",
+            );
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+                c_num_regs_r: 3,
+                startpoints: Some([0_usize].into_iter().collect()),
+                ..Default::default()
+            });
+            inner
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.pc_map.push(0);
+        pyjit.metadata.depth_at_py_pc.push(1);
+        pyjit.metadata.pyre_color_for_semantic_local = vec![0, 1];
+        pyjit.metadata.stack_slot_color_map = vec![0];
+        let inner_jc = crate::state::JitCode {
+            code: std::ptr::null(),
+            index: 0,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let local0 = OpRef::ref_op(10);
+        let local1 = OpRef::ref_op(11);
+        let stack0 = OpRef::ref_op(20);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 2;
+        sym.valuestackdepth = 3;
+        // Semantic mirror: local0 is at slot 0, while stack depth 0 is at
+        // semantic slot 2. Liveness color 0 belongs to the live stack slot,
+        // reusing dead local0's color.
+        sym.registers_r = vec![local0, local1, stack0];
+
+        let mut ctx = TraceCtx::for_test(1);
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
+        };
+
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
+        assert_eq!(active, vec![stack0]);
 
         unsafe {
             let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);

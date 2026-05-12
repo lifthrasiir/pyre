@@ -6004,7 +6004,7 @@ mod tests {
         w_list_can_append_without_realloc, w_list_getitem, w_list_uses_float_storage,
         w_list_uses_int_storage,
     };
-    use pyre_object::pyobject::{PyType, is_list};
+    use pyre_object::pyobject::{INT_TYPE, LIST_TYPE, PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
     use std::rc::Rc;
 
