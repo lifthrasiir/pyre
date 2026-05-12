@@ -4776,7 +4776,6 @@ impl JitState for PyreJitState {
         };
 
         let nlocals = sym.nlocals;
-        let bridge_valuestackdepth = sym.valuestackdepth.max(nlocals);
         // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
         // items are declared Ref (W_Root array). Bridge resume slots stay
         // Ref at the virtualizable contract; any Int/Float unboxing must
@@ -4833,6 +4832,13 @@ impl JitState for PyreJitState {
             .skip(vable_array_start)
             .copied()
             .collect();
+        let bridge_valuestackdepth = concrete_values
+            // virtualizable_values has no ec red: [vable, last_instr,
+            // pycode, valuestackdepth, debugdata, lastblock, w_globals, ...].
+            .get(first_vable_scalar_idx + 2)
+            .map(value_to_usize)
+            .unwrap_or(sym.valuestackdepth)
+            .max(nlocals);
 
         // Part 2 — frame registers (consume_boxes): walk the frame section
         // in liveness enumeration order ([int..., ref..., float...]), keep
@@ -4848,7 +4854,7 @@ impl JitState for PyreJitState {
         let frame0 = &resume_data.frames[0];
         let reg_indices =
             crate::state::frame_liveness_reg_indices_by_bank_at(frame0.jitcode_index, frame0.pc);
-        let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
+        let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // RPython parity: after A.1 the guard-recovery path calls
@@ -5073,8 +5079,8 @@ impl JitState for PyreJitState {
         // resume.py:1042-1057 `rebuild_from_resumedata` parity: bridge
         // tracing resumes from the full restored frame state via the
         // vable scalar reads + consume_boxes — `valuestackdepth` is
-        // recovered from the heap (`bridge_valuestackdepth` derived
-        // from concrete `vable.valuestackdepth` at line 4347), not
+        // recovered from the decoded virtualizable resume payload
+        // (`bridge_valuestackdepth` derived from vable.valuestackdepth), not
         // hardcoded to `nlocals`. Keep the stack tail in the unified
         // register file and expose Ref-typed virtualizable slots to
         // subsequent LOAD_FAST / close_loop_args_at calls.
