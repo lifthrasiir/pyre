@@ -11,7 +11,9 @@ use pyre_interpreter::call::{
 };
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::{Mode, PyDisplay, PyErrorKind, PyExecutionContext, compile_source};
+use pyre_interpreter::{
+    Mode, PyDisplay, PyErrorKind, PyExecutionContext, compile_source_with_filename,
+};
 use pyre_jit::eval::eval_with_jit;
 
 mod repl;
