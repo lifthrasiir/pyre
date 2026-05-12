@@ -5487,9 +5487,9 @@ impl JitState for PyreJitState {
                 let mut it = LivenessIterator::new(cursor, length, &all_liveness);
                 while let Some(reg_idx) = it.next() {
                     let reg = reg_idx as usize;
-                    if is_ref_bank {
-                        if let Some(value) = values.get(idx) {
-                            let boxed = virtualizable_box_value(value);
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        if is_ref_bank {
                             if let Some(slot_idx) = semantic_ref_slot_for_reg_color(
                                 nlocals,
                                 stack_only,
@@ -5503,7 +5503,25 @@ impl JitState for PyreJitState {
                                 } else {
                                     let _ = self.set_stack_at(slot_idx - nlocals, boxed);
                                 }
+                            } else if reg < nlocals
+                                && matches!(value, Value::Int(_) | Value::Float(_))
+                            {
+                                // Runtime resume values are authoritative for
+                                // kind.  A stale Ref-bank liveness entry can
+                                // still carry an unboxed Int/Float fail arg;
+                                // box it into the semantic local without
+                                // widening Ref color reverse-mapping for
+                                // actual Ref values.
+                                let _ = self.set_local_at(reg, boxed);
                             }
+                        } else if reg < nlocals {
+                            // Int/Float bank register indices are not Ref colors:
+                            // do not route them through
+                            // semantic_ref_slot_for_reg_color.  For the
+                            // current frame-local case, the jitcode liveness
+                            // uses the semantic local index; box the raw value
+                            // back into PyFrame.locals_cells_stack_w.
+                            let _ = self.set_local_at(reg, boxed);
                         }
                     }
                     idx += 1;
