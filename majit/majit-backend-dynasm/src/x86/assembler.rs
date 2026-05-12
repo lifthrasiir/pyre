@@ -2265,12 +2265,9 @@ impl<'a> Assembler386<'a> {
                     let store_may_need_wb = op.opcode == OpCode::SetarrayitemGc
                         && is_ref_array
                         && item_size as usize == WORD
-                        && !matches!(value_loc, Loc::Reg(val) if val.is_xmm)
-                        && !matches!(value_loc, Loc::Immed(i) if i.value == 0);
+                        && self.setarrayitem_value_needs_write_barrier(op.arg(2), value_loc);
                     if store_may_need_wb {
-                        let wb_op =
-                            Op::new(OpCode::CondCallGcWbArray, &[op.arg(0), op.arg(1)]);
-                        self.emit_write_barrier_fastpath(&wb_op, &arglocs[..2]);
+                        self.emit_setarrayitem_gc_write_barrier(&arglocs[..2]);
                     }
 
                     self.regalloc_mov(
@@ -5215,8 +5212,50 @@ impl<'a> Assembler386<'a> {
     // These require GC runtime support. Emit trap for now.
     // ----------------------------------------------------------------
 
+    /// rewrite.py:936-942 `handle_write_barrier_setarrayitem` value gate.
+    ///
+    /// PyPy emits a barrier only for Ref-typed values, and `rgc.needs_write_barrier`
+    /// returns false for NULL constants and true for non-NULL constants
+    /// (rpython/rlib/rgc.py:285-297).  The normal rewriter path already performs
+    /// this check; this is the direct-backend fallback for unre-written tests.
+    fn setarrayitem_value_needs_write_barrier(&self, value: OpRef, value_loc: &Loc) -> bool {
+        if matches!(value_loc, Loc::Reg(val) if val.is_xmm) {
+            return false;
+        }
+        if let Some(tp) = self.constant_types.get(&value.raw()) {
+            if *tp != Type::Ref {
+                return false;
+            }
+        }
+        if let Some(&constant) = self.constants.get(&value.raw()) {
+            return constant != 0;
+        }
+        !matches!(value_loc, Loc::Immed(i) if i.value == 0)
+    }
+
+    /// rewrite.py:955-973 `gen_write_barrier_array` for the direct
+    /// SETARRAYITEM_GC fallback.  This assembler-only path has no
+    /// `RewriteState.known_lengths`, so it mirrors PyPy's
+    /// `known_length(v_base, LARGE)` default: unknown length selects the array
+    /// barrier when card marking exists; otherwise it falls back to the generic
+    /// write barrier.
+    fn emit_setarrayitem_gc_write_barrier(&mut self, arglocs: &[Loc]) {
+        let use_array_barrier = crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|gc| gc.get_write_barrier_descr())
+                .is_some_and(|wb| wb.jit_wb_cards_set != 0)
+        });
+        self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier);
+    }
+
     /// x86/assembler.py:2438 _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
+        let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
+        self.emit_write_barrier_fastpath_kind(arglocs, is_array);
+    }
+
+    fn emit_write_barrier_fastpath_kind(&mut self, arglocs: &[Loc], is_array: bool) {
         let wb = match crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
             cell.borrow()
                 .as_ref()
@@ -5229,7 +5268,6 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Reg(r)) => *r,
             _ => return,
         };
-        let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
         let card_marking = is_array && wb.jit_wb_cards_set != 0;
         let mut mask = wb.jit_wb_if_flag_singlebyte as i64;
         if card_marking {
@@ -5267,25 +5305,37 @@ impl<'a> Assembler386<'a> {
 
             // Inline card bit set (x86/assembler.py:2398 WriteBarrierSlowPath parity)
             dynasm!(self.mc ; .arch x64 ; =>card_mark);
-            if let Some(Loc::Reg(loc_index)) = arglocs.get(1) {
-                let page_shift = wb.jit_wb_card_page_shift as i8;
-                let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
-                dynasm!(self.mc ; .arch x64
-                    ; push rcx
-                    ; push rdx
-                    ; mov r11, Rq(loc_index.value as u8)
-                    ; shr r11, byte_shift
-                    ; not r11
-                    ; sub r11, majit_gc::header::GcHeader::SIZE as i32
-                    ; mov rcx, Rq(loc_index.value as u8)
-                    ; shr rcx, page_shift
-                    ; and rcx, 7
-                    ; mov dl, 1
-                    ; shl dl, cl
-                    ; or BYTE [Rq(loc_base.value as u8) + r11], dl
-                    ; pop rdx
-                    ; pop rcx
-                );
+            match arglocs.get(1) {
+                Some(Loc::Reg(loc_index)) => {
+                    let page_shift = wb.jit_wb_card_page_shift as i8;
+                    let byte_shift = (3 + wb.jit_wb_card_page_shift) as i8;
+                    dynasm!(self.mc ; .arch x64
+                        ; push rcx
+                        ; push rdx
+                        ; mov r11, Rq(loc_index.value as u8)
+                        ; shr r11, byte_shift
+                        ; not r11
+                        ; sub r11, majit_gc::header::GcHeader::SIZE as i32
+                        ; mov rcx, Rq(loc_index.value as u8)
+                        ; shr rcx, page_shift
+                        ; and rcx, 7
+                        ; mov dl, 1
+                        ; shl dl, cl
+                        ; or BYTE [Rq(loc_base.value as u8) + r11], dl
+                        ; pop rdx
+                        ; pop rcx
+                    );
+                }
+                Some(Loc::Immed(loc_index)) => {
+                    let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
+                    let byte_ofs =
+                        !((byte_index >> 3) as i64) - majit_gc::header::GcHeader::SIZE as i64;
+                    let byte_val = 1_i64 << (byte_index & 7);
+                    dynasm!(self.mc ; .arch x64
+                        ; or BYTE [Rq(loc_base.value as u8) + byte_ofs as i32], byte_val as i8
+                    );
+                }
+                _ => {}
             }
         } else {
             // Non-array: generic barrier
