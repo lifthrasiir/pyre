@@ -1139,7 +1139,9 @@ impl MIFrame {
             let live_value_pre = read_live(self, ctx);
             if live_value_pre == OpRef::NONE {
                 if semantic_idx < nlocals {
-                    let _ = MIFrame::load_local_value(self, ctx, semantic_idx);
+                    let value = MIFrame::load_local_value(self, ctx, semantic_idx)
+                        .expect("get_list_of_active_boxes: failed to lazy-load live local");
+                    self.sym_mut().registers_r[color_idx] = value;
                 } else {
                     // Stack lazy-fill: heap read at semantic index,
                     // store in both the semantic mirror (read_live) and
