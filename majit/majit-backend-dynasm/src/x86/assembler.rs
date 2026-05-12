@@ -2256,7 +2256,11 @@ impl<'a> Assembler386<'a> {
                         })
                         .unwrap_or((0, 8, false));
                     let index_reg = crate::regloc::X86_64_SCRATCH_REG.value;
-                    let value_reg = crate::regloc::X86_64_SCRATCH_REG_2.value;
+                    // r11 is already the computed destination address here.
+                    // Stage non-register values through a saved GPR: r12 is
+                    // allocatable on x86-64, so using SCRATCH_REG_2 would
+                    // clobber live regalloc state.
+                    let value_reg = crate::regloc::EAX.value;
 
                     let store_may_need_wb = op.opcode == OpCode::SetarrayitemGc
                         && is_ref_array
@@ -2292,6 +2296,7 @@ impl<'a> Assembler386<'a> {
                             _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(val.value)),
                         },
                         _ => {
+                            dynasm!(self.mc ; .arch x64 ; push rax);
                             self.regalloc_mov(
                                 value_loc,
                                 &Loc::Reg(crate::regloc::RegLoc::new(value_reg, false)),
@@ -2310,6 +2315,7 @@ impl<'a> Assembler386<'a> {
                                     dynasm!(self.mc ; .arch x64 ; mov [Rq(index_reg)], Rq(value_reg))
                                 }
                             }
+                            dynasm!(self.mc ; .arch x64 ; pop rax);
                         }
                     }
                 }
