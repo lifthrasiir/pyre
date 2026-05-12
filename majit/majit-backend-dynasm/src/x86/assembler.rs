@@ -2830,7 +2830,6 @@ impl<'a> Assembler386<'a> {
 
     /// Emit SETcc into a register (zero-extend to 64-bit).
     fn emit_setcc(&mut self, cc: u8, dst_reg: u8) {
-        dynasm!(self.mc ; .arch x64 ; xor Rd(dst_reg), Rd(dst_reg));
         match cc {
             CC_E => {
                 dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
@@ -2878,6 +2877,7 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; sete  Rb(dst_reg));
             }
         }
+        dynasm!(self.mc ; .arch x64 ; movzx Rd(dst_reg), Rb(dst_reg));
     }
 
     /// Map an integer comparison OpCode to a condition code.
