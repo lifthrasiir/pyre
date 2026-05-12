@@ -2442,15 +2442,16 @@ fn filter_liveness_in_place(
         // once Task #158 graph regalloc lands a separate scratch
         // color space; until then this env-var is the only path back
         // to RPython form.
+        assert!(
+            local_color_map.len() >= nlocals,
+            "local_color_map is shorter than nlocals: {} < {}",
+            local_color_map.len(),
+            nlocals
+        );
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
-                .map(|idx| {
-                    local_color_map
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(idx as u16)
-                })
+                .map(|idx| local_color_map[idx])
                 .collect();
             s.extend(live_stack_colors.iter().copied());
             s
