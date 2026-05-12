@@ -515,16 +515,6 @@ pub trait TraceHelperAccess {
     fn trace_ellipsis_constant(&mut self) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(ctx.const_ref(pyre_object::noneobject::w_ellipsis() as i64)))
     }
-
-    fn trace_slice_constant(
-        &mut self,
-        _start: OpRef,
-        _stop: OpRef,
-        _step: OpRef,
-        concrete_slice: pyre_object::PyObjectRef,
-    ) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(ctx.const_ref(concrete_slice as i64)))
-    }
 }
 
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
@@ -548,6 +538,51 @@ pub fn emit_box_int_inline(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_int], intval_descr);
     ctx.heap_cache_mut()
         .setfield_cached(new_op, intval_idx, raw_int);
+    new_op
+}
+
+/// Emit inline `space.newslice(w_start, w_end, w_step)` creation
+/// (NewWithVtable + 3 SetfieldGc).
+///
+/// `pypy/objspace/std/objspace.py:385` `space.newslice` returns
+/// `W_SliceObject(w_start, w_end, w_step)` — a fresh allocation per
+/// invocation (matching `pypy/interpreter/pyopcode.py:1463 BUILD_SLICE`).
+/// `_immutable_fields_ = ['w_start', 'w_stop', 'w_step']`
+/// (`sliceobject.py:13`) marks all three slots immutable, so the
+/// `optimizeopt/virtualize.py optimize_NEW_WITH_VTABLE` pass can
+/// virtualize the allocation when the slice never escapes — the IR
+/// shape (NewWithVtable + 3 SetfieldGc) preserves the operand
+/// dependencies the optimizer needs to reason about that.
+///
+/// `jtransform.py:908-911 rewrite_op_setfield` skips the typeptr
+/// setfield (the backend writes typeptr inside `new_with_vtable` per
+/// `llmodel.py:778-782`); `rewrite.py:479-484 handle_malloc_operation`
+/// emits the vtable setfield via `fielddescr_vtable` during the GC
+/// rewrite pass.
+pub fn emit_box_slice_inline(
+    ctx: &mut TraceCtx,
+    w_start: OpRef,
+    w_stop: OpRef,
+    w_step: OpRef,
+    size_descr: majit_ir::DescrRef,
+    w_start_descr: majit_ir::DescrRef,
+    w_stop_descr: majit_ir::DescrRef,
+    w_step_descr: majit_ir::DescrRef,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    ctx.heap_cache_mut().new_object(new_op);
+    let w_start_idx = w_start_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_start], w_start_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, w_start_idx, w_start);
+    let w_stop_idx = w_stop_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_stop], w_stop_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, w_stop_idx, w_stop);
+    let w_step_idx = w_step_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_step], w_step_descr);
+    ctx.heap_cache_mut()
+        .setfield_cached(new_op, w_step_idx, w_step);
     new_op
 }
 

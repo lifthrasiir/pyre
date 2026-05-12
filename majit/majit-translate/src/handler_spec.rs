@@ -161,7 +161,15 @@ fn emit_constant_impl(out: &mut String) {
     out.push('\n');
     emit_constant_method(out, &CONSTANT_METHODS[5]);
 
-    // slice_constant — special: takes 3 Self::Value args, creates W_SliceObject.
+    // slice_constant — `pypy/objspace/std/objspace.py:385` `space.newslice`
+    // emits a fresh W_SliceObject per call. The IR shape mirrors
+    // `pypy/interpreter/pyopcode.py:1463 BUILD_SLICE` →
+    // `op.newslice(w_start, w_end, w_step)` so the three operands stay
+    // live in the trace as field dependencies (NewWithVtable + 3
+    // SetfieldGc per `emit_box_slice_inline`). `concrete` is left
+    // `Null`: every iteration allocates a distinct W_SliceObject, so
+    // there is no canonical concrete heap pointer to box — matching
+    // the `bool_value_from_truth` shape for fresh-per-iteration values.
     out.push('\n');
     out.push_str("    fn slice_constant(\n");
     out.push_str("        &mut self,\n");
@@ -169,23 +177,22 @@ fn emit_constant_impl(out: &mut String) {
     out.push_str("        stop: Self::Value,\n");
     out.push_str("        step: Self::Value,\n");
     out.push_str("    ) -> Result<Self::Value, pyre_interpreter::PyError> {\n");
-    out.push_str("        use crate::helpers::TraceHelperAccess;\n");
-    out.push_str("        let concrete = if start.concrete.is_null() || stop.concrete.is_null() || step.concrete.is_null() {\n");
-    out.push_str("            crate::state::ConcreteValue::Null\n");
-    out.push_str("        } else {\n");
-    out.push_str("            crate::state::ConcreteValue::Ref(\n");
-    out.push_str("                pyre_object::w_slice_new(\n");
-    out.push_str("                    start.concrete.to_pyobj(),\n");
-    out.push_str("                    stop.concrete.to_pyobj(),\n");
-    out.push_str("                    step.concrete.to_pyobj(),\n");
-    out.push_str("                ),\n");
-    out.push_str("            )\n");
-    out.push_str("        };\n");
-    out.push_str("        let opref = self.trace_slice_constant(\n");
-    out.push_str("            start.opref, stop.opref, step.opref,\n");
-    out.push_str("            concrete.to_pyobj(),\n");
-    out.push_str("        )?;\n");
-    out.push_str("        Ok(crate::state::FrontendOp::new(opref, concrete))\n");
+    out.push_str("        let opref = self.with_ctx(|_this, ctx| {\n");
+    out.push_str("            let new_op = crate::helpers::emit_box_slice_inline(\n");
+    out.push_str("                ctx,\n");
+    out.push_str("                start.opref,\n");
+    out.push_str("                stop.opref,\n");
+    out.push_str("                step.opref,\n");
+    out.push_str("                crate::descr::w_slice_size_descr(),\n");
+    out.push_str("                crate::descr::slice_w_start_descr(),\n");
+    out.push_str("                crate::descr::slice_w_stop_descr(),\n");
+    out.push_str("                crate::descr::slice_w_step_descr(),\n");
+    out.push_str("            );\n");
+    out.push_str("            Ok::<_, pyre_interpreter::PyError>(new_op)\n");
+    out.push_str("        })?;\n");
+    out.push_str(
+        "        Ok(crate::state::FrontendOp::new(opref, crate::state::ConcreteValue::Null))\n",
+    );
     out.push_str("    }\n");
 
     out.push_str("}\n");

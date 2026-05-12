@@ -2205,27 +2205,66 @@ fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantData] {
     }
 }
 
+/// Materialise a single `ConstantData` into a `PyObjectRef`.
+///
+/// Line-by-line port of the `ConstantOpcodeHandler for PyFrame` impl
+/// (`eval.rs:1300-1352`) routed through `load_const_value`
+/// (`pyopcode.rs:343-394`). The blackhole's `bh_load_const_fn` lacks a
+/// `&mut PyFrame` to dispatch through the trait, so this free function
+/// mirrors each `*_constant` body directly. Variant order matches
+/// `pyopcode.rs::load_const_value` so future additions stay in sync.
 fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
     use crate::bytecode::ConstantData;
     use num_traits::ToPrimitive;
     match constant {
-        ConstantData::Integer { value } => {
-            pyre_object::intobject::w_int_new(value.to_i64().unwrap_or(0))
-        }
+        // `pyopcode.rs:347-353` — promote bigints to W_LongObject just
+        // like `load_const_value` does before invoking the trait.
+        ConstantData::Integer { value } => match value.to_i64() {
+            Some(v) => pyre_object::intobject::w_int_new(v),
+            None => pyre_object::longobject::w_long_new(value.clone()),
+        },
+        // `eval.rs:1309-1311 float_constant`.
         ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
-        ConstantData::Boolean { value } => {
-            pyre_object::intobject::w_int_new(if *value { 1 } else { 0 })
-        }
-        ConstantData::Str { value } => pyre_object::w_str_new(value.as_str().unwrap_or("")),
+        // `eval.rs:1313-1315 bool_constant` — bools must surface as
+        // W_BoolObject (`is space.w_True/w_False`), not W_IntObject.
+        ConstantData::Boolean { value } => pyre_object::w_bool_from(*value),
+        // `eval.rs:1317-1319 str_constant` — `box_str_constant` interns
+        // matching `space.newtext` per `unicodeobject.py wrapunicode`.
+        ConstantData::Str { value } => pyre_object::strobject::box_str_constant(
+            value.as_str().expect("non-UTF-8 string constant"),
+        ),
+        // `eval.rs:1321-1323 bytes_constant`.
+        ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
+        // `eval.rs:1325-1331 code_constant` — same pointer-cast helper.
+        ConstantData::Code { code } => crate::pycode::box_code_constant(code),
+        // `eval.rs:1333-1335 none_constant`.
         ConstantData::None => pyre_object::w_none(),
+        // `eval.rs:1337-1339 ellipsis_constant`.
         ConstantData::Ellipsis => pyre_object::noneobject::w_ellipsis(),
-        ConstantData::Slice { elements } if elements.len() == 3 => {
+        // `pyopcode.rs:360-366` — recurse + delegate to the default
+        // `build_tuple` body (`eval.rs:767 build_tuple_from_refs`).
+        ConstantData::Tuple { elements } => {
+            let items: Vec<PyObjectRef> = elements.iter().map(pyobject_from_constant).collect();
+            crate::runtime_ops::build_tuple_from_refs(&items)
+        }
+        // `pyopcode.rs:382-393` — recurse over `[start, stop, step]`
+        // before invoking `slice_constant` (`eval.rs:1341-1348`).
+        ConstantData::Slice { elements } => {
             let start = pyobject_from_constant(&elements[0]);
             let stop = pyobject_from_constant(&elements[1]);
             let step = pyobject_from_constant(&elements[2]);
             pyre_object::w_slice_new(start, stop, step)
         }
-        _ => pyre_object::w_none(),
+        // `pyopcode.rs:375-381` — recurse + delegate to
+        // `frozenset_constant` (`eval.rs:1350-1352`).
+        ConstantData::Frozenset { elements } => {
+            let items: Vec<PyObjectRef> = elements.iter().map(pyobject_from_constant).collect();
+            pyre_object::w_frozenset_from_items(&items)
+        }
+        // `pyopcode.rs:371-374` — Complex stub: route to the real-part
+        // `float_constant` per `load_const_value` until W_ComplexObject
+        // lands.
+        ConstantData::Complex { value } => pyre_object::floatobject::w_float_new(value.re),
     }
 }
 

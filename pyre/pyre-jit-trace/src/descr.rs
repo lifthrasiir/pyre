@@ -1105,6 +1105,50 @@ static DICT_STORAGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
+// `pypy/objspace/std/sliceobject.py:13` `W_SliceObject._immutable_fields_ =
+// ['w_start', 'w_stop', 'w_step']` — all three Ref fields are immutable
+// once `__init__` runs.  The `space.newslice(w_start, w_end, w_step)` JIT
+// shape allocates the W_SliceObject inline so the optimizer can virtualize
+// the three SetfieldGc writes when the slice never escapes (per
+// `optimizeopt/virtualize.py optimize_NEW_WITH_VTABLE`).
+static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::sliceobject::*;
+    build_object_descr_group(
+        W_SLICE_OBJECT_SIZE,
+        W_SLICE_GC_TYPE_ID,
+        &pyre_object::sliceobject::SLICE_TYPE as *const _ as usize,
+        &[
+            (
+                "W_SliceObject.w_start",
+                SLICE_START_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "W_SliceObject.w_stop",
+                SLICE_STOP_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "W_SliceObject.w_step",
+                SLICE_STEP_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+        ],
+    )
+});
+
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
@@ -1608,6 +1652,30 @@ pub fn w_range_iter_size_descr() -> DescrRef {
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for W_SliceObject allocation via NewWithVtable.
+/// vtable = &SLICE_TYPE (ob_type for virtual materialization).
+/// Mirrors `pypy/objspace/std/objspace.py:385` `space.newslice` →
+/// `W_SliceObject(w_start, w_end, w_step)` allocation shape.
+pub fn w_slice_size_descr() -> DescrRef {
+    W_SLICE_DESCR_GROUP.size_descr.clone()
+}
+
+/// `W_SliceObject.w_start` — `Ptr(W_Root)` per
+/// `sliceobject.py:13` `_immutable_fields_ = ['w_start', ...]`. Immutable.
+pub fn slice_w_start_descr() -> DescrRef {
+    field_descr_from_group(&W_SLICE_DESCR_GROUP, 0)
+}
+
+/// `W_SliceObject.w_stop` — `Ptr(W_Root)`. Immutable.
+pub fn slice_w_stop_descr() -> DescrRef {
+    field_descr_from_group(&W_SLICE_DESCR_GROUP, 1)
+}
+
+/// `W_SliceObject.w_step` — `Ptr(W_Root)`. Immutable.
+pub fn slice_w_step_descr() -> DescrRef {
+    field_descr_from_group(&W_SLICE_DESCR_GROUP, 2)
 }
 
 /// Cached SizeDescr for the host PyFrame virtualizable.

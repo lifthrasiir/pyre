@@ -340,23 +340,20 @@ impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
         stop: Self::Value,
         step: Self::Value,
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
-        use crate::helpers::TraceHelperAccess;
-        let concrete = if start.concrete.is_null() || stop.concrete.is_null() || step.concrete.is_null() {
-            crate::state::ConcreteValue::Null
-        } else {
-            crate::state::ConcreteValue::Ref(
-                pyre_object::w_slice_new(
-                    start.concrete.to_pyobj(),
-                    stop.concrete.to_pyobj(),
-                    step.concrete.to_pyobj(),
-                ),
-            )
-        };
-        let opref = self.trace_slice_constant(
-            start.opref, stop.opref, step.opref,
-            concrete.to_pyobj(),
-        )?;
-        Ok(crate::state::FrontendOp::new(opref, concrete))
+        let opref = self.with_ctx(|_this, ctx| {
+            let new_op = crate::helpers::emit_box_slice_inline(
+                ctx,
+                start.opref,
+                stop.opref,
+                step.opref,
+                crate::descr::w_slice_size_descr(),
+                crate::descr::slice_w_start_descr(),
+                crate::descr::slice_w_stop_descr(),
+                crate::descr::slice_w_step_descr(),
+            );
+            Ok::<_, pyre_interpreter::PyError>(new_op)
+        })?;
+        Ok(crate::state::FrontendOp::new(opref, crate::state::ConcreteValue::Null))
     }
 }
 

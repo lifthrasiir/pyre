@@ -1324,37 +1324,6 @@ impl ConcreteValue {
     }
 }
 
-/// Convert a bytecode constant to ConcreteValue.
-pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) -> ConcreteValue {
-    use pyre_interpreter::bytecode::ConstantData;
-    match constant {
-        ConstantData::Integer { value } => match i64::try_from(value).ok() {
-            Some(v) => ConcreteValue::Int(v),
-            None => ConcreteValue::Ref(pyre_object::w_long_new(value.clone())),
-        },
-        ConstantData::Float { value } => ConcreteValue::Float(*value),
-        ConstantData::Boolean { value } => ConcreteValue::Int(*value as i64),
-        ConstantData::Str { value } => ConcreteValue::Ref(pyre_object::w_str_new(
-            value.as_str().expect("non-UTF-8 string constant"),
-        )),
-        ConstantData::None => ConcreteValue::Ref(pyre_object::w_none()),
-        ConstantData::Slice { elements } if elements.len() == 3 => {
-            let start = load_const_concrete(&elements[0]);
-            let stop = load_const_concrete(&elements[1]);
-            let step = load_const_concrete(&elements[2]);
-            if start.is_null() || stop.is_null() || step.is_null() {
-                return ConcreteValue::Null;
-            }
-            ConcreteValue::Ref(pyre_object::w_slice_new(
-                start.to_pyobj(),
-                stop.to_pyobj(),
-                step.to_pyobj(),
-            ))
-        }
-        _ => ConcreteValue::Null,
-    }
-}
-
 use pyre_interpreter::DictStorage;
 
 use crate::descr::{
@@ -7189,7 +7158,7 @@ mod tests {
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
+                pre_opcode_semantic_depth: None,
             };
             trace_unbox_int_with_resume(
                 &mut state,
@@ -7623,7 +7592,7 @@ mod tests {
                 orgpc: 0,
                 concrete_frame_addr: 0,
                 pre_opcode_registers_r: None,
-            pre_opcode_semantic_depth: None,
+                pre_opcode_semantic_depth: None,
             };
 
             let loaded =
