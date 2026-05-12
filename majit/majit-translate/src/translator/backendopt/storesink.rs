@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 
 use crate::flowspace::model::{
-    BlockKey, BlockRef, ConcretetypePlaceholder, ConstValue, Constant, FunctionGraph, Hlvalue, LinkRef, SpaceOperation, Variable, mkentrymap,
+    BlockKey, BlockRef, ConcretetypePlaceholder, ConstValue, Constant, FunctionGraph, Hlvalue,
+    LinkRef, SpaceOperation, Variable, mkentrymap,
 };
 use crate::translator::backendopt::removenoops;
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;

@@ -6,9 +6,7 @@ use std::rc::Rc;
 use lexopt::Arg::*;
 use lexopt::ValueExt;
 
-use pyre_interpreter::call::{
-    register_build_class, set_build_class_exec_ctx, set_last_exec_ctx,
-};
+use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{

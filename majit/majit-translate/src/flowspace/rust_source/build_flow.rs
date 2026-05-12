@@ -33,7 +33,8 @@ use syn::{
 };
 
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, HOST_ENV, Hlvalue, Link,
+    SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::operation::{HLOperation, OpKind};
 

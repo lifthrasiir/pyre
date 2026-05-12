@@ -73,8 +73,8 @@ use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::objspace::CO_NEWLOCALS;
 use crate::flowspace::operation::{
-    ArithOps, cmp_fold, coerce_arith, coerce_int_pair, float_py_mod,
-    int_py_floor_div, int_py_mod, is_foldable_numeric, python_eq_const,
+    ArithOps, cmp_fold, coerce_arith, coerce_int_pair, float_py_mod, int_py_floor_div, int_py_mod,
+    is_foldable_numeric, python_eq_const,
 };
 use crate::flowspace::pygraph::PyGraph;
 

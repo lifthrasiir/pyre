@@ -1047,40 +1047,37 @@ impl MIFrame {
                 live_local_indices,
                 is_portal_bridge,
                 metadata_stack_depth,
-            ) =
-                if s.jitcode.is_null() {
-                    (Vec::new(), Vec::new(), Vec::new(), false, None)
-                } else {
-                    unsafe {
-                        let jc = &*s.jitcode;
-                        let live_local_indices = if jc.payload.code_ptr.is_null() {
-                            Vec::new()
-                        } else {
-                            let live_vars = crate::liveness::liveness_for(jc.payload.code_ptr);
-                            (0..s.nlocals)
-                                .filter(|&idx| live_vars.is_local_live(live_pc, idx))
-                                .collect()
-                        };
-                        (
-                            jc.payload.metadata.pyre_color_for_semantic_local.clone(),
-                            jc.payload.metadata.stack_slot_color_map.clone(),
-                            live_local_indices,
-                            jc.payload.is_portal_bridge(),
-                            jc.payload
-                                .metadata
-                                .depth_at_py_pc
-                                .get(live_pc)
-                                .copied()
-                                .map(|d| d as usize),
-                        )
-                    }
-                };
+            ) = if s.jitcode.is_null() {
+                (Vec::new(), Vec::new(), Vec::new(), false, None)
+            } else {
+                unsafe {
+                    let jc = &*s.jitcode;
+                    let live_local_indices = if jc.payload.code_ptr.is_null() {
+                        Vec::new()
+                    } else {
+                        let live_vars = crate::liveness::liveness_for(jc.payload.code_ptr);
+                        (0..s.nlocals)
+                            .filter(|&idx| live_vars.is_local_live(live_pc, idx))
+                            .collect()
+                    };
+                    (
+                        jc.payload.metadata.pyre_color_for_semantic_local.clone(),
+                        jc.payload.metadata.stack_slot_color_map.clone(),
+                        live_local_indices,
+                        jc.payload.is_portal_bridge(),
+                        jc.payload
+                            .metadata
+                            .depth_at_py_pc
+                            .get(live_pc)
+                            .copied()
+                            .map(|d| d as usize),
+                    )
+                }
+            };
             let valid_stack_only = if let Some(vsd) = portal_live_vsd {
                 vsd.saturating_sub(s.nlocals)
             } else if self.pre_opcode_registers_r.is_some() {
-                metadata_stack_depth.unwrap_or_else(|| {
-                    s.valuestackdepth.saturating_sub(s.nlocals)
-                })
+                metadata_stack_depth.unwrap_or_else(|| s.valuestackdepth.saturating_sub(s.nlocals))
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
             };
@@ -2779,9 +2776,7 @@ impl MIFrame {
             } else {
                 let read_color =
                     |color: usize| s.registers_r.get(color).copied().unwrap_or(OpRef::NONE);
-                let locals_vec: Vec<OpRef> = (0..nlocals)
-                    .map(|i| read_color(i))
-                    .collect();
+                let locals_vec: Vec<OpRef> = (0..nlocals).map(|i| read_color(i)).collect();
                 let live_stack_len = stack_only.min(target_stack_capacity);
                 let stack_vec: Vec<OpRef> = (0..live_stack_len)
                     .map(|d| read_color(nlocals + d))
@@ -3726,8 +3721,7 @@ impl MIFrame {
         let physical_array_len = concrete_frame
             .map(|f| f.locals_w().len())
             .unwrap_or_else(|| {
-                let current_vsd = self
-                    .pre_opcode_depth_or(sym.valuestackdepth);
+                let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
                 let stack_depth = current_vsd
                     .saturating_sub(sym.nlocals)
                     .min(symbolic_stack_len);
@@ -6493,64 +6487,66 @@ impl MIFrame {
 unsafe fn trace_check_exc_match_against(
     exc_value: pyre_object::PyObjectRef,
     exc_type: pyre_object::PyObjectRef,
-) -> bool { unsafe {
-    if !pyre_object::is_exception(exc_value) {
-        return true;
-    }
-    if pyre_object::is_tuple(exc_type) {
-        let n = pyre_object::w_tuple_len(exc_type) as i64;
-        for i in 0..n {
-            if let Some(elem) = pyre_object::w_tuple_getitem(exc_type, i) {
-                if trace_check_exc_match_against(exc_value, elem) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    let kind = pyre_object::w_exception_get_kind(exc_value);
-    if pyre_object::is_str(exc_type) {
-        let type_name = pyre_object::w_str_get_value(exc_type);
-        return pyre_object::exc_kind_matches(kind, type_name);
-    }
-    if pyre_interpreter::is_function(exc_type)
-        && pyre_interpreter::is_builtin_code(
-            pyre_interpreter::getcode(exc_type) as pyre_object::PyObjectRef
-        )
-    {
-        let type_name = pyre_interpreter::function_get_name(exc_type);
-        return pyre_object::exc_kind_matches(kind, type_name);
-    }
-    if pyre_object::is_type(exc_type) {
-        let type_name = pyre_object::w_type_get_name(exc_type);
-        if pyre_object::exc_kind_matches(kind, type_name) {
+) -> bool {
+    unsafe {
+        if !pyre_object::is_exception(exc_value) {
             return true;
         }
-        // ExcKind may not reflect the actual Python class hierarchy
-        // (e.g. FileNotFoundError created with ExcKind::Exception).
-        // Fall back to checking the exception's w_class MRO.
-        let w_class = (*exc_value).w_class;
-        if !w_class.is_null() && pyre_object::is_type(w_class) {
-            if std::ptr::eq(w_class, exc_type) {
-                return true;
-            }
-            let mro = pyre_object::w_type_get_mro(w_class);
-            if !mro.is_null() {
-                for &t in &*mro {
-                    if std::ptr::eq(t, exc_type) {
+        if pyre_object::is_tuple(exc_type) {
+            let n = pyre_object::w_tuple_len(exc_type) as i64;
+            for i in 0..n {
+                if let Some(elem) = pyre_object::w_tuple_getitem(exc_type, i) {
+                    if trace_check_exc_match_against(exc_value, elem) {
                         return true;
                     }
                 }
             }
+            return false;
         }
-        return false;
+        let kind = pyre_object::w_exception_get_kind(exc_value);
+        if pyre_object::is_str(exc_type) {
+            let type_name = pyre_object::w_str_get_value(exc_type);
+            return pyre_object::exc_kind_matches(kind, type_name);
+        }
+        if pyre_interpreter::is_function(exc_type)
+            && pyre_interpreter::is_builtin_code(
+                pyre_interpreter::getcode(exc_type) as pyre_object::PyObjectRef
+            )
+        {
+            let type_name = pyre_interpreter::function_get_name(exc_type);
+            return pyre_object::exc_kind_matches(kind, type_name);
+        }
+        if pyre_object::is_type(exc_type) {
+            let type_name = pyre_object::w_type_get_name(exc_type);
+            if pyre_object::exc_kind_matches(kind, type_name) {
+                return true;
+            }
+            // ExcKind may not reflect the actual Python class hierarchy
+            // (e.g. FileNotFoundError created with ExcKind::Exception).
+            // Fall back to checking the exception's w_class MRO.
+            let w_class = (*exc_value).w_class;
+            if !w_class.is_null() && pyre_object::is_type(w_class) {
+                if std::ptr::eq(w_class, exc_type) {
+                    return true;
+                }
+                let mro = pyre_object::w_type_get_mro(w_class);
+                if !mro.is_null() {
+                    for &t in &*mro {
+                        if std::ptr::eq(t, exc_type) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        // Unrecognised type-spec format — eval.rs:130+ falls through to the
+        // legacy isinstance helper.  At trace time we don't have that path
+        // ported yet; report a structural mismatch loudly so the caller
+        // surfaces a tracer regression rather than silently emitting True.
+        false
     }
-    // Unrecognised type-spec format — eval.rs:130+ falls through to the
-    // legacy isinstance helper.  At trace time we don't have that path
-    // ported yet; report a structural mismatch loudly so the caller
-    // surfaces a tracer regression rather than silently emitting True.
-    false
-}}
+}
 
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     match cv {

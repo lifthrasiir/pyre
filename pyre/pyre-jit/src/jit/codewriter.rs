@@ -26,8 +26,8 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState}
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, GraphFlattener, Insn, Kind, Operand,
-    Register, ResKind, SSARepr, TLabel, slot_for_call_flavor,
+    CallDescrStub, CallFlavor, GraphFlattener, Insn, Kind, Operand, Register, ResKind, SSARepr,
+    TLabel, slot_for_call_flavor,
 };
 
 // ---------------------------------------------------------------------------

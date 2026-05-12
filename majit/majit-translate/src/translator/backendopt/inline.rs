@@ -1478,7 +1478,6 @@ impl<'t> BaseInliner<'t> {
     /// per upstream `:172-173`. Returns the number of successful
     /// inlines.
     pub fn inline_all(&mut self) -> Result<usize, CannotInline> {
-        
         let mut count = 0usize;
         let mut non_recursive: std::collections::HashMap<usize, ()> =
             std::collections::HashMap::new();

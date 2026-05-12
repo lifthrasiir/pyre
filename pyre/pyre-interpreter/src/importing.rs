@@ -16,7 +16,6 @@ use crate::{CodeObject, Mode, compile_source_with_filename};
 use crate::{DictStorage, PyExecutionContext, dict_storage_store};
 use pyre_object::*;
 
-
 // ── sys.modules cache ────────────────────────────────────────────────
 // PyPy equivalent: space.sys.get('modules') — a dict mapping module names
 // to module objects. We use a thread-local HashMap<String, PyObjectRef>.
