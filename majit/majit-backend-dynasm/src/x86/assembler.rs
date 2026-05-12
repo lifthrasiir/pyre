@@ -2243,14 +2243,31 @@ impl<'a> Assembler386<'a> {
                 if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
-                    let (base_size, item_size) = op
+                    let (base_size, item_size, is_ref_array) = op
                         .descr
                         .as_ref()
                         .and_then(|d| d.as_array_descr())
-                        .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-                        .unwrap_or((0, 8));
+                        .map(|ad| {
+                            (
+                                ad.base_size() as i32,
+                                ad.item_size() as i32,
+                                ad.is_array_of_pointers(),
+                            )
+                        })
+                        .unwrap_or((0, 8, false));
                     let index_reg = crate::regloc::X86_64_SCRATCH_REG.value;
                     let value_reg = crate::regloc::X86_64_SCRATCH_REG_2.value;
+
+                    let store_may_need_wb = op.opcode == OpCode::SetarrayitemGc
+                        && is_ref_array
+                        && item_size as usize == WORD
+                        && !matches!(value_loc, Loc::Reg(val) if val.is_xmm)
+                        && !matches!(value_loc, Loc::Immed(i) if i.value == 0);
+                    if store_may_need_wb {
+                        let wb_op =
+                            Op::new(OpCode::CondCallGcWbArray, &[op.arg(0), op.arg(1)]);
+                        self.emit_write_barrier_fastpath(&wb_op, &arglocs[..2]);
+                    }
 
                     self.regalloc_mov(
                         index_loc,
