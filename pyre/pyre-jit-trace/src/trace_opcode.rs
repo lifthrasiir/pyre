@@ -2715,11 +2715,19 @@ impl MIFrame {
             // `concrete_value_at` and falls back to `PY_NULL` for dead
             // capacity slots — mirroring RPython's null-padded
             // virtualizable_boxes tail.
-            let reg_len = s.registers_r.len();
             let target_stack_capacity = target_array_capacity.saturating_sub(nlocals);
             let mut stack_types_vec =
                 s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())].to_vec();
             stack_types_vec.resize(target_stack_capacity, Type::Ref);
+            let (local_color_map, stack_color_map) = if s.jitcode.is_null() {
+                (Vec::new(), Vec::new())
+            } else {
+                let jc = unsafe { &*s.jitcode };
+                (
+                    jc.payload.metadata.pyre_color_for_semantic_local.clone(),
+                    jc.payload.metadata.stack_slot_color_map.clone(),
+                )
+            };
             // pyjitpl.py:2954-2965 `reached_loop_header` parity: read
             // both locals and stack values from the virtualizable shadow
             // (`virtualizable_boxes[NUM_VABLE_SCALARS + i]`). The shadow
@@ -2761,14 +2769,30 @@ impl MIFrame {
                     .collect();
                 (locals_vec, stack_vec)
             } else {
-                let locals_len = nlocals.min(reg_len);
-                let live_stack_len = stack_only.min(reg_len.saturating_sub(locals_len));
-                let stack_slice_start = locals_len;
-                let stack_slice_end = stack_slice_start + live_stack_len;
-                (
-                    s.registers_r[..locals_len].to_vec(),
-                    s.registers_r[stack_slice_start..stack_slice_end].to_vec(),
-                )
+                let read_color =
+                    |color: usize| s.registers_r.get(color).copied().unwrap_or(OpRef::NONE);
+                let locals_vec: Vec<OpRef> = (0..nlocals)
+                    .map(|i| {
+                        let color = local_color_map
+                            .get(i)
+                            .copied()
+                            .map(|c| c as usize)
+                            .unwrap_or(i);
+                        read_color(color)
+                    })
+                    .collect();
+                let live_stack_len = stack_only.min(target_stack_capacity);
+                let stack_vec: Vec<OpRef> = (0..live_stack_len)
+                    .map(|d| {
+                        let color = stack_color_map
+                            .get(d)
+                            .copied()
+                            .map(|c| c as usize)
+                            .unwrap_or(nlocals + d);
+                        read_color(color)
+                    })
+                    .collect();
+                (locals_vec, stack_vec)
             };
             stack_vec.resize(target_stack_capacity, OpRef::NONE);
             (
