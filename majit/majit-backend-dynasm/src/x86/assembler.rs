@@ -1152,24 +1152,36 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    fn emit_abi_call_rax(&mut self) {
+    fn emit_win64_call_adjust(extra_pushes: usize) -> i32 {
+        if extra_pushes & 1 == 0 {
+            40
+        } else {
+            32
+        }
+    }
+
+    fn emit_abi_call_rax_with_extra_pushes(&mut self, extra_pushes: usize) {
+        let _ = extra_pushes;
         #[cfg(target_os = "windows")]
-        dynasm!(self.mc ; .arch x64
-            ; sub rsp, 40
-            ; call rax
-            ; add rsp, 40
-        );
+        {
+            let adjust = Self::emit_win64_call_adjust(extra_pushes);
+            dynasm!(self.mc ; .arch x64
+                ; sub rsp, adjust
+                ; call rax
+                ; add rsp, adjust
+            );
+        }
         #[cfg(not(target_os = "windows"))]
         dynasm!(self.mc ; .arch x64 ; call rax);
     }
 
+    fn emit_abi_call_rax(&mut self) {
+        self.emit_abi_call_rax_with_extra_pushes(0);
+    }
+
     fn emit_abi_call_rax_aligned(&mut self) {
         #[cfg(target_os = "windows")]
-        dynasm!(self.mc ; .arch x64
-            ; sub rsp, 40
-            ; call rax
-            ; add rsp, 40
-        );
+        self.emit_abi_call_rax_with_extra_pushes(0);
         #[cfg(not(target_os = "windows"))]
         dynasm!(self.mc ; .arch x64
             ; sub rsp, 8
@@ -1179,25 +1191,26 @@ impl<'a> Assembler386<'a> {
     }
 
     fn emit_abi_call_rax_after_one_push(&mut self) {
+        self.emit_abi_call_rax_with_extra_pushes(1);
+    }
+
+    fn emit_abi_call_reg_with_extra_pushes(&mut self, reg: u8, extra_pushes: usize) {
+        let _ = extra_pushes;
         #[cfg(target_os = "windows")]
-        dynasm!(self.mc ; .arch x64
-            ; sub rsp, 32
-            ; call rax
-            ; add rsp, 32
-        );
+        {
+            let adjust = Self::emit_win64_call_adjust(extra_pushes);
+            dynasm!(self.mc ; .arch x64
+                ; sub rsp, adjust
+                ; call Rq(reg)
+                ; add rsp, adjust
+            );
+        }
         #[cfg(not(target_os = "windows"))]
-        dynasm!(self.mc ; .arch x64 ; call rax);
+        dynasm!(self.mc ; .arch x64 ; call Rq(reg));
     }
 
     fn emit_abi_call_reg(&mut self, reg: u8) {
-        #[cfg(target_os = "windows")]
-        dynasm!(self.mc ; .arch x64
-            ; sub rsp, 40
-            ; call Rq(reg)
-            ; add rsp, 40
-        );
-        #[cfg(not(target_os = "windows"))]
-        dynasm!(self.mc ; .arch x64 ; call Rq(reg));
+        self.emit_abi_call_reg_with_extra_pushes(reg, 0);
     }
 
     // ----------------------------------------------------------------
@@ -4658,13 +4671,13 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
                 );
-                self.emit_abi_call_rax();
+                self.emit_abi_call_rax_after_one_push();
             }
             ResolvedArg::Const(val) => {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val as i64
                 );
-                self.emit_abi_call_rax();
+                self.emit_abi_call_rax_after_one_push();
             }
         }
 
@@ -4702,20 +4715,20 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, [rbp + offset]
                 );
-                self.emit_abi_call_rax();
+                self.emit_abi_call_rax_after_one_push();
             }
             Some(Loc::Reg(r)) => {
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, Rq(r.value)
                 );
-                self.emit_abi_call_rax();
+                self.emit_abi_call_rax_after_one_push();
             }
             Some(Loc::Immed(i)) => {
                 let val = i.value;
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD val
                 );
-                self.emit_abi_call_rax();
+                self.emit_abi_call_rax_after_one_push();
             }
             _ => {}
         }
@@ -5380,7 +5393,7 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64
             ; mov rax, QWORD helper
         );
-        self.emit_abi_call_rax();
+        self.emit_abi_call_rax_after_one_push();
         // Restore XMM
         dynasm!(self.mc ; .arch x64
             ; movaps xmm0, [rsp]
