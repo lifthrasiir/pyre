@@ -4587,20 +4587,6 @@ impl CodeWriter {
                             },
                         )
                         .emit_space_operation(&graph_op);
-                    } else if let Some(jdindex) = portal_jd_index {
-                        // jtransform.py:1714 handle_jit_marker__loop_header
-                        // asserts `jd is not None` — only emit when this
-                        // compilation belongs to a registered jitdriver.
-                        let loop_header_op = emit_graph_op_void(
-                            &current_block.block(),
-                            "loop_header",
-                            vec![super::flow::Constant::signed(jdindex as i64).into()],
-                            py_pc as i64,
-                        );
-                        GraphFlattener::new(&mut ssarepr, |_variable| {
-                            unreachable!("loop_header graph op does not carry Variables")
-                        })
-                        .emit_space_operation(&loop_header_op);
                     }
                 }
 
@@ -9962,11 +9948,11 @@ mod tests {
             .callcontrol()
             .find_compiled_jitcode_arc(code_ptr)
             .expect("make_jitcodes must populate the registered portal");
-        assert!(
-            pyjit.merge_point_pc.is_some(),
-            "registered portal with no hint should infer its first loop header"
-        );
         assert_eq!(pyjit.jitcode.jitdriver_sd(), Some(0));
+        assert!(
+            pyjit.jitcode.exec.jit_merge_point_offset.is_some(),
+            "registered portal with no hint should still emit portal jit_merge_point bytecode"
+        );
     }
 
     #[test]
