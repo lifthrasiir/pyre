@@ -21027,7 +21027,14 @@ mod tests {
 
     #[test]
     fn test_cond_call_gc_wb_executes_with_configured_runtime() {
-        let mut backend = make_gc_backend();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let obj = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, 0, 16);
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -21047,12 +21054,7 @@ mod tests {
         let mut token = JitCellToken::new(1503);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
-        let mut raw = vec![0u64; 2];
-        unsafe {
-            *(raw.as_mut_ptr() as *mut GcHeader) = GcHeader::with_flags(9, flags::TRACK_YOUNG_PTRS);
-        }
-        let obj = GcRef(raw.as_mut_ptr() as usize + GcHeader::SIZE);
-
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
         backend.execute_token(&token, &[Value::Ref(obj)]);
         assert!(!unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
     }
