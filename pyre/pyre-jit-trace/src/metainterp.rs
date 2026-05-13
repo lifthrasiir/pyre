@@ -248,7 +248,10 @@ impl PyreMetaInterp {
                             // No compiled targets for this loop — continue tracing.
                             // RPython: reached_loop_header returns without closing.
                             let top = self.framestack.last_mut().unwrap();
-                            top.pc = pc;
+                            top.pc = target_pc;
+                            if let Some(ref mut cf) = top.owned_concrete_frame {
+                                cf.set_last_instr_from_next_instr(target_pc);
+                            }
                             return LoopAction::Continue;
                         }
                     }
