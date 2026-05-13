@@ -5092,8 +5092,74 @@ mod tests {
     #[test]
     fn test_number_boxes_uses_replacement_type_for_virtual_classification() {
         use majit_ir::OpRef;
+        struct RefOnlyVirtualEnv {
+            constants: HashMap<u32, (i64, majit_ir::Type)>,
+            replacements: HashMap<u32, majit_ir::OpRef>,
+            types: HashMap<u32, majit_ir::Type>,
+            virtuals: std::collections::HashSet<u32>,
+            virtual_fields: HashMap<u32, majit_ir::VirtualFieldsInfo>,
+        }
+
+        impl RefOnlyVirtualEnv {
+            fn new() -> Self {
+                Self {
+                    constants: HashMap::new(),
+                    replacements: HashMap::new(),
+                    types: HashMap::new(),
+                    virtuals: std::collections::HashSet::new(),
+                    virtual_fields: HashMap::new(),
+                }
+            }
+        }
+
+        impl BoxEnv for RefOnlyVirtualEnv {
+            fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+                self.replacements
+                    .get(&opref.raw())
+                    .copied()
+                    .unwrap_or(opref)
+            }
+
+            fn get_box_replacement_not_const(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
+                self.get_box_replacement(opref)
+            }
+
+            fn is_const(&self, opref: majit_ir::OpRef) -> bool {
+                self.constants.contains_key(&opref.raw())
+            }
+
+            fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
+                self.constants
+                    .get(&opref.raw())
+                    .copied()
+                    .unwrap_or((0, majit_ir::Type::Int))
+            }
+
+            fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
+                self.types
+                    .get(&opref.raw())
+                    .copied()
+                    .unwrap_or(majit_ir::Type::Int)
+            }
+
+            fn is_virtual_ref(&self, opref: majit_ir::OpRef) -> bool {
+                self.virtuals.contains(&opref.raw())
+            }
+
+            fn is_virtual_raw(&self, _opref: majit_ir::OpRef) -> bool {
+                false
+            }
+
+            fn get_virtual_fields(
+                &self,
+                opref: majit_ir::OpRef,
+            ) -> Option<majit_ir::VirtualFieldsInfo> {
+                self.virtual_fields.get(&opref.raw()).cloned()
+            }
+        }
+
         let mut memo = ResumeDataLoopMemo::new();
-        let mut env = SimpleBoxEnv::new();
+        let mut env = RefOnlyVirtualEnv::new();
 
         // RPython resume.py reads box.type after get_box_replacement().
         // Model a stale Int-typed snapshot slot that now forwards to a Ref
