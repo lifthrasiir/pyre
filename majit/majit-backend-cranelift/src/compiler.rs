@@ -3863,6 +3863,12 @@ extern "C" fn gc_malloc_unicode_helper(type_id: u64, length: u64) -> u64 {
 /// frames live outside any managed heap and need no barrier, so behave
 /// like `write_barrier_if_managed` and silently skip.
 extern "C" fn gc_write_barrier_shim(obj: u64) {
+    with_cranelift_gc(|gc| gc.write_barrier(GcRef(obj as usize)));
+}
+
+/// aarch64/assembler.py:342 get_write_barrier_fn() after the inline
+/// COND_CALL_GC_WB flag test has already fired.
+extern "C" fn gc_jit_remember_young_pointer_shim(obj: u64) {
     with_cranelift_gc(|gc| gc.jit_remember_young_pointer(GcRef(obj as usize)));
 }
 
@@ -10609,7 +10615,7 @@ impl CraneliftBackend {
                             &mut builder,
                             ptr_type,
                             call_conv,
-                            gc_write_barrier_shim as *const () as usize,
+                            gc_jit_remember_young_pointer_shim as *const () as usize,
                             &[obj],
                             None,
                         );
