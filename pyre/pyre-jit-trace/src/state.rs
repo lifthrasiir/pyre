@@ -6481,6 +6481,7 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
+            suppress_guard_no_exception_for_opcode: false,
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
@@ -6523,6 +6524,7 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
+            suppress_guard_no_exception_for_opcode: false,
         };
 
         let err = OpcodeStepExecutor::reraise(&mut state, 1).expect_err("reraise should raise");
