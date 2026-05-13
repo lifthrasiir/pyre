@@ -2261,10 +2261,13 @@ fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectR
             let items: Vec<PyObjectRef> = elements.iter().map(pyobject_from_constant).collect();
             pyre_object::w_frozenset_from_items(&items)
         }
-        // `pyopcode.rs:371-374` — Complex stub: route to the real-part
-        // `float_constant` per `load_const_value` until W_ComplexObject
-        // lands.
-        ConstantData::Complex { value } => pyre_object::floatobject::w_float_new(value.re),
+        ConstantData::Complex { value } => {
+            if value.im == 0.0 {
+                pyre_object::floatobject::w_float_new(value.re)
+            } else {
+                panic!("complex literals with nonzero imaginary part not yet supported");
+            }
+        }
     }
 }
 
