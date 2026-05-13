@@ -6431,6 +6431,7 @@ impl MIFrame {
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
+        self.suppress_guard_no_exception_for_opcode = false;
         // Keep inline-frame guard capture aligned with the root-frame path:
         // only opcodes that can actually reach a guard carry an opcode-start
         // snapshot, and specific guard paths may still suppress it.
@@ -6555,7 +6556,7 @@ impl MIFrame {
                 return InlineTraceStepAction::Trace(self.handle_possible_exception(code, pc));
             }
         }
-        if instruction_may_raise(instruction) {
+        if instruction_may_raise(instruction) && !self.suppress_guard_no_exception_for_opcode {
             let exc_action = self.handle_possible_exception(code, pc);
             if !matches!(exc_action, TraceAction::Continue) {
                 return InlineTraceStepAction::Trace(exc_action);
