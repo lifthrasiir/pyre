@@ -3870,7 +3870,6 @@ fn assemble_peeled_trace_with_jump_args(
         filtered_extra_label_args.push(label_arg);
         filtered_extra_jump_args.push(jump_arg);
     }
-
     let next_free_pos = |mut next: u32| {
         next = next.max(inputarg_base + body_num_inputs as u32);
         while constants.contains_key(&next) {
@@ -4025,6 +4024,7 @@ fn assemble_peeled_trace_with_jump_args(
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
     let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut fallthrough_aliases = Vec::new();
     {
         let mut seen_body_defs = std::collections::HashSet::new();
         for op in p2_ops {
@@ -4051,6 +4051,25 @@ fn assemble_peeled_trace_with_jump_args(
                 {
                     continue;
                 }
+                // RPython Box identity parity: Phase 2 may forward a
+                // preamble-defined Box to a fresh body-visible Box. The
+                // Label carries the forwarded Box, but first fall-through
+                // only has the preamble source; pyre's flat OpRef model
+                // needs an explicit SameAs bridge before the Label.
+                if let Some(source) = preamble_defs
+                    .iter()
+                    .copied()
+                    .find(|&source| source != arg && ctx.get_box_replacement(source) == arg)
+                {
+                    let tp = ctx
+                        .opref_type(arg)
+                        .or_else(|| ctx.opref_type(source))
+                        .or_else(|| arg.ty())
+                        .unwrap_or(Type::Int);
+                    let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[source]);
+                    same_as.pos = arg;
+                    fallthrough_aliases.push(same_as);
+                }
                 full_label_args.push(arg);
                 label_set.insert(arg);
             }
@@ -4060,12 +4079,6 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    // RPython Box identity parity: in RPython, the JUMP's Box IS the
-    // label's Box — no mapping needed. The flat OpRef model previously
-    // required a Phase 1 end_arg → label_arg SameAs bridge here for cases
-    // where the two diverged. Probe across 14 benchmarks (both backends)
-    // showed this block fires 0 times after Commit D1/D2's disjoint Phase
-    // 2 OpRef range eliminated the divergence cases. Removed.
     let mut label_op = Op::new(OpCode::Label, &full_label_args);
     // resoperation.py:260 AbstractResOp.type = 'v' default — Label has no
     // result Box, so its OpRef position carries the Void tag rather than
@@ -4073,6 +4086,7 @@ fn assemble_peeled_trace_with_jump_args(
     // shadows a real Box-bearing op at the same raw position.
     label_op.pos = OpRef::op_typed(label_pos, label_op.result_type());
     label_op.descr = loop_label_descr;
+    result.extend(fallthrough_aliases);
     result.push(label_op);
 
     // Body: 2-pass remap (inputarg refs -> label args, body results -> fresh boxes)
