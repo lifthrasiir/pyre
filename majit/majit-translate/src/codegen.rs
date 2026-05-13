@@ -1473,6 +1473,109 @@ pub fn generated_list_setitem_by_strategy(
     }
 }
 
+/// Trace same-length list slice assignment for the strategy-preserving case:
+/// ```text
+///     list[start:stop:1] = other_list
+/// ```
+///
+/// PyPy's `AbstractUnwrappedStrategy.setslice` mutates the underlying
+/// strategy storage directly when both lists have the same strategy.  This
+/// helper deliberately handles only the no-resize case; same-list replacement
+/// can only enter this path for full-list replacement, so the forward copy is
+/// harmless. Other cases fall back to the generic STORE_SUBSCR residual path
+/// rather than risking an incorrect partial port of listobject.py's resizing
+/// and overlap rules.
+#[inline]
+pub fn generated_list_setslice_same_len_by_strategy(
+    frame: &mut crate::state::MIFrame,
+    ctx: &mut majit_metainterp::TraceCtx,
+    obj: majit_ir::OpRef,
+    value: majit_ir::OpRef,
+    raw_start: i64,
+    raw_stop: i64,
+    start: i64,
+    stop: i64,
+    strategy_id: i64,
+    obj_len: usize,
+    value_len: usize,
+) {
+    frame.guard_class(
+        ctx,
+        obj,
+        &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+    );
+    frame.guard_class(
+        ctx,
+        value,
+        &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType,
+    );
+    frame.guard_list_strategy(ctx, obj, strategy_id);
+    frame.guard_list_strategy(ctx, value, strategy_id);
+
+    let len_descr = list_len_descr_for_strategy(strategy_id);
+    let obj_len_box = crate::state::opimpl_getfield_gc_i(ctx, obj, len_descr.clone());
+    if raw_start == start && raw_stop == stop {
+        let raw_stop_box = ctx.const_int(raw_stop);
+        let lower_bound_ok =
+            ctx.record_op(majit_ir::OpCode::IntGe, &[obj_len_box, raw_stop_box]);
+        frame.generate_guard(ctx, majit_ir::OpCode::GuardTrue, &[lower_bound_ok]);
+    } else {
+        frame.implement_guard_value(ctx, obj_len_box, obj_len as i64);
+    }
+    let value_len_box = crate::state::opimpl_getfield_gc_i(ctx, value, len_descr);
+    frame.implement_guard_value(ctx, value_len_box, value_len as i64);
+
+    match strategy_id {
+        0 => {
+            let dst_items = load_items_block(ctx, obj, crate::descr::list_items_descr());
+            let src_items = load_items_block(ctx, value, crate::descr::list_items_descr());
+            for i in 0..value_len {
+                let src_idx = ctx.const_int(i as i64);
+                let dst_idx = ctx.const_int(start + i as i64);
+                let item = crate::state::trace_items_block_getitem_value(ctx, src_items, src_idx);
+                crate::state::trace_items_block_setitem_value(ctx, dst_items, dst_idx, item);
+            }
+        }
+        1 => {
+            let dst_items =
+                crate::state::opimpl_getfield_gc_i(ctx, obj, crate::descr::list_int_items_ptr_descr());
+            let src_items = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                value,
+                crate::descr::list_int_items_ptr_descr(),
+            );
+            for i in 0..value_len {
+                let src_idx = ctx.const_int(i as i64);
+                let dst_idx = ctx.const_int(start + i as i64);
+                let item = crate::state::trace_raw_int_array_getitem_value(ctx, src_items, src_idx);
+                crate::state::trace_raw_int_array_setitem_value(ctx, dst_items, dst_idx, item);
+            }
+        }
+        2 => {
+            let dst_items = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                obj,
+                crate::descr::list_float_items_ptr_descr(),
+            );
+            let src_items = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                value,
+                crate::descr::list_float_items_ptr_descr(),
+            );
+            for i in 0..value_len {
+                let src_idx = ctx.const_int(i as i64);
+                let dst_idx = ctx.const_int(start + i as i64);
+                let item =
+                    crate::state::trace_raw_float_array_getitem_value(ctx, src_items, src_idx);
+                crate::state::trace_raw_float_array_setitem_value(ctx, dst_items, dst_idx, item);
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    debug_assert_eq!(stop - start, value_len as i64);
+}
+
 /// Unbox a Python int into a raw i64 for the int-strategy list path.
 /// `unbox_long=true` selects `trace_unbox_long_with_resume(LONG_TYPE)` to
 /// accept fits_int W_LongObject (`listobject.py:1957-1958 IntegerListStrategy

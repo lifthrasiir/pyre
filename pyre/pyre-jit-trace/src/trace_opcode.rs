@@ -195,9 +195,75 @@ use pyre_object::{
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
 };
 
+fn const_step_one_slice_bounds(
+    concrete_obj: PyObjectRef,
+    concrete_key: PyObjectRef,
+    concrete_value: PyObjectRef,
+) -> Option<(i64, i64, i64, i64, bool)> {
+    unsafe {
+        if concrete_obj.is_null()
+            || concrete_key.is_null()
+            || concrete_value.is_null()
+            || !is_list(concrete_obj)
+            || !pyre_object::sliceobject::is_slice(concrete_key)
+            || !is_list(concrete_value)
+        {
+            return None;
+        }
+        let step = pyre_object::sliceobject::w_slice_get_step(concrete_key);
+        let step_is_none = pyre_object::is_none(step);
+        let step_is_one = if step_is_none {
+            true
+        } else if is_int(step) {
+            pyre_object::w_int_get_value(step) == 1
+        } else {
+            false
+        };
+        if !step_is_one {
+            return None;
+        }
+        let start = pyre_object::sliceobject::w_slice_get_start(concrete_key);
+        let stop = pyre_object::sliceobject::w_slice_get_stop(concrete_key);
+        if pyre_object::is_none(start)
+            || pyre_object::is_none(stop)
+            || !is_int(start)
+            || !is_int(stop)
+        {
+            return None;
+        }
+        let start = pyre_object::w_int_get_value(start);
+        let stop = pyre_object::w_int_get_value(stop);
+        if start < 0 || stop < start {
+            return None;
+        }
+        let len = w_list_len(concrete_obj) as i64;
+        // PyPy `W_ListObject.descr_setitem` routes slices through
+        // `_unpack_slice` before `setslice`, so storage-level code sees
+        // adjusted positive-step bounds, not the raw slice fields.  This
+        // helper only accepts non-negative constant bounds, so adjustment
+        // reduces to CPython/PyPy's upper clamp.
+        Some((start, stop, start.min(len), stop.min(len), step_is_none))
+    }
+}
+
+fn concrete_list_strategy_id(concrete: PyObjectRef) -> Option<i64> {
+    unsafe {
+        if w_list_uses_object_storage(concrete) {
+            Some(0)
+        } else if w_list_uses_int_storage(concrete) {
+            Some(1)
+        } else if w_list_uses_float_storage(concrete) {
+            Some(2)
+        } else {
+            None
+        }
+    }
+}
+
 use crate::descr::{
     dict_storage_values_len_descr, dict_storage_values_ptr_descr, float_floatval_descr,
-    int_intval_descr, list_strategy_descr, ob_type_descr, w_float_size_descr, w_int_size_descr,
+    int_intval_descr, list_strategy_descr, ob_type_descr, slice_w_start_descr, slice_w_step_descr,
+    slice_w_stop_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
@@ -4508,6 +4574,67 @@ impl MIFrame {
         concrete_key: PyObjectRef,
         concrete_value: PyObjectRef,
     ) -> Result<(), PyError> {
+        if let Some((raw_start, raw_stop, start, stop, step_is_none)) =
+            const_step_one_slice_bounds(concrete_obj, concrete_key, concrete_value)
+        {
+            let specialized_same_len = unsafe {
+                let obj_len = w_list_len(concrete_obj);
+                let value_len = w_list_len(concrete_value);
+                let slice_len = (stop - start) as usize;
+                if value_len == slice_len {
+                    match (
+                        concrete_list_strategy_id(concrete_obj),
+                        concrete_list_strategy_id(concrete_value),
+                    ) {
+                        (Some(obj_sid), Some(value_sid)) if obj_sid == value_sid => {
+                            Some((obj_sid, obj_len, value_len))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((strategy_id, obj_len, value_len)) = specialized_same_len {
+                self.with_ctx(|this, ctx| {
+                    this.guard_class(
+                        ctx,
+                        key,
+                        &pyre_object::sliceobject::SLICE_TYPE as *const _
+                            as *const pyre_object::PyType,
+                    );
+                    let start_box =
+                        crate::state::opimpl_getfield_gc_r(ctx, key, slice_w_start_descr());
+                    this.guard_int_object_value(ctx, start_box, raw_start);
+                    let stop_box =
+                        crate::state::opimpl_getfield_gc_r(ctx, key, slice_w_stop_descr());
+                    this.guard_int_object_value(ctx, stop_box, raw_stop);
+                    let step_box =
+                        crate::state::opimpl_getfield_gc_r(ctx, key, slice_w_step_descr());
+                    if step_is_none {
+                        this.implement_guard_value(ctx, step_box, pyre_object::w_none() as i64);
+                    } else {
+                        this.guard_int_object_value(ctx, step_box, 1);
+                    }
+                    crate::generated_list_setslice_same_len_by_strategy(
+                        this,
+                        ctx,
+                        obj,
+                        value,
+                        raw_start,
+                        raw_stop,
+                        start,
+                        stop,
+                        strategy_id,
+                        obj_len,
+                        value_len,
+                    );
+                    Ok::<_, PyError>(())
+                })?;
+                self.suppress_guard_no_exception_for_opcode = true;
+                return Ok(());
+            }
+        }
         // jtransform do_resizable_list_setitem dispatch.
         let handled: bool = self.with_ctx(|this, ctx| {
             Ok::<_, PyError>(crate::generated_store_subscr_value(

@@ -368,7 +368,20 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_build_list(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| emit_trace_build_flat(ctx, FlatBuildKind::List, items))
+        self.with_trace_ctx(|ctx| {
+            // STRUCTURAL ADAPTATION: PyPy lowers `newlist(*items)` as
+            // trace-visible allocation + item stores, so virtual boxed items
+            // remain live through the list construction naturally.  Pyre still
+            // routes flat list construction through an opaque helper call;
+            // dynasm can otherwise drop a virtual item that is only consumed by
+            // that helper (`list_setslice`: `[i, i+1, i+2]` lost item2).  Keep
+            // item OpRefs pinned until list construction is ported to the
+            // PyPy/RPython `newlist` allocation shape.
+            for &item in items {
+                ctx.record_op(OpCode::Keepalive, &[item]);
+            }
+            emit_trace_build_flat(ctx, FlatBuildKind::List, items)
+        })
     }
 
     fn trace_build_tuple(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {

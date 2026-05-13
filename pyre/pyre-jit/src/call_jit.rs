@@ -3577,7 +3577,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
 /// RPython bhimpl_newlist: create a list from N items.
 /// argc is a raw integer count; items follow as PyObjectRef args.
 /// Blackhole's call_may_force_ref passes args from registers.
-pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64) -> i64 {
+pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64, item2: i64) -> i64 {
     let n = argc as usize;
     let items: Vec<pyre_object::PyObjectRef> = match n {
         0 => vec![],
@@ -3586,9 +3586,30 @@ pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64) -> i64 {
             item0 as pyre_object::PyObjectRef,
             item1 as pyre_object::PyObjectRef,
         ],
-        _ => vec![], // argc > 2 not supported via this helper
+        3 => vec![
+            item0 as pyre_object::PyObjectRef,
+            item1 as pyre_object::PyObjectRef,
+            item2 as pyre_object::PyObjectRef,
+        ],
+        _ => vec![], // argc > 3 not supported via this helper
     };
     pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
+}
+
+/// BUILD_SLICE: `space.newslice(w_start, w_end, w_step)`.
+/// `argc` is 2 or 3; for argc=2 the CPython/PyPy opcode semantics use None
+/// for `w_step` (`pypy/interpreter/pyopcode.py:1463-1472`).
+pub extern "C" fn bh_build_slice_fn(argc: i64, start: i64, stop: i64, step: i64) -> i64 {
+    let step = if argc == 2 {
+        pyre_object::w_none()
+    } else {
+        step as pyre_object::PyObjectRef
+    };
+    pyre_object::w_slice_new(
+        start as pyre_object::PyObjectRef,
+        stop as pyre_object::PyObjectRef,
+        step,
+    ) as i64
 }
 
 pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {

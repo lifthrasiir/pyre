@@ -1253,11 +1253,11 @@ pub fn is_graph_only_artifact(insn: &Insn) -> bool {
     }
     matches!(
         opname.as_str(),
-        // Container subscript store / unary / call / list construction
-        // (emit_frontend_{setitem,bool,neg,simple_call,newlist}).
+        // Container subscript store / unary / call / sequence construction
+        // (emit_frontend_{setitem,bool,neg,simple_call,newlist,newslice}).
         // `setattr` and `getattr` are intentionally NOT here — see
         // function-level docstring for the abort_permanent rationale.
-        "setitem" | "bool" | "neg" | "simple_call" | "newlist"
+        "setitem" | "bool" | "neg" | "simple_call" | "newlist" | "newslice"
     )
 }
 
@@ -3098,23 +3098,23 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
 /// `newlist(items)` HLOp via `emit_frontend_newlist`); this is a
 /// clean factor refactor with no asymmetry.
 ///
-/// `build_list_fn` has C ABI `extern "C" fn(i64, i64, i64)` —
-/// always 3 i64 parameters dispatched internally by the leading
-/// `argc` (`bh_build_list_fn` per `cpu.rs`).  The trailing 2 slots
+/// `build_list_fn` has C ABI `extern "C" fn(i64, i64, i64, i64)` —
+/// always 4 i64 parameters dispatched internally by the leading
+/// `argc` (`bh_build_list_fn` per `cpu.rs`).  The trailing 3 slots
 /// hold real boxed-Ref pointers when the corresponding item is
 /// present, or `0` (dummy bit pattern, routed through the int
 /// constants pool per `make_three_lists` jtransform.py:437-445)
-/// when absent.  Per codewriter.rs:5945-5954, `argc > 2` falls
+/// when absent.  Per codewriter.rs:5945-5954, `argc > 3` falls
 /// through to `emit_abort_permanent` and never invokes this
-/// helper, so `argc ∈ {0, 1, 2}`.
+/// helper, so `argc ∈ {0, 1, 2, 3}`.
 ///
 /// Inline arg order from `emit_residual_call_shape` for call-args
 /// `[ConstInt(argc), maybe_Reg_or_ConstInt(item0),
-/// maybe_Reg_or_ConstInt(item1)]`:
+/// maybe_Reg_or_ConstInt(item1), maybe_Reg_or_ConstInt(item2)]`:
 ///   * `args_i` = leading argc + each absent item's `0` dummy.
 ///   * `args_r` = each present item's Reg.
 ///   * `arg_kinds` preserves call-order (NOT bucket-order): always
-///     `[Int, item0_kind, item1_kind]` where each item kind is
+///     `[Int, item0_kind, item1_kind, item2_kind]` where each item kind is
 ///     `Ref` when present and `Int` when dummy.
 ///
 /// Both `ListI` and `ListR` are always pushed because `args_i` is
@@ -3139,18 +3139,18 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     dst_reg: u16,
 ) -> Insn {
     debug_assert!(
-        argc <= 2,
-        "BuildList helper only supports argc ∈ {{0, 1, 2}}"
+        argc <= 3,
+        "BuildList helper only supports argc ∈ {{0, 1, 2, 3}}"
     );
     debug_assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
-    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(3);
-    let mut args_i: Vec<Operand> = Vec::with_capacity(3);
-    let mut args_r: Vec<Operand> = Vec::with_capacity(2);
+    let mut arg_kinds: Vec<Kind> = Vec::with_capacity(4);
+    let mut args_i: Vec<Operand> = Vec::with_capacity(4);
+    let mut args_r: Vec<Operand> = Vec::with_capacity(3);
     // Leading argc slot — always Int.
     arg_kinds.push(Kind::Int);
     args_i.push(Operand::ConstInt(argc as i64));
-    // Trailing 2 slots — Ref if present, Int dummy `0` if absent.
-    for i in 0..2 {
+    // Trailing 3 slots — Ref if present, Int dummy `0` if absent.
+    for i in 0..3 {
         if i < argc {
             arg_kinds.push(Kind::Ref);
             args_r.push(Operand::Register(Register::new(Kind::Ref, arg_regs[i])));
@@ -3169,6 +3169,49 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
         "residual_call_ir_r",
         vec![
             Operand::ConstInt(build_list_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, args_i)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, args_r)),
+            descr_operand,
+        ],
+        Register::new(Kind::Ref, dst_reg),
+    )
+}
+
+/// Construct the BUILD_SLICE helper call.  Mirrors
+/// `pypy/interpreter/pyopcode.py:1463-1472`: argc is 2 or 3, start/stop are
+/// refs, and step is either a ref (argc=3) or an ignored int dummy (argc=2).
+pub fn build_build_slice_fn_residual_call_ir_r_insn(
+    build_slice_fn_idx: u16,
+    argc: usize,
+    start_reg: u16,
+    stop_reg: u16,
+    step_reg: Option<u16>,
+    dst_reg: u16,
+) -> Insn {
+    debug_assert!(argc == 2 || argc == 3, "BUILD_SLICE argc must be 2 or 3");
+    let mut arg_kinds = vec![Kind::Int, Kind::Ref, Kind::Ref];
+    let mut args_i = vec![Operand::ConstInt(argc as i64)];
+    let mut args_r = vec![
+        Operand::Register(Register::new(Kind::Ref, start_reg)),
+        Operand::Register(Register::new(Kind::Ref, stop_reg)),
+    ];
+    if let Some(step_reg) = step_reg {
+        arg_kinds.push(Kind::Ref);
+        args_r.push(Operand::Register(Register::new(Kind::Ref, step_reg)));
+    } else {
+        arg_kinds.push(Kind::Int);
+        args_i.push(Operand::ConstInt(0));
+    }
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds,
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(build_slice_fn_idx as i64),
             Operand::ListOfKind(ListOfKind::new(Kind::Int, args_i)),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, args_r)),
             descr_operand,
@@ -4847,7 +4890,15 @@ mod tests {
         }
         // Out-of-family opnames must return None so the lowering
         // arm falls through.
-        for opname in ["lt", "bool", "neg", "simple_call", "setitem", "newlist"] {
+        for opname in [
+            "lt",
+            "bool",
+            "neg",
+            "simple_call",
+            "setitem",
+            "newlist",
+            "newslice",
+        ] {
             assert_eq!(
                 binary_op_tag_for_opname(opname),
                 None,

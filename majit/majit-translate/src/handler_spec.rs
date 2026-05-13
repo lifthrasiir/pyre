@@ -166,10 +166,10 @@ fn emit_constant_impl(out: &mut String) {
     // `pypy/interpreter/pyopcode.py:1463 BUILD_SLICE` →
     // `op.newslice(w_start, w_end, w_step)` so the three operands stay
     // live in the trace as field dependencies (NewWithVtable + 3
-    // SetfieldGc per `emit_box_slice_inline`). `concrete` is left
-    // `Null`: every iteration allocates a distinct W_SliceObject, so
-    // there is no canonical concrete heap pointer to box — matching
-    // the `bool_value_from_truth` shape for fresh-per-iteration values.
+    // SetfieldGc per `emit_box_slice_inline`). The concrete shadow mirrors
+    // the root interpreter's W_SliceObject so STORE_SUBSCR can take the same
+    // list slice-assignment specialization decision PyPy takes after
+    // `space.newslice(...)`.
     out.push('\n');
     out.push_str("    fn slice_constant(\n");
     out.push_str("        &mut self,\n");
@@ -190,9 +190,14 @@ fn emit_constant_impl(out: &mut String) {
     out.push_str("            );\n");
     out.push_str("            Ok::<_, pyre_interpreter::PyError>(new_op)\n");
     out.push_str("        })?;\n");
-    out.push_str(
-        "        Ok(crate::state::FrontendOp::new(opref, crate::state::ConcreteValue::Null))\n",
-    );
+    out.push_str("        let concrete = crate::state::ConcreteValue::Ref(\n");
+    out.push_str("            pyre_object::w_slice_new(\n");
+    out.push_str("                start.concrete.to_pyobj(),\n");
+    out.push_str("                stop.concrete.to_pyobj(),\n");
+    out.push_str("                step.concrete.to_pyobj(),\n");
+    out.push_str("            ),\n");
+    out.push_str("        );\n");
+    out.push_str("        Ok(crate::state::FrontendOp::new(opref, concrete))\n");
     out.push_str("    }\n");
 
     out.push_str("}\n");

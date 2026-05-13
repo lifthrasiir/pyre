@@ -353,7 +353,14 @@ impl pyre_interpreter::ConstantOpcodeHandler for crate::state::MIFrame {
             );
             Ok::<_, pyre_interpreter::PyError>(new_op)
         })?;
-        Ok(crate::state::FrontendOp::new(opref, crate::state::ConcreteValue::Null))
+        let concrete = crate::state::ConcreteValue::Ref(
+            pyre_object::w_slice_new(
+                start.concrete.to_pyobj(),
+                stop.concrete.to_pyobj(),
+                step.concrete.to_pyobj(),
+            ),
+        );
+        Ok(crate::state::FrontendOp::new(opref, concrete))
     }
 }
 

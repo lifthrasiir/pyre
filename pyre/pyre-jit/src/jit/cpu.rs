@@ -51,8 +51,10 @@ pub struct Cpu {
     pub load_const_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_store_subscr` — obj[key] = value.
     pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// `bhimpl_build_list` — (argc, item0, item1) → new list.
-    pub build_list_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bhimpl_build_list` — (argc, item0, item1, item2) → new list.
+    pub build_list_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
+    pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
     pub normalize_raise_varargs_fn: extern "C" fn(i64, i64) -> i64,
     /// Read per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`.
@@ -85,6 +87,7 @@ impl Cpu {
             load_const_fn: crate::call_jit::bh_load_const_fn,
             store_subscr_fn: crate::call_jit::bh_store_subscr_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
+            build_slice_fn: crate::call_jit::bh_build_slice_fn,
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_fn,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
