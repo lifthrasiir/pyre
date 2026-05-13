@@ -104,7 +104,8 @@ pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
 }
 
 pub fn majit_log_enabled() -> bool {
-    std::env::var_os("MAJIT_LOG").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_LOG").is_some())
 }
 
 /// Result of tracing a single instruction.

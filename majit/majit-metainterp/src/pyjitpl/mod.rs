@@ -5399,6 +5399,22 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_trace_session();
     }
 
+    /// Successful `compile_trace()` cleanup.
+    ///
+    /// pyjitpl.py:3095-3099 `raise_if_successful()` unwinds tracing after a
+    /// bridge was attached to an existing target.  The warmstate `finally`
+    /// block clears `JC_TRACING`, but this is not an abort and must not call
+    /// `abort_tracing()` or increment abort counters.
+    pub fn discard_trace_after_compile_trace_success(&mut self) {
+        self.force_finish_trace = false;
+        self.clear_retrace_state();
+        if let Some(ctx) = self.tracing.take() {
+            self.warm_state.clear_tracing_flag(ctx.green_key);
+            self.pending_token = None;
+        }
+        self.clear_trace_session();
+    }
+
     /// Finish the current trace with a terminal `FINISH`, then optimize and compile it.
     ///
     /// `exit_with_exception` selects the FINISH descr per `pyjitpl.py`:
@@ -6360,7 +6376,6 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, fail_index);
         }
 
-        let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
         // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
@@ -6414,6 +6429,7 @@ impl<M: Clone> MetaInterp<M> {
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
         }
+        let exit_arity = exit_types.len();
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
@@ -6507,7 +6523,6 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, fail_index);
         }
 
-        let exit_arity = exit_types.len();
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         // FINISH descrs (singletons) have `trace_id == 0`; skip the
         // trace lookup and synthesize the default layout per
@@ -6558,6 +6573,7 @@ impl<M: Clone> MetaInterp<M> {
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
         }
+        let exit_arity = exit_types.len();
         let mut values = Vec::with_capacity(exit_arity);
         let mut typed_values = Vec::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {

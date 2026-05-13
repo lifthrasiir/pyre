@@ -5195,10 +5195,8 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, arglocs, result_loc, output);
     }
 
-    /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
-    /// Spill ALL registers: the nursery bump path clobbers x0-x3 (aarch64)
-    /// or ecx/edx/rax (x86). The slow path may trigger GC.
-    /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
+    /// aarch64/regalloc.py:958 / x86/regalloc.py:1013
+    /// prepare_op_call_malloc_nursery parity.
     fn consider_call_malloc_nursery(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
@@ -5211,7 +5209,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
@@ -5252,7 +5250,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
@@ -5405,7 +5403,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
@@ -5455,7 +5453,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,

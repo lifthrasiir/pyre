@@ -5596,17 +5596,19 @@ impl<'a> AssemblerARM64<'a> {
         if nf_addr == 0 || nt_addr == 0 {
             self.emit_mov_imm64(0, total_size);
             self.emit_mov_imm64(
-                2,
+                16,
                 crate::runner::dynasm_nursery_slowpath as *const () as i64,
             );
-            self.emit_malloc_slowpath_helper_call(2);
+            self.emit_malloc_slowpath_helper_call(16);
             self.reload_frame_if_necessary();
             return;
         }
 
-        // x0 = nursery_free, x1 = new_free, x2 = scratch, x3 = nursery_top
-        self.emit_mov_imm64(2, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x2]);
+        // x0 = nursery_free, x1 = new_free.  x16/x17 are IP scratch
+        // registers, matching aarch64/assembler.py's ip0/ip1 usage and
+        // keeping managed registers other than x0/x1 live across the fast path.
+        self.emit_mov_imm64(16, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
 
         if total_size < 4096 {
             let ts = total_size as u32;
@@ -5616,18 +5618,18 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        self.emit_mov_imm64(3, nt_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x3, [x3]);
-        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x3);
+        self.emit_mov_imm64(16, nt_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x16, [x16]);
+        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x16);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
         // Fast path: bump nursery_free, zero header, return payload ptr
-        self.emit_mov_imm64(2, nf_addr as i64);
+        self.emit_mov_imm64(16, nf_addr as i64);
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x2]       // *nursery_free = new_free
+            ; str x1, [x16]      // *nursery_free = new_free
             ; str xzr, [x0]      // zero GcHeader
         );
         let hs = gc_hdr as u32;
@@ -5682,10 +5684,10 @@ impl<'a> AssemblerARM64<'a> {
         }
         self.emit_mov_imm64(0, total_size);
         self.emit_mov_imm64(
-            2,
+            16,
             crate::runner::dynasm_nursery_slowpath as *const () as i64,
         );
-        self.emit_malloc_slowpath_helper_call(2);
+        self.emit_malloc_slowpath_helper_call(16);
         self.reload_frame_if_necessary();
         // pop_gcmap: clear jf_gcmap after collecting call
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;

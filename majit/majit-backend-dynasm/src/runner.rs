@@ -300,7 +300,7 @@ pub extern "C" fn dynasm_nursery_slowpath(total_size: u64) -> u64 {
         let raw = libc::calloc(1, total_size as usize) as u64;
         raw + gc_hdr as u64
     });
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if crate::majit_log_enabled() {
         eprintln!("[dynasm][nursery-frame] total_size={total_size} payload=0x{ptr:x}");
     }
     ptr
@@ -1285,7 +1285,7 @@ impl DynasmBackend {
     fn register_call_assembler_target(token: &mut JitCellToken, code_addr: usize) {
         let token_number = token.number;
         let index_of_virtualizable = token.virtualizable_arg_index.map_or(-1_i32, |i| i as i32);
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm][ca-target] register token={} addr=0x{:x}",
                 token_number, code_addr
@@ -1320,7 +1320,7 @@ impl DynasmBackend {
     }
 
     fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm][ca-target] redirect token={} addr=0x{:x}",
                 old_number, new_addr
@@ -1562,7 +1562,7 @@ impl Backend for DynasmBackend {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
-        if std::env::var_os("MAJIT_LOG").is_some() && trace_id == 2 {
+        if crate::majit_log_enabled() && trace_id == 2 {
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
@@ -1633,7 +1633,7 @@ impl Backend for DynasmBackend {
         // assembler.py:987 patch_jump_for_descr — redirect guard to bridge.
         // Use the exact guard descr found above, not a fail_index search.
         let ajo = guard_descr.adr_jump_offset();
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm-bridge] patch: trace_id={} fail_index={} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
                 guard_descr.trace_id(),
@@ -1644,7 +1644,7 @@ impl Backend for DynasmBackend {
         }
         if ajo != 0 {
             Asm::patch_jump_for_descr(&guard_descr, bridge_addr);
-        } else if std::env::var_os("MAJIT_LOG").is_some() {
+        } else if crate::majit_log_enabled() {
             eprintln!("[dynasm-bridge] WARNING: adr_jump_offset=0, bridge NOT patched!");
         }
         guard_descr.set_bridge_addr(bridge_addr);
@@ -1713,7 +1713,7 @@ impl Backend for DynasmBackend {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), raw as isize) };
         }
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             for (i, arg) in args.iter().enumerate() {
                 let raw = unsafe {
                     crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
@@ -1749,7 +1749,7 @@ impl Backend for DynasmBackend {
         }
 
         // Debug: verify bridge patches are visible
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             for descr in &compiled.fail_descrs {
                 if descr.bridge_addr() != 0 && descr.adr_jump_offset() == 0 {
                     eprintln!(
@@ -1770,7 +1770,7 @@ impl Backend for DynasmBackend {
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr) };
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] execute_token returned: result_jf={:?} (expected={:?}) same={}",
                 result_jf,
@@ -1783,7 +1783,7 @@ impl Backend for DynasmBackend {
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] descr: fi={} finish={} types={} locs={:?}",
                 descr.fail_index,
@@ -1802,7 +1802,7 @@ impl Backend for DynasmBackend {
                     Some(slot) => {
                         let val =
                             unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 };
-                        if std::env::var_os("MAJIT_LOG").is_some() && i < 10 {
+                        if crate::majit_log_enabled() && i < 10 {
                             eprintln!(
                                 "[dynasm] fail_arg[{}]: slot={} val={:#018x}",
                                 i, slot, val as u64

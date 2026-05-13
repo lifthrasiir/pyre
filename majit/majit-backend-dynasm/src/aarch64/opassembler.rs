@@ -99,6 +99,8 @@ impl<'a> AssemblerARM64<'a> {
             // Float: always 8-byte
             if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), X(r.value)]);
+            } else if ofs < 0 && ofs >= -256 {
+                dynasm!(self.mc ; .arch aarch64 ; ldur D(dst.value), [X(base.value), ofs]);
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
             }
@@ -132,25 +134,53 @@ impl<'a> AssemblerARM64<'a> {
         } else {
             match (size, signed) {
                 (1, false) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldurb W(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrb W(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
                 (1, true) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldursb X(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsb X(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
                 (2, false) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldurh W(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrh W(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
                 (2, true) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldursh X(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsh X(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
                 (4, false) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldur W(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldr W(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
                 (4, true) => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldursw X(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldrsw X(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
                 _ => {
-                    dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), ofs as u32])
+                    if ofs < 0 && ofs >= -256 {
+                        dynasm!(self.mc ; .arch aarch64 ; ldur X(dst.value), [X(base.value), ofs])
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), [X(base.value), ofs as u32])
+                    }
                 }
             }
         }

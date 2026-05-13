@@ -1532,9 +1532,8 @@ impl<S: JitState> JitDriver<S> {
         match action {
             TraceAction::Continue => {}
             TraceAction::CompileTrace => {
-                self.meta.abort_trace(false);
                 self.sym = None;
-                self.meta.clear_trace_session();
+                self.meta.discard_trace_after_compile_trace_success();
                 self.compile_trace_success = true;
                 return;
             }
@@ -1574,10 +1573,9 @@ impl<S: JitState> JitDriver<S> {
                             match result {
                                 crate::pyjitpl::BridgeCompileResult::Compiled => {
                                     self.sym = None;
-                                    self.meta.clear_trace_session();
                                     // pyjitpl.py:3095-3099 raise_if_successful():
                                     // successful bridge closure terminates tracing.
-                                    self.meta.abort_trace(false);
+                                    self.meta.discard_trace_after_compile_trace_success();
                                     return;
                                 }
                                 // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -1605,6 +1603,16 @@ impl<S: JitState> JitDriver<S> {
                         // compile_loop (pyjitpl.py:3014-3017).
                         self.meta.take_bridge_info();
                     }
+                }
+                // pyjitpl.py:2983: compile_trace already compiled a bridge
+                // to the existing loop and raise_if_successful() would leave
+                // tracing immediately.  Do not fall through to compile_loop()
+                // with the same target token; compile_loop would hit
+                // pyjitpl.py:3186 has_compiled_targets and abort the trace.
+                if self.take_compile_trace_success() {
+                    self.sym = None;
+                    self.meta.discard_trace_after_compile_trace_success();
+                    return;
                 }
                 let Some(trace_meta) = self.meta.trace_meta().cloned() else {
                     self.meta.abort_trace(false);
@@ -1697,10 +1705,9 @@ impl<S: JitState> JitDriver<S> {
                         match result {
                             crate::pyjitpl::BridgeCompileResult::Compiled => {
                                 self.sym = None;
-                                self.meta.clear_trace_session();
                                 // pyjitpl.py:3095-3099 raise_if_successful():
                                 // successful bridge closure terminates tracing.
-                                self.meta.abort_trace(false);
+                                self.meta.discard_trace_after_compile_trace_success();
                                 return;
                             }
                             // pyjitpl.py:2993-3007: after retrace_needed(),
@@ -1724,9 +1731,9 @@ impl<S: JitState> JitDriver<S> {
                 }
                 // pyjitpl.py:2983: compile_trace already compiled a bridge
                 // to the existing loop. Don't call compile_loop again.
-                if self.compile_trace_success_pending() {
+                if self.take_compile_trace_success() {
                     self.sym = None;
-                    self.meta.clear_trace_session();
+                    self.meta.discard_trace_after_compile_trace_success();
                     return;
                 }
                 let Some(trace_meta) = self.meta.trace_meta().cloned() else {
@@ -2014,9 +2021,8 @@ impl<S: JitState> JitDriver<S> {
             }
             self.merge_point(trace_fn);
             if self.take_compile_trace_success() {
-                self.meta.abort_trace(false);
                 self.sym = None;
-                self.meta.clear_trace_session();
+                self.meta.discard_trace_after_compile_trace_success();
                 return Some(DetailedDriverRunOutcome::Jump {
                     via_blackhole: false,
                 });

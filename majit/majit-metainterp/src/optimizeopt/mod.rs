@@ -67,7 +67,8 @@ pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
 }
 
 pub(crate) fn majit_log_enabled() -> bool {
-    std::env::var_os("MAJIT_LOG").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_LOG").is_some())
 }
 
 /// info.py:13-15 INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
