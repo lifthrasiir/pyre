@@ -32,18 +32,18 @@ jobs:
         revdb: [false, true]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
         fetch-depth: 1
 
     - name: Set up PyPy 2.7
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
       with:
         python-version: "pypy-2.7-v7.3.17"
         cache: 'pip' # caching pip dependencies
 
     - name: install system dependencies
-      uses: awalsh128/cache-apt-pkgs-action@latest
+      uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # v1.5.3
       with:
         packages: libffi-dev pkg-config zlib1g-dev libbz2-dev libsqlite3-dev libncurses5-dev libexpat1-dev libssl-dev libgdbm-dev tk-dev libgc-dev liblzma-dev libncursesw5-dev patchelf
         version: 1.0
@@ -64,7 +64,7 @@ jobs:
 
     - name: upload
       if: success() || failure()
-      uses: actions/upload-artifact@v7.0.0
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
       with:
         name: pypy-ci-build-${{ matrix.os }}${{ matrix.revdb && '-revdb' || '' }}
         path: ./pypy-nightly.tar.bz2
