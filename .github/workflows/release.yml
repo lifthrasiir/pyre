@@ -151,7 +151,7 @@ jobs:
             rustup_installer="$RUNNER_TEMP/rustup-init.sh"
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_installer"
             echo "6c30b75a75b28a96fd913a037c8581b580080b6ee9b8169a3c0feb1af7fe8caf  $rustup_installer" | sha256sum --check
-            sh "$rustup_installer" -s -- -y
+            sh "$rustup_installer" -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
