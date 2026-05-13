@@ -15073,6 +15073,13 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn exception_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
     fn pending_call_assembler_force_values() -> &'static Mutex<Vec<(i64, Option<i64>)>> {
         static VALUES: OnceLock<Mutex<Vec<(i64, Option<i64>)>>> = OnceLock::new();
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
@@ -16860,6 +16867,7 @@ mod tests {
 
     #[test]
     fn test_guard_exception_exact_match_returns_value_and_clears_deadframe_exception() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x1111));
@@ -16907,6 +16915,7 @@ mod tests {
 
     #[test]
     fn test_guard_exception_exact_mismatch_preserves_deadframe_exception() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x2222));
@@ -16947,6 +16956,7 @@ mod tests {
 
     #[test]
     fn test_guard_no_exception_failure_preserves_deadframe_exception() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x1111));
@@ -16997,6 +17007,7 @@ mod tests {
 
     #[test]
     fn test_execute_token_ints_raw_preserves_exception_and_layout_metadata() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x1111));
@@ -17050,6 +17061,7 @@ mod tests {
 
     #[test]
     fn test_save_restore_exception_roundtrip_matches_rpython_order() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
         clear_test_exception_call_log();
         set_test_exception_state(make_fake_exc(0x3333));
@@ -17105,6 +17117,7 @@ mod tests {
 
     #[test]
     fn test_deadframe_exception_ref_survives_collection_after_execute_token() {
+        let _exception_guard = exception_test_guard();
         jit_exc_clear();
 
         let mut gc = MiniMarkGC::with_config(GcConfig {
