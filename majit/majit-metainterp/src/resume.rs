@@ -4108,14 +4108,10 @@ impl ResumeDataLoopMemo {
             // to a Ref virtual after optimization; keeping the stale fallback
             // would number that virtual as a TAGBOX and the subsequent
             // optimizer.py:681 fail-arg force would materialize it.
-            let box_type = if opref == raw_opref {
-                opref
-                    .ty()
-                    .or(snapshot_box.tp)
-                    .unwrap_or_else(|| env.get_type(opref))
-            } else {
-                env.get_type(opref)
-            };
+            let box_type = opref
+                .ty()
+                .or(snapshot_box.tp)
+                .unwrap_or_else(|| env.get_type(opref));
             let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),
