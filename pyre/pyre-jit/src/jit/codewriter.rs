@@ -4856,42 +4856,20 @@ impl CodeWriter {
                         emit_vsd!(current_depth);
                     }
 
-                    // CPython 3.13 super-instructions LOAD_FAST_LOAD_FAST /
+                    // CPython super-instructions LOAD_FAST_LOAD_FAST /
                     // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
-                    // LOAD_FAST reads. Portal parity with plain LoadFast would
-                    // route both halves through vable_getarrayitem_ref, but
-                    // flipping this arm (attempted multiple times, most
-                    // recently 2026-04-27) reproduces the same
-                    // `set_virtualizable_entry_at: index X out of range for
-                    // X slots` bridge re-trace panic. The 2026-04-24 LFLF
-                    // flip (commit 776c763575) recovered correctness on
-                    // top-level benches but was reverted at 2648598f9da
-                    // because float-typed locals returned NaN — and even the
-                    // 2026-04-27 retry on the post-Phase-2.2 base hits the
-                    // same bridge re-trace push_value overflow.
+                    // LOAD_FAST reads. Keep the portal virtualizable lowering
+                    // identical to plain LoadFast: every local read goes
+                    // through getarrayitem_vable_r so blackhole resume can
+                    // reload dead-at-resume locals on demand, as RPython does
+                    // via jtransform.py:1877 do_fixed_list_getitem.
                     Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                     | Instruction::LoadFastLoadFast { var_nums } => {
                         let pair = var_nums.get(op_arg);
                         let reg_a = u32::from(pair.idx_1()) as u16;
                         let reg_b = u32::from(pair.idx_2()) as u16;
-                        let value_a = current_state
-                            .locals_w
-                            .get(reg_a as usize)
-                            .and_then(|value| value.clone())
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        emit_ref_copy!(ssarepr, stack_base + current_depth, reg_a);
-                        current_state.stack.push(value_a);
-                        current_depth += 1;
-                        emit_vsd!(current_depth);
-                        let value_b = current_state
-                            .locals_w
-                            .get(reg_b as usize)
-                            .and_then(|value| value.clone())
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        emit_ref_copy!(ssarepr, stack_base + current_depth, reg_b);
-                        current_state.stack.push(value_b);
-                        current_depth += 1;
-                        emit_vsd!(current_depth);
+                        emit_load_fast_ref!(ssarepr, current_depth, reg_a);
+                        emit_load_fast_ref!(ssarepr, current_depth, reg_b);
                     }
 
                     // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
