@@ -3238,14 +3238,6 @@ impl Optimizer {
             OptContext::with_inputarg_types(32, &types)
         });
 
-        // RPython parity: export virtual state BEFORE flush() and
-        // force_at_the_end_of_preamble(). In RPython, get_virtual_state
-        // is called inside _jump_to_existing_trace on the original Box
-        // objects whose PtrInfo reflects the pre-flush optimizer state.
-        // flush() may force pending virtuals, changing their PtrInfo to
-        // non-virtual. Capture the virtual state before any forcing.
-        let pre_force_vs = crate::optimizeopt::virtualstate::export_state(&jump_args, &ctx);
-
         self.flush(&mut ctx);
 
         // unroll.py:204-205: force_at_the_end_of_preamble for each jump arg
@@ -3255,13 +3247,6 @@ impl Optimizer {
             let _ = self.force_box_for_end_of_preamble(arg, &mut ctx);
         }
         ctx.current_pass_idx = saved_pass_idx;
-
-        // RPython parity: jump_op.getarglist() returns the ORIGINAL Boxes.
-        // force_at_the_end_of_preamble recurses into virtual fields but
-        // does NOT force the top-level virtuals. So get_virtual_state on
-        // the original args still sees Virtual PtrInfo.
-        // DO NOT resolve jump_args here — pass originals so virtual_state
-        // is computed from the pre-force state.
 
         // unroll.py:206-211: jump_to_existing_trace(force_boxes=False)
         // RPython iterates ALL target_tokens; preamble (virtual_state=None)
@@ -3275,7 +3260,7 @@ impl Optimizer {
             &mut ctx,
             false,
             &pre_opt_jump_args,
-            Some(pre_force_vs.clone()),
+            None,
         ) {
             Ok(vs) => vs,
             // unroll.py:209-210: except InvalidLoop → jump_to_preamble
@@ -3328,7 +3313,7 @@ impl Optimizer {
             &mut ctx,
             true,
             &pre_opt_jump_args,
-            Some(pre_force_vs),
+            None,
         ) {
             Ok(vs) => vs,
             // unroll.py:224-225: except InvalidLoop: pass

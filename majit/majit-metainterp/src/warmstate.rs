@@ -269,8 +269,8 @@ const DEFAULT_MAX_INLINE_DEPTH: u32 = 7;
 /// rlib/jit.py:592 trace_limit = 6000
 const DEFAULT_TRACE_LIMIT: u32 = crate::trace_ctx::DEFAULT_TRACE_LIMIT as u32;
 
-/// warmspot.py:93 retrace_limit=5
-const DEFAULT_RETRACE_LIMIT: u32 = 5;
+/// rlib/jit.py:595 retrace_limit = 0.
+const DEFAULT_RETRACE_LIMIT: u32 = 0;
 
 /// rlib/jit.py:598 max_unroll_loops = 0
 const DEFAULT_MAX_UNROLL_LOOPS: u32 = 0;
@@ -455,8 +455,7 @@ impl WarmEnterState {
             pureop_historylength: 16,
             memory_manager: {
                 let mut m = crate::memmgr::MemoryManager::new(0);
-                // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
-                // PARAMETERS is 0, applied in production via set_user_param).
+                // rlib/jit.py:595 PARAMETERS default retrace_limit=0.
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
                 // rlib/jit.py:598 / pyjitpl.py:2946: default 0 means
                 // the first cancelled unrolled compile immediately retries
@@ -492,8 +491,7 @@ impl WarmEnterState {
             pureop_historylength: 16,
             memory_manager: {
                 let mut m = crate::memmgr::MemoryManager::new(0);
-                // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
-                // PARAMETERS is 0, applied in production via set_user_param).
+                // rlib/jit.py:595 PARAMETERS default retrace_limit=0.
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
                 // rlib/jit.py:598 / pyjitpl.py:2946: default 0 means
                 // the first cancelled unrolled compile immediately retries

@@ -620,6 +620,7 @@ impl MIFrame {
             orgpc,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
+            suppress_guard_no_exception_for_opcode: false,
             parent_frames: Vec::new(),
             pending_result_stack_idx: None,
             pending_result_type: None,
@@ -4521,6 +4522,12 @@ impl MIFrame {
             ))
         })?;
         if handled {
+            // RPython parity: once STORE_SUBSCR is lowered through
+            // jtransform's list strategy primitive path, the emitted ops are
+            // guard_class/check_index/setarrayitem, not an exc=True residual
+            // call.  The generic bytecode-level may-raise classification must
+            // not append GUARD_NO_EXCEPTION to this primitive lowering.
+            self.suppress_guard_no_exception_for_opcode = true;
             return Ok(());
         }
         self.trace_store_subscr(obj, key, value)
@@ -5931,6 +5938,7 @@ impl MIFrame {
 
         self.set_orgpc(pc);
         self.prepare_fallthrough();
+        self.suppress_guard_no_exception_for_opcode = false;
         // RPython pyjitpl.py captures resumedata at each guard site, not at
         // every opcode boundary. Pyre still needs an opcode-start snapshot
         // for stack-machine opcodes that can mutate stack/register state
@@ -6048,7 +6056,7 @@ impl MIFrame {
         // RPython pyjitpl.py:1956-1957 execute_varargs: exc=True ops
         // always call handle_possible_exception, which internally decides
         // GUARD_EXCEPTION vs GUARD_NO_EXCEPTION.
-        if instruction_may_raise(instruction) {
+        if instruction_may_raise(instruction) && !self.suppress_guard_no_exception_for_opcode {
             let action = self.handle_possible_exception(code, pc);
             if !matches!(action, TraceAction::Continue) {
                 return action;
@@ -7557,6 +7565,7 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: None,
             pre_opcode_semantic_depth: None,
+            suppress_guard_no_exception_for_opcode: false,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
@@ -7632,6 +7641,7 @@ mod tests {
             concrete_frame_addr: 0,
             pre_opcode_registers_r: Some(vec![local0, local1, stack0]),
             pre_opcode_semantic_depth: Some(3),
+            suppress_guard_no_exception_for_opcode: false,
         };
 
         let active = frame.get_list_of_active_boxes(&mut ctx, false, false);

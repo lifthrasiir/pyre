@@ -1350,19 +1350,18 @@ impl JitCodeBuilder {
         reds_r: &[u8],
         reds_f: &[u8],
     ) {
-        // Capture the bytecode offset of the OPCODE byte (before
-        // `write_insn` pushes it).  jtransform.py:1690-1712 emits exactly
-        // one `jit_merge_point` per portal jitcode; assert the second
-        // call so a double-emit lowerer bug fails loud rather than
-        // overwriting the offset and leaving the validator on the wrong
-        // payload.
-        assert!(
-            self.jit_merge_point_offset.is_none(),
-            "JitCodeBuilder::jit_merge_point called twice; \
-             jtransform.py:1690-1712 emits exactly one merge point per \
-             portal jitcode",
-        );
-        self.jit_merge_point_offset = Some(self.code.len());
+        // Capture the bytecode offset of the first OPCODE byte (before
+        // `write_insn` pushes it).  PyPy's portal dispatch loop executes
+        // `jit_merge_point()` at every bytecode dispatch, so a lowered
+        // portal jitcode can contain more than one merge point when pyre
+        // materializes several Python loop headers in one dispatch body.
+        // The offset is only used by `register_dispatch_jitcode` for
+        // schema validation, so keeping the first one preserves that
+        // validation without rejecting later structurally identical merge
+        // points.
+        if self.jit_merge_point_offset.is_none() {
+            self.jit_merge_point_offset = Some(self.code.len());
+        }
         if (-128..=127).contains(&jdindex) {
             self.write_insn("jit_merge_point/cIRFIRF");
             self.push_u8((jdindex & 0xFF) as u8);

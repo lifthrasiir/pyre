@@ -4095,7 +4095,27 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(tagged);
                 continue;
             }
-            let box_type = snapshot_box.tp.unwrap_or_else(|| env.get_type(opref));
+            // resume.py:201-212:
+            //
+            //     box = iter.get(...)
+            //     box = box.get_box_replacement()
+            //     ...
+            //     if box.type == 'r':
+            //
+            // The type used for virtual classification is the replacement
+            // box's type, not the original snapshot slot's fallback type.  A
+            // snapshot slot can carry an Int fallback from tracing but forward
+            // to a Ref virtual after optimization; keeping the stale fallback
+            // would number that virtual as a TAGBOX and the subsequent
+            // optimizer.py:681 fail-arg force would materialize it.
+            let box_type = if opref == raw_opref {
+                opref
+                    .ty()
+                    .or(snapshot_box.tp)
+                    .unwrap_or_else(|| env.get_type(opref))
+            } else {
+                env.get_type(opref)
+            };
             let is_virtual = match box_type {
                 majit_ir::Type::Ref => env.is_virtual_ref(opref),
                 majit_ir::Type::Int => env.is_virtual_raw(opref),
@@ -5071,6 +5091,36 @@ mod tests {
         let (val, tagbits) = untag(items[8] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn test_number_boxes_uses_replacement_type_for_virtual_classification() {
+        use majit_ir::OpRef;
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+
+        // RPython resume.py reads box.type after get_box_replacement().
+        // Model a stale Int-typed snapshot slot that now forwards to a Ref
+        // virtual, the shape produced by optimized boxed-int locals.
+        let source = OpRef::int_op(1);
+        let target = OpRef::ref_op(2);
+        env.replacements.insert(source.raw(), target);
+        env.virtuals.insert(target.raw());
+        env.types.insert(target.raw(), majit_ir::Type::Ref);
+
+        let snapshot = Snapshot::single_frame_boxes(
+            0,
+            10,
+            vec![SnapshotBox::typed(source, majit_ir::Type::Int)],
+        );
+        let numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        let items = crate::resumecode::unpack_all(&numb_state.create_numbering());
+
+        let (val, tagbits) = untag(items[6] as i16);
+        assert_eq!(tagbits, TAGVIRTUAL);
+        assert_eq!(val, 0);
+        assert_eq!(numb_state.num_boxes, 0);
+        assert_eq!(numb_state.num_virtuals, 1);
     }
 
     #[test]
