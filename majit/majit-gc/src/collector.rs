@@ -184,6 +184,11 @@ pub struct MiniMarkGC {
     /// These are old-gen object payload addresses whose TRACK_YOUNG_PTRS
     /// flag has been cleared by the write barrier.
     remembered_set: Vec<usize>,
+    /// Last old-gen object accepted by the write barrier membership check.
+    /// Tight loops usually update the same container repeatedly; caching this
+    /// avoids repeatedly scanning OldGen's allocation list without changing
+    /// OldGen's RPython-like list shape.
+    last_write_barrier_old_obj: usize,
     /// incminimark.py:346-352: objects with GCFLAG_CARDS_SET bit.
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
@@ -253,6 +258,7 @@ impl MiniMarkGC {
             types: TypeRegistry::new(),
             roots: RootSet::new(),
             remembered_set: Vec::new(),
+            last_write_barrier_old_obj: 0,
             old_objects_with_cards_set: Vec::new(),
             config,
             minor_collections: 0,
@@ -399,6 +405,18 @@ impl MiniMarkGC {
     #[inline]
     fn is_managed_heap_object(&self, addr: usize) -> bool {
         self.nursery.contains(addr) || self.oldgen.contains(addr)
+    }
+
+    #[inline]
+    fn is_oldgen_write_barrier_object(&mut self, addr: usize) -> bool {
+        if self.last_write_barrier_old_obj == addr {
+            return true;
+        }
+        if self.oldgen.contains_fast(addr) {
+            self.last_write_barrier_old_obj = addr;
+            return true;
+        }
+        false
     }
 
     /// incminimark.py:1208 is_in_nursery parity.
@@ -1043,6 +1061,7 @@ impl MiniMarkGC {
     fn finish_incremental_cycle(&mut self) {
         self.major_collections += 1;
         self.oldgen.sweep();
+        self.last_write_barrier_old_obj = 0;
         self.last_major_bytes = self.oldgen.total_bytes();
         self.bytes_made_old_since_cycle = 0;
         self.threshold_bytes_made_old = 0;
@@ -1105,15 +1124,16 @@ impl MiniMarkGC {
     /// If the object has TRACK_YOUNG_PTRS set, we clear it and add the object
     /// to the remembered set, because it might now point to a young object.
     ///
-    /// The `is_managed_heap_object` guard is NOT in incminimark — it
-    /// compensates for virtualizable objects (PyFrame) being Rust
-    /// Box-allocated instead of GC-managed. The JIT's COND_CALL_GC_WB
-    /// fires for these objects because the rewriter emits WB for all
-    /// SETFIELD_GC on Ref-typed values, and the flag-test reads garbage
-    /// RPython's write_barrier() only tests the header flag and does not
-    /// special-case non-managed addresses here.
+    /// The `is_managed_heap_object` guard is NOT in incminimark: RPython's
+    /// write_barrier() is only called with GC-managed objects. In pyre,
+    /// virtualizable objects such as PyFrame are Rust Box-allocated, while the
+    /// JIT rewriter still emits COND_CALL_GC_WB for Ref-typed SETFIELD_GC
+    /// stores. Keep those non-GC addresses out of the remembered set here.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
-        if obj.is_null() {
+        if obj.is_null()
+            || self.nursery.contains(obj.0)
+            || !self.is_oldgen_write_barrier_object(obj.0)
+        {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
@@ -1171,8 +1191,9 @@ impl MiniMarkGC {
             self.old_objects_with_cards_set.push(obj.0);
             unsafe { (*hdr).set_flag(flags::CARDS_SET) };
         } else {
-            // No cards — generic barrier.
-            self.do_write_barrier(obj);
+            // No cards: the JIT already passed the inline flag test, so use
+            // the corresponding remember_young_pointer path.
+            self.jit_remember_young_pointer(obj);
         }
     }
 
@@ -1371,7 +1392,10 @@ impl MiniMarkGC {
     ///
     /// See `do_write_barrier` for why `is_managed_heap_object` is needed.
     pub fn jit_remember_young_pointer(&mut self, obj: GcRef) {
-        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+        if obj.is_null()
+            || self.nursery.contains(obj.0)
+            || !self.is_oldgen_write_barrier_object(obj.0)
+        {
             return;
         }
         // Clear TRACK_YOUNG_PTRS so the object won't trigger the

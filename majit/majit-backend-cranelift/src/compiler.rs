@@ -3863,7 +3863,7 @@ extern "C" fn gc_malloc_unicode_helper(type_id: u64, length: u64) -> u64 {
 /// frames live outside any managed heap and need no barrier, so behave
 /// like `write_barrier_if_managed` and silently skip.
 extern "C" fn gc_write_barrier_shim(obj: u64) {
-    with_cranelift_gc(|gc| gc.write_barrier(GcRef(obj as usize)));
+    with_cranelift_gc(|gc| gc.jit_remember_young_pointer(GcRef(obj as usize)));
 }
 
 /// aarch64/assembler.py:352 get_write_barrier_from_array_fn()
@@ -5247,10 +5247,13 @@ fn ref_root_slots_with_future_regular_uses(
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
 ) -> Vec<(u32, usize)> {
-    // RPython regalloc only reloads values it keeps in registers after a
-    // collecting call.  References that are live only as future failargs can
-    // remain frame-resident: the gcmap protects their slots, and failure
-    // recovery reads them from the frame if needed.
+    // RPython regalloc reloads values that remain live after a collecting
+    // call. Guard failargs are live uses too: failure recovery reads them
+    // after the call, and majit's failarg emission resolves OpRefs through
+    // the same variable/root-slot machinery as normal op args. Excluding
+    // failargs here leaves a Ref marked stale even though a later guard will
+    // use it, so the guard exit can copy an old frame-resident root slot into
+    // the deadframe instead of the post-GC value.
     ref_root_slots
         .iter()
         .filter(|(var_idx, _)| {
@@ -5258,7 +5261,7 @@ fn ref_root_slots_with_future_regular_uses(
                 && ops
                     .iter()
                     .skip(position + 1)
-                    .flat_map(|op| op.args.iter())
+                    .flat_map(|op| op.args.iter().chain(op.fail_args.iter().flatten()))
                     .any(|arg| arg.raw() == *var_idx)
         })
         .copied()
