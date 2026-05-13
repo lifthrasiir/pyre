@@ -4065,10 +4065,20 @@ fn assemble_peeled_trace_with_jump_args(
                         .opref_type(arg)
                         .or_else(|| ctx.opref_type(source))
                         .or_else(|| arg.ty())
-                        .unwrap_or(Type::Int);
-                    let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[source]);
-                    same_as.pos = arg;
-                    fallthrough_aliases.push(same_as);
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "assemble_peeled_trace_with_jump_args: cannot type \
+                                 fallthrough SameAs alias arg={:?} source={:?}; \
+                                 ctx.opref_type(arg), ctx.opref_type(source), and \
+                                 arg.ty() all returned None",
+                                arg, source
+                            )
+                        });
+                    if tp != Type::Void {
+                        let mut same_as = Op::new(OpCode::same_as_for_type(tp), &[source]);
+                        same_as.pos = arg;
+                        fallthrough_aliases.push(same_as);
+                    }
                 }
                 full_label_args.push(arg);
                 label_set.insert(arg);
