@@ -1129,6 +1129,12 @@ pub extern "C" fn jit_list_setitem(list: i64, index: i64, value: i64) -> i64 {
     0
 }
 
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_list_reverse(list: i64) -> i64 {
+    unsafe { w_list_reverse(list as PyObjectRef) };
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

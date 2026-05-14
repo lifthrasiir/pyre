@@ -4753,6 +4753,33 @@ impl MIFrame {
         self.trace_call_callable(callable, &[])
     }
 
+    /// Direct trace path for `list.reverse()`.
+    ///
+    /// PyPy reaches `listobject.py`'s strategy `reverse` through the normal
+    /// rtyper/list helper path. Pyre does not have that full oopspec lowering
+    /// yet, so mirror the existing append/pop trace-time specialization and
+    /// emit a narrow helper call on the proven builtin list receiver.
+    pub(crate) fn list_reverse_value(
+        &mut self,
+        callable: OpRef,
+        list: OpRef,
+        concrete_list: PyObjectRef,
+    ) -> Result<OpRef, PyError> {
+        if concrete_list.is_null() || unsafe { !is_list(concrete_list) } {
+            return self.trace_call_callable(callable, &[]);
+        }
+        self.with_ctx(|this, ctx| {
+            this.guard_class(ctx, list, &LIST_TYPE as *const PyType);
+            crate::helpers::emit_trace_call_void_typed(
+                ctx,
+                pyre_object::listobject::jit_list_reverse as *const (),
+                &[list],
+                &[Type::Ref],
+            );
+            Ok(ctx.const_ref(pyre_object::w_none() as i64))
+        })
+    }
+
     pub(crate) fn concrete_iter_continues(
         &self,
         concrete_iter: PyObjectRef,
@@ -4977,6 +5004,10 @@ impl MIFrame {
                         return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
                     }
                 }
+                if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
+                    let self_ref = recover_self(self);
+                    return self.list_reverse_value(callable, self_ref, inner_self);
+                }
             }
         }
 
@@ -4987,6 +5018,50 @@ impl MIFrame {
                 );
             if is_builtin {
                 let builtin_name = pyre_interpreter::function_get_name(concrete_callable);
+                let canonical_list_method = |name: &str| {
+                    let list_type = pyre_interpreter::typedef::gettypeobject(&LIST_TYPE);
+                    pyre_interpreter::lookup_in_type(list_type, name)
+                };
+                if args.len() == 2
+                    && canonical_list_method("append") == Some(concrete_callable)
+                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
+                    && is_list(concrete_args[0])
+                {
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    let c_arg = concrete_args.get(1).copied().unwrap_or(PY_NULL);
+                    self.list_append_value(args[0], args[1], concrete_args[0], c_arg)?;
+                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                }
+                if args.len() == 1
+                    && canonical_list_method("pop") == Some(concrete_callable)
+                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
+                    && is_list(concrete_args[0])
+                {
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    let concrete_len = w_list_len(concrete_args[0]);
+                    if concrete_len > 0 {
+                        return self.list_pop_value(
+                            callable,
+                            args[0],
+                            concrete_args[0],
+                            concrete_len,
+                        );
+                    }
+                }
+                if args.len() == 1
+                    && canonical_list_method("reverse") == Some(concrete_callable)
+                    && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
+                    && is_list(concrete_args[0])
+                {
+                    self.with_ctx(|this, ctx| {
+                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
+                    });
+                    return self.list_reverse_value(callable, args[0], concrete_args[0]);
+                }
                 if args.len() == 1 {
                     let c_arg0 = concrete_args.first().copied().unwrap_or(PY_NULL);
                     self.with_ctx(|this, ctx| {

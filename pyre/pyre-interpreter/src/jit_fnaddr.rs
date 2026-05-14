@@ -402,6 +402,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     push_alias_pair(
         &mut entries,
+        "pyre_object::listobject::jit_list_reverse",
+        "pyre_object::jit_list_reverse",
+        pyre_object::jit_list_reverse as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
         "pyre_object::tupleobject::jit_tuple_getitem",
         "pyre_object::jit_tuple_getitem",
         pyre_object::jit_tuple_getitem as *const (),
