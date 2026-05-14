@@ -3591,7 +3591,7 @@ pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64, item2: i64
             item1 as pyre_object::PyObjectRef,
             item2 as pyre_object::PyObjectRef,
         ],
-        _ => vec![], // argc > 3 not supported via this helper
+        _ => panic!("unsupported argc {} in bh_build_list_fn", argc),
     };
     pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
 }
