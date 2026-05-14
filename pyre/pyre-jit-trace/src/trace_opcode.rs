@@ -4581,7 +4581,9 @@ impl MIFrame {
                 let obj_len = w_list_len(concrete_obj);
                 let value_len = w_list_len(concrete_value);
                 let slice_len = (stop - start) as usize;
-                if value_len == slice_len {
+                if concrete_obj == concrete_value {
+                    None
+                } else if value_len == slice_len {
                     match (
                         concrete_list_strategy_id(concrete_obj),
                         concrete_list_strategy_id(concrete_value),
