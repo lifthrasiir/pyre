@@ -37,8 +37,8 @@ pub struct Cpu {
     pub call_fn_6: extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64,
     pub call_fn_7: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
     pub call_fn_8: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
-    /// `bhimpl_load_global` — namespace + code from getfield_vable_r.
-    pub load_global_fn: extern "C" fn(i64, i64, i64) -> i64,
+    /// `bhimpl_load_global` — namespace/code from getfield_vable_r plus live frame.
+    pub load_global_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_compare_op` — RPython compare_op opcodes.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_binary_op` — RPython binary_op opcodes.

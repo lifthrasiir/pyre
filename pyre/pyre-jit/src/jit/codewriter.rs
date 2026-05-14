@@ -2187,9 +2187,9 @@ fn register_helper_fn_pointers(
         HelperHandle { idx, flavor }
     };
     let call_fn = bind(assembler, cpu.call_fn as *const (), CallFlavor::MayForce);
-    // `bh_load_global_fn` is a flat `DictStorage::get(name)` lookup
-    // followed by `NameError` synthesis on miss — no
-    // `__getattr__`-style user dispatch (`call_jit.rs:3215-3242`).
+    // `bh_load_global_fn` mirrors pyopcode.py `_load_global`: globals
+    // lookup, then the current frame's picked builtins module, then
+    // `NameError` synthesis on miss.
     // Matches `EF_CAN_RAISE` (`call.py:301` `elif self._canraise(op)`):
     // can raise but does not force virtuals.
     let load_global_fn = bind(
@@ -5540,10 +5540,10 @@ impl CodeWriter {
                         // load_global_fn_idx, ...)` call is replaced by
                         // a single direct push of
                         // `build_load_global_fn_residual_call_ir_r_insn`,
-                        // which produces the same `residual_call_ir_r(
+                        // which produces the matching `residual_call_ir_r(
                         // ConstInt(fn_idx), ListI([ConstInt(namei)]),
-                        // ListR([Reg(ns), Reg(code)]), Descr) →
-                        // Reg(scratch_ns)` Insn shape
+                        // ListR([Reg(ns), Reg(code), Reg(frame)]), Descr)
+                        // → Reg(scratch_ns)` Insn shape
                         // `emit_residual_call_shape` would have
                         // produced.  LoadGlobal has no frontend HLOp
                         // (no `lower_load_global_hlop_to_insn` arm);
@@ -5559,15 +5559,17 @@ impl CodeWriter {
                                 raw_namei,
                                 scratch_ns,
                                 scratch_code,
+                                portal_frame_reg,
                                 scratch_ns,
                             ),
                         );
                         // Task #46 micro-slice 6: graph-side residual_call
                         // dual-write for load_global_fn(ns:Ref, code:Ref,
-                        // namei:Int) → Ref.  Both ns and code Variables
-                        // come from the preceding emit_vable_getfield_ref!
-                        // graph dual-writes — thread them so def-use stays
-                        // intact.  Shape: residual_call_ir_r.
+                        // frame:Ref, namei:Int) → Ref.  ns and code
+                        // Variables come from the preceding
+                        // emit_vable_getfield_ref! graph dual-writes; frame
+                        // is the portal red variable, matching PyPy's
+                        // `_load_global(self, ...)` receiver.
                         // Match helper bind-site flavor at
                         // codewriter.rs:2186 (`load_global_fn`
                         // is `EF_CAN_RAISE`, not virtual-forcing)
@@ -5587,9 +5589,9 @@ impl CodeWriter {
                                 load_global_fn_idx,
                                 CallFlavor::Plain,
                                 vec![super::flow::Constant::signed(raw_namei).into()],
-                                vec![ns_var.into(), code_var.into()],
+                                vec![ns_var.into(), code_var.into(), frame_var.into()],
                                 vec![],
-                                vec![Kind::Ref, Kind::Ref, Kind::Int],
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
                                 ResKind::Ref,
                                 py_pc as i64,
                             )

@@ -3316,10 +3316,17 @@ fn bh_call_fn_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> i64 {
     }
 }
 
-/// jtransform.py parity: namespace and code come from getfield_vable_r.
+/// jtransform.py parity: namespace and code come from getfield_vable_r; the
+/// live frame is passed explicitly so `_load_global` can mirror
+/// `self.get_builtin()` in compiled residual-call paths as well as blackhole.
 /// namespace = getfield_vable_r(frame, w_globals), code = getfield_vable_r(frame, pycode).
 /// namei is the raw oparg from LOAD_GLOBAL: name_idx = namei >> 1.
-pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: i64) -> i64 {
+pub extern "C" fn bh_load_global_fn(
+    namespace_ptr: i64,
+    w_code_ptr: i64,
+    frame_ptr: i64,
+    namei: i64,
+) -> i64 {
     let code = unsafe {
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject)
@@ -3343,10 +3350,10 @@ pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: 
         return w_value as i64;
     }
 
-    // Blackhole helper adaptation: `self` is the virtualizable frame currently
-    // pinned in BH_VABLE_PTR, so `self.get_builtin()` maps to PyFrame::get_builtin().
-    let parent_frame_ptr =
-        majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+    // Residual helper adaptation: `self` is the live portal frame passed as
+    // an explicit Ref argument, so `self.get_builtin()` maps to
+    // PyFrame::get_builtin() without relying on blackhole-only TLS.
+    let parent_frame_ptr = frame_ptr as *const PyFrame;
     if !parent_frame_ptr.is_null() {
         let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {

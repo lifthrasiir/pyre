@@ -2693,8 +2693,8 @@ pub fn build_binary_op_residual_call_ir_r_insn(
 /// `(Ref, Ref, Int) → Ref` HLOp / helper families that lower to a
 /// uniform `residual_call_ir_r` Insn shape.  Today: BINARY_OP
 /// (`binary_op_fn`, MayForce), COMPARE_OP (`compare_fn`, MayForce),
-/// and LOAD_GLOBAL (`load_global_fn`, Plain — `(ns, code, namei)`
-/// per codewriter.rs:5598-5615).  All share `arg_kinds = [Ref,
+/// and two-Ref residual helper families.  BINARY_OP and COMPARE_OP share
+/// `arg_kinds = [Ref,
 /// Ref, Int]`, ResKind Ref → kinds `"ir"` + reskind `'r'` → opname
 /// `"residual_call_ir_r"`.  They differ in the leading `fn_idx`
 /// literal, the per-family `op_val` (or callee-arg integer), and
@@ -2838,12 +2838,11 @@ pub fn build_compare_op_residual_call_ir_r_insn(
 /// graph dual-write at codewriter.rs:5622-5635 stays in place — this
 /// slice is incremental factor refactor, not retirement.
 ///
-/// `load_global_fn` has signature `(ns: Ref, code: Ref, namei: Int)
+/// `load_global_fn` has signature `(ns: Ref, code: Ref, frame: Ref, namei: Int)
 /// → Ref` with `CallFlavor::Plain` (per codewriter.rs:2176-2185 —
-/// `bh_load_global_fn` is a flat namespace lookup that can `NameError`
-/// but cannot force virtuals; matches `EF_CAN_RAISE`).  Same
-/// `(Ref, Ref, Int) → Ref` arity as BINARY_OP/COMPARE_OP — only the
-/// CallFlavor on the EffectInfo descr differs.
+/// `bh_load_global_fn` can `NameError` but cannot force virtuals; matches
+/// `EF_CAN_RAISE`).  The explicit frame Ref is the Rust residual-helper
+/// adaptation for PyPy's `_load_global(self, ...)` receiver.
 ///
 /// The matching graph dual-write at codewriter.rs (LoadGlobal arm)
 /// records `CallFlavor::Plain` so the SSA helper, the inline
@@ -2853,14 +2852,30 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
     namei: i64,
     ns_reg: u16,
     code_reg: u16,
+    frame_reg: u16,
     dst_reg: u16,
 ) -> Insn {
-    build_residual_call_ir_r_insn_from_operands(
-        load_global_fn_idx,
-        namei,
-        Operand::Register(Register::new(Kind::Ref, ns_reg)),
-        Operand::Register(Register::new(Kind::Ref, code_reg)),
-        CallFlavor::Plain,
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(load_global_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(namei)])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Ref,
+                vec![
+                    Operand::Register(Register::new(Kind::Ref, ns_reg)),
+                    Operand::Register(Register::new(Kind::Ref, code_reg)),
+                    Operand::Register(Register::new(Kind::Ref, frame_reg)),
+                ],
+            )),
+            descr_operand,
+        ],
         Register::new(Kind::Ref, dst_reg),
     )
 }
@@ -5740,15 +5755,13 @@ mod tests {
         // that `emit_residual_call_shape` produced inline at
         // codewriter.rs:5598-5615 before the refactor: `[ConstInt(
         // fn_idx), ListI([ConstInt(namei)]), ListR([Reg(ns), Reg(
-        // code)]), Descr(CallDescrStub{Plain, [Ref, Ref, Int]})] →
-        // Reg(Ref, dst)`.  Same `(Ref, Ref, Int) → Ref` arity as
-        // BINARY_OP/COMPARE_OP — distinguished only by the `Plain`
-        // CallFlavor on the EffectInfo descr (per
-        // codewriter.rs:2176-2185 — `bh_load_global_fn` cannot force
-        // virtuals, matches `EF_CAN_RAISE`).
+        // code), Reg(frame)]), Descr(CallDescrStub{Plain,
+        // [Ref, Ref, Ref, Int]})] → Reg(Ref, dst)`.  The explicit
+        // frame Ref is the helper-level stand-in for PyPy's
+        // `_load_global(self, ...)` receiver.
         let insn = build_load_global_fn_residual_call_ir_r_insn(
             /* load_global_fn_idx */ 12, /* namei */ 5, /* ns_reg */ 3,
-            /* code_reg */ 4, /* dst_reg */ 3,
+            /* code_reg */ 4, /* frame_reg */ 6, /* dst_reg */ 3,
         );
         match insn {
             Insn::Op {
@@ -5775,11 +5788,11 @@ mod tests {
                     }
                     other => panic!("expected ListOfKind(Int, 1), got {other:?}"),
                 }
-                // args[2] = ListR([Reg(Ref, ns_reg), Reg(Ref, code_reg)]).
+                // args[2] = ListR([Reg(Ref, ns_reg), Reg(Ref, code_reg), Reg(Ref, frame_reg)]).
                 match &args[2] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
-                        assert_eq!(list.content.len(), 2);
+                        assert_eq!(list.content.len(), 3);
                         assert!(matches!(
                             &list.content[0],
                             Operand::Register(Register {
@@ -5794,13 +5807,23 @@ mod tests {
                                 index: 4
                             })
                         ));
+                        assert!(matches!(
+                            &list.content[2],
+                            Operand::Register(Register {
+                                kind: Kind::Ref,
+                                index: 6
+                            })
+                        ));
                     }
-                    other => panic!("expected ListOfKind(Ref, 2), got {other:?}"),
+                    other => panic!("expected ListOfKind(Ref, 3), got {other:?}"),
                 }
                 match &args[3] {
                     Operand::Descr(rc) => match &**rc {
                         DescrOperand::CallDescrStub(stub) => {
-                            assert_eq!(stub.arg_kinds, vec![Kind::Ref, Kind::Ref, Kind::Int]);
+                            assert_eq!(
+                                stub.arg_kinds,
+                                vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int]
+                            );
                             assert_eq!(
                                 stub.effect_info,
                                 effect_info_for_call_flavor(CallFlavor::Plain),
@@ -5827,10 +5850,11 @@ mod tests {
         // path.
         let ns_var = Variable::new(VariableId(3), Kind::Ref);
         let code_var = Variable::new(VariableId(4), Kind::Ref);
+        let frame_var = Variable::new(VariableId(6), Kind::Ref);
         let dst_var = Variable::new(VariableId(3), Kind::Ref);
         let descr = intern_call_descr_stub(
             effect_info_for_call_flavor(CallFlavor::Plain),
-            vec![Kind::Ref, Kind::Ref, Kind::Int],
+            vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
             Some(Kind::Ref),
         );
         let dual_op = SpaceOperation::new(
@@ -5838,7 +5862,11 @@ mod tests {
             vec![
                 Constant::signed(12).into(),
                 FlowListOfKind::new(Kind::Int, vec![Constant::signed(5).into()]).into(),
-                FlowListOfKind::new(Kind::Ref, vec![ns_var.into(), code_var.into()]).into(),
+                FlowListOfKind::new(
+                    Kind::Ref,
+                    vec![ns_var.into(), code_var.into(), frame_var.into()],
+                )
+                .into(),
                 descr.into(),
             ],
             Some(dst_var.into()),
@@ -5848,7 +5876,7 @@ mod tests {
         let mut lower_constant = probe_constant_lowering();
         let dual = flatten_op_to_insn(&dual_op, &mut get_register)
             .expect("residual_call SpaceOperation must lower");
-        let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 3);
+        let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 3);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
 
@@ -5868,7 +5896,7 @@ mod tests {
         // (`:293-299`). Both EIs therefore carry distinct shapes and
         // round-trip through `dispatch_kind_for_effect_info`.
         let bin = build_binary_op_residual_call_ir_r_insn(7, 0, 1, 2, 3);
-        let glob = build_load_global_fn_residual_call_ir_r_insn(7, 0, 1, 2, 3);
+        let glob = build_load_global_fn_residual_call_ir_r_insn(7, 0, 1, 2, 4, 3);
         let bin_descr = match &bin {
             Insn::Op { args, .. } => match &args[3] {
                 Operand::Descr(rc) => match &**rc {
