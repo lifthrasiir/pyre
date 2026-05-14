@@ -1493,6 +1493,26 @@ fn emit_frontend_newslice(
     )
 }
 
+fn emit_frontend_buildslice_shadow_graph(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    argc: pyre_interpreter::bytecode::BuildSliceArgCount,
+    start: super::flow::FlowValue,
+    stop: super::flow::FlowValue,
+    step: Option<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    use pyre_interpreter::bytecode::BuildSliceArgCount;
+    let step = match argc {
+        BuildSliceArgCount::Two => {
+            debug_assert!(step.is_none(), "BUILD_SLICE argc=2 must synthesize None");
+            super::flow::Constant::none().into()
+        }
+        BuildSliceArgCount::Three => step.expect("BUILD_SLICE argc=3 must preserve explicit step"),
+    };
+    emit_frontend_newslice(graph, block, start, stop, step, offset)
+}
+
 fn emit_frontend_setitem(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -5907,16 +5927,14 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        let (step_reg, step_value) = match step_info {
-                            Some((reg, value)) => (Some(reg), value),
-                            None => (None, super::flow::Constant::none().into()),
-                        };
-                        let result_value = emit_frontend_newslice(
+                        let step_reg = step_info.as_ref().map(|(reg, _)| *reg);
+                        let result_value = emit_frontend_buildslice_shadow_graph(
                             &mut graph,
                             &current_block.block(),
+                            argc,
                             start_value,
                             stop_value,
-                            step_value,
+                            step_info.map(|(_, value)| value),
                             py_pc as i64,
                         );
                         ssarepr.insns.push(
@@ -8670,6 +8688,99 @@ mod tests {
         assert_eq!(op.offset, 44);
         assert_eq!(op.args, vec![item0.into(), item1.into(), item2.into()]);
         assert_eq!(op.result, Some(result.into()));
+    }
+
+    #[test]
+    fn emit_frontend_newslice_records_three_ref_operands() {
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("newslice", start.clone(), None);
+        let w_start = Variable::new(VariableId(22), Kind::Ref);
+        let w_stop = Variable::new(VariableId(23), Kind::Ref);
+        let w_step = Variable::new(VariableId(24), Kind::Ref);
+
+        let result = emit_frontend_newslice(
+            &mut graph,
+            &start,
+            w_start.into(),
+            w_stop.into(),
+            w_step.into(),
+            46,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("newslice op should be recorded");
+        assert_eq!(op.opname, "newslice");
+        assert_eq!(op.offset, 46);
+        assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn emit_frontend_buildslice_shadow_graph_two_arg_synthesizes_none_step() {
+        use pyre_interpreter::bytecode::BuildSliceArgCount;
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("build_slice_two", start.clone(), None);
+        let w_start = Variable::new(VariableId(25), Kind::Ref);
+        let w_stop = Variable::new(VariableId(26), Kind::Ref);
+
+        let result = emit_frontend_buildslice_shadow_graph(
+            &mut graph,
+            &start,
+            BuildSliceArgCount::Two,
+            w_start.into(),
+            w_stop.into(),
+            None,
+            47,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("BUILD_SLICE argc=2 should record newslice");
+        assert_eq!(op.opname, "newslice");
+        assert_eq!(op.offset, 47);
+        assert_eq!(
+            op.args,
+            vec![w_start.into(), w_stop.into(), Constant::none().into()],
+        );
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    fn emit_frontend_buildslice_shadow_graph_three_arg_preserves_step() {
+        use pyre_interpreter::bytecode::BuildSliceArgCount;
+        let start = Block::shared(Vec::new());
+        let mut graph = FunctionGraph::new("build_slice_three", start.clone(), None);
+        let w_start = Variable::new(VariableId(27), Kind::Ref);
+        let w_stop = Variable::new(VariableId(28), Kind::Ref);
+        let w_step = Variable::new(VariableId(29), Kind::Ref);
+
+        let result = emit_frontend_buildslice_shadow_graph(
+            &mut graph,
+            &start,
+            BuildSliceArgCount::Three,
+            w_start.into(),
+            w_stop.into(),
+            Some(w_step.into()),
+            48,
+        );
+
+        let block = start.borrow();
+        let op = block
+            .operations
+            .last()
+            .expect("BUILD_SLICE argc=3 should record newslice");
+        assert_eq!(op.opname, "newslice");
+        assert_eq!(op.offset, 48);
+        assert_eq!(op.args, vec![w_start.into(), w_stop.into(), w_step.into()]);
+        assert_eq!(op.result, Some(result.into()));
+        assert_eq!(result.kind, Some(Kind::Ref));
     }
 
     #[test]
