@@ -3138,11 +3138,11 @@ pub fn build_build_list_fn_residual_call_ir_r_insn(
     arg_regs: &[u16],
     dst_reg: u16,
 ) -> Insn {
-    debug_assert!(
+    assert!(
         argc <= 3,
         "BuildList helper only supports argc ∈ {{0, 1, 2, 3}}"
     );
-    debug_assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
+    assert_eq!(arg_regs.len(), argc, "arg_regs length must match argc");
     let mut arg_kinds: Vec<Kind> = Vec::with_capacity(4);
     let mut args_i: Vec<Operand> = Vec::with_capacity(4);
     let mut args_r: Vec<Operand> = Vec::with_capacity(3);
@@ -3188,7 +3188,10 @@ pub fn build_build_slice_fn_residual_call_ir_r_insn(
     step_reg: Option<u16>,
     dst_reg: u16,
 ) -> Insn {
-    debug_assert!(argc == 2 || argc == 3, "BUILD_SLICE argc must be 2 or 3");
+    assert!(
+        matches!((argc, step_reg), (2, None) | (3, Some(_))),
+        "BUILD_SLICE expects argc=2 without step or argc=3 with step"
+    );
     let mut arg_kinds = vec![Kind::Int, Kind::Ref, Kind::Ref];
     let mut args_i = vec![Operand::ConstInt(argc as i64)];
     let mut args_r = vec![
@@ -6410,6 +6413,30 @@ mod tests {
             .expect("residual_call SpaceOperation must lower");
         let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "BuildList helper only supports argc")]
+    fn build_build_list_fn_residual_call_ir_r_insn_rejects_unsupported_argc() {
+        let _ = build_build_list_fn_residual_call_ir_r_insn(18, 4, &[1, 2, 3, 4], 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "arg_regs length must match argc")]
+    fn build_build_list_fn_residual_call_ir_r_insn_rejects_arg_reg_mismatch() {
+        let _ = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[1], 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUILD_SLICE expects argc=2 without step or argc=3 with step")]
+    fn build_build_slice_fn_residual_call_ir_r_insn_rejects_two_arg_with_step() {
+        let _ = build_build_slice_fn_residual_call_ir_r_insn(19, 2, 1, 2, Some(3), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "BUILD_SLICE expects argc=2 without step or argc=3 with step")]
+    fn build_build_slice_fn_residual_call_ir_r_insn_rejects_three_arg_without_step() {
+        let _ = build_build_slice_fn_residual_call_ir_r_insn(19, 3, 1, 2, None, 4);
     }
 
     #[test]
