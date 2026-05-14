@@ -3331,21 +3331,49 @@ pub extern "C" fn bh_load_global_fn(namespace_ptr: i64, w_code_ptr: i64, namei: 
         return 0;
     }
 
-    let name = code.names[idx].as_ref();
-    let ns = unsafe { &*(namespace_ptr as *const pyre_interpreter::DictStorage) };
-    match ns.get(name) {
-        Some(&value) => value as i64,
-        None => {
-            // NameError: set exception object in TLS.
-            let err = pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::NameError,
-                format!("name '{}' is not defined", name),
-            );
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-            0
+    let varname = code.names[idx].as_ref();
+    let w_globals = unsafe { &*(namespace_ptr as *const pyre_interpreter::DictStorage) };
+    // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
+    //   w_value = self.space.finditem_str(self.get_w_globals(), varname)
+    //   if w_value is None:
+    //       w_value = self.get_builtin().getdictvalue(self.space, varname)
+    //       if w_value is None:
+    //           self._load_global_failed(w_varname)
+    if let Some(&w_value) = pyre_interpreter::dict_storage_get(w_globals, varname).as_ref() {
+        return w_value as i64;
+    }
+
+    // Blackhole helper adaptation: `self` is the virtualizable frame currently
+    // pinned in BH_VABLE_PTR, so `self.get_builtin()` maps to PyFrame::get_builtin().
+    let parent_frame_ptr =
+        majit_metainterp::blackhole::BH_VABLE_PTR.with(|c| c.get()) as *const PyFrame;
+    if !parent_frame_ptr.is_null() {
+        let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
+        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            if !w_dict.is_null() {
+                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                    Ok(Some(w_value)) => return w_value as i64,
+                    Ok(None) => {}
+                    Err(err) => {
+                        let exc_obj = err.to_exc_object();
+                        majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                            .with(|c| c.set(exc_obj as i64));
+                        return 0;
+                    }
+                }
+            }
         }
     }
+
+    // pyopcode.py:970 `_load_global_failed`: raise NameError.
+    let err = pyre_interpreter::PyError::new(
+        pyre_interpreter::PyErrorKind::NameError,
+        format!("name '{}' is not defined", varname),
+    );
+    let exc_obj = err.to_exc_object();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    0
 }
 
 /// Load a constant from the code object.

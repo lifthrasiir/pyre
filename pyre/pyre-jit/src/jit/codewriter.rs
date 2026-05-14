@@ -6114,13 +6114,14 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        // D2-1: input-side staging retire — exc_reg's SSA
-                        // register slot still holds the popped value (the
-                        // popvalue macro only NULL-clears the portal vable
-                        // mirror), so set_current_exception can read it
-                        // directly and the trailing push can use it as the
-                        // src register. Pattern matches Sessions 1-3
-                        // input-side retirements.
+                        // pyopcode.py:786 keeps `exc` in a local after
+                        // `popvalue()`.  Mirror that with a scratch register:
+                        // the following `push(prev)` writes to the popped
+                        // stack slot, so reusing `exc_reg` for the trailing
+                        // `push(exc)` would read back `prev` instead of the
+                        // caught exception.
+                        let scratch_exc = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                        emit_ref_copy!(ssarepr, scratch_exc, exc_reg);
                         let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         // get_current_exception / set_current_exception are TLS read/write —
                         // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
@@ -6141,7 +6142,7 @@ impl CodeWriter {
                         ssarepr.insns.push(
                             super::flatten::build_set_current_exception_fn_residual_call_r_v_insn(
                                 set_current_exception_fn_idx,
-                                exc_reg,
+                                scratch_exc,
                             ),
                         );
                         // Task #46 micro-slice 7: graph dual-writes for
@@ -6188,7 +6189,7 @@ impl CodeWriter {
                         current_state.stack.push(prev_value.clone());
                         emit_pushvalue_ref!(ssarepr, current_depth, scratch_prev, prev_value);
                         current_state.stack.push(exc_value.clone());
-                        emit_pushvalue_ref!(ssarepr, current_depth, exc_reg, exc_value);
+                        emit_pushvalue_ref!(ssarepr, current_depth, scratch_exc, exc_value);
                     }
 
                     Instruction::CheckExcMatch => {
