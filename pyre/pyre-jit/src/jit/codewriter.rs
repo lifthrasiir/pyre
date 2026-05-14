@@ -2910,6 +2910,12 @@ impl CodeWriter {
         // tests stay stable.
         let portal_frame_reg = (nlocals + max_stackdepth + 11) as u16;
         let portal_ec_reg = (nlocals + max_stackdepth + 12) as u16;
+        // Trace inputarg 0 is the live PyFrame pointer for both portal
+        // and non-portal dispatch (virtualizable_gen.rs:25).  Portal red
+        // register slots are only the codewriter/BH register-bank carrier,
+        // so residual helpers that need the actual frame receiver must use
+        // this canonical frame input slot.
+        let caller_frame_reg = 0_u16;
         // Per-arm fresh ref scratch slots — Phase 2 Commit 2.2 first slice
         // (Tasks #158/#159/#122 plan).  Each opcode handler arm that needs
         // a transient ref-typed register allocates one or more fresh slots
@@ -5559,7 +5565,7 @@ impl CodeWriter {
                                 raw_namei,
                                 scratch_ns,
                                 scratch_code,
-                                portal_frame_reg,
+                                caller_frame_reg,
                                 scratch_ns,
                             ),
                         );

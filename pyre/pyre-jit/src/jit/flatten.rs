@@ -5761,7 +5761,7 @@ mod tests {
         // `_load_global(self, ...)` receiver.
         let insn = build_load_global_fn_residual_call_ir_r_insn(
             /* load_global_fn_idx */ 12, /* namei */ 5, /* ns_reg */ 3,
-            /* code_reg */ 4, /* frame_reg */ 6, /* dst_reg */ 3,
+            /* code_reg */ 4, /* frame_reg */ 6, /* dst_reg */ 7,
         );
         match insn {
             Insn::Op {
@@ -5770,7 +5770,7 @@ mod tests {
                 result: Some(reg),
             } => {
                 assert_eq!(opname, "residual_call_ir_r");
-                assert_eq!(reg, Register::new(Kind::Ref, 3));
+                assert_eq!(reg, Register::new(Kind::Ref, 7));
                 assert_eq!(args.len(), 4);
                 match &args[0] {
                     Operand::ConstInt(v) => assert_eq!(*v, 12),
@@ -5851,7 +5851,7 @@ mod tests {
         let ns_var = Variable::new(VariableId(3), Kind::Ref);
         let code_var = Variable::new(VariableId(4), Kind::Ref);
         let frame_var = Variable::new(VariableId(6), Kind::Ref);
-        let dst_var = Variable::new(VariableId(3), Kind::Ref);
+        let dst_var = Variable::new(VariableId(7), Kind::Ref);
         let descr = intern_call_descr_stub(
             effect_info_for_call_flavor(CallFlavor::Plain),
             vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
@@ -5876,7 +5876,7 @@ mod tests {
         let mut lower_constant = probe_constant_lowering();
         let dual = flatten_op_to_insn(&dual_op, &mut get_register)
             .expect("residual_call SpaceOperation must lower");
-        let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 3);
+        let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 7);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
 
