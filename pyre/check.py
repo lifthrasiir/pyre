@@ -554,6 +554,11 @@ class Check:
             print(f"{red('CRASH')} (exit {cpython_code})")
             cpython_output = None
             t_cpython = "-"
+            for backend in ("dynasm", "cranelift"):
+                if self.enabled(backend):
+                    self._record(backend, False, name, "cpython crash")
+                    self._append_comparison(backend, name, "-", "-", "FAIL")
+            return
         else:
             t_cpython = f"{cpython_time:.2f}"
             print(f"{dim('done')}  {t_cpython}s")
@@ -712,6 +717,12 @@ class Check:
 # ── Argument parsing ─────────────────────────────────────────────────
 
 def parse_args():
+    def positive_float(value):
+        f = float(value)
+        if f <= 0:
+            raise argparse.ArgumentTypeError("must be greater than 0")
+        return f
+
     parser = argparse.ArgumentParser(
         description="pyre pre-merge check: correctness + regression guard + comparison",
     )
@@ -744,7 +755,7 @@ def parse_args():
     )
     parser.add_argument(
         "--synthetic-timeout",
-        type=float,
+        type=positive_float,
         default=20.0,
         help="per-script timeout in seconds for synthetic benchmarks",
     )

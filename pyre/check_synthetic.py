@@ -35,8 +35,8 @@ def run(args, timeout):
     try:
         proc = subprocess.run(
             args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            check=False,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -44,6 +44,9 @@ def run(args, timeout):
         )
     except subprocess.TimeoutExpired:
         return 124, "", "timeout", timeout
+    except FileNotFoundError as e:
+        elapsed = time.perf_counter() - start
+        return 127, "", str(e), elapsed
     elapsed = time.perf_counter() - start
     return proc.returncode, proc.stdout.replace("\r\n", "\n"), proc.stderr, elapsed
 
