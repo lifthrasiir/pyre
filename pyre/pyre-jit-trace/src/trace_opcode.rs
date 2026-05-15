@@ -4306,6 +4306,23 @@ impl MIFrame {
         None
     }
 
+    fn existing_ref_for_concrete(&self, concrete_obj: PyObjectRef) -> Option<OpRef> {
+        if concrete_obj.is_null() {
+            return None;
+        }
+        let s = self.sym();
+        let total_slots = s.nlocals + s.concrete_stack.len();
+        for abs_idx in 0..total_slots {
+            if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
+                let opref = *s.registers_r.get(abs_idx)?;
+                if self.value_type(opref) == Type::Ref {
+                    return Some(opref);
+                }
+            }
+        }
+        None
+    }
+
     #[allow(dead_code)]
     fn guard_int_object_value(&mut self, ctx: &mut TraceCtx, int_obj: OpRef, expected: i64) {
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
@@ -5050,6 +5067,9 @@ impl MIFrame {
                     unsafe { pyre_interpreter::lookup_in_type(list_type, name) }
                 };
                 let recover_self = |this: &mut Self| {
+                    if let Some(existing) = this.existing_ref_for_concrete(inner_self) {
+                        return existing;
+                    }
                     this.with_ctx(|this, ctx| {
                         this.guard_class(ctx, callable, &METHOD_TYPE as *const PyType);
                         let func_ref = ctx.record_op_with_descr(
@@ -5066,21 +5086,14 @@ impl MIFrame {
                     })
                 };
                 if args.len() == 1 && canonical_list_method("append") == Some(inner_func) {
-                    let c_arg = concrete_args.first().copied().unwrap_or(PY_NULL);
-                    let self_ref = recover_self(self);
-                    self.list_append_value(self_ref, args[0], inner_self, c_arg)?;
-                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                    return Err(PyError::type_error(
+                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 0 && canonical_list_method("pop") == Some(inner_func) {
-                    let concrete_len = unsafe { w_list_len(inner_self) };
-                    // Empty-list pop raises IndexError; let the generic
-                    // dispatcher handle that. Strategy-unknown lists also
-                    // fall through; `list_pop_value` mirrors the strategy
-                    // detection from `list_append_value`.
-                    if concrete_len > 0 {
-                        let self_ref = recover_self(self);
-                        return self.list_pop_value(callable, self_ref, inner_self, concrete_len);
-                    }
+                    return Err(PyError::type_error(
+                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 0 && canonical_list_method("reverse") == Some(inner_func) {
                     let self_ref = recover_self(self);
@@ -5118,30 +5131,18 @@ impl MIFrame {
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    let c_arg = concrete_args.get(1).copied().unwrap_or(PY_NULL);
-                    self.list_append_value(args[0], args[1], concrete_args[0], c_arg)?;
-                    return Ok(self.with_ctx(|_, ctx| ctx.const_ref(pyre_object::w_none() as i64)));
+                    return Err(PyError::type_error(
+                        "abort tracing builtin list.append until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 1
                     && canonical_list_method("pop") == Some(concrete_callable)
                     && !concrete_args.first().copied().unwrap_or(PY_NULL).is_null()
                     && is_list(concrete_args[0])
                 {
-                    self.with_ctx(|this, ctx| {
-                        this.implement_guard_value(ctx, callable, concrete_callable as i64)
-                    });
-                    let concrete_len = w_list_len(concrete_args[0]);
-                    if concrete_len > 0 {
-                        return self.list_pop_value(
-                            callable,
-                            args[0],
-                            concrete_args[0],
-                            concrete_len,
-                        );
-                    }
+                    return Err(PyError::type_error(
+                        "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
+                    ));
                 }
                 if args.len() == 1
                     && canonical_list_method("reverse") == Some(concrete_callable)

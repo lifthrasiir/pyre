@@ -3802,12 +3802,20 @@ impl Optimizer {
         }
 
         // optimizer.py:672-683: shared vs. fresh dispatch.
+        // RPython's descrless sharing applies to optimizer-created
+        // follow-up guards with no captured resume data of their own.  Pyre
+        // keeps resume snapshots in side tables keyed by rd_resume_position;
+        // unroll clones those entries and strips descrs to mirror
+        // opencoder.py.  If such a guard shared solely because descr is None,
+        // it would inherit the previous guard's resume pc and discard the
+        // cloned snapshot.
         // compile.py:925-926 invent_fail_descr_for_op: GUARD_NOT_FORCED /
         // GUARD_NOT_FORCED_2 must always mint a fresh ResumeGuardForcedDescr
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path at
         // optimizeopt/mod.rs:3061-3066.
         let shared = op.descr.is_none()
+            && op.rd_resume_position < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;

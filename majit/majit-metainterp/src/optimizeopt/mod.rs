@@ -4162,12 +4162,17 @@ impl OptContext {
         }
 
         // optimizer.py:672: `self._last_guard_op and guard_op.getdescr() is None`
-        // getdescr() is None only for optimizer-created guards (no descr
-        // from tracing, no ResumeAtPositionDescr from unroll).
+        // getdescr() is None only for optimizer-created guards in RPython.
+        // Pyre stores resume snapshots in side tables keyed by
+        // rd_resume_position; unroll clones those side-table entries and then
+        // strips descrs to match opencoder.py.  A guard that already carries a
+        // cloned rd_resume_position must therefore be finalized from its own
+        // snapshot instead of sharing the previous guard's resume descr.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
             && op.descr.is_none()
+            && op.rd_resume_position < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
