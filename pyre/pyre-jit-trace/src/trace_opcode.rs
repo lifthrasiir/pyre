@@ -279,6 +279,48 @@ use crate::helpers::TraceHelperAccess;
 ///
 /// Returns `(frame, drop_needed)`. `drop_needed` is true only for the legacy
 /// arena helper path; trace-visible frames are GC-owned.
+fn fill_positional_defaults_for_trace_call(
+    callable: PyObjectRef,
+    code: &CodeObject,
+    args: &[PyObjectRef],
+) -> Vec<PyObjectRef> {
+    let nparams = code.arg_count as usize;
+    if args.len() >= nparams {
+        return args.to_vec();
+    }
+
+    let defaults = unsafe { pyre_interpreter::function_get_defaults(callable) };
+    if defaults.is_null() {
+        return args.to_vec();
+    }
+
+    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
+    let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+        unsafe { pyre_object::w_tuple_len(defaults) }
+    } else {
+        0
+    };
+    if ndefaults == 0 {
+        return args.to_vec();
+    }
+
+    let first_default = nparams - ndefaults;
+    let mut full = Vec::with_capacity(nparams);
+    full.extend_from_slice(args);
+    for i in args.len()..nparams {
+        if i >= first_default {
+            let default_idx = i - first_default;
+            full.push(
+                unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
+                    .unwrap_or(pyre_object::PY_NULL),
+            );
+        } else {
+            full.push(pyre_object::PY_NULL);
+        }
+    }
+    full
+}
+
 fn emit_call_assembler_callee_frame(
     this: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -5575,8 +5617,7 @@ impl MIFrame {
             this.implement_guard_value(ctx, callable, concrete_callable as i64);
         });
 
-        let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
-        for (_idx, arg) in concrete_args.iter().copied().enumerate() {
+        for (_idx, arg) in passed_concrete_args.iter().copied().enumerate() {
             if arg.is_null() {
                 return Err(PyError::type_error(
                     "pending inline frame lost concrete arg",
@@ -5588,7 +5629,7 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        let _raw_code = unsafe {
+        let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const CodeObject
         };
@@ -5597,6 +5638,11 @@ impl MIFrame {
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
         // tuple equality is lossless vs the derived u64 hash.
         let is_self_recursive = caller_code as usize == w_code as usize;
+        let concrete_args = fill_positional_defaults_for_trace_call(
+            concrete_callable,
+            unsafe { &*raw_code },
+            passed_concrete_args,
+        );
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             w_code,
             &concrete_args,

@@ -11,6 +11,32 @@ use crate::{
     function_get_globals,
 };
 
+struct FrameLocalsRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl FrameLocalsRoot {
+    fn new(frame: &PyFrame) -> Self {
+        let frame = frame as *const PyFrame as *mut PyFrame;
+        let slot = unsafe { std::ptr::addr_of_mut!((*frame).locals_cells_stack_w) } as *mut *mut u8;
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+
+    fn new_mut(frame: &mut PyFrame) -> Self {
+        Self::new(frame)
+    }
+}
+
+impl Drop for FrameLocalsRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
 thread_local! {
     /// Most recent error swallowed by `call_function_impl` /
     /// `call_user_function_with_args`. These functions return a bare
@@ -302,6 +328,8 @@ fn call_user_function_with_eval(
         closure,
     );
     func_frame.fix_array_ptrs();
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame)
 }
 
@@ -345,6 +373,8 @@ pub fn call_user_function_resolved(
     let mut func_frame =
         PyFrame::new_for_call_with_closure(w_code, args, globals, frame.execution_context, closure);
     func_frame.fix_array_ptrs();
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame)
 }
 

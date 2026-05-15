@@ -3,14 +3,15 @@
 //!
 //! Separated from pyre-interpreter/src/call.rs so pyre-interpreter stays JIT-free.
 
+use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Once;
 
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
-    PyResult, function_get_closure, function_get_globals, function_get_name, is_function,
-    register_jit_function_caller,
+    PyResult, function_get_closure, function_get_defaults, function_get_globals, function_get_name,
+    is_function, register_jit_function_caller,
 };
 use pyre_object::intobject::w_int_get_value;
 use pyre_object::intobject::w_int_new;
@@ -2622,6 +2623,52 @@ pub fn create_callee_frame_impl_pub(caller_frame: i64, callable: i64, args: &[Py
     create_callee_frame_impl(caller_frame, callable, args)
 }
 
+fn fill_positional_defaults_for_jit_call<'a>(
+    callable: PyObjectRef,
+    w_code: *const (),
+    args: &'a [PyObjectRef],
+) -> Cow<'a, [PyObjectRef]> {
+    let defaults = unsafe { function_get_defaults(callable) };
+    if defaults.is_null() {
+        return Cow::Borrowed(args);
+    }
+
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
+            as *const pyre_interpreter::CodeObject)
+    };
+    let nparams = code.arg_count as usize;
+    if args.len() >= nparams {
+        return Cow::Borrowed(args);
+    }
+
+    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
+    let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+        unsafe { pyre_object::w_tuple_len(defaults) }
+    } else {
+        0
+    };
+    if ndefaults == 0 {
+        return Cow::Borrowed(args);
+    }
+
+    let first_default = nparams - ndefaults;
+    let mut full = Vec::with_capacity(nparams);
+    full.extend_from_slice(args);
+    for i in args.len()..nparams {
+        if i >= first_default {
+            let default_idx = i - first_default;
+            full.push(
+                unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
+                    .unwrap_or(PY_NULL),
+            );
+        } else {
+            full.push(PY_NULL);
+        }
+    }
+    Cow::Owned(full)
+}
+
 #[inline]
 fn reset_reused_call_frame(frame: &mut PyFrame, args: &[PyObjectRef]) {
     frame.locals_w_mut().as_mut_slice().fill(PY_NULL);
@@ -2652,6 +2699,9 @@ fn create_callee_frame_impl_1_boxed(
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
+    let one_arg = [boxed_arg];
+    let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
+    let args = args.as_ref();
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {
@@ -2661,7 +2711,7 @@ fn create_callee_frame_impl_1_boxed(
                 && f.w_globals == globals
                 && f.execution_context == caller.execution_context
             {
-                reset_reused_call_frame(f, &[boxed_arg]);
+                reset_reused_call_frame(f, args);
             } else {
                 unsafe {
                     // Different function: drop the previous frame before
@@ -2670,12 +2720,7 @@ fn create_callee_frame_impl_1_boxed(
                     std::ptr::drop_in_place(ptr);
                     std::ptr::write(
                         ptr,
-                        PyFrame::new_for_call(
-                            w_code,
-                            &[boxed_arg],
-                            globals,
-                            caller.execution_context,
-                        ),
+                        PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
                     );
                     (&mut *ptr).fix_array_ptrs();
                 }
@@ -2684,7 +2729,7 @@ fn create_callee_frame_impl_1_boxed(
             unsafe {
                 std::ptr::write(
                     ptr,
-                    PyFrame::new_for_call(w_code, &[boxed_arg], globals, caller.execution_context),
+                    PyFrame::new_for_call(w_code, args, globals, caller.execution_context),
                 );
                 (&mut *ptr).fix_array_ptrs();
             }
@@ -2695,7 +2740,7 @@ fn create_callee_frame_impl_1_boxed(
 
     let frame_ptr = heap_alloc_frame(PyFrame::new_for_call(
         w_code,
-        &[boxed_arg],
+        args,
         globals,
         caller.execution_context,
     ));
@@ -2776,6 +2821,8 @@ fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRe
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let globals = unsafe { function_get_globals(callable) };
+    let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
+    let args = args.as_ref();
 
     let arena = arena_ref();
     if let Some((ptr, was_init)) = arena.take() {

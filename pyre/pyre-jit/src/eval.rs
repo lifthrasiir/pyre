@@ -80,6 +80,36 @@ fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
     majit_gc::gc_remove_root(slot as *mut majit_ir::GcRef);
 }
 
+struct FrameLocalsRoot {
+    slots: Vec<(*mut *mut u8, bool)>,
+}
+
+impl FrameLocalsRoot {
+    fn new(frame: &mut PyFrame) -> Self {
+        let mut slots = Vec::new();
+        let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
+        slots.push((slot, unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }));
+        if !frame.locals_cells_stack_w.is_null() {
+            let arr = unsafe { &mut *frame.locals_cells_stack_w };
+            for item in arr.as_mut_slice() {
+                let slot = item as *mut _ as *mut *mut u8;
+                slots.push((slot, unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }));
+            }
+        }
+        Self { slots }
+    }
+}
+
+impl Drop for FrameLocalsRoot {
+    fn drop(&mut self) {
+        for (slot, registered) in self.slots.drain(..).rev() {
+            if registered {
+                pyre_object::gc_hook::try_gc_remove_root(slot);
+            }
+        }
+    }
+}
+
 /// Bridge pyre-object's `is_managed_heap_object` query to
 /// `majit_gc::gc_owns_object`. Used by host-side allocators
 /// (`pyre_object::dealloc_items_block`) to discriminate
@@ -87,6 +117,10 @@ fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
 /// fallback blocks.
 fn pyre_object_gc_owns_object_trampoline(addr: usize) -> bool {
     majit_gc::gc_owns_object(addr)
+}
+
+fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
+    majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
 /// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
@@ -499,11 +533,11 @@ thread_local! {
             &pyre_interpreter::gateway::BUILTIN_CODE_TYPE as *const _ as usize,
             builtin_code_tid,
         );
-        // Function carries 4 inline `PyObjectRef` fields (closure /
-        // defs_w / w_kw_defs / w_module) that the collector must walk
-        // — `object_subclass_with_gc_ptrs` records the offsets so
-        // mark traversal reaches them. `BUILTIN_FUNCTION_TYPE` is a
-        // separate static `PyType` for module-level builtins
+        // Function carries inline `PyObjectRef` fields (code / closure /
+        // defs_w / w_kw_defs / w_module / cached metadata) that the
+        // collector must walk — `object_subclass_with_gc_ptrs` records
+        // the offsets so mark traversal reaches them. `BUILTIN_FUNCTION_TYPE`
+        // is a separate static `PyType` for module-level builtins
         // (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
         // instances are the same Rust struct, so the vtable map sends
         // both PyTypes to `function_tid`.
@@ -1193,6 +1227,7 @@ thread_local! {
             pyre_object_gc_remove_root_trampoline,
         );
         pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
+        pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
         // Task #145 Step 2.4 Phase 2c — host-side `pyre_object::gc_roots`
         // shadow stack mirror of `framework.shadowstack`. Pinned roots
         // come from manual `pyre_object::gc_roots::pin_root` calls
@@ -3373,13 +3408,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         }
         let env = PyreEnv;
         let mut jit_state = build_jit_state(frame, info);
-        let outcome = driver.run_compiled_detailed_with_bridge_keyed(
-            green_key,
-            frame.next_instr(),
-            &mut jit_state,
-            &env,
-            || {},
-        );
+        let outcome = {
+            let _frame_locals_root = FrameLocalsRoot::new(frame);
+            driver.run_compiled_detailed_with_bridge_keyed(
+                green_key,
+                frame.next_instr(),
+                &mut jit_state,
+                &env,
+                || {},
+            )
+        };
         // rstack.stack_check_slowpath → _StackOverflow parity: drain
         // the JIT-overflow flag the backend probe records when it
         // trips during compiled execution at function entry.
@@ -3549,7 +3587,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             debug_first_arg_int(frame),
         );
     }
-    driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
+    {
+        let _frame_locals_root = FrameLocalsRoot::new(frame);
+        driver.force_start_tracing(green_key, frame.next_instr(), &mut jit_state, &env);
+    }
     None
 }
 

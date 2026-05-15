@@ -239,6 +239,17 @@ fn dynasm_gc_remove_root(slot: *mut GcRef) {
     });
 }
 
+/// Host-side write-barrier trampoline for GC-managed objects updated
+/// outside compiled code.
+fn dynasm_gc_write_barrier(obj: GcRef) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.write_barrier(obj);
+        }
+    });
+}
+
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side
 /// allocators (`pyre_object::dealloc_items_block`) discriminate
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
@@ -923,6 +934,7 @@ impl DynasmBackend {
         majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
         majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
         majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
+        majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

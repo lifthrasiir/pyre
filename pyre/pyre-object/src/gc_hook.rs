@@ -176,6 +176,38 @@ pub fn try_gc_owns_object(addr: *mut u8) -> bool {
     })
 }
 
+/// Signature of the host-side write barrier callback. `obj` is the
+/// GC-managed object whose field is being updated with a possible young
+/// pointer. The backend decides whether `obj` is old enough to require
+/// remembering.
+pub type GcWriteBarrierHookFn = fn(obj: *mut u8);
+
+thread_local! {
+    static GC_WRITE_BARRIER_HOOK: Cell<Option<GcWriteBarrierHookFn>> = const { Cell::new(None) };
+}
+
+/// Install the write-barrier callback for this thread.
+pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
+    GC_WRITE_BARRIER_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the write-barrier callback on this thread.
+pub fn clear_gc_write_barrier_hook() {
+    GC_WRITE_BARRIER_HOOK.with(|cell| cell.set(None));
+}
+
+/// Run the active GC write barrier for `obj` when one is installed.
+#[inline]
+pub fn try_gc_write_barrier(obj: *mut u8) -> bool {
+    GC_WRITE_BARRIER_HOOK.with(|cell| match cell.get() {
+        Some(f) => {
+            f(obj);
+            true
+        }
+        None => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

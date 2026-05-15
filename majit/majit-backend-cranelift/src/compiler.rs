@@ -1325,6 +1325,12 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
     with_cranelift_gc(|gc| gc.remove_root(slot));
 }
 
+/// Host-side write-barrier trampoline for GC-managed objects updated
+/// outside compiled code.
+fn gc_write_barrier_via_active_runtime(obj: GcRef) {
+    with_cranelift_gc(|gc| gc.write_barrier(obj));
+}
+
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side
 /// allocators (`pyre_object::dealloc_items_block`) discriminate
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
@@ -6933,6 +6939,7 @@ impl CraneliftBackend {
             Some(gc_remove_root_via_active_runtime),
         );
         majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
+        majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
     }
 
     // `set_constants`, `set_constant_types`, `set_next_trace_id`,

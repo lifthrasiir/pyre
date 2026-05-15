@@ -116,6 +116,32 @@ pub type Method = pyre_object::methodobject::W_MethodObject;
 pub type StaticMethod = pyre_object::propertyobject::W_StaticMethodObject;
 pub type ClassMethod = pyre_object::propertyobject::W_ClassMethodObject;
 
+struct FrameLocalsRoot {
+    slot: *mut *mut u8,
+    registered: bool,
+}
+
+impl FrameLocalsRoot {
+    fn new(frame: &mut crate::pyframe::PyFrame) -> Self {
+        let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
+    }
+}
+
+impl Drop for FrameLocalsRoot {
+    fn drop(&mut self) {
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
+        }
+    }
+}
+
+#[inline]
+fn function_write_barrier(obj: PyObjectRef) {
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 /// Field offset of `code` within `Function`, for JIT field access.
 pub const FUNCTION_CODE_OFFSET: usize = std::mem::offset_of!(Function, code);
 /// Field offset of `name` within `Function`.
@@ -286,7 +312,7 @@ fn function_new_impl(
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
 
     let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
-    pyre_object::lltype::malloc_typed(Function {
+    let function = Function {
         ob: PyObject {
             ob_type: ob_type as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(ob_type),
@@ -305,7 +331,19 @@ fn function_new_impl(
         w_qualname: PY_NULL,
         w_objclass: PY_NULL,
         w_text_signature: PY_NULL,
-    }) as PyObjectRef
+    };
+
+    if let Some(raw) =
+        pyre_object::gc_hook::try_gc_alloc_stable(FUNCTION_GC_TYPE_ID, FUNCTION_OBJECT_SIZE)
+            .filter(|p| !p.is_null())
+    {
+        unsafe {
+            std::ptr::write(raw as *mut Function, function);
+        }
+        return raw as PyObjectRef;
+    }
+
+    pyre_object::lltype::malloc_typed(function) as PyObjectRef
 }
 
 /// function.py:703 — `class FunctionWithFixedCode(Function): can_change_code = False`
@@ -538,6 +576,7 @@ pub unsafe fn function_get_qualname(obj: PyObjectRef) -> String {
 #[inline]
 pub unsafe fn function_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_qualname = value;
     }
 }
@@ -594,6 +633,7 @@ pub unsafe fn function_get_globals_obj(obj: PyObjectRef) -> PyObjectRef {
         return pyre_object::PY_NULL;
     }
     let resolved = crate::baseobjspace::dict_storage_to_dict(func.w_func_globals);
+    function_write_barrier(obj);
     func.w_func_globals_obj = resolved;
     resolved
 }
@@ -614,7 +654,10 @@ pub unsafe fn function_get_closure(obj: PyObjectRef) -> PyObjectRef {
 /// `obj` must point to a valid `Function`.
 #[inline]
 pub unsafe fn function_set_closure(obj: PyObjectRef, closure: PyObjectRef) {
-    unsafe { (*(obj as *mut Function)).closure = closure }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).closure = closure;
+    }
 }
 
 /// Get defaults tuple.
@@ -626,7 +669,10 @@ pub unsafe fn function_get_defaults(obj: PyObjectRef) -> PyObjectRef {
 /// Set defaults tuple.
 #[inline]
 pub unsafe fn function_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
-    unsafe { (*(obj as *mut Function)).defs_w = defaults }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).defs_w = defaults;
+    }
 }
 
 /// Get kwdefaults dict.
@@ -638,7 +684,10 @@ pub unsafe fn function_get_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
 /// Set kwdefaults dict.
 #[inline]
 pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef) {
-    unsafe { (*(obj as *mut Function)).w_kw_defs = kwdefaults }
+    unsafe {
+        function_write_barrier(obj);
+        (*(obj as *mut Function)).w_kw_defs = kwdefaults;
+    }
 }
 
 /// PyPy-compatible `__dict__` storage field alias.
@@ -746,6 +795,7 @@ pub unsafe fn function_set_doc(obj: PyObjectRef, value: PyObjectRef) -> Result<(
         if obj.is_null() {
             return Ok(());
         }
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = value;
         Ok(())
     }
@@ -768,6 +818,7 @@ pub unsafe fn function_del_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
         if obj.is_null() {
             return Ok(());
         }
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_doc = pyre_object::w_none();
         Ok(())
     }
@@ -794,6 +845,7 @@ pub unsafe fn function_get_annotations(obj: PyObjectRef) -> PyObjectRef {
             return cached;
         }
         let fresh = pyre_object::w_dict_new();
+        function_write_barrier(obj);
         (*func).w_ann = fresh;
         fresh
     }
@@ -817,6 +869,7 @@ pub unsafe fn function_set_annotations(obj: PyObjectRef, w_ann: PyObjectRef) {
         if obj.is_null() {
             return;
         }
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_ann = w_ann;
     }
 }
@@ -1015,6 +1068,7 @@ pub unsafe fn function_get_func_code(obj: PyObjectRef) -> *const () {
 #[inline]
 pub unsafe fn function_set_func_code(obj: PyObjectRef, code: *const ()) {
     unsafe {
+        function_write_barrier(obj);
         (*(obj as *mut Function)).code = code;
     }
 }
@@ -1072,6 +1126,7 @@ pub unsafe fn fget_func_objclass(obj: PyObjectRef) -> Result<PyObjectRef, crate:
 #[inline]
 pub unsafe fn function_set_objclass(obj: PyObjectRef, w_type: PyObjectRef) {
     unsafe {
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_objclass = w_type;
     }
 }
@@ -1893,6 +1948,8 @@ fn _flat_pycall(
     }
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
 
     // function.py:214 — return new_frame.run(self.name, self.qualname)
     // Check generator/coroutine: run() wraps into generator object instead
@@ -1964,6 +2021,8 @@ fn _flat_pycall_defaults(
 
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
+    let _caller_locals_root = FrameLocalsRoot::new(frame);
+    let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
 
     // function.py:231 — return new_frame.run(self.name, self.qualname)
     if new_frame._is_generator_or_coroutine() {

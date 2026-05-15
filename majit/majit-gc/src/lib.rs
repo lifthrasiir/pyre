@@ -878,3 +878,26 @@ pub fn gc_remove_root(slot: *mut GcRef) {
         }
     });
 }
+
+/// Thread-local callback that performs a host-side write barrier through
+/// the currently active backend GC.
+pub type WriteBarrierFn = fn(obj: GcRef);
+
+thread_local! {
+    static ACTIVE_WRITE_BARRIER: Cell<Option<WriteBarrierFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's write-barrier callback. Pass `None` to clear.
+pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
+    ACTIVE_WRITE_BARRIER.with(|c| c.set(hook));
+}
+
+/// Perform a write barrier through the active backend. No-op when no backend
+/// is installed on this thread.
+pub fn gc_write_barrier(obj: GcRef) {
+    ACTIVE_WRITE_BARRIER.with(|c| {
+        if let Some(f) = c.get() {
+            f(obj)
+        }
+    });
+}
