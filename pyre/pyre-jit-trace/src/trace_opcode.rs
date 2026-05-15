@@ -5,6 +5,8 @@
 
 use crate::state::*;
 
+use std::borrow::Cow;
+
 use majit_ir::{DescrRef, GcRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::{
     CANNOT_RAISE_NO_HEAP_EFFECT_INFO, TraceAction, TraceCtx, default_effect_info,
@@ -178,8 +180,8 @@ use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
     DictStorage, OpcodeStepExecutor, PyError, SharedOpcodeHandler, call_function,
-    decode_instruction_at, execute_opcode_step, function_get_globals, is_builtin_code, is_function,
-    range_iter_continues,
+    decode_instruction_at, execute_opcode_step, function_get_defaults, function_get_globals,
+    is_builtin_code, is_function, range_iter_continues,
 };
 
 use pyre_object::PyObjectRef;
@@ -194,6 +196,58 @@ use pyre_object::{
     PY_NULL, w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len,
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
 };
+
+fn positional_defaults_to_load(
+    callable: PyObjectRef,
+    code: &CodeObject,
+    nargs: usize,
+) -> Option<Vec<PyObjectRef>> {
+    let nparams = code.arg_count as usize;
+    if nargs >= nparams {
+        return None;
+    }
+
+    let defaults = unsafe { function_get_defaults(callable) };
+    if defaults.is_null() {
+        return None;
+    }
+
+    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
+    let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
+        unsafe { w_tuple_len(defaults) }
+    } else {
+        0
+    };
+    if ndefaults == 0 {
+        return None;
+    }
+
+    let first_default = nparams - ndefaults;
+    if nargs < first_default {
+        return None;
+    }
+
+    let mut loaded = Vec::with_capacity(nparams - nargs);
+    for i in nargs..nparams {
+        let default_idx = i - first_default;
+        loaded.push(unsafe { w_tuple_getitem(defaults, default_idx as i64) }.unwrap_or(PY_NULL));
+    }
+    Some(loaded)
+}
+
+fn fill_positional_defaults_for_trace_call<'a>(
+    callable: PyObjectRef,
+    code: &CodeObject,
+    args: &'a [PyObjectRef],
+) -> Cow<'a, [PyObjectRef]> {
+    let Some(defaults) = positional_defaults_to_load(callable, code, args.len()) else {
+        return Cow::Borrowed(args);
+    };
+    let mut full = Vec::with_capacity(args.len() + defaults.len());
+    full.extend_from_slice(args);
+    full.extend(defaults);
+    Cow::Owned(full)
+}
 
 fn const_step_one_slice_bounds(
     concrete_obj: PyObjectRef,
@@ -281,7 +335,10 @@ fn emit_call_assembler_callee_frame(
     is_self_recursive: bool,
     self_recursive_raw_int_arg: Option<OpRef>,
 ) -> Result<(OpRef, bool), PyError> {
-    if is_self_recursive && args.len() == 1 {
+    let needs_positional_defaults = is_self_recursive
+        && positional_defaults_to_load(concrete_callable, callee_code, args.len()).is_some();
+
+    if is_self_recursive && !needs_positional_defaults && args.len() == 1 {
         if let Some(raw_arg) = self_recursive_raw_int_arg {
             let nlocals = callee_code.varnames.len();
             let ncells = pyre_interpreter::ncells(callee_code);
@@ -314,12 +371,25 @@ fn emit_call_assembler_callee_frame(
     if args.len() == 1 {
         let (helper, helper_arg_types, helper_args) = if is_self_recursive {
             if let Some(raw_arg) = self_recursive_raw_int_arg {
-                let (helper, helper_arg_types) = one_arg_callee_frame_helper(Type::Int, true);
-                (helper, helper_arg_types, vec![this.frame(), raw_arg])
-            } else {
                 let (helper, helper_arg_types) =
-                    one_arg_callee_frame_helper(this.value_type(args[0]), true);
-                (helper, helper_arg_types, vec![this.frame(), args[0]])
+                    one_arg_callee_frame_helper(Type::Int, !needs_positional_defaults);
+                let helper_args = if needs_positional_defaults {
+                    vec![this.frame(), callable, raw_arg]
+                } else {
+                    vec![this.frame(), raw_arg]
+                };
+                (helper, helper_arg_types, helper_args)
+            } else {
+                let (helper, helper_arg_types) = one_arg_callee_frame_helper(
+                    this.value_type(args[0]),
+                    !needs_positional_defaults,
+                );
+                let helper_args = if needs_positional_defaults {
+                    vec![this.frame(), callable, args[0]]
+                } else {
+                    vec![this.frame(), args[0]]
+                };
+                (helper, helper_arg_types, helper_args)
             }
         } else {
             let (helper, helper_arg_types) =
@@ -340,11 +410,7 @@ fn emit_call_assembler_callee_frame(
     }
 
     if let Some(frame_helper) = (crate::callbacks::get().callee_frame_helper)(args.len()) {
-        let mut helper_args = if is_self_recursive {
-            vec![this.frame()]
-        } else {
-            vec![this.frame(), callable]
-        };
+        let mut helper_args = vec![this.frame(), callable];
         helper_args.extend_from_slice(args);
         let helper_arg_types = frame_callable_arg_types(args.len());
         let frame = ctx.call_ref_typed_with_effect(
@@ -5622,10 +5688,17 @@ impl MIFrame {
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
         // tuple equality is lossless vs the derived u64 hash.
         let is_self_recursive = caller_code as usize == w_code as usize;
-        let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
+        let concrete_args = fill_positional_defaults_for_trace_call(
+            concrete_callable,
+            unsafe {
+                &*pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef).cast::<CodeObject>()
+            },
+            passed_concrete_args,
+        );
+        let concrete_args = concrete_args.as_ref();
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             w_code,
-            &concrete_args,
+            concrete_args,
             globals,
             caller_exec_ctx,
             closure,
@@ -5640,6 +5713,7 @@ impl MIFrame {
         let callee_globals = unsafe { function_get_globals(concrete_callable) };
         let can_skip_traced_callee_frame = !is_self_recursive
             && callee_globals == caller_namespace
+            && concrete_args.len() == args.len()
             && callee_nlocals == args.len();
 
         let (callee_sym, drop_frame_opref) = if can_skip_traced_callee_frame {
@@ -5732,10 +5806,25 @@ impl MIFrame {
             sym.valuestackdepth = sym.nlocals;
             sym.registers_r = Vec::with_capacity(sym.nlocals);
             sym.symbolic_local_types = Vec::with_capacity(sym.nlocals);
+            let default_oprefs: Vec<OpRef> = if concrete_args.len() > args.len() {
+                self.with_ctx(|_, ctx| {
+                    Ok::<_, PyError>(
+                        concrete_args[args.len()..]
+                            .iter()
+                            .map(|&default| ctx.const_ref(default as i64))
+                            .collect(),
+                    )
+                })?
+            } else {
+                Vec::new()
+            };
             for i in 0..sym.nlocals {
                 if i < args.len() {
                     sym.registers_r.push(args[i]);
                     sym.symbolic_local_types.push(self.value_type(args[i]));
+                } else if i < concrete_args.len() {
+                    sym.registers_r.push(default_oprefs[i - args.len()]);
+                    sym.symbolic_local_types.push(Type::Ref);
                 } else {
                     sym.registers_r.push(OpRef::NONE);
                     sym.symbolic_local_types.push(Type::Ref);
@@ -5880,11 +5969,21 @@ impl MIFrame {
                     let caller_raw: (usize, usize) =
                         (unsafe { (*this.sym().jitcode).code } as usize, 0);
                     let is_self_recursive = callee_raw == caller_raw;
+                    let needs_positional_defaults = is_self_recursive
+                        && unsafe {
+                            let w_callee_code = pyre_interpreter::getcode(concrete_callable);
+                            let callee_code =
+                                &*pyre_interpreter::w_code_get_ptr(w_callee_code as PyObjectRef)
+                                    .cast::<CodeObject>();
+                            positional_defaults_to_load(concrete_callable, callee_code, args.len())
+                                .is_some()
+                        };
                     // RPython parity: an opaque helper-boundary Python CALL
                     // still produces a boxed object result.  Even if the
                     // callee itself can finish with a raw int, the helper
                     // boxes at the boundary and the trace records a Ref.
                     let force_fn = if is_self_recursive
+                        && !needs_positional_defaults
                         && (crate::callbacks::get().recursive_force_cache_safe)(concrete_callable)
                     {
                         crate::callbacks::get().jit_force_self_recursive_call_argraw_boxed_1
