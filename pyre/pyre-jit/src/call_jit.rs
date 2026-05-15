@@ -2651,16 +2651,7 @@ fn fill_positional_defaults_for_jit_call<'a>(
     if ndefaults == 0 {
         return Cow::Borrowed(args);
     }
-    if ndefaults > nparams {
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][defaults] malformed defaults metadata nparams={nparams} ndefaults={ndefaults}"
-            );
-        }
-        return Cow::Borrowed(args);
-    }
-
-    let first_default = nparams - ndefaults;
+    let first_default = nparams.saturating_sub(ndefaults);
     if args.len() < first_default {
         // function.py:_flat_pycall_defaults is entered only after argument
         // matching proves that all required positional parameters are present.
@@ -2670,11 +2661,13 @@ fn fill_positional_defaults_for_jit_call<'a>(
         return Cow::Borrowed(args);
     }
 
+    let defaults_to_load = nparams - first_default;
+    let default_start = ndefaults - defaults_to_load;
     let mut full = Vec::with_capacity(nparams);
     full.extend_from_slice(args);
     for i in args.len()..nparams {
         if i >= first_default {
-            let default_idx = i - first_default;
+            let default_idx = default_start + (i - first_default);
             let Some(default) =
                 (unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) })
             else {

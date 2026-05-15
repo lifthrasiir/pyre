@@ -232,14 +232,16 @@ fn positional_defaults_to_load(
         return None;
     }
 
-    let first_default = nparams - ndefaults;
+    let first_default = nparams.saturating_sub(ndefaults);
     if nargs < first_default {
         return None;
     }
 
+    let defaults_to_load = nparams - first_default;
+    let default_start = ndefaults - defaults_to_load;
     let mut loaded = Vec::with_capacity(nparams - nargs);
     for i in nargs..nparams {
-        let default_idx = i - first_default;
+        let default_idx = default_start + (i - first_default);
         loaded.push(unsafe { w_tuple_getitem(defaults, default_idx as i64) }.unwrap_or(PY_NULL));
     }
     Some(loaded)
