@@ -270,57 +270,6 @@ use crate::frame_layout::{
 };
 use crate::helpers::TraceHelperAccess;
 
-/// Build the red `frame` argument for PyPy-style recursive CALL_ASSEMBLER.
-///
-/// RPython `pyjitpl.py:3589-3609 direct_assembler_call` records the portal
-/// reds (`frame`, `ec`) directly. For the narrow fib-style case we can emit
-/// the callee `PyFrame` as ordinary trace IR; cases that need closure or
-/// debugdata setup keep the existing opaque helper fallback.
-///
-/// Returns `(frame, drop_needed)`. `drop_needed` is true only for the legacy
-/// arena helper path; trace-visible frames are GC-owned.
-fn fill_positional_defaults_for_trace_call(
-    callable: PyObjectRef,
-    code: &CodeObject,
-    args: &[PyObjectRef],
-) -> Vec<PyObjectRef> {
-    let nparams = code.arg_count as usize;
-    if args.len() >= nparams {
-        return args.to_vec();
-    }
-
-    let defaults = unsafe { pyre_interpreter::function_get_defaults(callable) };
-    if defaults.is_null() {
-        return args.to_vec();
-    }
-
-    let defaults = pyre_interpreter::baseobjspace::unwrap_cell(defaults);
-    let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
-        unsafe { pyre_object::w_tuple_len(defaults) }
-    } else {
-        0
-    };
-    if ndefaults == 0 {
-        return args.to_vec();
-    }
-
-    let first_default = nparams - ndefaults;
-    let mut full = Vec::with_capacity(nparams);
-    full.extend_from_slice(args);
-    for i in args.len()..nparams {
-        if i >= first_default {
-            let default_idx = i - first_default;
-            full.push(
-                unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
-                    .unwrap_or(pyre_object::PY_NULL),
-            );
-        } else {
-            full.push(pyre_object::PY_NULL);
-        }
-    }
-    full
-}
-
 fn emit_call_assembler_callee_frame(
     this: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -5668,20 +5617,12 @@ impl MIFrame {
         let caller_exec_ctx = self.sym().concrete_execution_context;
         let caller_namespace_ptr = self.sym().concrete_namespace;
         let w_code = unsafe { pyre_interpreter::getcode(concrete_callable) };
-        let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
-                as *const CodeObject
-        };
         let globals = unsafe { function_get_globals(concrete_callable) };
         let closure = unsafe { pyre_interpreter::function_get_closure(concrete_callable) };
         // pyjitpl.py:1396-1401 element-wise greenkey — `(code_ptr, 0)`
         // tuple equality is lossless vs the derived u64 hash.
         let is_self_recursive = caller_code as usize == w_code as usize;
-        let concrete_args = fill_positional_defaults_for_trace_call(
-            concrete_callable,
-            unsafe { &*raw_code },
-            passed_concrete_args,
-        );
+        let concrete_args: Vec<PyObjectRef> = passed_concrete_args.to_vec();
         let mut callee_frame = PyFrame::new_for_call_with_closure(
             w_code,
             &concrete_args,
