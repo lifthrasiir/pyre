@@ -4909,6 +4909,23 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
+        // compile.py:355-359: resolve `loop_jitcell_token` before recording
+        // the closing JUMP.  Keep this lookup before any state is consumed so
+        // the rare missing-token path does not drain the active retrace.
+        let loop_jitcell_token = {
+            let green_key = match self.tracing.as_ref() {
+                Some(ctx) => ctx.green_key,
+                None => return false,
+            };
+            let Some(token) = self
+                .compiled_loops
+                .get(&green_key)
+                .map(|compiled| Arc::clone(&compiled.token))
+            else {
+                return false;
+            };
+            token
+        };
         let partial = match self.partial_trace.take() {
             Some(p) => p,
             None => return false,
@@ -4941,13 +4958,6 @@ impl<M: Clone> MetaInterp<M> {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
-            let Some(loop_jitcell_token) = self
-                .compiled_loops
-                .get(&green_key)
-                .map(|compiled| Arc::clone(&compiled.token))
-            else {
-                return false;
-            };
             let retrace_cut = retracing_from.and_then(|retrace_pos| {
                 ctx.get_merge_point_at(green_key, header_pc)
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
