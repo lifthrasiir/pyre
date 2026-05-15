@@ -3965,8 +3965,9 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             trace
         };
+        let enable_opts = self.warm_state.get_enable_opts();
         let preamble_data =
-            compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results);
+            compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
         let trace_snapshots = preamble_data.base.snapshots().to_vec();
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
@@ -4043,12 +4044,11 @@ impl<M: Clone> MetaInterp<M> {
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
         // stack BEFORE Phase 2 starts. If Phase 2 panics, phase1_out still
         // holds the Phase 1 results.
-        let loop_data = compile::UnrolledLoopData::new(&trace, None, None, &call_pure_results);
         let mut phase1_out: Option<(Vec<Op>, crate::optimizeopt::unroll::ExportedState)> = None;
         let mut updated_constant_types = constant_types.clone();
         let optimize_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let result = unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
-                loop_data.base.operations(),
+                &trace_ops,
                 &mut constants,
                 num_trace_inputargs,
                 vable_config.clone(),
@@ -4730,6 +4730,7 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         let mut constants = ctx.constants.snapshot();
         let mut constant_types = ctx.constants.constant_types_snapshot();
+        let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
             snapshot_boxes,
@@ -4820,6 +4821,7 @@ impl<M: Clone> MetaInterp<M> {
                     snapshot_vable_boxes,
                     snapshot_vref_boxes,
                     snapshot_frame_pcs,
+                    call_pure_results,
                 );
                 if success {
                     CompileOutcome::Compiled {
@@ -4933,6 +4935,7 @@ impl<M: Clone> MetaInterp<M> {
             mut constants,
             mut constant_types,
             trace,
+            call_pure_results,
         ) = {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
@@ -4953,6 +4956,7 @@ impl<M: Clone> MetaInterp<M> {
             let constants = ctx.constants.snapshot();
             let constant_types = ctx.constants.constant_types_snapshot();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
+            let call_pure_results = ctx.take_call_pure_results();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
@@ -4987,16 +4991,24 @@ impl<M: Clone> MetaInterp<M> {
                 constants,
                 constant_types,
                 trace,
+                call_pure_results,
             )
         };
 
-        let call_pure_results = HashMap::new();
+        let Some(loop_jitcell_token) = self
+            .compiled_loops
+            .get(&green_key)
+            .map(|compiled| Arc::clone(&compiled.token))
+        else {
+            return false;
+        };
         let trace_ops = {
             let loop_data = compile::UnrolledLoopData::new(
                 &trace,
-                None,
-                Some(&start_state),
+                &loop_jitcell_token,
+                &start_state,
                 &call_pure_results,
+                self.warm_state.get_enable_opts(),
             );
             loop_data.base.operations().to_vec()
         };
@@ -5025,6 +5037,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
+        unroll_opt.call_pure_results = call_pure_results.clone();
         let (
             retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
@@ -5490,7 +5503,12 @@ impl<M: Clone> MetaInterp<M> {
         // returns a snapshot-less TreeLoop post-Task #70.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
-        let simple_data = compile::SimpleCompileData::new(&trace, None, &call_pure_results);
+        let simple_data = compile::SimpleCompileData::new(
+            &trace,
+            None,
+            &call_pure_results,
+            self.warm_state.get_enable_opts(),
+        );
         let trace_snapshots = simple_data.base.snapshots().to_vec();
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
@@ -5898,7 +5916,12 @@ impl<M: Clone> MetaInterp<M> {
         // returns a snapshot-less TreeLoop post-Task #70.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
-        let simple_data = compile::SimpleCompileData::new(&trace, None, &call_pure_results);
+        let simple_data = compile::SimpleCompileData::new(
+            &trace,
+            None,
+            &call_pure_results,
+            self.warm_state.get_enable_opts(),
+        );
         let trace_snapshots = simple_data.base.snapshots().to_vec();
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
@@ -8286,6 +8309,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
+        call_pure_results: HashMap<Vec<Value>, Value>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;
@@ -8439,16 +8463,34 @@ impl<M: Clone> MetaInterp<M> {
             pending_bridge_rd,
             bridge_inputarg_base,
         );
-        let call_pure_results = HashMap::new();
         let bridge_trace_data =
             TreeLoop::with_snapshots(prepared.inputargs.clone(), prepared.ops.clone(), Vec::new());
-        let bridge_data = compile::BridgeCompileData::new(
-            &bridge_trace_data,
-            &[],
-            None,
-            &call_pure_results,
-            inline_short_preamble,
-        );
+        let bridge_runtime_boxes: Vec<OpRef> =
+            prepared.inputargs.iter().map(|ia| ia.opref()).collect();
+        let bridge_resumestorage = prepared
+            .pending_bridge_rd
+            .as_ref()
+            .map(|pending| pending.storage.as_ref());
+        let (bridge_inputarg_types, bridge_inline_short_preamble, bridge_call_pure_results) = {
+            let bridge_data = compile::BridgeCompileData::new(
+                &bridge_trace_data,
+                &bridge_runtime_boxes,
+                bridge_resumestorage,
+                &call_pure_results,
+                inline_short_preamble,
+                self.warm_state.get_enable_opts(),
+            );
+            (
+                bridge_data
+                    .base
+                    .inputargs()
+                    .iter()
+                    .map(|ia| ia.tp)
+                    .collect::<Vec<_>>(),
+                bridge_data.inline_short_preamble,
+                bridge_data.base.call_pure_results.clone(),
+            )
+        };
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         let pending_bridge_rd = prepared.pending_bridge_rd;
@@ -8461,6 +8503,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.set_pending_box_pool(prepared.box_pool);
         let mut constants = constants;
         optimizer.constant_types = constant_types.clone();
+        optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
         // legacy `constant_types.insert(arg.index, arg.tp)` writes were
@@ -8472,12 +8515,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
         // Store bridge inputarg types so export_state can propagate them
         // to ExportedState.renamed_inputarg_types (RPython Box type parity).
-        optimizer.trace_inputarg_types = bridge_data
-            .base
-            .inputargs()
-            .iter()
-            .map(|ia| ia.tp)
-            .collect();
+        optimizer.trace_inputarg_types = bridge_inputarg_types;
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
@@ -8511,7 +8549,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut constants,
                     bridge_inputargs.len(),
                     &mut compiled.front_target_tokens,
-                    bridge_data.inline_short_preamble,
+                    bridge_inline_short_preamble,
                     retraced_count,
                     retrace_limit,
                     pending_bridge_rd,

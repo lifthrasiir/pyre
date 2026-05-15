@@ -220,14 +220,18 @@ pub struct DeadFrameArtifacts {
     pub exception: ExceptionState,
 }
 
-// ── CompileData class hierarchy markers (compile.py:31-139) ─────────────
+// ── CompileData input bundles (compile.py:31-139) ───────────────────────
 
 /// `compile.py:31` `class CompileData(object)`.
 ///
-/// This is intentionally only the shared input bundle for now.  RPython
-/// stores optimization-path state on subclasses, and pyre's larger compile
-/// flow is still flattened in `pyjitpl/mod.rs`; the named Rust structs below
-/// give each path the same boundary without changing backend behavior.
+/// PYRE-ADAPTATION: RPython's `CompileData.optimize_trace()` builds the
+/// optimizer chain, logs, dispatches to the subclass `optimize()`, and clears
+/// forwarded boxes in one Python method. Pyre's optimizer entry points borrow
+/// `MetaInterp`, backend state, constant pools, and snapshot side tables
+/// directly in `pyjitpl/mod.rs`, so that dispatch remains flattened there.
+/// These structs intentionally model the RPython constructor payloads only;
+/// call sites must still pass the same trace/runtime/resume/call-pure/opts
+/// state that RPython would store on the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
     pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
@@ -258,6 +262,7 @@ impl<'a> CompileData<'a> {
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
+    pub enable_opts: &'a [String],
 }
 
 impl<'a> PreambleCompileData<'a> {
@@ -265,10 +270,12 @@ impl<'a> PreambleCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
         call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace, call_pure_results),
             runtime_boxes,
+            enable_opts,
         }
     }
 }
@@ -277,6 +284,7 @@ impl<'a> PreambleCompileData<'a> {
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     pub resumestorage: Option<&'a ResumeStorage>,
+    pub enable_opts: &'a [String],
 }
 
 impl<'a> SimpleCompileData<'a> {
@@ -284,10 +292,12 @@ impl<'a> SimpleCompileData<'a> {
         trace: &'a TreeLoop,
         resumestorage: Option<&'a ResumeStorage>,
         call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace, call_pure_results),
             resumestorage,
+            enable_opts,
         }
     }
 }
@@ -298,6 +308,7 @@ pub struct BridgeCompileData<'a> {
     pub runtime_boxes: &'a [OpRef],
     pub resumestorage: Option<&'a ResumeStorage>,
     pub inline_short_preamble: bool,
+    pub enable_opts: &'a [String],
 }
 
 impl<'a> BridgeCompileData<'a> {
@@ -307,12 +318,14 @@ impl<'a> BridgeCompileData<'a> {
         resumestorage: Option<&'a ResumeStorage>,
         call_pure_results: &'a HashMap<Vec<Value>, Value>,
         inline_short_preamble: bool,
+        enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace, call_pure_results),
             runtime_boxes,
             resumestorage,
             inline_short_preamble,
+            enable_opts,
         }
     }
 }
@@ -320,24 +333,24 @@ impl<'a> BridgeCompileData<'a> {
 /// `compile.py:122` `class UnrolledLoopData(CompileData)`.
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
-    /// RPython has this at construction time. Some pyre paths allocate the
-    /// `JitCellToken` after optimization for backend bookkeeping, so the
-    /// marker accepts `None` until that larger flow is refactored.
-    pub celltoken: Option<&'a Arc<JitCellToken>>,
-    pub state: Option<&'a crate::optimizeopt::unroll::ExportedState>,
+    pub celltoken: &'a Arc<JitCellToken>,
+    pub state: &'a crate::optimizeopt::unroll::ExportedState,
+    pub enable_opts: &'a [String],
 }
 
 impl<'a> UnrolledLoopData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
-        celltoken: Option<&'a Arc<JitCellToken>>,
-        state: Option<&'a crate::optimizeopt::unroll::ExportedState>,
+        celltoken: &'a Arc<JitCellToken>,
+        state: &'a crate::optimizeopt::unroll::ExportedState,
         call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        enable_opts: &'a [String],
     ) -> Self {
         Self {
             base: CompileData::new(trace, call_pure_results),
             celltoken,
             state,
+            enable_opts,
         }
     }
 }
