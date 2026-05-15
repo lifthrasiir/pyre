@@ -123,6 +123,27 @@ pub enum CompileOutcome {
     Aborted,
 }
 
+struct SimpleCompileViews<'a> {
+    data: compile::SimpleCompileData<'a>,
+    trace_snapshots: Vec<crate::recorder::Snapshot>,
+    trace_ops: Vec<Op>,
+}
+
+fn make_simple_compile_views<'a>(
+    trace: &'a TreeLoop,
+    call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    enable_opts: &'a [String],
+) -> SimpleCompileViews<'a> {
+    let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
+    let trace_snapshots = data.base.snapshots().to_vec();
+    let trace_ops = data.base.operations().to_vec();
+    SimpleCompileViews {
+        data,
+        trace_snapshots,
+        trace_ops,
+    }
+}
+
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
@@ -5515,20 +5536,20 @@ impl<M: Clone> MetaInterp<M> {
         // returns a snapshot-less TreeLoop post-Task #70.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
-        let simple_data = compile::SimpleCompileData::new(
+        let SimpleCompileViews {
+            data: simple_data,
+            trace_snapshots,
+            trace_ops,
+        } = make_simple_compile_views(
             &trace,
-            None,
             &call_pure_results,
             self.warm_state.get_enable_opts(),
         );
-        let trace_snapshots = simple_data.base.snapshots().to_vec();
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
-
-        let trace_ops = simple_data.base.operations().to_vec();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -5928,20 +5949,20 @@ impl<M: Clone> MetaInterp<M> {
         // returns a snapshot-less TreeLoop post-Task #70.
         let mut trace = recorder.get_trace();
         trace.snapshots = std::mem::take(&mut ctx.snapshots);
-        let simple_data = compile::SimpleCompileData::new(
+        let SimpleCompileViews {
+            data: simple_data,
+            trace_snapshots,
+            trace_ops,
+        } = make_simple_compile_views(
             &trace,
-            None,
             &call_pure_results,
             self.warm_state.get_enable_opts(),
         );
-        let trace_snapshots = simple_data.base.snapshots().to_vec();
 
         // Refresh shadow-stack-rooted Ref constants so `into_inner_with_types`
         // sees the post-GC addresses for any object that moved.
         ctx.constants.refresh_from_gc();
         let (mut constants, mut constant_types) = ctx.constants.into_inner_with_types();
-
-        let trace_ops = simple_data.base.operations().to_vec();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
