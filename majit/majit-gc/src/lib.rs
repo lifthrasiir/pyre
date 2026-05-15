@@ -892,8 +892,13 @@ pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
     ACTIVE_WRITE_BARRIER.with(|c| c.set(hook));
 }
 
-/// Perform a write barrier through the active backend. No-op when no backend
-/// is installed on this thread.
+/// Perform a write barrier through the active backend.
+///
+/// Calling convention: callers must invoke this before storing a GC reference
+/// into `obj`, matching [`GcAllocator::write_barrier`]. The active callback is
+/// thread-local and installed with [`set_active_write_barrier`] as a
+/// [`WriteBarrierFn`]; this is a no-op when no barrier is installed on the
+/// current thread.
 pub fn gc_write_barrier(obj: GcRef) {
     ACTIVE_WRITE_BARRIER.with(|c| {
         if let Some(f) = c.get() {

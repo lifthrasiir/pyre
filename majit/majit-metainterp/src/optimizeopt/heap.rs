@@ -1762,10 +1762,16 @@ impl OptHeap {
         let pending_fields: Vec<(u32, DescrRef, OpRef, Op)> = field_entries
             .into_iter()
             .filter_map(|(field_idx, descr, cf)| match cf.lazy_set.as_ref() {
-                Some((obj, _)) if call_args.contains(obj) => cf
-                    .lazy_set
-                    .take()
-                    .map(|(obj, op)| (field_idx, descr, obj, op)),
+                Some((obj, _)) => {
+                    let owner = ctx.get_box_replacement(*obj);
+                    if call_args.contains(&owner) {
+                        cf.lazy_set
+                            .take()
+                            .map(|(_, op)| (field_idx, descr, owner, op))
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             })
             .collect();
@@ -1795,13 +1801,12 @@ impl OptHeap {
                 .collect();
             sort_array_index_entries_untranslated(&mut index_entries);
             for (index, cai) in index_entries {
-                if cai
-                    .lazy_set
-                    .as_ref()
-                    .map_or(false, |(obj, _)| call_args.contains(obj))
-                {
+                if cai.lazy_set.as_ref().map_or(false, |(obj, _)| {
+                    let owner = ctx.get_box_replacement(*obj);
+                    call_args.contains(&owner)
+                }) {
                     if let Some((obj, op)) = cai.lazy_set.take() {
-                        pending_arrays.push((*descr_idx, index, obj, op));
+                        pending_arrays.push((*descr_idx, index, ctx.get_box_replacement(obj), op));
                     }
                 }
             }

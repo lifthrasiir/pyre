@@ -530,6 +530,7 @@ pub unsafe fn fset_func_qualname(
                 "__qualname__ must be set to a string object",
             ));
         }
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_qualname = value;
         Ok(())
     }

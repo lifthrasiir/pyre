@@ -2651,6 +2651,14 @@ fn fill_positional_defaults_for_jit_call<'a>(
     if ndefaults == 0 {
         return Cow::Borrowed(args);
     }
+    if ndefaults > nparams {
+        if majit_metainterp::majit_log_enabled() {
+            eprintln!(
+                "[jit][defaults] malformed defaults metadata nparams={nparams} ndefaults={ndefaults}"
+            );
+        }
+        return Cow::Borrowed(args);
+    }
 
     let first_default = nparams - ndefaults;
     if args.len() < first_default {
@@ -2667,10 +2675,17 @@ fn fill_positional_defaults_for_jit_call<'a>(
     for i in args.len()..nparams {
         if i >= first_default {
             let default_idx = i - first_default;
-            full.push(
-                unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) }
-                    .unwrap_or(PY_NULL),
-            );
+            let Some(default) =
+                (unsafe { pyre_object::w_tuple_getitem(defaults, default_idx as i64) })
+            else {
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][defaults] tuple access failed default_idx={default_idx} defaults={defaults:p}"
+                    );
+                }
+                return Cow::Borrowed(args);
+            };
+            full.push(default);
         } else {
             full.push(PY_NULL);
         }

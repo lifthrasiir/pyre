@@ -197,6 +197,16 @@ use pyre_object::{
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
 };
 
+const TRACE_ABORT_PREFIX: &str = "__pyre_trace_abort__:";
+
+fn trace_abort_error(reason: &'static str) -> PyError {
+    PyError::runtime_error(format!("{TRACE_ABORT_PREFIX}{reason}"))
+}
+
+fn is_trace_abort_error(err: &PyError) -> bool {
+    err.message.starts_with(TRACE_ABORT_PREFIX)
+}
+
 fn positional_defaults_to_load(
     callable: PyObjectRef,
     code: &CodeObject,
@@ -4330,7 +4340,7 @@ impl MIFrame {
         for abs_idx in 0..total_slots {
             if s.concrete_value_at(abs_idx).to_pyobj() == concrete_obj {
                 let opref = *s.registers_r.get(abs_idx)?;
-                if self.value_type(opref) == Type::Ref {
+                if opref != OpRef::NONE && self.value_type(opref) == Type::Ref {
                     return Some(opref);
                 }
             }
@@ -5108,7 +5118,7 @@ impl MIFrame {
                     // --synthetic-only --synthetic-pattern list_append_pop.py`
                     // reports wrong output on both dynasm and cranelift when
                     // these aborts are removed.
-                    return Err(PyError::type_error(
+                    return Err(trace_abort_error(
                         "abort tracing builtin list.append until guard-failure blackhole resume is complete",
                     ));
                 }
@@ -5116,7 +5126,7 @@ impl MIFrame {
                     // Keep in sync with the append guard above. Removing this
                     // abort caused `synth/list_append_pop` correctness
                     // failures during the PyPy-parity audit.
-                    return Err(PyError::type_error(
+                    return Err(trace_abort_error(
                         "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
                     ));
                 }
@@ -5139,7 +5149,7 @@ impl MIFrame {
                 // user-defined bound methods fall through to generic tracing
                 // currently corrupts `synth/class_attrs_methods` output on
                 // both dynasm and cranelift.
-                return Err(PyError::type_error(
+                return Err(trace_abort_error(
                     "abort tracing user-defined bound method call",
                 ));
             }
@@ -5168,7 +5178,7 @@ impl MIFrame {
                     // --synthetic-only --synthetic-pattern list_append_pop.py`
                     // reports wrong output on both dynasm and cranelift when
                     // these aborts are removed.
-                    return Err(PyError::type_error(
+                    return Err(trace_abort_error(
                         "abort tracing builtin list.append until guard-failure blackhole resume is complete",
                     ));
                 }
@@ -5180,7 +5190,7 @@ impl MIFrame {
                     // Keep in sync with the append guard above. Removing this
                     // abort caused `synth/list_append_pop` correctness
                     // failures during the PyPy-parity audit.
-                    return Err(PyError::type_error(
+                    return Err(trace_abort_error(
                         "abort tracing builtin list.pop until guard-failure blackhole resume is complete",
                     ));
                 }
@@ -5764,48 +5774,6 @@ impl MIFrame {
             sym.vable_w_globals = vable_w_globals;
             (sym, None)
         } else {
-            // Create symbolic OpRef for callee frame in trace
-            let callee_frame_opref = self.with_ctx(|this, ctx| {
-                if args.len() == 1 {
-                    let (helper, helper_arg_types) =
-                        one_arg_callee_frame_helper(this.value_type(args[0]), is_self_recursive);
-                    if is_self_recursive {
-                        ctx.call_ref_typed_with_effect(
-                            helper,
-                            &[this.frame(), args[0]],
-                            &helper_arg_types,
-                            default_effect_info(),
-                        )
-                    } else {
-                        ctx.call_ref_typed_with_effect(
-                            helper,
-                            &[this.frame(), callable, args[0]],
-                            &helper_arg_types,
-                            default_effect_info(),
-                        )
-                    }
-                } else if let Some(frame_helper) =
-                    (crate::callbacks::get().callee_frame_helper)(args.len())
-                {
-                    let mut helper_args = vec![this.frame(), callable];
-                    helper_args.extend_from_slice(args);
-                    let helper_arg_types = frame_callable_arg_types(args.len());
-                    ctx.call_ref_typed_with_effect(
-                        frame_helper,
-                        &helper_args,
-                        &helper_arg_types,
-                        default_effect_info(),
-                    )
-                } else {
-                    panic!("no frame helper for {} args", args.len());
-                }
-            });
-
-            let mut sym = PyreSym::new_uninit(callee_frame_opref);
-            sym.nlocals = callee_nlocals;
-            sym.valuestackdepth = sym.nlocals;
-            sym.registers_r = Vec::with_capacity(sym.nlocals);
-            sym.symbolic_local_types = Vec::with_capacity(sym.nlocals);
             let default_oprefs: Vec<OpRef> = if concrete_args.len() > args.len() {
                 self.with_ctx(|_, ctx| {
                     Ok::<_, PyError>(
@@ -5818,13 +5786,57 @@ impl MIFrame {
             } else {
                 Vec::new()
             };
+            let mut frame_args = args.to_vec();
+            frame_args.extend_from_slice(&default_oprefs);
+            // Create symbolic OpRef for callee frame in trace
+            let callee_frame_opref = self.with_ctx(|this, ctx| {
+                if frame_args.len() == 1 {
+                    let (helper, helper_arg_types) = one_arg_callee_frame_helper(
+                        this.value_type(frame_args[0]),
+                        is_self_recursive,
+                    );
+                    if is_self_recursive {
+                        ctx.call_ref_typed_with_effect(
+                            helper,
+                            &[this.frame(), frame_args[0]],
+                            &helper_arg_types,
+                            default_effect_info(),
+                        )
+                    } else {
+                        ctx.call_ref_typed_with_effect(
+                            helper,
+                            &[this.frame(), callable, frame_args[0]],
+                            &helper_arg_types,
+                            default_effect_info(),
+                        )
+                    }
+                } else if let Some(frame_helper) =
+                    (crate::callbacks::get().callee_frame_helper)(frame_args.len())
+                {
+                    let mut helper_args = vec![this.frame(), callable];
+                    helper_args.extend_from_slice(&frame_args);
+                    let helper_arg_types = frame_callable_arg_types(frame_args.len());
+                    ctx.call_ref_typed_with_effect(
+                        frame_helper,
+                        &helper_args,
+                        &helper_arg_types,
+                        default_effect_info(),
+                    )
+                } else {
+                    panic!("no frame helper for {} args", frame_args.len());
+                }
+            });
+
+            let mut sym = PyreSym::new_uninit(callee_frame_opref);
+            sym.nlocals = callee_nlocals;
+            sym.valuestackdepth = sym.nlocals;
+            sym.registers_r = Vec::with_capacity(sym.nlocals);
+            sym.symbolic_local_types = Vec::with_capacity(sym.nlocals);
             for i in 0..sym.nlocals {
-                if i < args.len() {
-                    sym.registers_r.push(args[i]);
-                    sym.symbolic_local_types.push(self.value_type(args[i]));
-                } else if i < concrete_args.len() {
-                    sym.registers_r.push(default_oprefs[i - args.len()]);
-                    sym.symbolic_local_types.push(Type::Ref);
+                if i < frame_args.len() {
+                    sym.registers_r.push(frame_args[i]);
+                    sym.symbolic_local_types
+                        .push(self.value_type(frame_args[i]));
                 } else {
                     sym.registers_r.push(OpRef::NONE);
                     sym.symbolic_local_types.push(Type::Ref);
@@ -6365,6 +6377,9 @@ impl MIFrame {
         // Valid raise/reraise paths seed `last_exc_box` directly; malformed
         // bytecode-level raises still surface as ordinary interpreter errors
         // and use the generic raised-exception path below.
+        if step_result.as_ref().err().is_some_and(is_trace_abort_error) {
+            return TraceAction::Abort;
+        }
         if let Err(ref err) = step_result {
             if !matches!(
                 instruction,
@@ -6850,6 +6865,9 @@ impl MIFrame {
         // exception in last_exc_value. Valid raise/reraise paths seed
         // `last_exc_box` directly; malformed bytecode-level raises still
         // use the generic raised-exception path below.
+        if step_result.as_ref().err().is_some_and(is_trace_abort_error) {
+            return InlineTraceStepAction::Trace(TraceAction::Abort);
+        }
         if let Err(ref err) = step_result {
             if !matches!(
                 instruction,

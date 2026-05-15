@@ -77,21 +77,43 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
 /// the object layout; expose the value slots here so the backend GC can update
 /// them when nursery objects move.
 pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    INSTANCE_DICT.with(|table| {
-        for dict in table.borrow_mut().values_mut() {
-            visitor(dict);
-            unsafe {
-                pyre_object::w_dict_walk_entries_mut(*dict, |slot| {
-                    visitor(slot);
-                });
+    let dict_values = INSTANCE_DICT.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .map(|(&key, &dict)| (key, dict))
+            .collect::<Vec<_>>()
+    });
+    // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
+    // visitor and w_dict_walk_entries_mut may re-enter mapdict/dict APIs.
+    for (key, mut dict) in dict_values {
+        visitor(&mut dict);
+        INSTANCE_DICT.with(|table| {
+            if let Some(slot) = table.borrow_mut().get_mut(&key) {
+                *slot = dict;
             }
+        });
+        unsafe {
+            pyre_object::w_dict_walk_entries_mut(dict, |slot| {
+                visitor(slot);
+            });
         }
+    }
+    let weakref_values = WEAKREF_TABLE.with(|table| {
+        table
+            .borrow()
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect::<Vec<_>>()
     });
-    WEAKREF_TABLE.with(|table| {
-        for value in table.borrow_mut().values_mut() {
-            visitor(value);
-        }
-    });
+    for (key, mut value) in weakref_values {
+        visitor(&mut value);
+        WEAKREF_TABLE.with(|table| {
+            if let Some(slot) = table.borrow_mut().get_mut(&key) {
+                *slot = value;
+            }
+        });
+    }
 }
 
 /// objspace/std/mapdict.py:842-860 _obj_setdict.

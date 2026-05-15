@@ -263,6 +263,7 @@ mod tests {
 
     static LAST_ROOT_PTR: AtomicUsize = AtomicUsize::new(0);
     static REMOVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static WRITE_BARRIER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe fn mock_add_root(slot: *mut *mut u8) {
         LAST_ROOT_PTR.store(slot as usize, Ordering::Relaxed);
@@ -270,6 +271,11 @@ mod tests {
     fn mock_remove_root(slot: *mut *mut u8) {
         let _ = slot;
         REMOVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mock_write_barrier(obj: *mut u8) {
+        let _ = obj;
+        WRITE_BARRIER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[test]
@@ -315,5 +321,20 @@ mod tests {
 
         clear_gc_alloc_hook();
         clear_gc_alloc_stable_hook();
+    }
+
+    #[test]
+    fn write_barrier_hook_registers_invokes_and_clears() {
+        clear_gc_write_barrier_hook();
+        let obj = 0x1000usize as *mut u8;
+        assert!(!try_gc_write_barrier(obj));
+
+        WRITE_BARRIER_CALLS.store(0, Ordering::Relaxed);
+        register_gc_write_barrier_hook(mock_write_barrier);
+        assert!(try_gc_write_barrier(obj));
+        assert_eq!(WRITE_BARRIER_CALLS.load(Ordering::Relaxed), 1);
+
+        clear_gc_write_barrier_hook();
+        assert!(!try_gc_write_barrier(obj));
     }
 }

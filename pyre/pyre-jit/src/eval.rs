@@ -89,13 +89,6 @@ impl FrameLocalsRoot {
         let mut slots = Vec::new();
         let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
         slots.push((slot, unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }));
-        if !frame.locals_cells_stack_w.is_null() {
-            let arr = unsafe { &mut *frame.locals_cells_stack_w };
-            for item in arr.as_mut_slice() {
-                let slot = item as *mut _ as *mut *mut u8;
-                slots.push((slot, unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }));
-            }
-        }
         Self { slots }
     }
 }
@@ -2959,13 +2952,16 @@ fn execute_assembler(
     }
 
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
-    let outcome = driver.run_compiled_detailed_with_bridge_keyed(
-        green_key,
-        entry_pc,
-        &mut jit_state,
-        env,
-        || {},
-    );
+    let outcome = {
+        let _frame_locals_root = FrameLocalsRoot::new(frame);
+        driver.run_compiled_detailed_with_bridge_keyed(
+            green_key,
+            entry_pc,
+            &mut jit_state,
+            env,
+            || {},
+        )
+    };
 
     // rstack.stack_check_slowpath → _StackOverflow parity: drain the
     // JIT-overflow flag the backend probe records when it trips. The
@@ -3203,6 +3199,7 @@ fn bound_reached(
     }
     // warmstate.py:503-511: procedure_token → EnterJitAssembler.
     let outcome = if driver.has_compiled_loop(green_key) {
+        let _frame_locals_root = FrameLocalsRoot::new(frame);
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             loop_header_pc,
