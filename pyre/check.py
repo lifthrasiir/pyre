@@ -21,6 +21,7 @@ PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
 )
 
 BENCH_DIR = "pyre/bench"
+SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 SNAP_DIR = "pyre/check.snap"
 BENCH_COMPARE_BUFFER_S = 0.005
 
@@ -536,6 +537,75 @@ class Check:
                 vs_cpython, vs_pypy, t_cpython, t_pypy, pypy_output,
             )
 
+    # ── synthetic parity suite ──
+
+    def run_synthetic_bench(self, path, timeout):
+        name = f"synth/{Path(path).stem}"
+        effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
+
+        print(f"  {name}")
+
+        sys.stdout.write(f"    {'cpython':<10s}")
+        sys.stdout.flush()
+        cpython_output, cpython_time, cpython_code = run_timed(
+            [PYTHON3, path], timeout_s=effective_timeout,
+        )
+        if cpython_code != 0:
+            print(f"{red('CRASH')} (exit {cpython_code})")
+            cpython_output = None
+            t_cpython = "-"
+        else:
+            t_cpython = f"{cpython_time:.2f}"
+            print(f"{dim('done')}  {t_cpython}s")
+
+        sys.stdout.write(f"    {'pypy':<10s}")
+        sys.stdout.flush()
+        pypy_output, pypy_time, pypy_code = run_timed(
+            [PYPY3, path], timeout_s=effective_timeout,
+        )
+        if pypy_code != 0:
+            print(f"{red('CRASH')} (exit {pypy_code})")
+            for backend in ("dynasm", "cranelift"):
+                if self.enabled(backend):
+                    self._record(backend, False, name, "pypy crash")
+                    self._append_comparison(backend, name, fmt_time(t_cpython), "-", "FAIL")
+            return
+        t_pypy = f"{pypy_time:.2f}"
+        print(f"{dim('done')}  {t_pypy}s")
+
+        if cpython_output is not None and cpython_output != pypy_output:
+            print(f"    {'baseline':<10s}{red('WRONG')}  cpython output differs from pypy")
+            for backend in ("dynasm", "cranelift"):
+                if self.enabled(backend):
+                    self._record(backend, False, name, "cpython/pypy output mismatch")
+                    self._append_comparison(
+                        backend, name, fmt_time(t_cpython), fmt_time(t_pypy), "BASEFAIL",
+                    )
+            return
+
+        for backend in ("dynasm", "cranelift"):
+            if not self.enabled(backend):
+                continue
+            self._run_backend_bench(
+                backend, name, path, timeout,
+                None, None, t_cpython, t_pypy, pypy_output,
+            )
+
+    def run_synthetic_suite(self):
+        pattern = self.args.synthetic_pattern
+        paths = sorted(Path(SYNTHETIC_BENCH_DIR).glob(pattern))
+        paths = [p for p in paths if p.is_file() and p.suffix == ".py"]
+        if not paths:
+            print(f"{red('ERROR')}: no synthetic benchmarks matched {pattern!r}")
+            sys.exit(1)
+
+        print(bold("synthetic parity suite"))
+        print(dim(f"{len(paths)} benchmark(s), pattern={pattern!r}"))
+        for path in paths:
+            self.run_synthetic_bench(
+                str(path), self.args.synthetic_timeout,
+            )
+
     # ── printing ──
 
     def print_backend_config(self):
@@ -556,37 +626,37 @@ class Check:
         print(bold("Comparison"))
 
         if both:
-            print(f"  {'benchmark':<15s} {'cpython':>8s} {'pypy':>8s} {'dynasm':>18s} {'cranelift':>18s}")
-            print("  " + "─" * 78)
+            print(f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s} {'dynasm':>18s} {'cranelift':>18s}")
+            print("  " + "─" * 98)
             for c in self.comparisons:
                 print(
-                    f"  {c['name']:<15s} {c['cpython']:>8s} {c['pypy']:>8s}"
+                    f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
                     f" {c['dynasm']:>18s} {c['cranelift']:>18s}"
                 )
         elif dynasm_only:
-            print(f"  {'benchmark':<15s} {'cpython':>8s} {'pypy':>8s} {'dynasm':>18s}")
-            print("  " + "─" * 56)
+            print(f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s} {'dynasm':>18s}")
+            print("  " + "─" * 76)
             for c in self.comparisons:
                 print(
-                    f"  {c['name']:<15s} {c['cpython']:>8s} {c['pypy']:>8s}"
+                    f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
                     f" {c['dynasm']:>18s}"
                 )
         elif cranelift_only:
-            print(f"  {'benchmark':<15s} {'cpython':>8s} {'pypy':>8s} {'cranelift':>18s}")
-            print("  " + "─" * 56)
+            print(f"  {'benchmark':<35s} {'cpython':>8s} {'pypy':>8s} {'cranelift':>18s}")
+            print("  " + "─" * 76)
             for c in self.comparisons:
                 print(
-                    f"  {c['name']:<15s} {c['cpython']:>8s} {c['pypy']:>8s}"
+                    f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
                     f" {c['cranelift']:>18s}"
                 )
 
     def print_summary(self):
         print()
         if self.results:
-            print("─" * 33)
+            print("─" * 53)
             for r in self.results:
                 print(f"  {r}")
-            print("─" * 33)
+            print("─" * 53)
 
         failed_runs = 0
         enabled_runs = 0
@@ -657,11 +727,35 @@ def parse_args():
         action="store_true",
         help="also run cpython on benchmarks without a vs_cpython gate (comparison only)",
     )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="also run pyre/bench/synth feature-parity benchmarks",
+    )
+    parser.add_argument(
+        "--synthetic-only",
+        action="store_true",
+        help="run only pyre/bench/synth feature-parity benchmarks",
+    )
+    parser.add_argument(
+        "--synthetic-pattern",
+        default="*.py",
+        help="glob pattern under pyre/bench/synth for --synthetic runs",
+    )
+    parser.add_argument(
+        "--synthetic-timeout",
+        type=float,
+        default=20.0,
+        help="per-script timeout in seconds for synthetic benchmarks",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
 
     if args.pyre_path and not args.backend:
         parser.error("[path/to/pyre] requires --backend when running a single binary")
+
+    if args.synthetic_only:
+        args.synthetic = True
 
     if args.snapshot_mode == "record" and args.threshold is not None:
         print("NOTE: --threshold ignored in --snapshot record mode")
@@ -694,26 +788,31 @@ def main():
     print(bold("pyre pre-merge check"))
     chk.print_backend_config()
     print()
-    chk.warmup(f"{BENCH_DIR}/int_loop.py")
-    print()
+    if not args.synthetic_only:
+        chk.warmup(f"{BENCH_DIR}/int_loop.py")
+        print()
 
-    B = BENCH_DIR
+        B = BENCH_DIR
 
-    #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py  skip
-    chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    1.5,     None,    2)
-    chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    4)
-    chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    3,     3,     None)
-    chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
-    chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     10,      1.5,     10)
-    chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    2)
-    chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
-    chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
-    chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       5,       None,    30,      None)
-    chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       2,       10,      40,      None)
-    chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       10,      None,    10,      None)
-    chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       15,      None,    15,      None)
-    chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
-    chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       10,      None,    10,      None)
+        #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py  skip
+        chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    1.5,     None,    2)
+        chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    4)
+        chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    3,     3,     None)
+        chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     10,      1.5,     10)
+        chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    2)
+        chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
+        chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       5,       None,    30,      None)
+        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       2,       10,      40,      None)
+        chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       10,      None,    10,      None)
+        chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       15,      None,    15,      None)
+        chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
+        chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       10,      None,    10,      None)
+
+    if args.synthetic:
+        print()
+        chk.run_synthetic_suite()
 
     rc = chk.print_summary()
     sys.exit(rc)
