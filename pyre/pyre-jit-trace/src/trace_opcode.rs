@@ -5110,6 +5110,24 @@ impl MIFrame {
                     return self.list_reverse_value(callable, self_ref, inner_self);
                 }
             }
+            if !inner_func.is_null()
+                && !inner_self.is_null()
+                && unsafe { is_function(inner_func) }
+                && unsafe {
+                    !is_builtin_code(
+                        pyre_interpreter::getcode(inner_func) as pyre_object::PyObjectRef
+                    )
+                }
+            {
+                // Do not remove this abort until bound-method replay and
+                // guard-failure blackhole resume are aligned. Letting
+                // user-defined bound methods fall through to generic tracing
+                // currently corrupts `synth/class_attrs_methods` output on
+                // both dynasm and cranelift.
+                return Err(PyError::type_error(
+                    "abort tracing user-defined bound method call",
+                ));
+            }
         }
 
         unsafe {
