@@ -3032,6 +3032,7 @@ impl Optimizer {
         constants: &mut std::collections::HashMap<u32, i64>,
         num_inputs: usize,
         front_target_tokens: &mut Vec<crate::optimizeopt::unroll::TargetToken>,
+        runtime_boxes: &[OpRef],
         inline_short_preamble: bool,
         retraced_count: u32,
         retrace_limit: u32,
@@ -3055,9 +3056,10 @@ impl Optimizer {
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
         self.pending_bridge_rd = pending_bridge_rd;
-        // unroll.py:183 parity: save pre-optimization JUMP args as
-        // runtime_boxes. RPython passes the original live_arg_boxes from
-        // compile_trace / guard failure, not the optimized jump args.
+        // The prepared trace's pre-optimization JUMP args are used when
+        // emitting a fallback jump through send_extra_operation.  RPython's
+        // separate `runtime_boxes` argument is threaded below into
+        // jump_to_existing_trace for virtual-state guard generation.
         let pre_opt_jump_args: Vec<OpRef> = ops
             .last()
             .filter(|op| op.opcode == OpCode::Jump)
@@ -3189,7 +3191,7 @@ impl Optimizer {
             self,
             &mut ctx,
             false,
-            &pre_opt_jump_args,
+            runtime_boxes,
             None,
         ) {
             Ok(vs) => vs,
@@ -3246,7 +3248,7 @@ impl Optimizer {
             self,
             &mut ctx,
             true,
-            &pre_opt_jump_args,
+            runtime_boxes,
             None,
         ) {
             Ok(vs) => vs,

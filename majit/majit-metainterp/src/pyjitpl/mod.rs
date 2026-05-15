@@ -7995,6 +7995,14 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
+        // separately from the trace iterator and stay as the original live
+        // boxes from the closing JUMP.
+        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.args.to_vec())
+            .unwrap_or_default();
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
@@ -8045,6 +8053,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut constants,
                     bridge_inputargs.len(),
                     &mut compiled.front_target_tokens,
+                    &bridge_runtime_boxes,
                     true,
                     retraced_count,
                     retrace_limit,
@@ -8475,7 +8484,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_resumestorage = pending_bridge_rd
             .as_ref()
             .map(|pending| pending.storage.as_ref());
-        let (bridge_inline_short_preamble, bridge_call_pure_results) = {
+        let (bridge_inline_short_preamble, bridge_call_pure_results, bridge_runtime_boxes) = {
             let bridge_data = compile::BridgeCompileData::new(
                 &bridge_trace_data,
                 &bridge_runtime_boxes,
@@ -8487,6 +8496,7 @@ impl<M: Clone> MetaInterp<M> {
             (
                 bridge_data.inline_short_preamble,
                 bridge_data.call_pure_results.clone(),
+                bridge_data.runtime_boxes.to_vec(),
             )
         };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
@@ -8562,6 +8572,7 @@ impl<M: Clone> MetaInterp<M> {
                     &mut constants,
                     bridge_inputargs.len(),
                     &mut compiled.front_target_tokens,
+                    &bridge_runtime_boxes,
                     bridge_inline_short_preamble,
                     retraced_count,
                     retrace_limit,
