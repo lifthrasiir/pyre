@@ -2653,6 +2653,15 @@ fn fill_positional_defaults_for_jit_call<'a>(
     }
 
     let first_default = nparams - ndefaults;
+    if args.len() < first_default {
+        // function.py:_flat_pycall_defaults is entered only after argument
+        // matching proves that all required positional parameters are present.
+        // Do not synthesize PY_NULL for missing required args here; callers
+        // that reach this helper without enough args must keep the original
+        // frame shape and let the normal call/resume path handle the error.
+        return Cow::Borrowed(args);
+    }
+
     let mut full = Vec::with_capacity(nparams);
     full.extend_from_slice(args);
     for i in args.len()..nparams {
