@@ -1662,6 +1662,10 @@ impl OptHeap {
     /// per the same descr-aware policy as the catch-all `_` arm.
     fn emit_residual_call(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         self.mark_escaped_varargs(op, ctx);
+        if self.call_references_lazy_set_object(op, ctx) {
+            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+            self.clean_caches(ctx);
+        }
         // heapcache.py:337-369 clear_caches_varargs.
         // Plain residual calls preserve cache entries for unescaped
         // allocations. Calls with explicit EffectInfo keep the more
@@ -1722,6 +1726,29 @@ impl OptHeap {
         for &arg in &op.args {
             self.escape_box(arg);
         }
+    }
+
+    /// Flush lazy stores when the object with the pending store escapes as a
+    /// direct residual-call argument. EffectInfo bitstrings only describe
+    /// global heap effects; a callee can still read fields from objects it
+    /// receives explicitly.
+    fn call_references_lazy_set_object(&self, op: &Op, ctx: &mut OptContext) -> bool {
+        let call_args: Vec<OpRef> = op
+            .args
+            .iter()
+            .map(|arg| ctx.get_box_replacement(*arg))
+            .collect();
+        self.cached_fields.iter().any(|(_, _, cf)| {
+            cf.lazy_set
+                .as_ref()
+                .map_or(false, |(obj, _)| call_args.contains(obj))
+        }) || self.cached_arrayitems.iter().any(|(_, _, submap)| {
+            submap.const_indexes.values().any(|cai| {
+                cai.lazy_set
+                    .as_ref()
+                    .map_or(false, |(obj, _)| call_args.contains(obj))
+            })
+        })
     }
 
     /// heap.py: check if a call has random effects (EffectInfo).
@@ -3017,6 +3044,10 @@ impl OptHeap {
                 // force_from_effectinfo (selective) or clean_caches,
                 // NOT force_all_lazy. force_all_lazy is only in flush().
                 self.mark_escaped_varargs(op, ctx);
+                if self.call_references_lazy_set_object(op, ctx) {
+                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                    self.clean_caches(ctx);
+                }
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
                 if Self::call_has_random_effects(op) {
