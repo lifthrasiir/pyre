@@ -716,7 +716,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 known_class: None,
                 field_oprefs: vi
                     .buffer
-                    .values
+                    .values()
                     .iter()
                     .map(|vref| self.ctx.get_box_replacement(*vref))
                     .collect(),
@@ -2624,7 +2624,7 @@ impl OptContext {
                         .iter()
                         .flat_map(|row| row.iter().map(|(_, r)| *r))
                         .collect(),
-                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values.clone(),
+                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values().to_vec(),
                     _ => Vec::new(),
                 };
                 self.setinfo_from_preamble_list(&items, infos);

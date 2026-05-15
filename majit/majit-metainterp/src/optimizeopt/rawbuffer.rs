@@ -13,14 +13,14 @@ pub struct RawBuffer {
     /// unbounded int allows `basesize + itemsize*index` to be negative
     /// when `index < 0`. `write_value` keeps the list sorted using
     /// signed comparison (rawbuffer.py:104 `self.offsets[i] > offset`).
-    pub offsets: Vec<i64>,
+    offsets: Vec<i64>,
     /// rawbuffer.py:15: self.lengths — always non-negative (unsigned
     /// upstream itemsize from `unpack_arraydescr_size`).
-    pub lengths: Vec<usize>,
+    lengths: Vec<usize>,
     /// rawbuffer.py:16: self.descrs — per-entry ArrayDescr.
-    pub descrs: Vec<DescrRef>,
+    descrs: Vec<DescrRef>,
     /// rawbuffer.py:17: self.values
-    pub values: Vec<OpRef>,
+    values: Vec<OpRef>,
 }
 
 /// Error returned when a raw buffer operation violates invariants.
@@ -57,6 +57,53 @@ impl RawBuffer {
             descrs: Vec::new(),
             values: Vec::new(),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn offsets(&self) -> &[i64] {
+        &self.offsets
+    }
+
+    pub fn lengths(&self) -> &[usize] {
+        &self.lengths
+    }
+
+    pub fn descrs(&self) -> &[DescrRef] {
+        &self.descrs
+    }
+
+    pub fn values(&self) -> &[OpRef] {
+        &self.values
+    }
+
+    pub fn iter_entries(&self) -> impl Iterator<Item = (i64, usize, &DescrRef, OpRef)> + '_ {
+        self.offsets
+            .iter()
+            .copied()
+            .zip(self.lengths.iter().copied())
+            .zip(self.descrs.iter())
+            .zip(self.values.iter().copied())
+            .map(|(((offset, length), descr), value)| (offset, length, descr, value))
+    }
+
+    pub(crate) fn drain_entries(&mut self) -> Vec<(i64, usize, DescrRef, OpRef)> {
+        let offsets = std::mem::take(&mut self.offsets);
+        let lengths = std::mem::take(&mut self.lengths);
+        let descrs = std::mem::take(&mut self.descrs);
+        let values = std::mem::take(&mut self.values);
+        debug_assert_eq!(offsets.len(), lengths.len());
+        debug_assert_eq!(offsets.len(), descrs.len());
+        debug_assert_eq!(offsets.len(), values.len());
+        offsets
+            .into_iter()
+            .zip(lengths)
+            .zip(descrs)
+            .zip(values)
+            .map(|(((offset, length), descr), value)| (offset, length, descr, value))
+            .collect()
     }
 
     /// rawbuffer.py:83: _descrs_are_compatible(d1, d2)
@@ -231,7 +278,7 @@ mod tests {
         buf.write_value(0, 8, d.clone(), OpRef::int_op(99)).unwrap();
 
         assert_eq!(buf.read_value(0, 8, &d).unwrap(), OpRef::int_op(99));
-        assert_eq!(buf.offsets.len(), 1);
+        assert_eq!(buf.offsets().len(), 1);
     }
 
     #[test]
@@ -310,9 +357,9 @@ mod tests {
             .unwrap();
 
         // Entries should be sorted by offset
-        assert_eq!(buf.offsets[0], 0);
-        assert_eq!(buf.offsets[1], 8);
-        assert_eq!(buf.offsets[2], 16);
+        assert_eq!(buf.offsets()[0], 0);
+        assert_eq!(buf.offsets()[1], 8);
+        assert_eq!(buf.offsets()[2], 16);
     }
 
     /// test_rawbuffer.py:66 test_unpack_descrs

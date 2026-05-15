@@ -1111,7 +1111,7 @@ impl PtrInfo {
             PtrInfo::VirtualArray(v) => v.items.len(),
             PtrInfo::VirtualStruct(v) => v.fields.len(),
             PtrInfo::VirtualArrayStruct(v) => v.element_fields.len(),
-            PtrInfo::VirtualRawBuffer(v) => v.buffer.offsets.len(),
+            PtrInfo::VirtualRawBuffer(v) => v.buffer.len(),
             _ => 0,
         }
     }
@@ -1131,7 +1131,7 @@ impl PtrInfo {
                 .iter()
                 .flat_map(|fields| fields.iter().map(|(_, r)| *r))
                 .collect(),
-            PtrInfo::VirtualRawBuffer(v) => v.buffer.values.clone(),
+            PtrInfo::VirtualRawBuffer(v) => v.buffer.values().to_vec(),
             // info.py:478-482 `RawSlicePtrInfo._visitor_walk_recursive`:
             //
             // ```python
@@ -1289,8 +1289,8 @@ impl PtrInfo {
             PtrInfo::VirtualRawBuffer(info) => Some(visitor.visit_vrawbuffer(
                 info.func,
                 info.size,
-                &info.buffer.offsets,
-                &info.buffer.descrs,
+                info.buffer.offsets(),
+                info.buffer.descrs(),
             )),
             // info.py:485-486 RawSlicePtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualRawSlice(info) => Some(visitor.visit_vrawslice(info.offset)),
@@ -1611,9 +1611,7 @@ impl PtrInfo {
             PtrInfo::VirtualRawBuffer(vinfo) => {
                 // info.py:420-436: RawBufferPtrInfo._force_elements()
                 // info.py:421: self.size = -1 (mark as no longer virtual)
-                let offsets = std::mem::take(&mut vinfo.buffer.offsets);
-                let descrs = std::mem::take(&mut vinfo.buffer.descrs);
-                let values = std::mem::take(&mut vinfo.buffer.values);
+                let entries = vinfo.buffer.drain_entries();
                 let func = vinfo.func;
                 let size = vinfo.size;
                 let calldescr = vinfo.calldescr.take();
@@ -1639,12 +1637,12 @@ impl PtrInfo {
                 emit_op(ctx, check_op);
 
                 // info.py:429-436: emit RAW_STORE for each buffered write
-                for i in 0..offsets.len() {
-                    let value_ref = force_child(values[i], ctx);
-                    let offset_ref = ctx.emit_constant_int(offsets[i] as i64);
+                for (offset, _length, descr, value) in entries {
+                    let value_ref = force_child(value, ctx);
+                    let offset_ref = ctx.emit_constant_int(offset);
                     let mut store_op =
                         Op::new(OpCode::RawStore, &[alloc_ref, offset_ref, value_ref]);
-                    store_op.descr = Some(descrs[i].clone());
+                    store_op.descr = Some(descr);
                     emit_op(ctx, store_op);
                 }
 
