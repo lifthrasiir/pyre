@@ -3525,6 +3525,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_default_pipeline_escaping_call_arg_flush_is_selective() {
+        let fd = field_descr(12);
+        let call_descr = crate::call_descr::make_call_descr_with_effect(
+            &[Type::Ref],
+            Type::Ref,
+            majit_ir::EffectInfo::default(),
+        );
+
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                fd.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::input_arg_ref(1), OpRef::int_op(101)],
+                fd,
+            ),
+            Op::with_descr(
+                OpCode::CallR,
+                &[OpRef::int_op(200), OpRef::input_arg_ref(0)],
+                call_descr,
+            ),
+            Op::new(OpCode::Finish, &[OpRef::int_op(2)]),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline_typed(&ops, &[100, 101], &[]);
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR)
+            .expect("escaping call must remain");
+        let arg0_setfield_pos = result
+            .iter()
+            .position(|op| {
+                op.opcode == OpCode::SetfieldGc
+                    && op.args.first().copied() == Some(OpRef::input_arg_ref(0))
+            })
+            .expect("escaping argument store must be emitted");
+        let arg1_setfield_pos = result
+            .iter()
+            .position(|op| {
+                op.opcode == OpCode::SetfieldGc
+                    && op.args.first().copied() == Some(OpRef::input_arg_ref(1))
+            })
+            .expect("unrelated store must still be emitted by the final flush");
+
+        assert!(
+            arg0_setfield_pos < call_pos,
+            "store for the escaping call argument must be before the call: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        assert!(
+            arg1_setfield_pos > call_pos,
+            "unrelated lazy store must remain pending until after the call: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
     // Note: forced struct field forwarding is handled by heap.rs caching,
     // not by virtualize.rs PtrInfo tracking. After force_box, the object
     // is materialized and heap.py caches field values independently.
