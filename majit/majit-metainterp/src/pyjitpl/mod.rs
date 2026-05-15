@@ -8463,10 +8463,17 @@ impl<M: Clone> MetaInterp<M> {
             pending_bridge_rd,
             bridge_inputarg_base,
         );
+        // compile.py:1056-1060 / unroll.py:183-184 parity:
+        // BridgeCompileData.runtime_boxes is the original live box list
+        // passed to compile_trace, i.e. the bridge's closing JUMP args before
+        // trace.get_iter() allocates fresh input boxes for optimization.
+        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.args.to_vec())
+            .unwrap_or_default();
         let bridge_trace_data =
             TreeLoop::with_snapshots(prepared.inputargs.clone(), prepared.ops.clone(), Vec::new());
-        let bridge_runtime_boxes: Vec<OpRef> =
-            prepared.inputargs.iter().map(|ia| ia.opref()).collect();
         let bridge_resumestorage = prepared
             .pending_bridge_rd
             .as_ref()
