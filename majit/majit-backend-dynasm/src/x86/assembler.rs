@@ -2213,7 +2213,25 @@ impl<'a> Assembler386<'a> {
             | OpCode::FloatNe
             | OpCode::FloatGt
             | OpCode::FloatGe => {
-                if let (Some(Loc::Reg(a)), Some(Loc::Reg(b))) = (arglocs.first(), arglocs.get(1)) {
+                if let (Some(a_loc), Some(b_loc)) = (arglocs.first(), arglocs.get(1)) {
+                    let a = if let Loc::Reg(a) = a_loc {
+                        *a
+                    } else {
+                        let scratch = crate::regloc::XMM15;
+                        self.regalloc_mov(a_loc, &Loc::Reg(scratch));
+                        scratch
+                    };
+                    let b = if let Loc::Reg(b) = b_loc {
+                        *b
+                    } else {
+                        let scratch = if a.value == crate::regloc::XMM14.value && a.is_xmm {
+                            crate::regloc::XMM15
+                        } else {
+                            crate::regloc::XMM14
+                        };
+                        self.regalloc_mov(b_loc, &Loc::Reg(scratch));
+                        scratch
+                    };
                     dynasm!(self.mc ; .arch x64 ; ucomisd Rx(a.value), Rx(b.value));
                     if let Some(Loc::Reg(r)) = result_loc {
                         let cc = Self::float_opcode_to_cc(op.opcode);

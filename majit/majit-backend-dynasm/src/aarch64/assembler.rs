@@ -2004,7 +2004,25 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::FloatNe
             | OpCode::FloatGt
             | OpCode::FloatGe => {
-                if let (Some(Loc::Reg(a)), Some(Loc::Reg(b))) = (arglocs.first(), arglocs.get(1)) {
+                if let (Some(a_loc), Some(b_loc)) = (arglocs.first(), arglocs.get(1)) {
+                    let a = if let Loc::Reg(a) = a_loc {
+                        *a
+                    } else {
+                        let scratch = crate::regloc::RegLoc::new(15, true);
+                        self.regalloc_mov(a_loc, &Loc::Reg(scratch));
+                        scratch
+                    };
+                    let b = if let Loc::Reg(b) = b_loc {
+                        *b
+                    } else {
+                        let scratch = if a.value == 14 && a.is_xmm {
+                            crate::regloc::RegLoc::new(15, true)
+                        } else {
+                            crate::regloc::RegLoc::new(14, true)
+                        };
+                        self.regalloc_mov(b_loc, &Loc::Reg(scratch));
+                        scratch
+                    };
                     dynasm!(self.mc ; .arch aarch64 ; fcmp D(a.value), D(b.value));
                     if let Some(Loc::Reg(r)) = result_loc {
                         let cc = Self::float_opcode_to_cc(op.opcode);
