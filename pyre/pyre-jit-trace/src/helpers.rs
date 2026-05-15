@@ -280,15 +280,11 @@ pub fn emit_trace_binary_value(
         )));
     };
     let tag = ctx.const_int(tag);
-    // Generic Python binary operations can read and mutate arbitrary heap
-    // state through user-defined special methods.  Until these helpers go
-    // through codewriter write analysis, use PyPy's analyzer-top fallback so
-    // OptHeap flushes forced virtual fields before the residual call.
-    Ok(ctx.call_ref_typed_with_effect(
+    Ok(emit_trace_call_ref_typed(
+        ctx,
         jit_binary_value_from_tag as *const (),
         &[a, b, tag],
         &[Type::Ref, Type::Ref, Type::Int],
-        EffectInfo::MOST_GENERAL,
     ))
 }
 
