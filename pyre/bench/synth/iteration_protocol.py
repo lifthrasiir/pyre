@@ -1,4 +1,4 @@
-N = 200000
+N = 40000
 
 
 class CountDown:
