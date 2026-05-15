@@ -10809,35 +10809,37 @@ mod tests {
     /// source-only classifier needs the explicit bool predicate entry.
     #[test]
     fn unary_not_on_crate_is_function_classifies_via_predicate_shortlist() {
-        let parsed = crate::parse::parse_source(
-            r#"
+        for predicate in ["crate::is_function", "crate::is_function_with_fixed_code"] {
+            let parsed = crate::parse::parse_source(&format!(
+                r#"
             type Obj = i64;
-            fn example(obj: Obj) -> bool {
-                !crate::is_function(obj)
-            }
-        "#,
-        );
-        let program = build_semantic_program(&parsed).expect("source must lower");
-        let example = program
-            .functions
-            .iter()
-            .find(|f| f.graph.name == "example")
-            .expect("example graph must be present");
-        let saw_bool = example
-            .graph
-            .iter_blocks()
-            .flat_map(|b| b.operations.iter())
-            .any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::UnaryOp { op, result_ty, .. }
-                        if op == "bool" && *result_ty == ValueType::Bool
-                )
-            });
-        assert!(
-            saw_bool,
-            "expected `!crate::is_function(...)` to lower through RPython UNARY_NOT"
-        );
+            fn example(obj: Obj) -> bool {{
+                !{predicate}(obj)
+            }}
+        "#
+            ));
+            let program = build_semantic_program(&parsed).expect("source must lower");
+            let example = program
+                .functions
+                .iter()
+                .find(|f| f.graph.name == "example")
+                .expect("example graph must be present");
+            let saw_bool = example
+                .graph
+                .iter_blocks()
+                .flat_map(|b| b.operations.iter())
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, result_ty, .. }
+                            if op == "bool" && *result_ty == ValueType::Bool
+                    )
+                });
+            assert!(
+                saw_bool,
+                "expected `!{predicate}(...)` to lower through RPython UNARY_NOT"
+            );
+        }
     }
 
     /// `let v = call_returning_result()?; if !v { ... }` —

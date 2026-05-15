@@ -1661,6 +1661,7 @@ impl OptHeap {
     /// through force_from_effectinfo / clean_caches / invalidate_for_escaped
     /// per the same descr-aware policy as the catch-all `_` arm.
     fn emit_residual_call(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let escaped_owners = self.call_argument_owner_closure(op, ctx);
         self.mark_escaped_varargs(op, ctx);
         // STRUCTURAL ADAPTATION: RPython heap.py relies purely on EffectInfo
         // here. Removing this pyre-specific direct-argument flush currently
@@ -1668,7 +1669,7 @@ impl OptHeap {
         // dynasm/cranelift wrong-output failures). Keep it until the caller
         // materialization path is ported enough that direct call arguments
         // cannot observe stale lazy stores.
-        self.force_call_argument_lazy_sets(op, ctx.current_pass_idx, ctx);
+        self.force_call_argument_lazy_sets(&escaped_owners, ctx.current_pass_idx, ctx);
         // heapcache.py:337-369 clear_caches_varargs.
         // Plain residual calls preserve cache entries for unescaped
         // allocations. Calls with explicit EffectInfo keep the more
@@ -1731,6 +1732,41 @@ impl OptHeap {
         }
     }
 
+    fn call_argument_owner_closure(&self, op: &Op, ctx: &OptContext) -> Vec<OpRef> {
+        let mut owners = Vec::new();
+        let mut stack: Vec<OpRef> = op
+            .args
+            .iter()
+            .map(|arg| ctx.get_box_replacement(*arg))
+            .collect();
+        while let Some(owner) = stack.pop() {
+            if owners.contains(&owner) {
+                continue;
+            }
+            owners.push(owner);
+            if let Some(deps) = self.heapc_deps.get(&owner) {
+                stack.extend(deps.iter().map(|dep| ctx.get_box_replacement(*dep)));
+            }
+        }
+        owners
+    }
+
+    fn emit_postponed_if_referenced(
+        &mut self,
+        op: &Op,
+        heap_pass_idx: usize,
+        ctx: &mut OptContext,
+    ) {
+        let needs_postponed = self.postponed_op.as_ref().map_or(false, |postponed| {
+            op.args.iter().any(|arg| *arg == postponed.pos)
+        });
+        if needs_postponed {
+            if let Some(p) = self.postponed_op.take() {
+                ctx.emit_extra(heap_pass_idx, p);
+            }
+        }
+    }
+
     /// Flush lazy stores for objects that escape as direct residual-call
     /// arguments. EffectInfo bitstrings describe global heap effects, but a
     /// callee can still read fields from objects it receives explicitly.
@@ -1743,16 +1779,10 @@ impl OptHeap {
     /// caused correctness failures.
     fn force_call_argument_lazy_sets(
         &mut self,
-        op: &Op,
+        escaped_owners: &[OpRef],
         heap_pass_idx: usize,
         ctx: &mut OptContext,
     ) {
-        let call_args: Vec<OpRef> = op
-            .args
-            .iter()
-            .map(|arg| ctx.get_box_replacement(*arg))
-            .collect();
-
         let mut field_entries: Vec<_> = self
             .cached_fields
             .iter_mut()
@@ -1764,7 +1794,7 @@ impl OptHeap {
             .filter_map(|(field_idx, descr, cf)| match cf.lazy_set.as_ref() {
                 Some((obj, _)) => {
                     let owner = ctx.get_box_replacement(*obj);
-                    if call_args.contains(&owner) {
+                    if escaped_owners.contains(&owner) {
                         cf.lazy_set
                             .take()
                             .map(|(_, op)| (field_idx, descr, owner, op))
@@ -1785,6 +1815,7 @@ impl OptHeap {
             for arg in pending_op.args.iter_mut() {
                 *arg = ctx.get_box_replacement(*arg);
             }
+            self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(1);
             let put_back_op = pending_op.clone();
             ctx.emit_extra(heap_pass_idx, pending_op);
@@ -1803,7 +1834,7 @@ impl OptHeap {
             for (index, cai) in index_entries {
                 if cai.lazy_set.as_ref().map_or(false, |(obj, _)| {
                     let owner = ctx.get_box_replacement(*obj);
-                    call_args.contains(&owner)
+                    escaped_owners.contains(&owner)
                 }) {
                     if let Some((obj, op)) = cai.lazy_set.take() {
                         pending_arrays.push((*descr_idx, index, ctx.get_box_replacement(obj), op));
@@ -1815,6 +1846,7 @@ impl OptHeap {
             for arg in pending_op.args.iter_mut() {
                 *arg = ctx.get_box_replacement(*arg);
             }
+            self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(2);
             let array_ref = pending_op.arg(0);
             let descr = pending_op.descr.clone();
@@ -3117,10 +3149,11 @@ impl OptHeap {
                 // RPython emitting_operation: calls go through
                 // force_from_effectinfo (selective) or clean_caches,
                 // NOT force_all_lazy. force_all_lazy is only in flush().
+                let escaped_owners = self.call_argument_owner_closure(op, ctx);
                 self.mark_escaped_varargs(op, ctx);
                 // See `emit_residual_call`: this pyre-specific flush is
                 // required for current synthetic correctness.
-                self.force_call_argument_lazy_sets(op, ctx.current_pass_idx, ctx);
+                self.force_call_argument_lazy_sets(&escaped_owners, ctx.current_pass_idx, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
                 if Self::call_has_random_effects(op) {

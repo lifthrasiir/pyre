@@ -81,24 +81,22 @@ fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
 }
 
 struct FrameLocalsRoot {
-    slots: Vec<(*mut *mut u8, bool)>,
+    slot: *mut *mut u8,
+    registered: bool,
 }
 
 impl FrameLocalsRoot {
     fn new(frame: &mut PyFrame) -> Self {
-        let mut slots = Vec::new();
         let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
-        slots.push((slot, unsafe { pyre_object::gc_hook::try_gc_add_root(slot) }));
-        Self { slots }
+        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
+        Self { slot, registered }
     }
 }
 
 impl Drop for FrameLocalsRoot {
     fn drop(&mut self) {
-        for (slot, registered) in self.slots.drain(..).rev() {
-            if registered {
-                pyre_object::gc_hook::try_gc_remove_root(slot);
-            }
+        if self.registered {
+            pyre_object::gc_hook::try_gc_remove_root(self.slot);
         }
     }
 }

@@ -277,9 +277,9 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
                 }
                 if !(*frame).w_globals.is_null() {
-                    let globals = &mut *(*frame).w_globals;
-                    let mirror = globals.mirror_target();
-                    let value_slots: Vec<*mut PyObjectRef> = globals
+                    let globals_ptr = (*frame).w_globals;
+                    let mirror = (&*globals_ptr).mirror_target();
+                    let value_slots: Vec<*mut PyObjectRef> = (&mut *globals_ptr)
                         .values_mut()
                         .iter_mut()
                         .map(|value| value as *mut PyObjectRef)
@@ -291,7 +291,7 @@ fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                     let mut mirror_slot = mirror;
                     visitor(&mut *(&mut mirror_slot as *mut PyObjectRef as *mut majit_ir::GcRef));
                     if mirror_slot != mirror {
-                        globals.set_mirror_target(mirror_slot);
+                        (&mut *globals_ptr).set_mirror_target(mirror_slot);
                     }
                 }
                 let f = &*frame;

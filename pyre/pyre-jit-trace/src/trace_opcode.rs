@@ -14,6 +14,10 @@ use majit_metainterp::{
 
 use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ComparisonOperator, Instruction};
 
+extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
+    unsafe { function_get_defaults(func as PyObjectRef) as i64 }
+}
+
 /// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
 ///
 /// `_pow` in floatobject.py:799-881 takes two raw floats and returns a
@@ -5790,6 +5794,19 @@ impl MIFrame {
             };
             let mut frame_args = args.to_vec();
             frame_args.extend_from_slice(&default_oprefs);
+            if !default_oprefs.is_empty() {
+                let expected_defaults = unsafe { function_get_defaults(concrete_callable) };
+                self.with_ctx(|this, ctx| {
+                    let defaults = ctx.call_ref_typed_with_effect(
+                        trace_function_get_defaults as *const (),
+                        &[callable],
+                        &[Type::Ref],
+                        CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                    );
+                    this.implement_guard_value(ctx, defaults, expected_defaults as i64);
+                    Ok::<_, PyError>(())
+                })?;
+            }
             // Create symbolic OpRef for callee frame in trace
             let callee_frame_opref = self.with_ctx(|this, ctx| {
                 if frame_args.len() == 1 {

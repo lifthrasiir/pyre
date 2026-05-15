@@ -87,10 +87,18 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
     // visitor and w_dict_walk_entries_mut may re-enter mapdict/dict APIs.
     for (key, mut dict) in dict_values {
+        let mut owner = key as PyObjectRef;
+        visitor(&mut owner);
         visitor(&mut dict);
+        let new_key = owner as usize;
         INSTANCE_DICT.with(|table| {
-            if let Some(slot) = table.borrow_mut().get_mut(&key) {
-                *slot = dict;
+            let mut table = table.borrow_mut();
+            if new_key == key {
+                if let Some(slot) = table.get_mut(&key) {
+                    *slot = dict;
+                }
+            } else if table.remove(&key).is_some() {
+                table.insert(new_key, dict);
             }
         });
         unsafe {
@@ -107,10 +115,18 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
             .collect::<Vec<_>>()
     });
     for (key, mut value) in weakref_values {
+        let mut owner = key as PyObjectRef;
+        visitor(&mut owner);
         visitor(&mut value);
+        let new_key = owner as usize;
         WEAKREF_TABLE.with(|table| {
-            if let Some(slot) = table.borrow_mut().get_mut(&key) {
-                *slot = value;
+            let mut table = table.borrow_mut();
+            if new_key == key {
+                if let Some(slot) = table.get_mut(&key) {
+                    *slot = value;
+                }
+            } else if table.remove(&key).is_some() {
+                table.insert(new_key, value);
             }
         });
     }
