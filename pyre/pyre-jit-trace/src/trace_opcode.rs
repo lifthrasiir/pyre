@@ -3791,8 +3791,13 @@ impl MIFrame {
         } else {
             sym.registers_r.len().saturating_sub(sym.nlocals)
         };
-        let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
-            Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
+        let concrete_frame_ptr = if !sym.concrete_vable_ptr.is_null() {
+            sym.concrete_vable_ptr as usize
+        } else {
+            self.concrete_frame_addr
+        };
+        let concrete_frame = if concrete_frame_ptr != 0 {
+            Some(unsafe { &*(concrete_frame_ptr as *const pyre_interpreter::pyframe::PyFrame) })
         } else {
             None
         };
@@ -3807,14 +3812,23 @@ impl MIFrame {
         // physical frame had been allocated with stack room beyond the
         // current symbolic depth. Read the physical frame length and
         // pad missing slots with the live concrete value (or NULL).
-        let physical_array_len = concrete_frame
-            .map(|f| f.locals_w().len())
+        let physical_array_len = ctx
+            .virtualizable_array_lengths()
+            .and_then(|lengths| lengths.first().copied())
+            .or_else(|| concrete_frame.map(|f| f.locals_w().len()))
             .unwrap_or_else(|| {
-                let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
-                let stack_depth = current_vsd
-                    .saturating_sub(sym.nlocals)
-                    .min(symbolic_stack_len);
-                sym.nlocals + stack_depth
+                if !sym.jitcode.is_null() {
+                    let code = unsafe { &*(*sym.jitcode).raw_code() };
+                    code.varnames.len()
+                        + pyre_interpreter::pyframe::ncells(code)
+                        + code.max_stackdepth as usize
+                } else {
+                    let current_vsd = self.pre_opcode_depth_or(sym.valuestackdepth);
+                    let stack_depth = current_vsd
+                        .saturating_sub(sym.nlocals)
+                        .min(symbolic_stack_len);
+                    sym.nlocals + stack_depth
+                }
             });
         let full_array_len = physical_array_len;
         // virtualizable.py:135-137 `lst[j] = reader.load_next_value_of_type(
