@@ -234,15 +234,11 @@ pub struct DeadFrameArtifacts {
 /// state that RPython would store on the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
 }
 
 impl<'a> CompileData<'a> {
-    pub fn new(trace: &'a TreeLoop, call_pure_results: &'a HashMap<Vec<Value>, Value>) -> Self {
-        Self {
-            trace,
-            call_pure_results,
-        }
+    pub fn new(trace: &'a TreeLoop) -> Self {
+        Self { trace }
     }
 
     pub fn inputargs(&self) -> &'a [InputArg] {
@@ -262,6 +258,7 @@ impl<'a> CompileData<'a> {
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -273,8 +270,9 @@ impl<'a> PreambleCompileData<'a> {
         enable_opts: &'a [String],
     ) -> Self {
         Self {
-            base: CompileData::new(trace, call_pure_results),
+            base: CompileData::new(trace),
             runtime_boxes,
+            call_pure_results,
             enable_opts,
         }
     }
@@ -284,6 +282,7 @@ impl<'a> PreambleCompileData<'a> {
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     pub resumestorage: Option<&'a ResumeStorage>,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -295,8 +294,9 @@ impl<'a> SimpleCompileData<'a> {
         enable_opts: &'a [String],
     ) -> Self {
         Self {
-            base: CompileData::new(trace, call_pure_results),
+            base: CompileData::new(trace),
             resumestorage,
+            call_pure_results,
             enable_opts,
         }
     }
@@ -307,6 +307,7 @@ pub struct BridgeCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
     pub resumestorage: Option<&'a ResumeStorage>,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
     pub enable_opts: &'a [String],
 }
@@ -321,9 +322,10 @@ impl<'a> BridgeCompileData<'a> {
         enable_opts: &'a [String],
     ) -> Self {
         Self {
-            base: CompileData::new(trace, call_pure_results),
+            base: CompileData::new(trace),
             runtime_boxes,
             resumestorage,
+            call_pure_results,
             inline_short_preamble,
             enable_opts,
         }
@@ -335,6 +337,7 @@ pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     pub celltoken: &'a Arc<JitCellToken>,
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -347,9 +350,10 @@ impl<'a> UnrolledLoopData<'a> {
         enable_opts: &'a [String],
     ) -> Self {
         Self {
-            base: CompileData::new(trace, call_pure_results),
+            base: CompileData::new(trace),
             celltoken,
             state,
+            call_pure_results,
             enable_opts,
         }
     }

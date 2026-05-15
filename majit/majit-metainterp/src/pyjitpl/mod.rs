@@ -4011,7 +4011,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.constant_types = constant_types.clone();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
-        unroll_opt.call_pure_results = preamble_data.base.call_pure_results.clone();
+        unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
         // tracing. Propagate to optimizer so value_types covers inputargs.
         unroll_opt.trace_inputarg_types = preamble_data
@@ -4932,6 +4932,7 @@ impl<M: Clone> MetaInterp<M> {
             green_key,
             driver_descriptor,
             orig_vable_ptr_retrace,
+            loop_jitcell_token,
             mut constants,
             mut constant_types,
             trace,
@@ -4940,6 +4941,13 @@ impl<M: Clone> MetaInterp<M> {
             let green_key = ctx.green_key;
             let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
+            let Some(loop_jitcell_token) = self
+                .compiled_loops
+                .get(&green_key)
+                .map(|compiled| Arc::clone(&compiled.token))
+            else {
+                return false;
+            };
             let retrace_cut = retracing_from.and_then(|retrace_pos| {
                 ctx.get_merge_point_at(green_key, header_pc)
                     .filter(|mp| mp.position == retrace_pos && mp.position._pos > 0)
@@ -4988,6 +4996,7 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
                 driver_descriptor,
                 orig_vable_ptr_retrace,
+                loop_jitcell_token,
                 constants,
                 constant_types,
                 trace,
@@ -4995,13 +5004,6 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
 
-        let Some(loop_jitcell_token) = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|compiled| Arc::clone(&compiled.token))
-        else {
-            return false;
-        };
         let trace_ops = {
             let loop_data = compile::UnrolledLoopData::new(
                 &trace,
@@ -5526,7 +5528,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         optimizer.constant_types = constant_types.clone();
-        optimizer.call_pure_results = simple_data.base.call_pure_results.clone();
+        optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
@@ -5947,7 +5949,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.all_descrs = std::mem::take(&mut *self.staticdata.all_descrs.lock().unwrap());
         optimizer.constant_types = constant_types.clone();
-        optimizer.call_pure_results = simple_data.base.call_pure_results.clone();
+        optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py InputArg.type parity: each `InputArg` already carries
         // its type in the typed OpRef variant tag (`InputArg::opref()` calls
         // `OpRef::input_arg_typed(idx, tp)` in majit-ir/src/value.rs:253).
@@ -8449,6 +8451,34 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // compile.py:1056-1060: BridgeCompileData is built from the original
+        // history trace/runtime boxes. The explicit Rust TraceIterator
+        // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
+        // and must happen after this payload is formed.
+        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|op| op.args.to_vec())
+            .unwrap_or_default();
+        let bridge_trace_data =
+            TreeLoop::with_snapshots(bridge_inputargs.to_vec(), bridge_ops.to_vec(), Vec::new());
+        let bridge_resumestorage = pending_bridge_rd
+            .as_ref()
+            .map(|pending| pending.storage.as_ref());
+        let (bridge_inline_short_preamble, bridge_call_pure_results) = {
+            let bridge_data = compile::BridgeCompileData::new(
+                &bridge_trace_data,
+                &bridge_runtime_boxes,
+                bridge_resumestorage,
+                &call_pure_results,
+                inline_short_preamble,
+                self.warm_state.get_enable_opts(),
+            );
+            (
+                bridge_data.inline_short_preamble,
+                bridge_data.call_pure_results.clone(),
+            )
+        };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
@@ -8463,41 +8493,7 @@ impl<M: Clone> MetaInterp<M> {
             pending_bridge_rd,
             bridge_inputarg_base,
         );
-        // compile.py:1056-1060 / unroll.py:183-184 parity:
-        // BridgeCompileData.runtime_boxes is the original live box list
-        // passed to compile_trace, i.e. the bridge's closing JUMP args before
-        // trace.get_iter() allocates fresh input boxes for optimization.
-        let bridge_runtime_boxes: Vec<OpRef> = bridge_ops
-            .last()
-            .filter(|op| op.opcode == OpCode::Jump)
-            .map(|op| op.args.to_vec())
-            .unwrap_or_default();
-        let bridge_trace_data =
-            TreeLoop::with_snapshots(prepared.inputargs.clone(), prepared.ops.clone(), Vec::new());
-        let bridge_resumestorage = prepared
-            .pending_bridge_rd
-            .as_ref()
-            .map(|pending| pending.storage.as_ref());
-        let (bridge_inputarg_types, bridge_inline_short_preamble, bridge_call_pure_results) = {
-            let bridge_data = compile::BridgeCompileData::new(
-                &bridge_trace_data,
-                &bridge_runtime_boxes,
-                bridge_resumestorage,
-                &call_pure_results,
-                inline_short_preamble,
-                self.warm_state.get_enable_opts(),
-            );
-            (
-                bridge_data
-                    .base
-                    .inputargs()
-                    .iter()
-                    .map(|ia| ia.tp)
-                    .collect::<Vec<_>>(),
-                bridge_data.inline_short_preamble,
-                bridge_data.base.call_pure_results.clone(),
-            )
-        };
+        let bridge_inputarg_types = prepared.inputargs.iter().map(|ia| ia.tp).collect();
         let bridge_inputargs = prepared.inputargs.as_slice();
         let bridge_ops = prepared.ops.as_slice();
         let pending_bridge_rd = prepared.pending_bridge_rd;
