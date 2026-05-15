@@ -4329,7 +4329,7 @@ impl CodeWriter {
         // it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
             ($ssarepr:expr, $depth:ident) => {{
-                $depth = $depth.saturating_sub(1);
+                $depth -= 1;
                 let popped_reg = stack_base + $depth;
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
