@@ -6757,7 +6757,11 @@ fn expr_unary_not_operand_kind(expr: &syn::Expr, ctx: &GraphBuildContext) -> Una
                 let joined = segments.join("::");
                 if matches!(
                     joined.as_str(),
-                    "std::ptr::eq" | "core::ptr::eq" | "ptr::eq"
+                    "std::ptr::eq"
+                        | "core::ptr::eq"
+                        | "ptr::eq"
+                        | "crate::is_function"
+                        | "crate::is_function_with_fixed_code"
                 ) {
                     return UnaryNotOperandKind::Bool;
                 }
@@ -10794,6 +10798,45 @@ mod tests {
         assert!(
             saw_bool,
             "expected `!pyre_object::is_exception(...)` to lower through RPython UNARY_NOT"
+        );
+    }
+
+    /// `!crate::is_function(obj)` — pyre-interpreter predicate whose
+    /// defining module (`function.rs`) is outside
+    /// `generated::PYRE_JIT_GRAPH_SOURCES`.  This is the crate-local
+    /// version of the cross-crate predicate shortlist above: RPython
+    /// resolves the host callable by object identity, while pyre's
+    /// source-only classifier needs the explicit bool predicate entry.
+    #[test]
+    fn unary_not_on_crate_is_function_classifies_via_predicate_shortlist() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            type Obj = i64;
+            fn example(obj: Obj) -> bool {
+                !crate::is_function(obj)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let example = program
+            .functions
+            .iter()
+            .find(|f| f.graph.name == "example")
+            .expect("example graph must be present");
+        let saw_bool = example
+            .graph
+            .iter_blocks()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, result_ty, .. }
+                        if op == "bool" && *result_ty == ValueType::Bool
+                )
+            });
+        assert!(
+            saw_bool,
+            "expected `!crate::is_function(...)` to lower through RPython UNARY_NOT"
         );
     }
 
