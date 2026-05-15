@@ -100,27 +100,6 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
                     );
                     let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
                     result_concrete = crate::state::ConcreteValue::from_pyobj(result);
-                } else if pyre_interpreter::is_function(concrete_callable) {
-                    // pyjitpl.py:2025 concrete execution only.
-                    use std::cell::Cell;
-                    thread_local! {
-                        static CONCRETE_CALL_DEPTH: Cell<u32> = Cell::new(0);
-                    }
-                    let depth = CONCRETE_CALL_DEPTH.with(|d| d.get());
-                    if depth < 32 {
-                        CONCRETE_CALL_DEPTH.with(|d| d.set(depth + 1));
-                        let exec_ctx = self.sym().concrete_execution_context;
-                        let result =
-                            pyre_interpreter::call::call_user_function_plain_with_ctx(
-                                exec_ctx,
-                                concrete_callable,
-                                &concrete_args,
-                            );
-                        CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
-                        if let Ok(result) = result {
-                            result_concrete = crate::state::ConcreteValue::from_pyobj(result);
-                        }
-                    }
                 }
             }
         }
@@ -253,4 +232,3 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         self.trace_store_attr(obj.opref, name, value.opref)
     }
 }
-
