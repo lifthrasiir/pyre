@@ -30,10 +30,11 @@ use majit_ir::{
 };
 
 use crate::blackhole::ExceptionState;
+use crate::history::TreeLoop;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
 use crate::resume::{
     ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
-    ResumeLayoutSummary, ResumeValueSource,
+    ResumeLayoutSummary, ResumeStorage, ResumeValueSource,
 };
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
@@ -217,6 +218,128 @@ pub struct DeadFrameArtifacts {
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
+}
+
+// ── CompileData class hierarchy markers (compile.py:31-139) ─────────────
+
+/// `compile.py:31` `class CompileData(object)`.
+///
+/// This is intentionally only the shared input bundle for now.  RPython
+/// stores optimization-path state on subclasses, and pyre's larger compile
+/// flow is still flattened in `pyjitpl/mod.rs`; the named Rust structs below
+/// give each path the same boundary without changing backend behavior.
+pub struct CompileData<'a> {
+    pub trace: &'a TreeLoop,
+    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+}
+
+impl<'a> CompileData<'a> {
+    pub fn new(trace: &'a TreeLoop, call_pure_results: &'a HashMap<Vec<Value>, Value>) -> Self {
+        Self {
+            trace,
+            call_pure_results,
+        }
+    }
+
+    pub fn inputargs(&self) -> &'a [InputArg] {
+        &self.trace.inputargs
+    }
+
+    pub fn operations(&self) -> &'a [Op] {
+        &self.trace.ops
+    }
+
+    pub fn snapshots(&self) -> &'a [crate::recorder::Snapshot] {
+        &self.trace.snapshots
+    }
+}
+
+/// `compile.py:62` `class PreambleCompileData(CompileData)`.
+pub struct PreambleCompileData<'a> {
+    pub base: CompileData<'a>,
+    pub runtime_boxes: &'a [OpRef],
+}
+
+impl<'a> PreambleCompileData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        runtime_boxes: &'a [OpRef],
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace, call_pure_results),
+            runtime_boxes,
+        }
+    }
+}
+
+/// `compile.py:81` `class SimpleCompileData(CompileData)`.
+pub struct SimpleCompileData<'a> {
+    pub base: CompileData<'a>,
+    pub resumestorage: Option<&'a ResumeStorage>,
+}
+
+impl<'a> SimpleCompileData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        resumestorage: Option<&'a ResumeStorage>,
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace, call_pure_results),
+            resumestorage,
+        }
+    }
+}
+
+/// `compile.py:98` `class BridgeCompileData(CompileData)`.
+pub struct BridgeCompileData<'a> {
+    pub base: CompileData<'a>,
+    pub runtime_boxes: &'a [OpRef],
+    pub resumestorage: Option<&'a ResumeStorage>,
+    pub inline_short_preamble: bool,
+}
+
+impl<'a> BridgeCompileData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        runtime_boxes: &'a [OpRef],
+        resumestorage: Option<&'a ResumeStorage>,
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        inline_short_preamble: bool,
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace, call_pure_results),
+            runtime_boxes,
+            resumestorage,
+            inline_short_preamble,
+        }
+    }
+}
+
+/// `compile.py:122` `class UnrolledLoopData(CompileData)`.
+pub struct UnrolledLoopData<'a> {
+    pub base: CompileData<'a>,
+    /// RPython has this at construction time. Some pyre paths allocate the
+    /// `JitCellToken` after optimization for backend bookkeeping, so the
+    /// marker accepts `None` until that larger flow is refactored.
+    pub celltoken: Option<&'a Arc<JitCellToken>>,
+    pub state: Option<&'a crate::optimizeopt::unroll::ExportedState>,
+}
+
+impl<'a> UnrolledLoopData<'a> {
+    pub fn new(
+        trace: &'a TreeLoop,
+        celltoken: Option<&'a Arc<JitCellToken>>,
+        state: Option<&'a crate::optimizeopt::unroll::ExportedState>,
+        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    ) -> Self {
+        Self {
+            base: CompileData::new(trace, call_pure_results),
+            celltoken,
+            state,
+        }
+    }
 }
 
 // ── Compilation helper functions ────────────────────────────────────────
