@@ -389,7 +389,16 @@ pub trait TraceHelperAccess {
     }
 
     fn trace_build_tuple(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| emit_trace_build_flat(ctx, FlatBuildKind::Tuple, items))
+        self.with_trace_ctx(|ctx| {
+            // Same helper-call adaptation as trace_build_list: tuple
+            // construction still goes through an opaque helper, so virtual
+            // items that are only consumed by that helper must stay live until
+            // tuple allocation is ported to trace-visible newtuple stores.
+            for &item in items {
+                ctx.record_op(OpCode::Keepalive, &[item]);
+            }
+            emit_trace_build_flat(ctx, FlatBuildKind::Tuple, items)
+        })
     }
 
     fn trace_build_map(&mut self, items: &[OpRef]) -> Result<OpRef, PyError> {
