@@ -1662,6 +1662,13 @@ impl OptHeap {
     /// per the same descr-aware policy as the catch-all `_` arm.
     fn emit_residual_call(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         self.mark_escaped_varargs(op, ctx);
+        // STRUCTURAL ADAPTATION: RPython heap.py relies purely on EffectInfo
+        // here. Removing this pyre-specific direct-argument flush currently
+        // breaks synthetic correctness (`comprehensions.py`, and then wider
+        // dynasm/cranelift wrong-output failures). Keep it until the caller
+        // materialization path is ported enough that direct call arguments
+        // cannot observe stale lazy stores.
+        self.force_call_argument_lazy_sets(op, ctx.current_pass_idx, ctx);
         // heapcache.py:337-369 clear_caches_varargs.
         // Plain residual calls preserve cache entries for unescaped
         // allocations. Calls with explicit EffectInfo keep the more
@@ -1721,6 +1728,95 @@ impl OptHeap {
         }
         for &arg in &op.args {
             self.escape_box(arg);
+        }
+    }
+
+    /// Flush lazy stores for objects that escape as direct residual-call
+    /// arguments. EffectInfo bitstrings describe global heap effects, but a
+    /// callee can still read fields from objects it receives explicitly.
+    ///
+    /// Keep this selective: unrelated lazy stores may represent loop-carried
+    /// state that should stay pending until the regular guard/JUMP flush.
+    ///
+    /// Do not remove as a cosmetic PyPy-parity cleanup. The direct parity
+    /// change was tested with `python3 pyre/check.py --synthetic-only` and
+    /// caused correctness failures.
+    fn force_call_argument_lazy_sets(
+        &mut self,
+        op: &Op,
+        heap_pass_idx: usize,
+        ctx: &mut OptContext,
+    ) {
+        let call_args: Vec<OpRef> = op
+            .args
+            .iter()
+            .map(|arg| ctx.get_box_replacement(*arg))
+            .collect();
+
+        let mut field_entries: Vec<_> = self
+            .cached_fields
+            .iter_mut()
+            .map(|(field_idx, descr, cf)| (*field_idx, descr.clone(), cf))
+            .collect();
+        sort_descr_entries_untranslated(&mut field_entries);
+        let pending_fields: Vec<(u32, DescrRef, OpRef, Op)> = field_entries
+            .into_iter()
+            .filter_map(|(field_idx, descr, cf)| match cf.lazy_set.as_ref() {
+                Some((obj, _)) if call_args.contains(obj) => cf
+                    .lazy_set
+                    .take()
+                    .map(|(obj, op)| (field_idx, descr, obj, op)),
+                _ => None,
+            })
+            .collect();
+
+        for (field_idx, descr, obj, mut pending_op) in pending_fields {
+            if !descr.is_always_pure() {
+                if let Some(cf) = self.get_cached_field_mut(&descr) {
+                    cf.invalidate(field_idx, ctx);
+                }
+            }
+            for arg in pending_op.args.iter_mut() {
+                *arg = ctx.get_box_replacement(*arg);
+            }
+            let final_value = pending_op.arg(1);
+            let put_back_op = pending_op.clone();
+            ctx.emit_extra(heap_pass_idx, pending_op);
+            self.cache_field(obj, &descr);
+            ctx.structinfo_setfield(&put_back_op, field_idx, final_value);
+        }
+
+        let mut pending_arrays = Vec::new();
+        for (descr_idx, _, submap) in &mut self.cached_arrayitems {
+            let mut index_entries: Vec<_> = submap
+                .const_indexes
+                .iter_mut()
+                .map(|(&index, cai)| (index, cai))
+                .collect();
+            sort_array_index_entries_untranslated(&mut index_entries);
+            for (index, cai) in index_entries {
+                if cai
+                    .lazy_set
+                    .as_ref()
+                    .map_or(false, |(obj, _)| call_args.contains(obj))
+                {
+                    if let Some((obj, op)) = cai.lazy_set.take() {
+                        pending_arrays.push((*descr_idx, index, obj, op));
+                    }
+                }
+            }
+        }
+        for (descr_idx, index, _obj, mut pending_op) in pending_arrays {
+            for arg in pending_op.args.iter_mut() {
+                *arg = ctx.get_box_replacement(*arg);
+            }
+            let final_value = pending_op.arg(2);
+            let array_ref = pending_op.arg(0);
+            let descr = pending_op.descr.clone();
+            let put_back_op = pending_op.clone();
+            ctx.emit_extra(heap_pass_idx, pending_op);
+            self.cache_arrayitem(array_ref, descr_idx, index, descr.as_ref());
+            ctx.arrayinfo_setitem(&put_back_op, index as usize, final_value);
         }
     }
 
@@ -3017,6 +3113,9 @@ impl OptHeap {
                 // force_from_effectinfo (selective) or clean_caches,
                 // NOT force_all_lazy. force_all_lazy is only in flush().
                 self.mark_escaped_varargs(op, ctx);
+                // See `emit_residual_call`: this pyre-specific flush is
+                // required for current synthetic correctness.
+                self.force_call_argument_lazy_sets(op, ctx.current_pass_idx, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
                 if Self::call_has_random_effects(op) {
