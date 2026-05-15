@@ -370,17 +370,11 @@ impl OptVirtualize {
         source_op: &Op,
         ctx: &mut OptContext,
     ) {
-        let opinfo = crate::optimizeopt::info::VirtualRawBufferInfo {
+        let opinfo = crate::optimizeopt::info::VirtualRawBufferInfo::new(
             func,
             size,
-            offsets: Vec::new(),
-            lengths: Vec::new(),
-            descrs: Vec::new(),
-            values: Vec::new(),
-            last_guard_pos: -1,
-            calldescr: source_op.descr.clone(),
-            cached_vinfo: std::cell::RefCell::new(None),
-        };
+            source_op.descr.clone(),
+        );
         let b = ctx
             .ensure_box(source_op.pos)
             .expect("body-namespace OpRef must have a BoxRef slot");
@@ -3883,17 +3877,7 @@ mod tests {
                 .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.set_ptr_info(
                 &b,
-                PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
-                    func: 0,
-                    size,
-                    offsets: Vec::new(),
-                    lengths: Vec::new(),
-                    descrs: Vec::new(),
-                    values: Vec::new(),
-                    last_guard_pos: -1,
-                    calldescr: None,
-                    cached_vinfo: std::cell::RefCell::new(None),
-                }),
+                PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, size, None)),
             );
         }
 

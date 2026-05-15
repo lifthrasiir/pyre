@@ -17,6 +17,7 @@ pub mod intutils;
 // optimize module is at crate::optimize (RPython: metainterp/optimize.py)
 pub mod optimizer;
 pub mod pure;
+pub mod rawbuffer;
 pub mod renamer;
 pub mod rewrite;
 pub mod schedule;
@@ -714,6 +715,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                 descr: None,
                 known_class: None,
                 field_oprefs: vi
+                    .buffer
                     .values
                     .iter()
                     .map(|vref| self.ctx.get_box_replacement(*vref))
@@ -2622,7 +2624,7 @@ impl OptContext {
                         .iter()
                         .flat_map(|row| row.iter().map(|(_, r)| *r))
                         .collect(),
-                    PtrInfo::VirtualRawBuffer(r) => r.values.clone(),
+                    PtrInfo::VirtualRawBuffer(r) => r.buffer.values.clone(),
                     _ => Vec::new(),
                 };
                 self.setinfo_from_preamble_list(&items, infos);
@@ -7224,17 +7226,7 @@ mod constant_ptr_info_tests {
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(
             &parent_box,
-            PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo {
-                func: 0,
-                size: 32,
-                offsets: Vec::new(),
-                lengths: Vec::new(),
-                descrs: Vec::new(),
-                values: Vec::new(),
-                last_guard_pos: -1,
-                calldescr: None,
-                cached_vinfo: std::cell::RefCell::new(None),
-            }),
+            PtrInfo::VirtualRawBuffer(VirtualRawBufferInfo::new(0, 32, None)),
         );
         ctx.set_ptr_info(
             &slice_box,
