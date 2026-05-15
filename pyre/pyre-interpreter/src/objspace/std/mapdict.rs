@@ -79,6 +79,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
 pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     INSTANCE_DICT.with(|table| {
         for dict in table.borrow_mut().values_mut() {
+            visitor(dict);
             unsafe {
                 pyre_object::w_dict_walk_entries_mut(*dict, |slot| {
                     visitor(slot);

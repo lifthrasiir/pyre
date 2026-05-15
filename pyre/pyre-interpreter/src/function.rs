@@ -747,6 +747,7 @@ pub fn function_get_doc(obj: PyObjectRef) -> PyObjectRef {
     // Lazy fallback: `code.getdocstring(space)` (function.py:448).
     let resolved = code_getdocstring(obj);
     unsafe {
+        function_write_barrier(obj);
         (*func).w_doc = resolved;
     }
     resolved
@@ -906,6 +907,7 @@ pub unsafe fn fset_func_annotations(
         } else {
             return Err(crate::PyError::type_error("__annotations__ must be a dict"));
         };
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_ann = stored;
         Ok(())
     }
@@ -927,6 +929,7 @@ pub unsafe fn fdel_func_annotations(obj: PyObjectRef) -> Result<(), crate::PyErr
         if obj.is_null() {
             return Ok(());
         }
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_ann = PY_NULL;
         Ok(())
     }
@@ -1174,6 +1177,7 @@ pub unsafe fn fget_func_text_signature(obj: PyObjectRef) -> Result<PyObjectRef, 
 #[inline]
 pub unsafe fn fset_func_text_signature(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_text_signature = value;
     }
 }
@@ -1348,12 +1352,14 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
             // function.py:505-506: globals.get("__name__")
             let globals = (*func).w_func_globals;
             if !globals.is_null() {
+                function_write_barrier(obj);
                 (*func).w_module = (*globals)
                     .get("__name__")
                     .copied()
                     .unwrap_or(pyre_object::w_none());
             } else {
                 // function.py:508: self.w_module = space.w_None
+                function_write_barrier(obj);
                 (*func).w_module = pyre_object::w_none();
             }
         }
@@ -1398,6 +1404,7 @@ pub unsafe fn descr_function__new__(
 pub unsafe fn fset___module__(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__module__")?; // function.py:512
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_module = value;
         Ok(())
     }
@@ -1415,6 +1422,7 @@ pub unsafe fn fdel___module__(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         _check_code_mutable(obj, "__module__")?; // function.py:516
         // function.py:517: self.w_module = space.w_None
+        function_write_barrier(obj);
         (*(obj as *mut Function)).w_module = pyre_object::w_none();
         Ok(())
     }
