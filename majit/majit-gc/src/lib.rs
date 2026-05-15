@@ -830,6 +830,21 @@ pub fn gc_owns_object(addr: usize) -> bool {
     })
 }
 
+/// Return the current address for a managed object without treating it as a
+/// root. During a minor collection this follows an already-installed nursery
+/// forwarding pointer; otherwise it returns `addr` unchanged.
+pub fn gc_current_object_address(addr: usize) -> usize {
+    if addr == 0 || !gc_owns_object(addr) {
+        return addr;
+    }
+    let hdr = unsafe { header::header_of(addr) };
+    if unsafe { (*hdr).is_forwarded() } {
+        unsafe { header::GcHeader::forwarding_address(hdr) }
+    } else {
+        addr
+    }
+}
+
 /// Thread-local callbacks for registering/removing a Rust-stack slot
 /// as a GC root with the currently active backend (Task #141 option
 /// a). Used by host-side allocators whose callers need to keep a

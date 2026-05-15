@@ -60,13 +60,18 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
         return w_dict;
     }
     // PyPy stores this in the mapdict "dict" SPECIAL slot. pyre's temporary
-    // mapdict adapter is an address-keyed side table, so keep the dict holder
-    // at a stable raw address and expose its entries through walk_mapdict_roots.
-    let w_dict = pyre_object::w_dict_new_unmanaged_side_table_value();
+    // mapdict adapter is an address-keyed side table; keep the holder
+    // GC-managed so a user-held old __dict__ remains traceable after
+    // _obj_setdict replaces the side-table entry.
+    let w_dict = pyre_object::w_dict_new();
     INSTANCE_DICT.with(|table| {
         table.borrow_mut().insert(self_ref as usize, w_dict);
     });
     w_dict
+}
+
+fn current_owner_key(key: usize) -> usize {
+    pyre_object::gc_hook::try_gc_current_object_address(key as *mut u8) as usize
 }
 
 /// Walk roots held by pyre's temporary mapdict side tables.
@@ -87,10 +92,8 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     // SAFETY: do not hold the RefCell borrow while invoking callbacks. The
     // visitor and w_dict_walk_entries_mut may re-enter mapdict/dict APIs.
     for (key, mut dict) in dict_values {
-        let mut owner = key as PyObjectRef;
-        visitor(&mut owner);
         visitor(&mut dict);
-        let new_key = owner as usize;
+        let new_key = current_owner_key(key);
         INSTANCE_DICT.with(|table| {
             let mut table = table.borrow_mut();
             if new_key == key {
@@ -115,10 +118,8 @@ pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
             .collect::<Vec<_>>()
     });
     for (key, mut value) in weakref_values {
-        let mut owner = key as PyObjectRef;
-        visitor(&mut owner);
         visitor(&mut value);
-        let new_key = owner as usize;
+        let new_key = current_owner_key(key);
         WEAKREF_TABLE.with(|table| {
             let mut table = table.borrow_mut();
             if new_key == key {

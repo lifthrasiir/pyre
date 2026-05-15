@@ -201,14 +201,12 @@ use pyre_object::{
     w_list_uses_float_storage, w_list_uses_int_storage, w_list_uses_object_storage, w_tuple_len,
 };
 
-const TRACE_ABORT_PREFIX: &str = "__pyre_trace_abort__:";
-
 fn trace_abort_error(reason: &'static str) -> PyError {
-    PyError::runtime_error(format!("{TRACE_ABORT_PREFIX}{reason}"))
+    PyError::internal_trace_abort(reason)
 }
 
 fn is_trace_abort_error(err: &PyError) -> bool {
-    err.message.starts_with(TRACE_ABORT_PREFIX)
+    err.kind == pyre_interpreter::PyErrorKind::TraceAbort
 }
 
 fn positional_defaults_to_load(

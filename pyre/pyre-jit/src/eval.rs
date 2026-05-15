@@ -110,6 +110,10 @@ fn pyre_object_gc_owns_object_trampoline(addr: usize) -> bool {
     majit_gc::gc_owns_object(addr)
 }
 
+fn pyre_object_gc_current_object_address_trampoline(addr: usize) -> usize {
+    majit_gc::gc_current_object_address(addr)
+}
+
 fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
@@ -120,6 +124,14 @@ unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     for (key, value) in entries.iter_mut() {
         f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
+unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let set = unsafe { &mut *(obj_addr as *mut pyre_object::setobject::W_SetObject) };
+    let items = unsafe { &mut *set.items };
+    for item in items.iter_mut() {
+        f(item as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     }
 }
 
@@ -850,13 +862,13 @@ thread_local! {
             &pyre_object::DICT_TYPE as *const _ as usize,
             w_dict_tid,
         );
-        // W_SetObject carries `items: *mut Vec<PyObjectRef>` and a
-        // `usize` length. Same size-only registration shape as
-        // W_DictObject. Both `set` and `frozenset` PyTypes share the
-        // `W_SetObject` Rust struct so they map to the same tid.
-        let w_set_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_SetObject carries `items: *mut Vec<PyObjectRef>`. Register a
+        // custom trace hook so GC forwarding updates indirect element slots.
+        // Both `set` and `frozenset` PyTypes share this Rust struct/tid.
+        let w_set_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::setobject::W_SetObject>(),
             object_tid,
+            set_object_custom_trace,
         ));
         debug_assert_eq!(w_set_tid, W_SET_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1230,6 +1242,9 @@ thread_local! {
             pyre_object_gc_remove_root_trampoline,
         );
         pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
+        pyre_object::register_gc_current_object_address_hook(
+            pyre_object_gc_current_object_address_trampoline,
+        );
         pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
         // Task #145 Step 2.4 Phase 2c — host-side `pyre_object::gc_roots`
         // shadow stack mirror of `framework.shadowstack`. Pinned roots

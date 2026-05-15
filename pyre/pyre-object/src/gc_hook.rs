@@ -147,9 +147,12 @@ pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
 /// window) use this to discriminate GC-managed blocks from
 /// `std::alloc`-backed ones at dealloc time.
 pub type GcOwnsObjectHookFn = fn(addr: usize) -> bool;
+pub type GcCurrentObjectAddressHookFn = fn(addr: usize) -> usize;
 
 thread_local! {
     static GC_OWNS_OBJECT_HOOK: Cell<Option<GcOwnsObjectHookFn>> = const { Cell::new(None) };
+    static GC_CURRENT_OBJECT_ADDRESS_HOOK: Cell<Option<GcCurrentObjectAddressHookFn>> =
+        const { Cell::new(None) };
 }
 
 /// Install the GC-ownership predicate. Overwrites any previously-
@@ -163,6 +166,16 @@ pub fn clear_gc_owns_object_hook() {
     GC_OWNS_OBJECT_HOOK.with(|cell| cell.set(None));
 }
 
+/// Install the non-rooting current-address lookup hook.
+pub fn register_gc_current_object_address_hook(hook: GcCurrentObjectAddressHookFn) {
+    GC_CURRENT_OBJECT_ADDRESS_HOOK.with(|cell| cell.set(Some(hook)));
+}
+
+/// Remove the current-address lookup hook on this thread.
+pub fn clear_gc_current_object_address_hook() {
+    GC_CURRENT_OBJECT_ADDRESS_HOOK.with(|cell| cell.set(None));
+}
+
 /// Whether `addr` lies inside the active backend's managed GC heap.
 /// Returns `false` when no hook is installed — callers treat that as
 /// "no GC owns this pointer" and fall through to their non-GC
@@ -173,6 +186,17 @@ pub fn try_gc_owns_object(addr: *mut u8) -> bool {
     GC_OWNS_OBJECT_HOOK.with(|cell| match cell.get() {
         Some(f) => f(addr as usize),
         None => false,
+    })
+}
+
+/// Return the current address for `addr` without registering it as a root.
+/// When no hook is installed, or the active GC does not know the object, the
+/// address is unchanged.
+#[inline]
+pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
+    GC_CURRENT_OBJECT_ADDRESS_HOOK.with(|cell| match cell.get() {
+        Some(f) => f(addr as usize) as *mut u8,
+        None => addr,
     })
 }
 

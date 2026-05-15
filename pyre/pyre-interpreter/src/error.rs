@@ -382,6 +382,9 @@ pub enum PyErrorKind {
     /// (e.g. `chain_exceptions` rejecting non-BaseException context
     /// at `error.py:429`).
     SystemError,
+    /// Internal JIT trace-abort signal. This is not a Python exception
+    /// class and must be intercepted before user-visible error handling.
+    TraceAbort,
 }
 
 impl PyError {
@@ -451,6 +454,16 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
+        }
+    }
+
+    pub fn internal_trace_abort(reason: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::TraceAbort,
+            message: reason.into(),
+            exc_object: std::ptr::null_mut(),
+            attach_tb: false,
             reraise_lasti: -1,
         }
     }
@@ -596,6 +609,7 @@ impl PyError {
             PyErrorKind::SystemExit => ExcKind::SystemExit,
             PyErrorKind::MemoryError => ExcKind::MemoryError,
             PyErrorKind::SystemError => ExcKind::SystemError,
+            PyErrorKind::TraceAbort => ExcKind::RuntimeError,
         }
     }
 

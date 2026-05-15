@@ -1040,6 +1040,14 @@ impl OptHeap {
             .map(|pos| self.cached_arrayitems[pos].1.clone())
     }
 
+    fn invalidate_arrayitem_cache(&mut self, descr_idx: u32, index: i64, ctx: &mut OptContext) {
+        if let Some(submap) = self.get_cached_array_submap_mut(descr_idx) {
+            if let Some(cai) = submap.const_indexes.get_mut(&index) {
+                cai.invalidate(ctx);
+            }
+        }
+    }
+
     fn cache_arrayitem(
         &mut self,
         array: OpRef,
@@ -1846,6 +1854,7 @@ impl OptHeap {
             for arg in pending_op.args.iter_mut() {
                 *arg = ctx.get_box_replacement(*arg);
             }
+            self.invalidate_arrayitem_cache(descr_idx, index, ctx);
             self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
             let final_value = pending_op.arg(2);
             let array_ref = pending_op.arg(0);
