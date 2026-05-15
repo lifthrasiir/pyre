@@ -42,8 +42,34 @@ impl crate::lltype::GcType for W_DictObject {
     const SIZE: usize = W_DICT_OBJECT_SIZE;
 }
 
+#[inline]
+fn dict_write_barrier(obj: PyObjectRef) {
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
 /// Allocate a new empty dict.
 pub fn w_dict_new() -> PyObjectRef {
+    let entries = crate::lltype::malloc_raw(Vec::new());
+    alloc_dict_object(
+        W_DictObject {
+            ob_header: PyObject {
+                ob_type: &DICT_TYPE as *const PyType,
+                w_class: get_instantiate(&DICT_TYPE),
+            },
+            entries,
+            len: 0,
+            dict_storage_proxy: std::ptr::null_mut(),
+        },
+        false,
+    )
+}
+
+/// Allocate a dict for a pyre-side address-keyed side table.
+///
+/// These tables are not part of the translated object graph yet, so the dict
+/// holder itself must keep a stable raw address. The table walker traces the
+/// entries through [`w_dict_walk_entries_mut`] instead.
+pub fn w_dict_new_unmanaged_side_table_value() -> PyObjectRef {
     let entries = crate::lltype::malloc_raw(Vec::new());
     crate::lltype::malloc_typed(W_DictObject {
         ob_header: PyObject {
@@ -56,19 +82,50 @@ pub fn w_dict_new() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// Visit the raw `entries` vector's key/value slots with mutable access.
+///
+/// Used by pyre-side side table walkers whose dict object is not itself
+/// GC-managed but whose contained PyObjectRef values still need relocation.
+pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(&mut PyObjectRef)) {
+    let dict = &mut *(obj as *mut W_DictObject);
+    let entries = &mut *dict.entries;
+    for (key, value) in entries.iter_mut() {
+        visitor(key);
+        visitor(value);
+    }
+}
+
 /// Allocate a dict backed by a `DictStorage` (for `globals()` and similar
 /// live dict views). Mutations to this dict also update the backing storage.
 pub fn w_dict_new_with_dict_storage(ns: *mut u8) -> PyObjectRef {
     let entries = crate::lltype::malloc_raw(Vec::new());
-    crate::lltype::malloc_typed(W_DictObject {
-        ob_header: PyObject {
-            ob_type: &DICT_TYPE as *const PyType,
-            w_class: get_instantiate(&DICT_TYPE),
+    alloc_dict_object(
+        W_DictObject {
+            ob_header: PyObject {
+                ob_type: &DICT_TYPE as *const PyType,
+                w_class: get_instantiate(&DICT_TYPE),
+            },
+            entries,
+            len: 0,
+            dict_storage_proxy: ns,
         },
-        entries,
-        len: 0,
-        dict_storage_proxy: ns,
-    }) as PyObjectRef
+        true,
+    )
+}
+
+fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+    } else {
+        crate::gc_hook::try_gc_alloc(W_DICT_GC_TYPE_ID, W_DICT_OBJECT_SIZE)
+    };
+    match raw.filter(|p| !p.is_null()) {
+        Some(raw) => unsafe {
+            std::ptr::write(raw as *mut W_DictObject, value);
+            raw as PyObjectRef
+        },
+        None => crate::lltype::malloc_typed(value) as PyObjectRef,
+    }
 }
 
 /// Compare two dict keys for equality.
@@ -187,6 +244,7 @@ pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRe
     for entry in entries.iter_mut() {
         if dict_keys_equal(entry.0, key) {
             entry.1 = value;
+            dict_write_barrier(obj);
             // Storage proxy sync: if this dict is backed by a DictStorage
             // (typical for globals()), propagate the update back so that
             // module-level assignments via `globals()[name] = value` appear
@@ -197,6 +255,7 @@ pub unsafe fn w_dict_store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRe
     }
     entries.push((key, value));
     dict.len += 1;
+    dict_write_barrier(obj);
     maybe_sync_dict_storage_store(dict.dict_storage_proxy, key, value);
 }
 
@@ -468,11 +527,13 @@ pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: Py
     for entry in entries.iter_mut() {
         if crate::is_str(entry.0) && crate::w_str_get_value(entry.0) == key {
             entry.1 = value;
+            dict_write_barrier(obj);
             return;
         }
     }
     entries.push((crate::w_str_new(key), value));
     dict.len += 1;
+    dict_write_barrier(obj);
 }
 
 /// Remove an entry by str key WITHOUT firing the dict_storage_proxy

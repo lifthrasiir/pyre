@@ -59,11 +59,38 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     if let Some(w_dict) = existing {
         return w_dict;
     }
-    let w_dict = pyre_object::w_dict_new();
+    // PyPy stores this in the mapdict "dict" SPECIAL slot. pyre's temporary
+    // mapdict adapter is an address-keyed side table, so keep the dict holder
+    // at a stable raw address and expose its entries through walk_mapdict_roots.
+    let w_dict = pyre_object::w_dict_new_unmanaged_side_table_value();
     INSTANCE_DICT.with(|table| {
         table.borrow_mut().insert(self_ref as usize, w_dict);
     });
     w_dict
+}
+
+/// Walk roots held by pyre's temporary mapdict side tables.
+///
+/// PyPy stores the instance dict and weakref lifeline in mapdict SPECIAL slots,
+/// so the translated GC sees them as ordinary object fields. pyre keeps the
+/// same logical data in address-keyed side tables until mapdict is ported into
+/// the object layout; expose the value slots here so the backend GC can update
+/// them when nursery objects move.
+pub fn walk_mapdict_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
+    INSTANCE_DICT.with(|table| {
+        for dict in table.borrow_mut().values_mut() {
+            unsafe {
+                pyre_object::w_dict_walk_entries_mut(*dict, |slot| {
+                    visitor(slot);
+                });
+            }
+        }
+    });
+    WEAKREF_TABLE.with(|table| {
+        for value in table.borrow_mut().values_mut() {
+            visitor(value);
+        }
+    });
 }
 
 /// objspace/std/mapdict.py:842-860 _obj_setdict.

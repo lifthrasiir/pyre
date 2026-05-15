@@ -457,6 +457,28 @@ impl TypeInfo {
         }
     }
 
+    /// `object_subclass` variant for instances whose GC references are
+    /// discovered by a custom trace hook rather than fixed inline offsets.
+    pub fn object_subclass_with_custom_trace(
+        size: usize,
+        parent_typeid: u32,
+        trace_fn: CustomTraceFn,
+    ) -> Self {
+        TypeInfo {
+            size,
+            has_gc_ptrs: true,
+            gc_ptr_offsets: Vec::new(),
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: Some(trace_fn),
+            is_object: true,
+            parent: Some(parent_typeid),
+            subclassrange_min: 0,
+            subclassrange_max: 0,
+        }
+    }
+
     /// Create a type info for a fixed-size object with GC pointer fields.
     /// `offsets` lists byte offsets of GcRef fields within the payload.
     pub fn with_gc_ptrs(size: usize, offsets: Vec<usize>) -> Self {

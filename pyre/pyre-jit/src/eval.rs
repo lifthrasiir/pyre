@@ -123,6 +123,15 @@ fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
+unsafe fn dict_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let dict = unsafe { &mut *(obj_addr as *mut pyre_object::dictobject::W_DictObject) };
+    let entries = unsafe { &mut *dict.entries };
+    for (key, value) in entries.iter_mut() {
+        f(key as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+        f(value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    }
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
 /// resume data from the last guard failure. rd_numb provides frame
 /// boundaries (jitcode_index, pc); values are resolved from deadframe.
@@ -831,15 +840,14 @@ thread_local! {
             &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const _ as usize,
             w_bytearray_tid,
         );
-        // W_DictObject carries `entries: *mut Vec<...>` (raw heap),
-        // a `usize` length, and `dict_storage_proxy: *mut u8`. None
-        // of those are direct `PyObjectRef` fields (the (key, value)
-        // pairs live behind a raw `Vec` pointer), so registration is
-        // size-only. The Vec's PyObjectRefs reaching the GC is a
-        // pre-existing limitation common to set/dict storage.
-        let w_dict_tid = gc.register_type(TypeInfo::object_subclass(
+        // W_DictObject carries `entries: *mut Vec<(PyObjectRef,
+        // PyObjectRef)>` behind a raw pointer. Register a custom trace
+        // hook so the GC updates those indirect key/value slots just as it
+        // updates inline object fields.
+        let w_dict_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_object::dictobject::W_DictObject>(),
             object_tid,
+            dict_object_custom_trace,
         ));
         debug_assert_eq!(w_dict_tid, W_DICT_GC_TYPE_ID);
         majit_gc::GcAllocator::register_vtable_for_type(
@@ -1213,6 +1221,10 @@ thread_local! {
         // dereference freed memory. See
         // `majit_metainterp::MetaInterp::walk_rd_consts_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(rd_consts_root_walker);
+        // pyre's temporary mapdict side table mirrors PyPy fields that are
+        // normally traced by the translated GC. Walk its value slots
+        // explicitly until the table is folded into the object layout.
+        majit_gc::shadow_stack::register_extra_root_walker(pyre_interpreter_side_table_root_walker);
         // Route pyre-object host-side allocators through the backend's
         // nursery. `set_gc_allocator` populated
         // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
@@ -1299,6 +1311,21 @@ fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         let gcref: &mut majit_ir::GcRef =
             unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
         visitor(gcref);
+    });
+}
+
+fn visit_pyobject_root(
+    slot: &mut pyre_object::PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let gcref: &mut majit_ir::GcRef =
+        unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
+    visitor(gcref);
+}
+
+fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
+        visit_pyobject_root(slot, visitor);
     });
 }
 
