@@ -4781,6 +4781,14 @@ impl MIFrame {
         concrete_items: &[PyObjectRef],
     ) -> Result<OpRef, PyError> {
         if concrete_items.iter().any(|item| item.is_null()) {
+            // STRUCTURAL ADAPTATION: PyPy's `space.newtuple()` always
+            // reaches `wraptuple()` with concrete W_Root instances, so
+            // `makespecialisedtuple2()` can choose `Cls_ii` / `Cls_ff` /
+            // `Cls_oo` for arity 2. Pyre's trace-side FrontendOp may
+            // lack that concrete side channel after earlier trace-only
+            // operations. In that case, keep the older helper path rather
+            // than guessing a canonical W_TupleObject and regressing
+            // specialised tuple parity on escaped two-tuples.
             return self.trace_build_tuple(items);
         }
 
