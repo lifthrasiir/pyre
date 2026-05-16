@@ -1669,6 +1669,7 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
     matches!(
         instruction,
         Instruction::Call { .. }
+            | Instruction::CallKw { .. }
             | Instruction::StoreSubscr
             | Instruction::BinaryOp { .. }
             | Instruction::CompareOp { .. }
@@ -1693,6 +1694,7 @@ pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
         // real lowering; otherwise the default "not implemented" error is
         // mis-recorded as a traced GUARD_EXCEPTION.
         Instruction::Call { .. }
+            | Instruction::CallKw { .. }
             | Instruction::StoreAttr { .. }
             | Instruction::StoreSubscr
             | Instruction::ImportFrom { .. } // RPython raise/reraise are dedicated opimpls, not generic
@@ -6372,8 +6374,8 @@ mod tests {
                 _ => None,
             })
             .expect("source should contain a Call instruction to reuse argc shape");
-        assert!(!instruction_may_raise(call_kw_instruction));
-        assert!(!instruction_needs_pre_opcode_snapshot(call_kw_instruction));
+        assert!(instruction_may_raise(call_kw_instruction));
+        assert!(instruction_needs_pre_opcode_snapshot(call_kw_instruction));
 
         assert!(!instruction_may_raise(Instruction::CallFunctionEx));
         assert!(!instruction_needs_pre_opcode_snapshot(
