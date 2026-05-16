@@ -7551,6 +7551,7 @@ impl OpcodeStepExecutor for MIFrame {
         let code_ptr = unsafe { pyre_interpreter::get_pycode(target_func) };
         let code = unsafe { &*(code_ptr as *const CodeObject) };
         let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
+        let n_pos_params = code.arg_count as usize;
         let has_varargs = code.flags.contains(CodeFlags::VARARGS);
         let has_varkw = code.flags.contains(CodeFlags::VARKEYWORDS);
         let n_pos = args.len() - nkw;
@@ -7558,7 +7559,7 @@ impl OpcodeStepExecutor for MIFrame {
         let mut resolved: Vec<Option<FrontendOp>> = vec![None; total_params];
 
         // Fill positional args.
-        for i in 0..n_pos.min(total_params) {
+        for i in 0..n_pos.min(n_pos_params) {
             resolved[i] = Some(args[i].clone());
         }
 
@@ -7587,7 +7588,6 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // Fill positional defaults.
-        let n_pos_params = code.arg_count as usize;
         let defaults_obj = unsafe { function_get_defaults(target_func) };
         if !defaults_obj.is_null() {
             let defaults_obj = pyre_interpreter::baseobjspace::unwrap_cell(defaults_obj);
@@ -7641,8 +7641,8 @@ impl OpcodeStepExecutor for MIFrame {
 
         // Pack *args if needed.
         if has_varargs {
-            let extra_pos: Vec<FrontendOp> = if n_pos > total_params {
-                args[total_params..n_pos].to_vec()
+            let extra_pos: Vec<FrontendOp> = if n_pos > n_pos_params {
+                args[n_pos_params..n_pos].to_vec()
             } else {
                 vec![]
             };
