@@ -7508,30 +7508,6 @@ impl OpcodeStepExecutor for MIFrame {
             args.insert(0, null_or_self);
         }
 
-        // Unwrap bound method to get the underlying function for resolution.
-        let target_func = if unsafe { is_method(concrete_callable) } {
-            let func = unsafe { w_method_get_func(concrete_callable) };
-            let receiver = unsafe { w_method_get_self(concrete_callable) };
-            if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
-                let receiver_opref = self.with_ctx(|this, ctx| {
-                    this.guard_class(ctx, callable.opref, &METHOD_TYPE as *const PyType);
-                    ctx.record_op_with_descr(
-                        OpCode::GetfieldGcR,
-                        &[callable.opref],
-                        crate::descr::method_w_self_descr(),
-                    )
-                });
-                let receiver_val = FrontendOp::new(
-                    receiver_opref,
-                    ConcreteValue::from_pyobj(receiver),
-                );
-                args.insert(0, receiver_val);
-            }
-            func
-        } else {
-            concrete_callable
-        };
-
         // Determine nkw from concrete kwarg_names tuple.
         let nkw = if !concrete_kwnames.is_null()
             && unsafe { pyre_object::is_tuple(concrete_kwnames) }
@@ -7541,7 +7517,30 @@ impl OpcodeStepExecutor for MIFrame {
             0
         };
 
-        if nkw == 0 || !unsafe { is_function(target_func) } {
+        // Only trace the direct user-function keyword path here.  PyPy keeps
+        // kwargs inside `Arguments` and dispatches through `space.call_args`;
+        // pyre's trace side does not yet have an equivalent structured kwargs
+        // residual helper for methods, builtins, types, or arbitrary
+        // `__call__` objects.  Let those uncommon keyword-call shapes run in
+        // the interpreter instead of recording a call with the keyword-name
+        // tuple discarded or with a bound receiver inserted twice.
+        let target_func = if nkw == 0 {
+            concrete_callable
+        } else if unsafe { is_function(concrete_callable) }
+            && unsafe {
+                !is_builtin_code(
+                    pyre_interpreter::getcode(concrete_callable) as pyre_object::PyObjectRef
+                )
+            }
+        {
+            concrete_callable
+        } else {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW for non-user-function callable",
+            ));
+        };
+
+        if nkw == 0 {
             // No kwargs or not a user function — fall through to plain call.
             let result =
                 <Self as SharedOpcodeHandler>::call_callable(self, callable, &args)?;
