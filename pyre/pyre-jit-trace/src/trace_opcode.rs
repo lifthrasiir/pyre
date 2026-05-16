@@ -7509,13 +7509,12 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // Determine nkw from concrete kwarg_names tuple.
-        let nkw = if !concrete_kwnames.is_null()
-            && unsafe { pyre_object::is_tuple(concrete_kwnames) }
-        {
-            unsafe { w_tuple_len(concrete_kwnames) }
-        } else {
-            0
-        };
+        let nkw =
+            if !concrete_kwnames.is_null() && unsafe { pyre_object::is_tuple(concrete_kwnames) } {
+                unsafe { w_tuple_len(concrete_kwnames) }
+            } else {
+                0
+            };
 
         // Only trace the direct user-function keyword path here.  PyPy keeps
         // kwargs inside `Arguments` and dispatches through `space.call_args`;
@@ -7542,8 +7541,7 @@ impl OpcodeStepExecutor for MIFrame {
 
         if nkw == 0 {
             // No kwargs or not a user function — fall through to plain call.
-            let result =
-                <Self as SharedOpcodeHandler>::call_callable(self, callable, &args)?;
+            let result = <Self as SharedOpcodeHandler>::call_callable(self, callable, &args)?;
             return <Self as SharedOpcodeHandler>::push_value(self, result);
         }
 
@@ -7557,7 +7555,22 @@ impl OpcodeStepExecutor for MIFrame {
         let has_varkw = code.flags.contains(CodeFlags::VARKEYWORDS);
         let n_pos = args.len() - nkw;
 
-        if n_pos > n_pos_params && !has_varargs {
+        if has_varargs || has_varkw {
+            // PyPy's `Arguments._match_signature` writes a fully resolved
+            // frame scope for `*args` / `**kwargs` (argument.py:222-242).
+            // The trace-side residual helper below still calls the normal
+            // positional user-function path, whose `call_user_function`
+            // re-packs varargs/kwargs. Passing a pre-packed scope there
+            // double-packs `*args` and drops non-empty `**kwargs`. Until the
+            // JIT grows a resolved-scope helper matching
+            // `call_user_function_resolved`, keep this as a structural
+            // adaptation and let the interpreter handle these calls.
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW for *args/**kwargs user function",
+            ));
+        }
+
+        if n_pos > n_pos_params {
             return Err(trace_abort_error(
                 "abort tracing CALL_KW with too many positional args",
             ));
@@ -7571,12 +7584,11 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // Match keyword args to parameter positions.
-        let mut extra_kw_keys: Vec<PyObjectRef> = Vec::new();
-        let mut extra_kw_vals: Vec<FrontendOp> = Vec::new();
         for ki in 0..nkw {
-            let kw_name_obj =
-                unsafe { pyre_object::w_tuple_getitem(concrete_kwnames, ki as i64) };
-            let Some(kw_name_obj) = kw_name_obj else { continue };
+            let kw_name_obj = unsafe { pyre_object::w_tuple_getitem(concrete_kwnames, ki as i64) };
+            let Some(kw_name_obj) = kw_name_obj else {
+                continue;
+            };
             if !unsafe { pyre_object::is_str(kw_name_obj) } {
                 return Err(trace_abort_error(
                     "abort tracing CALL_KW with non-string keyword name",
@@ -7589,9 +7601,6 @@ impl OpcodeStepExecutor for MIFrame {
             for pi in 0..total_params {
                 if &*code.varnames[pi] == kw_str {
                     if pi < n_posonly_params {
-                        if has_varkw {
-                            break;
-                        }
                         return Err(trace_abort_error(
                             "abort tracing CALL_KW with positional-only keyword",
                         ));
@@ -7606,10 +7615,7 @@ impl OpcodeStepExecutor for MIFrame {
                     break;
                 }
             }
-            if !matched && has_varkw {
-                extra_kw_keys.push(kw_name_obj);
-                extra_kw_vals.push(kw_val);
-            } else if !matched {
+            if !matched {
                 return Err(trace_abort_error(
                     "abort tracing CALL_KW with unknown keyword",
                 ));
@@ -7625,9 +7631,9 @@ impl OpcodeStepExecutor for MIFrame {
                 let first_default = n_pos_params.saturating_sub(ndefaults);
                 for pi in first_default..n_pos_params {
                     if resolved[pi].is_none() {
-                        if let Some(v) =
-                            unsafe { pyre_object::w_tuple_getitem(defaults_obj, (pi - first_default) as i64) }
-                        {
+                        if let Some(v) = unsafe {
+                            pyre_object::w_tuple_getitem(defaults_obj, (pi - first_default) as i64)
+                        } {
                             let opref = self.with_ctx(|_this, ctx| ctx.const_ref(v as i64));
                             resolved[pi] =
                                 Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(v)));
@@ -7648,8 +7654,7 @@ impl OpcodeStepExecutor for MIFrame {
                     let key = pyre_object::w_str_new(param_name);
                     if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
                         let opref = self.with_ctx(|_this, ctx| ctx.const_ref(val as i64));
-                        resolved[pi] =
-                            Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(val)));
+                        resolved[pi] = Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(val)));
                     }
                 }
             }
@@ -7674,39 +7679,7 @@ impl OpcodeStepExecutor for MIFrame {
             }
         }
 
-        // Pack *args if needed.
-        if has_varargs {
-            let extra_pos: Vec<FrontendOp> = if n_pos > n_pos_params {
-                args[n_pos_params..n_pos].to_vec()
-            } else {
-                vec![]
-            };
-            let concrete_items: Vec<PyObjectRef> =
-                extra_pos.iter().map(|v| v.concrete.to_pyobj()).collect();
-            let tuple = pyre_interpreter::build_tuple_from_refs(&concrete_items);
-            let item_oprefs: Vec<OpRef> = extra_pos.iter().map(|v| v.opref).collect();
-            let opref = self.trace_build_tuple(&item_oprefs)?;
-            final_args.push(FrontendOp::new(opref, ConcreteValue::from_pyobj(tuple)));
-        }
-
-        // Pack **kwargs if needed.
-        if has_varkw {
-            let kw_dict = pyre_object::w_dict_new();
-            let mut item_oprefs = Vec::with_capacity(extra_kw_keys.len() * 2);
-            for (key, val) in extra_kw_keys.iter().zip(extra_kw_vals.iter()) {
-                unsafe {
-                    pyre_object::w_dict_store(kw_dict, *key, val.concrete.to_pyobj());
-                }
-                let key_opref = self.with_ctx(|_this, ctx| ctx.const_ref(*key as i64));
-                item_oprefs.push(key_opref);
-                item_oprefs.push(val.opref);
-            }
-            let opref = self.trace_build_map(&item_oprefs)?;
-            final_args.push(FrontendOp::new(opref, ConcreteValue::from_pyobj(kw_dict)));
-        }
-
-        let result =
-            <Self as SharedOpcodeHandler>::call_callable(self, callable, &final_args)?;
+        let result = <Self as SharedOpcodeHandler>::call_callable(self, callable, &final_args)?;
         <Self as SharedOpcodeHandler>::push_value(self, result)
     }
 
