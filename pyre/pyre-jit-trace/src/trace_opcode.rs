@@ -7516,13 +7516,16 @@ impl OpcodeStepExecutor for MIFrame {
                 0
             };
 
-        // Only trace the direct user-function keyword path here.  PyPy keeps
-        // kwargs inside `Arguments` and dispatches through `space.call_args`;
-        // pyre's trace side does not yet have an equivalent structured kwargs
-        // residual helper for methods, builtins, types, or arbitrary
-        // `__call__` objects.  Let those uncommon keyword-call shapes run in
-        // the interpreter instead of recording a call with the keyword-name
-        // tuple discarded or with a bound receiver inserted twice.
+        // Only trace the direct user-function keyword path here.  PyPy's
+        // `CALL_FUNCTION_KW` builds `Arguments(keyword_names_w, keywords_w)`
+        // and dispatches the same object through `space.call_args`
+        // (pyopcode.py:1386-1410), so methods, builtins, type calls, and
+        // arbitrary `__call__` objects all receive structured kwargs.
+        // Pyre's trace-side residual helpers still expose only flat
+        // positional slices for those callable shapes; forcing them through
+        // `call_callable` here would either discard the keyword-name tuple
+        // or re-bind receivers differently from PyPy.  Keep this as a
+        // structural adaptation until the trace ABI can carry `Arguments`.
         let target_func = if nkw == 0 {
             concrete_callable
         } else if unsafe { is_function(concrete_callable) }
@@ -7570,6 +7573,13 @@ impl OpcodeStepExecutor for MIFrame {
             ));
         }
 
+        // PyPy would raise the exact `ArgErr*` TypeError from
+        // `Arguments._match_signature` / `_match_keywords`
+        // (argument.py:259-321, 464-501).  The trace recorder cannot yet
+        // emit those exception paths with the right keyword metadata, and
+        // recording a partially resolved call would be worse than falling
+        // back to the interpreter.  Treat argument-mismatch keyword calls as
+        // structural aborts rather than residual calls.
         if n_pos > n_pos_params {
             return Err(trace_abort_error(
                 "abort tracing CALL_KW with too many positional args",
