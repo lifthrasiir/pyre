@@ -7487,6 +7487,191 @@ impl OpcodeStepExecutor for MIFrame {
         <Self as SharedOpcodeHandler>::push_value(self, result)
     }
 
+    fn call_kw(&mut self, nargs: usize) -> Result<(), Self::Error> {
+        use pyre_interpreter::bytecode::CodeFlags;
+
+        let kwarg_names_val = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(<Self as SharedOpcodeHandler>::pop_value(self)?);
+        }
+        args.reverse();
+        let null_or_self = <Self as SharedOpcodeHandler>::pop_value(self)?;
+        let callable = <Self as SharedOpcodeHandler>::pop_value(self)?;
+
+        let concrete_kwnames = kwarg_names_val.concrete.to_pyobj();
+        let concrete_callable = callable.concrete.to_pyobj();
+
+        if null_or_self.concrete.to_pyobj() != PY_NULL
+            && !unsafe { pyre_object::is_none(null_or_self.concrete.to_pyobj()) }
+        {
+            args.insert(0, null_or_self);
+        }
+
+        // Unwrap bound method to get the underlying function for resolution.
+        let target_func = if unsafe { is_method(concrete_callable) } {
+            let func = unsafe { w_method_get_func(concrete_callable) };
+            let receiver = unsafe { w_method_get_self(concrete_callable) };
+            if !receiver.is_null() && !unsafe { pyre_object::is_none(receiver) } {
+                let receiver_opref = self.with_ctx(|this, ctx| {
+                    this.guard_class(ctx, callable.opref, &METHOD_TYPE as *const PyType);
+                    ctx.record_op_with_descr(
+                        OpCode::GetfieldGcR,
+                        &[callable.opref],
+                        crate::descr::method_w_self_descr(),
+                    )
+                });
+                let receiver_val = FrontendOp::new(
+                    receiver_opref,
+                    ConcreteValue::from_pyobj(receiver),
+                );
+                args.insert(0, receiver_val);
+            }
+            func
+        } else {
+            concrete_callable
+        };
+
+        // Determine nkw from concrete kwarg_names tuple.
+        let nkw = if !concrete_kwnames.is_null()
+            && unsafe { pyre_object::is_tuple(concrete_kwnames) }
+        {
+            unsafe { w_tuple_len(concrete_kwnames) }
+        } else {
+            0
+        };
+
+        if nkw == 0 || !unsafe { is_function(target_func) } {
+            // No kwargs or not a user function — fall through to plain call.
+            let result =
+                <Self as SharedOpcodeHandler>::call_callable(self, callable, &args)?;
+            return <Self as SharedOpcodeHandler>::push_value(self, result);
+        }
+
+        // Resolve kwargs to positional order at trace time.
+        let code_ptr = unsafe { pyre_interpreter::get_pycode(target_func) };
+        let code = unsafe { &*(code_ptr as *const CodeObject) };
+        let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
+        let has_varargs = code.flags.contains(CodeFlags::VARARGS);
+        let has_varkw = code.flags.contains(CodeFlags::VARKEYWORDS);
+        let n_pos = args.len() - nkw;
+
+        let mut resolved: Vec<Option<FrontendOp>> = vec![None; total_params];
+
+        // Fill positional args.
+        for i in 0..n_pos.min(total_params) {
+            resolved[i] = Some(args[i].clone());
+        }
+
+        // Match keyword args to parameter positions.
+        let mut extra_kw_keys: Vec<PyObjectRef> = Vec::new();
+        let mut extra_kw_vals: Vec<FrontendOp> = Vec::new();
+        for ki in 0..nkw {
+            let kw_name_obj =
+                unsafe { pyre_object::w_tuple_getitem(concrete_kwnames, ki as i64) };
+            let Some(kw_name_obj) = kw_name_obj else { continue };
+            let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
+            let kw_val = args[n_pos + ki].clone();
+
+            let mut matched = false;
+            for pi in 0..total_params {
+                if &*code.varnames[pi] == kw_str {
+                    resolved[pi] = Some(kw_val.clone());
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched && has_varkw {
+                extra_kw_keys.push(kw_name_obj);
+                extra_kw_vals.push(kw_val);
+            }
+        }
+
+        // Fill positional defaults.
+        let n_pos_params = code.arg_count as usize;
+        let defaults_obj = unsafe { function_get_defaults(target_func) };
+        if !defaults_obj.is_null() {
+            let defaults_obj = pyre_interpreter::baseobjspace::unwrap_cell(defaults_obj);
+            if unsafe { pyre_object::is_tuple(defaults_obj) } {
+                let ndefaults = unsafe { w_tuple_len(defaults_obj) };
+                let first_default = n_pos_params.saturating_sub(ndefaults);
+                for pi in first_default..n_pos_params {
+                    if resolved[pi].is_none() {
+                        if let Some(v) =
+                            unsafe { pyre_object::w_tuple_getitem(defaults_obj, (pi - first_default) as i64) }
+                        {
+                            let opref = self.with_ctx(|_this, ctx| ctx.const_ref(v as i64));
+                            resolved[pi] =
+                                Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(v)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fill keyword-only defaults.
+        let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(target_func) };
+        if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+            let nkwonly = code.kwonlyarg_count as usize;
+            for ki in 0..nkwonly {
+                let pi = n_pos_params + ki;
+                if resolved[pi].is_none() {
+                    let param_name = &code.varnames[pi];
+                    let key = pyre_object::w_str_new(param_name);
+                    if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
+                        let opref = self.with_ctx(|_this, ctx| ctx.const_ref(val as i64));
+                        resolved[pi] =
+                            Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(val)));
+                    }
+                }
+            }
+        }
+
+        // Build final args vec. Any remaining None slots are PY_NULL
+        // (missing required args — the callee will raise TypeError).
+        let mut final_args: Vec<FrontendOp> = Vec::with_capacity(total_params + 2);
+        for slot in resolved {
+            match slot {
+                Some(val) => final_args.push(val),
+                None => {
+                    let opref = self.with_ctx(|_this, ctx| ctx.const_ref(PY_NULL as i64));
+                    final_args.push(FrontendOp::new(opref, ConcreteValue::Null));
+                }
+            }
+        }
+
+        // Pack *args if needed.
+        if has_varargs {
+            let extra_pos: Vec<FrontendOp> = if n_pos > total_params {
+                args[total_params..n_pos].to_vec()
+            } else {
+                vec![]
+            };
+            let concrete_items: Vec<PyObjectRef> =
+                extra_pos.iter().map(|v| v.concrete.to_pyobj()).collect();
+            let tuple = pyre_interpreter::build_tuple_from_refs(&concrete_items);
+            let item_oprefs: Vec<OpRef> = extra_pos.iter().map(|v| v.opref).collect();
+            let opref = self.trace_build_tuple(&item_oprefs)?;
+            final_args.push(FrontendOp::new(opref, ConcreteValue::from_pyobj(tuple)));
+        }
+
+        // Pack **kwargs if needed.
+        if has_varkw {
+            let kw_dict = pyre_object::w_dict_new();
+            for (key, val) in extra_kw_keys.iter().zip(extra_kw_vals.iter()) {
+                unsafe {
+                    pyre_object::w_dict_store(kw_dict, *key, val.concrete.to_pyobj());
+                }
+            }
+            let opref = self.with_ctx(|_this, ctx| ctx.const_ref(kw_dict as i64));
+            final_args.push(FrontendOp::new(opref, ConcreteValue::from_pyobj(kw_dict)));
+        }
+
+        let result =
+            <Self as SharedOpcodeHandler>::call_callable(self, callable, &final_args)?;
+        <Self as SharedOpcodeHandler>::push_value(self, result)
+    }
+
     // RPython exception handler tracing (pyjitpl.py:2506 finishframe_exception):
     // handle_possible_exception emits GUARD_EXCEPTION and continues at the
     // handler PC. These three overrides trace the handler-entry bytecodes.
