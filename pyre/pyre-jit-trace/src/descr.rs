@@ -1077,6 +1077,15 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_TupleObject",
         "tupleobject::W_TupleObject",
@@ -1111,6 +1120,15 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 true,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_SpecialisedTupleObject_ii",
         "specialisedtupleobject::W_SpecialisedTupleObject_ii",
@@ -1142,6 +1160,15 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 true,
                 false,
             ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_SpecialisedTupleObject_ff",
         "specialisedtupleobject::W_SpecialisedTupleObject_ff",
@@ -1171,6 +1198,15 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
                 Type::Ref,
                 false,
                 true,
+                false,
+            ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
                 false,
             ),
         ],
@@ -1724,6 +1760,10 @@ pub fn tuple_wrappeditems_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 0)
 }
 
+pub fn tuple_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
+}
+
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
 /// `specialisedtupleobject.py:34-44`. Immutable.
 pub fn specialised_tuple_ii_value0_descr() -> DescrRef {
@@ -1733,6 +1773,10 @@ pub fn specialised_tuple_ii_value0_descr() -> DescrRef {
 /// `W_SpecialisedTupleObject_ii.value1` — inline `i64`. Immutable.
 pub fn specialised_tuple_ii_value1_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 1)
+}
+
+pub fn specialised_tuple_ii_w_class_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 2)
 }
 
 /// `W_SpecialisedTupleObject_ff.value0` — inline `f64`. Immutable.
@@ -1745,6 +1789,10 @@ pub fn specialised_tuple_ff_value1_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 1)
 }
 
+pub fn specialised_tuple_ff_w_class_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 2)
+}
+
 /// `W_SpecialisedTupleObject_oo.value0` — inline `PyObjectRef`. Immutable.
 pub fn specialised_tuple_oo_value0_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 0)
@@ -1753,6 +1801,10 @@ pub fn specialised_tuple_oo_value0_descr() -> DescrRef {
 /// `W_SpecialisedTupleObject_oo.value1` — inline `PyObjectRef`. Immutable.
 pub fn specialised_tuple_oo_value1_descr() -> DescrRef {
     field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 1)
+}
+
+pub fn specialised_tuple_oo_w_class_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 2)
 }
 
 /// `ItemsBlock.capacity` — the GcArray length header at offset 0 of
