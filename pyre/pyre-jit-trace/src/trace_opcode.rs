@@ -204,9 +204,13 @@ use pyre_object::PyObjectRef;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list, is_tuple,
+    FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float, is_int,
+    is_list, is_tuple, py_type_check,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
+use pyre_object::specialisedtupleobject::{
+    SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
+};
 use pyre_object::tupleobject::w_tuple_getitem;
 use pyre_object::{
     PY_NULL, w_list_can_append_without_realloc, w_list_is_inline_storage, w_list_len,
@@ -219,6 +223,14 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 
 fn is_trace_abort_error(err: &PyError) -> bool {
     err.kind == pyre_interpreter::PyErrorKind::TraceAbort
+}
+
+unsafe fn is_exact_plain_int_object(obj: PyObjectRef) -> bool {
+    if obj.is_null() || !unsafe { py_type_check(obj, &INT_TYPE) } {
+        return false;
+    }
+    let int_typeobj = get_instantiate(&INT_TYPE);
+    int_typeobj.is_null() || unsafe { std::ptr::eq((*obj).w_class, int_typeobj) }
 }
 
 fn positional_defaults_to_load(
@@ -4729,20 +4741,246 @@ impl MIFrame {
         crate::generated_dynamic_list_index(self, ctx, key, len, concrete_key)
     }
 
-    /// Unpack a known-length tuple. `tupleobject.py:376-390`
-    /// `W_TupleObject` carries `wrappeditems` only; length is read
-    /// from the GcArray header via `arraylen_gc(items_block,
-    /// pyobject_gcarray_descr)`. Guard order matches pyjitpl.py:832-836:
-    /// `guard_class(tuple) → getfield_gc_pure_r(wrappeditems) →
-    /// arraylen_gc(items_block) → implement_guard_value(len, count) →
-    /// per-index getarrayitem_gc_pure_r`.
+    /// Trace-visible tuple construction, matching
+    /// `objspace/std/objspace.py:515 fixedview` consumers and
+    /// `tupleobject.py` / `specialisedtupleobject.py` producers. This
+    /// replaces the older opaque `jit_build_tuple_N` helper for concrete
+    /// tuple shapes so OptVirtualize can remove a tuple that is built only
+    /// to be immediately unpacked.
+    pub(crate) fn trace_build_tuple_value(
+        &mut self,
+        items: &[OpRef],
+        concrete_items: &[PyObjectRef],
+    ) -> Result<OpRef, PyError> {
+        if concrete_items.iter().any(|item| item.is_null()) {
+            return self.trace_build_tuple(items);
+        }
+
+        self.with_ctx(|this, ctx| unsafe {
+            if items.len() == 2 {
+                let lhs = concrete_items[0];
+                let rhs = concrete_items[1];
+                if is_exact_plain_int_object(lhs) && is_exact_plain_int_object(rhs) {
+                    let raw0 = if this.value_type(items[0]) == Type::Int {
+                        items[0]
+                    } else {
+                        this.trace_guarded_int_payload(ctx, items[0])
+                    };
+                    let raw1 = if this.value_type(items[1]) == Type::Int {
+                        items[1]
+                    } else {
+                        this.trace_guarded_int_payload(ctx, items[1])
+                    };
+                    let tuple = ctx.record_op_with_descr(
+                        OpCode::NewWithVtable,
+                        &[],
+                        crate::descr::specialised_tuple_ii_size_descr(),
+                    );
+                    ctx.heap_cache_mut().new_object(tuple);
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw0],
+                        crate::descr::specialised_tuple_ii_value0_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ii_value0_descr().index(),
+                        raw0,
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw1],
+                        crate::descr::specialised_tuple_ii_value1_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ii_value1_descr().index(),
+                        raw1,
+                    );
+                    return Ok(tuple);
+                }
+
+                if py_type_check(lhs, &FLOAT_TYPE) && py_type_check(rhs, &FLOAT_TYPE) {
+                    let raw0 = if this.value_type(items[0]) == Type::Float {
+                        items[0]
+                    } else {
+                        crate::state::trace_unbox_float_with_resume(
+                            this,
+                            ctx,
+                            items[0],
+                            &FLOAT_TYPE as *const _ as i64,
+                        )
+                    };
+                    let raw1 = if this.value_type(items[1]) == Type::Float {
+                        items[1]
+                    } else {
+                        crate::state::trace_unbox_float_with_resume(
+                            this,
+                            ctx,
+                            items[1],
+                            &FLOAT_TYPE as *const _ as i64,
+                        )
+                    };
+                    let tuple = ctx.record_op_with_descr(
+                        OpCode::NewWithVtable,
+                        &[],
+                        crate::descr::specialised_tuple_ff_size_descr(),
+                    );
+                    ctx.heap_cache_mut().new_object(tuple);
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw0],
+                        crate::descr::specialised_tuple_ff_value0_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ff_value0_descr().index(),
+                        raw0,
+                    );
+                    ctx.record_op_with_descr(
+                        OpCode::SetfieldGc,
+                        &[tuple, raw1],
+                        crate::descr::specialised_tuple_ff_value1_descr(),
+                    );
+                    ctx.heapcache_setfield_cached(
+                        tuple,
+                        crate::descr::specialised_tuple_ff_value1_descr().index(),
+                        raw1,
+                    );
+                    return Ok(tuple);
+                }
+
+                let tuple = ctx.record_op_with_descr(
+                    OpCode::NewWithVtable,
+                    &[],
+                    crate::descr::specialised_tuple_oo_size_descr(),
+                );
+                ctx.heap_cache_mut().new_object(tuple);
+                ctx.record_op_with_descr(
+                    OpCode::SetfieldGc,
+                    &[tuple, items[0]],
+                    crate::descr::specialised_tuple_oo_value0_descr(),
+                );
+                ctx.heapcache_setfield_cached(
+                    tuple,
+                    crate::descr::specialised_tuple_oo_value0_descr().index(),
+                    items[0],
+                );
+                ctx.record_op_with_descr(
+                    OpCode::SetfieldGc,
+                    &[tuple, items[1]],
+                    crate::descr::specialised_tuple_oo_value1_descr(),
+                );
+                ctx.heapcache_setfield_cached(
+                    tuple,
+                    crate::descr::specialised_tuple_oo_value1_descr().index(),
+                    items[1],
+                );
+                return Ok(tuple);
+            }
+
+            let len = ctx.const_int(items.len() as i64);
+            let array_descr = crate::state::pyobject_gcarray_descr();
+            let items_block = ctx.record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr);
+            ctx.heap_cache_mut().new_array(items_block, len, true);
+            for (idx, &item) in items.iter().enumerate() {
+                let idx = ctx.const_int(idx as i64);
+                crate::state::trace_items_block_setitem_value(ctx, items_block, idx, item);
+            }
+
+            let tuple = ctx.record_op_with_descr(
+                OpCode::NewWithVtable,
+                &[],
+                crate::descr::w_tuple_size_descr(),
+            );
+            ctx.heap_cache_mut().new_object(tuple);
+            let wrappeditems_descr = crate::descr::tuple_wrappeditems_descr();
+            ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[tuple, items_block],
+                wrappeditems_descr.clone(),
+            );
+            ctx.heapcache_setfield_cached(tuple, wrappeditems_descr.index(), items_block);
+            Ok(tuple)
+        })
+    }
+
+    /// Unpack a known-length tuple. `W_TupleObject` follows
+    /// `tupleobject.py:376-390`: `wrappeditems` is a GcArray and the
+    /// length is read via `arraylen_gc(items_block, pyobject_gcarray_descr)`.
+    ///
+    /// Arity-2 specialised tuple variants follow
+    /// `specialisedtupleobject.py`: after `guard_class` their immutable
+    /// inline `value0` / `value1` fields are loaded directly. This keeps
+    /// `UNPACK_SEQUENCE` structurally aligned with the tuple getitem path
+    /// and avoids tracing a canonical `W_TupleObject` guard for `Cls_ii`.
     fn trace_unpack_known_tuple(
         &mut self,
         ctx: &mut TraceCtx,
         seq: OpRef,
         count: usize,
+        concrete_seq: PyObjectRef,
         items_descr: DescrRef,
     ) -> Vec<OpRef> {
+        let ob_type = unsafe { (*concrete_seq).ob_type };
+        let spec_ii = &SPECIALISED_TUPLE_II_TYPE as *const PyType;
+        let spec_ff = &SPECIALISED_TUPLE_FF_TYPE as *const PyType;
+        let spec_oo = &SPECIALISED_TUPLE_OO_TYPE as *const PyType;
+
+        if std::ptr::eq(ob_type, spec_ii) {
+            debug_assert_eq!(count, 2);
+            self.guard_class(ctx, seq, spec_ii);
+            let value0 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureI,
+                &[seq],
+                crate::descr::specialised_tuple_ii_value0_descr(),
+            );
+            let value1 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureI,
+                &[seq],
+                crate::descr::specialised_tuple_ii_value1_descr(),
+            );
+            return vec![
+                crate::state::wrapint(ctx, value0),
+                crate::state::wrapint(ctx, value1),
+            ];
+        }
+
+        if std::ptr::eq(ob_type, spec_ff) {
+            debug_assert_eq!(count, 2);
+            self.guard_class(ctx, seq, spec_ff);
+            let value0 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureF,
+                &[seq],
+                crate::descr::specialised_tuple_ff_value0_descr(),
+            );
+            let value1 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureF,
+                &[seq],
+                crate::descr::specialised_tuple_ff_value1_descr(),
+            );
+            return vec![
+                crate::state::wrapfloat(ctx, value0),
+                crate::state::wrapfloat(ctx, value1),
+            ];
+        }
+
+        if std::ptr::eq(ob_type, spec_oo) {
+            debug_assert_eq!(count, 2);
+            self.guard_class(ctx, seq, spec_oo);
+            let value0 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureR,
+                &[seq],
+                crate::descr::specialised_tuple_oo_value0_descr(),
+            );
+            let value1 = ctx.record_op_with_descr(
+                OpCode::GetfieldGcPureR,
+                &[seq],
+                crate::descr::specialised_tuple_oo_value1_descr(),
+            );
+            return vec![value0, value1];
+        }
+
         self.guard_class(ctx, seq, &TUPLE_TYPE as *const PyType);
 
         let items_block = crate::state::opimpl_getfield_gc_r(ctx, seq, items_descr);
@@ -4821,6 +5059,7 @@ impl MIFrame {
                     ctx,
                     seq,
                     count,
+                    concrete_seq,
                     crate::descr::tuple_wrappeditems_descr(),
                 ));
             }

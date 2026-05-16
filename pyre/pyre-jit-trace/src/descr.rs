@@ -1834,6 +1834,26 @@ pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
 }
 
+/// Size descriptor for canonical `W_TupleObject`.
+pub fn w_tuple_size_descr() -> DescrRef {
+    W_TUPLE_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_SpecialisedTupleObject_ii`.
+pub fn specialised_tuple_ii_size_descr() -> DescrRef {
+    SPECIALISED_TUPLE_II_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_SpecialisedTupleObject_ff`.
+pub fn specialised_tuple_ff_size_descr() -> DescrRef {
+    SPECIALISED_TUPLE_FF_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_SpecialisedTupleObject_oo`.
+pub fn specialised_tuple_oo_size_descr() -> DescrRef {
+    SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
+}
+
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
 /// vtable = &SLICE_TYPE (ob_type for virtual materialization).
 /// Mirrors `pypy/objspace/std/objspace.py:385` `space.newslice` →

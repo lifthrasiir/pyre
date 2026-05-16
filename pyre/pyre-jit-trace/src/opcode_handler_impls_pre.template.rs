@@ -155,7 +155,6 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         &mut self,
         items: &[Self::Value],
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
-        use crate::helpers::TraceHelperAccess;
         let concrete_items: Vec<pyre_object::PyObjectRef> =
             items.iter().map(|i| i.concrete.to_pyobj()).collect();
         let mut result_concrete = crate::state::ConcreteValue::Null;
@@ -164,7 +163,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
             result_concrete = crate::state::ConcreteValue::from_pyobj(tuple);
         }
         let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
-        let opref = self.trace_build_tuple(&item_oprefs)?;
+        let opref = self.trace_build_tuple_value(&item_oprefs, &concrete_items)?;
         Ok(crate::state::FrontendOp::new(opref, result_concrete))
     }
 
