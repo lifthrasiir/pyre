@@ -7552,9 +7552,16 @@ impl OpcodeStepExecutor for MIFrame {
         let code = unsafe { &*(code_ptr as *const CodeObject) };
         let total_params = (code.arg_count + code.kwonlyarg_count) as usize;
         let n_pos_params = code.arg_count as usize;
+        let n_posonly_params = code.posonlyarg_count as usize;
         let has_varargs = code.flags.contains(CodeFlags::VARARGS);
         let has_varkw = code.flags.contains(CodeFlags::VARKEYWORDS);
         let n_pos = args.len() - nkw;
+
+        if n_pos > n_pos_params && !has_varargs {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW with too many positional args",
+            ));
+        }
 
         let mut resolved: Vec<Option<FrontendOp>> = vec![None; total_params];
 
@@ -7570,12 +7577,30 @@ impl OpcodeStepExecutor for MIFrame {
             let kw_name_obj =
                 unsafe { pyre_object::w_tuple_getitem(concrete_kwnames, ki as i64) };
             let Some(kw_name_obj) = kw_name_obj else { continue };
+            if !unsafe { pyre_object::is_str(kw_name_obj) } {
+                return Err(trace_abort_error(
+                    "abort tracing CALL_KW with non-string keyword name",
+                ));
+            }
             let kw_str = unsafe { pyre_object::w_str_get_value(kw_name_obj) };
             let kw_val = args[n_pos + ki].clone();
 
             let mut matched = false;
             for pi in 0..total_params {
                 if &*code.varnames[pi] == kw_str {
+                    if pi < n_posonly_params {
+                        if has_varkw {
+                            break;
+                        }
+                        return Err(trace_abort_error(
+                            "abort tracing CALL_KW with positional-only keyword",
+                        ));
+                    }
+                    if pi < n_pos.min(n_pos_params) || resolved[pi].is_some() {
+                        return Err(trace_abort_error(
+                            "abort tracing CALL_KW with duplicate keyword value",
+                        ));
+                    }
                     resolved[pi] = Some(kw_val.clone());
                     matched = true;
                     break;
@@ -7584,6 +7609,10 @@ impl OpcodeStepExecutor for MIFrame {
             if !matched && has_varkw {
                 extra_kw_keys.push(kw_name_obj);
                 extra_kw_vals.push(kw_val);
+            } else if !matched {
+                return Err(trace_abort_error(
+                    "abort tracing CALL_KW with unknown keyword",
+                ));
             }
         }
 
@@ -7626,8 +7655,14 @@ impl OpcodeStepExecutor for MIFrame {
             }
         }
 
-        // Build final args vec. Any remaining None slots are PY_NULL
-        // (missing required args — the callee will raise TypeError).
+        if resolved.iter().any(Option::is_none) {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW with missing required arguments",
+            ));
+        }
+
+        // Build the resolved call scope. Missing required arguments were
+        // rejected above so no PY_NULL placeholder reaches the compiled call.
         let mut final_args: Vec<FrontendOp> = Vec::with_capacity(total_params + 2);
         for slot in resolved {
             match slot {
