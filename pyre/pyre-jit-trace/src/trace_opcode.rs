@@ -7692,12 +7692,16 @@ impl OpcodeStepExecutor for MIFrame {
         // Pack **kwargs if needed.
         if has_varkw {
             let kw_dict = pyre_object::w_dict_new();
+            let mut item_oprefs = Vec::with_capacity(extra_kw_keys.len() * 2);
             for (key, val) in extra_kw_keys.iter().zip(extra_kw_vals.iter()) {
                 unsafe {
                     pyre_object::w_dict_store(kw_dict, *key, val.concrete.to_pyobj());
                 }
+                let key_opref = self.with_ctx(|_this, ctx| ctx.const_ref(*key as i64));
+                item_oprefs.push(key_opref);
+                item_oprefs.push(val.opref);
             }
-            let opref = self.with_ctx(|_this, ctx| ctx.const_ref(kw_dict as i64));
+            let opref = self.trace_build_map(&item_oprefs)?;
             final_args.push(FrontendOp::new(opref, ConcreteValue::from_pyobj(kw_dict)));
         }
 
