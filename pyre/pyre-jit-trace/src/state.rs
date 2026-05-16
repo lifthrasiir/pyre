@@ -17,7 +17,7 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
-use pyre_object::pyobject::{is_bool, is_float, is_int};
+use pyre_object::pyobject::{INT_TYPE, get_instantiate, is_bool, is_float, is_int, py_type_check};
 use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
@@ -1310,7 +1310,9 @@ impl ConcreteValue {
             return ConcreteValue::Null;
         }
         unsafe {
-            if is_int(obj) {
+            if is_bool(obj) {
+                ConcreteValue::Int(w_bool_get_value(obj) as i64)
+            } else if is_trace_plain_int(obj) {
                 ConcreteValue::Int(w_int_get_value(obj))
             } else if is_float(obj) {
                 ConcreteValue::Float(w_float_get_value(obj))
@@ -1398,6 +1400,21 @@ impl ConcreteValue {
         }
     }
 }
+
+#[inline]
+unsafe fn is_trace_plain_int(obj: PyObjectRef) -> bool {
+    if !unsafe { py_type_check(obj, &INT_TYPE) } {
+        return false;
+    }
+    let int_typeobj = get_instantiate(&INT_TYPE);
+    if int_typeobj.is_null() {
+        return true;
+    }
+    let w_class = unsafe { (*obj).w_class };
+    w_class.is_null() || std::ptr::eq(w_class, int_typeobj)
+}
+
+use pyre_interpreter::DictStorage;
 
 use crate::descr::{
     PY_OBJECT_ARRAY_GC_TYPE_ID, float_floatval_descr, int_intval_descr, make_array_descr_with_type,
@@ -7792,6 +7809,27 @@ mod tests {
                 crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             (driver, info)
         });
+    }
+
+    #[test]
+    fn concrete_value_preserves_int_subclass_identity() {
+        pyre_interpreter::typedef::init_typeobjects();
+        let obj = pyre_object::intobject::w_int_new_unique(7);
+        unsafe {
+            (*obj).w_class = pyre_object::w_none();
+        }
+
+        assert_eq!(ConcreteValue::from_pyobj(obj), ConcreteValue::Ref(obj));
+    }
+
+    #[test]
+    fn concrete_value_still_unboxes_exact_int_and_bool() {
+        pyre_interpreter::typedef::init_typeobjects();
+        let int_obj = pyre_object::w_int_new(11);
+        let true_obj = pyre_object::w_bool_from(true);
+
+        assert_eq!(ConcreteValue::from_pyobj(int_obj), ConcreteValue::Int(11));
+        assert_eq!(ConcreteValue::from_pyobj(true_obj), ConcreteValue::Int(1));
     }
 
     fn ensure_test_callbacks() {
