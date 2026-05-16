@@ -155,8 +155,16 @@ pub fn makespecialisedtuple2(w_arg1: PyObjectRef, w_arg2: PyObjectRef) -> PyObje
 /// directly with no fits-* extension (no `is_plain_float1` helper
 /// upstream).
 #[inline]
-unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &FLOAT_TYPE)
+pub unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
+    if !py_type_check(obj, &FLOAT_TYPE) {
+        return false;
+    }
+    let float_typeobj = get_instantiate(&FLOAT_TYPE);
+    if float_typeobj.is_null() {
+        return (*obj).w_class.is_null();
+    }
+    let w_class = (*obj).w_class;
+    w_class.is_null() || std::ptr::eq(w_class, float_typeobj)
 }
 
 /// Get the item at the given index from a tuple — polymorphic over
@@ -337,6 +345,27 @@ mod tests {
             assert!(is_tuple(tup));
             let v0 = w_tuple_getitem(tup, 0).unwrap();
             assert_eq!(crate::floatobject::w_float_get_value(v0), 1.5);
+        }
+    }
+
+    /// `specialisedtupleobject.py:176` checks `type(w) is W_FloatObject`.
+    /// A float subclass keeps the W_FloatObject payload shape but has a
+    /// different Python-level `w_class`, so it must fall through to `Cls_oo`.
+    #[test]
+    fn test_arity2_float_subclass_pair_falls_through_to_oo() {
+        let lhs = crate::floatobject::w_float_new(1.5);
+        let rhs = crate::floatobject::w_float_new(2.25);
+        unsafe {
+            (*lhs).w_class = crate::noneobject::w_none();
+            (*rhs).w_class = crate::noneobject::w_none();
+        }
+
+        let tup = w_tuple_new(vec![lhs, rhs]);
+        unsafe {
+            assert!(is_specialised_tuple_oo(tup));
+            assert!(!is_specialised_tuple_ff(tup));
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), lhs);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), rhs);
         }
     }
 

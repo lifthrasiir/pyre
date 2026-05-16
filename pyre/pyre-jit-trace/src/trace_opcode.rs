@@ -205,7 +205,7 @@ use pyre_object::listobject::w_list_getitem;
 use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
     FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
-    is_int, is_list, is_long, is_tuple, py_type_check,
+    is_int, is_list, is_long, is_tuple,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::specialisedtupleobject::{
@@ -4832,7 +4832,9 @@ impl MIFrame {
                     return Ok(tuple);
                 }
 
-                if py_type_check(lhs, &FLOAT_TYPE) && py_type_check(rhs, &FLOAT_TYPE) {
+                if pyre_object::is_plain_float_strict(lhs)
+                    && pyre_object::is_plain_float_strict(rhs)
+                {
                     let raw0 = if this.value_type(items[0]) == Type::Float {
                         items[0]
                     } else {
