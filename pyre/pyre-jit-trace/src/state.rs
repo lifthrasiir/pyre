@@ -1288,6 +1288,7 @@ impl FrontendOp {
 pub enum ConcreteValue {
     Int(i64),
     Float(f64),
+    Bool(bool),
     Ref(PyObjectRef),
     Null,
 }
@@ -1311,7 +1312,7 @@ impl ConcreteValue {
         }
         unsafe {
             if is_bool(obj) {
-                ConcreteValue::Int(w_bool_get_value(obj) as i64)
+                ConcreteValue::Bool(w_bool_get_value(obj))
             } else if is_trace_plain_int(obj) {
                 ConcreteValue::Int(w_int_get_value(obj))
             } else if is_float(obj) {
@@ -1327,6 +1328,7 @@ impl ConcreteValue {
         match self {
             ConcreteValue::Int(v) => w_int_new(v),
             ConcreteValue::Float(v) => pyre_object::w_float_new(v),
+            ConcreteValue::Bool(v) => pyre_object::w_bool_from(v),
             ConcreteValue::Ref(obj) => obj,
             ConcreteValue::Null => PY_NULL,
         }
@@ -1340,6 +1342,7 @@ impl ConcreteValue {
     pub fn getint(&self) -> Option<i64> {
         match self {
             ConcreteValue::Int(v) => Some(*v),
+            ConcreteValue::Bool(v) => Some(*v as i64),
             _ => None,
         }
     }
@@ -1349,6 +1352,7 @@ impl ConcreteValue {
         match self {
             ConcreteValue::Float(v) => Some(*v),
             ConcreteValue::Int(v) => Some(*v as f64),
+            ConcreteValue::Bool(v) => Some(*v as i64 as f64),
             _ => None,
         }
     }
@@ -1361,7 +1365,7 @@ impl ConcreteValue {
     /// Convert to majit IR Type.
     pub fn ir_type(&self) -> Type {
         match self {
-            ConcreteValue::Int(_) => Type::Int,
+            ConcreteValue::Int(_) | ConcreteValue::Bool(_) => Type::Int,
             ConcreteValue::Float(_) => Type::Float,
             ConcreteValue::Ref(_) => Type::Ref,
             ConcreteValue::Null => Type::Ref,
@@ -1386,7 +1390,7 @@ impl ConcreteValue {
         match self {
             ConcreteValue::Ref(obj) => Some(majit_ir::Value::Ref(majit_ir::GcRef(*obj as usize))),
             ConcreteValue::Null => Some(majit_ir::Value::Ref(majit_ir::GcRef(0))),
-            ConcreteValue::Int(_) | ConcreteValue::Float(_) => None,
+            ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => None,
         }
     }
 
@@ -1395,6 +1399,7 @@ impl ConcreteValue {
         match self {
             ConcreteValue::Int(v) => *v != 0,
             ConcreteValue::Float(v) => *v != 0.0,
+            ConcreteValue::Bool(v) => *v,
             ConcreteValue::Ref(obj) => objspace_truth_value(*obj),
             ConcreteValue::Null => false,
         }
@@ -7829,7 +7834,7 @@ mod tests {
         let true_obj = pyre_object::w_bool_from(true);
 
         assert_eq!(ConcreteValue::from_pyobj(int_obj), ConcreteValue::Int(11));
-        assert_eq!(ConcreteValue::from_pyobj(true_obj), ConcreteValue::Int(1));
+        assert_eq!(ConcreteValue::from_pyobj(true_obj), ConcreteValue::Bool(true));
     }
 
     fn ensure_test_callbacks() {

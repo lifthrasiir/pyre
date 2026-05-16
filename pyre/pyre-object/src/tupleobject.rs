@@ -355,9 +355,10 @@ mod tests {
     fn test_arity2_float_subclass_pair_falls_through_to_oo() {
         let lhs = crate::floatobject::w_float_new(1.5);
         let rhs = crate::floatobject::w_float_new(2.25);
+        let fake_subclass = &INSTANCE_TYPE as *const PyType as PyObjectRef;
         unsafe {
-            (*lhs).w_class = crate::noneobject::w_none();
-            (*rhs).w_class = crate::noneobject::w_none();
+            (*lhs).w_class = fake_subclass;
+            (*rhs).w_class = fake_subclass;
         }
 
         let tup = w_tuple_new(vec![lhs, rhs]);
@@ -376,9 +377,10 @@ mod tests {
     fn test_arity2_long_subclass_pair_falls_through_to_oo() {
         let lhs = crate::longobject::w_long_from_i64(7);
         let rhs = crate::longobject::w_long_from_i64(11);
+        let fake_subclass = &INSTANCE_TYPE as *const PyType as PyObjectRef;
         unsafe {
-            (*lhs).w_class = crate::noneobject::w_none();
-            (*rhs).w_class = crate::noneobject::w_none();
+            (*lhs).w_class = fake_subclass;
+            (*rhs).w_class = fake_subclass;
         }
 
         let tup = w_tuple_new(vec![lhs, rhs]);
