@@ -19,7 +19,8 @@ extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
 }
 
 extern "C" fn trace_function_get_kwdefaults(func: i64) -> i64 {
-    unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) as i64 }
+    let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) };
+    pyre_interpreter::baseobjspace::unwrap_cell(kwdefaults) as i64
 }
 
 extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
@@ -7513,9 +7514,7 @@ impl OpcodeStepExecutor for MIFrame {
         let concrete_kwnames = kwarg_names_val.concrete.to_pyobj();
         let concrete_callable = callable.concrete.to_pyobj();
 
-        if null_or_self.concrete.to_pyobj() != PY_NULL
-            && !unsafe { pyre_object::is_none(null_or_self.concrete.to_pyobj()) }
-        {
+        if null_or_self.concrete.to_pyobj() != PY_NULL {
             args.insert(0, null_or_self);
         }
 
@@ -7693,7 +7692,9 @@ impl OpcodeStepExecutor for MIFrame {
         }
 
         // Fill keyword-only defaults.
-        let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(target_func) };
+        let kwdefaults = pyre_interpreter::baseobjspace::unwrap_cell(unsafe {
+            pyre_interpreter::function_get_kwdefaults(target_func)
+        });
         if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
             let kwdefaults_opref = self.with_ctx(|this, ctx| {
                 let runtime_kwdefaults = ctx.call_ref_typed_with_effect(
