@@ -1408,7 +1408,7 @@ unsafe fn is_trace_plain_int(obj: PyObjectRef) -> bool {
     }
     let int_typeobj = get_instantiate(&INT_TYPE);
     if int_typeobj.is_null() {
-        return true;
+        return unsafe { (*obj).w_class.is_null() };
     }
     let w_class = unsafe { (*obj).w_class };
     w_class.is_null() || std::ptr::eq(w_class, int_typeobj)

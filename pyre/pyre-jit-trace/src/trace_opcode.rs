@@ -4796,6 +4796,19 @@ impl MIFrame {
                 let lhs = concrete_items[0];
                 let rhs = concrete_items[1];
                 if pyre_object::is_plain_int1(lhs) && pyre_object::is_plain_int1(rhs) {
+                    // STRUCTURAL ADAPTATION: PyPy's
+                    // `type(w) is W_IntObject/W_LongObject` rejects
+                    // app-level int subclasses. Pyre stores that subclass
+                    // identity in `PyObject.w_class` while `ob_type` stays
+                    // at the payload layout. Adding `w_class` guards here
+                    // preserves that exact predicate but injects
+                    // GetfieldGcR + PtrEq + GuardTrue for each tuple item,
+                    // which prevents OptVirtualize from removing the
+                    // build-then-unpack tuple in `synth/tuple_unpacking`
+                    // (regressed from pypy-like speed to ~100x slower).
+                    // Keep the hot trace on the payload/class guards used
+                    // by unboxing; the runtime helper path still applies
+                    // the exact `is_plain_int1` predicate.
                     let raw0 = trace_plain_int_payload(this, ctx, items[0], lhs);
                     let raw1 = trace_plain_int_payload(this, ctx, items[1], rhs);
                     let tuple = ctx.record_op_with_descr(
@@ -4835,6 +4848,11 @@ impl MIFrame {
                 if pyre_object::is_plain_float_strict(lhs)
                     && pyre_object::is_plain_float_strict(rhs)
                 {
+                    // STRUCTURAL ADAPTATION: same `w_class` caveat as
+                    // the int-int path above. PyPy's `type(w) is
+                    // W_FloatObject` is stricter than Pyre's payload-layout
+                    // `GuardClass(FLOAT_TYPE)`, but exact `w_class` guards
+                    // on this hot path break tuple virtualisation.
                     let raw0 = if this.value_type(items[0]) == Type::Float {
                         items[0]
                     } else {

@@ -369,6 +369,27 @@ mod tests {
         }
     }
 
+    /// `listobject.py:2390` checks `type(w) is W_LongObject`, so a
+    /// W_LongObject carrying an app-level int subclass must not take the
+    /// int-int specialised tuple path.
+    #[test]
+    fn test_arity2_long_subclass_pair_falls_through_to_oo() {
+        let lhs = crate::longobject::w_long_from_i64(7);
+        let rhs = crate::longobject::w_long_from_i64(11);
+        unsafe {
+            (*lhs).w_class = crate::noneobject::w_none();
+            (*rhs).w_class = crate::noneobject::w_none();
+        }
+
+        let tup = w_tuple_new(vec![lhs, rhs]);
+        unsafe {
+            assert!(is_specialised_tuple_oo(tup));
+            assert!(!is_specialised_tuple_ii(tup));
+            assert_eq!(w_tuple_getitem(tup, 0).unwrap(), lhs);
+            assert_eq!(w_tuple_getitem(tup, 1).unwrap(), rhs);
+        }
+    }
+
     #[test]
     fn test_arity2_mixed_falls_through_to_specialised_oo() {
         let tup = w_tuple_new(vec![w_int_new(7), crate::floatobject::w_float_new(2.0)]);

@@ -244,15 +244,26 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
         // Subclass instances share ob_type == &INT_TYPE but have w_class
         // overwritten to the subclass type object (typedef.rs:673).
         let int_typeobj = get_instantiate(&INT_TYPE);
-        if !int_typeobj.is_null() {
-            let w_class = (*item).w_class;
-            if !w_class.is_null() && !std::ptr::eq(w_class, int_typeobj) {
-                return false;
-            }
+        let w_class = (*item).w_class;
+        if int_typeobj.is_null() {
+            return w_class.is_null();
+        }
+        if !w_class.is_null() && !std::ptr::eq(w_class, int_typeobj) {
+            return false;
         }
         return true;
     }
     if is_long(item) {
+        // `type(w_obj) is W_LongObject` — reject app-level int
+        // subclasses that reuse the W_LongObject payload layout.
+        let int_typeobj = get_instantiate(&INT_TYPE);
+        let w_class = (*item).w_class;
+        if int_typeobj.is_null() {
+            return w_class.is_null() && w_long_fits_int(item);
+        }
+        if !w_class.is_null() && !std::ptr::eq(w_class, int_typeobj) {
+            return false;
+        }
         return w_long_fits_int(item);
     }
     false
