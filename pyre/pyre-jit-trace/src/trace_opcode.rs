@@ -7508,13 +7508,22 @@ impl OpcodeStepExecutor for MIFrame {
             args.insert(0, null_or_self);
         }
 
-        // Determine nkw from concrete kwarg_names tuple.
-        let nkw =
-            if !concrete_kwnames.is_null() && unsafe { pyre_object::is_tuple(concrete_kwnames) } {
-                unsafe { w_tuple_len(concrete_kwnames) }
-            } else {
-                0
-            };
+        // Determine nkw from the concrete kwarg_names tuple. PyPy's
+        // `CALL_FUNCTION_KW` immediately `interp_w`s the stack value as a
+        // tuple (pyopcode.py:1391), so treating an unavailable/non-tuple
+        // concrete value as "no kwargs" would record a plain positional call
+        // that PyPy would never execute.
+        if concrete_kwnames.is_null() || unsafe { !pyre_object::is_tuple(concrete_kwnames) } {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW without concrete keyword tuple",
+            ));
+        }
+        let nkw = unsafe { w_tuple_len(concrete_kwnames) };
+        if nkw > args.len() {
+            return Err(trace_abort_error(
+                "abort tracing CALL_KW with malformed keyword tuple",
+            ));
+        }
 
         // Only trace the direct user-function keyword path here.  PyPy's
         // `CALL_FUNCTION_KW` builds `Arguments(keyword_names_w, keywords_w)`
@@ -7528,7 +7537,8 @@ impl OpcodeStepExecutor for MIFrame {
         // structural adaptation until the trace ABI can carry `Arguments`.
         let target_func = if nkw == 0 {
             concrete_callable
-        } else if unsafe { is_function(concrete_callable) }
+        } else if !concrete_callable.is_null()
+            && unsafe { is_function(concrete_callable) }
             && unsafe {
                 !is_builtin_code(
                     pyre_interpreter::getcode(concrete_callable) as pyre_object::PyObjectRef
