@@ -204,8 +204,8 @@ use pyre_object::PyObjectRef;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, LIST_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float, is_int,
-    is_list, is_tuple, py_type_check,
+    FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list,
+    is_long, is_tuple, py_type_check,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::specialisedtupleobject::{
@@ -225,12 +225,26 @@ fn is_trace_abort_error(err: &PyError) -> bool {
     err.kind == pyre_interpreter::PyErrorKind::TraceAbort
 }
 
-unsafe fn is_exact_plain_int_object(obj: PyObjectRef) -> bool {
-    if obj.is_null() || !unsafe { py_type_check(obj, &INT_TYPE) } {
-        return false;
+fn trace_plain_int_payload(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    item: OpRef,
+    concrete_item: PyObjectRef,
+) -> OpRef {
+    if frame.value_type(item) == Type::Int {
+        return item;
     }
-    let int_typeobj = get_instantiate(&INT_TYPE);
-    int_typeobj.is_null() || unsafe { std::ptr::eq((*obj).w_class, int_typeobj) }
+    unsafe {
+        if is_long(concrete_item) {
+            return crate::state::trace_unbox_long_with_resume(
+                frame,
+                ctx,
+                item,
+                &LONG_TYPE as *const _ as i64,
+            );
+        }
+    }
+    frame.trace_guarded_int_payload(ctx, item)
 }
 
 fn positional_defaults_to_load(
@@ -4760,17 +4774,9 @@ impl MIFrame {
             if items.len() == 2 {
                 let lhs = concrete_items[0];
                 let rhs = concrete_items[1];
-                if is_exact_plain_int_object(lhs) && is_exact_plain_int_object(rhs) {
-                    let raw0 = if this.value_type(items[0]) == Type::Int {
-                        items[0]
-                    } else {
-                        this.trace_guarded_int_payload(ctx, items[0])
-                    };
-                    let raw1 = if this.value_type(items[1]) == Type::Int {
-                        items[1]
-                    } else {
-                        this.trace_guarded_int_payload(ctx, items[1])
-                    };
+                if pyre_object::is_plain_int1(lhs) && pyre_object::is_plain_int1(rhs) {
+                    let raw0 = trace_plain_int_payload(this, ctx, items[0], lhs);
+                    let raw1 = trace_plain_int_payload(this, ctx, items[1], rhs);
                     let tuple = ctx.record_op_with_descr(
                         OpCode::NewWithVtable,
                         &[],
