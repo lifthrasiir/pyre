@@ -18,6 +18,17 @@ extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
     unsafe { function_get_defaults(func as PyObjectRef) as i64 }
 }
 
+extern "C" fn trace_function_get_kwdefaults(func: i64) -> i64 {
+    unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) as i64 }
+}
+
+extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
+    unsafe {
+        pyre_object::w_dict_lookup(dict as PyObjectRef, key as PyObjectRef).unwrap_or(PY_NULL)
+            as i64
+    }
+}
+
 /// floatobject.py:561 `descr_pow` → `_pow(space, x, y)` parity.
 ///
 /// `_pow` in floatobject.py:799-881 takes two raw floats and returns a
@@ -7648,6 +7659,15 @@ impl OpcodeStepExecutor for MIFrame {
         // Fill positional defaults.
         let defaults_obj = unsafe { function_get_defaults(target_func) };
         if !defaults_obj.is_null() {
+            self.with_ctx(|this, ctx| {
+                let defaults = ctx.call_ref_typed_with_effect(
+                    trace_function_get_defaults as *const (),
+                    &[callable.opref],
+                    &[Type::Ref],
+                    CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                );
+                this.implement_guard_value(ctx, defaults, defaults_obj as i64);
+            });
             let defaults_obj = pyre_interpreter::baseobjspace::unwrap_cell(defaults_obj);
             if unsafe { pyre_object::is_tuple(defaults_obj) } {
                 let ndefaults = unsafe { w_tuple_len(defaults_obj) };
@@ -7669,6 +7689,16 @@ impl OpcodeStepExecutor for MIFrame {
         // Fill keyword-only defaults.
         let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(target_func) };
         if !kwdefaults.is_null() && unsafe { pyre_object::is_dict(kwdefaults) } {
+            let kwdefaults_opref = self.with_ctx(|this, ctx| {
+                let runtime_kwdefaults = ctx.call_ref_typed_with_effect(
+                    trace_function_get_kwdefaults as *const (),
+                    &[callable.opref],
+                    &[Type::Ref],
+                    CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                );
+                this.implement_guard_value(ctx, runtime_kwdefaults, kwdefaults as i64);
+                runtime_kwdefaults
+            });
             let nkwonly = code.kwonlyarg_count as usize;
             for ki in 0..nkwonly {
                 let pi = n_pos_params + ki;
@@ -7676,7 +7706,17 @@ impl OpcodeStepExecutor for MIFrame {
                     let param_name = &code.varnames[pi];
                     let key = pyre_object::w_str_new(param_name);
                     if let Some(val) = unsafe { pyre_object::w_dict_lookup(kwdefaults, key) } {
-                        let opref = self.with_ctx(|_this, ctx| ctx.const_ref(val as i64));
+                        let opref = self.with_ctx(|this, ctx| {
+                            let key_opref = ctx.const_ref(key as i64);
+                            let val_opref = ctx.call_ref_typed_with_effect(
+                                trace_dict_lookup_jit as *const (),
+                                &[kwdefaults_opref, key_opref],
+                                &[Type::Ref, Type::Ref],
+                                CANNOT_RAISE_NO_HEAP_EFFECT_INFO.clone(),
+                            );
+                            this.implement_guard_value(ctx, val_opref, val as i64);
+                            val_opref
+                        });
                         resolved[pi] = Some(FrontendOp::new(opref, ConcreteValue::from_pyobj(val)));
                     }
                 }
