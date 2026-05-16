@@ -7518,6 +7518,9 @@ impl OpcodeStepExecutor for MIFrame {
                 "abort tracing CALL_KW without concrete keyword tuple",
             ));
         }
+        self.with_ctx(|this, ctx| {
+            this.implement_guard_value(ctx, kwarg_names_val.opref, concrete_kwnames as i64);
+        });
         let nkw = unsafe { w_tuple_len(concrete_kwnames) };
         if nkw > args.len() {
             return Err(trace_abort_error(
