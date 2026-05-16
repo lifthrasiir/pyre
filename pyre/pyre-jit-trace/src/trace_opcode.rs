@@ -7639,11 +7639,17 @@ impl OpcodeStepExecutor for MIFrame {
                             "abort tracing CALL_KW with positional-only keyword",
                         ));
                     }
-                    if pi < n_pos.min(n_pos_params) || resolved[pi].is_some() {
+                    if pi < n_pos.min(n_pos_params) {
                         return Err(trace_abort_error(
                             "abort tracing CALL_KW with duplicate keyword value",
                         ));
                     }
+                    // PyPy argument.py:_match_keywords overwrites
+                    // kwds_mapping[j - input_argcount] for duplicate
+                    // keyword names in malformed bytecode; the last value
+                    // then wins when _match_signature fills scope_w. Only
+                    // conflicts with already-filled positional parameters
+                    // raise ArgErrMultipleValues.
                     resolved[pi] = Some(kw_val.clone());
                     matched = true;
                     break;
