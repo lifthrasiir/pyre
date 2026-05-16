@@ -204,8 +204,8 @@ use pyre_object::PyObjectRef;
 use pyre_object::listobject::w_list_getitem;
 use pyre_object::methodobject::{METHOD_TYPE, is_method, w_method_get_func, w_method_get_self};
 use pyre_object::pyobject::{
-    FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, is_float, is_int, is_list,
-    is_long, is_tuple, py_type_check,
+    FLOAT_TYPE, INT_TYPE, LIST_TYPE, LONG_TYPE, PyType, TUPLE_TYPE, get_instantiate, is_float,
+    is_int, is_list, is_long, is_tuple, py_type_check,
 };
 use pyre_object::rangeobject::RANGE_ITER_TYPE;
 use pyre_object::specialisedtupleobject::{
@@ -245,6 +245,20 @@ fn trace_plain_int_payload(
         }
     }
     frame.trace_guarded_int_payload(ctx, item)
+}
+
+fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef) {
+    let w_class = get_instantiate(&TUPLE_TYPE);
+    if w_class.is_null() {
+        return;
+    }
+    // Pyre object-model adaptation: `ob_type` is the JIT-visible
+    // RPython vtable, but Python-level `type()` reads `w_class`.
+    // PyPy's specialised tuple variants all share the public tuple typedef.
+    let w_class = ctx.const_ref(w_class as i64);
+    let descr = crate::descr::w_class_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[tuple, w_class], descr.clone());
+    ctx.heapcache_setfield_cached(tuple, descr.index(), w_class);
 }
 
 fn positional_defaults_to_load(
@@ -4783,6 +4797,7 @@ impl MIFrame {
                         crate::descr::specialised_tuple_ii_size_descr(),
                     );
                     ctx.heap_cache_mut().new_object(tuple);
+                    trace_set_tuple_w_class(ctx, tuple);
                     ctx.record_op_with_descr(
                         OpCode::SetfieldGc,
                         &[tuple, raw0],
@@ -4833,6 +4848,7 @@ impl MIFrame {
                         crate::descr::specialised_tuple_ff_size_descr(),
                     );
                     ctx.heap_cache_mut().new_object(tuple);
+                    trace_set_tuple_w_class(ctx, tuple);
                     ctx.record_op_with_descr(
                         OpCode::SetfieldGc,
                         &[tuple, raw0],
@@ -4862,6 +4878,7 @@ impl MIFrame {
                     crate::descr::specialised_tuple_oo_size_descr(),
                 );
                 ctx.heap_cache_mut().new_object(tuple);
+                trace_set_tuple_w_class(ctx, tuple);
                 ctx.record_op_with_descr(
                     OpCode::SetfieldGc,
                     &[tuple, items[0]],
@@ -4900,6 +4917,7 @@ impl MIFrame {
                 crate::descr::w_tuple_size_descr(),
             );
             ctx.heap_cache_mut().new_object(tuple);
+            trace_set_tuple_w_class(ctx, tuple);
             let wrappeditems_descr = crate::descr::tuple_wrappeditems_descr();
             ctx.record_op_with_descr(
                 OpCode::SetfieldGc,
