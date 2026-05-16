@@ -17,7 +17,7 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
-use pyre_object::pyobject::{INT_TYPE, get_instantiate, is_bool, is_float, is_int, py_type_check};
+use pyre_object::pyobject::{FLOAT_TYPE, INT_TYPE, get_instantiate, is_bool, is_float, is_int, py_type_check};
 use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
@@ -1315,7 +1315,7 @@ impl ConcreteValue {
                 ConcreteValue::Bool(w_bool_get_value(obj))
             } else if is_trace_plain_int(obj) {
                 ConcreteValue::Int(w_int_get_value(obj))
-            } else if is_float(obj) {
+            } else if is_trace_plain_float(obj) {
                 ConcreteValue::Float(w_float_get_value(obj))
             } else {
                 ConcreteValue::Ref(obj)
@@ -1417,6 +1417,19 @@ unsafe fn is_trace_plain_int(obj: PyObjectRef) -> bool {
     }
     let w_class = unsafe { (*obj).w_class };
     w_class.is_null() || std::ptr::eq(w_class, int_typeobj)
+}
+
+#[inline]
+unsafe fn is_trace_plain_float(obj: PyObjectRef) -> bool {
+    if !unsafe { py_type_check(obj, &FLOAT_TYPE) } {
+        return false;
+    }
+    let float_typeobj = get_instantiate(&FLOAT_TYPE);
+    if float_typeobj.is_null() {
+        return unsafe { (*obj).w_class.is_null() };
+    }
+    let w_class = unsafe { (*obj).w_class };
+    w_class.is_null() || std::ptr::eq(w_class, float_typeobj)
 }
 
 use pyre_interpreter::DictStorage;
@@ -1957,15 +1970,15 @@ pub(crate) fn try_trace_const_boxed_int(
         return None;
     }
     unsafe {
-        if is_int(concrete_value) {
-            return Some(ctx.const_int(w_int_get_value(concrete_value)));
-        }
         if is_bool(concrete_value) {
             return Some(ctx.const_int(if w_bool_get_value(concrete_value) {
                 1
             } else {
                 0
             }));
+        }
+        if is_trace_plain_int(concrete_value) {
+            return Some(ctx.const_int(w_int_get_value(concrete_value)));
         }
     }
     None
@@ -7832,9 +7845,22 @@ mod tests {
         pyre_interpreter::typedef::init_typeobjects();
         let int_obj = pyre_object::w_int_new(11);
         let true_obj = pyre_object::w_bool_from(true);
+        let float_obj = pyre_object::w_float_new(3.14);
 
         assert_eq!(ConcreteValue::from_pyobj(int_obj), ConcreteValue::Int(11));
         assert_eq!(ConcreteValue::from_pyobj(true_obj), ConcreteValue::Bool(true));
+        assert_eq!(ConcreteValue::from_pyobj(float_obj), ConcreteValue::Float(3.14));
+    }
+
+    #[test]
+    fn concrete_value_preserves_float_subclass_identity() {
+        pyre_interpreter::typedef::init_typeobjects();
+        let obj = pyre_object::w_float_new(2.5);
+        unsafe {
+            (*obj).w_class = pyre_object::w_none();
+        }
+
+        assert_eq!(ConcreteValue::from_pyobj(obj), ConcreteValue::Ref(obj));
     }
 
     fn ensure_test_callbacks() {

@@ -4792,7 +4792,7 @@ impl MIFrame {
         }
 
         self.with_ctx(|this, ctx| unsafe {
-            if items.len() == 2 {
+            if items.len() == 2 && concrete_items.len() >= 2 {
                 let lhs = concrete_items[0];
                 let rhs = concrete_items[1];
                 if pyre_object::is_plain_int1(lhs) && pyre_object::is_plain_int1(rhs) {
