@@ -6721,21 +6721,26 @@ impl CodeWriter {
                     // adjust current_depth so subsequent instructions don't
                     // underflow.
                     Instruction::UnpackSequence { count } => {
-                        let n = count.get(op_arg) as u16;
-                        emit_abort_permanent!();
-                        // Stack effect: pop 1 + push n = net (n - 1)
-                        if current_depth > 0 {
-                            current_depth -= 1;
-                            emit_vsd!(current_depth);
+                        let n = count.get(op_arg) as usize;
+                        // Pop iterable, push n unpacked items.
+                        // pypy/interpreter/pyopcode.py:872.
+                        let _ = current_state.stack.pop();
+                        current_depth = current_depth.saturating_sub(1);
+                        for _ in 0..n {
+                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            current_depth += 1;
                         }
-                        current_depth += n;
+                        emit_abort_permanent!();
                     }
 
                     // CPython 3.13 iterator protocol — emit abort_permanent
                     // with correct depth tracking so subsequent instructions
                     // don't underflow.
                     Instruction::GetIter => {
-                        // pop iterable, push iterator: net 0
+                        // Pop iterable, push iterator. Net: 0. Replace shadow value.
+                        // pypy/interpreter/pyopcode.py:1281.
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
 
@@ -6977,24 +6982,29 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // SetFunctionAttribute: pops attr+func, pushes func. Net: -1.
+                    // SetFunctionAttribute: pops attr (TOS), pops func (TOS1),
+                    // pushes same func back. Net: -1. Preserve func identity.
+                    // eval.rs:1897.
                     Instruction::SetFunctionAttribute { .. } => {
-                        for _ in 0..2 {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
-                        }
-                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        let _ = current_state.stack.pop(); // attr
+                        current_depth = current_depth.saturating_sub(1);
+                        let func = current_state.stack.pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        current_depth = current_depth.saturating_sub(1);
+                        current_state.stack.push(func);
                         current_depth += 1;
                         emit_abort_permanent!();
                     }
 
-                    // EndSend: pops 2 (result, iter), pushes 1. Net: -1.
+                    // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
+                    // Net: -1. Preserve result identity. eval.rs:2305-2309.
                     Instruction::EndSend => {
-                        for _ in 0..2 {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
-                        }
-                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        let result = current_state.stack.pop()
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        current_depth = current_depth.saturating_sub(1);
+                        let _ = current_state.stack.pop(); // iter
+                        current_depth = current_depth.saturating_sub(1);
+                        current_state.stack.push(result);
                         current_depth += 1;
                         emit_abort_permanent!();
                     }
@@ -7101,19 +7111,18 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // CallIntrinsic1: pops 1, pushes 1. Net: 0.
+                    // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
                     Instruction::CallIntrinsic1 { .. } => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
 
-                    // CallIntrinsic2: pops 2, pushes 1. Net: -1.
+                    // CallIntrinsic2: pops type_params, preserves func (TOS1). Net: -1.
+                    // eval.rs SetFunctionTypeParams pops only type_params.
                     Instruction::CallIntrinsic2 { .. } => {
-                        for _ in 0..2 {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
-                        }
-                        current_state.stack.push(fresh_ref_value(&mut graph));
-                        current_depth += 1;
+                        let _ = current_state.stack.pop();
+                        current_depth = current_depth.saturating_sub(1);
                         emit_abort_permanent!();
                     }
 
@@ -7137,13 +7146,11 @@ impl CodeWriter {
                     }
 
                     // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
-                    Instruction::LoadFromDictOrGlobals { .. } => {
-                        emit_abort_permanent!();
-                    }
-
-                    // LoadFromDictOrDeref: pops 1 (dict), pushes 1 (result). Net: 0.
-                    // Same shape as LoadFromDictOrGlobals.
-                    Instruction::LoadFromDictOrDeref { .. } => {
+                    // Replace shadow value. eval.rs:2028.
+                    Instruction::LoadFromDictOrGlobals { .. }
+                    | Instruction::LoadFromDictOrDeref { .. } => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
 
@@ -7158,7 +7165,7 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // Pops 1, pushes 1 (net 0).
+                    // Pops 1, pushes 1 (net 0). Replace shadow value.
                     Instruction::ConvertValue { .. }
                     | Instruction::FormatSimple
                     | Instruction::UnaryNot
@@ -7166,6 +7173,8 @@ impl CodeWriter {
                     | Instruction::GetAiter
                     | Instruction::GetAwaitable { .. }
                     | Instruction::GetYieldFromIter => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
 
@@ -7192,9 +7201,11 @@ impl CodeWriter {
                     // (This is separate from the above because pyopcode.rs pops.)
 
                     // YieldValue: pops yielded value, pushes placeholder back. Net: 0.
-                    // rpython/flowspace/flowcontext.py:721, liveness.rs:569,
-                    // assemble.py:1543.
+                    // Replace shadow value. rpython/flowspace/flowcontext.py:721,
+                    // liveness.rs:569, assemble.py:1543.
                     Instruction::YieldValue { .. } => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
 
@@ -7205,8 +7216,11 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // Send: pops 1, peeks iter, pushes 1. Net: 0.
+                    // Send: pops sent value, peeks iter, pushes next result. Net: 0.
+                    // Replace shadow value.
                     Instruction::Send { .. } => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
 
