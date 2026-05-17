@@ -7230,11 +7230,10 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // ExitInitCheck: pops __init__ return value. Net: -1.
-                    // RustPython instructions.rs:1202 (0 pushed, 1 popped).
+                    // ExitInitCheck: no-op in pyre (pyopcode.rs:2069). Net: 0.
+                    // RustPython pops the __init__ return value, but pyre's
+                    // dispatch is a plain Ok(StepResult::Continue).
                     Instruction::ExitInitCheck => {
-                        let _ = current_state.stack.pop();
-                        current_depth = current_depth.saturating_sub(1);
                         emit_abort_permanent!();
                     }
 
