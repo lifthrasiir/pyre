@@ -7027,15 +7027,22 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // LoadSuperAttr: pops 3 (super, cls, self), pushes 1 or 2. Net: -2 or -1.
-                    // Conservative: treat as pops 3, pushes 1.
+                    // LoadSuperAttr: pops 3 (super, cls, self).
+                    // is_method=false → pushes 1 (result). Net: -2.
+                    // is_method=true  → pushes 2 (func, self_or_null). Net: -1.
+                    // pyopcode.rs:1926-1932, eval.rs:2331-2360.
                     Instruction::LoadSuperAttr { .. } => {
+                        let is_method = (u32::from(op_arg) & 1) != 0;
                         for _ in 0..3 {
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
                         }
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         current_depth += 1;
+                        if is_method {
+                            current_state.stack.push(fresh_ref_value(&mut graph));
+                            current_depth += 1;
+                        }
                         emit_abort_permanent!();
                     }
 
@@ -7053,8 +7060,17 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // BuildInterpolation: pops 1-2 depending on format spec, pushes 1. Net: 0 or -1.
-                    Instruction::BuildInterpolation { .. } => {
+                    // BuildInterpolation: conditionally pops format_spec when (oparg & 1) != 0,
+                    // then pops 2 (value, expression_str) via build_tuple, pushes 1.
+                    // No spec: pops 2, pushes 1. Net: -1.
+                    // With spec: pops 3, pushes 1. Net: -2.
+                    // pyopcode.rs:1798-1806.
+                    Instruction::BuildInterpolation { format } => {
+                        let has_format_spec = (u32::from(format.get(op_arg)) & 1) != 0;
+                        if has_format_spec {
+                            let _ = current_state.stack.pop();
+                            current_depth = current_depth.saturating_sub(1);
+                        }
                         for _ in 0..2 {
                             let _ = current_state.stack.pop();
                             current_depth = current_depth.saturating_sub(1);
@@ -7098,8 +7114,15 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // LoadSpecial: pops 1 (obj), pushes 1 (bound method). Net: 0.
+                    // LoadSpecial: pops 1 (obj), pushes 2 (callable, self_or_null). Net: +1.
+                    // pyopcode.rs:2059 delegates to load_method; eval.rs:2365 pops 1 pushes 2.
                     Instruction::LoadSpecial { .. } => {
+                        let _ = current_state.stack.pop();
+                        current_depth = current_depth.saturating_sub(1);
+                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        current_depth += 1;
+                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        current_depth += 1;
                         emit_abort_permanent!();
                     }
 
@@ -7181,6 +7204,9 @@ impl CodeWriter {
                     }
 
                     // EndAsyncFor: pops 2. Net: -2.
+                    // CPython 3.12/3.13 semantics; PyPy pops 3 (w_exc, w_prev, aiter)
+                    // on the StopAsyncIteration path (assemble.py:1578). Structural
+                    // adaptation: pyre targets CPython opcode shape here.
                     Instruction::EndAsyncFor => {
                         for _ in 0..2 {
                             let _ = current_state.stack.pop();
@@ -7200,8 +7226,11 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // MatchSequence: pops 1, pushes 1. Net: 0.
+                    // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
+                    // assemble.py:1614, liveness.rs:601.
                     Instruction::MatchSequence => {
+                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        current_depth += 1;
                         emit_abort_permanent!();
                     }
 
