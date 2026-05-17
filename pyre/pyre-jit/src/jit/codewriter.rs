@@ -6619,7 +6619,11 @@ impl CodeWriter {
                         emit_vsd!(current_depth);
                     }
                     Instruction::MakeFunction { .. } => {
-                        // Module-level only: abort_permanent (won't block blackhole).
+                        // Pops code object (TOS), pushes function. Net: 0.
+                        // Replace shadow value so SET_FUNCTION_ATTRIBUTE sees func.
+                        // RustPython: (1 pushed, 1 popped).
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
                     }
                     Instruction::StoreAttr { namei } => {
@@ -6752,9 +6756,13 @@ impl CodeWriter {
                     }
 
                     Instruction::EndFor => {
-                        // pop iterator + last value: net -2
+                        // Pyre's end_for() is a no-op (pyopcode.rs:999).
+                        // The actual pop is handled by the subsequent PopIter.
+                        // RustPython instructions.rs:1200 (0 pushed, 1 popped)
+                        // covers combined semantics; pyre splits it.
+                        let _ = current_state.stack.pop();
+                        current_depth = current_depth.saturating_sub(1);
                         emit_abort_permanent!();
-                        current_depth = current_depth.saturating_sub(2);
                         // No emit_vsd: after abort_permanent, depth is
                         // simulation-only for subsequent compile-time tracking.
                     }
@@ -6982,14 +6990,14 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // SetFunctionAttribute: pops attr (TOS), pops func (TOS1),
+                    // SetFunctionAttribute: pops func (TOS), pops attr (TOS1),
                     // pushes same func back. Net: -1. Preserve func identity.
-                    // eval.rs:1897.
+                    // eval.rs:1907-1908: func = pop(), attr = pop().
                     Instruction::SetFunctionAttribute { .. } => {
-                        let _ = current_state.stack.pop(); // attr
-                        current_depth = current_depth.saturating_sub(1);
                         let func = current_state.stack.pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        current_depth = current_depth.saturating_sub(1);
+                        let _ = current_state.stack.pop(); // attr
                         current_depth = current_depth.saturating_sub(1);
                         current_state.stack.push(func);
                         current_depth += 1;
@@ -7118,11 +7126,15 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // CallIntrinsic2: pops type_params, preserves func (TOS1). Net: -1.
-                    // eval.rs SetFunctionTypeParams pops only type_params.
+                    // CallIntrinsic2: pops 2, pushes 1. Net: -1.
+                    // RustPython instructions.rs:1248 stack effect (1 pushed, 2 popped).
                     Instruction::CallIntrinsic2 { .. } => {
-                        let _ = current_state.stack.pop();
-                        current_depth = current_depth.saturating_sub(1);
+                        for _ in 0..2 {
+                            let _ = current_state.stack.pop();
+                            current_depth = current_depth.saturating_sub(1);
+                        }
+                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        current_depth += 1;
                         emit_abort_permanent!();
                     }
 
@@ -7192,8 +7204,15 @@ impl CodeWriter {
                     | Instruction::DeleteName { .. }
                     | Instruction::CopyFreeVars { .. }
                     | Instruction::MakeCell { .. }
-                    | Instruction::SetupAnnotations
-                    | Instruction::ExitInitCheck => {
+                    | Instruction::SetupAnnotations => {
+                        emit_abort_permanent!();
+                    }
+
+                    // ExitInitCheck: pops __init__ return value. Net: -1.
+                    // RustPython instructions.rs:1202 (0 pushed, 1 popped).
+                    Instruction::ExitInitCheck => {
+                        let _ = current_state.stack.pop();
+                        current_depth = current_depth.saturating_sub(1);
                         emit_abort_permanent!();
                     }
 
