@@ -571,8 +571,8 @@ fn stack_effects(
         // PopExcept: codewriter pops the saved previous exception object
         // from the value stack and restores TLS from it. Net -1.
         Instruction::PopExcept => (d - 1, d - 1),
-        // Pop one; pyre splits the CPython END_FOR into EndFor (-1) + PopIter (-1).
-        Instruction::EndFor => (d - 1, d - 1),
+        // No-op; pyre's end_for() is a no-op (pyopcode.rs:999). PopIter handles the pop.
+        Instruction::EndFor => (d, d),
         // Pop 0, push 0 (identity stack effect)
         Instruction::DeleteFast { .. }
         | Instruction::DeleteName { .. }

@@ -6756,15 +6756,9 @@ impl CodeWriter {
                     }
 
                     Instruction::EndFor => {
-                        // Pyre's end_for() is a no-op (pyopcode.rs:999).
-                        // The actual pop is handled by the subsequent PopIter.
-                        // RustPython instructions.rs:1200 (0 pushed, 1 popped)
-                        // covers combined semantics; pyre splits it.
-                        let _ = current_state.stack.pop();
-                        current_depth = current_depth.saturating_sub(1);
+                        // Pyre's end_for() is a no-op (pyopcode.rs:999). Net: 0.
+                        // The actual pop is handled by the subsequent PopIter (-1).
                         emit_abort_permanent!();
-                        // No emit_vsd: after abort_permanent, depth is
-                        // simulation-only for subsequent compile-time tracking.
                     }
 
                     Instruction::PopIter => {
@@ -7126,15 +7120,26 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // CallIntrinsic2: pops 2, pushes 1. Net: -1.
-                    // RustPython instructions.rs:1248 stack effect (1 pushed, 2 popped).
-                    Instruction::CallIntrinsic2 { .. } => {
-                        for _ in 0..2 {
-                            let _ = current_state.stack.pop();
-                            current_depth = current_depth.saturating_sub(1);
+                    // CallIntrinsic2: variant-dependent stack effect.
+                    // SetFunctionTypeParams: pops type_params (TOS), leaves func. Net: -1.
+                    // Other variants: general pop 2, push 1. Net: -1.
+                    // pyopcode.rs:1302-1316.
+                    Instruction::CallIntrinsic2 { func } => {
+                        use pyre_interpreter::bytecode::IntrinsicFunction2;
+                        match func.get(op_arg) {
+                            IntrinsicFunction2::SetFunctionTypeParams => {
+                                let _ = current_state.stack.pop(); // type_params only
+                                current_depth = current_depth.saturating_sub(1);
+                            }
+                            _ => {
+                                for _ in 0..2 {
+                                    let _ = current_state.stack.pop();
+                                    current_depth = current_depth.saturating_sub(1);
+                                }
+                                current_state.stack.push(fresh_ref_value(&mut graph));
+                                current_depth += 1;
+                            }
                         }
-                        current_state.stack.push(fresh_ref_value(&mut graph));
-                        current_depth += 1;
                         emit_abort_permanent!();
                     }
 
@@ -7159,8 +7164,17 @@ impl CodeWriter {
 
                     // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
                     // Replace shadow value. eval.rs:2028.
-                    Instruction::LoadFromDictOrGlobals { .. }
-                    | Instruction::LoadFromDictOrDeref { .. } => {
+                    Instruction::LoadFromDictOrGlobals { .. } => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        emit_abort_permanent!();
+                    }
+
+                    // LoadFromDictOrDeref: structural adaptation — CPython pops dict,
+                    // pushes result (net 0). Pyre's trait default raises before stack
+                    // mutation (pyopcode.rs:1247), so this models the intended CPython
+                    // shape, not current pyre runtime behavior.
+                    Instruction::LoadFromDictOrDeref { .. } => {
                         let _ = current_state.stack.pop();
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
@@ -7182,9 +7196,17 @@ impl CodeWriter {
                     | Instruction::FormatSimple
                     | Instruction::UnaryNot
                     | Instruction::UnaryInvert
-                    | Instruction::GetAiter
-                    | Instruction::GetAwaitable { .. }
                     | Instruction::GetYieldFromIter => {
+                        let _ = current_state.stack.pop();
+                        current_state.stack.push(fresh_ref_value(&mut graph));
+                        emit_abort_permanent!();
+                    }
+
+                    // Structural adaptation: async opcodes. Pyre's dispatcher
+                    // errors immediately (pyopcode.rs:2027) without stack mutation.
+                    // Stack effects model intended CPython shape for convergence.
+                    Instruction::GetAiter
+                    | Instruction::GetAwaitable { .. } => {
                         let _ = current_state.stack.pop();
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
@@ -7243,7 +7265,10 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
-                    // Async instructions: not implemented, but account for stack.
+                    // Structural adaptation: async opcodes below. Pyre's dispatcher
+                    // errors immediately (pyopcode.rs:2027) without stack mutation.
+                    // Stack effects model intended CPython shape for convergence.
+
                     // GetAnext: pushes 1. Net: +1.
                     Instruction::GetAnext => {
                         current_state.stack.push(fresh_ref_value(&mut graph));
