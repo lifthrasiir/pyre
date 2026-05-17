@@ -6554,7 +6554,10 @@ impl CodeWriter {
                     }
 
                     Instruction::Reraise { .. } => {
-                        // Exception path: abort_permanent.
+                        // Pops the exception. Net: -1.
+                        // pypy/interpreter/pyopcode.py:1364, assemble.py:1608.
+                        let _ = current_state.stack.pop();
+                        current_depth = current_depth.saturating_sub(1);
                         emit_abort_permanent!();
                     }
 
@@ -6580,9 +6583,16 @@ impl CodeWriter {
                                 duplicated
                             );
                         } else {
-                            // COPY(d>1): exception handler pattern only.
-                            // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
-                            // doesn't trigger the has_abort(BC_ABORT=13) check.
+                            // COPY(d>1): duplicates stack[d] onto TOS. Net: +1.
+                            // assemble.py:1482.
+                            let stack_len = current_state.stack.len();
+                            let duplicated = if d > 0 && d <= stack_len {
+                                current_state.stack[stack_len - d].clone()
+                            } else {
+                                fresh_ref_value(&mut graph)
+                            };
+                            current_state.stack.push(duplicated);
+                            current_depth += 1;
                             emit_abort_permanent!();
                         }
                     }
@@ -7176,10 +7186,10 @@ impl CodeWriter {
                     // StoreName pops 1 value from the stack.
                     // (This is separate from the above because pyopcode.rs pops.)
 
-                    // YieldValue: pops 1. Net: -1. (Re-push happens on SEND/resume.)
+                    // YieldValue: pops yielded value, pushes placeholder back. Net: 0.
+                    // rpython/flowspace/flowcontext.py:721, liveness.rs:569,
+                    // assemble.py:1543.
                     Instruction::YieldValue { .. } => {
-                        let _ = current_state.stack.pop();
-                        current_depth = current_depth.saturating_sub(1);
                         emit_abort_permanent!();
                     }
 
