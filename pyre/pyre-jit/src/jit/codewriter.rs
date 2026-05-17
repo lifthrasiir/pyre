@@ -7141,13 +7141,18 @@ impl CodeWriter {
                         emit_abort_permanent!();
                     }
 
+                    // LoadFromDictOrDeref: pops 1 (dict), pushes 1 (result). Net: 0.
+                    // Same shape as LoadFromDictOrGlobals.
+                    Instruction::LoadFromDictOrDeref { .. } => {
+                        emit_abort_permanent!();
+                    }
+
                     // Loads that push +1.
                     Instruction::LoadDeref { .. }
                     | Instruction::LoadFastCheck { .. }
                     | Instruction::LoadCommonConstant { .. }
                     | Instruction::LoadLocals
-                    | Instruction::LoadBuildClass
-                    | Instruction::LoadFromDictOrDeref { .. } => {
+                    | Instruction::LoadBuildClass => {
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         current_depth += 1;
                         emit_abort_permanent!();
