@@ -6988,7 +6988,9 @@ impl CodeWriter {
                     // pushes same func back. Net: -1. Preserve func identity.
                     // eval.rs:1907-1908: func = pop(), attr = pop().
                     Instruction::SetFunctionAttribute { .. } => {
-                        let func = current_state.stack.pop()
+                        let func = current_state
+                            .stack
+                            .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         current_depth = current_depth.saturating_sub(1);
                         let _ = current_state.stack.pop(); // attr
@@ -7001,7 +7003,9 @@ impl CodeWriter {
                     // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
                     // Net: -1. Preserve result identity. eval.rs:2305-2309.
                     Instruction::EndSend => {
-                        let result = current_state.stack.pop()
+                        let result = current_state
+                            .stack
+                            .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         current_depth = current_depth.saturating_sub(1);
                         let _ = current_state.stack.pop(); // iter
@@ -7205,8 +7209,7 @@ impl CodeWriter {
                     // Structural adaptation: async opcodes. Pyre's dispatcher
                     // errors immediately (pyopcode.rs:2027) without stack mutation.
                     // Stack effects model intended CPython shape for convergence.
-                    Instruction::GetAiter
-                    | Instruction::GetAwaitable { .. } => {
+                    Instruction::GetAiter | Instruction::GetAwaitable { .. } => {
                         let _ = current_state.stack.pop();
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         emit_abort_permanent!();
@@ -7307,7 +7310,9 @@ impl CodeWriter {
                     }
 
                     // Catch-all: unknown instruction.
-                    _other => { emit_abort_permanent!(); }
+                    _other => {
+                        emit_abort_permanent!();
+                    }
                 }
                 sync_stack_state(&mut graph, &mut current_state, current_depth);
                 current_state.next_offset = py_pc + 1;

@@ -610,7 +610,11 @@ fn stack_effects(
         // is_method=true  → push 2 (func, self_or_null). Net -1.
         Instruction::LoadSuperAttr { .. } => {
             let is_method = (u32::from(op_arg) & 1) != 0;
-            if is_method { (d - 1, d - 1) } else { (d - 2, d - 2) }
+            if is_method {
+                (d - 1, d - 1)
+            } else {
+                (d - 2, d - 2)
+            }
         }
         // CheckExcMatch: codewriter pops match_type, peeks the caught
         // exception, then pushes the bool result. Net 0.
