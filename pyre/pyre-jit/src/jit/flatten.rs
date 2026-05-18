@@ -1845,6 +1845,27 @@ where
             self.emitline(normal_label);
             let mut captured_all = false;
             for link in &catch_links {
+                let has_exception_payload = {
+                    let link_borrow = link.borrow();
+                    link_borrow.last_exception.is_some() && link_borrow.last_exc_value.is_some()
+                };
+                if !has_exception_payload {
+                    // Structural adaptation for pyre's bytecode-level
+                    // graph builder.  RPython `flowcontext.py:130-156
+                    // guessexception` closes a canraise block with
+                    // `exits[0]` as the sole normal link and all
+                    // following links seeded via `Link.extravars`.
+                    // Pyre's PC-sequential walker can leave an
+                    // additional normal/explicit-raise edge after
+                    // the first slot.  Such a link is not an
+                    // exception match arm; flatten it with ordinary
+                    // `make_link` so final exceptblock targets still
+                    // lower through `make_return`, and keep
+                    // `make_exception_link` reserved for seeded
+                    // exception links as upstream expects.
+                    self.make_link(link, false);
+                    continue;
+                }
                 let llexitcase = link.borrow().llexitcase.clone();
                 if let Some(case) = llexitcase {
                     let case_operand = self.getcolor(&case);

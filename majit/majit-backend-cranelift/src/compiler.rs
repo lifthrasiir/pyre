@@ -1134,6 +1134,8 @@ thread_local! {
     /// `majit-backend-dynasm/src/runner.rs:46 DYNASM_ACTIVE_GC`.
     static CRANELIFT_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
         const { RefCell::new(None) };
+    static CRANELIFT_ACTIVE_GC_RAW: Cell<Option<*mut dyn GcAllocator>> =
+        const { Cell::new(None) };
     /// JITFRAME `Type` id of the active GC runtime. Lazy-registered when
     /// the GC sees its first JITFRAME, cleared when the active GC is
     /// replaced or torn down.
@@ -1181,7 +1183,12 @@ fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R
 }
 
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
-    CRANELIFT_ACTIVE_GC.with(|cell| *cell.borrow_mut() = gc);
+    CRANELIFT_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        *guard = gc;
+        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+        CRANELIFT_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+    });
 }
 
 fn cranelift_jitframe_type_id() -> Option<u32> {
@@ -1348,7 +1355,30 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
-    with_cranelift_gc(|gc| gc.is_managed_heap_object(addr)).unwrap_or(false)
+    CRANELIFT_ACTIVE_GC.with(|cell| {
+        let mut guard = match cell.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Structural adaptation: RPython's GC descriptor can be
+                // queried reentrantly while a collection is walking extra
+                // roots. Pyre stores the active cranelift GC in a Rust
+                // `RefCell`; allocation slowpaths hold the mutable borrow
+                // while those root walkers may call
+                // `gc_current_object_address`. Use the raw pointer only
+                // for this immutable ownership query, matching the
+                // read-only nature of RPython's descriptor call, instead
+                // of panicking across the extern slowpath.
+                return CRANELIFT_ACTIVE_GC_RAW.with(|raw| match raw.get() {
+                    Some(ptr) => unsafe { (&*ptr).is_managed_heap_object(addr) },
+                    None => false,
+                });
+            }
+        };
+        guard
+            .as_deref_mut()
+            .map(|gc| gc.is_managed_heap_object(addr))
+            .unwrap_or(false)
+    })
 }
 
 /// Returns true when the active GC was present and roots were

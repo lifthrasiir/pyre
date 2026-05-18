@@ -1,4 +1,4 @@
-N = 300000
+N = 150000
 
 
 class Accumulator:
@@ -25,4 +25,3 @@ def main():
 
 
 main()
-

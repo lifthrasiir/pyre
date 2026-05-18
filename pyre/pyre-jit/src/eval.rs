@@ -2168,12 +2168,81 @@ pub fn init_jit_hooks() {
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
 }
 
+thread_local! {
+    static JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME: Cell<usize> = const { Cell::new(0) };
+}
+
+struct JitSuppressionGuard;
+
+impl JitSuppressionGuard {
+    fn new() -> Self {
+        JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for JitSuppressionGuard {
+    fn drop(&mut self) {
+        JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn jit_suppressed_by_unsupported_frame() -> bool {
+    JIT_SUPPRESSED_BY_UNSUPPORTED_FRAME.with(|depth| depth.get() != 0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnsupportedJitShape {
+    None,
+    CurrentFrameOnly,
+    StructuralRegion,
+}
+
+fn unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> UnsupportedJitShape {
+    // Structural adaptation: RPython/PyPy traces these bytecodes with
+    // fully translated support. Pyre's codewriter still lowers
+    // `WITH_EXCEPT_START` through a pyre-local `abort_permanent`
+    // path. A frame containing this unsupported shape must run in the
+    // interpreter. While that frame is active, nested helper calls are
+    // also kept out of the JIT by `JitSuppressionGuard`; this mirrors
+    // the structural unsupported region instead of keying on a
+    // benchmark filename.
+    //
+    // `FOR_ITER` is narrower: pyre currently emits `abort_permanent`
+    // for iterator protocol opcodes in codewriter.rs, so the current
+    // code object must run in the interpreter to preserve the Python
+    // loop result. Unlike `WITH_EXCEPT_START`, this is not a structural
+    // region boundary; callees are allowed to enter the JIT. This keeps
+    // module-level driver loops such as fannkuch's `for range(3, 10)`
+    // from disabling the hot function they call.
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    let mut has_for_iter = false;
+    for unit in code.instructions.iter().copied() {
+        match arg_state.get(unit).0 {
+            pyre_interpreter::Instruction::WithExceptStart => {
+                return UnsupportedJitShape::StructuralRegion;
+            }
+            pyre_interpreter::Instruction::ForIter { .. } => has_for_iter = true,
+            _ => {}
+        }
+    }
+    if has_for_iter {
+        UnsupportedJitShape::CurrentFrameOnly
+    } else {
+        UnsupportedJitShape::None
+    }
+}
+
 fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
         return frame.execute_frame(None, None);
     }
+    if jit_suppressed_by_unsupported_frame() {
+        return frame.execute_frame(None, None);
+    }
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     #[cfg(not(target_arch = "wasm32"))]
@@ -2185,6 +2254,14 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     majit_backend_cranelift::register_recovery_layout(
         crate::call_jit::cranelift_recovery_layout_for_descr,
     );
+    match unsupported_jit_shape(code) {
+        UnsupportedJitShape::None => {}
+        UnsupportedJitShape::CurrentFrameOnly => return frame.execute_frame(None, None),
+        UnsupportedJitShape::StructuralRegion => {
+            let _guard = JitSuppressionGuard::new();
+            return frame.execute_frame(None, None);
+        }
+    }
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
@@ -2645,6 +2722,11 @@ fn jit_merge_point_hook(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    if jit_suppressed_by_unsupported_frame()
+        || unsupported_jit_shape(code) != UnsupportedJitShape::None
+    {
+        return None;
+    }
     let concrete_frame = frame as *mut PyFrame as usize;
     let green_key = make_green_key(frame.pycode, pc);
 
@@ -2794,6 +2876,12 @@ fn maybe_compile_and_run(
     // TODO: remove when JIT is stable enough to not need a kill switch.
     static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
+        return None;
+    }
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    if jit_suppressed_by_unsupported_frame()
+        || unsupported_jit_shape(code) != UnsupportedJitShape::None
+    {
         return None;
     }
     // warmstate.py:473-477: JC_TRACING → skip entirely (no counter tick)
@@ -3427,8 +3515,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    if jit_suppressed_by_unsupported_frame()
+        || unsupported_jit_shape(code) != UnsupportedJitShape::None
+    {
+        return None;
+    }
     if std::env::var_os("MAJIT_DUMP_BYTECODE").is_some() {
-        let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
         if code.obj_name.as_str() == "fannkuch" && frame.next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();

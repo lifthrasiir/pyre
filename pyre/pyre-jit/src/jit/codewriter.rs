@@ -1294,7 +1294,7 @@ fn mergeblock(
         // re-walked under widened inputargs.  Its emit appends a
         // duplicate `Label("pcN")` + `-live-` pair to ssarepr.insns,
         // but `pc_anchor_positions` (first-wins) and
-        // `live_marker_indices_by_pc` (first-takes) ensure the
+        // `live_marker_indices_by_pc` (last-takes) ensure the
         // original dead block's bytes remain the runtime canonical
         // emission for `pcN`.  The supersede re-walk's bytes are
         // unreachable via pcN labels.
@@ -2098,6 +2098,54 @@ fn attach_catch_exception_edge(
     link
 }
 
+fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
+    let mut block_mut = block.borrow_mut();
+    if block_mut.exits.len() < 2 {
+        return;
+    }
+
+    let first_normal = block_mut.exits.iter().position(|link| {
+        let link = link.borrow();
+        link.exitcase.is_none()
+            && link.llexitcase.is_none()
+            && link.last_exception.is_none()
+            && link.last_exc_value.is_none()
+    });
+    let Some(first_normal) = first_normal else {
+        return;
+    };
+
+    let mut ordered = Vec::with_capacity(block_mut.exits.len());
+    ordered.push(block_mut.exits[first_normal].clone());
+    for (index, link) in block_mut.exits.iter().enumerate() {
+        if index == first_normal {
+            continue;
+        }
+        let is_exception_edge = {
+            let link = link.borrow();
+            link.last_exception.is_some() || link.last_exc_value.is_some()
+        };
+        if is_exception_edge {
+            ordered.push(link.clone());
+        }
+    }
+
+    // Structural adaptation for pyre's PC-sequential walker:
+    // RPython `flowcontext.py:130-156 guessexception` closes a
+    // canraise block with exactly one normal edge followed by
+    // exception edges.  Pyre may transiently append an extra normal
+    // fallthrough while forcing the next-PC boundary after
+    // `emit_catch_exception!`.  That duplicate has no
+    // `Link.extravars`, so `flatten.py:223-238` would treat it as an
+    // exception link and trip `make_exception_link`'s
+    // `last_exception` assertion.  Keep the upstream shape at the
+    // graph boundary: first normal edge, then only seeded exception
+    // edges.
+    if ordered.len() >= 2 {
+        block_mut.exits = ordered;
+    }
+}
+
 /// collect `BlockRef → FrameState` entries from the
 /// walker's in-flight block catalogues.  Pure function, no side effects.
 ///
@@ -2646,20 +2694,23 @@ fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) 
             .get(anchor_pos + 1)
             .map(|(next_idx, _)| *next_idx)
             .unwrap_or(ssarepr.insns.len());
-        // Take the FIRST -live- marker per anchor pair.  RPython emits
-        // one per block-entry (`flatten.py:107`); pyre's PC-sequential
-        // walker can emit multiple `-live-` markers in the scan range
-        // when sibling joinpoint blocks share a py_pc (same structural
-        // root as `pc_anchor_positions`'s first-wins).  The first
-        // marker matches the runtime's actual liveness window via the
-        // first-wins anchor; subsequent duplicates belong to sibling
-        // blocks reachable through fall-through after the first anchor.
+        // Take the LAST -live- marker per anchor pair.
+        // jtransform.py:1708-1712 emits two -live- ops around
+        // jit_merge_point: op3 before (for inlined short preambles)
+        // and op2 after (for do_recursive_call / guard resume).
+        // Pyre's pc_map and filter_liveness_in_place must resolve
+        // to op2 (after jit_merge_point) so that blackhole guard-
+        // failure resume lands past the merge point — otherwise the
+        // blackhole immediately hits bhimpl_jit_merge_point →
+        // ContinueRunningNormally.  Last-wins picks op2.
+        //
+        // For non-merge-point PCs and sibling joinpoint blocks
+        // at the same py_pc, only one -live- exists per anchor
+        // range so first/last are equivalent.
         let mut live_idx: Option<usize> = None;
         for insn_idx in (anchor_idx + 1)..end {
             if ssarepr.insns[insn_idx].is_live() {
-                if live_idx.is_none() {
-                    live_idx = Some(insn_idx);
-                }
+                live_idx = Some(insn_idx);
             }
         }
         live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
@@ -3562,7 +3613,7 @@ impl CodeWriter {
         // skip is retired; supersede may re-walk a PC under widened
         // framestate, producing duplicate `Label("pcN")` + `-live-`
         // pairs.  Both `pc_anchor_positions` and
-        // `live_marker_indices_by_pc` use first-wins / first-takes
+        // `live_marker_indices_by_pc` use first-wins / last-takes
         // semantics so the runtime canonical bytes are the dead
         // block's emit; the supersede newblock's re-walk emit is
         // unreachable via pcN labels.
@@ -3841,7 +3892,7 @@ impl CodeWriter {
                 // same edge.  Phase A.4 retired the back-edge skip
                 // (was Phase 4.C); back-edge mergeblock now creates a
                 // re-walked supersede block, which the relaxed
-                // `live_marker_indices_by_pc` first-takes semantics
+                // `live_marker_indices_by_pc` last-takes semantics
                 // tolerates.
                 mergeblock(
                     code,
@@ -4157,24 +4208,7 @@ impl CodeWriter {
                         &mut all_walker_blocks,
                     );
                     if canraise_pending {
-                        // `flowcontext.py:130-156 guessexception` builds
-                        // `block.exits = [normal_to_egg,
-                        // exception_to_handler]` — normal at index 0,
-                        // exception at index 1.  Pyre's
-                        // `emit_catch_exception!` attached the exception
-                        // edge first (it ran during op dispatch, before
-                        // any normal-flow edge existed); the mergeblock
-                        // above appended the normal edge to the end.
-                        // Restore the upstream order so
-                        // `flatten.py:1665-1670` (`exits[0].exitcase
-                        // is None` + `normal_link = exits[0]`) lands
-                        // the right link in the right slot.
-                        let block_rc = current_block.block();
-                        let mut block_mut = block_rc.borrow_mut();
-                        if block_mut.exits.len() >= 2 {
-                            let last = block_mut.exits.len() - 1;
-                            block_mut.exits.swap(0, last);
-                        }
+                        restore_canraise_exit_order(&current_block.block());
                     }
                     merged
                 } else if let Some(target) = joinpoints
@@ -5148,7 +5182,7 @@ impl CodeWriter {
                 // Supersede re-walks under widened framestate produce
                 // duplicate `Label("pcN")` + `-live-` pairs in ssarepr;
                 // `pc_anchor_positions` (first-wins) and
-                // `live_marker_indices_by_pc` (first-takes) keep the
+                // `live_marker_indices_by_pc` (last-takes) keep the
                 // original dead block's bytes canonical for `pcN`
                 // dispatch.
                 current_block = pending_block;
@@ -5229,6 +5263,77 @@ impl CodeWriter {
                     // breaks its merge run on PcAnchor so each PC keeps
                     // its own `-live-` marker.
                     depth_at_pc[py_pc] = current_depth;
+
+                    // jtransform.py:1708-1712 emits [op3, op1, op2]:
+                    //   op3 = -live- (for inlined short preambles)
+                    //   op1 = jit_merge_point
+                    //   op2 = -live- (for do_recursive_call / guard resume)
+                    // The per-PC emit_live_placeholder!() after this block
+                    // serves as op2; op3 is emitted inside the block below.
+                    // live_marker_indices_by_pc uses last-wins to resolve
+                    // to op2 so blackhole guard-failure resume lands past
+                    // the merge point.
+                    if loop_header_pcs.contains(&py_pc) {
+                        // jtransform.py:1710-1711 op3: -live- before
+                        // jit_merge_point, "for inlined short preambles".
+                        emit_live_placeholder!();
+                        if is_portal {
+                            let jdindex = portal_jd_index
+                                .expect("portal jit_merge_point requires a registered jitdriver");
+                            let scratch_pycode_reg =
+                                ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            let pycode_var = emit_vable_getfield_ref!(
+                                portal_frame_reg,
+                                scratch_pycode_reg,
+                                VABLE_CODE_FIELD_IDX
+                            )
+                            .expect(
+                                "portal jit_merge_point requires is_portal=true; \
+                             emit_vable_getfield_ref! must return a per-SpaceOp \
+                             Variable for the `pycode` green arg",
+                            );
+                            let graph_args = portal_jit_merge_point_graph_args(
+                                &graph, py_pc, pycode_var, jdindex,
+                            );
+                            let graph_op = emit_graph_op_void(
+                                &current_block.block(),
+                                "jit_merge_point",
+                                graph_args,
+                                py_pc as i64,
+                            );
+                            let pre_len = ssarepr.insns.len();
+                            GraphFlattener::new_with_constant_lowering(
+                            &mut ssarepr,
+                            |v: super::flow::Variable| {
+                                if v.id == frame_var.id {
+                                    Register::new(Kind::Ref, portal_frame_reg)
+                                } else if v.id == ec_var.id {
+                                    Register::new(Kind::Ref, portal_ec_reg)
+                                } else if v.id == pycode_var.id {
+                                    Register::new(Kind::Ref, scratch_pycode_reg)
+                                } else {
+                                    panic!(
+                                        "portal jit_merge_point: unexpected graph Variable {v:?} \
+                                     (only portal frame/ec/pycode expected)"
+                                    )
+                                }
+                            },
+                            |c: &super::flow::Constant| match (&c.value, c.kind) {
+                                (super::flow::ConstantValue::Signed(value), Some(Kind::Int)) => {
+                                    Operand::ConstInt(*value)
+                                }
+                                other => {
+                                    panic!("portal jit_merge_point: unexpected Constant {other:?}")
+                                }
+                            },
+                        )
+                        .serialize_op(&graph_op);
+                            for insn in ssarepr.insns[pre_len..].iter().cloned() {
+                                current_block.push_insn(insn);
+                            }
+                        }
+                    }
+
                     emit_live_placeholder!();
 
                     // Dead-code dispatch gate: `current_block` has already
@@ -5272,126 +5377,10 @@ impl CodeWriter {
                             )
                     };
                     if block_closed_by_terminator {
-                        // Advance `current_state.next_offset` to `py_pc + 1`
-                        // mirroring the line ~6927 update that runs at the
-                        // end of every dispatched op.  Without this, the
-                        // next PC's `emit_mark_label_pc!` first arm would
-                        // see `current_state.next_offset != py_pc` and
-                        // fire `mergeblock(currentblock=closed_block,
-                        // target=py_pc)`, appending an orphan
-                        // `(None,None)` exit on top of the terminator's
-                        // already-attached exit.
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
                             frame_blocks_for_offset(code, current_state.next_offset);
                         continue;
-                    }
-
-                    if loop_header_pcs.contains(&py_pc) {
-                        if is_portal {
-                            // interp_jit.py:64 portal contract:
-                            //   greens = ['next_instr', 'is_being_profiled', 'pycode']
-                            //   reds = ['frame', 'ec']
-                            //
-                            // Graph side: record the upstream-matched 7-arg
-                            // SpaceOperation per
-                            // `jtransform.py:1690-1712 handle_jit_marker__jit_merge_point`.
-                            // The graph carries the full
-                            // `[jd_index, 3 green ListOfKinds, 3 red ListOfKinds]`
-                            // shape, and `GraphFlattener::serialize_op`
-                            // lowers that same shape into SSARepr — the byte
-                            // side is no longer pyre's old 3-list shorthand.
-                            // Assembler / blackhole / backend (`assembler.rs:712`)
-                            // assert the canonical 7-arg form on the way out.
-                            //
-                            // pycode green arg: emit `getfield_vable_r frame,
-                            // PYCODE_FIELD_IDX → pycode_var` (graph dual-write
-                            // returns the per-SpaceOp Variable) and reference
-                            // that Variable from the `jit_merge_point` greens.
-                            // Matches `pypyjit/interp_jit.py:25 _virtualizable_=
-                            // ['..., 'pycode', ...]` + `:67-78 PyPyJitDriver
-                            // greens=['next_instr', 'is_being_profiled',
-                            // 'pycode']`: pycode is recovered from the live
-                            // frame at every merge point, not baked into the
-                            // per-CodeObject constants_r pool.
-                            //
-                            // PYFRAME_VABLE_FIELDS in `virtualizable_spec.rs`
-                            // enumerates the field indices (pycode is field 1
-                            // per `interp_jit.py:25-31`).
-                            let jdindex = portal_jd_index
-                                .expect("portal jit_merge_point requires a registered jitdriver");
-                            // RPython orthodox parity per
-                            // `pypyjit/interp_jit.py:67 reds=['frame','ec']` +
-                            // `interp_jit.py:25 _virtualizable_=['..., 'pycode',
-                            // ...]`: pycode is recovered from the live frame at
-                            // every merge point, so the trace key is the runtime
-                            // value rather than a build-time constant.
-                            let scratch_pycode_reg =
-                                ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            let pycode_var = emit_vable_getfield_ref!(
-                                portal_frame_reg,
-                                scratch_pycode_reg,
-                                VABLE_CODE_FIELD_IDX
-                            )
-                            .expect(
-                                "portal jit_merge_point requires is_portal=true; \
-                             emit_vable_getfield_ref! must return a per-SpaceOp \
-                             Variable for the `pycode` green arg",
-                            );
-                            let graph_args = portal_jit_merge_point_graph_args(
-                                &graph, py_pc, pycode_var, jdindex,
-                            );
-                            let graph_op = emit_graph_op_void(
-                                &current_block.block(),
-                                "jit_merge_point",
-                                graph_args,
-                                py_pc as i64,
-                            );
-                            // Task #227.3 capture-before/after-len so the
-                            // GraphFlattener-mediated push lands in both
-                            // `ssarepr.insns` AND `current_block`'s per-
-                            // block accumulator.
-                            let pre_len = ssarepr.insns.len();
-                            GraphFlattener::new_with_constant_lowering(
-                            &mut ssarepr,
-                            |v: super::flow::Variable| {
-                                if v.id == frame_var.id {
-                                    Register::new(Kind::Ref, portal_frame_reg)
-                                } else if v.id == ec_var.id {
-                                    Register::new(Kind::Ref, portal_ec_reg)
-                                } else if v.id == pycode_var.id {
-                                    // `pypyjit/interp_jit.py:67-78` PyPyJitDriver
-                                    // `greens=[..., 'pycode']`: pycode is read
-                                    // from the live frame at every merge point,
-                                    // via the `getfield_vable_r frame,
-                                    // PYCODE_FIELD_IDX → scratch_pycode_reg`
-                                    // emit above.  The graph Variable produced
-                                    // by that dual-write maps to the same
-                                    // register slot here.
-                                    Register::new(Kind::Ref, scratch_pycode_reg)
-                                } else {
-                                    panic!(
-                                        "portal jit_merge_point: unexpected graph Variable {v:?} \
-                                     (only portal frame/ec/pycode expected)"
-                                    )
-                                }
-                            },
-                            |c: &super::flow::Constant| match (&c.value, c.kind) {
-                                (super::flow::ConstantValue::Signed(value), Some(Kind::Int)) => {
-                                    Operand::ConstInt(*value)
-                                }
-                                other => {
-                                    panic!("portal jit_merge_point: unexpected Constant {other:?}")
-                                }
-                            },
-                        )
-                        .serialize_op(&graph_op);
-                            // Task #227.3 mirror GraphFlattener-mediated
-                            // jit_merge_point emit into per-block accumulator.
-                            for insn in ssarepr.insns[pre_len..].iter().cloned() {
-                                current_block.push_insn(insn);
-                            }
-                        }
                     }
 
                     let code_unit = code.instructions[py_pc];
@@ -10761,6 +10750,31 @@ mod tests {
         // Per-PC `-live-` boundaries: live(R0) at index 1,
         // live(R1) at index 3.
         assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 3]);
+    }
+
+    #[test]
+    fn live_marker_indices_by_pc_last_wins_for_two_live_per_anchor() {
+        // jtransform.py:1708-1712 emits two -live- around jit_merge_point:
+        //   op3 (-live-) → op1 (jit_merge_point) → op2 (-live-)
+        // last-wins must resolve to op2 so blackhole resume lands past jmp.
+        let mut ssarepr = SSARepr::new("t");
+        // PC 0: single -live- (no merge point)
+        ssarepr.insns.push(Insn::pc_anchor(0));
+        ssarepr
+            .insns
+            .push(Insn::live(vec![Operand::Register(Register::new(
+                Kind::Ref,
+                0,
+            ))]));
+        // PC 1: two -live- (merge point PC) — op3 at idx 3, op2 at idx 5
+        ssarepr.insns.push(Insn::pc_anchor(1));
+        ssarepr.insns.push(Insn::live(vec![])); // op3 (before jmp)
+        ssarepr
+            .insns
+            .push(Insn::op("jit_merge_point", vec![Operand::ConstInt(0)]));
+        ssarepr.insns.push(Insn::live(vec![])); // op2 (after jmp)
+
+        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 5]);
     }
 
     #[test]
