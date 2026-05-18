@@ -725,6 +725,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         description="pyre pre-merge check: correctness + regression guard + comparison",
+        allow_abbrev=False,
     )
     parser.add_argument("--backend", choices=["dynasm", "cranelift"], default="")
     parser.add_argument("--timeout-scale", type=float, default=1.0)
@@ -739,9 +740,9 @@ def parse_args():
         help="also run cpython on benchmarks without a vs_cpython gate (comparison only)",
     )
     parser.add_argument(
-        "--synthetic",
+        "--no-synthetic",
         action="store_true",
-        help="also run pyre/bench/synth feature-parity benchmarks",
+        help="skip pyre/bench/synth feature-parity benchmarks",
     )
     parser.add_argument(
         "--synthetic-only",
@@ -751,7 +752,7 @@ def parse_args():
     parser.add_argument(
         "--synthetic-pattern",
         default="*.py",
-        help="glob pattern under pyre/bench/synth for --synthetic runs",
+        help="glob pattern under pyre/bench/synth for synthetic runs",
     )
     parser.add_argument(
         "--synthetic-timeout",
@@ -765,8 +766,8 @@ def parse_args():
     if args.pyre_path and not args.backend:
         parser.error("[path/to/pyre] requires --backend when running a single binary")
 
-    if args.synthetic_only:
-        args.synthetic = True
+    if args.synthetic_only and args.no_synthetic:
+        parser.error("--synthetic-only cannot be combined with --no-synthetic")
 
     if args.snapshot_mode == "record" and args.threshold is not None:
         print("NOTE: --threshold ignored in --snapshot record mode")
@@ -821,7 +822,7 @@ def main():
         chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
         chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       10,      None,    10,      None)
 
-    if args.synthetic:
+    if not args.no_synthetic:
         print()
         chk.run_synthetic_suite()
 
