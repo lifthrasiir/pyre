@@ -639,17 +639,6 @@ unsafe fn try_instance_binop(a: PyObjectRef, b: PyObjectRef, dunder: &str) -> Op
                 Err(e) => return Some(Err(e)),
             }
         }
-        // Also check per-instance attributes (ATTR_TABLE)
-        if let Ok(method) = getattr(a, dunder) {
-            match crate::call::call_function_impl_result(method, &[a, b]) {
-                Ok(result) => {
-                    if !is_not_implemented(result) {
-                        return Some(Ok(result));
-                    }
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
     }
 
     // Reverse: b.__rop__(a) — only if not already tried above
