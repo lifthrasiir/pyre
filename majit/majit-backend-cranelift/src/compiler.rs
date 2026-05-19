@@ -1185,9 +1185,15 @@ fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
     CRANELIFT_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
-        *guard = gc;
-        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+        // Publish the new raw pointer before dropping the previous
+        // allocator: `drop(old)` can reenter `gc_owns_object_via_active_runtime`
+        // via root walkers, and the reentrant path would otherwise read
+        // a raw pointer to freed memory.
+        let mut next = gc;
+        let raw = next.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
         CRANELIFT_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+        let old = std::mem::replace(&mut *guard, next);
+        drop(old);
     });
 }
 
@@ -12350,6 +12356,10 @@ impl Drop for CraneliftBackend {
         // active allocator so a subsequent backend is free to install
         // its own; matching dynasm's
         // `runner.rs DYNASM_ACTIVE_GC` reset on backend teardown.
+        // Clear the raw mirror before the boxed allocator so reentrant
+        // `gc_owns_object_via_active_runtime` cannot read a stale
+        // pointer during the boxed `drop`.
+        let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
         let _ = CRANELIFT_ACTIVE_GC.try_with(|cell| {
             *cell.borrow_mut() = None;
         });

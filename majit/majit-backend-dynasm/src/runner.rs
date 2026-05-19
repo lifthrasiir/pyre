@@ -108,6 +108,20 @@ fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> 
     })
 }
 
+/// Clear both `DYNASM_ACTIVE_GC` and `DYNASM_ACTIVE_GC_RAW`. Callers
+/// that want to drop the active dynasm GC must go through this helper
+/// rather than mutating `DYNASM_ACTIVE_GC` directly, otherwise the raw
+/// mirror used by `dynasm_gc_owns_object`'s reentrant fallback would be
+/// left pointing at freed memory.
+pub fn clear_gc_allocator() {
+    // Clear the raw mirror first so any reentry during the boxed drop
+    // sees `None` instead of a stale pointer.
+    DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+    DYNASM_ACTIVE_GC.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
 /// TYPE_INFO / CLASSTYPE constants read by the dynasm assemblers for
 /// `GUARD_IS_OBJECT` and `GUARD_SUBCLASS`.
 ///
@@ -1056,11 +1070,17 @@ impl DynasmBackend {
         let supports_guard_gc_type = gc.supports_guard_gc_type();
         DYNASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
-            *guard = Some(gc);
-            let raw = guard
+            // Publish the new raw pointer before dropping the previous
+            // allocator: `drop(old)` can reenter `dynasm_gc_owns_object`
+            // via root walkers, and the reentrant path would otherwise
+            // read a raw pointer to freed memory.
+            let mut next: Option<Box<dyn majit_gc::GcAllocator>> = Some(gc);
+            let raw = next
                 .as_deref_mut()
                 .map(|gc| gc as *mut dyn majit_gc::GcAllocator);
             DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+            let old = std::mem::replace(&mut *guard, next);
+            drop(old);
         });
         majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
             check_is_object: Some(dynasm_check_is_object),

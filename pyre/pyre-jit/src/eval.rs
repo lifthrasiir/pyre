@@ -2462,6 +2462,17 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // bhimpl_recursive_call_* paths.
     frame.fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
+    // Mirror `eval_with_jit_inner`'s structural-region suppression so a
+    // recursive portal entry whose code contains `WITH_EXCEPT_START`
+    // keeps nested helper Python frames out of the JIT too. The current
+    // frame is already kept out of trace by `try_function_entry_jit` and
+    // `jit_merge_point_hook`'s `unsupported_jit_shape` check; the guard
+    // extends that to callees.
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let _suppression = match unsupported_jit_shape(code) {
+        UnsupportedJitShape::StructuralRegion => Some(JitSuppressionGuard::new()),
+        UnsupportedJitShape::None | UnsupportedJitShape::CurrentFrameOnly => None,
+    };
     portal_runner_dispatch(frame)
 }
 

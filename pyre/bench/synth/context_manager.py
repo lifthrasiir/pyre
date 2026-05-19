@@ -1,4 +1,4 @@
-N = 150000
+N = 75000
 
 
 class Accumulator:
