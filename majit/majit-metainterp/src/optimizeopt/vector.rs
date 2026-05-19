@@ -27,11 +27,11 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 // Re-exports: these types live in schedule.rs but are defined in vector.py
 // in RPython. Re-exporting preserves the public API surface.
-pub use crate::optimizeopt::dependency::{schedule_operations, Node};
+pub use crate::optimizeopt::dependency::{Node, schedule_operations};
 pub use crate::optimizeopt::schedule::{
-    are_adjacent_memory_refs, isomorphic, turn_into_vector, unpack_from_vector, AccumEntry,
-    AccumPack, CostModel, GenericCostModel, GuardAnalysis, NotAProfitableLoop,
-    NotAVectorizeableLoop, Pack, PackSet, VecScheduleState,
+    AccumEntry, AccumPack, CostModel, GenericCostModel, GuardAnalysis, NotAProfitableLoop,
+    NotAVectorizeableLoop, Pack, PackSet, VecScheduleState, are_adjacent_memory_refs, isomorphic,
+    turn_into_vector, unpack_from_vector,
 };
 
 // ── vector.py:35-40: copy_resop ────────────────────────────────────────
@@ -221,8 +221,7 @@ pub fn optimize_vector(
 
     let result = (|| -> Result<Vec<Op>, NotAVectorizeableLoop> {
         // vector.py:142-143
-        let mut opt =
-            VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
+        let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_)
     })();
 
@@ -243,8 +242,9 @@ pub fn user_loop_bail_fast_path(loop_: &VectorLoop) -> bool {
     let mut _resop_count = 0;
     let mut _vector_instr = 0;
     let mut _guard_count = 0;
-    // vector.py:183: at_least_one_array_access = True  (RPython bug — always True)
-    let mut at_least_one_array_access = false;
+    // vector.py:183: at_least_one_array_access = True  (RPython bug — always True,
+    // because line 194 only ever re-assigns True.  Match upstream literal.)
+    let mut at_least_one_array_access = true;
 
     for op in &loop_.operations {
         // vector.py:185-186: skip jit debug ops
@@ -309,7 +309,6 @@ pub struct VectorizingOptimizer {
     // ── Rust Optimization trait fields (PRE-EXISTING-ADAPTATION) ──
     // These support the sub-pass integration path where VectorizingOptimizer
     // is used inside an Optimizer pipeline via the Optimization trait.
-
     /// Buffered loop body ops (populated by propagate_forward).
     body_ops: Vec<Op>,
     /// Whether we're inside a Label..Jump loop body.
@@ -390,8 +389,10 @@ impl VectorizingOptimizer {
         if let Some(graph) = self.analyse_index_calculations(loop_, &constant_of) {
             let schedule = schedule_operations(&graph);
             if schedule.len() == loop_.operations.len() {
-                let scheduled: Vec<Op> =
-                    schedule.iter().map(|&i| loop_.operations[i].clone()).collect();
+                let scheduled: Vec<Op> = schedule
+                    .iter()
+                    .map(|&i| loop_.operations[i].clone())
+                    .collect();
                 loop_.operations = scheduled;
             }
         }
@@ -521,7 +522,8 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (pi, group) in packset.packs.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -868,11 +870,7 @@ impl VectorizingOptimizer {
             }
         }
 
-        if one_valid {
-            Some(graph)
-        } else {
-            None
-        }
+        if one_valid { Some(graph) } else { None }
     }
 
     // ── vector.py:585-599: mark_guard ──────────────────────────────────
@@ -987,8 +985,12 @@ impl VectorizingOptimizer {
             sched_state.invariant_oplist.push(vec_create);
 
             let xor_op = sched_state.create_vec_op(
-                OpCode::VecIntXor, &[zero_vec, zero_vec],
-                datatype, bytesize, signed, count,
+                OpCode::VecIntXor,
+                &[zero_vec, zero_vec],
+                datatype,
+                bytesize,
+                signed,
+                count,
             );
             let zeroed_vec = xor_op.pos.get();
             sched_state.invariant_oplist.push(xor_op);
@@ -996,22 +998,31 @@ impl VectorizingOptimizer {
             let zero_const = OpRef::const_int(0);
             let one_const = OpRef::const_int(1);
             let pack_op = sched_state.create_vec_op(
-                OpCode::VecPackI, &[zeroed_vec, seed, zero_const, one_const],
-                datatype, bytesize, signed, count,
+                OpCode::VecPackI,
+                &[zeroed_vec, seed, zero_const, one_const],
+                datatype,
+                bytesize,
+                signed,
+                count,
             );
             let seed_vec = pack_op.pos.get();
             sched_state.invariant_oplist.push(pack_op);
 
             sched_state.accumulation.insert(
                 seed,
-                AccumEntry { seed, operator, accum_opcode: pack.scalar_opcode },
+                AccumEntry {
+                    seed,
+                    operator,
+                    accum_opcode: pack.scalar_opcode,
+                },
             );
             sched_state.setvector_of_box(seed, 0, seed_vec);
             sched_state.renamer.start_renaming(seed, seed_vec);
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
@@ -1358,7 +1369,8 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
+            op.pos
+                .set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
     }
 
@@ -1395,12 +1407,10 @@ mod tests {
     #[test]
     fn test_vector_loop_new() {
         let label = Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]);
-        let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
-            ),
-        ];
+        let ops = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+        )];
         let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
         let vloop = VectorLoop::new(label, ops, jump);
         assert_eq!(vloop.body_len(), 1);
@@ -1413,12 +1423,10 @@ mod tests {
     #[test]
     fn test_vector_loop_finaloplist() {
         let label = Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]);
-        let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
-            ),
-        ];
+        let ops = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+        )];
         let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
         let vloop = VectorLoop::new(label, ops, jump);
 
@@ -1433,16 +1441,16 @@ mod tests {
     #[test]
     fn test_user_loop_bail_fast_path_no_array() {
         let label = Op::new(OpCode::Label, &[OpRef::input_arg_int(100)]);
-        let ops = vec![
-            Op::new(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
-            ),
-        ];
+        let ops = vec![Op::new(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(100), OpRef::input_arg_int(101)],
+        )];
         let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
         let vloop = VectorLoop::new(label, ops, jump);
-        // No array access → bail
-        assert!(user_loop_bail_fast_path(&vloop));
+        // vector.py:183 initializes at_least_one_array_access = True and only
+        // re-assigns True, so the "no array access" branch is unreachable.
+        // Match upstream literal: no array access does NOT bail.
+        assert!(!user_loop_bail_fast_path(&vloop));
     }
 
     // ── Dependency graph tests ──

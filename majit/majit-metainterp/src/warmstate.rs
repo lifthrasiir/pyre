@@ -12,7 +12,7 @@ use majit_backend::JitCellToken;
 use majit_ir::{GreenKey, Type};
 use std::sync::Arc;
 
-use majit_trace::counter::{JitCounter, DEFAULT_SIZE};
+use majit_trace::counter::{DEFAULT_SIZE, JitCounter};
 use majit_trace::logger::Logger;
 
 use crate::recorder::Trace;
@@ -509,7 +509,8 @@ impl WarmEnterState {
                 return false;
             }
         }
-        self.counter.would_tick_fire(green_key_hash, self.increment_threshold)
+        self.counter
+            .would_tick_fire(green_key_hash, self.increment_threshold)
     }
 
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).

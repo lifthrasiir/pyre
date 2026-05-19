@@ -1206,7 +1206,6 @@ pub(crate) fn binary_builtin_type_error(
     ))
 }
 
-
 /// 3-arg `pow(a, b, c)` dispatch — pypy/objspace/descroperation.py:399
 /// `def pow(space, w_obj1, w_obj2, w_obj3)`. Tries the int/long modulus
 /// fast path, then forward `__pow__` and reverse `__rpow__` with the
@@ -1330,7 +1329,6 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 }
 
 /// Left shift dispatch (`<<` operator).
-
 
 pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let a = unwrap_cell(a);
@@ -1572,7 +1570,6 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 /// Comparison operation dispatch.
-
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     let a = unwrap_cell(a);
@@ -2172,5 +2169,4 @@ mod tests {
             );
         }
     }
-
 }

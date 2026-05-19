@@ -1,9 +1,9 @@
 //! pypy/objspace/std/formatting.py — printf-style string formatting.
 #![allow(non_camel_case_types, non_snake_case)]
 
-use pyre_object::*;
-use crate::{PyError, PyErrorKind, PyResult};
 use crate::objspace::descroperation::{int_value, is_int_like};
+use crate::{PyError, PyErrorKind, PyResult};
+use pyre_object::*;
 
 /// `str % args` — printf-style string formatting.
 /// PyPy: unicodeobject.py mod__String_ANY → formatting.py

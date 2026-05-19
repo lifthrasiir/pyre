@@ -89,9 +89,8 @@ impl JitCounter {
     /// counter.py:142-153 fetch_next_hash
     pub fn fetch_next_hash(&mut self) -> u64 {
         let result = self._nexthash;
-        self._nexthash = result.wrapping_add(
-            1 | (1u64 << self.shift) | (1u64 << (self.shift - 16)),
-        );
+        self._nexthash =
+            result.wrapping_add(1 | (1u64 << self.shift) | (1u64 << (self.shift - 16)));
         result
     }
 

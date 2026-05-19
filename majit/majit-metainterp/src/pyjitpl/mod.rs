@@ -6238,7 +6238,9 @@ impl<M: Clone> MetaInterp<M> {
         // PRE-EXISTING-ADAPTATION: jitdriver_sd.vec is not yet wired;
         // cpu.vector_ext is always SSE on x86_64. We gate on vec_all only.
         let optimized_ops = if self.warm_state.vec_all() {
-            use crate::optimizeopt::vector::{optimize_vector, user_loop_bail_fast_path, VectorLoop};
+            use crate::optimizeopt::vector::{
+                VectorLoop, optimize_vector, user_loop_bail_fast_path,
+            };
             if let Some(mut vloop) = VectorLoop::from_trace(&optimized_ops) {
                 if !user_loop_bail_fast_path(&vloop) {
                     let vec_cost = self.warm_state.vec_cost() as i32;
@@ -6252,7 +6254,10 @@ impl<M: Clone> MetaInterp<M> {
                         }
                         Err(err) => {
                             if crate::majit_log_enabled() {
-                                eprintln!("[jit] vectorization failed for key={}: {:?}", green_key, err);
+                                eprintln!(
+                                    "[jit] vectorization failed for key={}: {:?}",
+                                    green_key, err
+                                );
                             }
                             optimized_ops
                         }

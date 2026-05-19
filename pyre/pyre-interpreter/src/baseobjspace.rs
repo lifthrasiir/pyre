@@ -27,7 +27,6 @@ use pyre_object::*;
 pub use crate::objspace::descroperation::*;
 pub(crate) use crate::objspace::std::formatting::{format_g_like, normalise_exponent};
 
-
 /// Compatibility alias for PyPy's base-object type.
 /// PyPy frequently models interpreter values as subclasses of `W_Root`.
 pub type W_Root = PyObjectRef;
