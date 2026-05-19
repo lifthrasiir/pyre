@@ -1185,15 +1185,19 @@ fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R
 fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
     CRANELIFT_ACTIVE_GC.with(|cell| {
         let mut guard = cell.borrow_mut();
-        // Publish the new raw pointer before dropping the previous
-        // allocator: `drop(old)` can reenter `gc_owns_object_via_active_runtime`
-        // via root walkers, and the reentrant path would otherwise read
-        // a raw pointer to freed memory.
-        let mut next = gc;
-        let raw = next.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+        // Drop the previous allocator first so reentrant
+        // `is_managed_heap_object` queries from its drop body still
+        // resolve old-heap addresses through the raw mirror — it keeps
+        // pointing at the live old box throughout the drop body.
+        // Publishing the new raw pointer before the drop would route
+        // those queries to the new allocator, which does not know
+        // about old-heap addresses and would report them as
+        // unmanaged. After the drop returns no further reentry is
+        // possible on this thread before the raw mirror is republished
+        // synchronously below.
+        *guard = gc;
+        let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
         CRANELIFT_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-        let old = std::mem::replace(&mut *guard, next);
-        drop(old);
     });
 }
 
@@ -12356,13 +12360,14 @@ impl Drop for CraneliftBackend {
         // active allocator so a subsequent backend is free to install
         // its own; matching dynasm's
         // `runner.rs DYNASM_ACTIVE_GC` reset on backend teardown.
-        // Clear the raw mirror before the boxed allocator so reentrant
-        // `gc_owns_object_via_active_runtime` cannot read a stale
-        // pointer during the boxed `drop`.
-        let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
+        // Drop the boxed allocator first so reentrant
+        // `gc_owns_object_via_active_runtime` queries from its drop
+        // body still resolve old-heap addresses through the raw
+        // mirror, then clear the raw mirror.
         let _ = CRANELIFT_ACTIVE_GC.try_with(|cell| {
             *cell.borrow_mut() = None;
         });
+        let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
         let _ = CRANELIFT_JITFRAME_TYPE_ID.try_with(|c| c.set(None));
     }
 }

@@ -114,12 +114,14 @@ fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> 
 /// mirror used by `dynasm_gc_owns_object`'s reentrant fallback would be
 /// left pointing at freed memory.
 pub fn clear_gc_allocator() {
-    // Clear the raw mirror first so any reentry during the boxed drop
-    // sees `None` instead of a stale pointer.
-    DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+    // Drop the boxed allocator first so reentrant
+    // `dynasm_gc_owns_object` queries from its drop body still resolve
+    // old-heap addresses through the raw mirror, then clear the raw
+    // mirror.
     DYNASM_ACTIVE_GC.with(|cell| {
         *cell.borrow_mut() = None;
     });
+    DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
 }
 
 /// TYPE_INFO / CLASSTYPE constants read by the dynasm assemblers for
@@ -1070,17 +1072,20 @@ impl DynasmBackend {
         let supports_guard_gc_type = gc.supports_guard_gc_type();
         DYNASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
-            // Publish the new raw pointer before dropping the previous
-            // allocator: `drop(old)` can reenter `dynasm_gc_owns_object`
-            // via root walkers, and the reentrant path would otherwise
-            // read a raw pointer to freed memory.
-            let mut next: Option<Box<dyn majit_gc::GcAllocator>> = Some(gc);
-            let raw = next
+            // Drop the previous allocator first so reentrant
+            // `dynasm_gc_owns_object` queries from its drop body still
+            // resolve old-heap addresses through the raw mirror — it
+            // keeps pointing at the live old box throughout the drop
+            // body. Publishing the new raw pointer before the drop
+            // would route those queries to the new allocator, which
+            // does not know about old-heap addresses. After the drop
+            // returns no further reentry is possible on this thread
+            // before the raw mirror is republished synchronously below.
+            *guard = Some(gc);
+            let raw = guard
                 .as_deref_mut()
                 .map(|gc| gc as *mut dyn majit_gc::GcAllocator);
             DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
-            let old = std::mem::replace(&mut *guard, next);
-            drop(old);
         });
         majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
             check_is_object: Some(dynasm_check_is_object),
