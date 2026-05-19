@@ -1,15 +1,15 @@
 ---
 name: merge
-description: Plan and execute a safe merge of the current working branch into main by accumulating only green-test changes onto a separate `<branch>-merge` branch. Invoked via `/merge`. Use this skill whenever the user asks to "merge", "land", "prepare for merge", "cherry-pick safely", or any equivalent request to move work from a long-running branch toward main. The skill enforces the house policy that `pyre/check.sh` must be all green, and it prefers line-level imports over whole-commit cherry-picks (bare `git cherry-pick` is only safe for trivially conflict-free, self-contained commits). Default to using this skill any time the user hints at moving work from a long-running branch toward main, even without explicit keywords.
+description: Plan and execute a safe merge of the current working branch into main by accumulating only green-test changes onto a separate `<branch>-merge` branch. Invoked via `/merge`. Use this skill whenever the user asks to "merge", "land", "prepare for merge", "cherry-pick safely", or any equivalent request to move work from a long-running branch toward main. The skill enforces the house policy that `pyre/check.py` must be all green, and it prefers line-level imports over whole-commit cherry-picks (bare `git cherry-pick` is only safe for trivially conflict-free, self-contained commits). Default to using this skill any time the user hints at moving work from a long-running branch toward main, even without explicit keywords.
 ---
 
 # Safe Merge via `-merge` Branch
 
 ## Why this skill exists
 
-The working branch has accumulated many commits; some of them break `pyre/check.sh`. House policy is:
+The working branch has accumulated many commits; some of them break `pyre/check.py`. House policy is:
 
-**`pyre/check.sh` must be all green — no exceptions — before anything lands on main.**
+**`pyre/check.py` must be all green — no exceptions — before anything lands on main.**
 
 Cherry-picking by commit almost always breaks the build because commits depend on each other and on intermediate states that never made it through review. So we never move whole commits. We move **code**, one small slice at a time, and run the tests after each slice.
 
@@ -44,7 +44,7 @@ If `<MERGE>` does **not** exist:
 
 If `<MERGE>` already exists:
 - Verify it is a descendant of (or equal to) `main`. If not, surface the divergence and ask the user whether to reset it to `main` or continue from its current tip.
-- Check whether `pyre/check.sh` passes on `<MERGE>` before adding anything.
+- Check whether `pyre/check.py` passes on `<MERGE>` before adding anything.
 
 State the plan concisely before moving code: which branch is source, which is destination, and what the user wants to land first.
 
@@ -88,10 +88,10 @@ Safe slicing procedure (line-by-line path):
 
 ## Step 4 — Test every slice
 
-Run `pyre/check.sh` after every slice, no matter how small. This is non-negotiable — the whole point of the `-merge` branch is that it is always green.
+Run `python ./pyre/check.py` after every slice, no matter how small. This is non-negotiable — the whole point of the `-merge` branch is that it is always green.
 
 ```bash
-./pyre/check.sh
+python ./pyre/check.py
 ```
 
 Outcomes:
@@ -106,7 +106,7 @@ Never "commit and fix later". `<MERGE>` must stay green at every commit.
 
 ## Step 5 — Commit on success
 
-When `pyre/check.sh` is green, commit with a factual message (CLAUDE.md convention — no speculation about goals, no `Co-Authored-By`, English only):
+When `pyre/check.py` is green, commit with a factual message (CLAUDE.md convention — no speculation about goals, no `Co-Authored-By`, English only):
 
 ```bash
 git add <files>
@@ -135,7 +135,7 @@ When the user decides to stop (either the diff is empty or the remaining work is
 ## Hard rules (recap)
 
 - Prefer line-by-line slices. `git cherry-pick` is allowed only for trivially conflict-free, self-contained commits that have been inspected hunk-by-hunk.
-- Never commit on `<MERGE>` without a green `pyre/check.sh` immediately before.
+- Never commit on `<MERGE>` without a green `pyre/check.py` immediately before.
 - Never modify `WORK` from this skill — it is read-only here.
 - Never push `<MERGE>` or open a PR without explicit user instruction.
 - Always commit after each green test — do not batch multiple slices into one commit, because a later red test cannot be bisected if slices are batched.

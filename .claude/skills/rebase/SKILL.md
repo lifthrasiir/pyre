@@ -121,12 +121,12 @@ git rebase --abort     # returns to pre-rebase state; no work lost
 After the rebase completes:
 
 1. `git log main..HEAD --oneline` — confirm the commit list is what was expected, and that the history is linear on top of `main`.
-2. `./pyre/check.sh` — end-to-end verification. A clean compile does not prove the resolutions were correct; runtime tests do.
+2. `python ./pyre/check.py` — end-to-end verification. A clean compile does not prove the resolutions were correct; runtime tests do.
 3. `cargo test --all` on touched crates if the rebase was large.
 4. Report to the user:
    - Number of conflicts resolved.
    - For each non-trivial resolution: file:line on our side, file:line upstream consulted, one-sentence justification.
-   - Whether `pyre/check.sh` is green.
+   - Whether `pyre/check.py` is green.
 
 Do **not** push, merge, or force-push unless the user explicitly asks. CLAUDE.md rule.
 
@@ -143,5 +143,5 @@ Do **not** push, merge, or force-push unless the user explicitly asks. CLAUDE.md
 ## Interaction with other skills
 
 - **`/parity`** — defines "RPython-orthodox" in detail (mechanical upstream path lookup, NEW-DEVIATION signals, structural vs functional parity). Read its body when a conflict requires judging orthodoxy and the summary above is insufficient.
-- **`/merge`** — separate workflow. `/merge` accumulates green slices on a `<branch>-merge` branch starting from `main`; `/rebase` rewrites the current branch on top of `main` in place. They are not interchangeable. Use `/rebase` when the goal is "my branch should be linear on top of current main"; use `/merge` when the goal is "I need a staging branch where `pyre/check.sh` is always green".
+- **`/merge`** — separate workflow. `/merge` accumulates green slices on a `<branch>-merge` branch starting from `main`; `/rebase` rewrites the current branch on top of `main` in place. They are not interchangeable. Use `/rebase` when the goal is "my branch should be linear on top of current main"; use `/merge` when the goal is "I need a staging branch where `pyre/check.py` is always green".
 - **`/commit`** — the commit convention (factual English, no `Co-Authored-By`, no "improves X" speculation) applies to any commits this skill creates during Step 1 prep.
