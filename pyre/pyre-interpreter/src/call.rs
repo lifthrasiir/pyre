@@ -2007,6 +2007,9 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1254: copy_flags_from_bases — inherit hasdict/weakrefable
         copy_flags_from_bases(w_type, w_bases);
 
+        // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
+        pyre_object::typeobject::inherit_flag_map_or_seq(w_type, w_bases);
+
         // typeobject.py:1146: base_layout = w_bestbase.layout
         let base_layout = if w_bestbase.is_null() {
             std::ptr::null()

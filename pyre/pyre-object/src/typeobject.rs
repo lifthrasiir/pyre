@@ -24,8 +24,12 @@ pub struct Layout {
     /// typeobject.py:116 — parent layout (identity comparison).
     pub base_layout: *const Layout,
     /// typedef.py:43 — `acceptable_as_base_class = '__new__' in rawdict`.
-    /// Stored on Layout (≈ TypeDef level) so the check goes through
-    /// w_bestbase.layout, not the type object itself.
+    /// PRE-EXISTING-ADAPTATION: in RPython this lives on TypeDef, accessed
+    /// via `layout.typedef.acceptable_as_base_class`. Stored on Layout
+    /// here because Rust has no TypeDef struct yet — Layout.typedef is
+    /// `*const PyType` (≈ CLASSTYPE), and many types share INSTANCE_TYPE
+    /// but need different acceptable_as_base_class values.
+    /// Convergence: introduce a Rust TypeDef struct, move this field there.
     pub acceptable_as_base_class: bool,
 }
 
@@ -168,7 +172,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(bases);
 
-    let w_self = crate::lltype::malloc_typed(W_TypeObject {
+    crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
@@ -181,26 +185,15 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-        // typeobject.py:216 default — inheritance walk below may
-        // overwrite from a non-`?` base.
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
-    }) as PyObjectRef;
-    // typeobject.py:1493-1496 — `for w_base in w_self.bases_w: if
-    // w_self.flag_map_or_seq == '?': w_self.flag_map_or_seq =
-    // w_base.flag_map_or_seq`.  Heap-type construction inherits the
-    // marker from the first non-`?` base so user-defined dict / list
-    // / tuple subclasses see PyPy's `M` / `S` flag.
-    unsafe { inherit_flag_map_or_seq(w_self, bases) };
-    w_self
+    }) as PyObjectRef
 }
 
-/// typeobject.py:1493-1496 — copy `flag_map_or_seq` from the first
-/// W_TypeObject base whose flag is non-`?`.  No-op if self's flag is
-/// already non-`?` (explicit value wins) or if no base has a non-`?`
-/// flag.
-unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
+/// typeobject.py:1507-1508 in setup_user_defined_type — copy
+/// `flag_map_or_seq` from the first base whose flag is non-`?`.
+pub unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
     if w_self.is_null() || bases.is_null() {
         return;
     }
@@ -217,7 +210,7 @@ unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
         let Some(w_base) = crate::w_tuple_getitem(bases, i) else {
             continue;
         };
-        if w_base.is_null() || !is_w_type(w_base) {
+        if w_base.is_null() || !is_type(w_base) {
             continue;
         }
         let base_ref = &*(w_base as *const W_TypeObject);
@@ -231,16 +224,6 @@ unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
             return;
         }
     }
-}
-
-/// Identity test mirroring `pyre_object::is_type` (the user-facing
-/// helper in `pyobject.rs`).  Inlined here to avoid a circular module
-/// dependency.
-unsafe fn is_w_type(obj: PyObjectRef) -> bool {
-    if obj.is_null() {
-        return false;
-    }
-    std::ptr::eq((*obj).ob_type, &TYPE_TYPE as *const PyType)
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = false`.
@@ -299,7 +282,7 @@ pub const COMPARES_BY_IDENTITY_NO: u8 = 2;
 /// # Safety
 /// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
 pub unsafe fn w_type_compares_by_identity_status(w_type: PyObjectRef) -> u8 {
-    if w_type.is_null() || !is_w_type(w_type) {
+    if w_type.is_null() || !is_type(w_type) {
         return COMPARES_BY_IDENTITY_NO;
     }
     let t = &*(w_type as *const W_TypeObject);
@@ -313,7 +296,7 @@ pub unsafe fn w_type_compares_by_identity_status(w_type: PyObjectRef) -> u8 {
 /// Same as the reader; called by pyre-interpreter's lookup after
 /// resolving `__eq__` / `__hash__`.
 pub unsafe fn w_type_set_compares_by_identity_status(w_type: PyObjectRef, status: u8) {
-    if w_type.is_null() || !is_w_type(w_type) {
+    if w_type.is_null() || !is_type(w_type) {
         return;
     }
     let t = &*(w_type as *const W_TypeObject);
@@ -325,7 +308,7 @@ pub unsafe fn w_type_set_compares_by_identity_status(w_type: PyObjectRef, status
 /// Returns `'?'` if `w_type` is null, not a type object, or never had
 /// the marker assigned.
 pub unsafe fn w_type_get_flag_map_or_seq(w_type: PyObjectRef) -> u8 {
-    if w_type.is_null() || !is_w_type(w_type) {
+    if w_type.is_null() || !is_type(w_type) {
         return b'?';
     }
     let t = &*(w_type as *const W_TypeObject);
@@ -336,7 +319,7 @@ pub unsafe fn w_type_get_flag_map_or_seq(w_type: PyObjectRef) -> u8 {
 /// `init_typeobjects` to mark dict / list / tuple W_TypeObjects at
 /// registration time (objspace.py:104-108).
 pub unsafe fn w_type_set_flag_map_or_seq(w_type: PyObjectRef, flag: u8) {
-    if w_type.is_null() || !is_w_type(w_type) {
+    if w_type.is_null() || !is_type(w_type) {
         return;
     }
     let t = &*(w_type as *const W_TypeObject);
@@ -379,11 +362,6 @@ pub unsafe fn w_type_get_nslots(obj: PyObjectRef) -> u32 {
     }
 }
 
-/// Backward-compat: set nslots on the Layout (creates a new Layout if needed).
-pub unsafe fn w_type_set_nslots(_obj: PyObjectRef, _n: u32) {
-    // No-op: nslots is set via Layout construction in create_all_slots.
-}
-
 /// Get newslotnames from the Layout.
 pub unsafe fn w_type_get_newslotnames(obj: PyObjectRef) -> &'static [String] {
     let layout = (*(obj as *const W_TypeObject)).layout;
@@ -392,11 +370,6 @@ pub unsafe fn w_type_get_newslotnames(obj: PyObjectRef) -> &'static [String] {
     } else {
         &(*layout).newslotnames
     }
-}
-
-/// Backward-compat alias.
-pub unsafe fn w_type_set_newslotnames(_obj: PyObjectRef, _names: Vec<String>) {
-    // No-op: newslotnames set via Layout construction.
 }
 
 /// Get base_layout pointer for identity comparison.
@@ -498,9 +471,6 @@ pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
     (*(obj as *mut W_TypeObject)).layout = new_layout;
 }
 
-// Backward-compat no-ops for removed direct field setters.
-pub unsafe fn w_type_set_base_layout(_obj: PyObjectRef, _base: PyObjectRef) {}
-
 // ── Subclass tree (typeobject.py:640-689) ────────────────────────────
 
 /// `typeobject.py:640-662 W_TypeObject.add_subclass`.
@@ -522,7 +492,7 @@ pub unsafe fn w_type_add_subclass(w_parent: PyObjectRef, w_subclass: PyObjectRef
     if w_parent.is_null() || w_subclass.is_null() {
         return;
     }
-    if !is_w_type(w_parent) || !is_w_type(w_subclass) {
+    if !is_type(w_parent) || !is_type(w_subclass) {
         return;
     }
     let parent = &mut *(w_parent as *mut W_TypeObject);
@@ -560,7 +530,7 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
     if w_parent.is_null() || w_subclass.is_null() {
         return;
     }
-    if !is_w_type(w_parent) {
+    if !is_type(w_parent) {
         return;
     }
     let parent = &mut *(w_parent as *mut W_TypeObject);
@@ -593,7 +563,7 @@ pub unsafe fn w_type_remove_subclass(w_parent: PyObjectRef, w_subclass: PyObject
 /// # Safety
 /// `w_parent` must point at a valid `W_TypeObject`.
 pub unsafe fn w_type_get_subclasses(w_parent: PyObjectRef) -> Vec<PyObjectRef> {
-    if w_parent.is_null() || !is_w_type(w_parent) {
+    if w_parent.is_null() || !is_type(w_parent) {
         return Vec::new();
     }
     let parent = &*(w_parent as *const W_TypeObject);
@@ -621,7 +591,7 @@ pub unsafe fn w_type_get_subclasses(w_parent: PyObjectRef) -> Vec<PyObjectRef> {
 /// # Safety
 /// `w_self.bases` must be a valid tuple (or `PY_NULL`).
 pub unsafe fn w_type_ready(w_self: PyObjectRef) {
-    if w_self.is_null() || !is_w_type(w_self) {
+    if w_self.is_null() || !is_type(w_self) {
         return;
     }
     let bases = (*(w_self as *const W_TypeObject)).bases;
@@ -633,7 +603,7 @@ pub unsafe fn w_type_ready(w_self: PyObjectRef) {
         let Some(w_base) = crate::w_tuple_getitem(bases, i) else {
             continue;
         };
-        if w_base.is_null() || !is_w_type(w_base) {
+        if w_base.is_null() || !is_type(w_base) {
             continue;
         }
         w_type_add_subclass(w_base, w_self);
