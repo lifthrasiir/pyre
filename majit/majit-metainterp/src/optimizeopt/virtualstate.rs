@@ -2540,7 +2540,7 @@ fn export_single_value(
     // each cycle entry allocates its own Rc.
     //
     // Verified 2026-04-10: this branch fires zero times across all 10
-    // benchmarks in pyre/check.sh (int_loop, float_loop, fib_loop,
+    // benchmarks in pyre/check.py (int_loop, float_loop, fib_loop,
     // fib_recursive, nested_loop, nbody, fannkuch, raise_catch_loop,
     // spectral_norm, inline_helper). The cyclic-virtual-graph regression
     // (RPython parity gap documented above) is therefore latent — no

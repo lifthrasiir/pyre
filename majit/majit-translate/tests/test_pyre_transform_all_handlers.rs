@@ -32,7 +32,7 @@
 //! special cases, which is the structural claim of the epic.
 //!
 //! The test is READ-ONLY against `pyre-interpreter/src/` and does not
-//! touch pyre-jit; baseline `./pyre/check.sh` 14/14 remains unaffected.
+//! touch pyre-jit; baseline `./pyre/check.py` 14/14 remains unaffected.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;

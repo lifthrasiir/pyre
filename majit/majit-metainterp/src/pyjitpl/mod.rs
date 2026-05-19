@@ -12919,7 +12919,7 @@ impl<M: Clone> MetaInterp<M> {
         // to NULL on the bh_call_r side. `warmspot.py:1010-1012` populates this
         // before any do_recursive_call can fire; `debug_assert!` catches a
         // mis-wired registration in dev/test builds (the bench harness runs in
-        // dev so violations surface via `pyre/check.sh`).
+        // dev so violations surface via `pyre/check.py`).
         debug_assert!(
             targetjitdriver_sd.portal_runner_adr != 0,
             "do_recursive_call: targetjitdriver_sd.portal_runner_adr is 0 — \

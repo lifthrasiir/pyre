@@ -2719,7 +2719,7 @@ mod tests {
                 which now matches upstream `unixcheckpoint.py:13-16` (skip prompt) and \
                 falls through to `RealRuntime::fork`, forking the test runner. \
                 Re-enable once the driver accepts an injectable CheckpointRuntime; \
-                in production the contract still holds and is exercised by `pyre/check.sh`."]
+                in production the contract still holds and is exercised by `pyre/check.py`."]
     fn task_jittest_lltype_calls_unixcheckpoint_first() {
         // Upstream `:371-372`: `unixcheckpoint.restartable_point(auto='run')`
         // runs *before* the jittest module is imported. The local port

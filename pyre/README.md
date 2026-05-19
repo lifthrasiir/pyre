@@ -31,7 +31,7 @@ Measured on Apple M-series, single core:
 
 Integer-heavy benchmarks where the JIT fires still trail PyPy, but the gap is smaller there than on float-heavy or exception-heavy workloads. Float-heavy workloads (nbody, spectral_norm) and exception-heavy paths (raise_catch) run correctly but are not yet JIT-compiled — they fall back to the interpreter.
 
-Run `pyre/check.sh` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
+Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
 
 ## Installation
 

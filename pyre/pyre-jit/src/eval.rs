@@ -3462,7 +3462,7 @@ fn execute_assembler(
                             // triggers. Until then
                             // the bare `invalidate_loop` keeps the cell
                             // retraceable; the failure surfaces in
-                            // check.sh rather than being masked.
+                            // check.py rather than being masked.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} trace={} guard={} — invalidating",

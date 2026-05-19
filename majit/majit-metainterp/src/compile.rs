@@ -2326,7 +2326,7 @@ pub fn compile_tmp_callback(
     // never ran for this driver, so `funcbox` would dereference a null portal
     // address and the resulting tmp callback would jump to 0x0. `debug_assert!`
     // catches the misuse in dev/test builds (the bench harness runs in dev
-    // profile so violations surface in `pyre/check.sh`); release builds opt
+    // profile so violations surface in `pyre/check.py`); release builds opt
     // out for the same hot-path reason upstream avoids per-call asserts.
     debug_assert!(
         jitdriver_sd.portal_runner_adr != 0,

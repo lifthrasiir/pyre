@@ -150,5 +150,5 @@ pub fn expand_fast_op(instr: &Instruction, op_arg: OpArg) -> Option<([FastOp; 2]
 // `var_nums` field has an opaque auto-generated type. The shape
 // guarantee — that every super-instruction flattens to two plain
 // primitives in the documented order — is validated end-to-end by
-// the codewriter and liveness lockstep tests plus the `check.sh`
+// the codewriter and liveness lockstep tests plus the `check.py`
 // benchmark suite (`nbody.py`, `fannkuch.py`).

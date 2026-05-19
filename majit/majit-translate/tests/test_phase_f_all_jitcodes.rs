@@ -13,7 +13,7 @@
 //!   `AllJitCodes::in_order`. The test re-checks the surface invariant.
 //!
 //! The test is READ-ONLY against pyre-jit; no pyre-jit binary links
-//! against `generated` yet (Phase G), so baseline `./pyre/check.sh`
+//! against `generated` yet (Phase G), so baseline `./pyre/check.py`
 //! 14/14+14/14 is unaffected.
 
 use majit_translate::generated::all_jitcodes;
