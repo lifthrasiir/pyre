@@ -6250,7 +6250,12 @@ impl<M: Clone> MetaInterp<M> {
                             }
                             vloop.finaloplist(true)
                         }
-                        Err(_) => optimized_ops,
+                        Err(err) => {
+                            if crate::majit_log_enabled() {
+                                eprintln!("[jit] vectorization failed for key={}: {:?}", green_key, err);
+                            }
+                            optimized_ops
+                        }
                     }
                 } else {
                     optimized_ops

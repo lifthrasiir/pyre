@@ -1515,7 +1515,7 @@ impl WarmEnterState {
             "trace_eagerness" | "bridge_threshold" => {
                 self.set_param_trace_eagerness(DEFAULT_TRACE_EAGERNESS)
             }
-            "function_threshold" => self.function_threshold = DEFAULT_FUNCTION_THRESHOLD,
+            "function_threshold" => self.set_function_threshold(DEFAULT_FUNCTION_THRESHOLD),
             "max_inline_depth" => self.max_inline_depth = 10,
             "retrace_limit" => self.memory_manager.retrace_limit = DEFAULT_RETRACE_LIMIT,
             "max_retrace_guards" => self.memory_manager.max_retrace_guards = 15,

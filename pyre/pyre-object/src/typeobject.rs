@@ -194,7 +194,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
 /// typeobject.py:1507-1508 in setup_user_defined_type — copy
 /// `flag_map_or_seq` from the first base whose flag is non-`?`.
 pub unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
-    if w_self.is_null() || bases.is_null() {
+    if w_self.is_null() || bases.is_null() || !is_type(w_self) {
         return;
     }
     let self_ref = &*(w_self as *const W_TypeObject);

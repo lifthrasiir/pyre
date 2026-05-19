@@ -325,7 +325,10 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // Negative exponent → float result
         return Ok(w_float_new((va as f64).powf(vb as f64)));
     }
-    let vb = vb as u32;
+    let vb = match u32::try_from(vb) {
+        Ok(v) => v,
+        Err(_) => return Err(PyError::memory_error("exponent too large")),
+    };
     match va.checked_pow(vb) {
         Some(r) => Ok(w_int_new(r)),
         None => Ok(w_long_new(BigInt::from(va).pow(vb))),
@@ -339,7 +342,10 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let fb = as_float(b);
         return Ok(w_float_new(fa.powf(fb)));
     }
-    let exp = vb.to_u32().unwrap_or(u32::MAX);
+    let exp = match vb.to_u32() {
+        Some(v) => v,
+        None => return Err(PyError::memory_error("exponent too large")),
+    };
     Ok(bigint_result(as_bigint(a).pow(exp)))
 }
 
@@ -374,8 +380,11 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
-    let shift = vb.to_u32().unwrap_or(u32::MAX);
-    Ok(bigint_result(bigint_lshift(as_bigint(a), shift as usize)))
+    let shift = match vb.to_usize() {
+        Some(v) => v,
+        None => return Err(PyError::memory_error("shift count too large")),
+    };
+    Ok(bigint_result(bigint_lshift(as_bigint(a), shift)))
 }
 
 unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -383,8 +392,11 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
-    let shift = vb.to_u32().unwrap_or(u32::MAX);
-    Ok(bigint_result(bigint_rshift(as_bigint(a), shift as usize)))
+    let shift = match vb.to_usize() {
+        Some(v) => v,
+        None => return Err(PyError::memory_error("shift count too large")),
+    };
+    Ok(bigint_result(bigint_rshift(as_bigint(a), shift)))
 }
 
 // ── bool-as-int helpers ──────────────────────────────────────────────
@@ -1814,18 +1826,9 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // path is the one that succeeds for `set == d.keys()`.
         if let Some(a_type) = crate::typedef::r#type(a) {
             if let Some(method) = lookup_in_type_where(a_type, dunder) {
-                if !crate::is_function(method) {
-                    if let Ok(result) = crate::call::call_function_impl_result(method, &[a, b]) {
-                        if !is_not_implemented(result) {
-                            return Ok(result);
-                        }
-                    }
-                }
-                if crate::is_function(method) {
-                    if let Ok(result) = crate::call::call_function_impl_result(method, &[a, b]) {
-                        if !is_not_implemented(result) {
-                            return Ok(result);
-                        }
+                if let Ok(result) = crate::call::call_function_impl_result(method, &[a, b]) {
+                    if !is_not_implemented(result) {
+                        return Ok(result);
                     }
                 }
             }

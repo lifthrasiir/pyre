@@ -160,7 +160,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 }
             }
             if i >= bytes.len() {
-                break;
+                return Err(PyError::value_error("incomplete format"));
             }
             let spec = bytes[i] as char;
             i += 1;
@@ -439,8 +439,10 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 }
             }
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            let rest = std::str::from_utf8(&bytes[i..]).unwrap_or("\u{FFFD}");
+            let ch = rest.chars().next().unwrap_or('\u{FFFD}');
+            result.push(ch);
+            i += ch.len_utf8();
         }
     }
     // `formatting.py:572-580 checkconsumed` — surplus positional
@@ -485,7 +487,11 @@ pub(crate) fn format_g_like(abs: f64, prec: usize, upper: bool, alt_form: bool) 
         };
     }
     if !abs.is_finite() {
-        return format!("{abs}");
+        return if upper {
+            format!("{abs}").to_uppercase()
+        } else {
+            format!("{abs}")
+        };
     }
     let prec = prec.max(1);
     let exp = abs.log10().floor() as i32;
