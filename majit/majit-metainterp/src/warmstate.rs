@@ -12,7 +12,7 @@ use majit_backend::JitCellToken;
 use majit_ir::{GreenKey, Type};
 use std::sync::Arc;
 
-use majit_trace::counter::JitCounter;
+use majit_trace::counter::{JitCounter, DEFAULT_SIZE};
 use majit_trace::logger::Logger;
 
 use crate::recorder::Trace;
@@ -314,22 +314,23 @@ pub struct JitStats {
 pub struct WarmEnterState {
     /// counter.py JitCounter parity: single timetable shared by loop
     /// entry, guard failure, and function entry — each caller passes
-    /// a different threshold to tick_with_threshold().
+    /// a different pre-computed increment to tick(hash, increment).
     pub counter: JitCounter,
     /// Per-greenkey cells, keyed by the hash of the green key.
     cells: crate::optimizeopt::vec_assoc::VecAssoc<u64, BaseJitCell>,
     /// Compilation threshold (copied from counter for easy access).
     threshold: u32,
+    /// warmstate.py:254: increment_threshold = compute_threshold(threshold).
+    increment_threshold: f64,
     /// warmstate.py: trace_eagerness parameter (integer, default 200).
     trace_eagerness: u32,
     /// warmstate.py: increment_trace_eagerness = compute_threshold(trace_eagerness).
     /// Pre-computed f64 increment for guard failure counter ticking.
     increment_trace_eagerness: f64,
     /// Function call threshold for inlining during tracing.
-    ///
-    /// A function must be called at least this many times before
-    /// the meta-interpreter inlines it into the trace.
     function_threshold: u32,
+    /// warmstate.py:257: increment_function_threshold = compute_threshold(function_threshold).
+    increment_function_threshold: f64,
     /// Maximum depth of inlined function calls during tracing.
     max_inline_depth: u32,
     /// Maximum number of operations per trace before aborting.
@@ -405,7 +406,7 @@ impl WarmEnterState {
             return false;
         }
         if flags & jc_flags::TRACING_OCCURRED != 0 {
-            self.counter.tick(green_key_hash)
+            self.counter.tick(green_key_hash, self.increment_threshold)
         } else {
             true
         }
@@ -428,51 +429,26 @@ impl WarmEnterState {
     /// Create a new WarmEnterState with the given threshold.
     /// Automatically enables Logger if MAJIT_STATS=1 or MAJIT_LOG=1.
     pub fn new(threshold: u32) -> Self {
-        WarmEnterState {
-            counter: JitCounter::new(threshold),
-            cells: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            threshold,
-            trace_eagerness: DEFAULT_TRACE_EAGERNESS,
-            increment_trace_eagerness: JitCounter::compute_threshold_static(
-                DEFAULT_TRACE_EAGERNESS,
-            ),
-            function_threshold: DEFAULT_FUNCTION_THRESHOLD,
-            max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
-            trace_limit: DEFAULT_TRACE_LIMIT,
-            tracing_generation: 0,
-            jitlog: Logger::from_env(),
-            quasiimmut_deps: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            vectorize: false,
-            vec_all: false,
-            vec_cost: 0,
-            enable_opts: default_enable_opts(),
-            inlining: true,
-            disable_unrolling_threshold: DEFAULT_DISABLE_UNROLLING,
-            pureop_historylength: 16,
-            memory_manager: {
-                let mut m = crate::memmgr::MemoryManager::new(0);
-                // rlib/jit.py:595 PARAMETERS default retrace_limit=0.
-                m.retrace_limit = DEFAULT_RETRACE_LIMIT;
-                // rlib/jit.py:598 / pyjitpl.py:2946: default 0 means
-                // the first cancelled unrolled compile immediately retries
-                // once without unrolling.
-                m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
-                m
-            },
-        }
+        Self::with_jitlog(threshold, Logger::from_env())
     }
 
     /// Create a new WarmEnterState with an explicit Logger.
     pub fn with_jitlog(threshold: u32, jitlog: Option<Logger>) -> Self {
+        let mut counter = JitCounter::new(DEFAULT_SIZE);
+        // rlib/jit.py:588 PARAMETERS default decay=40.
+        counter.set_decay(40);
+        let increment_threshold = counter.compute_threshold(threshold);
+        let increment_trace_eagerness = counter.compute_threshold(DEFAULT_TRACE_EAGERNESS);
+        let increment_function_threshold = counter.compute_threshold(DEFAULT_FUNCTION_THRESHOLD);
         WarmEnterState {
-            counter: JitCounter::new(threshold),
+            counter,
             cells: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             threshold,
+            increment_threshold,
             trace_eagerness: DEFAULT_TRACE_EAGERNESS,
-            increment_trace_eagerness: JitCounter::compute_threshold_static(
-                DEFAULT_TRACE_EAGERNESS,
-            ),
+            increment_trace_eagerness,
             function_threshold: DEFAULT_FUNCTION_THRESHOLD,
+            increment_function_threshold,
             max_inline_depth: DEFAULT_MAX_INLINE_DEPTH,
             trace_limit: DEFAULT_TRACE_LIMIT,
             tracing_generation: 0,
@@ -487,11 +463,7 @@ impl WarmEnterState {
             pureop_historylength: 16,
             memory_manager: {
                 let mut m = crate::memmgr::MemoryManager::new(0);
-                // rlib/jit.py:595 PARAMETERS default retrace_limit=0.
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
-                // rlib/jit.py:598 / pyjitpl.py:2946: default 0 means
-                // the first cancelled unrolled compile immediately retries
-                // once without unrolling.
                 m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
@@ -520,6 +492,10 @@ impl WarmEnterState {
         self.disable_noninlinable_function(green_key_hash);
     }
 
+    /// PRE-EXISTING-ADAPTATION: pyre-only cold fast path check. RPython
+    /// warmstate.py:467 just calls jitcounter.tick(hash, increment_threshold)
+    /// directly; this read-only peek exists to skip GreenKey allocation
+    /// in jitdriver.rs for cold keys.
     #[inline]
     pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
@@ -533,17 +509,10 @@ impl WarmEnterState {
                 return false;
             }
         }
-        self.counter.would_fire(green_key_hash)
+        self.counter.would_tick_fire(green_key_hash, self.increment_threshold)
     }
 
-    /// Tick counter and check if key should enter JIT.
-    ///
-    /// RPython parity: this is the inline fast path equivalent of
-    /// `maybe_compile_and_run(increment_threshold, ...)`.
-    /// Returns true if counter reached threshold (should enter slow path).
-    /// Returns false for DONT_TRACE keys or cold keys.
-    /// Advance counter toward threshold. Respects DONT_TRACE_HERE and
-    /// DontTraceHere — does not tick suppressed keys (warmstate.py:484).
+    /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
     pub fn counter_tick(&mut self, green_key_hash: u64) {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
@@ -553,7 +522,7 @@ impl WarmEnterState {
                 return;
             }
         }
-        let _ = self.counter.tick(green_key_hash);
+        let _ = self.counter.tick(green_key_hash, self.increment_threshold);
     }
 
     pub fn counter_tick_checked(&mut self, green_key_hash: u64) -> bool {
@@ -565,7 +534,7 @@ impl WarmEnterState {
                 return false;
             }
         }
-        self.counter.tick(green_key_hash)
+        self.counter.tick(green_key_hash, self.increment_threshold)
     }
 
     pub fn maybe_compile(&mut self, green_key_hash: u64) -> HotResult {
@@ -592,7 +561,7 @@ impl WarmEnterState {
             }
         }
 
-        if !self.counter.tick(green_key_hash) {
+        if !self.counter.tick(green_key_hash, self.increment_threshold) {
             return HotResult::NotHot;
         }
 
@@ -643,7 +612,7 @@ impl WarmEnterState {
             }
         }
 
-        if !self.counter.tick(hash) {
+        if !self.counter.tick(hash, self.increment_threshold) {
             return HotResult::NotHot;
         }
 
@@ -857,10 +826,10 @@ impl WarmEnterState {
         self.threshold
     }
 
-    /// Set a new threshold. Also updates the internal counter.
+    /// warmstate.py:253-254 set_param_threshold.
     pub fn set_threshold(&mut self, threshold: u32) {
         self.threshold = threshold;
-        self.counter.set_threshold(threshold);
+        self.increment_threshold = self.counter.compute_threshold(threshold);
     }
 
     /// Decay all counters (e.g., periodically to avoid stale counts).
@@ -875,8 +844,10 @@ impl WarmEnterState {
 
     /// Reset ALL counters to zero. Used after invalidation with incomplete
     /// resume data (NONE fail_args) to prevent immediate recompilation.
+    /// PRE-EXISTING-ADAPTATION: RPython has no equivalent; this is a
+    /// pyre-only recovery path.
     pub fn decay_all_counters_to_zero(&mut self) {
-        self.counter.decay_all_counters_by(0.0);
+        self.counter.reset_all();
     }
 
     /// Check if a green key is marked DontTraceHere.
@@ -1051,7 +1022,7 @@ impl WarmEnterState {
     /// warmstate.py:259: set_param_trace_eagerness.
     pub fn set_param_trace_eagerness(&mut self, value: u32) {
         self.trace_eagerness = value;
-        self.increment_trace_eagerness = JitCounter::compute_threshold_static(value);
+        self.increment_trace_eagerness = self.counter.compute_threshold(value);
     }
 
     /// warmstate.py: increment_trace_eagerness (pre-computed f64).
@@ -1065,7 +1036,7 @@ impl WarmEnterState {
     #[inline]
     pub fn tick_guard_failure(&mut self, guard_hash: u64) -> bool {
         self.counter
-            .tick_with_increment(guard_hash, self.increment_trace_eagerness)
+            .tick(guard_hash, self.increment_trace_eagerness)
     }
 
     /// Compat alias: bridge_threshold() returns trace_eagerness.
@@ -1089,9 +1060,10 @@ impl WarmEnterState {
         self.function_threshold
     }
 
-    /// Set the function inlining threshold.
+    /// warmstate.py:256-257 set_param_function_threshold.
     pub fn set_function_threshold(&mut self, threshold: u32) {
         self.function_threshold = threshold;
+        self.increment_function_threshold = self.counter.compute_threshold(threshold);
     }
 
     /// RPython-compatible wrapper: set_param_threshold.
@@ -1284,18 +1256,7 @@ impl WarmEnterState {
 
     /// warmstate.py:467 jitcounter.tick(hash, increment_threshold) parity.
     ///
-    /// Function-entry hotness rides on the same `JitCounter` timetable as
-    /// the loop counter (counter.py:16-202). `maybe_compile_and_run`
-    /// increments the per-hash float with `increment_threshold =
-    /// 1/function_threshold`; `tick_with_threshold` returns true (and
-    /// auto-resets the slot) when the accumulated value reaches 1.0 —
-    /// exactly counter.py:185-201.
-    ///
-    /// The cell lookup replicates `maybe_compile_and_run`'s pre-tick
-    /// shortcuts (warmstate.py:473-495):
-    ///   * compiled or currently-tracing keys skip tracing
-    ///   * a `DONT_TRACE_HERE` cell with no seen procedure token fires
-    ///     eagerly on the first visit after tracing completes
+    /// warmstate.py:256-257: jitcounter.tick(hash, increment_function_threshold).
     pub fn should_trace_function_entry(&mut self, green_key_hash: u64) -> bool {
         if let Some(cell) = self.cells.get(&green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
@@ -1311,7 +1272,7 @@ impl WarmEnterState {
             }
         }
         self.counter
-            .tick_with_threshold(green_key_hash, self.function_threshold)
+            .tick(green_key_hash, self.increment_function_threshold)
     }
 
     /// Check if inlining is allowed at the given depth.
@@ -1457,7 +1418,7 @@ impl WarmEnterState {
             "threshold" => self.set_threshold(as_u32),
             "trace_limit" => self.trace_limit = as_u32,
             "trace_eagerness" | "bridge_threshold" => self.set_param_trace_eagerness(as_u32),
-            "function_threshold" => self.function_threshold = as_u32,
+            "function_threshold" => self.set_function_threshold(as_u32),
             "max_inline_depth" => self.max_inline_depth = as_u32,
             "retrace_limit" => self.memory_manager.retrace_limit = as_u32,
             "max_retrace_guards" => self.memory_manager.max_retrace_guards = as_u32,
@@ -1522,7 +1483,7 @@ impl WarmEnterState {
     /// warmstate.py: get_param(name) — read a JIT parameter value.
     pub fn get_param(&self, name: &str) -> Option<i64> {
         match name {
-            "threshold" => Some(self.counter.threshold() as i64),
+            "threshold" => Some(self.threshold as i64),
             "trace_limit" => Some(self.trace_limit as i64),
             "trace_eagerness" | "bridge_threshold" => Some(self.trace_eagerness as i64),
             "function_threshold" => Some(self.function_threshold as i64),

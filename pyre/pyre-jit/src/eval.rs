@@ -3358,8 +3358,7 @@ fn maybe_compile_and_run(
     if driver
         .meta_interp_mut()
         .warm_state_mut()
-        .counter
-        .tick(green_key)
+        .counter_tick_checked(green_key)
     {
         if driver
             .meta_interp()
