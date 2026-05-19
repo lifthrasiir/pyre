@@ -1572,6 +1572,10 @@ impl WarmEnterState {
     pub fn vectorize(&self) -> bool {
         self.vectorize
     }
+    /// warmstate.py: vec_all — try to vectorize all trace loops.
+    pub fn vec_all(&self) -> bool {
+        self.vec_all
+    }
     pub fn vec_cost(&self) -> u32 {
         self.vec_cost
     }
