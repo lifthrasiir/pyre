@@ -30,8 +30,8 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 pub use crate::optimizeopt::dependency::{Node, schedule_operations};
 pub use crate::optimizeopt::schedule::{
     AccumEntry, AccumPack, CostModel, GenericCostModel, GuardAnalysis, NotAProfitableLoop,
-    NotAVectorizeableLoop, Pack, PackSet, VecScheduleState, are_adjacent_memory_refs, isomorphic,
-    turn_into_vector, unpack_from_vector,
+    NotAVectorizeableLoop, Pack, PackSet, VecScheduleState, VectorizeError,
+    are_adjacent_memory_refs, isomorphic, turn_into_vector, unpack_from_vector,
 };
 
 // ── vector.py:35-40: copy_resop ────────────────────────────────────────
@@ -132,11 +132,60 @@ impl VectorLoop {
     }
 
     /// vector.py:62-92: finaloplist — assemble the complete operation list
-    /// for compilation. If `label` is true, includes the Label op at the
-    /// front. Handles prefix/prefix_label for alignment unrolling.
-    pub fn finaloplist(&self, label: bool) -> Vec<Op> {
-        let mut oplist = Vec::new();
-        // vector.py:81-84
+    /// for compilation.
+    ///
+    /// `jitcell_token`: when supplied, allocate fresh `TargetToken`s for
+    ///   `self.label` (`reset_label_token` true) and `self.prefix_label` /
+    ///   `self.jump`, mirroring `vector.py:62-79`. When `None`, the descr
+    ///   block is skipped — equivalent to RPython's `if jitcell_token:` guard.
+    /// `reset_label_token`: vector.py:64 — choose between minting a new
+    ///   `TargetToken` for the label (true) or pulling the existing jump
+    ///   descr (false).
+    /// `label`: include `self.label` at the front. When false, follow
+    ///   `vector.py:87-90` and clear the vectorize-time scratch
+    ///   (`set_forwarded(None)` upstream) from every emitted prefix op plus
+    ///   the jump. In majit the vectorize-time scratch lives on
+    ///   `VectorizationInfo`, so the equivalent is `clear_vecinfo()`.
+    pub fn finaloplist(
+        &self,
+        jitcell_token: Option<&std::sync::Arc<majit_backend::JitCellToken>>,
+        reset_label_token: bool,
+        label: bool,
+    ) -> Vec<Op> {
+        // vector.py:63-79: descr wiring against the owning JitCellToken.
+        if let Some(jcell) = jitcell_token {
+            // vector.py:64-72
+            if reset_label_token {
+                let token =
+                    std::sync::Arc::new(crate::optimizeopt::unroll::TargetToken::new_loop(0));
+                let descr = token.as_jump_target_descr();
+                jcell.target_tokens.lock().push(descr.clone());
+                self.label.setdescr(descr);
+            }
+            // else: vector.py:70-72 grabs token = self.jump.getdescr(); the
+            // result is only used below to re-setdescr the jump when there's
+            // no prefix_label, which is already what's there. Skip.
+
+            // vector.py:73-77: prefix_label gets its own TargetToken, and
+            // the jump is rebound to point at it.
+            if let Some(ref prefix_label) = self.prefix_label {
+                let pre_token =
+                    std::sync::Arc::new(crate::optimizeopt::unroll::TargetToken::new_loop(0));
+                let pre_descr = pre_token.as_jump_target_descr();
+                jcell.target_tokens.lock().push(pre_descr.clone());
+                prefix_label.setdescr(pre_descr.clone());
+                self.jump.setdescr(pre_descr);
+            } else if reset_label_token {
+                // vector.py:78-79: with no prefix_label, re-bind jump to the
+                // label's freshly-minted token.
+                if let Some(label_descr) = self.label.getdescr() {
+                    self.jump.setdescr(label_descr);
+                }
+            }
+        }
+
+        // vector.py:80-84
+        let mut oplist: Vec<Op> = Vec::new();
         if let Some(ref prefix_label) = self.prefix_label {
             oplist.extend(self.prefix.iter().cloned());
             oplist.push(prefix_label.clone());
@@ -146,6 +195,15 @@ impl VectorLoop {
         // vector.py:85-86
         if label {
             oplist.insert(0, self.label.clone());
+        }
+        // vector.py:87-90: when not emitting the label op (i.e. the prefix
+        // is the *only* thing being compiled this round, e.g. a bridge),
+        // strip vectorization scratch so nothing leaks into the next pass.
+        if !label {
+            for op in &oplist {
+                op.clear_vecinfo();
+            }
+            self.jump.clear_vecinfo();
         }
         // vector.py:91
         oplist.extend(self.operations.iter().cloned());
@@ -210,16 +268,23 @@ pub fn optimize_vector(
     loop_: &mut VectorLoop,
     cost_threshold: i32,
     vec_size: usize,
-) -> Result<Vec<Op>, NotAVectorizeableLoop> {
+) -> Result<Vec<Op>, VectorizeError> {
     // vector.py:126-128
     if loop_.operations.is_empty() {
-        return Err(NotAVectorizeableLoop);
+        return Err(VectorizeError::NotVectorizeable);
     }
+
+    // vector.py:134 `version = info.snapshot(loop)` — keep an untouched
+    // clone so that *any* downstream failure (NotAVectorizeableLoop /
+    // NotAProfitableLoop / panic-equivalent) restores the caller-visible
+    // VectorLoop to its pre-vectorize shape. The clone is only used on the
+    // error path; on success we hand back the vectorized ops directly.
+    let version = loop_.clone_loop();
 
     // vector.py:135: loop.setup_vectorization()
     loop_.setup_vectorization();
 
-    let result = (|| -> Result<Vec<Op>, NotAVectorizeableLoop> {
+    let result = (|| -> Result<Vec<Op>, VectorizeError> {
         // vector.py:142-143
         let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_)
@@ -227,6 +292,13 @@ pub fn optimize_vector(
 
     // vector.py:172: finally: loop.teardown_vectorization()
     loop_.teardown_vectorization();
+
+    if result.is_err() {
+        // vector.py:155 / :160: `return loop_info, version.loop.finaloplist()`.
+        // Restore the pre-vectorize ops into loop_ so the caller can resume
+        // from a clean state if it wants to inspect the loop further.
+        *loop_ = version;
+    }
 
     result
 }
@@ -359,10 +431,7 @@ impl VectorizingOptimizer {
     /// 6. Schedule with cost model
     /// 7. Guard strengthening
     /// 8. Re-schedule for cleanup
-    pub fn run_optimization(
-        &mut self,
-        loop_: &mut VectorLoop,
-    ) -> Result<Vec<Op>, NotAVectorizeableLoop> {
+    pub fn run_optimization(&mut self, loop_: &mut VectorLoop) -> Result<Vec<Op>, VectorizeError> {
         // vector.py:221
         self.orig_label_args = Some(loop_.label.getarglist().to_vec());
 
@@ -375,13 +444,13 @@ impl VectorizingOptimizer {
 
         // vector.py:227-235: bail checks
         if vsize == 0 {
-            return Err(NotAVectorizeableLoop);
+            return Err(VectorizeError::NotVectorizeable);
         }
         if byte_count == 0 {
-            return Err(NotAVectorizeableLoop);
+            return Err(VectorizeError::NotVectorizeable);
         }
         if loop_.label.opcode != OpCode::Label {
-            return Err(NotAVectorizeableLoop);
+            return Err(VectorizeError::NotVectorizeable);
         }
 
         // vector.py:237-240: analyse_index_calculations → reorder
@@ -397,10 +466,15 @@ impl VectorizingOptimizer {
             }
         }
 
-        // vector.py:243-247: unroll
+        // vector.py:243-247: unroll. `align_unroll` mirrors RPython's
+        // `cpu.vector_ext.should_align_unroll`; the unroll_count == 1 branch
+        // means the natural unroll factor is too small to amortise the loop
+        // setup, so we add one alignment pass and stash the *original* body
+        // into loop.align_operations (so the caller can replay it once
+        // before entering the unrolled body).
         self.unroll_count = Self::get_unroll_count(byte_count, vsize);
-        let _align_unroll = self.unroll_count == 1; // vector_ext.should_align_unroll
-        loop_.unroll_loop_iterations(self.unroll_count);
+        let align_unroll = self.unroll_count == 1;
+        loop_.unroll_loop_iterations(self.unroll_count, align_unroll);
 
         // vector.py:250-253: vectorize — build graph, find adjacent memory refs
         let graph = DependencyGraph::build(&loop_.operations, &constant_of);
@@ -409,21 +483,31 @@ impl VectorizingOptimizer {
         // isomorphic_with_state (vector.py: packset.can_be_packed reaches
         // state for accumulation/invariant lookups; pre-state form was a
         // pre-rebase fork).
-        let start_pos = loop_.operations.iter().map(|op| op.pos.get().raw()).max().unwrap_or(0) + 1;
+        let start_pos = loop_
+            .operations
+            .iter()
+            .map(|op| op.pos.get().raw())
+            .max()
+            .unwrap_or(0)
+            + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
+        // vector.py:606-609 CostModel.__init__: savings = 0, threshold stored
+        // separately. Initializing savings = self.cost_threshold inverted the
+        // gate — a positive threshold made profitable() trivially true.
         let costmodel = CostModel {
             min_pack_size: 2,
             pack_cost: 2,
             scalar_save: 1,
-            savings: self.cost_threshold,
+            savings: 0,
         };
         sched_state.costmodel = costmodel;
 
         self.find_adjacent_memory_refs(&graph, loop_, &mut sched_state);
 
-        // vector.py:253-254: extend and combine
+        // vector.py:253-254: extend and combine — combine_packset raises
+        // NotAVectorizeableLoop on an empty packset (vector.py:468-470).
         self.extend_packset(&graph, &mut sched_state);
-        self.combine_packset();
+        self.combine_packset()?;
 
         // vector.py:254-258: schedule with cost model
         let packset = self.packset.take().unwrap_or_default();
@@ -466,7 +550,7 @@ impl VectorizingOptimizer {
             }
             let is_float = first_op.opcode.result_type() == majit_ir::Type::Float;
             if is_float {
-                return Err(NotAVectorizeableLoop);
+                return Err(VectorizeError::NotVectorizeable);
             }
             let datatype = 'i';
             let bytesize: i32 = loop_
@@ -561,16 +645,36 @@ impl VectorizingOptimizer {
             }
         }
 
-        // vector.py:257-258: profitability check
-        if !sched_state.costmodel.profitable() {
-            return Err(NotAVectorizeableLoop);
+        // schedule.py:762 VecScheduleState.post_schedule — moves
+        // invariant_oplist into loop.prefix and routes invariant_vector_vars
+        // through prefix_label/jump renaming. That post-pass is not yet
+        // ported. If anything is sitting in either list (e.g. expand()'d
+        // splat ops or accumulator seed packs), splicing it into the loop
+        // body — which is what the original concatenation below did — is a
+        // silent semantic divergence. Bail until post_schedule lands.
+        if !sched_state.invariant_oplist.is_empty() || !sched_state.invariant_vector_vars.is_empty()
+        {
+            return Err(VectorizeError::NotVectorizeable);
         }
 
-        // vector.py:267-269: extra_before_label = loop.align_operations
-        // (handled by caller via loop_.align_operations)
+        // vector.py:257-258: profitability check — distinct error variant
+        // so the caller (or future GuardStrengthenOpt logging) can react to
+        // cost-model rejection separately from a structural bail.
+        if !sched_state.costmodel.profitable() {
+            return Err(VectorizeError::NotProfitable);
+        }
 
-        let mut result = sched_state.invariant_oplist;
-        result.append(&mut sched_state.oplist);
+        // vector.py:267-269: extra_before_label = loop.align_operations;
+        // for op in loop.align_operations: op.set_forwarded(None).
+        // We hand the align_operations back through `loop_.align_operations`
+        // (already populated by `unroll_loop_iterations` on the align arm);
+        // clearing vecinfo matches the upstream `set_forwarded(None)` reset
+        // so post-vectorize passes don't see stale VectorizationInfo.
+        for op in &loop_.align_operations {
+            op.clear_vecinfo();
+        }
+
+        let result = sched_state.oplist;
 
         // Update loop operations for finaloplist
         loop_.operations = result.clone();
@@ -784,15 +888,15 @@ impl VectorizingOptimizer {
 
     /// vector.py:460-496: combine_packset — merge adjacent 2-packs into
     /// larger packs, then split overloaded packs.
-    pub fn combine_packset(&mut self) {
+    pub fn combine_packset(&mut self) -> Result<(), NotAVectorizeableLoop> {
         let packset = match self.packset.as_mut() {
             Some(ps) => ps,
-            None => return,
+            None => return Err(NotAVectorizeableLoop),
         };
 
-        // vector.py:468-470: empty packset → bail
+        // vector.py:468-470: empty packset → raise NotAVectorizeableLoop
         if packset.packs.is_empty() {
-            return;
+            return Err(NotAVectorizeableLoop);
         }
 
         // vector.py:474-494: iterative merge
@@ -810,6 +914,7 @@ impl VectorizingOptimizer {
         // removes packs that are too small (< FULL load). This requires
         // pack_load() and Pack.FULL which depend on vectorization info
         // infrastructure not yet available in Rust.
+        Ok(())
     }
 
     // ── vector.py:515-521: schedule ────────────────────────────────────
@@ -835,42 +940,17 @@ impl VectorizingOptimizer {
     /// - Node.iterate_paths() — path enumeration with blacklist
     /// - Path.is_always_pure() — purity analysis along paths
     /// - Node.remove_edge_to() / edge_to() — graph mutation
-    /// These dependency.rs primitives are not yet ported. When they are,
-    /// this method should be completed to match vector.py:523-583.
+    /// These dependency.rs primitives are not yet ported. Until they are,
+    /// return None unconditionally — the earlier "zero-dep guard" heuristic
+    /// did not actually rewire the graph the way RPython does, and feeding
+    /// the unmodified graph back to the caller as a reschedule basis was a
+    /// silent divergence. mark_guard is similarly stubbed.
     fn analyse_index_calculations(
         &self,
-        loop_: &VectorLoop,
-        constant_of: &dyn Fn(OpRef) -> Option<i64>,
+        _loop_: &VectorLoop,
+        _constant_of: &dyn Fn(OpRef) -> Option<i64>,
     ) -> Option<DependencyGraph> {
-        let graph = DependencyGraph::build(&loop_.operations, constant_of);
-
-        // vector.py:531-532: zero_deps — nodes with no incoming dependencies
-        let mut zero_deps: VecSet<usize> = VecSet::new();
-        for (i, node) in graph.nodes.iter().enumerate() {
-            if node.deps.is_empty() {
-                zero_deps.insert(i);
-            }
-        }
-
-        // vector.py:534-582: guard analysis and edge manipulation
-        // Requires iterate_paths, imaginary_node, remove_edge_to — not yet
-        // available in dependency.rs. For now, check if any guard depends
-        // only on zero-dep (loop-invariant) nodes as a simplified heuristic.
-        let mut one_valid = false;
-        for &guard_idx in &graph.guards {
-            zero_deps.remove(&guard_idx);
-            let guard_node = &graph.nodes[guard_idx];
-            // Simplified check: all dependencies are pure and zero-dep
-            let all_deps_pure = guard_node.deps.iter().all(|&dep_idx| {
-                let dep_node = &graph.nodes[dep_idx];
-                dep_node.op.opcode.is_always_pure() && dep_node.deps.is_empty()
-            });
-            if all_deps_pure && !guard_node.deps.is_empty() {
-                one_valid = true;
-            }
-        }
-
-        if one_valid { Some(graph) } else { None }
+        None
     }
 
     // ── vector.py:585-599: mark_guard ──────────────────────────────────
@@ -1060,13 +1140,19 @@ impl VectorizingOptimizer {
             }
         }
 
+        // schedule.py:762 post_schedule not yet ported — same bail rationale
+        // as run_optimization (do not splice invariant_oplist /
+        // invariant_vector_vars into the loop body).
+        if !sched_state.invariant_oplist.is_empty() || !sched_state.invariant_vector_vars.is_empty()
+        {
+            return None;
+        }
+
         if !sched_state.costmodel.profitable() {
             return None;
         }
 
-        let mut result = sched_state.invariant_oplist;
-        result.append(&mut sched_state.oplist);
-        Some(result)
+        Some(sched_state.oplist)
     }
 
     // ── Static variants for extend/combine (used by try_vectorize) ─────
@@ -1121,10 +1207,21 @@ impl VectorizingOptimizer {
 impl VectorLoop {
     /// vector.py:273-344: unroll_loop_iterations — unroll the loop body
     /// `count` times with proper renaming.
-    pub fn unroll_loop_iterations(&mut self, count: usize) {
+    ///
+    /// `align_unroll_once` (vector.py:273) requests one extra alignment
+    /// unroll. When set: `count` is bumped by one before the unroll runs;
+    /// after the first iteration a fresh `LABEL` is materialised and
+    /// installed as `self.label`; the *original* body is moved to
+    /// `self.align_operations` (consumed before the unrolled loop) while
+    /// `self.operations` is replaced by the unrolled sequence. When unset,
+    /// `self.operations` becomes `original + unrolled` (the default body
+    /// shape).
+    pub fn unroll_loop_iterations(&mut self, count: usize, align_unroll_once: bool) {
         if count == 0 {
             return;
         }
+        // vector.py:284 — bump count once for the alignment pass.
+        let unroll_count = if align_unroll_once { count + 1 } else { count };
         let original_body = self.operations.clone();
         let label_args = self.label.getarglist_copy();
         let jump_args = self.jump.getarglist_copy();
@@ -1138,6 +1235,10 @@ impl VectorLoop {
 
         let mut renamer = Renamer::new();
         let mut unrolled = Vec::new();
+        // vector.py:292 `new_label = loop.label` — the label install-target
+        // is the existing label by default; the align-unroll arm overwrites
+        // it with a freshly minted LABEL after the first body copy.
+        let mut new_label = self.label.clone();
 
         let base_offset = original_body
             .iter()
@@ -1146,7 +1247,7 @@ impl VectorLoop {
             .unwrap_or(0)
             + 1;
 
-        for u in 0..count {
+        for u in 0..unroll_count {
             // vector.py:296-301: fill rename map: label args → jump args
             for i in 0..label_args.len().min(jump_args.len()) {
                 let la = label_args[i];
@@ -1185,6 +1286,22 @@ impl VectorLoop {
 
                 unrolled.push(copied_op);
             }
+
+            // vector.py:324-328 — after the first iteration of an align
+            // unroll, mint a fresh LABEL using the same descr and arglist
+            // as the original label, then run the renamer over it so its
+            // args track the rename state at this point.
+            if align_unroll_once && u == 0 {
+                let mut minted = Op::new(OpCode::Label, &label_args);
+                if let Some(descr) = self.label.getdescr() {
+                    minted.setdescr(descr);
+                }
+                for i in 0..minted.num_args() {
+                    let renamed = renamer.rename_box(minted.arg(i));
+                    minted.setarg(i, renamed);
+                }
+                new_label = minted;
+            }
         }
 
         // vector.py:334-337: update jump args with final renaming
@@ -1193,8 +1310,14 @@ impl VectorLoop {
             self.jump.setarg(i, renamed);
         }
 
-        // vector.py:343-344: merge original + unrolled
-        self.operations.extend(unrolled);
+        // vector.py:339-344
+        self.label = new_label;
+        if align_unroll_once {
+            self.align_operations = original_body;
+            self.operations = unrolled;
+        } else {
+            self.operations.extend(unrolled);
+        }
     }
 }
 
@@ -1430,11 +1553,11 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[OpRef::int_op(0)]);
         let vloop = VectorLoop::new(label, ops, jump);
 
-        let with_label = vloop.finaloplist(true);
+        let with_label = vloop.finaloplist(None, true, true);
         assert_eq!(with_label.len(), 3); // Label + IntAdd + Jump
         assert_eq!(with_label[0].opcode, OpCode::Label);
 
-        let without_label = vloop.finaloplist(false);
+        let without_label = vloop.finaloplist(None, true, false);
         assert_eq!(without_label.len(), 2); // IntAdd + Jump
     }
 
@@ -2112,7 +2235,7 @@ mod tests {
         let mut vloop = VectorLoop::new(label, vec![body_op], jump);
         assert_eq!(vloop.body_len(), 1);
 
-        vloop.unroll_loop_iterations(2);
+        vloop.unroll_loop_iterations(2, false);
         // Original 1 + 2 unrolled copies = 3
         assert_eq!(vloop.body_len(), 3);
     }

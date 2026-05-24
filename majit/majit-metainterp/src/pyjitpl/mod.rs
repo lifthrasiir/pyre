@@ -6250,7 +6250,12 @@ impl<M: Clone> MetaInterp<M> {
                             if crate::majit_log_enabled() {
                                 eprintln!("[jit] vectorization succeeded for key={}", green_key);
                             }
-                            vloop.finaloplist(true)
+                            // jitcell_token is allocated later in this
+                            // pipeline (compile_loop), so the descr block
+                            // is skipped here. label=true since this op
+                            // list is fed into the main compile path that
+                            // still expects the Label at the front.
+                            vloop.finaloplist(None, true, true)
                         }
                         Err(err) => {
                             if crate::majit_log_enabled() {

@@ -1215,7 +1215,31 @@ impl VecScheduleState {
 /// schedule.py:317-320: failnbail_transformation
 #[derive(Debug)]
 pub struct NotAVectorizeableLoop;
+#[derive(Debug)]
 pub struct NotAProfitableLoop;
+
+/// Combined failure mode for `optimize_vector` / `run_optimization`,
+/// mirroring vector.py:154-166's two `except` arms. Callers convert this
+/// back to a "no-vectorize-this-time" decision and replay the original
+/// loop ops; the distinction is kept so future passes (e.g. logging or
+/// GuardStrengthenOpt) can react differently.
+#[derive(Debug)]
+pub enum VectorizeError {
+    NotVectorizeable,
+    NotProfitable,
+}
+
+impl From<NotAVectorizeableLoop> for VectorizeError {
+    fn from(_: NotAVectorizeableLoop) -> Self {
+        VectorizeError::NotVectorizeable
+    }
+}
+
+impl From<NotAProfitableLoop> for VectorizeError {
+    fn from(_: NotAProfitableLoop) -> Self {
+        VectorizeError::NotProfitable
+    }
+}
 
 /// schedule.py:462-474: check_if_pack_supported — validate pack constraints.
 pub fn check_if_pack_supported(
