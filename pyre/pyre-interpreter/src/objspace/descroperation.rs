@@ -324,6 +324,10 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb < 0 {
         return Ok(w_float_new((va as f64).powf(vb as f64)));
     }
+    // intobject.py:415 / longobject.py:229: x ** 0 == 1 for any x.
+    if vb == 0 {
+        return Ok(w_int_new(1));
+    }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
     // Rust BigInt::pow takes u32; short-circuit trivial bases so that
     // e.g. `1 ** huge` returns 1 instead of MemoryError.
@@ -350,12 +354,15 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let fb = as_float(b);
         return Ok(w_float_new(fa.powf(fb)));
     }
+    // longobject.py:229: `if not exp_bigint: return int_pow(0)` → 1.
+    if vb.sign() == malachite_bigint::Sign::NoSign {
+        return Ok(w_int_new(1));
+    }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
     // Short-circuit trivial bases before the u32 narrowing so that
     // 1 ** huge, (-1) ** huge, 0 ** huge succeed.
     let va = as_bigint(a);
-    let sign = va.sign();
-    if sign == malachite_bigint::Sign::NoSign {
+    if va.sign() == malachite_bigint::Sign::NoSign {
         return Ok(w_int_new(0));
     }
     if va == BigInt::from(1) {
@@ -403,9 +410,17 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
+    // longobject.py:375-380: shift overflows → 0 if base is zero,
+    // OverflowError otherwise.
     let shift = match vb.to_usize() {
         Some(v) => v,
-        None => return Err(PyError::memory_error("shift count too large")),
+        None => {
+            let va = as_bigint(a);
+            if va.sign() == malachite_bigint::Sign::NoSign {
+                return Ok(w_int_new(0));
+            }
+            return Err(PyError::overflow_error("shift count too large"));
+        }
     };
     Ok(bigint_result(bigint_lshift(as_bigint(a), shift)))
 }
