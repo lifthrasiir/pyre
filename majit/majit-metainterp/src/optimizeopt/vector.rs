@@ -986,12 +986,22 @@ impl VectorizingOptimizer {
 
         let constant_of = |opref: OpRef| -> Option<i64> { ctx.get_constant_int(opref) };
 
+        let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
+        let mut sched_state = VecScheduleState::new(start_pos);
+        // vector.py:135 loop.setup_vectorization() — stamps
+        // VectorizationInfo on each op. INT_SIGNEXT reads arg1's const
+        // value for bytesize (resoperation.py:181); the constant_of
+        // resolver feeds that through so the inline vecinfo slot matches
+        // PyPy's VectorizationInfo(op) constructor.
+        sched_state.setup_vectorization(&self.body_ops, &constant_of);
+
         // Phase 1: Schedule operations for ILP before packing.
         let dep_graph = DependencyGraph::build(&self.body_ops, &constant_of);
         let schedule = schedule_operations(&dep_graph);
         if schedule.len() == self.body_ops.len() {
             let scheduled: Vec<Op> = schedule.iter().map(|&i| self.body_ops[i].clone()).collect();
             self.body_ops = scheduled;
+            sched_state.setup_vectorization(&self.body_ops, &constant_of);
         }
 
         // Phase 2: Rebuild dependency graph and find packs.
@@ -1004,8 +1014,6 @@ impl VectorizingOptimizer {
         for pack in seed_packs {
             pack_set.add_pack(pack);
         }
-        let start_pos = ctx.new_operations.len() as u32 + self.body_ops.len() as u32;
-        let mut sched_state = VecScheduleState::new(start_pos);
         Self::extend_packset_static(&mut pack_set, &dep_graph, &mut sched_state);
         Self::combine_packset_static(&mut pack_set);
         let profitable = pack_set.packs;

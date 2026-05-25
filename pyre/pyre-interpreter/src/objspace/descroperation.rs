@@ -322,8 +322,16 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb < 0 {
-        // Negative exponent → float result
         return Ok(w_float_new((va as f64).powf(vb as f64)));
+    }
+    // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
+    // Rust BigInt::pow takes u32; short-circuit trivial bases so that
+    // e.g. `1 ** huge` returns 1 instead of MemoryError.
+    match va {
+        0 => return Ok(w_int_new(0)),
+        1 => return Ok(w_int_new(1)),
+        -1 => return Ok(w_int_new(if vb % 2 == 0 { 1 } else { -1 })),
+        _ => {}
     }
     let vb = match u32::try_from(vb) {
         Ok(v) => v,
@@ -342,11 +350,26 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let fb = as_float(b);
         return Ok(w_float_new(fa.powf(fb)));
     }
+    // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
+    // Short-circuit trivial bases before the u32 narrowing so that
+    // 1 ** huge, (-1) ** huge, 0 ** huge succeed.
+    let va = as_bigint(a);
+    let sign = va.sign();
+    if sign == malachite_bigint::Sign::NoSign {
+        return Ok(w_int_new(0));
+    }
+    if va == BigInt::from(1) {
+        return Ok(w_int_new(1));
+    }
+    if va == BigInt::from(-1) {
+        let even = vb.clone() % BigInt::from(2) == BigInt::from(0);
+        return Ok(w_int_new(if even { 1 } else { -1 }));
+    }
     let exp = match vb.to_u32() {
         Some(v) => v,
         None => return Err(PyError::memory_error("exponent too large")),
     };
-    Ok(bigint_result(as_bigint(a).pow(exp)))
+    Ok(bigint_result(va.pow(exp)))
 }
 
 // ── Shift operations ─────────────────────────────────────────────────
@@ -392,9 +415,19 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if bigint_lt(vb.clone(), BigInt::from(0)) {
         return Err(PyError::value_error("negative shift count"));
     }
+    // longobject.py:393-397: shift overflows → positive yields 0,
+    // negative yields -1 (all bits shifted out).
     let shift = match vb.to_usize() {
         Some(v) => v,
-        None => return Err(PyError::memory_error("shift count too large")),
+        None => {
+            let va = as_bigint(a);
+            let va = as_bigint(a);
+            return Ok(w_int_new(if va.sign() == malachite_bigint::Sign::Minus {
+                -1
+            } else {
+                0
+            }));
+        }
     };
     Ok(bigint_result(bigint_rshift(as_bigint(a), shift)))
 }
