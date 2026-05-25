@@ -2067,7 +2067,7 @@ mod tests {
         let graph = DependencyGraph::build(&ops, &|_| None);
         let ps = PackSet::new();
 
-        let result = ps.can_be_packed(0, 1, None, false, &graph);
+        let result = ps.can_be_packed(&mut VecScheduleState::new(0), 0, 1, None, false, &graph);
         assert!(result.is_ok());
         let pack = result.unwrap();
         assert!(pack.is_some());
@@ -2092,7 +2092,9 @@ mod tests {
         let graph = DependencyGraph::build(&ops, &|_| None);
         let ps = PackSet::new();
 
-        let result = ps.can_be_packed(0, 1, None, false, &graph).unwrap();
+        let result = ps
+            .can_be_packed(&mut VecScheduleState::new(0), 0, 1, None, false, &graph)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -2126,7 +2128,14 @@ mod tests {
         };
 
         let ps = PackSet::new();
-        let result = ps.can_be_packed(2, 3, Some(&origin), true, &graph);
+        let result = ps.can_be_packed(
+            &mut VecScheduleState::new(0),
+            2,
+            3,
+            Some(&origin),
+            true,
+            &graph,
+        );
         assert!(result.is_ok());
         let pack = result.unwrap();
         if let Some(p) = pack {
@@ -2164,9 +2173,13 @@ mod tests {
             position: -1,
             operator: None,
         });
-        let result = ps.can_be_packed(0, 2, None, false, &graph).unwrap();
+        let result = ps
+            .can_be_packed(&mut VecScheduleState::new(0), 0, 2, None, false, &graph)
+            .unwrap();
         assert!(result.is_none());
-        let result = ps.can_be_packed(2, 1, None, false, &graph).unwrap();
+        let result = ps
+            .can_be_packed(&mut VecScheduleState::new(0), 2, 1, None, false, &graph)
+            .unwrap();
         assert!(result.is_none());
     }
 
