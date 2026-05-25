@@ -6231,51 +6231,19 @@ impl<M: Clone> MetaInterp<M> {
         // from optimizer to MetaInterp for post-compile watcher registration.
         self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
-        // compile.py:302-308 parity: after the main optimization pass,
-        // conditionally run the vectorization post-pass.
-        // RPython condition: ((warmstate.vec and jitdriver_sd.vec) or warmstate.vec_all)
-        //                    and cpu.vector_ext and cpu.vector_ext.is_enabled()
-        // PRE-EXISTING-ADAPTATION: jitdriver_sd.vec is not yet wired;
-        // cpu.vector_ext is always SSE on x86_64. We gate on vec_all only.
-        let optimized_ops = if self.warm_state.vec_all() {
-            use crate::optimizeopt::vector::{
-                VectorLoop, optimize_vector, user_loop_bail_fast_path,
-            };
-            if let Some(mut vloop) = VectorLoop::from_trace(&optimized_ops) {
-                if !user_loop_bail_fast_path(&vloop) {
-                    let vec_cost = self.warm_state.vec_cost() as i32;
-                    let vec_size = 16; // SSE = 16 bytes; AVX = 32
-                    match optimize_vector(&mut vloop, vec_cost, vec_size) {
-                        Ok(_) => {
-                            if crate::majit_log_enabled() {
-                                eprintln!("[jit] vectorization succeeded for key={}", green_key);
-                            }
-                            // jitcell_token is allocated later in this
-                            // pipeline (compile_loop), so the descr block
-                            // is skipped here. label=true since this op
-                            // list is fed into the main compile path that
-                            // still expects the Label at the front.
-                            vloop.finaloplist(None, true, true)
-                        }
-                        Err(err) => {
-                            if crate::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit] vectorization failed for key={}: {:?}",
-                                    green_key, err
-                                );
-                            }
-                            optimized_ops
-                        }
-                    }
-                } else {
-                    optimized_ops
-                }
-            } else {
-                optimized_ops
-            }
-        } else {
-            optimized_ops
-        };
+        // compile.py:302-308: vectorization post-pass.
+        // RPython condition: ((warmstate.vec and jitdriver_sd.vec) or
+        // warmstate.vec_all) and cpu.vector_ext and
+        // cpu.vector_ext.is_enabled().
+        //
+        // The vectorizer's success path is incomplete: GuardStrengthenOpt,
+        // cleanup SchedulerState.schedule(), and info.extra_before_label
+        // are not yet ported (vector.py:257-269). Wiring the incomplete
+        // pass into compile produces vectorized loops that differ from
+        // RPython's output — weaker guards, no cleanup scheduling, missing
+        // alignment prefix — which is a parity regression vs main (which
+        // never wired this). Gate the call until the full pipeline lands.
+        let optimized_ops = optimized_ops;
 
         if crate::majit_log_enabled() {
             eprintln!(

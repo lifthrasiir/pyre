@@ -377,6 +377,10 @@ pub struct VectorizingOptimizer {
     cost_threshold: i32,
     /// vector.py:214: self.vector_ext.vec_size()
     vec_size: usize,
+    /// vector.py:244: self.vector_ext.should_align_unroll
+    /// True on x86 SSE (default); a future backend abstraction can set
+    /// false for platforms where alignment unrolling is not beneficial.
+    should_align_unroll: bool,
 
     // ── Rust Optimization trait fields (PRE-EXISTING-ADAPTATION) ──
     // These support the sub-pass integration path where VectorizingOptimizer
@@ -403,6 +407,7 @@ impl VectorizingOptimizer {
             orig_label_args: None,
             cost_threshold: 0,
             vec_size: 16, // SSE default
+            should_align_unroll: true,
             body_ops: Vec::new(),
             in_loop: false,
             label_args: Vec::new(),
@@ -466,14 +471,15 @@ impl VectorizingOptimizer {
             }
         }
 
-        // vector.py:243-247: unroll. `align_unroll` mirrors RPython's
-        // `cpu.vector_ext.should_align_unroll`; the unroll_count == 1 branch
-        // means the natural unroll factor is too small to amortise the loop
-        // setup, so we add one alignment pass and stash the *original* body
-        // into loop.align_operations (so the caller can replay it once
-        // before entering the unrolled body).
+        // vector.py:243-247: unroll.
+        // RPython: `align_unroll = self.unroll_count == 1 and
+        //           self.vector_ext.should_align_unroll`
+        // should_align_unroll is a backend flag (True on x86 SSE, False on
+        // some other backends). We default to true since only x86_64 is
+        // supported; the flag is stored on self so a future backend
+        // abstraction can override it.
         self.unroll_count = Self::get_unroll_count(byte_count, vsize);
-        let align_unroll = self.unroll_count == 1;
+        let align_unroll = self.unroll_count == 1 && self.should_align_unroll;
         loop_.unroll_loop_iterations(self.unroll_count, align_unroll);
 
         // vector.py:250-253: vectorize — build graph, find adjacent memory refs
