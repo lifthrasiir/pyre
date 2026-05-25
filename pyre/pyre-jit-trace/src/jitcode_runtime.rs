@@ -1384,12 +1384,7 @@ mod tests {
         // `*_ir>i` alias.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
-        // jtransform rewrite_op_ptr_eq/_rewrite_cmp_ptrs (jtransform.py:
-        // 1227-1255) coerces mixed int/ref comparisons via
-        // cast_ptr_to_int so int_eq always sees ii>i. Pyre's jtransform
-        // only catches both-r → ptr_eq; the mixed i+r fallthrough
-        // produces int_eq/ir>i which has no bhimpl handler.
-        let expected: Vec<String> = vec!["int_eq/ir>i".into()];
+        let expected: Vec<String> = vec![];
         assert_eq!(
             unwired, expected,
             "Task #85 unwired-opname snapshot drifted. If a new entry \

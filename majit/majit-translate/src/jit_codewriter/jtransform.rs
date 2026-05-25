@@ -872,6 +872,32 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
+            // jtransform.py:1227-1235 `_rewrite_cmp_ptrs`: non-GC ptr
+            // equality becomes int_eq/int_ne.  Mixed i+r operands from
+            // Pyre's unified BinOp need cast_ptr_to_int on the Ref side
+            // (blackhole.py:603-606 `cast_ptr_to_int/r>i` is wired).
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if (binop_name == "eq" || binop_name == "ne")
+                && (self.get_value_kind_var(lhs) == 'r' || self.get_value_kind_var(rhs) == 'r') =>
+            {
+                let (lhs_coerced, mut ops) = self.coerce_operand_to_int(graph, lhs);
+                let (rhs_coerced, rhs_ops) = self.coerce_operand_to_int(graph, rhs);
+                ops.extend(rhs_ops);
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: binop_name.clone(),
+                        lhs: lhs_coerced,
+                        rhs: rhs_coerced,
+                        result_ty: result_ty.clone(),
+                    },
+                });
+                RewriteResult::Replace(ops)
+            }
             // RPython rtyper produces `float_*` opnames directly when
             // operand `concretetype` is `lltype.Float` — there is no
             // `int_*` op with float operands in RPython's IR

@@ -497,6 +497,8 @@ impl VectorizingOptimizer {
             .unwrap_or(0)
             + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
+        // vector.py:135 loop.setup_vectorization()
+        sched_state.setup_vectorization(&loop_.operations, &constant_of);
         // vector.py:606-609 CostModel.__init__: savings = 0, threshold stored
         // separately. Initializing savings = self.cost_threshold inverted the
         // gate — a positive threshold made profitable() trivially true.
