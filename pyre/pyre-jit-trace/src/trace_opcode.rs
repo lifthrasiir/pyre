@@ -260,6 +260,29 @@ fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
     ctx.heapcache_setfield_cached(tuple, descr.index(), w_class);
 }
 
+/// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace
+/// only stays specialised for instances whose Python-level `w_class`
+/// matches `expected_typeobj`. Mirrors the `type(w) is W_IntObject` /
+/// `type(w) is W_FloatObject` half of `listobject.py:2390 is_plain_int1`
+/// and `specialisedtupleobject.py:176`. Without this guard a later
+/// int/float subclass with the same payload layout would re-enter a
+/// trace specialised for the exact payload type and silently lose
+/// subclass identity when the trace rewraps via `wrapint` / `wrapfloat`.
+fn trace_guard_exact_w_class(
+    frame: &mut MIFrame,
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    expected_typeobj: PyObjectRef,
+) {
+    if expected_typeobj.is_null() {
+        return;
+    }
+    let actual = crate::state::opimpl_getfield_gc_r(ctx, obj, crate::descr::w_class_descr());
+    let expected = ctx.const_ref(expected_typeobj as i64);
+    let eq = ctx.record_op(OpCode::PtrEq, &[actual, expected]);
+    frame.generate_guard(ctx, OpCode::GuardTrue, &[eq]);
+}
+
 fn positional_defaults_to_load(
     callable: PyObjectRef,
     code: &CodeObject,
@@ -4796,19 +4819,18 @@ impl MIFrame {
                 let lhs = concrete_items[0];
                 let rhs = concrete_items[1];
                 if pyre_object::is_plain_int1(lhs) && pyre_object::is_plain_int1(rhs) {
-                    // STRUCTURAL ADAPTATION: PyPy's
-                    // `type(w) is W_IntObject/W_LongObject` rejects
-                    // app-level int subclasses. Pyre stores that subclass
-                    // identity in `PyObject.w_class` while `ob_type` stays
-                    // at the payload layout. Adding `w_class` guards here
-                    // preserves that exact predicate but injects
-                    // GetfieldGcR + PtrEq + GuardTrue for each tuple item,
-                    // which prevents OptVirtualize from removing the
-                    // build-then-unpack tuple in `synth/tuple_unpacking`
-                    // (regressed from pypy-like speed to ~100x slower).
-                    // Keep the hot trace on the payload/class guards used
-                    // by unboxing; the runtime helper path still applies
-                    // the exact `is_plain_int1` predicate.
+                    // `listobject.py:2390 is_plain_int1` rejects app-level
+                    // int subclasses via `type(w) is W_IntObject/W_LongObject`.
+                    // Pyre stores that subclass identity in `PyObject.w_class`
+                    // while `ob_type` stays at the payload layout, so the
+                    // unbox guard (which only checks `ob_type`) is not
+                    // enough — emit a paired `w_class` guard so a later
+                    // int subclass with the same payload layout side-exits
+                    // instead of replaying the Cls_ii fast path and
+                    // re-wrapping its payload as a plain int.
+                    let int_typeobj = get_instantiate(&INT_TYPE);
+                    trace_guard_exact_w_class(this, ctx, items[0], int_typeobj);
+                    trace_guard_exact_w_class(this, ctx, items[1], int_typeobj);
                     let raw0 = trace_plain_int_payload(this, ctx, items[0], lhs);
                     let raw1 = trace_plain_int_payload(this, ctx, items[1], rhs);
                     let tuple = ctx.record_op_with_descr(
@@ -4848,11 +4870,17 @@ impl MIFrame {
                 if pyre_object::is_plain_float_strict(lhs)
                     && pyre_object::is_plain_float_strict(rhs)
                 {
-                    // STRUCTURAL ADAPTATION: same `w_class` caveat as
-                    // the int-int path above. PyPy's `type(w) is
-                    // W_FloatObject` is stricter than Pyre's payload-layout
-                    // `GuardClass(FLOAT_TYPE)`, but exact `w_class` guards
-                    // on this hot path break tuple virtualisation.
+                    // `specialisedtupleobject.py:176` requires
+                    // `type(w) is W_FloatObject` strict identity. The
+                    // unbox guard only checks `ob_type == FLOAT_TYPE`,
+                    // so emit a paired `w_class` guard against the
+                    // canonical float class — a later float subclass
+                    // with the same payload layout must side-exit
+                    // instead of replaying the Cls_ff fast path and
+                    // re-wrapping its payload as a plain float.
+                    let float_typeobj = get_instantiate(&FLOAT_TYPE);
+                    trace_guard_exact_w_class(this, ctx, items[0], float_typeobj);
+                    trace_guard_exact_w_class(this, ctx, items[1], float_typeobj);
                     let raw0 = if this.value_type(items[0]) == Type::Float {
                         items[0]
                     } else {
