@@ -3780,50 +3780,6 @@ impl Optimizer {
         let saved_in_final_emission = ctx.in_final_emission;
         ctx.in_final_emission = true;
 
-        // RPython rewrite.py:163-184 parity: guard args may already be
-        // forwarded to constants (e.g. via premature make_constant in
-        // optimize_guard_value). Check BEFORE emitting_operation so that
-        // heap lazy-set flushing and other side-effects are not triggered
-        // for a guard that will be removed — matching RPython where
-        // optimize_guard returns before emit.
-        if op.opcode == OpCode::GuardFalse || op.opcode == OpCode::GuardTrue {
-            if let Some(val) = ctx
-                .get_box_replacement_box(op.arg(0))
-                .and_then(|b| ctx.get_constant_int_box(&b))
-            {
-                let trivially_true = match op.opcode {
-                    OpCode::GuardFalse => val == 0,
-                    OpCode::GuardTrue => val != 0,
-                    _ => false,
-                };
-                if trivially_true {
-                    ctx.pending_for_guard.clear();
-                    ctx.in_final_emission = saved_in_final_emission;
-                    return;
-                }
-                std::panic::panic_any(crate::optimize::InvalidLoop(
-                    "guard proven to always fail (late forwarding)",
-                ));
-            }
-        } else if op.opcode == OpCode::GuardValue && op.num_args() >= 2 {
-            let ra = ctx
-                .get_box_replacement_box(op.arg(0))
-                .and_then(|b| ctx.get_constant_int_box(&b));
-            let rb = ctx
-                .get_box_replacement_box(op.arg(1))
-                .and_then(|b| ctx.get_constant_int_box(&b));
-            if let (Some(a), Some(b)) = (ra, rb) {
-                if a == b {
-                    ctx.pending_for_guard.clear();
-                    ctx.in_final_emission = saved_in_final_emission;
-                    return;
-                }
-                std::panic::panic_any(crate::optimize::InvalidLoop(
-                    "GUARD_VALUE proven to always fail (late forwarding)",
-                ));
-            }
-        }
-
         // RPython optimizer.py: emitting_operation callback — notify all passes
         // before any op is emitted. This is how OptHeap forces lazy sets before
         // guards even when the guard is emitted by an earlier pass.

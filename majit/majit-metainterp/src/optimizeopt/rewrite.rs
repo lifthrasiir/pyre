@@ -5224,12 +5224,9 @@ mod tests {
             crate::r#box::BoxPool::new(),
         );
 
-        // GUARD_VALUE(v, 0) folds to GUARD_FALSE(v). postprocess_GUARD_VALUE
-        // then calls make_constant(v, 0), after which the emit-time trivial
-        // guard check eliminates the now-constant GuardFalse(0).
         assert!(
-            !result.iter().any(|o| o.opcode == OpCode::GuardFalse),
-            "GUARD_FALSE(0) should be eliminated as trivially true"
+            result.iter().any(|o| o.opcode == OpCode::GuardFalse),
+            "GUARD_VALUE(v, 0) should become GUARD_FALSE(v)"
         );
     }
 
