@@ -17,7 +17,9 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_object::PyObjectRef;
 use pyre_object::boolobject::w_bool_get_value;
-use pyre_object::pyobject::{FLOAT_TYPE, INT_TYPE, get_instantiate, is_bool, is_float, is_int, py_type_check};
+use pyre_object::pyobject::{
+    FLOAT_TYPE, INT_TYPE, get_instantiate, is_bool, is_float, is_int, py_type_check,
+};
 use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 
 /// jitcode.py:9-21 / codewriter.py:68: JitCode — compiled bytecode unit.
@@ -7848,8 +7850,14 @@ mod tests {
         let float_obj = pyre_object::w_float_new(3.14);
 
         assert_eq!(ConcreteValue::from_pyobj(int_obj), ConcreteValue::Int(11));
-        assert_eq!(ConcreteValue::from_pyobj(true_obj), ConcreteValue::Bool(true));
-        assert_eq!(ConcreteValue::from_pyobj(float_obj), ConcreteValue::Float(3.14));
+        assert_eq!(
+            ConcreteValue::from_pyobj(true_obj),
+            ConcreteValue::Bool(true)
+        );
+        assert_eq!(
+            ConcreteValue::from_pyobj(float_obj),
+            ConcreteValue::Float(3.14)
+        );
     }
 
     #[test]
