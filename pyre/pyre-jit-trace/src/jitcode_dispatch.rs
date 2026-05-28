@@ -1130,7 +1130,9 @@ fn write_ref_reg(
     // expect `ConcreteValue::Ref(_)` or `Null`.
     let sanitized = match concrete {
         ConcreteValue::Ref(_) | ConcreteValue::Null => concrete,
-        ConcreteValue::Int(_) | ConcreteValue::Float(_) => ConcreteValue::Null,
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => {
+            ConcreteValue::Null
+        }
     };
     if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
         *c_slot = sanitized;
@@ -1199,6 +1201,10 @@ fn write_int_reg(
     // into `concrete_registers_i`.
     let sanitized = match concrete {
         ConcreteValue::Int(_) | ConcreteValue::Null => concrete,
+        // `is_int(bool_obj)` is true and `ConcreteValue::Bool::getint()`
+        // coerces to `bool as i64`, so booleans flow safely through the
+        // Int shadow.
+        ConcreteValue::Bool(v) => ConcreteValue::Int(v as i64),
         ConcreteValue::Ref(_) | ConcreteValue::Float(_) => ConcreteValue::Null,
     };
     if let Some(c_slot) = ctx.concrete_registers_i.get_mut(dst) {
@@ -2463,7 +2469,7 @@ fn getfield_vable_via_metainterp(
     let vable_struct_ptr = match read_ref_reg_concrete(code, op, 0, ctx) {
         ConcreteValue::Ref(ptr) => ptr as i64,
         ConcreteValue::Null => 0,
-        ConcreteValue::Int(_) | ConcreteValue::Float(_) => 0,
+        ConcreteValue::Int(_) | ConcreteValue::Float(_) | ConcreteValue::Bool(_) => 0,
     };
     let (result, shadow_value) = match dst_bank {
         'i' => ctx
