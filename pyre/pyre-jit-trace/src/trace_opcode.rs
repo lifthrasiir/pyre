@@ -268,16 +268,38 @@ fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
 /// int/float subclass with the same payload layout would re-enter a
 /// trace specialised for the exact payload type and silently lose
 /// subclass identity when the trace rewraps via `wrapint` / `wrapfloat`.
+///
+/// Only `Type::Ref` items can carry a divergent `w_class`: a raw
+/// `Type::Int` / `Type::Float` trace value is an unboxed payload produced
+/// by arithmetic or a guarded unbox, and its concrete shadow can only be
+/// `Int` / `Float` (the `write_int_reg` / `write_ref_reg` sanitizers
+/// collapse a boxed subclass to `Null`), never a subclass pointer. Reading
+/// `w_class` off such a value would force the box that OptVirtualize is
+/// meant to remove, so skip the guard there.
+///
+/// A box freshly allocated in this trace (`wrapint` / `wrapfloat` boxing an
+/// arithmetic result, e.g. the `i + 1` of `(i, i + 1)`) is likewise exempt:
+/// it is always the exact `W_IntObject` / `W_FloatObject` on every replay —
+/// never a subclass — so the guard is redundant. `emit_box_int_inline`
+/// writes only the payload field, leaving `PyObject.w_class` zero, so
+/// emitting the guard here would compare that 0 against the type object and
+/// side-exit on every iteration. Skipping it lets the dead box fold away,
+/// mirroring how the optimizer folds `guard_class` on a virtual whose class
+/// is statically known.
 fn trace_guard_exact_w_class(
     frame: &mut MIFrame,
     ctx: &mut TraceCtx,
     obj: OpRef,
     expected_typeobj: PyObjectRef,
 ) {
-    if expected_typeobj.is_null() {
+    if expected_typeobj.is_null() || frame.value_type(obj) != Type::Ref {
         return;
     }
-    let actual = crate::state::opimpl_getfield_gc_r(ctx, obj, crate::descr::w_class_descr());
+    if ctx.heap_cache().is_unescaped(obj) {
+        return;
+    }
+    let descr = crate::descr::w_class_descr();
+    let actual = crate::state::opimpl_getfield_gc_r(ctx, obj, descr);
     let expected = ctx.const_ref(expected_typeobj as i64);
     let eq = ctx.record_op(OpCode::PtrEq, &[actual, expected]);
     frame.generate_guard(ctx, OpCode::GuardTrue, &[eq]);
@@ -7900,6 +7922,14 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // `ConstRef(prebuilt_instance)`; the assembler lowers `ConstRef`
     // through `ref_copy/r>r` (`assembler.rs::emit_const_r`), so arms
     // decode without residual-call wrappers around unit variants.
+    //
+    // BuildTuple / UnpackSequence are intentionally NOT in this set: the
+    // trait-dispatch handlers (`trace_build_tuple_value`,
+    // `unpack_sequence_value`) carry the specialised arity-2 tuple
+    // build/unpack fast paths, and the walker's jitcode dispatch cannot
+    // yet express them (it aborts with `InlineCallArityMismatch` when the
+    // tuple flows through an inlined call). Keep them on the trait path
+    // until the walker can encode the specialised tuple layout.
     matches!(
         instruction,
         Instruction::Nop
@@ -7931,7 +7961,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::ContainsOp { .. }
             | Instruction::IsOp { .. }
             | Instruction::Swap { .. }
-            | Instruction::BuildTuple { .. }
             | Instruction::BuildList { .. }
             | Instruction::BuildSet { .. }
             | Instruction::BuildString { .. }
@@ -7946,7 +7975,6 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::DictUpdate { .. }
             | Instruction::DictMerge { .. }
             | Instruction::SetFunctionAttribute { .. }
-            | Instruction::UnpackSequence { .. }
             | Instruction::UnpackEx { .. }
             | Instruction::LoadName { .. }
             | Instruction::StoreName { .. }
@@ -9281,6 +9309,22 @@ impl OpcodeStepExecutor for MIFrame {
 mod tests {
     use super::*;
 
+    fn test_miframe<'a>(ctx: &'a mut TraceCtx, sym: &'a mut PyreSym) -> MIFrame {
+        MIFrame {
+            ctx,
+            sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_result_type: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+            pre_opcode_semantic_depth: None,
+        }
+    }
+
     #[cfg(feature = "cranelift")]
     fn clear_pending_jit_exception() {
         majit_backend_cranelift::jit_exc_raise(0);
@@ -9307,6 +9351,34 @@ mod tests {
     #[cfg(not(any(feature = "cranelift", feature = "dynasm")))]
     fn pending_jit_exception_raw() -> i64 {
         0
+    }
+
+    #[test]
+    fn exact_w_class_guard_skips_primitive_values() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int, Type::Float]);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        let mut frame = test_miframe(&mut ctx, &mut sym);
+
+        let fake_type = 0x1234usize as PyObjectRef;
+        let before = unsafe { &*frame.ctx }.num_ops();
+        let frame_ptr: *mut MIFrame = &mut frame;
+        let ctx_ptr = frame.ctx;
+        unsafe {
+            trace_guard_exact_w_class(
+                &mut *frame_ptr,
+                &mut *ctx_ptr,
+                OpRef::input_arg_int(0),
+                fake_type,
+            );
+            trace_guard_exact_w_class(
+                &mut *frame_ptr,
+                &mut *ctx_ptr,
+                OpRef::input_arg_float(1),
+                fake_type,
+            );
+        }
+
+        assert_eq!(unsafe { &*frame.ctx }.num_ops(), before);
     }
 
     #[test]
