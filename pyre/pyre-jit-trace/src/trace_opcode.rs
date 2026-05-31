@@ -4814,16 +4814,13 @@ impl MIFrame {
         items: &[OpRef],
         concrete_items: &[PyObjectRef],
     ) -> Result<OpRef, PyError> {
-        // The trace-visible specialised-tuple build (NewWithVtable +
-        // inline `value0`/`value1` SetfieldGc) is disabled: OptVirtualize's
-        // `propagate_forward` forwards the re-boxed unpack result (a `Ref`
-        // box from `wrapint`) onto the inline `Int` field value, tripping
-        // the `make_equal_to` Box.type invariant (`Ref` vs `Int`) and
-        // aborting the optimizer. Until that cross-type forward is fixed,
-        // build through the opaque `jit_build_tuple_N` helper, which keeps
-        // the tuple a real heap object the optimizer never virtualizes.
-        return self.trace_build_tuple(items);
-        #[allow(unreachable_code)]
+        // Build the trace-visible specialised tuple (NewWithVtable +
+        // inline `value0`/`value1` SetfieldGc) so OptVirtualize can
+        // virtualize the build→unpack pair and elide the allocation. The
+        // paired `w_class` guard on the int/float items is a header-field
+        // read that OptVirtualize resolves via `FieldDescr::is_w_class`
+        // (virtualize.rs), so the virtual loop-carried items no longer
+        // trip the `make_equal_to` Box.type invariant.
         if concrete_items.iter().any(|item| item.is_null()) {
             // STRUCTURAL ADAPTATION: PyPy's `space.newtuple()` always
             // reaches `wraptuple()` with concrete W_Root instances, so

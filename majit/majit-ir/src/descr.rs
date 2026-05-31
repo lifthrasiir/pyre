@@ -2446,6 +2446,17 @@ pub trait SizeDescr: Descr {
         0
     }
 
+    /// Pyre object-model: the canonical Python class object pointer
+    /// (`PyObject.w_class`) that instances of this type carry, i.e.
+    /// `get_instantiate(vtable_type)`. A `new_with_vtable` virtual of a
+    /// builtin type inherits this value unless the trace stores an
+    /// explicit `w_class` field. OptVirtualize folds `w_class` header
+    /// reads to this constant. `None`/`0` for non-pyre size descrs or
+    /// before the type objects are initialised.
+    fn w_class_obj(&self) -> Option<i64> {
+        None
+    }
+
     /// descr.py: repr_of_descr()
     fn repr_of_descr(&self) -> String {
         format!(
@@ -2586,6 +2597,22 @@ pub trait FieldDescr: Descr {
     fn is_typeptr(&self) -> bool {
         let name = self.field_name();
         name == "typeptr" || name.ends_with(".typeptr")
+    }
+
+    /// Pyre object-model: `PyObject.w_class` (offset 8) carries the
+    /// Python-level class identity, distinct from the `typeptr`/vtable
+    /// (offset 0). Like `typeptr`, it is a header field — not a value
+    /// field that may be indexed by `index_in_parent` against a
+    /// virtual's stored fields. Recognised by name so OptVirtualize can
+    /// resolve it from the object's class identity instead of colliding
+    /// with the first value field.
+    ///
+    /// Handles both formats:
+    /// - `"w_class"` (pyre tracer w_class_descr)
+    /// - `"STRUCT.w_class"` (e.g. "PyObject.w_class")
+    fn is_w_class(&self) -> bool {
+        let name = self.field_name();
+        name == "w_class" || name.ends_with(".w_class")
     }
 
     /// descr.py: sort_key() — for ordering field descriptors.

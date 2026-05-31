@@ -1469,6 +1469,23 @@ impl SizeDescr for PyreSizeDescr {
         self.vtable
     }
 
+    /// The canonical `w_class` (Python class object) for instances of
+    /// this type — `get_instantiate(vtable_type)`. Read live (not cached
+    /// at construction) since the type objects are installed after the
+    /// descrs are built. `None` before `init_typeobjects()` runs.
+    fn w_class_obj(&self) -> Option<i64> {
+        if self.vtable == 0 {
+            return None;
+        }
+        let tp = self.vtable as *const pyre_object::pyobject::PyType;
+        let w_class = unsafe { pyre_object::pyobject::get_instantiate(&*tp) };
+        if w_class.is_null() {
+            None
+        } else {
+            Some(w_class as i64)
+        }
+    }
+
     fn is_immutable(&self) -> bool {
         false
     }
@@ -1655,7 +1672,23 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 ///
 /// Mutable because __class__ assignment can change it.
 pub fn w_class_descr() -> DescrRef {
-    make_field_descr(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false)
+    // Named "w_class" so `FieldDescr::is_w_class()` recognises the
+    // header field; OptVirtualize must resolve it from the object's
+    // class identity rather than indexing it against a virtual's value
+    // fields (its `index_in_parent` of 0 would otherwise collide with
+    // the first value field, e.g. `W_IntObject.intval`).
+    Arc::new(PyreFieldDescr {
+        offset: pyre_object::pyobject::W_CLASS_OFFSET,
+        field_size: 8,
+        field_type: Type::Ref,
+        signed: false,
+        immutable: false,
+        quasi_immutable: false,
+        name: "w_class",
+        index_in_parent: 0,
+        parent_descr: None,
+        ei_index: AtomicU32::new(u32::MAX),
+    })
 }
 
 /// Alias for backward compatibility — same as w_class_descr().
