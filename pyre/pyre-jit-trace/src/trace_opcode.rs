@@ -276,16 +276,6 @@ fn trace_set_tuple_w_class(ctx: &mut TraceCtx, tuple: OpRef, descr: DescrRef) {
 /// collapse a boxed subclass to `Null`), never a subclass pointer. Reading
 /// `w_class` off such a value would force the box that OptVirtualize is
 /// meant to remove, so skip the guard there.
-///
-/// A box freshly allocated in this trace (`wrapint` / `wrapfloat` boxing an
-/// arithmetic result, e.g. the `i + 1` of `(i, i + 1)`) is likewise exempt:
-/// it is always the exact `W_IntObject` / `W_FloatObject` on every replay —
-/// never a subclass — so the guard is redundant. `emit_box_int_inline`
-/// writes only the payload field, leaving `PyObject.w_class` zero, so
-/// emitting the guard here would compare that 0 against the type object and
-/// side-exit on every iteration. Skipping it lets the dead box fold away,
-/// mirroring how the optimizer folds `guard_class` on a virtual whose class
-/// is statically known.
 fn trace_guard_exact_w_class(
     frame: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -4824,6 +4814,16 @@ impl MIFrame {
         items: &[OpRef],
         concrete_items: &[PyObjectRef],
     ) -> Result<OpRef, PyError> {
+        // The trace-visible specialised-tuple build (NewWithVtable +
+        // inline `value0`/`value1` SetfieldGc) is disabled: OptVirtualize's
+        // `propagate_forward` forwards the re-boxed unpack result (a `Ref`
+        // box from `wrapint`) onto the inline `Int` field value, tripping
+        // the `make_equal_to` Box.type invariant (`Ref` vs `Int`) and
+        // aborting the optimizer. Until that cross-type forward is fixed,
+        // build through the opaque `jit_build_tuple_N` helper, which keeps
+        // the tuple a real heap object the optimizer never virtualizes.
+        return self.trace_build_tuple(items);
+        #[allow(unreachable_code)]
         if concrete_items.iter().any(|item| item.is_null()) {
             // STRUCTURAL ADAPTATION: PyPy's `space.newtuple()` always
             // reaches `wraptuple()` with concrete W_Root instances, so
@@ -7930,6 +7930,15 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
     // yet express them (it aborts with `InlineCallArityMismatch` when the
     // tuple flows through an inlined call). Keep them on the trait path
     // until the walker can encode the specialised tuple layout.
+    //
+    // StoreFastStoreFast is also excluded: its codewriter arm lowers to a
+    // chain of `residual_call` ops whose funcptr `constants_i` entries are
+    // unresolved placeholders (not patched by `patch_constants_i_fnaddrs`,
+    // which only rewrites build→runtime fnaddr pairs). The walker reads one
+    // of those placeholders as the call target and branches to it (`blr`),
+    // faulting on an unmapped address. Route it through the trait handler
+    // (`opcode_store_fast_store_fast`) until the arm's helper fnaddrs are
+    // resolved.
     matches!(
         instruction,
         Instruction::Nop
@@ -8024,36 +8033,39 @@ pub fn production_walker_handles(instruction: &Instruction) -> bool {
             | Instruction::CallFunctionEx
             | Instruction::LoadAttr { .. }
             | Instruction::StoreAttr { .. }
-            | Instruction::StoreFastStoreFast { .. } // Instruction::PopExcept excluded: same bridge-tracing
-                                                     // rationale as PushExcInfo below — its arm manages the
-                                                     // exception-info stack via impure helper jitcodes the walker
-                                                     // cannot execute concretely, so on the bridge leg the handler's
-                                                     // stack is left inflated and the loop-back `Jump` carries the
-                                                     // wrong arg count.  Trait dispatch executes it concretely.
-                                                     // Instruction::PushExcInfo excluded: its codewriter arm
-                                                     // `inline_call`s the exception-info-stack helper jitcodes,
-                                                     // which branch on the concrete result of an impure /
-                                                     // may-raise `residual_call`.  The production walker only folds
-                                                     // the concrete result of *pure* calls
-                                                     // (`try_fold_pure_call_via_executor`), so the helper's
-                                                     // post-call `goto_if_not` reads a `Null` concrete and mis-routes
-                                                     // into the helper's `raise/r` tail — surfacing a spurious
-                                                     // `SubRaise { exc_concrete: Null }` that aborts every bridge
-                                                     // trace of an exception handler.  The walker path was never
-                                                     // exercised before (the main loop only traces the no-exception
-                                                     // path; the bridge that reaches the handler never compiled
-                                                     // until the exc-value threading fix landed).  Keep PUSH_EXC_INFO
-                                                     // on trait dispatch — which executes the opcode concretely — the
-                                                     // same rationale that excludes `Reraise` above, until the walker
-                                                     // can execute impure residual calls during tracing.
-                                                     // Instruction::PopTop excluded: in the exception-handler
-                                                     // region it pops the matched exception value off the stack the
-                                                     // PUSH_EXC_INFO / POP_EXCEPT helpers manage.  Leaving it on the
-                                                     // walker while those are trait-dispatched desyncs the bridge's
-                                                     // handler-region stack, producing a loop-back `Jump` with the
-                                                     // wrong arg count (bridge fails to compile) and a backend
-                                                     // regalloc panic.  Keep the whole handler region on one concrete
-                                                     // (trait) leg so the bridge's framestate matches the loop entry.
+            // Instruction::StoreFastStoreFast excluded: routed off the
+            // walker JIT path (kept on trait dispatch) until the SFSF
+            // walker re-enable is unblocked.
+            // Instruction::PopExcept excluded: same bridge-tracing
+            // rationale as PushExcInfo below — its arm manages the
+            // exception-info stack via impure helper jitcodes the walker
+            // cannot execute concretely, so on the bridge leg the handler's
+            // stack is left inflated and the loop-back `Jump` carries the
+            // wrong arg count.  Trait dispatch executes it concretely.
+            // Instruction::PushExcInfo excluded: its codewriter arm
+            // `inline_call`s the exception-info-stack helper jitcodes,
+            // which branch on the concrete result of an impure /
+            // may-raise `residual_call`.  The production walker only folds
+            // the concrete result of *pure* calls
+            // (`try_fold_pure_call_via_executor`), so the helper's
+            // post-call `goto_if_not` reads a `Null` concrete and mis-routes
+            // into the helper's `raise/r` tail — surfacing a spurious
+            // `SubRaise { exc_concrete: Null }` that aborts every bridge
+            // trace of an exception handler.  The walker path was never
+            // exercised before (the main loop only traces the no-exception
+            // path; the bridge that reaches the handler never compiled
+            // until the exc-value threading fix landed).  Keep PUSH_EXC_INFO
+            // on trait dispatch — which executes the opcode concretely — the
+            // same rationale that excludes `Reraise` above, until the walker
+            // can execute impure residual calls during tracing.
+            // Instruction::PopTop excluded: in the exception-handler
+            // region it pops the matched exception value off the stack the
+            // PUSH_EXC_INFO / POP_EXCEPT helpers manage.  Leaving it on the
+            // walker while those are trait-dispatched desyncs the bridge's
+            // handler-region stack, producing a loop-back `Jump` with the
+            // wrong arg count (bridge fails to compile) and a backend
+            // regalloc panic.  Keep the whole handler region on one concrete
+            // (trait) leg so the bridge's framestate matches the loop entry.
             // PushNull is a bare stack push (delta +1) with no may-force
             // receiver and no `vsd <= nlocals` underflow guard, so it
             // routes through the non-zero stack-effect resync alongside
