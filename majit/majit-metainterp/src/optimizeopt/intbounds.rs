@@ -2277,6 +2277,13 @@ impl OptIntBounds {
     /// RPython's `as_operation(box)` checks `_emittedoperations` directly;
     /// majit's flat OpRef model requires a positional lookup.
     fn find_producing_op<'a>(&self, cond_ref: OpRef, ctx: &'a OptContext) -> Option<&'a Op> {
+        // optimizer.py:372 `isinstance(op, AbstractResOp)` — a `Const` is not
+        // an AbstractResOp, so `as_operation` returns None for it. A constant
+        // operand has no producing op; bail before `raw()`, which panics on
+        // the inline-`Const` OpRef variants.
+        if cond_ref.is_constant() {
+            return None;
+        }
         // First try direct index (when OpRef matches new_operations index)
         let idx = cond_ref.raw() as usize;
         if idx < ctx.new_operations.len() && ctx.new_operations[idx].pos.get() == cond_ref {
